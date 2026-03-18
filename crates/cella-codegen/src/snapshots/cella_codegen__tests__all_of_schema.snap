@@ -1,0 +1,150 @@
+---
+source: crates/cella-codegen/src/lib.rs
+expression: result
+---
+use std::collections::HashMap;
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub path: String,
+    pub message: String,
+    pub kind: ValidationErrorKind,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationErrorKind {
+    TypeError,
+    MissingRequired,
+    UnknownField,
+    InvalidEnumValue,
+    MutuallyExclusive,
+    OutOfRange,
+    PatternMismatch,
+    ConstraintViolation,
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.message)
+    }
+}
+impl std::error::Error for ValidationError {}
+#[derive(Debug, Clone)]
+pub struct Base {
+    pub id: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct Extra {
+    pub label: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct Root {
+    pub base: Base,
+    pub extra: Extra,
+}
+impl Base {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let id = if let Some(v) = obj.get("id") {
+            let field_path = format!("{path}/{}", "id");
+            match v
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { id }) } else { Err(errors) }
+    }
+}
+impl Extra {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let label = if let Some(v) = obj.get("label") {
+            let field_path = format!("{path}/{}", "label");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { label }) } else { Err(errors) }
+    }
+}
+impl Root {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let base = match Base::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        let extra = match Extra::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                base: base.unwrap(),
+                extra: extra.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}

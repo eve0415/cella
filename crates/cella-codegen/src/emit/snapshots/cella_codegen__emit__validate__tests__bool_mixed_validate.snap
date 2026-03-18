@@ -1,0 +1,34 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 652
+expression: fmt(tokens)
+---
+impl Toggle {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Some(b) = value.as_bool() {
+            if b == true {
+                return Ok(Self::On);
+            }
+        }
+        if let Some(b) = value.as_bool() {
+            if b == false {
+                return Ok(Self::Off);
+            }
+        }
+        if let Some(s) = value.as_str() {
+            if s == "custom" {
+                return Ok(Self::Custom);
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::InvalidEnumValue, }
+            ],
+        )
+    }
+}

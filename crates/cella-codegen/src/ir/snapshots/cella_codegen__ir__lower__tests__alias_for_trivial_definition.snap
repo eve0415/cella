@@ -1,0 +1,22 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Alias(
+        IrAlias {
+            name: "Anything",
+            doc: Some(
+                "A free-form value",
+            ),
+            ty: Value,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
+        },
+    ),
+]

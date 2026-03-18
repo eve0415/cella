@@ -1,0 +1,28 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 526
+expression: fmt(tokens)
+---
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub path: String,
+    pub message: String,
+    pub kind: ValidationErrorKind,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationErrorKind {
+    TypeError,
+    MissingRequired,
+    UnknownField,
+    InvalidEnumValue,
+    MutuallyExclusive,
+    OutOfRange,
+    PatternMismatch,
+    ConstraintViolation,
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.message)
+    }
+}
+impl std::error::Error for ValidationError {}

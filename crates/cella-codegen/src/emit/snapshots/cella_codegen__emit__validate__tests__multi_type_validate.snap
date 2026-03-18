@@ -1,0 +1,48 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 702
+expression: fmt(tokens)
+---
+impl Flexible {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(Flexible::Text(val));
+            }
+        }
+        if value.is_i64() {
+            if let Ok(val) = value
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(Flexible::Number(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}

@@ -507,3 +507,210 @@ fn emit_value_validation(ty: &IrTypeRef, value: &TokenStream, path: &TokenStream
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::*;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn fmt(tokens: proc_macro2::TokenStream) -> String {
+        let raw = tokens.to_string();
+        syn::parse_file(&raw)
+            .map(|f| prettyplease::unparse(&f))
+            .unwrap_or(raw)
+    }
+
+    #[test]
+    fn validation_infra() {
+        let tokens = emit_validation_infra();
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn struct_validate_basic() {
+        let ir = IrType::Struct(IrStruct {
+            name: "Basic".into(),
+            doc: None,
+            fields: vec![IrField {
+                name: "name".into(),
+                json_name: "name".into(),
+                doc: None,
+                ty: IrTypeRef::String,
+                required: true,
+                deprecated: false,
+            }],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn struct_validate_deny_unknown() {
+        let ir = IrType::Struct(IrStruct {
+            name: "Strict".into(),
+            doc: None,
+            fields: vec![IrField {
+                name: "allowed".into(),
+                json_name: "allowed".into(),
+                doc: None,
+                ty: IrTypeRef::String,
+                required: true,
+                deprecated: false,
+            }],
+            deny_unknown_fields: true,
+            is_all_of: false,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn all_of_validate() {
+        let ir = IrType::Struct(IrStruct {
+            name: "Combined".into(),
+            doc: None,
+            fields: vec![
+                IrField {
+                    name: "base".into(),
+                    json_name: "base".into(),
+                    doc: None,
+                    ty: IrTypeRef::Named("BaseConfig".into()),
+                    required: true,
+                    deprecated: false,
+                },
+                IrField {
+                    name: "extra".into(),
+                    json_name: "extra".into(),
+                    doc: None,
+                    ty: IrTypeRef::Named("ExtraConfig".into()),
+                    required: true,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: true,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn string_enum_validate() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Status".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Active".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::String("active".into())),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Inactive".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::String("inactive".into())),
+                    ty: None,
+                },
+            ],
+            repr: EnumRepr::StringEnum,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn bool_mixed_validate() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Toggle".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "On".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::Bool(true)),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Off".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::Bool(false)),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Custom".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::String("custom".into())),
+                    ty: None,
+                },
+            ],
+            repr: EnumRepr::BoolMixed,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn typed_variants_validate() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Config".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Alpha".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::Named("AlphaConfig".into())),
+                },
+                IrVariant {
+                    name: "Beta".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::Named("BetaConfig".into())),
+                },
+            ],
+            repr: EnumRepr::TypedVariants,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn multi_type_validate() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Flexible".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Text".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::String),
+                },
+                IrVariant {
+                    name: "Number".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::I64),
+                },
+            ],
+            repr: EnumRepr::MultiType,
+        });
+        let tokens = emit_validate(&ir);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn alias_no_validator() {
+        let ir = IrType::Alias(IrAlias {
+            name: "Passthrough".into(),
+            doc: None,
+            ty: IrTypeRef::Value,
+        });
+        let tokens = emit_validate(&ir);
+        assert!(tokens.is_empty(), "alias should produce no validator");
+    }
+}

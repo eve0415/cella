@@ -208,10 +208,106 @@ mod tests {
 
     #[test]
     fn test_trailing_comma_in_array() {
-        let input = r#"[1, 2, 3, ]"#;
+        let input = r"[1, 2, 3, ]";
         let output = strip_jsonc(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_nested_block_comments() {
+        // JSONC does not support nested block comments. The first `*/` ends the comment.
+        // So `/* /* */ */` leaves ` */` as literal text.
+        let input = r#"{"a": 1 /* /* */ , "b": 2}"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        // After first `*/`, the rest is normal text, so `"b"` should be present
+        assert!(output.contains("\"b\": 2"));
+    }
+
+    #[test]
+    fn test_multiple_comments_same_line() {
+        let input = r#"{"a": 1 /* c1 */ , "b": 2 /* c2 */}"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn test_comment_like_in_string() {
+        let input = r#"{"a": "// not a comment"}"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_block_comment_syntax_in_string() {
+        let input = r#"{"a": "/* not a comment */"}"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let output = strip_jsonc("").unwrap();
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_whitespace_only() {
+        let input = "   ";
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output, "   ");
+    }
+
+    #[test]
+    fn test_line_comment_at_eof() {
+        let input = r#"{"a": 1} // comment"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_multiple_trailing_commas_nested() {
+        let input = r#"{"a": {"b": 1, }, }"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"]["b"], 1);
+    }
+
+    #[test]
+    fn test_consecutive_line_comments() {
+        let input = "// first\n// second\n{\"a\": 1}";
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        assert!(!output.contains("//"));
+        let trimmed = output.trim();
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap();
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_multi_line_block_comment() {
+        let input = "/*\n  multi\n  line\n*/\n{\"a\": 1}";
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(output.len(), input.len());
+        // Newlines should be preserved
+        assert_eq!(
+            output.chars().filter(|c| *c == '\n').count(),
+            input.chars().filter(|c| *c == '\n').count()
+        );
+    }
+
+    #[test]
+    fn test_single_slash_not_comment() {
+        let input = r#"{"a": "x/y"}"#;
+        let output = strip_jsonc(input).unwrap();
+        assert_eq!(input, output);
     }
 }

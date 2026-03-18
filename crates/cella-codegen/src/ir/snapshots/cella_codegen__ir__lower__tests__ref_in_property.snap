@@ -1,0 +1,51 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Enum(
+        IrEnum {
+            name: "Theme",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "Light",
+                    doc: None,
+                    json_value: Some(
+                        String("light"),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Dark",
+                    doc: None,
+                    json_value: Some(
+                        String("dark"),
+                    ),
+                    ty: None,
+                },
+            ],
+            repr: StringEnum,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "Config",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "theme",
+                    json_name: "theme",
+                    doc: None,
+                    ty: Named(
+                        "Theme",
+                    ),
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+]

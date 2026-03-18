@@ -1,0 +1,34 @@
+---
+source: crates/cella-codegen/src/schema/parse.rs
+assertion_line: 304
+expression: result
+---
+ParsedSchema {
+    definitions: {},
+    root: SchemaNode {
+        title: None,
+        description: None,
+        deprecated: false,
+        deprecation_message: None,
+        schema_type: None,
+        properties: {},
+        required: [],
+        additional_properties: None,
+        pattern_properties: {},
+        items: None,
+        one_of: [],
+        all_of: [],
+        any_of: [],
+        enum_values: [],
+        ref: Some(
+            "#/definitions/Foo",
+        ),
+        minimum: None,
+        maximum: None,
+        pattern: None,
+        format: None,
+        default_value: None,
+        unevaluated_properties: None,
+        definitions: {},
+    },
+}

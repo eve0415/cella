@@ -1,0 +1,53 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 546
+expression: fmt(tokens)
+---
+impl Basic {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("name") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "name"),
+                    message: format!("missing required field: {}", "name"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let name = if let Some(v) = obj.get("name") {
+            let field_path = format!("{path}/{}", "name");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { name: name.unwrap() }) } else { Err(errors) }
+    }
+}

@@ -1,0 +1,11 @@
+---
+source: crates/cella-codegen/src/emit/types.rs
+assertion_line: 206
+expression: fmt(tokens)
+---
+///This is a documented struct.
+#[derive(Debug, Clone)]
+pub struct Documented {
+    ///Field doc.
+    pub x: bool,
+}

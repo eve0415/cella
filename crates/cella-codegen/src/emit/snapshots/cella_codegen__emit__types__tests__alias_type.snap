@@ -1,0 +1,6 @@
+---
+source: crates/cella-codegen/src/emit/types.rs
+assertion_line: 337
+expression: fmt(tokens)
+---
+pub type Anything = serde_json::Value;

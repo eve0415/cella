@@ -1,0 +1,46 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Enum(
+        IrEnum {
+            name: "Color",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "A",
+                    doc: None,
+                    json_value: Some(
+                        String("a"),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "B",
+                    doc: None,
+                    json_value: Some(
+                        String("b"),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "C",
+                    doc: None,
+                    json_value: Some(
+                        String("c"),
+                    ),
+                    ty: None,
+                },
+            ],
+            repr: StringEnum,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
+        },
+    ),
+]

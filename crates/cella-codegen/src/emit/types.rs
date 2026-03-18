@@ -130,3 +130,232 @@ fn emit_doc(doc: Option<&String>, config: &CodegenConfig) -> TokenStream {
     }
     quote! {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::*;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn fmt(tokens: proc_macro2::TokenStream) -> String {
+        let raw = tokens.to_string();
+        syn::parse_file(&raw)
+            .map(|f| prettyplease::unparse(&f))
+            .unwrap_or(raw)
+    }
+
+    fn default_config() -> CodegenConfig {
+        CodegenConfig {
+            root_type_name: "Test".into(),
+            emit_docs: false,
+            emit_deprecated: false,
+        }
+    }
+
+    #[test]
+    fn struct_basic() {
+        let ir = IrType::Struct(IrStruct {
+            name: "Foo".into(),
+            doc: None,
+            fields: vec![
+                IrField {
+                    name: "bar".into(),
+                    json_name: "bar".into(),
+                    doc: None,
+                    ty: IrTypeRef::String,
+                    required: true,
+                    deprecated: false,
+                },
+                IrField {
+                    name: "baz".into(),
+                    json_name: "baz".into(),
+                    doc: None,
+                    ty: IrTypeRef::I64,
+                    required: true,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn struct_with_doc() {
+        let ir = IrType::Struct(IrStruct {
+            name: "Documented".into(),
+            doc: Some("This is a documented struct.".into()),
+            fields: vec![IrField {
+                name: "x".into(),
+                json_name: "x".into(),
+                doc: Some("Field doc.".into()),
+                ty: IrTypeRef::Bool,
+                required: true,
+                deprecated: false,
+            }],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        });
+        let config = CodegenConfig {
+            root_type_name: "Test".into(),
+            emit_docs: true,
+            emit_deprecated: false,
+        };
+        let tokens = emit_type(&ir, &config);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn struct_deprecated_field() {
+        let ir = IrType::Struct(IrStruct {
+            name: "WithDeprecated".into(),
+            doc: None,
+            fields: vec![IrField {
+                name: "old_field".into(),
+                json_name: "oldField".into(),
+                doc: None,
+                ty: IrTypeRef::String,
+                required: true,
+                deprecated: true,
+            }],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        });
+        let config = CodegenConfig {
+            root_type_name: "Test".into(),
+            emit_docs: false,
+            emit_deprecated: true,
+        };
+        let tokens = emit_type(&ir, &config);
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn struct_optional_field() {
+        let ir = IrType::Struct(IrStruct {
+            name: "OptionalFields".into(),
+            doc: None,
+            fields: vec![IrField {
+                name: "maybe".into(),
+                json_name: "maybe".into(),
+                doc: None,
+                ty: IrTypeRef::String,
+                required: false,
+                deprecated: false,
+            }],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn enum_string() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Color".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Red".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::String("red".into())),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Blue".into(),
+                    doc: None,
+                    json_value: Some(serde_json::Value::String("blue".into())),
+                    ty: None,
+                },
+            ],
+            repr: EnumRepr::StringEnum,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn enum_typed_variants() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Item".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Str".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::String),
+                },
+                IrVariant {
+                    name: "Obj".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::Named("FooConfig".into())),
+                },
+            ],
+            repr: EnumRepr::TypedVariants,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn enum_multi_type() {
+        let ir = IrType::Enum(IrEnum {
+            name: "Mixed".into(),
+            doc: None,
+            variants: vec![
+                IrVariant {
+                    name: "Text".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::String),
+                },
+                IrVariant {
+                    name: "Num".into(),
+                    doc: None,
+                    json_value: None,
+                    ty: Some(IrTypeRef::I64),
+                },
+            ],
+            repr: EnumRepr::MultiType,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn alias_type() {
+        let ir = IrType::Alias(IrAlias {
+            name: "Anything".into(),
+            doc: None,
+            ty: IrTypeRef::Value,
+        });
+        let tokens = emit_type(&ir, &default_config());
+        insta::assert_snapshot!(fmt(tokens));
+    }
+
+    #[test]
+    fn type_ref_string() {
+        let tokens = emit_type_ref(&IrTypeRef::String);
+        insta::assert_snapshot!(tokens.to_string(), @"String");
+    }
+
+    #[test]
+    fn type_ref_vec() {
+        let tokens = emit_type_ref(&IrTypeRef::Vec(Box::new(IrTypeRef::String)));
+        insta::assert_snapshot!(tokens.to_string(), @"Vec < String >");
+    }
+
+    #[test]
+    fn type_ref_map() {
+        let tokens = emit_type_ref(&IrTypeRef::Map(
+            Box::new(IrTypeRef::String),
+            Box::new(IrTypeRef::Value),
+        ));
+        insta::assert_snapshot!(tokens.to_string(), @"HashMap < String , serde_json :: Value >");
+    }
+}

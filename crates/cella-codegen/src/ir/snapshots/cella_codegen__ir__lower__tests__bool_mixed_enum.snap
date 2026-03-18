@@ -1,0 +1,46 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Enum(
+        IrEnum {
+            name: "Gpu",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "True",
+                    doc: None,
+                    json_value: Some(
+                        Bool(true),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "False",
+                    doc: None,
+                    json_value: Some(
+                        Bool(false),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Auto",
+                    doc: None,
+                    json_value: Some(
+                        String("auto"),
+                    ),
+                    ty: None,
+                },
+            ],
+            repr: BoolMixed,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
+        },
+    ),
+]

@@ -1,0 +1,67 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 566
+expression: fmt(tokens)
+---
+impl Strict {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("allowed") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "allowed"),
+                    message: format!("missing required field: {}", "allowed"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let allowed = if let Some(v) = obj.get("allowed") {
+            let field_path = format!("{path}/{}", "allowed");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for key in obj.keys() {
+            if !["allowed"].contains(&key.as_str()) {
+                errors
+                    .push(ValidationError {
+                        path: format!("{path}/{key}"),
+                        message: format!("unknown field: {key}"),
+                        kind: ValidationErrorKind::UnknownField,
+                    });
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self { allowed: allowed.unwrap() })
+        } else {
+            Err(errors)
+        }
+    }
+}

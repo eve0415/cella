@@ -1,0 +1,35 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 621
+expression: fmt(tokens)
+---
+impl Status {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "active" => Ok(Self::Active),
+            "inactive" => Ok(Self::Inactive),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "active, inactive"), kind :
+                        ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}

@@ -1,0 +1,51 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Enum(
+        IrEnum {
+            name: "ConfigMode",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "Fast",
+                    doc: None,
+                    json_value: Some(
+                        String("fast"),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Slow",
+                    doc: None,
+                    json_value: Some(
+                        String("slow"),
+                    ),
+                    ty: None,
+                },
+            ],
+            repr: StringEnum,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "Config",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "mode",
+                    json_name: "mode",
+                    doc: None,
+                    ty: Named(
+                        "ConfigMode",
+                    ),
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+]

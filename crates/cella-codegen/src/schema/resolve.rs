@@ -120,3 +120,193 @@ fn merge_with_ref(
 
     Ok(merged)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{AdditionalProperties, PrimitiveType, SchemaNode, SchemaType};
+    use indexmap::IndexMap;
+
+    fn make_definitions() -> IndexMap<String, SchemaNode> {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "Foo".to_string(),
+            SchemaNode {
+                schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                description: Some("A foo string".to_string()),
+                ..SchemaNode::default()
+            },
+        );
+        defs.insert("Bar".to_string(), {
+            let mut bar = SchemaNode {
+                schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+                ..SchemaNode::default()
+            };
+            bar.properties.insert(
+                "name".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                    ..SchemaNode::default()
+                },
+            );
+            bar
+        });
+        defs
+    }
+
+    #[test]
+    fn simple_ref_resolution() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            r#ref: Some("#/definitions/Foo".to_string()),
+            ..SchemaNode::default()
+        };
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn nested_ref_in_property() {
+        let defs = make_definitions();
+        let mut node = SchemaNode {
+            schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+            ..SchemaNode::default()
+        };
+        node.properties.insert(
+            "my_field".to_string(),
+            SchemaNode {
+                r#ref: Some("#/definitions/Foo".to_string()),
+                ..SchemaNode::default()
+            },
+        );
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn ref_with_extra_constraints() {
+        let defs = make_definitions();
+        let mut node = SchemaNode {
+            r#ref: Some("#/definitions/Bar".to_string()),
+            schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+            ..SchemaNode::default()
+        };
+        node.properties.insert(
+            "extra".to_string(),
+            SchemaNode {
+                schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                ..SchemaNode::default()
+            },
+        );
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn missing_ref_error() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            r#ref: Some("#/definitions/DoesNotExist".to_string()),
+            ..SchemaNode::default()
+        };
+        let err = resolve_refs(&node, &defs).unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved"),
+            "expected 'unresolved' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unsupported_ref_format() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            r#ref: Some("other/path/Foo".to_string()),
+            ..SchemaNode::default()
+        };
+        let err = resolve_refs(&node, &defs).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported"),
+            "expected 'unsupported' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn no_ref_passthrough() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            schema_type: Some(SchemaType::Single(PrimitiveType::Boolean)),
+            description: Some("a bool".to_string()),
+            ..SchemaNode::default()
+        };
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn resolve_through_items() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            schema_type: Some(SchemaType::Single(PrimitiveType::Array)),
+            items: Some(Box::new(SchemaNode {
+                r#ref: Some("#/definitions/Foo".to_string()),
+                ..SchemaNode::default()
+            })),
+            ..SchemaNode::default()
+        };
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn resolve_through_one_of() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            one_of: vec![
+                SchemaNode {
+                    r#ref: Some("#/definitions/Foo".to_string()),
+                    ..SchemaNode::default()
+                },
+                SchemaNode {
+                    r#ref: Some("#/definitions/Bar".to_string()),
+                    ..SchemaNode::default()
+                },
+            ],
+            ..SchemaNode::default()
+        };
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn resolve_additional_properties_schema() {
+        let defs = make_definitions();
+        let node = SchemaNode {
+            schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+            additional_properties: Some(AdditionalProperties::Schema(Box::new(SchemaNode {
+                r#ref: Some("#/definitions/Foo".to_string()),
+                ..SchemaNode::default()
+            }))),
+            ..SchemaNode::default()
+        };
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+
+    #[test]
+    fn resolve_pattern_properties() {
+        let defs = make_definitions();
+        let mut node = SchemaNode {
+            schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+            ..SchemaNode::default()
+        };
+        node.pattern_properties.insert(
+            "^x-".to_string(),
+            SchemaNode {
+                r#ref: Some("#/definitions/Foo".to_string()),
+                ..SchemaNode::default()
+            },
+        );
+        let resolved = resolve_refs(&node, &defs).unwrap();
+        insta::assert_debug_snapshot!(resolved);
+    }
+}

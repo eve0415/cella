@@ -510,3 +510,508 @@ impl Lowerer {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{AdditionalProperties, PrimitiveType, SchemaNode, SchemaType};
+    use indexmap::IndexMap;
+
+    fn empty_defs() -> IndexMap<String, SchemaNode> {
+        IndexMap::new()
+    }
+
+    #[test]
+    fn simple_struct() {
+        let root = SchemaNode {
+            properties: IndexMap::from([
+                (
+                    "name".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                ),
+                (
+                    "label".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                ),
+            ]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn required_vs_optional() {
+        let root = SchemaNode {
+            properties: IndexMap::from([
+                (
+                    "host".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                ),
+                (
+                    "port".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                        ..SchemaNode::default()
+                    },
+                ),
+            ]),
+            required: vec!["host".to_string()],
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Server");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn deny_unknown_fields() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "name".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                    ..SchemaNode::default()
+                },
+            )]),
+            additional_properties: Some(AdditionalProperties::Bool(false)),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Strict");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn string_enum() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "color".to_string(),
+            SchemaNode {
+                enum_values: vec![
+                    serde_json::Value::String("a".to_string()),
+                    serde_json::Value::String("b".to_string()),
+                    serde_json::Value::String("c".to_string()),
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn bool_mixed_enum() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "gpu".to_string(),
+            SchemaNode {
+                enum_values: vec![
+                    serde_json::Value::Bool(true),
+                    serde_json::Value::Bool(false),
+                    serde_json::Value::String("auto".to_string()),
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn one_of_typed_variants() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "alpha".to_string(),
+            SchemaNode {
+                properties: IndexMap::from([(
+                    "x".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                )]),
+                ..SchemaNode::default()
+            },
+        );
+        defs.insert(
+            "beta".to_string(),
+            SchemaNode {
+                properties: IndexMap::from([(
+                    "y".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                        ..SchemaNode::default()
+                    },
+                )]),
+                ..SchemaNode::default()
+            },
+        );
+        defs.insert(
+            "choice".to_string(),
+            SchemaNode {
+                one_of: vec![
+                    SchemaNode {
+                        r#ref: Some("#/definitions/alpha".to_string()),
+                        ..SchemaNode::default()
+                    },
+                    SchemaNode {
+                        r#ref: Some("#/definitions/beta".to_string()),
+                        ..SchemaNode::default()
+                    },
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn any_of_variants() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "mixed".to_string(),
+            SchemaNode {
+                any_of: vec![
+                    SchemaNode {
+                        r#ref: Some("#/definitions/optA".to_string()),
+                        ..SchemaNode::default()
+                    },
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        defs.insert(
+            "optA".to_string(),
+            SchemaNode {
+                properties: IndexMap::from([(
+                    "val".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                        ..SchemaNode::default()
+                    },
+                )]),
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn all_of_composition() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "base".to_string(),
+            SchemaNode {
+                properties: IndexMap::from([(
+                    "id".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                        ..SchemaNode::default()
+                    },
+                )]),
+                ..SchemaNode::default()
+            },
+        );
+        defs.insert(
+            "combined".to_string(),
+            SchemaNode {
+                all_of: vec![
+                    SchemaNode {
+                        r#ref: Some("#/definitions/base".to_string()),
+                        ..SchemaNode::default()
+                    },
+                    SchemaNode {
+                        properties: IndexMap::from([(
+                            "extra".to_string(),
+                            SchemaNode {
+                                schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                                ..SchemaNode::default()
+                            },
+                        )]),
+                        ..SchemaNode::default()
+                    },
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn multi_type_string_null() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "maybe".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Multi(vec![
+                        PrimitiveType::String,
+                        PrimitiveType::Null,
+                    ])),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn multi_type_string_integer() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "value".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Multi(vec![
+                        PrimitiveType::String,
+                        PrimitiveType::Integer,
+                    ])),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn array_with_items() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "tags".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::Array)),
+                    items: Some(Box::new(SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    })),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn array_without_items() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "data".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::Array)),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn object_with_additional_properties_schema() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "env".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+                    additional_properties: Some(AdditionalProperties::Schema(Box::new(
+                        SchemaNode {
+                            schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                            ..SchemaNode::default()
+                        },
+                    ))),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn plain_object() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "metadata".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::Object)),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn ref_in_property() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "theme".to_string(),
+            SchemaNode {
+                enum_values: vec![
+                    serde_json::Value::String("light".to_string()),
+                    serde_json::Value::String("dark".to_string()),
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "theme".to_string(),
+                SchemaNode {
+                    r#ref: Some("#/definitions/theme".to_string()),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&defs, &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn nested_inline_object() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "server".to_string(),
+                SchemaNode {
+                    properties: IndexMap::from([
+                        (
+                            "host".to_string(),
+                            SchemaNode {
+                                schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                                ..SchemaNode::default()
+                            },
+                        ),
+                        (
+                            "port".to_string(),
+                            SchemaNode {
+                                schema_type: Some(SchemaType::Single(PrimitiveType::Integer)),
+                                ..SchemaNode::default()
+                            },
+                        ),
+                    ]),
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn deprecated_field() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "old_setting".to_string(),
+                SchemaNode {
+                    schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                    deprecated: true,
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn alias_for_trivial_definition() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "anything".to_string(),
+            SchemaNode {
+                description: Some("A free-form value".to_string()),
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode::default();
+        let result = lower(&defs, &root, "Root");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn inline_enum_in_property() {
+        let root = SchemaNode {
+            properties: IndexMap::from([(
+                "mode".to_string(),
+                SchemaNode {
+                    enum_values: vec![
+                        serde_json::Value::String("fast".to_string()),
+                        serde_json::Value::String("slow".to_string()),
+                    ],
+                    ..SchemaNode::default()
+                },
+            )]),
+            ..SchemaNode::default()
+        };
+        let result = lower(&empty_defs(), &root, "Config");
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn root_with_definitions() {
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "level".to_string(),
+            SchemaNode {
+                enum_values: vec![
+                    serde_json::Value::String("info".to_string()),
+                    serde_json::Value::String("warn".to_string()),
+                ],
+                ..SchemaNode::default()
+            },
+        );
+        let root = SchemaNode {
+            properties: IndexMap::from([
+                (
+                    "name".to_string(),
+                    SchemaNode {
+                        schema_type: Some(SchemaType::Single(PrimitiveType::String)),
+                        ..SchemaNode::default()
+                    },
+                ),
+                (
+                    "log_level".to_string(),
+                    SchemaNode {
+                        r#ref: Some("#/definitions/level".to_string()),
+                        ..SchemaNode::default()
+                    },
+                ),
+            ]),
+            required: vec!["name".to_string()],
+            ..SchemaNode::default()
+        };
+        let result = lower(&defs, &root, "AppConfig");
+        insta::assert_debug_snapshot!(result);
+    }
+}

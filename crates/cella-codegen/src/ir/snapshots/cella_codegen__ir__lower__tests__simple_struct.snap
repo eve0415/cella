@@ -1,0 +1,32 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Struct(
+        IrStruct {
+            name: "Config",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "name",
+                    json_name: "name",
+                    doc: None,
+                    ty: String,
+                    required: false,
+                    deprecated: false,
+                },
+                IrField {
+                    name: "label",
+                    json_name: "label",
+                    doc: None,
+                    ty: String,
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+]

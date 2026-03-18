@@ -1,0 +1,79 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Struct(
+        IrStruct {
+            name: "Base",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "id",
+                    json_name: "id",
+                    doc: None,
+                    ty: I64,
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "CombinedPart1",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "extra",
+                    json_name: "extra",
+                    doc: None,
+                    ty: String,
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "Combined",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "base",
+                    json_name: "",
+                    doc: None,
+                    ty: Named(
+                        "Base",
+                    ),
+                    required: true,
+                    deprecated: false,
+                },
+                IrField {
+                    name: "part_1",
+                    json_name: "",
+                    doc: None,
+                    ty: Named(
+                        "CombinedPart1",
+                    ),
+                    required: true,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: true,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
+        },
+    ),
+]

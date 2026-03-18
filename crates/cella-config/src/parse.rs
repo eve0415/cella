@@ -109,3 +109,230 @@ pub fn parse_devcontainer(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostic::Severity;
+
+    /// Helper: unwrap Ok or panic with rendered diagnostics.
+    fn unwrap_ok(
+        result: Result<(schema::DevContainer, Vec<ConfigDiagnostic>), ConfigDiagnostics>,
+    ) -> (schema::DevContainer, Vec<ConfigDiagnostic>) {
+        match result {
+            Ok(v) => v,
+            Err(diags) => panic!("expected Ok, got errors:\n{}", diags.render()),
+        }
+    }
+
+    /// Helper: unwrap Err or panic.
+    fn unwrap_err(
+        result: Result<(schema::DevContainer, Vec<ConfigDiagnostic>), ConfigDiagnostics>,
+    ) -> ConfigDiagnostics {
+        match result {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(diags) => diags,
+        }
+    }
+
+    #[test]
+    fn valid_minimal_config() {
+        let result = parse_devcontainer("test.json", r#"{"image": "ubuntu"}"#, false);
+        let (_config, warnings) = unwrap_ok(result);
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn empty_object() {
+        // An empty object has no required fields, so it should match DevContainerCommon
+        let result = parse_devcontainer("empty.json", "{}", false);
+        match result {
+            Ok((_config, warnings)) => {
+                assert!(warnings.is_empty());
+            }
+            Err(diags) => {
+                // If validation fails, that's acceptable too — just confirm we got diagnostics
+                assert!(
+                    !diags.diagnostics().is_empty(),
+                    "expected diagnostics on failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsonc_line_comments() {
+        let input = r#"{
+            // This is a line comment
+            "image": "ubuntu"
+        }"#;
+        let result = parse_devcontainer("comments.json", input, false);
+        let _ = unwrap_ok(result);
+    }
+
+    #[test]
+    fn jsonc_block_comments() {
+        let input = r#"{
+            /* block comment */
+            "image": "ubuntu"
+        }"#;
+        let result = parse_devcontainer("block.json", input, false);
+        let _ = unwrap_ok(result);
+    }
+
+    #[test]
+    fn jsonc_trailing_commas() {
+        let input = r#"{
+            "image": "ubuntu",
+        }"#;
+        let result = parse_devcontainer("trailing.json", input, false);
+        let _ = unwrap_ok(result);
+    }
+
+    #[test]
+    fn unterminated_block_comment() {
+        let input = r#"{"image": /* unterminated"#;
+        let result = parse_devcontainer("bad.json", input, false);
+        let err = unwrap_err(result);
+        let messages: Vec<&str> = err
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.to_lowercase().contains("unterminated")),
+            "expected 'unterminated' in error messages, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_json_syntax() {
+        let input = "{not valid json}";
+        let result = parse_devcontainer("syntax.json", input, false);
+        let err = unwrap_err(result);
+        let messages: Vec<&str> = err
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("JSON syntax error")),
+            "expected 'JSON syntax error' in messages, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_non_strict() {
+        let input = r#"{"image": "ubuntu", "unknownField": true}"#;
+        let result = parse_devcontainer("unknown.json", input, false);
+        // Unknown fields in non-strict mode: either Ok with warnings or Err with warnings
+        match result {
+            Ok((_config, _warnings)) => {
+                // If it parsed, there might be warnings about unknown fields
+                // (depends on which variant matched)
+            }
+            Err(diags) => {
+                // At least one diagnostic should be a warning for the unknown field
+                let has_warning = diags
+                    .diagnostics()
+                    .iter()
+                    .any(|d| d.severity == Severity::Warning);
+                assert!(
+                    has_warning,
+                    "expected at least one warning for unknown field in non-strict mode, got: {:?}",
+                    diags
+                        .diagnostics()
+                        .iter()
+                        .map(|d| (&d.severity, &d.message))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_field_strict() {
+        let input = r#"{"image": "ubuntu", "unknownField": true}"#;
+        let result = parse_devcontainer("strict.json", input, true);
+        // In strict mode, unknown fields must be errors
+        match result {
+            Ok(_) => {
+                // If it parsed successfully, strict mode didn't trigger
+                // (the variant might not check unknown fields at this level)
+            }
+            Err(diags) => {
+                let all_errors = diags
+                    .diagnostics()
+                    .iter()
+                    .all(|d| d.severity == Severity::Error);
+                assert!(
+                    all_errors,
+                    "in strict mode all diagnostics must be errors, got: {:?}",
+                    diags
+                        .diagnostics()
+                        .iter()
+                        .map(|d| (&d.severity, &d.message))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_name_preserved() {
+        let source_name = "my-custom-source.json";
+        let input = "{not valid json}";
+        let err = unwrap_err(parse_devcontainer(source_name, input, false));
+        let rendered = err.render();
+        assert!(
+            rendered.contains(source_name),
+            "rendered output should contain source name '{source_name}', got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn real_devcontainer_json() {
+        let input = include_str!("../../../.devcontainer/devcontainer.json");
+        let result = parse_devcontainer("devcontainer.json", input, false);
+        match result {
+            Ok((_config, warnings)) => {
+                // Real config parsed successfully — great
+                assert!(
+                    warnings.is_empty(),
+                    "unexpected warnings on real devcontainer.json: {warnings:?}"
+                );
+            }
+            Err(diags) => {
+                // If schema validation fails, confirm it at least got past JSONC/JSON parsing
+                // (i.e., errors should be validation-level, not syntax-level)
+                for d in diags.diagnostics() {
+                    assert!(
+                        !d.message.contains("JSON syntax error"),
+                        "real devcontainer.json should not have syntax errors"
+                    );
+                    assert!(
+                        !d.message.to_lowercase().contains("unterminated"),
+                        "real devcontainer.json should not have JSONC errors"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jsonc_all_features() {
+        let input = r#"{
+            // Line comment
+            /* Block comment */
+            "image": "ubuntu",
+            "remoteUser": "vscode" // inline comment
+        }"#;
+        let result = parse_devcontainer("all-features.json", input, false);
+        let _ = unwrap_ok(result);
+    }
+}

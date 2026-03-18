@@ -1,0 +1,25 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 677
+expression: fmt(tokens)
+---
+impl Config {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = AlphaConfig::validate(value, path) {
+            return Ok(Config::Alpha(val));
+        }
+        if let Ok(val) = BetaConfig::validate(value, path) {
+            return Ok(Config::Beta(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}

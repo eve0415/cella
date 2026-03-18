@@ -1,0 +1,9 @@
+---
+source: crates/cella-codegen/src/emit/types.rs
+assertion_line: 251
+expression: fmt(tokens)
+---
+#[derive(Debug, Clone)]
+pub struct OptionalFields {
+    pub maybe: Option<String>,
+}

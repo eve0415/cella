@@ -1,0 +1,10 @@
+---
+source: crates/cella-codegen/src/emit/types.rs
+assertion_line: 276
+expression: fmt(tokens)
+---
+#[derive(Debug, Clone)]
+pub enum Color {
+    Red,
+    Blue,
+}

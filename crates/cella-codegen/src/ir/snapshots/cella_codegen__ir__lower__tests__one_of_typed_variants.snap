@@ -1,0 +1,78 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Struct(
+        IrStruct {
+            name: "Alpha",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "x",
+                    json_name: "x",
+                    doc: None,
+                    ty: String,
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "Beta",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "y",
+                    json_name: "y",
+                    doc: None,
+                    ty: I64,
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+    Enum(
+        IrEnum {
+            name: "Choice",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "Alpha",
+                    doc: None,
+                    json_value: None,
+                    ty: Some(
+                        Named(
+                            "Alpha",
+                        ),
+                    ),
+                },
+                IrVariant {
+                    name: "Beta",
+                    doc: None,
+                    json_value: None,
+                    ty: Some(
+                        Named(
+                            "Beta",
+                        ),
+                    ),
+                },
+            ],
+            repr: TypedVariants,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
+        },
+    ),
+]

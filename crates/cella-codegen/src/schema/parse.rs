@@ -4,6 +4,7 @@ use super::{AdditionalProperties, PrimitiveType, SchemaNode, SchemaType};
 use crate::CellaCodegenError;
 
 /// The result of parsing a root JSON Schema document.
+#[derive(Debug)]
 pub struct ParsedSchema {
     pub definitions: IndexMap<String, SchemaNode>,
     pub root: SchemaNode,
@@ -199,4 +200,220 @@ fn get_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Optio
     obj.get(key)
         .and_then(serde_json::Value::as_str)
         .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn parse(json: serde_json::Value) -> ParsedSchema {
+        parse_root_schema(&json).unwrap()
+    }
+
+    #[test]
+    fn empty_schema() {
+        let result = parse(json!({}));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn single_string_property() {
+        let result = parse(json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn nested_objects() {
+        let result = parse(json!({
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "street": { "type": "string" },
+                        "city": { "type": "string" }
+                    }
+                }
+            }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn array_with_items() {
+        let result = parse(json!({
+            "type": "array",
+            "items": { "type": "string" }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn enum_values() {
+        let result = parse(json!({
+            "type": "string",
+            "enum": ["a", "b", "c"]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn one_of() {
+        let result = parse(json!({
+            "oneOf": [
+                { "type": "string" },
+                { "type": "integer" }
+            ]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn all_of() {
+        let result = parse(json!({
+            "allOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "integer" } } }
+            ]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn any_of() {
+        let result = parse(json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "boolean" }
+            ]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn ref_node() {
+        let result = parse(json!({
+            "$ref": "#/definitions/Foo"
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn definitions() {
+        let result = parse(json!({
+            "type": "object",
+            "definitions": {
+                "Foo": { "type": "string" },
+                "Bar": { "type": "integer" }
+            }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn multi_type() {
+        let result = parse(json!({
+            "type": ["string", "null"]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn additional_properties_bool() {
+        let result = parse(json!({
+            "type": "object",
+            "additionalProperties": false
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn additional_properties_schema() {
+        let result = parse(json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn boolean_schema_true() {
+        // Boolean schema `true` parsed at the root level should fail
+        // because root must be an object. Test parse_schema_node directly.
+        let result = parse_schema_node(&json!(true)).unwrap();
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn deprecated_field() {
+        let result = parse(json!({
+            "type": "string",
+            "deprecated": true,
+            "deprecationMessage": "use X instead"
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn pattern_properties() {
+        let result = parse(json!({
+            "type": "object",
+            "patternProperties": {
+                "^x-": { "type": "string" }
+            }
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn numeric_constraints() {
+        let result = parse(json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn required_fields() {
+        let result = parse(json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "b": { "type": "string" }
+            },
+            "required": ["a"]
+        }));
+        insta::assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn error_non_object_root() {
+        let result = parse_root_schema(&json!(42));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("root schema must be an object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn error_unknown_type() {
+        let result = parse_root_schema(&json!({"type": "foobar"}));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown type: foobar"),
+            "unexpected error: {err}"
+        );
+    }
 }

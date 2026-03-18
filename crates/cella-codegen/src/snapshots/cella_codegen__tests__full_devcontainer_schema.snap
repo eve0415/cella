@@ -1,0 +1,4139 @@
+---
+source: crates/cella-codegen/src/lib.rs
+expression: result
+---
+use std::collections::HashMap;
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub path: String,
+    pub message: String,
+    pub kind: ValidationErrorKind,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationErrorKind {
+    TypeError,
+    MissingRequired,
+    UnknownField,
+    InvalidEnumValue,
+    MutuallyExclusive,
+    OutOfRange,
+    PatternMismatch,
+    ConstraintViolation,
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.message)
+    }
+}
+impl std::error::Error for ValidationError {}
+///Mount type.
+#[derive(Debug, Clone)]
+pub enum MountType {
+    Bind,
+    Volume,
+}
+#[derive(Debug, Clone)]
+pub struct Mount {
+    ///Mount source.
+    pub source: Option<String>,
+    ///Mount target.
+    pub target: String,
+    ///Mount type.
+    pub r#type: MountType,
+}
+///The image to consider as a cache. Use an array to specify multiple images.
+#[derive(Debug, Clone)]
+pub enum BuildOptionsCacheFrom {
+    String(String),
+    Array(Vec<String>),
+}
+#[derive(Debug, Clone)]
+pub struct BuildOptions {
+    ///Build arguments.
+    pub args: Option<HashMap<String, String>>,
+    ///The image to consider as a cache. Use an array to specify multiple images.
+    pub cache_from: Option<BuildOptionsCacheFrom>,
+    ///Additional arguments passed to the build command.
+    pub options: Option<Vec<String>>,
+    ///Target stage in a multi-stage build.
+    pub target: Option<String>,
+}
+///The name of the docker-compose file(s) used to start the services.
+#[derive(Debug, Clone)]
+pub enum ComposeContainerDockerComposeFile {
+    String(String),
+    Array(Vec<String>),
+}
+///Action to take when the user disconnects from the primary container in their editor. The default is to stop all of the compose containers.
+#[derive(Debug, Clone)]
+pub enum ComposeContainerShutdownAction {
+    None,
+    StopCompose,
+}
+#[derive(Debug, Clone)]
+pub struct ComposeContainer {
+    ///The name of the docker-compose file(s) used to start the services.
+    pub docker_compose_file: ComposeContainerDockerComposeFile,
+    ///Whether to overwrite the command specified in the image. The default is false.
+    pub override_command: Option<bool>,
+    ///An array of services that should be started and stopped.
+    pub run_services: Option<Vec<String>>,
+    ///The service you want to work on. This is considered the primary container for your dev environment which your editor will connect to.
+    pub service: String,
+    ///Action to take when the user disconnects from the primary container in their editor. The default is to stop all of the compose containers.
+    pub shutdown_action: Option<ComposeContainerShutdownAction>,
+    ///The path of the workspace folder inside the container. This is typically the target path of a volume mount in the docker-compose.yml.
+    pub workspace_folder: String,
+}
+///Features to add to the dev container.
+#[derive(Debug, Clone)]
+pub struct DevContainerCommonFeatures {
+    #[deprecated]
+    pub fish: Option<serde_json::Value>,
+    #[deprecated]
+    pub gradle: Option<serde_json::Value>,
+    #[deprecated]
+    pub homebrew: Option<serde_json::Value>,
+    #[deprecated]
+    pub jupyterlab: Option<serde_json::Value>,
+    #[deprecated]
+    pub maven: Option<serde_json::Value>,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonForwardPortsItem {
+    DevContainerCommonForwardPortsItemVariant0(i64),
+    DevContainerCommonForwardPortsItemVariant1(String),
+}
+///Indicates whether a GPU is required. The string "optional" indicates that a GPU is optional. An object value can be used to configure more detailed requirements.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonHostRequirementsGpuVariant0 {
+    Boolean(bool),
+    String(String),
+}
+///Indicates whether a GPU is required. The string "optional" indicates that a GPU is optional. An object value can be used to configure more detailed requirements.
+#[derive(Debug, Clone)]
+pub struct DevContainerCommonHostRequirementsGpuVariant1 {
+    ///Number of required cores.
+    pub cores: Option<i64>,
+    ///Amount of required RAM in bytes. Supports units tb, gb, mb and kb.
+    pub memory: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonHostRequirementsGpu {
+    ///Indicates whether a GPU is required. The string "optional" indicates that a GPU is optional. An object value can be used to configure more detailed requirements.
+    DevContainerCommonHostRequirementsGpuVariant0(
+        DevContainerCommonHostRequirementsGpuVariant0,
+    ),
+    ///Indicates whether a GPU is required. The string "optional" indicates that a GPU is optional. An object value can be used to configure more detailed requirements.
+    DevContainerCommonHostRequirementsGpuVariant1(
+        DevContainerCommonHostRequirementsGpuVariant1,
+    ),
+}
+///Host hardware requirements.
+#[derive(Debug, Clone)]
+pub struct DevContainerCommonHostRequirements {
+    ///Number of required CPUs.
+    pub cpus: Option<i64>,
+    pub gpu: Option<DevContainerCommonHostRequirementsGpu>,
+    ///Amount of required RAM in bytes. Supports units tb, gb, mb and kb.
+    pub memory: Option<String>,
+    ///Amount of required disk space in bytes. Supports units tb, gb, mb and kb.
+    pub storage: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonInitializeCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run locally (i.e Your host machine, cloud VM) before anything else. This command is run before "onCreateCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonInitializeCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonInitializeCommandObjectValue>),
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonMountsItem {
+    Mount(Mount),
+    Variant1(String),
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonOnCreateCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run when creating the container. This command is run after "initializeCommand" and before "updateContentCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonOnCreateCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonOnCreateCommandObjectValue>),
+}
+///Defines the action that occurs when the port is discovered for automatic forwarding
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonOtherPortsAttributesOnAutoForward {
+    Notify,
+    OpenBrowser,
+    OpenPreview,
+    Silent,
+    Ignore,
+}
+///The protocol to use when forwarding this port.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonOtherPortsAttributesProtocol {
+    Http,
+    Https,
+}
+#[derive(Debug, Clone)]
+pub struct DevContainerCommonOtherPortsAttributes {
+    ///Automatically prompt for elevation (if needed) when this port is forwarded. Elevate is required if the local port is a privileged port.
+    pub elevate_if_needed: Option<bool>,
+    ///Label that will be shown in the UI for this port.
+    pub label: Option<String>,
+    ///Defines the action that occurs when the port is discovered for automatic forwarding
+    pub on_auto_forward: Option<DevContainerCommonOtherPortsAttributesOnAutoForward>,
+    ///The protocol to use when forwarding this port.
+    pub protocol: Option<DevContainerCommonOtherPortsAttributesProtocol>,
+    pub require_local_port: Option<bool>,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostAttachCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run when attaching to the container. This command is run after "postStartCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostAttachCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonPostAttachCommandObjectValue>),
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostCreateCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run after creating the container. This command is run after "updateContentCommand" and before "postStartCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostCreateCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonPostCreateCommandObjectValue>),
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostStartCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run after starting the container. This command is run after "postCreateCommand" and before "postAttachCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonPostStartCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonPostStartCommandObjectValue>),
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonUpdateContentCommandObjectValue {
+    String(String),
+    Array(Vec<String>),
+}
+///A command to run when creating the container and rerun when the workspace content was updated while creating the container. This command is run after "onCreateCommand" and before "postCreateCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonUpdateContentCommand {
+    String(String),
+    Array(Vec<String>),
+    Object(HashMap<String, DevContainerCommonUpdateContentCommandObjectValue>),
+}
+///User environment probe to run. The default is "loginInteractiveShell".
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonUserEnvProbe {
+    None,
+    LoginShell,
+    LoginInteractiveShell,
+    InteractiveShell,
+}
+///The user command to wait for before continuing execution in the background while the UI is starting up. The default is "updateContentCommand".
+#[derive(Debug, Clone)]
+pub enum DevContainerCommonWaitFor {
+    InitializeCommand,
+    OnCreateCommand,
+    UpdateContentCommand,
+    PostCreateCommand,
+    PostStartCommand,
+}
+#[derive(Debug, Clone)]
+pub struct DevContainerCommon {
+    ///The JSON schema of the `devcontainer.json` file.
+    pub schema: Option<String>,
+    pub additional_properties: Option<HashMap<String, serde_json::Value>>,
+    ///Passes docker capabilities to include when creating the dev container.
+    pub cap_add: Option<Vec<String>>,
+    ///Container environment variables.
+    pub container_env: Option<HashMap<String, String>>,
+    ///The user the container will be started with. The default is the user on the Docker image.
+    pub container_user: Option<String>,
+    ///Tool-specific configuration. Each tool should use a JSON object subproperty with a unique name to group its customizations.
+    pub customizations: Option<HashMap<String, serde_json::Value>>,
+    ///Features to add to the dev container.
+    pub features: Option<DevContainerCommonFeatures>,
+    ///Ports that are forwarded from the container to the local machine. Can be an integer port number, or a string of the format "host:port_number".
+    pub forward_ports: Option<Vec<DevContainerCommonForwardPortsItem>>,
+    ///Host hardware requirements.
+    pub host_requirements: Option<DevContainerCommonHostRequirements>,
+    ///Passes the --init flag when creating the dev container.
+    pub init: Option<bool>,
+    ///A command to run locally (i.e Your host machine, cloud VM) before anything else. This command is run before "onCreateCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub initialize_command: Option<DevContainerCommonInitializeCommand>,
+    ///Mount points to set up when creating the container. See Docker's documentation for the --mount option for the supported syntax.
+    pub mounts: Option<Vec<DevContainerCommonMountsItem>>,
+    ///A name for the dev container which can be displayed to the user.
+    pub name: Option<String>,
+    ///A command to run when creating the container. This command is run after "initializeCommand" and before "updateContentCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub on_create_command: Option<DevContainerCommonOnCreateCommand>,
+    pub other_ports_attributes: Option<DevContainerCommonOtherPortsAttributes>,
+    ///Array consisting of the Feature id (without the semantic version) of Features in the order the user wants them to be installed.
+    pub override_feature_install_order: Option<Vec<String>>,
+    pub ports_attributes: Option<HashMap<String, serde_json::Value>>,
+    ///A command to run when attaching to the container. This command is run after "postStartCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub post_attach_command: Option<DevContainerCommonPostAttachCommand>,
+    ///A command to run after creating the container. This command is run after "updateContentCommand" and before "postStartCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub post_create_command: Option<DevContainerCommonPostCreateCommand>,
+    ///A command to run after starting the container. This command is run after "postCreateCommand" and before "postAttachCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub post_start_command: Option<DevContainerCommonPostStartCommand>,
+    ///Passes the --privileged flag when creating the dev container.
+    pub privileged: Option<bool>,
+    ///Remote environment variables to set for processes spawned in the container including lifecycle scripts and any remote editor/IDE server process.
+    pub remote_env: Option<HashMap<String, Option<String>>>,
+    ///The username to use for spawning processes in the container including lifecycle scripts and any remote editor/IDE server process. The default is the same user as the container.
+    pub remote_user: Option<String>,
+    ///Recommended secrets for this dev container. Recommendations are provided as environment variable keys with optional metadata.
+    pub secrets: Option<HashMap<String, serde_json::Value>>,
+    ///Passes docker security options to include when creating the dev container.
+    pub security_opt: Option<Vec<String>>,
+    ///A command to run when creating the container and rerun when the workspace content was updated while creating the container. This command is run after "onCreateCommand" and before "postCreateCommand". If this is a single string, it will be run in a shell. If this is an array of strings, it will be run as a single command without shell. If this is an object, each provided command will be run in parallel.
+    pub update_content_command: Option<DevContainerCommonUpdateContentCommand>,
+    ///Controls whether on Linux the container's user should be updated with the local user's UID and GID. On by default when opening from a local folder.
+    pub update_remote_user_uid: Option<bool>,
+    ///User environment probe to run. The default is "loginInteractiveShell".
+    pub user_env_probe: Option<DevContainerCommonUserEnvProbe>,
+    ///The user command to wait for before continuing execution in the background while the UI is starting up. The default is "updateContentCommand".
+    pub wait_for: Option<DevContainerCommonWaitFor>,
+}
+#[derive(Debug, Clone)]
+pub struct DockerfileContainerVariant0 {
+    ///Docker build-related options.
+    pub build: HashMap<String, serde_json::Value>,
+}
+#[derive(Debug, Clone)]
+pub struct DockerfileContainerVariant1Part0 {
+    ///The location of the context folder for building the Docker image. The path is relative to the folder containing the `devcontainer.json` file.
+    pub context: Option<String>,
+    ///The location of the Dockerfile that defines the contents of the container. The path is relative to the folder containing the `devcontainer.json` file.
+    pub docker_file: String,
+}
+#[derive(Debug, Clone)]
+pub struct DockerfileContainerVariant1Part1 {
+    ///Docker build-related options.
+    pub build: Option<BuildOptions>,
+}
+#[derive(Debug, Clone)]
+pub struct DockerfileContainerVariant1 {
+    pub part_0: DockerfileContainerVariant1Part0,
+    pub part_1: DockerfileContainerVariant1Part1,
+}
+#[derive(Debug, Clone)]
+pub enum DockerfileContainer {
+    DockerfileContainerVariant0(DockerfileContainerVariant0),
+    DockerfileContainerVariant1(DockerfileContainerVariant1),
+}
+#[derive(Debug, Clone)]
+pub struct ImageContainer {
+    ///The docker image that will be used to create the container.
+    pub image: String,
+}
+#[derive(Debug, Clone)]
+pub enum NonComposeBaseAppPortItem {
+    Integer(i64),
+    String(String),
+}
+///Application ports that are exposed by the container. This can be a single port or an array of ports. Each port can be a number or a string. A number is mapped to the same port on the host. A string is passed to Docker unchanged and can be used to map ports differently, e.g. "8000:8010".
+#[derive(Debug, Clone)]
+pub enum NonComposeBaseAppPort {
+    Integer(i64),
+    String(String),
+    Array(Vec<NonComposeBaseAppPortItem>),
+}
+///Action to take when the user disconnects from the container in their editor. The default is to stop the container.
+#[derive(Debug, Clone)]
+pub enum NonComposeBaseShutdownAction {
+    None,
+    StopContainer,
+}
+#[derive(Debug, Clone)]
+pub struct NonComposeBase {
+    ///Application ports that are exposed by the container. This can be a single port or an array of ports. Each port can be a number or a string. A number is mapped to the same port on the host. A string is passed to Docker unchanged and can be used to map ports differently, e.g. "8000:8010".
+    pub app_port: Option<NonComposeBaseAppPort>,
+    ///Whether to overwrite the command specified in the image. The default is true.
+    pub override_command: Option<bool>,
+    ///The arguments required when starting in the container.
+    pub run_args: Option<Vec<String>>,
+    ///Action to take when the user disconnects from the container in their editor. The default is to stop the container.
+    pub shutdown_action: Option<NonComposeBaseShutdownAction>,
+    ///The path of the workspace folder inside the container.
+    pub workspace_folder: Option<String>,
+    ///The --mount parameter for docker run. The default is to mount the project folder at /workspaces/$project.
+    pub workspace_mount: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerVariant0Part0Variant0Part0 {
+    DockerfileContainer(DockerfileContainer),
+    ImageContainer(ImageContainer),
+}
+#[derive(Debug, Clone)]
+pub struct DevContainerVariant0Part0Variant0 {
+    pub part_0: DevContainerVariant0Part0Variant0Part0,
+    pub non_compose_base: NonComposeBase,
+}
+#[derive(Debug, Clone)]
+pub enum DevContainerVariant0Part0 {
+    DevContainerVariant0Part0Variant0(DevContainerVariant0Part0Variant0),
+    ComposeContainer(ComposeContainer),
+}
+#[derive(Debug, Clone)]
+pub struct DevContainerVariant0 {
+    pub part_0: DevContainerVariant0Part0,
+    pub dev_container_common: DevContainerCommon,
+}
+///Defines a dev container
+#[derive(Debug, Clone)]
+pub enum DevContainer {
+    DevContainerVariant0(DevContainerVariant0),
+    DevContainerCommon(DevContainerCommon),
+}
+impl MountType {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "bind" => Ok(Self::Bind),
+            "volume" => Ok(Self::Volume),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "bind, volume"), kind : ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl Mount {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("target") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "target"),
+                    message: format!("missing required field: {}", "target"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        if !obj.contains_key("type") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "type"),
+                    message: format!("missing required field: {}", "type"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let source = if let Some(v) = obj.get("source") {
+            let field_path = format!("{path}/{}", "source");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let target = if let Some(v) = obj.get("target") {
+            let field_path = format!("{path}/{}", "target");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let r#type = if let Some(v) = obj.get("type") {
+            let field_path = format!("{path}/{}", "type");
+            match MountType::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for key in obj.keys() {
+            if !["source", "target", "type"].contains(&key.as_str()) {
+                errors
+                    .push(ValidationError {
+                        path: format!("{path}/{key}"),
+                        message: format!("unknown field: {key}"),
+                        kind: ValidationErrorKind::UnknownField,
+                    });
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self {
+                source,
+                target: target.unwrap(),
+                r#type: r#type.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl BuildOptionsCacheFrom {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(BuildOptionsCacheFrom::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(BuildOptionsCacheFrom::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl BuildOptions {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let args = if let Some(v) = obj.get("args") {
+            let field_path = format!("{path}/{}", "args");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match map_val
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : entry_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cache_from = if let Some(v) = obj.get("cacheFrom") {
+            let field_path = format!("{path}/{}", "cacheFrom");
+            match BuildOptionsCacheFrom::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let options = if let Some(v) = obj.get("options") {
+            let field_path = format!("{path}/{}", "options");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let target = if let Some(v) = obj.get("target") {
+            let field_path = format!("{path}/{}", "target");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                args,
+                cache_from,
+                options,
+                target,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl ComposeContainerDockerComposeFile {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(ComposeContainerDockerComposeFile::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(ComposeContainerDockerComposeFile::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl ComposeContainerShutdownAction {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "none" => Ok(Self::None),
+            "stopCompose" => Ok(Self::StopCompose),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "none, stopCompose"), kind :
+                        ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl ComposeContainer {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("dockerComposeFile") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "dockerComposeFile"),
+                    message: format!("missing required field: {}", "dockerComposeFile"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        if !obj.contains_key("service") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "service"),
+                    message: format!("missing required field: {}", "service"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        if !obj.contains_key("workspaceFolder") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "workspaceFolder"),
+                    message: format!("missing required field: {}", "workspaceFolder"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let docker_compose_file = if let Some(v) = obj.get("dockerComposeFile") {
+            let field_path = format!("{path}/{}", "dockerComposeFile");
+            match ComposeContainerDockerComposeFile::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let override_command = if let Some(v) = obj.get("overrideCommand") {
+            let field_path = format!("{path}/{}", "overrideCommand");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let run_services = if let Some(v) = obj.get("runServices") {
+            let field_path = format!("{path}/{}", "runServices");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let service = if let Some(v) = obj.get("service") {
+            let field_path = format!("{path}/{}", "service");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let shutdown_action = if let Some(v) = obj.get("shutdownAction") {
+            let field_path = format!("{path}/{}", "shutdownAction");
+            match ComposeContainerShutdownAction::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let workspace_folder = if let Some(v) = obj.get("workspaceFolder") {
+            let field_path = format!("{path}/{}", "workspaceFolder");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                docker_compose_file: docker_compose_file.unwrap(),
+                override_command,
+                run_services,
+                service: service.unwrap(),
+                shutdown_action,
+                workspace_folder: workspace_folder.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerCommonFeatures {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let fish = if let Some(v) = obj.get("fish") {
+            let field_path = format!("{path}/{}", "fish");
+            match Ok::<serde_json::Value, Vec<ValidationError>>(v.clone()) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let gradle = if let Some(v) = obj.get("gradle") {
+            let field_path = format!("{path}/{}", "gradle");
+            match Ok::<serde_json::Value, Vec<ValidationError>>(v.clone()) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let homebrew = if let Some(v) = obj.get("homebrew") {
+            let field_path = format!("{path}/{}", "homebrew");
+            match Ok::<serde_json::Value, Vec<ValidationError>>(v.clone()) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let jupyterlab = if let Some(v) = obj.get("jupyterlab") {
+            let field_path = format!("{path}/{}", "jupyterlab");
+            match Ok::<serde_json::Value, Vec<ValidationError>>(v.clone()) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let maven = if let Some(v) = obj.get("maven") {
+            let field_path = format!("{path}/{}", "maven");
+            match Ok::<serde_json::Value, Vec<ValidationError>>(v.clone()) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                fish,
+                gradle,
+                homebrew,
+                jupyterlab,
+                maven,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerCommonForwardPortsItem {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = value
+            .as_i64()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string().to_string(), message :
+                    "expected integer".to_string(), kind :
+                    ValidationErrorKind::TypeError, }
+                ]
+            })
+        {
+            return Ok(
+                DevContainerCommonForwardPortsItem::DevContainerCommonForwardPortsItemVariant0(
+                    val,
+                ),
+            );
+        }
+        if let Ok(val) = value
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string().to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })
+        {
+            return Ok(
+                DevContainerCommonForwardPortsItem::DevContainerCommonForwardPortsItemVariant1(
+                    val,
+                ),
+            );
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonHostRequirementsGpuVariant0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_boolean() {
+            if let Ok(val) = value
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonHostRequirementsGpuVariant0::Boolean(val));
+            }
+        }
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonHostRequirementsGpuVariant0::String(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonHostRequirementsGpuVariant1 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let cores = if let Some(v) = obj.get("cores") {
+            let field_path = format!("{path}/{}", "cores");
+            match v
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let memory = if let Some(v) = obj.get("memory") {
+            let field_path = format!("{path}/{}", "memory");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for key in obj.keys() {
+            if !["cores", "memory"].contains(&key.as_str()) {
+                errors
+                    .push(ValidationError {
+                        path: format!("{path}/{key}"),
+                        message: format!("unknown field: {key}"),
+                        kind: ValidationErrorKind::UnknownField,
+                    });
+            }
+        }
+        if errors.is_empty() { Ok(Self { cores, memory }) } else { Err(errors) }
+    }
+}
+impl DevContainerCommonHostRequirementsGpu {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = DevContainerCommonHostRequirementsGpuVariant0::validate(
+            value,
+            path,
+        ) {
+            return Ok(
+                DevContainerCommonHostRequirementsGpu::DevContainerCommonHostRequirementsGpuVariant0(
+                    val,
+                ),
+            );
+        }
+        if let Ok(val) = DevContainerCommonHostRequirementsGpuVariant1::validate(
+            value,
+            path,
+        ) {
+            return Ok(
+                DevContainerCommonHostRequirementsGpu::DevContainerCommonHostRequirementsGpuVariant1(
+                    val,
+                ),
+            );
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonHostRequirements {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let cpus = if let Some(v) = obj.get("cpus") {
+            let field_path = format!("{path}/{}", "cpus");
+            match v
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let gpu = if let Some(v) = obj.get("gpu") {
+            let field_path = format!("{path}/{}", "gpu");
+            match DevContainerCommonHostRequirementsGpu::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let memory = if let Some(v) = obj.get("memory") {
+            let field_path = format!("{path}/{}", "memory");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let storage = if let Some(v) = obj.get("storage") {
+            let field_path = format!("{path}/{}", "storage");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for key in obj.keys() {
+            if !["cpus", "gpu", "memory", "storage"].contains(&key.as_str()) {
+                errors
+                    .push(ValidationError {
+                        path: format!("{path}/{key}"),
+                        message: format!("unknown field: {key}"),
+                        kind: ValidationErrorKind::UnknownField,
+                    });
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self { cpus, gpu, memory, storage })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerCommonInitializeCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonInitializeCommandObjectValue::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonInitializeCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonInitializeCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonInitializeCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonInitializeCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonInitializeCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonInitializeCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonMountsItem {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = Mount::validate(value, path) {
+            return Ok(DevContainerCommonMountsItem::Mount(val));
+        }
+        if let Ok(val) = value
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string().to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })
+        {
+            return Ok(DevContainerCommonMountsItem::Variant1(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonOnCreateCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonOnCreateCommandObjectValue::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonOnCreateCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonOnCreateCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonOnCreateCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonOnCreateCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonOnCreateCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonOnCreateCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonOtherPortsAttributesOnAutoForward {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "notify" => Ok(Self::Notify),
+            "openBrowser" => Ok(Self::OpenBrowser),
+            "openPreview" => Ok(Self::OpenPreview),
+            "silent" => Ok(Self::Silent),
+            "ignore" => Ok(Self::Ignore),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "notify, openBrowser, openPreview, silent, ignore"), kind :
+                        ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl DevContainerCommonOtherPortsAttributesProtocol {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "http, https"), kind : ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl DevContainerCommonOtherPortsAttributes {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let elevate_if_needed = if let Some(v) = obj.get("elevateIfNeeded") {
+            let field_path = format!("{path}/{}", "elevateIfNeeded");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let label = if let Some(v) = obj.get("label") {
+            let field_path = format!("{path}/{}", "label");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let on_auto_forward = if let Some(v) = obj.get("onAutoForward") {
+            let field_path = format!("{path}/{}", "onAutoForward");
+            match DevContainerCommonOtherPortsAttributesOnAutoForward::validate(
+                v,
+                &field_path,
+            ) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let protocol = if let Some(v) = obj.get("protocol") {
+            let field_path = format!("{path}/{}", "protocol");
+            match DevContainerCommonOtherPortsAttributesProtocol::validate(
+                v,
+                &field_path,
+            ) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let require_local_port = if let Some(v) = obj.get("requireLocalPort") {
+            let field_path = format!("{path}/{}", "requireLocalPort");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for key in obj.keys() {
+            if ![
+                "elevateIfNeeded",
+                "label",
+                "onAutoForward",
+                "protocol",
+                "requireLocalPort",
+            ]
+                .contains(&key.as_str())
+            {
+                errors
+                    .push(ValidationError {
+                        path: format!("{path}/{key}"),
+                        message: format!("unknown field: {key}"),
+                        kind: ValidationErrorKind::UnknownField,
+                    });
+            }
+        }
+        if errors.is_empty() {
+            Ok(Self {
+                elevate_if_needed,
+                label,
+                on_auto_forward,
+                protocol,
+                require_local_port,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerCommonPostAttachCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostAttachCommandObjectValue::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostAttachCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonPostAttachCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostAttachCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostAttachCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonPostAttachCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostAttachCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonPostCreateCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostCreateCommandObjectValue::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostCreateCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonPostCreateCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostCreateCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostCreateCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonPostCreateCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostCreateCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonPostStartCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostStartCommandObjectValue::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostStartCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonPostStartCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonPostStartCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostStartCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonPostStartCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonPostStartCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonUpdateContentCommandObjectValue {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(
+                    DevContainerCommonUpdateContentCommandObjectValue::String(val),
+                );
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonUpdateContentCommandObjectValue::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonUpdateContentCommand {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(DevContainerCommonUpdateContentCommand::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonUpdateContentCommand::Array(val));
+            }
+        }
+        if value.is_object() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", path.to_string());
+                    match DevContainerCommonUpdateContentCommandObjectValue::validate(
+                        map_val,
+                        &entry_path,
+                    ) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(DevContainerCommonUpdateContentCommand::Object(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerCommonUserEnvProbe {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "none" => Ok(Self::None),
+            "loginShell" => Ok(Self::LoginShell),
+            "loginInteractiveShell" => Ok(Self::LoginInteractiveShell),
+            "interactiveShell" => Ok(Self::InteractiveShell),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "none, loginShell, loginInteractiveShell, interactiveShell"),
+                        kind : ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl DevContainerCommonWaitFor {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "initializeCommand" => Ok(Self::InitializeCommand),
+            "onCreateCommand" => Ok(Self::OnCreateCommand),
+            "updateContentCommand" => Ok(Self::UpdateContentCommand),
+            "postCreateCommand" => Ok(Self::PostCreateCommand),
+            "postStartCommand" => Ok(Self::PostStartCommand),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "initializeCommand, onCreateCommand, updateContentCommand, postCreateCommand, postStartCommand"),
+                        kind : ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl DevContainerCommon {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let schema = if let Some(v) = obj.get("$schema") {
+            let field_path = format!("{path}/{}", "$schema");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let additional_properties = if let Some(v) = obj.get("additionalProperties") {
+            let field_path = format!("{path}/{}", "additionalProperties");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match Ok::<
+                        serde_json::Value,
+                        Vec<ValidationError>,
+                    >(map_val.clone()) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cap_add = if let Some(v) = obj.get("capAdd") {
+            let field_path = format!("{path}/{}", "capAdd");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let container_env = if let Some(v) = obj.get("containerEnv") {
+            let field_path = format!("{path}/{}", "containerEnv");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match map_val
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : entry_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let container_user = if let Some(v) = obj.get("containerUser") {
+            let field_path = format!("{path}/{}", "containerUser");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let customizations = if let Some(v) = obj.get("customizations") {
+            let field_path = format!("{path}/{}", "customizations");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match Ok::<
+                        serde_json::Value,
+                        Vec<ValidationError>,
+                    >(map_val.clone()) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let features = if let Some(v) = obj.get("features") {
+            let field_path = format!("{path}/{}", "features");
+            match DevContainerCommonFeatures::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let forward_ports = if let Some(v) = obj.get("forwardPorts") {
+            let field_path = format!("{path}/{}", "forwardPorts");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match DevContainerCommonForwardPortsItem::validate(
+                        item,
+                        &item_path,
+                    ) {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let host_requirements = if let Some(v) = obj.get("hostRequirements") {
+            let field_path = format!("{path}/{}", "hostRequirements");
+            match DevContainerCommonHostRequirements::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let init = if let Some(v) = obj.get("init") {
+            let field_path = format!("{path}/{}", "init");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let initialize_command = if let Some(v) = obj.get("initializeCommand") {
+            let field_path = format!("{path}/{}", "initializeCommand");
+            match DevContainerCommonInitializeCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mounts = if let Some(v) = obj.get("mounts") {
+            let field_path = format!("{path}/{}", "mounts");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match DevContainerCommonMountsItem::validate(item, &item_path) {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let name = if let Some(v) = obj.get("name") {
+            let field_path = format!("{path}/{}", "name");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let on_create_command = if let Some(v) = obj.get("onCreateCommand") {
+            let field_path = format!("{path}/{}", "onCreateCommand");
+            match DevContainerCommonOnCreateCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let other_ports_attributes = if let Some(v) = obj.get("otherPortsAttributes") {
+            let field_path = format!("{path}/{}", "otherPortsAttributes");
+            match DevContainerCommonOtherPortsAttributes::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let override_feature_install_order = if let Some(v) = obj
+            .get("overrideFeatureInstallOrder")
+        {
+            let field_path = format!("{path}/{}", "overrideFeatureInstallOrder");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let ports_attributes = if let Some(v) = obj.get("portsAttributes") {
+            let field_path = format!("{path}/{}", "portsAttributes");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match Ok::<
+                        serde_json::Value,
+                        Vec<ValidationError>,
+                    >(map_val.clone()) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let post_attach_command = if let Some(v) = obj.get("postAttachCommand") {
+            let field_path = format!("{path}/{}", "postAttachCommand");
+            match DevContainerCommonPostAttachCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let post_create_command = if let Some(v) = obj.get("postCreateCommand") {
+            let field_path = format!("{path}/{}", "postCreateCommand");
+            match DevContainerCommonPostCreateCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let post_start_command = if let Some(v) = obj.get("postStartCommand") {
+            let field_path = format!("{path}/{}", "postStartCommand");
+            match DevContainerCommonPostStartCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let privileged = if let Some(v) = obj.get("privileged") {
+            let field_path = format!("{path}/{}", "privileged");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let remote_env = if let Some(v) = obj.get("remoteEnv") {
+            let field_path = format!("{path}/{}", "remoteEnv");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match if map_val.is_null() {
+                        Ok(None)
+                    } else {
+                        (map_val
+                            .as_str()
+                            .map(String::from)
+                            .ok_or_else(|| {
+                                vec![
+                                    ValidationError { path : entry_path.to_string(), message :
+                                    "expected string".to_string(), kind :
+                                    ValidationErrorKind::TypeError, }
+                                ]
+                            }))
+                            .map(Some)
+                    } {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let remote_user = if let Some(v) = obj.get("remoteUser") {
+            let field_path = format!("{path}/{}", "remoteUser");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let secrets = if let Some(v) = obj.get("secrets") {
+            let field_path = format!("{path}/{}", "secrets");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match Ok::<
+                        serde_json::Value,
+                        Vec<ValidationError>,
+                    >(map_val.clone()) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let security_opt = if let Some(v) = obj.get("securityOpt") {
+            let field_path = format!("{path}/{}", "securityOpt");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let update_content_command = if let Some(v) = obj.get("updateContentCommand") {
+            let field_path = format!("{path}/{}", "updateContentCommand");
+            match DevContainerCommonUpdateContentCommand::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let update_remote_user_uid = if let Some(v) = obj.get("updateRemoteUserUID") {
+            let field_path = format!("{path}/{}", "updateRemoteUserUID");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let user_env_probe = if let Some(v) = obj.get("userEnvProbe") {
+            let field_path = format!("{path}/{}", "userEnvProbe");
+            match DevContainerCommonUserEnvProbe::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let wait_for = if let Some(v) = obj.get("waitFor") {
+            let field_path = format!("{path}/{}", "waitFor");
+            match DevContainerCommonWaitFor::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                schema,
+                additional_properties,
+                cap_add,
+                container_env,
+                container_user,
+                customizations,
+                features,
+                forward_ports,
+                host_requirements,
+                init,
+                initialize_command,
+                mounts,
+                name,
+                on_create_command,
+                other_ports_attributes,
+                override_feature_install_order,
+                ports_attributes,
+                post_attach_command,
+                post_create_command,
+                post_start_command,
+                privileged,
+                remote_env,
+                remote_user,
+                secrets,
+                security_opt,
+                update_content_command,
+                update_remote_user_uid,
+                user_env_probe,
+                wait_for,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DockerfileContainerVariant0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("build") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "build"),
+                    message: format!("missing required field: {}", "build"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let build = if let Some(v) = obj.get("build") {
+            let field_path = format!("{path}/{}", "build");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected object".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = HashMap::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (k, map_val) in obj {
+                    let entry_path = format!("{}/{k}", field_path);
+                    match Ok::<
+                        serde_json::Value,
+                        Vec<ValidationError>,
+                    >(map_val.clone()) {
+                        Ok(val) => {
+                            result.insert(k.clone(), val);
+                        }
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { build: build.unwrap() }) } else { Err(errors) }
+    }
+}
+impl DockerfileContainerVariant1Part0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("dockerFile") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "dockerFile"),
+                    message: format!("missing required field: {}", "dockerFile"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let context = if let Some(v) = obj.get("context") {
+            let field_path = format!("{path}/{}", "context");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let docker_file = if let Some(v) = obj.get("dockerFile") {
+            let field_path = format!("{path}/{}", "dockerFile");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                context,
+                docker_file: docker_file.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DockerfileContainerVariant1Part1 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let build = if let Some(v) = obj.get("build") {
+            let field_path = format!("{path}/{}", "build");
+            match BuildOptions::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { build }) } else { Err(errors) }
+    }
+}
+impl DockerfileContainerVariant1 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let part_0 = match DockerfileContainerVariant1Part0::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        let part_1 = match DockerfileContainerVariant1Part1::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                part_0: part_0.unwrap(),
+                part_1: part_1.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DockerfileContainer {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = DockerfileContainerVariant0::validate(value, path) {
+            return Ok(DockerfileContainer::DockerfileContainerVariant0(val));
+        }
+        if let Ok(val) = DockerfileContainerVariant1::validate(value, path) {
+            return Ok(DockerfileContainer::DockerfileContainerVariant1(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl ImageContainer {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        if !obj.contains_key("image") {
+            errors
+                .push(ValidationError {
+                    path: format!("{path}/{}", "image"),
+                    message: format!("missing required field: {}", "image"),
+                    kind: ValidationErrorKind::MissingRequired,
+                });
+        }
+        let image = if let Some(v) = obj.get("image") {
+            let field_path = format!("{path}/{}", "image");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() { Ok(Self { image: image.unwrap() }) } else { Err(errors) }
+    }
+}
+impl NonComposeBaseAppPortItem {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_i64() {
+            if let Ok(val) = value
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(NonComposeBaseAppPortItem::Integer(val));
+            }
+        }
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(NonComposeBaseAppPortItem::String(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl NonComposeBaseAppPort {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if value.is_i64() {
+            if let Ok(val) = value
+                .as_i64()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected integer".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(NonComposeBaseAppPort::Integer(val));
+            }
+        }
+        if value.is_string() {
+            if let Ok(val) = value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : path.to_string().to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                return Ok(NonComposeBaseAppPort::String(val));
+            }
+        }
+        if value.is_array() {
+            if let Ok(val) = (|| -> Result<_, Vec<ValidationError>> {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : path.to_string().to_string(),
+                            message : "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", path.to_string());
+                    match NonComposeBaseAppPortItem::validate(item, &item_path) {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                return Ok(NonComposeBaseAppPort::Array(val));
+            }
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected type".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl NonComposeBaseShutdownAction {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected string".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        match s {
+            "none" => Ok(Self::None),
+            "stopContainer" => Ok(Self::StopContainer),
+            other => {
+                Err(
+                    vec![
+                        ValidationError { path : path.to_string(), message :
+                        format!("invalid value \"{other}\", expected one of: {}",
+                        "none, stopContainer"), kind :
+                        ValidationErrorKind::InvalidEnumValue, }
+                    ],
+                )
+            }
+        }
+    }
+}
+impl NonComposeBase {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| {
+                vec![
+                    ValidationError { path : path.to_string(), message :
+                    "expected object".to_string(), kind : ValidationErrorKind::TypeError,
+                    }
+                ]
+            })?;
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let app_port = if let Some(v) = obj.get("appPort") {
+            let field_path = format!("{path}/{}", "appPort");
+            match NonComposeBaseAppPort::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let override_command = if let Some(v) = obj.get("overrideCommand") {
+            let field_path = format!("{path}/{}", "overrideCommand");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let run_args = if let Some(v) = obj.get("runArgs") {
+            let field_path = format!("{path}/{}", "runArgs");
+            match (|| -> Result<_, Vec<ValidationError>> {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| {
+                        vec![
+                            ValidationError { path : field_path.to_string(), message :
+                            "expected array".to_string(), kind :
+                            ValidationErrorKind::TypeError, }
+                        ]
+                    })?;
+                let mut result = Vec::new();
+                let mut errs: Vec<ValidationError> = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let item_path = format!("{}/{i}", field_path);
+                    match item
+                        .as_str()
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            vec![
+                                ValidationError { path : item_path.to_string(), message :
+                                "expected string".to_string(), kind :
+                                ValidationErrorKind::TypeError, }
+                            ]
+                        })
+                    {
+                        Ok(val) => result.push(val),
+                        Err(mut e) => errs.append(&mut e),
+                    }
+                }
+                if errs.is_empty() { Ok(result) } else { Err(errs) }
+            })() {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let shutdown_action = if let Some(v) = obj.get("shutdownAction") {
+            let field_path = format!("{path}/{}", "shutdownAction");
+            match NonComposeBaseShutdownAction::validate(v, &field_path) {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let workspace_folder = if let Some(v) = obj.get("workspaceFolder") {
+            let field_path = format!("{path}/{}", "workspaceFolder");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let workspace_mount = if let Some(v) = obj.get("workspaceMount") {
+            let field_path = format!("{path}/{}", "workspaceMount");
+            match v
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected string".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                app_port,
+                override_command,
+                run_args,
+                shutdown_action,
+                workspace_folder,
+                workspace_mount,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerVariant0Part0Variant0Part0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = DockerfileContainer::validate(value, path) {
+            return Ok(DevContainerVariant0Part0Variant0Part0::DockerfileContainer(val));
+        }
+        if let Ok(val) = ImageContainer::validate(value, path) {
+            return Ok(DevContainerVariant0Part0Variant0Part0::ImageContainer(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerVariant0Part0Variant0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let part_0 = match DevContainerVariant0Part0Variant0Part0::validate(
+            value,
+            path,
+        ) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        let non_compose_base = match NonComposeBase::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                part_0: part_0.unwrap(),
+                non_compose_base: non_compose_base.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainerVariant0Part0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = DevContainerVariant0Part0Variant0::validate(value, path) {
+            return Ok(DevContainerVariant0Part0::DevContainerVariant0Part0Variant0(val));
+        }
+        if let Ok(val) = ComposeContainer::validate(value, path) {
+            return Ok(DevContainerVariant0Part0::ComposeContainer(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}
+impl DevContainerVariant0 {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let part_0 = match DevContainerVariant0Part0::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        let dev_container_common = match DevContainerCommon::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                part_0: part_0.unwrap(),
+                dev_container_common: dev_container_common.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}
+impl DevContainer {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        if let Ok(val) = DevContainerVariant0::validate(value, path) {
+            return Ok(DevContainer::DevContainerVariant0(val));
+        }
+        if let Ok(val) = DevContainerCommon::validate(value, path) {
+            return Ok(DevContainer::DevContainerCommon(val));
+        }
+        Err(
+            vec![
+                ValidationError { path : path.to_string(), message :
+                "value does not match any expected variant".to_string(), kind :
+                ValidationErrorKind::TypeError, }
+            ],
+        )
+    }
+}

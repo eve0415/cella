@@ -1,0 +1,35 @@
+---
+source: crates/cella-codegen/src/emit/validate.rs
+assertion_line: 596
+expression: fmt(tokens)
+---
+impl Combined {
+    pub fn validate(
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Self, Vec<ValidationError>> {
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let base = match BaseConfig::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        let extra = match ExtraConfig::validate(value, path) {
+            Ok(v) => Some(v),
+            Err(mut e) => {
+                errors.append(&mut e);
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(Self {
+                base: base.unwrap(),
+                extra: extra.unwrap(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+}

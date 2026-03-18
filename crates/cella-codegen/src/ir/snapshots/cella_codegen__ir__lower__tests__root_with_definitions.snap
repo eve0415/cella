@@ -1,0 +1,59 @@
+---
+source: crates/cella-codegen/src/ir/lower.rs
+expression: result
+---
+[
+    Enum(
+        IrEnum {
+            name: "Level",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "Info",
+                    doc: None,
+                    json_value: Some(
+                        String("info"),
+                    ),
+                    ty: None,
+                },
+                IrVariant {
+                    name: "Warn",
+                    doc: None,
+                    json_value: Some(
+                        String("warn"),
+                    ),
+                    ty: None,
+                },
+            ],
+            repr: StringEnum,
+        },
+    ),
+    Struct(
+        IrStruct {
+            name: "AppConfig",
+            doc: None,
+            fields: [
+                IrField {
+                    name: "name",
+                    json_name: "name",
+                    doc: None,
+                    ty: String,
+                    required: true,
+                    deprecated: false,
+                },
+                IrField {
+                    name: "log_level",
+                    json_name: "log_level",
+                    doc: None,
+                    ty: Named(
+                        "Level",
+                    ),
+                    required: false,
+                    deprecated: false,
+                },
+            ],
+            deny_unknown_fields: false,
+            is_all_of: false,
+        },
+    ),
+]
