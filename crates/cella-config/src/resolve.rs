@@ -77,6 +77,25 @@ pub fn resolve_config(workspace_root: &Path) -> Result<ResolvedConfig, CellaConf
         merge_layers(&mut config, &local_value);
     }
 
+    // Substitute variables after merge, before hash
+    let container_wf = config
+        .get("workspaceFolder")
+        .and_then(|v| v.as_str());
+    let devcontainer_id = hex::encode(Sha256::digest(
+        workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf())
+            .to_string_lossy()
+            .as_bytes(),
+    ));
+    let ctx = crate::subst::SubstitutionContext::new(
+        workspace_root,
+        container_wf,
+        &devcontainer_id,
+        std::env::vars().collect(),
+    );
+    ctx.substitute_value(&mut config);
+
     // Compute hash of canonical JSON
     let canonical = serde_json::to_string(&config)?;
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
@@ -188,5 +207,43 @@ mod tests {
         let resolved = resolve_config(tmp.path()).unwrap();
         assert_eq!(resolved.config["remoteUser"], "vscode");
         assert_eq!(resolved.config["image"], "ubuntu");
+    }
+
+    #[test]
+    fn resolve_substitutes_workspace_folder_variable() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder}/data,target=/data"]}"#,
+        );
+
+        let resolved = resolve_config(tmp.path()).unwrap();
+        let mount = resolved.config["mounts"][0].as_str().unwrap();
+
+        // Should not contain the variable anymore
+        assert!(!mount.contains("${localWorkspaceFolder}"));
+        // Should contain the actual temp directory path
+        assert!(mount.contains("/data,target=/data"));
+    }
+
+    #[test]
+    fn resolve_hash_differs_with_different_workspace_roots() {
+        let tmp1 = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp1.path(),
+            r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder},target=/ws"]}"#,
+        );
+
+        let tmp2 = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp2.path(),
+            r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder},target=/ws"]}"#,
+        );
+
+        let r1 = resolve_config(tmp1.path()).unwrap();
+        let r2 = resolve_config(tmp2.path()).unwrap();
+
+        // Same template but different workspace roots → different substituted values → different hashes
+        assert_ne!(r1.config_hash, r2.config_hash);
     }
 }

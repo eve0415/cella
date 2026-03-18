@@ -1,9 +1,11 @@
 //! Image pull and Dockerfile build operations.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::OnceLock;
 
-use bollard::image::{BuildImageOptions, CreateImageOptions};
+use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
@@ -18,6 +20,81 @@ pub struct BuildOptions {
     pub args: HashMap<String, String>,
     pub target: Option<String>,
     pub cache_from: Vec<String>,
+    pub options: Vec<String>,
+}
+
+/// Locate the docker binary, caching the result.
+fn docker_binary() -> Result<&'static str, CellaDockerError> {
+    static BINARY: OnceLock<Result<&'static str, String>> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let output = std::process::Command::new("docker")
+                .arg("--version")
+                .output();
+            match output {
+                Ok(o) if o.status.success() => Ok("docker"),
+                Ok(o) => Err(format!(
+                    "docker --version failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                )),
+                Err(e) => Err(format!("docker not found: {e}")),
+            }
+        })
+        .as_ref()
+        .copied()
+        .map_err(|msg| CellaDockerError::DockerCliNotFound {
+            message: msg.clone(),
+        })
+}
+
+/// Check if `docker buildx` is available, caching the result.
+fn has_buildx() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("docker")
+            .args(["buildx", "version"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// Build the argument list for a `docker [buildx] build` invocation.
+fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
+    let mut args = Vec::new();
+
+    if use_buildx {
+        args.push("buildx".to_string());
+    }
+    args.push("build".to_string());
+
+    args.extend(["-t".to_string(), opts.image_name.clone()]);
+
+    args.extend([
+        "-f".to_string(),
+        opts.context_path
+            .join(&opts.dockerfile)
+            .to_string_lossy()
+            .to_string(),
+    ]);
+
+    for (k, v) in &opts.args {
+        args.extend(["--build-arg".to_string(), format!("{k}={v}")]);
+    }
+
+    if let Some(target) = &opts.target {
+        args.extend(["--target".to_string(), target.clone()]);
+    }
+
+    for cf in &opts.cache_from {
+        args.extend(["--cache-from".to_string(), cf.clone()]);
+    }
+
+    for opt in &opts.options {
+        args.push(opt.clone());
+    }
+
+    args.push(opts.context_path.to_string_lossy().to_string());
+    args
 }
 
 impl DockerClient {
@@ -50,44 +127,46 @@ impl DockerClient {
         Ok(())
     }
 
-    /// Build an image from a Dockerfile.
+    /// Build an image from a Dockerfile using the docker CLI.
+    ///
+    /// Prefers `docker buildx build` when available. Falls back to
+    /// `docker build` with `DOCKER_BUILDKIT=1` otherwise.
     ///
     /// # Errors
     ///
-    /// Returns error if tar creation, build, or Docker API fails.
+    /// Returns error if the docker CLI is not found or the build fails.
     pub async fn build_image(&self, opts: &BuildOptions) -> Result<String, CellaDockerError> {
         info!("Building image: {}", opts.image_name);
 
-        let tar = create_build_context(&opts.context_path)?;
+        let bin = docker_binary()?;
+        let use_buildx = has_buildx();
+        let args = build_command_args(opts, use_buildx);
 
-        let build_opts = BuildImageOptions::<String> {
-            dockerfile: opts.dockerfile.clone(),
-            t: opts.image_name.clone(),
-            rm: true,
-            target: opts.target.clone().unwrap_or_default(),
-            cachefrom: opts.cache_from.clone(),
-            buildargs: opts.args.clone(),
-            ..Default::default()
-        };
+        debug!("{bin} {}", args.join(" "));
 
-        let mut stream = self.inner().build_image(build_opts, None, Some(tar.into()));
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(output) => {
-                    if let Some(stream_msg) = &output.stream {
-                        let msg = stream_msg.trim();
-                        if !msg.is_empty() {
-                            debug!("{msg}");
-                        }
-                    }
-                    if let Some(error) = &output.error {
-                        return Err(CellaDockerError::BuildFailed {
-                            message: error.clone(),
-                        });
-                    }
-                }
-                Err(e) => return Err(CellaDockerError::DockerApi(e)),
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(&args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        if !use_buildx {
+            cmd.env("DOCKER_BUILDKIT", "1");
+        }
+
+        let status = cmd.status().await.map_err(|source| {
+            CellaDockerError::HostCommandFailed {
+                command: format!("{bin} {}", args.join(" ")),
+                source,
             }
+        })?;
+
+        if !status.success() {
+            return Err(CellaDockerError::BuildFailed {
+                message: format!(
+                    "docker build exited with code {}",
+                    status.code().unwrap_or(-1)
+                ),
+            });
         }
 
         info!("Image built: {}", opts.image_name);
@@ -110,26 +189,82 @@ impl DockerClient {
     }
 }
 
-/// Create a tar archive of the build context directory using the system `tar` command.
-fn create_build_context(context_path: &Path) -> Result<Vec<u8>, CellaDockerError> {
-    let output = std::process::Command::new("tar")
-        .args(["cf", "-", "-C"])
-        .arg(context_path)
-        .arg(".")
-        .output()
-        .map_err(|source| CellaDockerError::HostCommandFailed {
-            command: "tar".to_string(),
-            source,
-        })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if !output.status.success() {
-        return Err(CellaDockerError::BuildFailed {
-            message: format!(
-                "failed to create build context tar: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        });
+    fn basic_opts() -> BuildOptions {
+        BuildOptions {
+            image_name: "myimage:latest".to_string(),
+            context_path: PathBuf::from("/src/project"),
+            dockerfile: "Dockerfile".to_string(),
+            args: HashMap::new(),
+            target: None,
+            cache_from: Vec::new(),
+            options: Vec::new(),
+        }
     }
 
-    Ok(output.stdout)
+    #[test]
+    fn build_args_basic() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert_eq!(
+            args,
+            vec![
+                "build",
+                "-t",
+                "myimage:latest",
+                "-f",
+                "/src/project/Dockerfile",
+                "/src/project",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_with_buildx() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert_eq!(args[0], "buildx");
+        assert_eq!(args[1], "build");
+    }
+
+    #[test]
+    fn build_args_with_target() {
+        let mut opts = basic_opts();
+        opts.target = Some("builder".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--target".to_string()));
+        assert!(args.contains(&"builder".to_string()));
+    }
+
+    #[test]
+    fn build_args_with_build_args() {
+        let mut opts = basic_opts();
+        opts.args.insert("NODE_VERSION".to_string(), "20".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--build-arg".to_string()));
+        assert!(args.contains(&"NODE_VERSION=20".to_string()));
+    }
+
+    #[test]
+    fn build_args_with_cache_from() {
+        let mut opts = basic_opts();
+        opts.cache_from = vec!["myimage:cache".to_string()];
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--cache-from".to_string()));
+        assert!(args.contains(&"myimage:cache".to_string()));
+    }
+
+    #[test]
+    fn build_args_with_options_passthrough() {
+        let mut opts = basic_opts();
+        opts.options = vec!["--no-cache".to_string(), "--pull".to_string()];
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--no-cache".to_string()));
+        assert!(args.contains(&"--pull".to_string()));
+        // Context path is always last
+        assert_eq!(args.last().unwrap(), "/src/project");
+    }
 }

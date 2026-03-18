@@ -302,6 +302,16 @@ async fn ensure_image(
             })
             .unwrap_or_default();
 
+        let options: Vec<String> = build
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let build_opts = BuildOptions {
             image_name: img_name.clone(),
             context_path,
@@ -309,6 +319,7 @@ async fn ensure_image(
             args,
             target,
             cache_from,
+            options,
         };
 
         client.build_image(&build_opts).await?;

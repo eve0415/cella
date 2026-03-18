@@ -15,6 +15,10 @@ pub enum CellaDockerError {
     #[error("image not found: {image}")]
     ImageNotFound { image: String },
 
+    /// Docker CLI not found.
+    #[error("docker CLI not found: {message}")]
+    DockerCliNotFound { message: String },
+
     /// Image build failed.
     #[error("build failed: {message}")]
     BuildFailed { message: String },

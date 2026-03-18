@@ -6,6 +6,7 @@ pub mod merge;
 pub mod parse;
 pub mod resolve;
 pub mod span;
+pub mod subst;
 
 pub use error::CellaConfigError;
 
