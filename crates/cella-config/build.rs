@@ -28,23 +28,20 @@ fn main() {
         )
     });
 
-    match result {
-        Ok(formatted) => {
-            fs::write(&out_path, formatted).expect("failed to write generated.rs");
-        }
-        Err(_) => {
-            eprintln!(
-                "cargo::warning=typify could not fully process the devcontainer schema; \
-                 generated.rs will be empty. Core types will be defined manually."
-            );
-            fs::write(
-                &out_path,
-                "// typify could not process the devcontainer base schema.\n\
-                 // The schema uses draft 2019-09 features (mixed-type enums, complex\n\
-                 // oneOf/allOf) that are not yet supported. Core types will be defined\n\
-                 // manually in this crate as needed.\n",
-            )
-            .expect("failed to write generated.rs");
-        }
+    if let Ok(formatted) = result {
+        fs::write(&out_path, formatted).expect("failed to write generated.rs");
+    } else {
+        eprintln!(
+            "cargo::warning=typify could not fully process the devcontainer schema; \
+             generated.rs will be empty. Core types will be defined manually."
+        );
+        fs::write(
+            &out_path,
+            "// typify could not process the devcontainer base schema.\n\
+             // The schema uses draft 2019-09 features (mixed-type enums, complex\n\
+             // oneOf/allOf) that are not yet supported. Core types will be defined\n\
+             // manually in this crate as needed.\n",
+        )
+        .expect("failed to write generated.rs");
     }
 }
