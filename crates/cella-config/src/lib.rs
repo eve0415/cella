@@ -4,6 +4,7 @@ mod error;
 pub mod jsonc;
 pub mod merge;
 pub mod parse;
+pub mod resolve;
 pub mod span;
 
 pub use error::CellaConfigError;

@@ -1,3 +1,4 @@
+use crate::discover::DiscoverError;
 use thiserror::Error;
 
 /// Errors that can occur during configuration parsing and management.
@@ -22,4 +23,8 @@ pub enum CellaConfigError {
     /// Config validation failed with diagnostics.
     #[error("config validation failed with {error_count} error(s)")]
     Validation { error_count: usize },
+
+    /// Config discovery failed.
+    #[error("config discovery failed: {0}")]
+    Discovery(#[from] DiscoverError),
 }

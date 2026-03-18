@@ -131,10 +131,7 @@ mod tests {
     #[test]
     fn primary_path_wins() {
         let tmp = TempDir::new().unwrap();
-        let primary = tmp
-            .path()
-            .join(".devcontainer")
-            .join("devcontainer.json");
+        let primary = tmp.path().join(".devcontainer").join("devcontainer.json");
         create_file(&primary);
 
         // Also create root-level to prove priority
@@ -207,10 +204,7 @@ mod tests {
     #[test]
     fn primary_takes_priority_over_subfolder() {
         let tmp = TempDir::new().unwrap();
-        let primary = tmp
-            .path()
-            .join(".devcontainer")
-            .join("devcontainer.json");
+        let primary = tmp.path().join(".devcontainer").join("devcontainer.json");
         create_file(&primary);
         create_file(
             &tmp.path()

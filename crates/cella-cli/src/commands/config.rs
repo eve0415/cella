@@ -65,10 +65,7 @@ fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::erro
                 for w in &warnings {
                     eprintln!("warning: {} ({})", w.message, w.path);
                 }
-                eprintln!(
-                    "✓ {source_name} is valid ({} warning(s))",
-                    warnings.len()
-                );
+                eprintln!("✓ {source_name} is valid ({} warning(s))", warnings.len());
             }
             Ok(())
         }
@@ -76,11 +73,7 @@ fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::erro
             eprint!("{}", diagnostics.render());
 
             if diagnostics.has_errors() {
-                Err(format!(
-                    "validation failed: {} error(s)",
-                    diagnostics.error_count()
-                )
-                .into())
+                Err(format!("validation failed: {} error(s)", diagnostics.error_count()).into())
             } else if strict {
                 Err(format!(
                     "strict mode: {} warning(s) treated as errors",

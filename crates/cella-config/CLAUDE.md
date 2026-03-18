@@ -8,7 +8,7 @@ JSONC parsing, devcontainer config discovery, validation, and layer merging.
 
 ## Config merge order
 
-defaults → template → workspace → user
+global (~/.config/cella/global.jsonc) → workspace (devcontainer.json) → local (devcontainer.local.jsonc)
 
 ## Key internals
 
