@@ -1,0 +1,16 @@
+[package]
+name = "cella-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cella-config.workspace = true
+cella-docker.workspace = true
+cella-git.workspace = true
+cella-port.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

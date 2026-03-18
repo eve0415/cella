@@ -1,0 +1,23 @@
+[package]
+name = "cella-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cella"
+path = "src/main.rs"
+
+[dependencies]
+cella-config.workspace = true
+cella-docker.workspace = true
+cella-git.workspace = true
+cella-port.workspace = true
+cella-agent.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
