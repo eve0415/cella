@@ -7,10 +7,6 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Enable strict validation (unknown fields become errors)
-    #[arg(long, global = true)]
-    strict: bool,
-
     #[command(subcommand)]
     command: commands::Command,
 }
@@ -30,5 +26,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    cli.command.execute(cli.strict).await
+    cli.command.execute().await
 }

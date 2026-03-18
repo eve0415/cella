@@ -21,16 +21,19 @@ pub enum ConfigCommand {
     Agent,
     /// Validate a devcontainer.json file.
     Validate {
-        /// Path to the devcontainer.json file. Defaults to .devcontainer/devcontainer.json.
+        /// Path to the devcontainer.json file. Auto-discovered if not specified.
         #[arg(short, long)]
         file: Option<PathBuf>,
+        /// Treat warnings (e.g. unknown fields) as errors.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
 impl ConfigArgs {
-    pub async fn execute(self, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
-            ConfigCommand::Validate { file } => validate(file, strict),
+            ConfigCommand::Validate { file, strict } => validate(file, strict),
             ConfigCommand::Show
             | ConfigCommand::Global
             | ConfigCommand::Dotfiles
@@ -43,11 +46,15 @@ impl ConfigArgs {
 }
 
 fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let path = file.unwrap_or_else(|| PathBuf::from(".devcontainer/devcontainer.json"));
+    let path = if let Some(p) = file {
+        p
+    } else {
+        let cwd = std::env::current_dir()?;
+        cella_config::discover::discover_config(&cwd)?
+    };
 
     let raw_text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-
     let source_name = path.display().to_string();
 
     match cella_config::parse::parse_devcontainer(&source_name, &raw_text, strict) {
@@ -58,13 +65,36 @@ fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::erro
                 for w in &warnings {
                     eprintln!("warning: {} ({})", w.message, w.path);
                 }
-                eprintln!("✓ {} is valid ({} warning(s))", source_name, warnings.len());
+                eprintln!(
+                    "✓ {source_name} is valid ({} warning(s))",
+                    warnings.len()
+                );
             }
             Ok(())
         }
         Err(diagnostics) => {
             eprint!("{}", diagnostics.render());
-            Err(format!("validation failed: {} error(s)", diagnostics.error_count()).into())
+
+            if diagnostics.has_errors() {
+                Err(format!(
+                    "validation failed: {} error(s)",
+                    diagnostics.error_count()
+                )
+                .into())
+            } else if strict {
+                Err(format!(
+                    "strict mode: {} warning(s) treated as errors",
+                    diagnostics.warning_count()
+                )
+                .into())
+            } else {
+                // Warnings only, non-strict → success
+                eprintln!(
+                    "✓ {source_name} is valid ({} warning(s))",
+                    diagnostics.warning_count()
+                );
+                Ok(())
+            }
         }
     }
 }

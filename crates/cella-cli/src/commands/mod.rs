@@ -55,7 +55,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub async fn execute(self, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Up(args) => args.execute().await,
             Self::Down(args) => args.execute().await,
@@ -69,7 +69,7 @@ impl Command {
             Self::Spawn(args) => args.execute().await,
             Self::Switch(args) => args.execute().await,
             Self::Prune(args) => args.execute().await,
-            Self::Config(args) => args.execute(strict).await,
+            Self::Config(args) => args.execute().await,
             Self::Template(args) => args.execute().await,
             Self::Init(args) => args.execute().await,
             Self::Nvim(args) => args.execute().await,
