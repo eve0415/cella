@@ -8,12 +8,11 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+miette.workspace = true
 
 [build-dependencies]
-typify = "0.6.1"
+cella-codegen = { path = "../cella-codegen" }
 serde_json = "1.0.149"
-prettyplease = "0.2.37"
-syn = "2.0.117"
 
 [lints]
 workspace = true

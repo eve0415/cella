@@ -15,6 +15,7 @@ cella-git.workspace = true
 cella-port.workspace = true
 cella-agent.workspace = true
 clap.workspace = true
+miette.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

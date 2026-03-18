@@ -14,4 +14,12 @@ pub enum CellaConfigError {
     /// Failed to parse JSON content.
     #[error("failed to parse config")]
     Parse(#[from] serde_json::Error),
+
+    /// JSONC preprocessing failed.
+    #[error("JSONC error: {0}")]
+    Jsonc(String),
+
+    /// Config validation failed with diagnostics.
+    #[error("config validation failed with {error_count} error(s)")]
+    Validation { error_count: usize },
 }

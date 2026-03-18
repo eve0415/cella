@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cella-cli",
+    "crates/cella-codegen",
     "crates/cella-config",
     "crates/cella-docker",
     "crates/cella-git",
@@ -33,7 +34,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # CLI
 clap = { version = "4.6.0", features = ["derive"] }
 
+# Diagnostics
+miette = { version = "7", features = ["fancy"] }
+
 # Internal crates
+cella-codegen = { path = "crates/cella-codegen" }
 cella-config = { path = "crates/cella-config" }
 cella-docker = { path = "crates/cella-docker" }
 cella-git = { path = "crates/cella-git" }
