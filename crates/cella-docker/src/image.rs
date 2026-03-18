@@ -153,12 +153,13 @@ impl DockerClient {
             cmd.env("DOCKER_BUILDKIT", "1");
         }
 
-        let status = cmd.status().await.map_err(|source| {
-            CellaDockerError::HostCommandFailed {
+        let status = cmd
+            .status()
+            .await
+            .map_err(|source| CellaDockerError::HostCommandFailed {
                 command: format!("{bin} {}", args.join(" ")),
                 source,
-            }
-        })?;
+            })?;
 
         if !status.success() {
             return Err(CellaDockerError::BuildFailed {
@@ -242,7 +243,8 @@ mod tests {
     #[test]
     fn build_args_with_build_args() {
         let mut opts = basic_opts();
-        opts.args.insert("NODE_VERSION".to_string(), "20".to_string());
+        opts.args
+            .insert("NODE_VERSION".to_string(), "20".to_string());
         let args = build_command_args(&opts, false);
         assert!(args.contains(&"--build-arg".to_string()));
         assert!(args.contains(&"NODE_VERSION=20".to_string()));

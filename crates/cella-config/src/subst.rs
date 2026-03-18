@@ -175,10 +175,7 @@ mod tests {
     #[test]
     fn local_env_empty_value_not_default() {
         let ctx = test_ctx();
-        assert_eq!(
-            ctx.substitute_str("${localEnv:EMPTY_VAR:fallback}"),
-            ""
-        );
+        assert_eq!(ctx.substitute_str("${localEnv:EMPTY_VAR:fallback}"), "");
     }
 
     #[test]
@@ -240,10 +237,7 @@ mod tests {
     #[test]
     fn unrecognized_variable_passed_through() {
         let ctx = test_ctx();
-        assert_eq!(
-            ctx.substitute_str("${unknownVar:foo}"),
-            "${unknownVar:foo}"
-        );
+        assert_eq!(ctx.substitute_str("${unknownVar:foo}"), "${unknownVar:foo}");
     }
 
     #[test]
@@ -310,10 +304,7 @@ mod tests {
         let ctx = SubstitutionContext::new(&tmp, None, "deadbeef", env);
 
         assert!(!ctx.local_workspace_folder.is_empty());
-        assert_eq!(
-            ctx.local_workspace_folder_basename,
-            "test_subst_workspace"
-        );
+        assert_eq!(ctx.local_workspace_folder_basename, "test_subst_workspace");
         assert_eq!(
             ctx.container_workspace_folder,
             "/workspaces/test_subst_workspace"

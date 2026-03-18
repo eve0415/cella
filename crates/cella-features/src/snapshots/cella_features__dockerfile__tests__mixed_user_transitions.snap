@@ -1,0 +1,39 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: result
+---
+ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
+ARG _DEV_CONTAINERS_IMAGE_USER=vscode
+ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
+
+FROM ubuntu:22.04 AS dev_containers_target_stage
+
+USER root
+
+# Feature: root-tool (ghcr.io/example/root-tool:1)
+COPY --chown=root:root root-tool/ /tmp/dev-container-features/root-tool/
+RUN chmod +x /tmp/dev-container-features/root-tool/install.sh \
+    && cd /tmp/dev-container-features/root-tool \
+    && ./install.sh
+
+USER developer
+
+# Feature: user-tool (ghcr.io/example/user-tool:1)
+COPY --chown=root:root user-tool/ /tmp/dev-container-features/user-tool/
+RUN chmod +x /tmp/dev-container-features/user-tool/install.sh \
+    && cd /tmp/dev-container-features/user-tool \
+    && ./install.sh
+
+USER root
+
+# Feature: another-root (ghcr.io/example/another-root:1)
+COPY --chown=root:root another-root/ /tmp/dev-container-features/another-root/
+RUN chmod +x /tmp/dev-container-features/another-root/install.sh \
+    && cd /tmp/dev-container-features/another-root \
+    && ./install.sh
+
+# Cleanup
+RUN rm -rf /tmp/dev-container-features
+
+# Reset user
+USER vscode

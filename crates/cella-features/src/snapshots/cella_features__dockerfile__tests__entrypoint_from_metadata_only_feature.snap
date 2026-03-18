@@ -1,0 +1,8 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: script
+---
+#!/bin/sh
+# Entrypoints from devcontainer features
+/usr/local/share/meta-init.sh
+exec "$@"

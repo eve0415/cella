@@ -8,6 +8,7 @@ members = [
     "crates/cella-git",
     "crates/cella-port",
     "crates/cella-agent",
+    "crates/cella-features",
 ]
 
 [workspace.package]
@@ -23,6 +24,9 @@ tokio = { version = "1.50.0", features = ["full"] }
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+
+# Encoding
+base64 = "0.22.1"
 
 # Error handling
 thiserror = "2.0.18"
@@ -60,6 +64,7 @@ cella-docker = { path = "crates/cella-docker" }
 cella-git = { path = "crates/cella-git" }
 cella-port = { path = "crates/cella-port" }
 cella-agent = { path = "crates/cella-agent" }
+cella-features = { path = "crates/cella-features" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

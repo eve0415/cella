@@ -5,7 +5,7 @@ use std::path::Path;
 
 use bollard::container::Config;
 use bollard::models::{HostConfig, Mount, MountTypeEnum, PortBinding, PortMap};
-use tracing::warn;
+use cella_features::FeatureContainerConfig;
 
 /// Options for creating a container (pre-mapped from devcontainer.json).
 #[derive(Debug, Clone)]
@@ -127,6 +127,7 @@ pub fn map_config(
     image_name: &str,
     labels: HashMap<String, String>,
     workspace_root: &Path,
+    feature_config: Option<&FeatureContainerConfig>,
 ) -> CreateContainerOptions {
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
@@ -139,12 +140,47 @@ pub fn map_config(
         .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
 
     let workspace_mount = map_workspace_mount(config, workspace_root, &workspace_folder);
-    let mounts = map_additional_mounts(config);
-    let env = map_container_env(config);
+
+    // Mounts: feature mounts first, then user mounts
+    let mut mounts = Vec::new();
+    if let Some(fc) = feature_config {
+        for mount_str in &fc.mounts {
+            if let Some(mc) = parse_mount_string(mount_str) {
+                mounts.push(mc);
+            }
+        }
+    }
+    mounts.extend(map_additional_mounts(config));
+
+    // Environment: feature env first, user env overrides (Docker takes last value)
+    let mut env = Vec::new();
+    if let Some(fc) = feature_config {
+        for (k, v) in &fc.container_env {
+            env.push(format!("{k}={v}"));
+        }
+    }
+    env.extend(map_container_env(config));
+
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
-    let cap_add = map_string_array(config, "capAdd");
-    let security_opt = map_string_array(config, "securityOpt");
+
+    // capAdd: feature + user, deduplicated
+    let mut cap_add = Vec::new();
+    if let Some(fc) = feature_config {
+        cap_add.extend(fc.cap_add.clone());
+    }
+    cap_add.extend(map_string_array(config, "capAdd"));
+    cap_add.sort();
+    cap_add.dedup();
+
+    // securityOpt: feature + user, deduplicated
+    let mut security_opt = Vec::new();
+    if let Some(fc) = feature_config {
+        security_opt.extend(fc.security_opt.clone());
+    }
+    security_opt.extend(map_string_array(config, "securityOpt"));
+    security_opt.sort();
+    security_opt.dedup();
 
     let container_user = config
         .get("containerUser")
@@ -159,25 +195,28 @@ pub fn map_config(
         .unwrap_or(true);
 
     let (entrypoint, cmd) = if override_command {
-        (
-            Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-            Some(vec!["while sleep 1000; do :; done".to_string()]),
-        )
+        if feature_config.is_some_and(|fc| !fc.entrypoints.is_empty()) {
+            // Features have entrypoints — use docker-init.sh which chains them
+            (
+                Some(vec!["/usr/local/share/docker-init.sh".to_string()]),
+                Some(vec!["while sleep 1000; do :; done".to_string()]),
+            )
+        } else {
+            (
+                Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+                Some(vec!["while sleep 1000; do :; done".to_string()]),
+            )
+        }
     } else {
         (None, None)
     };
 
+    // privileged: OR of feature and user config
     let privileged = config
         .get("privileged")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    // Warn about unsupported features
-    if let Some(features) = config.get("features")
-        && features.as_object().is_some_and(|obj| !obj.is_empty())
-    {
-        warn!("OCI Features are not yet supported and will be skipped");
-    }
+        .unwrap_or(false)
+        || feature_config.is_some_and(|fc| fc.privileged);
 
     CreateContainerOptions {
         name: container_name.to_string(),
@@ -368,6 +407,7 @@ fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_features::FeatureLifecycle;
     use serde_json::json;
 
     #[test]
@@ -383,6 +423,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/my-project"),
+            None,
         );
 
         assert_eq!(opts.image, "ubuntu");
@@ -402,6 +443,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/my-project"),
+            None,
         );
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
@@ -420,6 +462,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
 
         assert!(opts.env.contains(&"FOO=bar".to_string()));
@@ -435,6 +478,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
         assert!(opts.entrypoint.is_some());
     }
@@ -448,6 +492,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
         assert!(opts.entrypoint.is_none());
         assert!(opts.cmd.is_none());
@@ -489,6 +534,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
         assert!(opts.port_bindings.contains_key("3000/tcp"));
         assert!(opts.port_bindings.contains_key("8080/tcp"));
@@ -508,6 +554,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
         assert!(opts.port_bindings.contains_key("3000/udp"));
     }
@@ -525,6 +572,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
         );
         assert_eq!(opts.mounts.len(), 1);
         assert_eq!(opts.mounts[0].target, "/b");
@@ -539,6 +587,7 @@ mod tests {
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/my-project"),
+            None,
         );
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
@@ -551,13 +600,102 @@ mod tests {
             "image": "ubuntu",
             "features": {"ghcr.io/devcontainers/features/node:1": {}},
         });
-        // Just verify it doesn't panic — warning is logged
         let _ = map_config(
             &config,
             "test",
             "ubuntu",
             HashMap::new(),
             Path::new("/tmp/test"),
+            None,
+        );
+    }
+
+    #[test]
+    fn map_config_merges_feature_config() {
+        let config = json!({
+            "image": "ubuntu",
+            "containerEnv": {"USER_VAR": "user_val", "SHARED": "from_user"},
+            "capAdd": ["SYS_PTRACE"],
+            "securityOpt": ["seccomp=unconfined"],
+            "mounts": [{"type": "bind", "source": "/user-src", "target": "/user-dst"}],
+        });
+
+        let feature_config = FeatureContainerConfig {
+            mounts: vec!["source=/feat-src,target=/feat-dst".to_string()],
+            cap_add: vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()],
+            security_opt: vec!["apparmor=unconfined".to_string()],
+            privileged: true,
+            init: false,
+            container_env: HashMap::from([
+                ("FEAT_VAR".to_string(), "feat_val".to_string()),
+                ("SHARED".to_string(), "from_feature".to_string()),
+            ]),
+            entrypoints: vec!["/usr/local/share/docker-init.sh".to_string()],
+            lifecycle: FeatureLifecycle::default(),
+            customizations: serde_json::Value::Null,
+        };
+
+        let opts = map_config(
+            &config,
+            "test",
+            "ubuntu",
+            HashMap::new(),
+            Path::new("/tmp/test"),
+            Some(&feature_config),
+        );
+
+        // Feature mounts come first, then user mounts
+        assert_eq!(opts.mounts.len(), 2);
+        assert_eq!(opts.mounts[0].target, "/feat-dst");
+        assert_eq!(opts.mounts[1].target, "/user-dst");
+
+        // capAdd merged and deduplicated
+        assert!(opts.cap_add.contains(&"SYS_PTRACE".to_string()));
+        assert!(opts.cap_add.contains(&"NET_ADMIN".to_string()));
+        // SYS_PTRACE appears in both but should be deduplicated
+        assert_eq!(
+            opts.cap_add.iter().filter(|c| *c == "SYS_PTRACE").count(),
+            1
+        );
+
+        // securityOpt merged and deduplicated
+        assert!(
+            opts.security_opt
+                .contains(&"seccomp=unconfined".to_string())
+        );
+        assert!(
+            opts.security_opt
+                .contains(&"apparmor=unconfined".to_string())
+        );
+
+        // privileged OR'd — feature is true
+        assert!(opts.privileged);
+
+        // Env: feature vars come first, user vars override same keys
+        // Docker takes last value, so SHARED should be overridden by user
+        assert!(opts.env.contains(&"FEAT_VAR=feat_val".to_string()));
+        assert!(opts.env.contains(&"USER_VAR=user_val".to_string()));
+        // Both SHARED entries present — Docker uses last occurrence (user wins)
+        let shared_entries: Vec<&String> = opts
+            .env
+            .iter()
+            .filter(|e| e.starts_with("SHARED="))
+            .collect();
+        assert_eq!(shared_entries.len(), 2);
+        // Feature value first, user value last
+        assert_eq!(
+            *shared_entries.last().unwrap(),
+            &"SHARED=from_user".to_string()
+        );
+
+        // Entrypoint should be docker-init.sh since features have entrypoints
+        assert_eq!(
+            opts.entrypoint,
+            Some(vec!["/usr/local/share/docker-init.sh".to_string()])
+        );
+        assert_eq!(
+            opts.cmd,
+            Some(vec!["while sleep 1000; do :; done".to_string()])
         );
     }
 }

@@ -78,9 +78,7 @@ pub fn resolve_config(workspace_root: &Path) -> Result<ResolvedConfig, CellaConf
     }
 
     // Substitute variables after merge, before hash
-    let container_wf = config
-        .get("workspaceFolder")
-        .and_then(|v| v.as_str());
+    let container_wf = config.get("workspaceFolder").and_then(|v| v.as_str());
     let devcontainer_id = hex::encode(Sha256::digest(
         workspace_root
             .canonicalize()

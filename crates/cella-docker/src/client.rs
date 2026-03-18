@@ -54,8 +54,8 @@ impl DockerClient {
         Ok(())
     }
 
-    /// Access the inner bollard client (for module-internal use).
-    pub(crate) const fn inner(&self) -> &Docker {
+    /// Access the inner bollard client.
+    pub const fn inner(&self) -> &Docker {
         &self.inner
     }
 }

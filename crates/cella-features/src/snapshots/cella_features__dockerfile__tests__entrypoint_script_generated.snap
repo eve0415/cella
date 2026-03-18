@@ -1,0 +1,9 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: script
+---
+#!/bin/sh
+# Entrypoints from devcontainer features
+/usr/local/share/feature-a-init.sh
+/usr/local/share/feature-b-init.sh
+exec "$@"

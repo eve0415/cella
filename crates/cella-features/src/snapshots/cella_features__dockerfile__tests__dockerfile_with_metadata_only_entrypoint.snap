@@ -1,0 +1,22 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: dockerfile
+---
+ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
+ARG _DEV_CONTAINERS_IMAGE_USER=root
+ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
+
+FROM ubuntu:22.04 AS dev_containers_target_stage
+
+# Feature: installer (ghcr.io/example/installer:1)
+COPY --chown=root:root installer/ /tmp/dev-container-features/installer/
+RUN chmod +x /tmp/dev-container-features/installer/install.sh \
+    && cd /tmp/dev-container-features/installer \
+    && ./install.sh
+
+# Entrypoint init script
+COPY docker-init.sh /usr/local/share/docker-init.sh
+RUN chmod +x /usr/local/share/docker-init.sh
+
+# Cleanup
+RUN rm -rf /tmp/dev-container-features

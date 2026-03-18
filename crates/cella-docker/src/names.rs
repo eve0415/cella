@@ -72,6 +72,19 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// Generate image name for a features-layered build.
+/// `features_digest` is the hex-encoded lowercase SHA256 (64-character string).
+pub fn image_name_with_features(
+    workspace_root: &Path,
+    config_name: Option<&str>,
+    features_digest: &str,
+) -> String {
+    let identifier = identifier_from(workspace_root, config_name);
+    let path_hash = workspace_hash(workspace_root);
+    let feat_hash = &features_digest[..8];
+    format!("cella-img-{identifier}-{path_hash}-{feat_hash}")
+}
+
 /// Standard Docker labels for cella containers.
 pub fn container_labels(
     workspace_root: &Path,
@@ -156,6 +169,25 @@ mod tests {
     #[test]
     fn sanitize_trims_dashes() {
         assert_eq!(sanitize_name("-abc-"), "abc");
+    }
+
+    #[test]
+    fn image_name_with_features_format() {
+        let path = PathBuf::from("/tmp/my-project");
+        let digest = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let name = image_name_with_features(&path, Some("test"), digest);
+        assert!(name.starts_with("cella-img-test-"));
+        assert!(name.len() > "cella-img-test-".len());
+        assert!(name.ends_with(&digest[..8]));
+    }
+
+    #[test]
+    fn image_name_with_features_hyphenated_identifier() {
+        let path = PathBuf::from("/tmp/my-app");
+        let digest = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let name = image_name_with_features(&path, Some("my-app"), digest);
+        assert!(name.starts_with("cella-img-my-app-"));
+        assert!(name.ends_with(&digest[..8]));
     }
 
     #[test]

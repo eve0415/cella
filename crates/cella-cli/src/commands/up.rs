@@ -1,14 +1,17 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use cella_config::resolve::resolve_config;
 use cella_docker::{
     BuildOptions, ContainerState, DockerClient, container_labels, container_name, image_name,
-    lifecycle, update_remote_user_uid,
+    image_name_with_features, lifecycle, update_remote_user_uid,
 };
+use cella_features::ResolvedFeatures;
 
 /// Start a dev container for the current workspace.
 #[derive(Args)]
@@ -79,7 +82,7 @@ impl UpArgs {
         if let Some(container) = existing {
             match (&container.state, self.rebuild) {
                 (ContainerState::Running, false) => {
-                    // Already running — run postAttachCommand and exit
+                    // Already running -- run postAttachCommand and exit
                     if let Some(cmd) = config.get("postAttachCommand") {
                         lifecycle::run_lifecycle_phase(
                             &client,
@@ -162,21 +165,37 @@ impl UpArgs {
                     client.remove_container(&container.id, false).await?;
                 }
                 _ => {
-                    // Other state (Created, etc.) — remove and recreate
+                    // Other state (Created, etc.) -- remove and recreate
                     let _ = client.remove_container(&container.id, false).await;
                 }
             }
         }
 
-        // 5. Ensure image
-        let img_name = ensure_image(&client, config, &resolved.workspace_root, config_name).await?;
+        // 5. Ensure image (with optional features layer)
+        let (img_name, resolved_features) = ensure_image(
+            &client,
+            config,
+            &resolved.workspace_root,
+            config_name,
+            &resolved.config_path,
+        )
+        .await?;
 
         // 6. Create container
-        let labels = container_labels(
+        let mut labels = container_labels(
             &resolved.workspace_root,
             &resolved.config_path,
             &resolved.config_hash,
         );
+
+        if let Some(ref rf) = resolved_features {
+            labels.insert(
+                "devcontainer.metadata".to_string(),
+                rf.metadata_label.clone(),
+            );
+        }
+
+        let feature_config = resolved_features.as_ref().map(|r| &r.container_config);
 
         let create_opts = cella_docker::config_map::map_config(
             config,
@@ -184,6 +203,7 @@ impl UpArgs {
             &img_name,
             labels,
             &resolved.workspace_root,
+            feature_config,
         );
 
         let container_id = client.create_container(&create_opts).await?;
@@ -220,6 +240,30 @@ impl UpArgs {
         ];
 
         for phase in lifecycle_phases {
+            // Feature lifecycle commands run first (features don't have updateContentCommand)
+            if let Some(ref rf) = resolved_features {
+                let feature_cmds = match phase {
+                    "onCreateCommand" => &rf.container_config.lifecycle.on_create,
+                    "postCreateCommand" => &rf.container_config.lifecycle.post_create,
+                    "postStartCommand" => &rf.container_config.lifecycle.post_start,
+                    "postAttachCommand" => &rf.container_config.lifecycle.post_attach,
+                    _ => &Vec::new(),
+                };
+                for cmd in feature_cmds {
+                    lifecycle::run_lifecycle_phase(
+                        &client,
+                        &container_id,
+                        phase,
+                        cmd,
+                        Some(remote_user),
+                        &create_opts.remote_env,
+                        workspace_folder,
+                    )
+                    .await?;
+                }
+            }
+
+            // Then user lifecycle commands
             if let Some(cmd) = config.get(phase) {
                 lifecycle::run_lifecycle_phase(
                     &client,
@@ -247,86 +291,159 @@ impl UpArgs {
     }
 }
 
+/// Compute a SHA-256 digest of the features config for image tagging.
+fn compute_features_digest(config: &serde_json::Value) -> String {
+    let features = config.get("features").unwrap_or(&serde_json::Value::Null);
+    let canonical = serde_json::to_string(features).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// Build the features layer image on top of a base image.
+async fn build_features_layer(
+    client: &DockerClient,
+    config: &serde_json::Value,
+    workspace_root: &std::path::Path,
+    config_name: Option<&str>,
+    resolved: &ResolvedFeatures,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let features_digest = compute_features_digest(config);
+    let features_image = image_name_with_features(workspace_root, config_name, &features_digest);
+
+    let build_opts = BuildOptions {
+        image_name: features_image.clone(),
+        context_path: resolved.build_context.clone(),
+        dockerfile: "Dockerfile.features".to_string(),
+        args: HashMap::new(),
+        target: None,
+        cache_from: vec![],
+        options: vec![],
+    };
+
+    info!(
+        "Building features layer image (context: {})",
+        resolved.build_context.display()
+    );
+    client.build_image(&build_opts).await?;
+    Ok(features_image)
+}
+
+#[allow(clippy::too_many_lines)]
 async fn ensure_image(
     client: &DockerClient,
     config: &serde_json::Value,
     workspace_root: &std::path::Path,
     config_name: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
+    config_path: &std::path::Path,
+) -> Result<(String, Option<ResolvedFeatures>), Box<dyn std::error::Error>> {
+    let has_features = config
+        .get("features")
+        .and_then(|v| v.as_object())
+        .is_some_and(|obj| !obj.is_empty());
+
+    // Determine base image tag
+    let base_image_tag = if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
+        // Pull base image if needed
         if !client.image_exists(image).await? {
             client.pull_image(image).await?;
         }
-        return Ok(image.to_string());
-    }
-
-    if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
+        image.to_string()
+    } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
+        // Build user Dockerfile
         let img_name = image_name(workspace_root, config_name);
-
-        let dockerfile = build
-            .get("dockerfile")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Dockerfile")
-            .to_string();
-
-        let context = build.get("context").and_then(|v| v.as_str()).unwrap_or(".");
-
-        let context_path = if std::path::Path::new(context).is_absolute() {
-            PathBuf::from(context)
-        } else {
-            workspace_root.join(".devcontainer").join(context)
-        };
-
-        let args: std::collections::HashMap<String, String> = build
-            .get("args")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let target = build
-            .get("target")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let cache_from: Vec<String> = build
-            .get("cacheFrom")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let options: Vec<String> = build
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let build_opts = BuildOptions {
-            image_name: img_name.clone(),
-            context_path,
-            dockerfile,
-            args,
-            target,
-            cache_from,
-            options,
-        };
-
+        let build_opts = parse_build_options(build, &img_name, workspace_root);
         client.build_image(&build_opts).await?;
-        return Ok(img_name);
+        img_name
+    } else {
+        return Err("devcontainer.json must specify either 'image' or 'build'".into());
+    };
+
+    // If no features, return the base image directly
+    if !has_features {
+        return Ok((base_image_tag, None));
     }
 
-    Err("devcontainer.json must specify either 'image' or 'build'".into())
+    // Resolve features
+    info!("Resolving devcontainer features...");
+    let platform = cella_features::oci::detect_platform(client.inner())
+        .await
+        .map_err(|e| format!("platform detection failed: {e}"))?;
+    let cache = cella_features::FeatureCache::new();
+
+    let resolved = cella_features::resolve_features(config, config_path, &platform, &cache)
+        .await
+        .map_err(|e| format!("feature resolution failed: {e}"))?;
+
+    // Build the features layer image
+    let features_image =
+        build_features_layer(client, config, workspace_root, config_name, &resolved).await?;
+
+    Ok((features_image, Some(resolved)))
+}
+
+/// Parse build configuration from the `build` object in devcontainer.json.
+fn parse_build_options(
+    build: &serde_json::Map<String, serde_json::Value>,
+    img_name: &str,
+    workspace_root: &std::path::Path,
+) -> BuildOptions {
+    let dockerfile = build
+        .get("dockerfile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Dockerfile")
+        .to_string();
+
+    let context = build.get("context").and_then(|v| v.as_str()).unwrap_or(".");
+
+    let context_path = if std::path::Path::new(context).is_absolute() {
+        PathBuf::from(context)
+    } else {
+        workspace_root.join(".devcontainer").join(context)
+    };
+
+    let args: HashMap<String, String> = build
+        .get("args")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let target = build
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let cache_from: Vec<String> = build
+        .get("cacheFrom")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let options: Vec<String> = build
+        .get("options")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    BuildOptions {
+        image_name: img_name.to_string(),
+        context_path,
+        dockerfile,
+        args,
+        target,
+        cache_from,
+        options,
+    }
 }
 
 fn run_host_command(

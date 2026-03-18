@@ -1,0 +1,23 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: result
+---
+ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
+ARG _DEV_CONTAINERS_IMAGE_USER=vscode
+ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
+
+FROM ubuntu:22.04 AS dev_containers_target_stage
+
+USER developer
+
+# Feature: custom-tool (ghcr.io/example/custom-tool:1)
+COPY --chown=root:root custom-tool/ /tmp/dev-container-features/custom-tool/
+RUN chmod +x /tmp/dev-container-features/custom-tool/install.sh \
+    && cd /tmp/dev-container-features/custom-tool \
+    && ./install.sh
+
+# Cleanup
+RUN rm -rf /tmp/dev-container-features
+
+# Reset user
+USER vscode

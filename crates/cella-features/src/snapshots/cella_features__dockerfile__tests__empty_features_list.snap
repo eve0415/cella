@@ -1,0 +1,9 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: result
+---
+ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
+ARG _DEV_CONTAINERS_IMAGE_USER=vscode
+ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
+
+FROM ubuntu:22.04 AS dev_containers_target_stage
