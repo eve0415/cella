@@ -26,12 +26,20 @@ const CONTAINER_SSH_SOCK: &str = "/tmp/cella-ssh-agent.sock";
 /// - `SSH_AUTH_SOCK` is unset or empty
 /// - The user has already configured `SSH_AUTH_SOCK` in `containerEnv`/`remoteEnv`
 /// - The user has a mount targeting the SSH socket path
+/// - The runtime uses tunnel-based forwarding (`OrbStack`, Colima, Unknown)
 pub fn ssh_agent_forwarding(
     runtime: &DockerRuntime,
     config: &serde_json::Value,
 ) -> Option<SshAgentForwarding> {
     if has_user_ssh_override(config) {
         tracing::debug!("User has SSH_AUTH_SOCK override in config, skipping auto-forward");
+        return None;
+    }
+
+    // Tunnel runtimes handle SSH forwarding via the tunnel daemon.
+    // No mount config produced here — env vars are set in prepare_env_forwarding.
+    if needs_tunnel(runtime) {
+        tracing::debug!("Runtime {runtime:?} uses tunnel for SSH forwarding");
         return None;
     }
 
@@ -67,6 +75,14 @@ pub fn ssh_agent_forwarding(
             env_value: CONTAINER_SSH_SOCK.to_string(),
         })
     }
+}
+
+/// Check if this runtime needs tunnel-based forwarding.
+pub const fn needs_tunnel(runtime: &DockerRuntime) -> bool {
+    matches!(
+        runtime,
+        DockerRuntime::OrbStack | DockerRuntime::Colima | DockerRuntime::Unknown
+    )
 }
 
 /// Check if the user has already configured SSH agent forwarding in their config.

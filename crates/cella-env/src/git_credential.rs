@@ -73,6 +73,20 @@ pub fn credential_proxy_pid_path() -> Option<PathBuf> {
     cella_data_dir().map(|d| d.join("credential-proxy.pid"))
 }
 
+/// Generate git config commands for tunnel-based credential forwarding.
+///
+/// Uses the `cella-tunnel-server` binary as the credential helper
+/// instead of a shell script, since there is no bind-mounted socket on tunnel runtimes.
+pub fn tunnel_credential_helper_commands() -> Vec<Vec<String>> {
+    vec![vec![
+        "git".to_string(),
+        "config".to_string(),
+        "--global".to_string(),
+        "credential.helper".to_string(),
+        "/usr/local/bin/cella-tunnel-server credential-helper".to_string(),
+    ]]
+}
+
 /// Get the cella data directory (`~/.cella/`).
 pub fn cella_data_dir() -> Option<PathBuf> {
     std::env::var("HOME")

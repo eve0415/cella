@@ -54,6 +54,8 @@ pub struct EnvForwarding {
     pub env: Vec<ForwardEnv>,
     /// Post-start injection (after container start + UID remap).
     pub post_start: PostStartInjection,
+    /// Whether the container needs tunnel-based forwarding (`OrbStack`, Colima, Unknown).
+    pub needs_tunnel: bool,
 }
 
 /// Post-start injection commands and files.
@@ -128,7 +130,35 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
     }
 
     // Credential proxy forwarding
-    if let Some(cred) = git_credential::credential_forwarding() {
+    if ssh_agent::needs_tunnel(&runtime) {
+        // Tunnel runtimes: SSH and credential forwarding handled by the tunnel daemon.
+        // Sockets are created inside the container by cella-tunnel-server.
+        tracing::info!("Using tunnel-based forwarding for SSH and credentials");
+        fwd.needs_tunnel = true;
+
+        // Set SSH_AUTH_SOCK to tunnel-server's socket path (no mount needed)
+        if std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .is_some_and(|s| !s.is_empty())
+        {
+            fwd.env.push(ForwardEnv {
+                key: "SSH_AUTH_SOCK".to_string(),
+                value: "/tmp/cella-ssh-agent.sock".to_string(),
+            });
+        }
+
+        // Set credential socket env var (no mount needed)
+        fwd.env.push(ForwardEnv {
+            key: "CELLA_CREDENTIAL_SOCKET".to_string(),
+            value: "/tmp/cella-credential-proxy.sock".to_string(),
+        });
+
+        // Configure git to use the tunnel-server binary as credential helper
+        fwd.post_start
+            .git_config_commands
+            .extend(git_credential::tunnel_credential_helper_commands());
+    } else if let Some(cred) = git_credential::credential_forwarding() {
+        // Bind-mount runtimes: mount the credential proxy socket directly.
         tracing::info!(
             "Credential proxy forwarding: {} -> {}",
             cred.mount_source,

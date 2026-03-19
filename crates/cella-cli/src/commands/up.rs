@@ -12,6 +12,8 @@ use cella_docker::{
 };
 use cella_env::git_credential::{credential_proxy_pid_path, credential_proxy_socket_path};
 
+use super::tunnel::{tunnel_pid_path, tunnel_socket_path};
+
 use super::image::ensure_image;
 
 /// Start a dev container for the current workspace.
@@ -475,6 +477,11 @@ impl UpArgs {
         )
         .await;
 
+        // 9.5.1. Start tunnel if needed (OrbStack, Colima, Unknown runtimes)
+        if env_fwd.needs_tunnel {
+            setup_tunnel(&client, &container_id, is_text).await;
+        }
+
         // 9.6. Probe and cache user environment (userEnvProbe)
         let probe_type = config
             .get("userEnvProbe")
@@ -842,6 +849,119 @@ async fn run_lifecycle_entries(
         .await?;
     }
     Ok(())
+}
+
+/// Set up tunnel forwarding for a container.
+///
+/// Ensures the tunnel daemon is running, uploads the tunnel-server binary,
+/// and registers the container with the daemon.
+/// Never fails — logs warnings and skips on error.
+async fn setup_tunnel(client: &DockerClient, container_id: &str, is_text: bool) {
+    if is_text {
+        eprint!("Setting up tunnel forwarding...");
+    }
+    let start = std::time::Instant::now();
+
+    // 1. Ensure tunnel daemon is running
+    ensure_tunnel_daemon();
+
+    // 2. Upload tunnel-server binary to container
+    if let Err(e) = upload_tunnel_server(client, container_id).await {
+        warn!("Failed to upload tunnel server: {e}");
+        if is_text {
+            eprintln!(" (skipped)");
+        }
+        return;
+    }
+
+    // 3. Register container with tunnel daemon
+    if let Some(socket_path) = tunnel_socket_path() {
+        match cella_tunnel::client::connect_container(&socket_path, container_id) {
+            Ok(response) if response.trim() == "ok" => {
+                info!("Tunnel registered for container {container_id}");
+            }
+            Ok(response) => {
+                warn!("Tunnel registration response: {}", response.trim());
+            }
+            Err(e) => {
+                warn!("Failed to register tunnel: {e}");
+            }
+        }
+    }
+
+    if is_text {
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= 100 {
+            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
+        } else {
+            eprintln!();
+        }
+    }
+}
+
+/// Upload the cella-tunnel-server binary into the container.
+async fn upload_tunnel_server(
+    client: &DockerClient,
+    container_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Detect container architecture
+    let arch_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["uname".to_string(), "-m".to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await?;
+
+    let arch = arch_result.stdout.trim().to_string();
+
+    // Select the embedded binary for this arch
+    let binary = match arch.as_str() {
+        "x86_64" | "amd64" => crate::tunnel_binaries::TUNNEL_SERVER_X86_64,
+        "aarch64" | "arm64" => crate::tunnel_binaries::TUNNEL_SERVER_AARCH64,
+        other => {
+            warn!("Unsupported arch {other} for tunnel server");
+            return Ok(());
+        }
+    };
+
+    if binary.is_empty() {
+        warn!(
+            "Tunnel server binary not embedded (dev build), SSH/credential forwarding via tunnel unavailable"
+        );
+        return Ok(());
+    }
+
+    client
+        .upload_files(
+            container_id,
+            &[FileToUpload {
+                path: "/usr/local/bin/cella-tunnel-server".to_string(),
+                content: binary.to_vec(),
+                mode: 0o755,
+            }],
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Ensure the tunnel daemon is running.
+fn ensure_tunnel_daemon() {
+    let Some(socket_path) = tunnel_socket_path() else {
+        return;
+    };
+    let Some(pid_path) = tunnel_pid_path() else {
+        return;
+    };
+
+    if let Err(e) = cella_tunnel::daemon::ensure_daemon_running(&socket_path, &pid_path) {
+        warn!("Failed to start tunnel daemon: {e}");
+    }
 }
 
 /// Ensure the credential proxy daemon is running.

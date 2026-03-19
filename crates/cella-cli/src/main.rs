@@ -1,4 +1,5 @@
 mod commands;
+mod tunnel_binaries;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

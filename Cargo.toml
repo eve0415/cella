@@ -11,6 +11,8 @@ members = [
     "crates/cella-port",
     "crates/cella-agent",
     "crates/cella-features",
+    "crates/cella-tunnel",
+    "crates/cella-tunnel-server",
 ]
 
 [workspace.package]
@@ -75,6 +77,7 @@ cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
 cella-port = { path = "crates/cella-port" }
+cella-tunnel = { path = "crates/cella-tunnel" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
