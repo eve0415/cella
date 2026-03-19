@@ -4,6 +4,7 @@ mod config;
 mod credential_proxy;
 mod doctor;
 mod down;
+mod env_cache;
 mod exec;
 pub mod image;
 mod init;

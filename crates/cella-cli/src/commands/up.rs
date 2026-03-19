@@ -63,9 +63,12 @@ impl UpArgs {
         };
 
         let remove_container = self.rebuild || self.remove_existing_container;
+        let is_text = matches!(&self.output, OutputFormat::Text);
 
         // 1. Resolve config
-        info!("Resolving devcontainer config...");
+        if is_text {
+            eprintln!("Resolving devcontainer configuration...");
+        }
         let resolved = resolve_config(&cwd, self.file.as_deref())?;
 
         for w in &resolved.warnings {
@@ -74,10 +77,6 @@ impl UpArgs {
 
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
-        let remote_user = config
-            .get("remoteUser")
-            .and_then(|v| v.as_str())
-            .unwrap_or("root");
 
         // 2. Connect to Docker
         let client = match &self.docker_host {
@@ -94,11 +93,19 @@ impl UpArgs {
         let workspace_folder = config.get("workspaceFolder").and_then(|v| v.as_str());
 
         if let Some(container) = existing {
+            // Resolve remote_user for existing container: label > container config > "root"
+            let remote_user = container
+                .labels
+                .get("dev.cella.remote_user")
+                .cloned()
+                .or_else(|| container.container_user.clone())
+                .unwrap_or_else(|| "root".to_string());
+
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
                     // Re-inject env forwarding (git config + SSH files may have changed)
-                    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
-                    inject_post_start(&client, &container.id, &env_fwd.post_start, remote_user)
+                    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+                    inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
                         .await;
 
                     // Already running -- run postAttachCommand and exit
@@ -108,7 +115,7 @@ impl UpArgs {
                             &container.id,
                             "postAttachCommand",
                             cmd,
-                            Some(remote_user),
+                            Some(remote_user.as_str()),
                             &remote_env,
                             workspace_folder,
                         )
@@ -119,7 +126,7 @@ impl UpArgs {
                         &self.output,
                         "existing",
                         &container.id,
-                        remote_user,
+                        &remote_user,
                         workspace_folder.unwrap_or("/workspaces"),
                     );
                     return Ok(());
@@ -146,8 +153,8 @@ impl UpArgs {
                     verify_container_running(&client, &container.id).await?;
 
                     // Re-inject env forwarding on restart
-                    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
-                    inject_post_start(&client, &container.id, &env_fwd.post_start, remote_user)
+                    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+                    inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
                         .await;
 
                     if let Some(cmd) = config.get("postStartCommand") {
@@ -156,7 +163,7 @@ impl UpArgs {
                             &container.id,
                             "postStartCommand",
                             cmd,
-                            Some(remote_user),
+                            Some(remote_user.as_str()),
                             &remote_env,
                             workspace_folder,
                         )
@@ -169,7 +176,7 @@ impl UpArgs {
                             &container.id,
                             "postAttachCommand",
                             cmd,
-                            Some(remote_user),
+                            Some(remote_user.as_str()),
                             &remote_env,
                             workspace_folder,
                         )
@@ -180,7 +187,7 @@ impl UpArgs {
                         &self.output,
                         "started",
                         &container.id,
-                        remote_user,
+                        &remote_user,
                         workspace_folder.unwrap_or("/workspaces"),
                     );
                     return Ok(());
@@ -205,6 +212,9 @@ impl UpArgs {
         }
 
         // 5. Ensure image (with optional features layer)
+        if is_text {
+            eprintln!("Building image...");
+        }
         let (img_name, resolved_features) = ensure_image(
             &client,
             config,
@@ -218,8 +228,17 @@ impl UpArgs {
         // 6. Inspect image env for merging with user containerEnv
         let image_env = client.inspect_image_env(&img_name).await?;
 
+        // 6.1. Resolve remote_user: remoteUser > containerUser > image USER
+        let remote_user = if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
+            u.to_string()
+        } else if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
+            u.to_string()
+        } else {
+            client.inspect_image_user(&img_name).await?
+        };
+
         // 6.5. Prepare environment forwarding (SSH agent, git config, credential proxy)
-        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
 
         // 6.6. Ensure credential proxy daemon is running (if host has git credentials)
         ensure_credential_proxy();
@@ -232,7 +251,7 @@ impl UpArgs {
         );
 
         // Store exec metadata labels for fast exec/shell without config re-resolution
-        labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
+        labels.insert("dev.cella.remote_user".to_string(), remote_user.clone());
         labels.insert(
             "dev.cella.workspace_folder".to_string(),
             workspace_folder.unwrap_or("/workspaces").to_string(),
@@ -289,9 +308,15 @@ impl UpArgs {
             create_opts.env.extend(fwd_env);
         }
 
+        if is_text {
+            eprintln!("Creating container...");
+        }
         let container_id = client.create_container(&create_opts).await?;
 
         // 8. Start container
+        if is_text {
+            eprintln!("Starting container...");
+        }
         client.start_container(&container_id).await?;
         verify_container_running(&client, &container_id).await?;
 
@@ -306,7 +331,7 @@ impl UpArgs {
             && let Err(e) = update_remote_user_uid(
                 &client,
                 &container_id,
-                remote_user,
+                &remote_user,
                 &resolved.workspace_root,
             )
             .await
@@ -315,7 +340,28 @@ impl UpArgs {
         }
 
         // 9.5. Inject post-start environment forwarding (SSH files, git config, credential helper)
-        inject_post_start(&client, &container_id, &env_fwd.post_start, remote_user).await;
+        if is_text {
+            eprintln!("Configuring environment...");
+        }
+        inject_post_start(&client, &container_id, &env_fwd.post_start, &remote_user).await;
+
+        // 9.6. Probe and cache user environment (userEnvProbe)
+        let probe_type = config
+            .get("userEnvProbe")
+            .and_then(|v| v.as_str())
+            .unwrap_or("loginInteractiveShell");
+
+        if is_text {
+            eprintln!("Running userEnvProbe...");
+        }
+
+        super::env_cache::probe_and_cache_user_env(
+            &client,
+            &container_id,
+            &remote_user,
+            probe_type,
+        )
+        .await;
 
         // 10-14. Lifecycle commands (first create)
         let lifecycle_phases = [
@@ -342,7 +388,7 @@ impl UpArgs {
                         &container_id,
                         phase,
                         cmd,
-                        Some(remote_user),
+                        Some(remote_user.as_str()),
                         &create_opts.remote_env,
                         workspace_folder,
                     )
@@ -357,7 +403,7 @@ impl UpArgs {
                     &container_id,
                     phase,
                     cmd,
-                    Some(remote_user),
+                    Some(remote_user.as_str()),
                     &create_opts.remote_env,
                     workspace_folder,
                 )
@@ -370,7 +416,7 @@ impl UpArgs {
             &self.output,
             "created",
             &container_id,
-            remote_user,
+            &remote_user,
             workspace_folder.unwrap_or("/workspaces"),
         );
 

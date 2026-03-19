@@ -50,9 +50,16 @@ impl ShellArgs {
             .labels
             .get("dev.cella.remote_user")
             .cloned()
+            .or_else(|| container.container_user.clone())
             .unwrap_or_else(|| "root".to_string());
 
         let working_dir = container.labels.get("dev.cella.workspace_folder").cloned();
+
+        let label_env: Vec<String> = container
+            .labels
+            .get("dev.cella.remote_env")
+            .and_then(|v| serde_json::from_str(v).ok())
+            .unwrap_or_default();
 
         // Detect shell
         let shell = if let Some(s) = self.shell {
@@ -63,8 +70,15 @@ impl ShellArgs {
 
         debug!("Using shell: {shell}");
 
-        // Forward terminal environment variables
-        let mut env = Vec::new();
+        // Build environment: probed env (merged with label env) + terminal env
+        let base_env = if let Some(probed) =
+            super::env_cache::read_probed_env_cache(&client, &container.id, &user).await
+        {
+            cella_env::user_env_probe::merge_env(&probed, &label_env)
+        } else {
+            label_env
+        };
+        let mut env = base_env;
         for var in TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 env.push(format!("{var}={val}"));

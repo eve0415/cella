@@ -65,6 +65,8 @@ pub struct ContainerInfo {
     pub config_hash: Option<String>,
     pub ports: Vec<PortBinding>,
     pub created_at: Option<String>,
+    /// The USER from the container's config (only populated via inspect, not list).
+    pub container_user: Option<String>,
 }
 
 impl DockerClient {
@@ -134,6 +136,7 @@ impl DockerClient {
                 config_hash,
                 ports,
                 created_at,
+                container_user: None,
             }))
         } else {
             Ok(None)
@@ -262,6 +265,13 @@ impl DockerClient {
             })
             .unwrap_or_default();
 
+        let container_user = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.user.as_deref())
+            .filter(|u| !u.is_empty())
+            .map(String::from);
+
         Ok(ContainerInfo {
             id: inspect.id.unwrap_or_default(),
             name,
@@ -271,6 +281,7 @@ impl DockerClient {
             config_hash,
             ports,
             created_at: inspect.created,
+            container_user,
         })
     }
 
@@ -340,6 +351,7 @@ impl DockerClient {
                 config_hash,
                 ports,
                 created_at,
+                container_user: None,
             });
         }
 

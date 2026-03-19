@@ -78,17 +78,25 @@ impl ExecArgs {
             warn!("No exec metadata labels found on container. Run `cella up` to set them.");
         }
 
-        // Determine user: --user > label > "root"
+        // Determine user: --user > label > container config > "root"
         let user = self
             .user
             .or(label_user)
+            .or_else(|| container.container_user.clone())
             .unwrap_or_else(|| "root".to_string());
 
         // Determine workdir: --workdir > label
         let working_dir = self.workdir.or(label_workdir);
 
-        // Build environment: label env + --remote-env + terminal env forwarding
-        let mut env = label_env;
+        // Build environment: probed env (merged with label env) + --remote-env + terminal env
+        let base_env = if let Some(probed) =
+            super::env_cache::read_probed_env_cache(&client, &container.id, &user).await
+        {
+            cella_env::user_env_probe::merge_env(&probed, &label_env)
+        } else {
+            label_env
+        };
+        let mut env = base_env;
         env.extend(self.remote_env);
 
         // Forward terminal environment variables
