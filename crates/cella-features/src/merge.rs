@@ -107,6 +107,22 @@ pub fn merge_with_devcontainer(
         for m in user_mounts {
             if let Some(s) = m.as_str() {
                 mounts.push(s.to_string());
+            } else if let Some(mount_obj) = m.as_object() {
+                let mt = mount_obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("bind");
+                let src = mount_obj
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tgt = mount_obj
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !tgt.is_empty() {
+                    mounts.push(format!("type={mt},source={src},target={tgt}"));
+                }
             }
         }
     }
@@ -1081,6 +1097,43 @@ mod tests {
     // =================================================================
     // deep_merge unit tests
     // =================================================================
+
+    #[test]
+    fn object_format_mounts_merged_from_devcontainer() {
+        let feature_config = FeatureContainerConfig {
+            mounts: vec!["type=volume,src=feat-vol,dst=/feat".to_string()],
+            ..Default::default()
+        };
+        let devcontainer = json!({
+            "mounts": [
+                "type=bind,src=/host-str,dst=/str-mount",
+                {"type": "bind", "source": "/host-obj", "target": "/obj-mount"},
+            ]
+        });
+
+        let merged = merge_with_devcontainer(&feature_config, &devcontainer);
+
+        assert_eq!(merged.mounts.len(), 3);
+        assert_eq!(merged.mounts[0], "type=volume,src=feat-vol,dst=/feat");
+        assert_eq!(merged.mounts[1], "type=bind,src=/host-str,dst=/str-mount");
+        assert_eq!(
+            merged.mounts[2],
+            "type=bind,source=/host-obj,target=/obj-mount"
+        );
+    }
+
+    #[test]
+    fn object_format_mount_without_target_skipped() {
+        let feature_config = FeatureContainerConfig::default();
+        let devcontainer = json!({
+            "mounts": [
+                {"type": "bind", "source": "/src"},
+            ]
+        });
+
+        let merged = merge_with_devcontainer(&feature_config, &devcontainer);
+        assert!(merged.mounts.is_empty());
+    }
 
     #[test]
     fn deep_merge_nested_objects() {

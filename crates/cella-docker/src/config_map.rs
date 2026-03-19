@@ -1,6 +1,6 @@
 //! Map devcontainer.json config to Docker API types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use bollard::container::Config;
@@ -60,6 +60,12 @@ impl CreateContainerOptions {
         for m in &self.mounts {
             mounts.push(to_bollard_mount(m));
         }
+
+        // Deduplicate by target path — last occurrence wins (matches devcontainer CLI)
+        let mut seen = HashSet::new();
+        mounts.reverse();
+        mounts.retain(|m| m.target.as_ref().is_none_or(|t| seen.insert(t.clone())));
+        mounts.reverse();
 
         let host_config = HostConfig {
             mounts: if mounts.is_empty() {
@@ -141,7 +147,7 @@ pub fn map_config(
 
     let workspace_mount = map_workspace_mount(config, workspace_root, &workspace_folder);
 
-    // Mounts: feature mounts first, then user mounts
+    // Mounts: from feature config (already includes user mounts via merge) or directly from config
     let mut mounts = Vec::new();
     if let Some(fc) = feature_config {
         for mount_str in &fc.mounts {
@@ -149,8 +155,9 @@ pub fn map_config(
                 mounts.push(mc);
             }
         }
+    } else {
+        mounts.extend(map_additional_mounts(config));
     }
-    mounts.extend(map_additional_mounts(config));
 
     // Environment: feature env first, user env overrides (Docker takes last value)
     let mut env = Vec::new();
@@ -621,7 +628,11 @@ mod tests {
         });
 
         let feature_config = FeatureContainerConfig {
-            mounts: vec!["source=/feat-src,target=/feat-dst".to_string()],
+            // In production, merge_with_devcontainer has already folded user mounts in
+            mounts: vec![
+                "source=/feat-src,target=/feat-dst".to_string(),
+                "type=bind,source=/user-src,target=/user-dst".to_string(),
+            ],
             cap_add: vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()],
             security_opt: vec!["apparmor=unconfined".to_string()],
             privileged: true,
@@ -697,5 +708,123 @@ mod tests {
             opts.cmd,
             Some(vec!["while sleep 1000; do :; done".to_string()])
         );
+    }
+
+    #[test]
+    fn feature_mounts_not_double_counted() {
+        let config = json!({
+            "image": "ubuntu",
+            "mounts": ["source=/host,target=/container"],
+        });
+
+        // Simulate merge_with_devcontainer output: feature_config already has user mounts
+        let feature_config = FeatureContainerConfig {
+            mounts: vec![
+                "source=/feat,target=/feat-dst".to_string(),
+                "source=/host,target=/container".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let opts = map_config(
+            &config,
+            "test",
+            "ubuntu",
+            HashMap::new(),
+            Path::new("/tmp/test"),
+            Some(&feature_config),
+        );
+
+        // Each mount target appears exactly once
+        assert_eq!(opts.mounts.len(), 2);
+        assert_eq!(opts.mounts[0].target, "/feat-dst");
+        assert_eq!(opts.mounts[1].target, "/container");
+    }
+
+    #[test]
+    fn mount_dedup_last_occurrence_wins() {
+        let opts = CreateContainerOptions {
+            name: "test".to_string(),
+            image: "ubuntu".to_string(),
+            labels: HashMap::new(),
+            env: Vec::new(),
+            remote_env: Vec::new(),
+            user: None,
+            workspace_folder: "/workspace".to_string(),
+            workspace_mount: None,
+            mounts: vec![
+                MountConfig {
+                    mount_type: "bind".to_string(),
+                    source: "/first".to_string(),
+                    target: "/shared-target".to_string(),
+                    consistency: None,
+                },
+                MountConfig {
+                    mount_type: "bind".to_string(),
+                    source: "/second".to_string(),
+                    target: "/shared-target".to_string(),
+                    consistency: None,
+                },
+            ],
+            port_bindings: HashMap::new(),
+            entrypoint: None,
+            cmd: None,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            privileged: false,
+        };
+
+        let bollard_config = opts.to_bollard_config();
+        let mounts = bollard_config
+            .host_config
+            .unwrap()
+            .mounts
+            .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source.as_deref(), Some("/second"));
+        assert_eq!(mounts[0].target.as_deref(), Some("/shared-target"));
+    }
+
+    #[test]
+    fn workspace_mount_participates_in_dedup() {
+        let opts = CreateContainerOptions {
+            name: "test".to_string(),
+            image: "ubuntu".to_string(),
+            labels: HashMap::new(),
+            env: Vec::new(),
+            remote_env: Vec::new(),
+            user: None,
+            workspace_folder: "/workspace".to_string(),
+            workspace_mount: Some(MountConfig {
+                mount_type: "bind".to_string(),
+                source: "/ws-source".to_string(),
+                target: "/workspace".to_string(),
+                consistency: Some("cached".to_string()),
+            }),
+            mounts: vec![MountConfig {
+                mount_type: "bind".to_string(),
+                source: "/override-source".to_string(),
+                target: "/workspace".to_string(),
+                consistency: None,
+            }],
+            port_bindings: HashMap::new(),
+            entrypoint: None,
+            cmd: None,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            privileged: false,
+        };
+
+        let bollard_config = opts.to_bollard_config();
+        let mounts = bollard_config
+            .host_config
+            .unwrap()
+            .mounts
+            .unwrap();
+
+        // Last occurrence wins — user mount overrides workspace mount
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source.as_deref(), Some("/override-source"));
     }
 }
