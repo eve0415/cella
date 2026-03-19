@@ -51,6 +51,20 @@ pub fn generate_dockerfile(
             current_user = target_user;
         }
 
+        // Emit ENV instructions for feature containerEnv (before COPY+RUN so
+        // install scripts and subsequent layers see the values, and ${VAR}
+        // expansion works correctly during the Docker build).
+        if !feature.metadata.container_env.is_empty() {
+            let mut keys: Vec<&String> = feature.metadata.container_env.keys().collect();
+            keys.sort();
+            writeln!(out).unwrap();
+            for key in keys {
+                let value = &feature.metadata.container_env[key];
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                writeln!(out, "ENV {key}=\"{escaped}\"").unwrap();
+            }
+        }
+
         writeln!(out).unwrap();
         writeln!(
             out,
@@ -617,6 +631,34 @@ mod tests {
         // Dockerfile should still have COPY for init script
         let dockerfile = generate_dockerfile("ubuntu:22.04", "root", &features);
         insta::assert_snapshot!("dockerfile_with_metadata_only_entrypoint", dockerfile);
+    }
+
+    // ---------------------------------------------------------------
+    // Feature with containerEnv emits ENV instructions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn feature_with_container_env() {
+        let features = vec![make_feature(
+            "node",
+            "ghcr.io/devcontainers/features/node:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "node".to_string(),
+                container_env: HashMap::from([
+                    ("NVM_DIR".to_string(), "/usr/local/share/nvm".to_string()),
+                    (
+                        "PATH".to_string(),
+                        "/usr/local/share/nvm/current/bin:${PATH}".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        )];
+
+        let result = generate_dockerfile("ubuntu:22.04", "root", &features);
+        insta::assert_snapshot!(result);
     }
 
     // ---------------------------------------------------------------

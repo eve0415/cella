@@ -138,6 +138,7 @@ pub fn map_config(
     labels: HashMap<String, String>,
     workspace_root: &Path,
     feature_config: Option<&FeatureContainerConfig>,
+    image_env: &[String],
 ) -> CreateContainerOptions {
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
@@ -163,14 +164,19 @@ pub fn map_config(
         mounts.extend(map_additional_mounts(config));
     }
 
-    // Environment: feature env first, user env overrides (Docker takes last value)
-    let mut env = Vec::new();
-    if let Some(fc) = feature_config {
-        for (k, v) in &fc.container_env {
-            env.push(format!("{k}={v}"));
-        }
-    }
-    env.extend(map_container_env(config));
+    // Build container env: image env as base, user containerEnv overlays.
+    // Feature containerEnv is NOT included here — it's baked into the image
+    // via Dockerfile ENV instructions (see cella-features/src/dockerfile.rs).
+    let user_env = map_container_env(config);
+    let env = if user_env.is_empty() {
+        // No user overrides — image env preserved via None in to_bollard_config()
+        Vec::new()
+    } else {
+        // Merge: image env first, user env last (Docker API replaces by key)
+        let mut merged = image_env.to_vec();
+        merged.extend(user_env);
+        merged
+    };
 
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
@@ -438,6 +444,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/my-project"),
             None,
+            &[],
         );
 
         assert_eq!(opts.image, "ubuntu");
@@ -458,6 +465,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/my-project"),
             None,
+            &[],
         );
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
@@ -477,6 +485,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
 
         assert!(opts.env.contains(&"FOO=bar".to_string()));
@@ -493,6 +502,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
         assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
         let cmd = opts.cmd.unwrap();
@@ -511,6 +521,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
         assert!(opts.entrypoint.is_none());
         assert!(opts.cmd.is_none());
@@ -553,6 +564,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
         assert!(opts.port_bindings.contains_key("3000/tcp"));
         assert!(opts.port_bindings.contains_key("8080/tcp"));
@@ -573,6 +585,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
         assert!(opts.port_bindings.contains_key("3000/udp"));
     }
@@ -591,6 +604,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
         assert_eq!(opts.mounts.len(), 1);
         assert_eq!(opts.mounts[0].target, "/b");
@@ -606,6 +620,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/my-project"),
             None,
+            &[],
         );
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
@@ -625,6 +640,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             None,
+            &[],
         );
     }
 
@@ -664,6 +680,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             Some(&feature_config),
+            &[],
         );
 
         // Feature mounts come first, then user mounts
@@ -693,22 +710,11 @@ mod tests {
         // privileged OR'd — feature is true
         assert!(opts.privileged);
 
-        // Env: feature vars come first, user vars override same keys
-        // Docker takes last value, so SHARED should be overridden by user
-        assert!(opts.env.contains(&"FEAT_VAR=feat_val".to_string()));
+        // Feature containerEnv is NOT in runtime env (baked into image via Dockerfile ENV)
+        assert!(!opts.env.iter().any(|e| e.starts_with("FEAT_VAR=")));
+        // User containerEnv IS present (merged with image env)
         assert!(opts.env.contains(&"USER_VAR=user_val".to_string()));
-        // Both SHARED entries present — Docker uses last occurrence (user wins)
-        let shared_entries: Vec<&String> = opts
-            .env
-            .iter()
-            .filter(|e| e.starts_with("SHARED="))
-            .collect();
-        assert_eq!(shared_entries.len(), 2);
-        // Feature value first, user value last
-        assert_eq!(
-            *shared_entries.last().unwrap(),
-            &"SHARED=from_user".to_string()
-        );
+        assert!(opts.env.contains(&"SHARED=from_user".to_string()));
 
         // Entrypoint should be /bin/sh; feature entrypoints embedded in CMD script
         assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
@@ -742,6 +748,7 @@ mod tests {
             HashMap::new(),
             Path::new("/tmp/test"),
             Some(&feature_config),
+            &[],
         );
 
         // Each mount target appears exactly once
@@ -827,5 +834,59 @@ mod tests {
         // Last occurrence wins — user mount overrides workspace mount
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].source.as_deref(), Some("/override-source"));
+    }
+
+    #[test]
+    fn feature_container_env_not_in_runtime_env() {
+        let config = json!({"image": "ubuntu"});
+        let feature_config = FeatureContainerConfig {
+            container_env: HashMap::from([
+                ("NVM_DIR".to_string(), "/usr/local/share/nvm".to_string()),
+                (
+                    "PATH".to_string(),
+                    "/usr/local/share/nvm/current/bin:${PATH}".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let opts = map_config(
+            &config,
+            "test",
+            "ubuntu",
+            HashMap::new(),
+            Path::new("/tmp/test"),
+            Some(&feature_config),
+            &[],
+        );
+
+        // Feature containerEnv must NOT appear in runtime env
+        assert!(opts.env.is_empty());
+    }
+
+    #[test]
+    fn user_container_env_merged_with_image_env() {
+        let config = json!({
+            "image": "ubuntu",
+            "containerEnv": {"FOO": "bar"},
+        });
+
+        let image_env = vec!["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()];
+
+        let opts = map_config(
+            &config,
+            "test",
+            "ubuntu",
+            HashMap::new(),
+            Path::new("/tmp/test"),
+            None,
+            &image_env,
+        );
+
+        // Image env preserved as base, user env appended
+        assert!(opts.env.contains(&"PATH=/usr/bin:/bin".to_string()));
+        assert!(opts.env.contains(&"HOME=/root".to_string()));
+        assert!(opts.env.contains(&"FOO=bar".to_string()));
+        assert_eq!(opts.env.len(), 3);
     }
 }

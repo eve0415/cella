@@ -203,7 +203,10 @@ impl UpArgs {
         )
         .await?;
 
-        // 6. Create container
+        // 6. Inspect image env for merging with user containerEnv
+        let image_env = client.inspect_image_env(&img_name).await?;
+
+        // 7. Create container
         let mut labels = container_labels(
             &resolved.workspace_root,
             &resolved.config_path,
@@ -226,15 +229,16 @@ impl UpArgs {
             labels,
             &resolved.workspace_root,
             feature_config,
+            &image_env,
         );
 
         let container_id = client.create_container(&create_opts).await?;
 
-        // 7. Start container
+        // 8. Start container
         client.start_container(&container_id).await?;
         verify_container_running(&client, &container_id).await?;
 
-        // 8. updateRemoteUserUID
+        // 9. updateRemoteUserUID
         let update_uid = config
             .get("updateRemoteUserUID")
             .and_then(serde_json::Value::as_bool)
@@ -253,7 +257,7 @@ impl UpArgs {
             warn!("Failed to update remote user UID: {e}");
         }
 
-        // 9-13. Lifecycle commands (first create)
+        // 10-14. Lifecycle commands (first create)
         let lifecycle_phases = [
             "onCreateCommand",
             "updateContentCommand",
@@ -301,7 +305,7 @@ impl UpArgs {
             }
         }
 
-        // 14. Output
+        // 15. Output
         output_result(
             &self.output,
             "created",

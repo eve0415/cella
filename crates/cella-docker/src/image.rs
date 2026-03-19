@@ -193,6 +193,26 @@ impl DockerClient {
         }
     }
 
+    /// Inspect an image and return its configured environment variables.
+    ///
+    /// Returns `Vec<String>` of `KEY=value` entries from the image config.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors,
+    /// `CellaDockerError::ImageNotFound` if the image does not exist.
+    pub async fn inspect_image_env(&self, image: &str) -> Result<Vec<String>, CellaDockerError> {
+        match self.inner().inspect_image(image).await {
+            Ok(details) => Ok(details.config.and_then(|c| c.env).unwrap_or_default()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(CellaDockerError::ImageNotFound {
+                image: image.to_string(),
+            }),
+            Err(e) => Err(CellaDockerError::DockerApi(e)),
+        }
+    }
+
     /// Inspect an image and return its configured USER (defaulting to `"root"`).
     ///
     /// # Errors

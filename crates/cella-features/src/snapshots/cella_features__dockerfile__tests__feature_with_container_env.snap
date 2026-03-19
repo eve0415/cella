@@ -1,0 +1,21 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: result
+---
+ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
+ARG _DEV_CONTAINERS_IMAGE_USER=root
+ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
+
+FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage
+
+ENV NVM_DIR="/usr/local/share/nvm"
+ENV PATH="/usr/local/share/nvm/current/bin:${PATH}"
+
+# Feature: node (ghcr.io/devcontainers/features/node:1)
+COPY --chown=root:root node/ /tmp/dev-container-features/node/
+RUN chmod +x /tmp/dev-container-features/node/install.sh \
+    && cd /tmp/dev-container-features/node \
+    && ./install.sh
+
+# Cleanup
+RUN rm -rf /tmp/dev-container-features
