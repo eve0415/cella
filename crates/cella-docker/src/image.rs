@@ -67,6 +67,10 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
     }
     args.push("build".to_string());
 
+    if use_buildx {
+        args.push("--load".to_string());
+    }
+
     args.extend(["-t".to_string(), opts.image_name.clone()]);
 
     args.extend([
@@ -259,6 +263,7 @@ mod tests {
         let args = build_command_args(&opts, true);
         assert_eq!(args[0], "buildx");
         assert_eq!(args[1], "build");
+        assert_eq!(args[2], "--load");
     }
 
     #[test]

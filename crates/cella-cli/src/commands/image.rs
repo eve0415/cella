@@ -21,6 +21,7 @@ pub async fn build_features_layer(
     workspace_root: &Path,
     config_name: Option<&str>,
     resolved: &ResolvedFeatures,
+    base_image: &str,
     no_cache: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let features_digest = compute_features_digest(config);
@@ -28,14 +29,20 @@ pub async fn build_features_layer(
 
     let mut options = vec![];
     if no_cache {
-        options.extend(["--no-cache".to_string(), "--pull".to_string()]);
+        options.push("--no-cache".to_string());
     }
+
+    let mut args = HashMap::new();
+    args.insert(
+        "_DEV_CONTAINERS_BASE_IMAGE".to_string(),
+        base_image.to_string(),
+    );
 
     let build_opts = BuildOptions {
         image_name: features_image.clone(),
         context_path: resolved.build_context.clone(),
         dockerfile: "Dockerfile.features".to_string(),
-        args: HashMap::new(),
+        args,
         target: None,
         cache_from: vec![],
         options,
@@ -51,8 +58,9 @@ pub async fn build_features_layer(
 
 /// Ensure the dev container image exists (pull or build), including features layer.
 ///
-/// When `no_cache` is true, `--no-cache` and `--pull` are passed to docker build
-/// and image-based configs force re-pull even if the image exists locally.
+/// When `no_cache` is true, `--no-cache` and `--pull` are passed to the base
+/// image build (but only `--no-cache` for the features layer, since its FROM
+/// image is local-only) and image-based configs force re-pull.
 #[allow(clippy::too_many_lines)]
 pub async fn ensure_image(
     client: &DockerClient,
@@ -115,6 +123,7 @@ pub async fn ensure_image(
         workspace_root,
         config_name,
         &resolved,
+        &base_image_tag,
         no_cache,
     )
     .await?;

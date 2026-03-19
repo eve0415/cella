@@ -6,7 +6,7 @@ ARG _DEV_CONTAINERS_BASE_IMAGE=ubuntu:22.04
 ARG _DEV_CONTAINERS_IMAGE_USER=root
 ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
 
-FROM ubuntu:22.04 AS dev_containers_target_stage
+FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage
 
 # Feature: tool (ghcr.io/example/tool:1)
 COPY --chown=root:root tool/ /tmp/dev-container-features/tool/
