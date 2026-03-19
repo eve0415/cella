@@ -7,6 +7,7 @@ pub mod image;
 pub mod lifecycle;
 pub mod names;
 pub mod uid;
+pub mod upload;
 
 pub use client::DockerClient;
 pub use config_map::{CreateContainerOptions, MountConfig};
@@ -17,3 +18,4 @@ pub use image::BuildOptions;
 pub use lifecycle::{ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase};
 pub use names::{container_labels, container_name, image_name, image_name_with_features};
 pub use uid::update_remote_user_uid;
+pub use upload::FileToUpload;

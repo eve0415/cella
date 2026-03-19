@@ -8,6 +8,7 @@ license.workspace = true
 bollard.workspace = true
 cella-config.workspace = true
 cella-features.workspace = true
+tar.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true

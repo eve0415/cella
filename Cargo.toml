@@ -4,7 +4,9 @@ members = [
     "crates/cella-cli",
     "crates/cella-codegen",
     "crates/cella-config",
+    "crates/cella-credential-proxy",
     "crates/cella-docker",
+    "crates/cella-env",
     "crates/cella-git",
     "crates/cella-port",
     "crates/cella-agent",
@@ -54,17 +56,22 @@ futures-util = "0.3.31"
 # Timestamps
 chrono = "0.4.40"
 
+# Tar archives
+tar = "0.4.43"
+
 # Testing
 tempfile = "3.15.0"
 
 # Internal crates
+cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
 cella-config = { path = "crates/cella-config" }
+cella-credential-proxy = { path = "crates/cella-credential-proxy" }
 cella-docker = { path = "crates/cella-docker" }
+cella-env = { path = "crates/cella-env" }
+cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
 cella-port = { path = "crates/cella-port" }
-cella-agent = { path = "crates/cella-agent" }
-cella-features = { path = "crates/cella-features" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

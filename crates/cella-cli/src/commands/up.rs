@@ -5,10 +5,12 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use cella_config::resolve::resolve_config;
+use cella_credential_proxy::daemon;
 use cella_docker::{
-    CellaDockerError, ContainerState, DockerClient, container_labels, container_name, lifecycle,
-    update_remote_user_uid,
+    CellaDockerError, ContainerState, DockerClient, ExecOptions, FileToUpload, MountConfig,
+    container_labels, container_name, lifecycle, update_remote_user_uid,
 };
+use cella_env::git_credential::{credential_proxy_pid_path, credential_proxy_socket_path};
 
 use super::image::ensure_image;
 
@@ -94,6 +96,11 @@ impl UpArgs {
         if let Some(container) = existing {
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
+                    // Re-inject env forwarding (git config + SSH files may have changed)
+                    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+                    inject_post_start(&client, &container.id, &env_fwd.post_start, remote_user)
+                        .await;
+
                     // Already running -- run postAttachCommand and exit
                     if let Some(cmd) = config.get("postAttachCommand") {
                         lifecycle::run_lifecycle_phase(
@@ -137,6 +144,11 @@ impl UpArgs {
 
                     client.start_container(&container.id).await?;
                     verify_container_running(&client, &container.id).await?;
+
+                    // Re-inject env forwarding on restart
+                    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+                    inject_post_start(&client, &container.id, &env_fwd.post_start, remote_user)
+                        .await;
 
                     if let Some(cmd) = config.get("postStartCommand") {
                         lifecycle::run_lifecycle_phase(
@@ -206,6 +218,12 @@ impl UpArgs {
         // 6. Inspect image env for merging with user containerEnv
         let image_env = client.inspect_image_env(&img_name).await?;
 
+        // 6.5. Prepare environment forwarding (SSH agent, git config, credential proxy)
+        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+
+        // 6.6. Ensure credential proxy daemon is running (if host has git credentials)
+        ensure_credential_proxy();
+
         // 7. Create container
         let mut labels = container_labels(
             &resolved.workspace_root,
@@ -222,7 +240,7 @@ impl UpArgs {
 
         let feature_config = resolved_features.as_ref().map(|r| &r.container_config);
 
-        let create_opts = cella_docker::config_map::map_config(
+        let mut create_opts = cella_docker::config_map::map_config(
             config,
             &container_nm,
             &img_name,
@@ -231,6 +249,32 @@ impl UpArgs {
             feature_config,
             &image_env,
         );
+
+        // Merge forwarding mounts
+        for m in &env_fwd.mounts {
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: m.source.clone(),
+                target: m.target.clone(),
+                consistency: None,
+            });
+        }
+
+        // Merge forwarding env vars
+        if !env_fwd.env.is_empty() {
+            let fwd_env: Vec<String> = env_fwd
+                .env
+                .iter()
+                .map(|e| format!("{}={}", e.key, e.value))
+                .collect();
+
+            if create_opts.env.is_empty() {
+                // No user containerEnv was set (Docker would use image env).
+                // Now we have forwarding env, so explicitly set image_env + fwd_env.
+                create_opts.env = image_env.clone();
+            }
+            create_opts.env.extend(fwd_env);
+        }
 
         let container_id = client.create_container(&create_opts).await?;
 
@@ -256,6 +300,9 @@ impl UpArgs {
         {
             warn!("Failed to update remote user UID: {e}");
         }
+
+        // 9.5. Inject post-start environment forwarding (SSH files, git config, credential helper)
+        inject_post_start(&client, &container_id, &env_fwd.post_start, remote_user).await;
 
         // 10-14. Lifecycle commands (first create)
         let lifecycle_phases = [
@@ -436,5 +483,134 @@ fn output_result(
                 serde_json::to_string_pretty(&output).unwrap_or_default()
             );
         }
+    }
+}
+
+/// Inject post-start environment forwarding into a running container.
+///
+/// Uploads SSH config files, sets git config, and installs credential helper.
+/// Never fails — individual steps log warnings and are skipped on error.
+async fn inject_post_start(
+    client: &DockerClient,
+    container_id: &str,
+    post_start: &cella_env::PostStartInjection,
+    remote_user: &str,
+) {
+    // Upload SSH config files
+    if !post_start.file_uploads.is_empty() {
+        // Create .ssh directory with correct permissions
+        let ssh_dir = cella_env::ssh_config::remote_ssh_dir(remote_user);
+        let mkdir_result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("mkdir -p {ssh_dir} && chmod 700 {ssh_dir}"),
+                    ],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+        if let Err(e) = mkdir_result {
+            warn!("Failed to create .ssh directory: {e}");
+        }
+
+        let docker_files: Vec<FileToUpload> = post_start
+            .file_uploads
+            .iter()
+            .map(|f| FileToUpload {
+                path: f.container_path.clone(),
+                content: f.content.clone(),
+                mode: f.mode,
+            })
+            .collect();
+
+        if let Err(e) = client.upload_files(container_id, &docker_files).await {
+            warn!("Failed to upload SSH config files: {e}");
+        } else {
+            // Fix ownership
+            let _ = client
+                .exec_command(
+                    container_id,
+                    &ExecOptions {
+                        cmd: vec![
+                            "chown".to_string(),
+                            "-R".to_string(),
+                            format!("{remote_user}:{remote_user}"),
+                            ssh_dir,
+                        ],
+                        user: Some("root".to_string()),
+                        env: None,
+                        working_dir: None,
+                    },
+                )
+                .await;
+        }
+    }
+
+    // Install credential helper script
+    if let Some(ref helper) = post_start.credential_helper {
+        let helper_file = FileToUpload {
+            path: helper.container_path.clone(),
+            content: helper.content.clone(),
+            mode: helper.mode,
+        };
+        if let Err(e) = client.upload_files(container_id, &[helper_file]).await {
+            warn!("Failed to install credential helper: {e}");
+        }
+    }
+
+    // Set git config inside container
+    if !post_start.git_config_commands.is_empty() {
+        for cmd in &post_start.git_config_commands {
+            let result = client
+                .exec_command(
+                    container_id,
+                    &ExecOptions {
+                        cmd: cmd.clone(),
+                        user: Some(remote_user.to_string()),
+                        env: None,
+                        working_dir: None,
+                    },
+                )
+                .await;
+            match result {
+                Ok(r) if r.exit_code != 0 => {
+                    // git probably not installed in container
+                    warn!(
+                        "git config failed (exit {}): {}",
+                        r.exit_code,
+                        r.stderr.trim()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to exec git config: {e}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Ensure the credential proxy daemon is running.
+///
+/// Starts it as a background process if not already running.
+/// Logs a warning and continues if it can't be started.
+fn ensure_credential_proxy() {
+    let Some(socket_path) = credential_proxy_socket_path() else {
+        return;
+    };
+    let Some(pid_path) = credential_proxy_pid_path() else {
+        return;
+    };
+
+    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path) {
+        warn!("Failed to start credential proxy daemon: {e}");
     }
 }

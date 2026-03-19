@@ -262,7 +262,9 @@ version = "0.1.0"
 dependencies = [
  "cella-agent",
  "cella-config",
+ "cella-credential-proxy",
  "cella-docker",
+ "cella-env",
  "cella-features",
  "cella-git",
  "cella-port",
@@ -307,6 +309,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-credential-proxy"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cella-docker"
 version = "0.1.0"
 dependencies = [
@@ -319,8 +331,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cella-env"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

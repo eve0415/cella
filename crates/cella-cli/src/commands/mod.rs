@@ -1,6 +1,7 @@
 mod branch;
 mod build_cmd;
 mod config;
+mod credential_proxy;
 mod doctor;
 mod down;
 mod exec;
@@ -53,6 +54,9 @@ pub enum Command {
     Init(init::InitArgs),
     /// Open neovim connected to the dev container.
     Nvim(nvim::NvimArgs),
+    /// Manage the credential proxy daemon.
+    #[command(name = "credential-proxy", hide = true)]
+    CredentialProxy(credential_proxy::CredentialProxyArgs),
 }
 
 impl Command {
@@ -74,6 +78,7 @@ impl Command {
             Self::Template(args) => args.execute().await,
             Self::Init(args) => args.execute().await,
             Self::Nvim(args) => args.execute().await,
+            Self::CredentialProxy(args) => args.execute().await,
         }
     }
 }
