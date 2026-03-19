@@ -12,7 +12,7 @@ pub mod upload;
 
 pub use client::DockerClient;
 pub use config_map::{CreateContainerOptions, MountConfig};
-pub use container::{ContainerInfo, ContainerState, PortBinding};
+pub use container::{ContainerInfo, ContainerState, MountInfo, PortBinding};
 pub use error::CellaDockerError;
 pub use exec::{ExecOptions, ExecResult, InteractiveExecOptions};
 pub use image::BuildOptions;

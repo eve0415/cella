@@ -67,6 +67,7 @@ impl BuildArgs {
         client.ping().await?;
 
         // 3. Build image via shared ensure_image logic
+        let is_text = matches!(self.output, OutputFormat::Text);
         let (img_name, _resolved_features) = ensure_image(
             &client,
             config,
@@ -74,6 +75,7 @@ impl BuildArgs {
             config_name,
             &resolved.config_path,
             self.no_cache,
+            is_text,
         )
         .await?;
 

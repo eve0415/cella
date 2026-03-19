@@ -15,6 +15,7 @@ pub fn compute_features_digest(config: &serde_json::Value) -> String {
 }
 
 /// Build the features layer image on top of a base image.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_features_layer(
     client: &DockerClient,
     config: &serde_json::Value,
@@ -23,6 +24,7 @@ pub async fn build_features_layer(
     resolved: &ResolvedFeatures,
     base_image: &str,
     no_cache: bool,
+    is_text: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let features_digest = compute_features_digest(config);
     let features_image = image_name_with_features(workspace_root, config_name, &features_digest);
@@ -52,7 +54,15 @@ pub async fn build_features_layer(
         "Building features layer image (context: {})",
         resolved.build_context.display()
     );
+    if is_text {
+        eprintln!("Building features layer...");
+    }
+    let start = std::time::Instant::now();
     client.build_image(&build_opts).await?;
+    if is_text {
+        let elapsed = start.elapsed();
+        eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
+    }
     Ok(features_image)
 }
 
@@ -69,6 +79,7 @@ pub async fn ensure_image(
     config_name: Option<&str>,
     config_path: &Path,
     no_cache: bool,
+    is_text: bool,
 ) -> Result<(String, Option<ResolvedFeatures>), Box<dyn std::error::Error>> {
     let has_features = config
         .get("features")
@@ -79,14 +90,34 @@ pub async fn ensure_image(
     let base_image_tag = if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
         // Pull base image if needed (force re-pull when no_cache)
         if no_cache || !client.image_exists(image).await? {
+            if is_text {
+                eprint!("Pulling base image...");
+            }
+            let start = std::time::Instant::now();
             client.pull_image(image).await?;
+            if is_text {
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() >= 100 {
+                    eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
+                } else {
+                    eprintln!();
+                }
+            }
         }
         image.to_string()
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
         // Build user Dockerfile
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
+        if is_text {
+            eprintln!("Building Dockerfile...");
+        }
+        let start = std::time::Instant::now();
         client.build_image(&build_opts).await?;
+        if is_text {
+            let elapsed = start.elapsed();
+            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
+        }
         img_name
     } else {
         return Err("devcontainer.json must specify either 'image' or 'build'".into());
@@ -125,6 +156,7 @@ pub async fn ensure_image(
         &resolved,
         &base_image_tag,
         no_cache,
+        is_text,
     )
     .await?;
 

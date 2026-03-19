@@ -54,6 +54,14 @@ pub struct PortBinding {
     pub protocol: String,
 }
 
+/// A bind mount or volume attached to the container.
+#[derive(Debug, Clone)]
+pub struct MountInfo {
+    pub mount_type: String,
+    pub source: String,
+    pub destination: String,
+}
+
 /// Information about a container.
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
@@ -69,6 +77,8 @@ pub struct ContainerInfo {
     pub container_user: Option<String>,
     /// The image used to create the container.
     pub image: Option<String>,
+    /// Bind mounts and volumes (only populated via inspect, not list).
+    pub mounts: Vec<MountInfo>,
 }
 
 impl DockerClient {
@@ -140,6 +150,7 @@ impl DockerClient {
                 created_at,
                 container_user: None,
                 image: summary.image,
+                mounts: Vec::new(),
             }))
         } else {
             Ok(None)
@@ -277,6 +288,19 @@ impl DockerClient {
 
         let image = inspect.config.as_ref().and_then(|c| c.image.clone());
 
+        let mounts = inspect
+            .mounts
+            .unwrap_or_default()
+            .iter()
+            .map(|mp| MountInfo {
+                mount_type: mp
+                    .typ
+                    .map_or_else(|| "bind".to_string(), |t| format!("{t:?}").to_lowercase()),
+                source: mp.source.clone().unwrap_or_default(),
+                destination: mp.destination.clone().unwrap_or_default(),
+            })
+            .collect();
+
         Ok(ContainerInfo {
             id: inspect.id.unwrap_or_default(),
             name,
@@ -288,6 +312,7 @@ impl DockerClient {
             created_at: inspect.created,
             container_user,
             image,
+            mounts,
         })
     }
 
@@ -359,6 +384,7 @@ impl DockerClient {
                 created_at,
                 container_user: None,
                 image: summary.image,
+                mounts: Vec::new(),
             });
         }
 

@@ -125,6 +125,7 @@ impl UpArgs {
 
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
+                    ensure_credential_proxy();
                     // Re-inject env forwarding (git config + SSH files may have changed)
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
                     timed_step(
@@ -187,7 +188,7 @@ impl UpArgs {
 
                     output_result(
                         &self.output,
-                        "existing",
+                        "running",
                         &container.id,
                         &remote_user,
                         workspace_folder_str,
@@ -200,93 +201,116 @@ impl UpArgs {
                     client.remove_container(&container.id, false).await?;
                 }
                 (ContainerState::Stopped, false) => {
-                    // Start existing stopped container
-                    if let Some(old_hash) = &container.config_hash
-                        && *old_hash != resolved.config_hash
-                    {
-                        eprintln!(
-                            "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
-                        );
-                        eprintln!(
-                            "  Run `cella up --rebuild` to recreate with the updated config."
-                        );
-                    }
+                    ensure_credential_proxy();
 
-                    timed_step(
-                        is_text,
-                        "Starting container...",
-                        client.start_container(&container.id),
-                    )
-                    .await?;
-                    verify_container_running(&client, &container.id).await?;
+                    // Inspect for bind mounts with missing sources
+                    let detailed = client.inspect_container(&container.id).await?;
+                    let missing: Vec<_> = detailed
+                        .mounts
+                        .iter()
+                        .filter(|m| {
+                            m.mount_type == "bind"
+                                && !m.source.is_empty()
+                                && !std::path::Path::new(&m.source).exists()
+                        })
+                        .collect();
 
-                    // Re-inject env forwarding on restart
-                    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-                    timed_step(
-                        is_text,
-                        "Configuring environment...",
-                        inject_post_start(
-                            &client,
-                            &container.id,
-                            &env_fwd.post_start,
-                            &remote_user,
-                        ),
-                    )
-                    .await;
+                    if missing.is_empty() {
+                        // Start existing stopped container
+                        if let Some(old_hash) = &container.config_hash
+                            && *old_hash != resolved.config_hash
+                        {
+                            eprintln!(
+                                "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
+                            );
+                            eprintln!(
+                                "  Run `cella up --rebuild` to recreate with the updated config."
+                            );
+                        }
 
-                    timed_step(
-                        is_text,
-                        "Running userEnvProbe...",
-                        super::env_cache::probe_and_cache_user_env(
-                            &client,
-                            &container.id,
-                            &remote_user,
-                            probe_type,
-                        ),
-                    )
-                    .await;
-
-                    // Run lifecycle from metadata label (includes features)
-                    let metadata = container.labels.get("devcontainer.metadata");
-                    for phase in ["postStartCommand", "postAttachCommand"] {
-                        let entries = metadata.map_or_else(
-                            || {
-                                config
-                                    .get(phase)
-                                    .filter(|v| !v.is_null())
-                                    .map(|cmd| {
-                                        vec![cella_features::LifecycleEntry {
-                                            origin: "devcontainer.json".into(),
-                                            command: cmd.clone(),
-                                        }]
-                                    })
-                                    .unwrap_or_default()
-                            },
-                            |meta_json| {
-                                cella_features::lifecycle_from_metadata_label(meta_json, phase)
-                            },
-                        );
-                        run_lifecycle_entries(
-                            &client,
-                            &container.id,
-                            phase,
-                            &entries,
-                            Some(remote_user.as_str()),
-                            &remote_env,
-                            workspace_folder,
+                        timed_step(
                             is_text,
+                            "Starting container...",
+                            client.start_container(&container.id),
                         )
                         .await?;
-                    }
+                        verify_container_running(&client, &container.id).await?;
 
-                    output_result(
-                        &self.output,
-                        "started",
-                        &container.id,
-                        &remote_user,
-                        workspace_folder_str,
-                    );
-                    return Ok(());
+                        // Re-inject env forwarding on restart
+                        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+                        timed_step(
+                            is_text,
+                            "Configuring environment...",
+                            inject_post_start(
+                                &client,
+                                &container.id,
+                                &env_fwd.post_start,
+                                &remote_user,
+                            ),
+                        )
+                        .await;
+
+                        timed_step(
+                            is_text,
+                            "Running userEnvProbe...",
+                            super::env_cache::probe_and_cache_user_env(
+                                &client,
+                                &container.id,
+                                &remote_user,
+                                probe_type,
+                            ),
+                        )
+                        .await;
+
+                        // Run lifecycle from metadata label (includes features)
+                        let metadata = container.labels.get("devcontainer.metadata");
+                        for phase in ["postStartCommand", "postAttachCommand"] {
+                            let entries = metadata.map_or_else(
+                                || {
+                                    config
+                                        .get(phase)
+                                        .filter(|v| !v.is_null())
+                                        .map(|cmd| {
+                                            vec![cella_features::LifecycleEntry {
+                                                origin: "devcontainer.json".into(),
+                                                command: cmd.clone(),
+                                            }]
+                                        })
+                                        .unwrap_or_default()
+                                },
+                                |meta_json| {
+                                    cella_features::lifecycle_from_metadata_label(meta_json, phase)
+                                },
+                            );
+                            run_lifecycle_entries(
+                                &client,
+                                &container.id,
+                                phase,
+                                &entries,
+                                Some(remote_user.as_str()),
+                                &remote_env,
+                                workspace_folder,
+                                is_text,
+                            )
+                            .await?;
+                        }
+
+                        output_result(
+                            &self.output,
+                            "started",
+                            &container.id,
+                            &remote_user,
+                            workspace_folder_str,
+                        );
+                        return Ok(());
+                    }
+                    eprintln!("\x1b[33mWARNING:\x1b[0m Bind mount source(s) no longer exist:");
+                    for m in &missing {
+                        eprintln!("  {} \u{2192} {}", m.source, m.destination);
+                    }
+                    eprintln!("Recreating container...");
+                    client.remove_container(&container.id, false).await?;
+                    // Fall through to create path
                 }
                 (_, true) => {
                     // Rebuild: stop if running, then remove
@@ -308,17 +332,14 @@ impl UpArgs {
         }
 
         // 5. Ensure image (with optional features layer)
-        let (img_name, resolved_features) = timed_step(
+        let (img_name, resolved_features) = ensure_image(
+            &client,
+            config,
+            &resolved.workspace_root,
+            config_name,
+            &resolved.config_path,
+            self.build_no_cache,
             is_text,
-            "Building image...",
-            ensure_image(
-                &client,
-                config,
-                &resolved.workspace_root,
-                config_name,
-                &resolved.config_path,
-                self.build_no_cache,
-            ),
         )
         .await?;
 
@@ -334,11 +355,11 @@ impl UpArgs {
             client.inspect_image_user(&img_name).await?
         };
 
-        // 6.5. Prepare environment forwarding (SSH agent, git config, credential proxy)
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-
-        // 6.6. Ensure credential proxy daemon is running (if host has git credentials)
+        // 6.5. Ensure credential proxy daemon is running (if host has git credentials)
         ensure_credential_proxy();
+
+        // 6.6. Prepare environment forwarding (SSH agent, git config, credential proxy)
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
 
         // 7. Create container
         let mut labels = container_labels(
