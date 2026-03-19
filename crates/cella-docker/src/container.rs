@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bollard::container::{
-    CreateContainerOptions as BollardCreateOptions, ListContainersOptions, RemoveContainerOptions,
-    StopContainerOptions,
+    CreateContainerOptions as BollardCreateOptions, ListContainersOptions, LogsOptions,
+    RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::models::ContainerStateStatusEnum;
+use futures_util::StreamExt;
 use tracing::{debug, info};
 
 use crate::CellaDockerError;
@@ -51,6 +52,7 @@ pub struct ContainerInfo {
     pub id: String,
     pub name: String,
     pub state: ContainerState,
+    pub exit_code: Option<i64>,
     pub labels: HashMap<String, String>,
     pub config_hash: Option<String>,
 }
@@ -99,6 +101,7 @@ impl DockerClient {
                     .trim_start_matches('/')
                     .to_string(),
                 state,
+                exit_code: None,
                 labels,
                 config_hash,
             }))
@@ -188,10 +191,12 @@ impl DockerClient {
     pub async fn inspect_container(&self, id: &str) -> Result<ContainerInfo, CellaDockerError> {
         let inspect = self.inner().inspect_container(id, None).await?;
 
-        let state = inspect.state.and_then(|s| s.status).map_or_else(
+        let container_state = inspect.state.as_ref();
+        let state = container_state.and_then(|s| s.status).map_or_else(
             || ContainerState::Other("unknown".to_string()),
             ContainerState::from_bollard,
         );
+        let exit_code = container_state.and_then(|s| s.exit_code);
 
         let labels = inspect
             .config
@@ -210,8 +215,38 @@ impl DockerClient {
             id: inspect.id.unwrap_or_default(),
             name,
             state,
+            exit_code,
             labels,
             config_hash,
         })
+    }
+
+    /// Fetch the last `tail` lines of container logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn container_logs(&self, id: &str, tail: u32) -> Result<String, CellaDockerError> {
+        let options = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            tail: tail.to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = self.inner().logs(id, Some(options));
+        let mut output = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            match chunk? {
+                bollard::container::LogOutput::StdOut { message }
+                | bollard::container::LogOutput::StdErr { message } => {
+                    output.push_str(&String::from_utf8_lossy(&message));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(output)
     }
 }

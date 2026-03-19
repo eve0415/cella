@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use cella_config::resolve::resolve_config;
 use cella_docker::{
-    ContainerState, DockerClient, container_labels, container_name, lifecycle,
+    CellaDockerError, ContainerState, DockerClient, container_labels, container_name, lifecycle,
     update_remote_user_uid,
 };
 
@@ -136,6 +136,7 @@ impl UpArgs {
                     }
 
                     client.start_container(&container.id).await?;
+                    verify_container_running(&client, &container.id).await?;
 
                     if let Some(cmd) = config.get("postStartCommand") {
                         lifecycle::run_lifecycle_phase(
@@ -231,6 +232,7 @@ impl UpArgs {
 
         // 7. Start container
         client.start_container(&container_id).await?;
+        verify_container_running(&client, &container_id).await?;
 
         // 8. updateRemoteUserUID
         let update_uid = config
@@ -388,6 +390,22 @@ fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn verify_container_running(
+    client: &DockerClient,
+    container_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = client.inspect_container(container_id).await?;
+    if info.state != ContainerState::Running {
+        let logs = client.container_logs(container_id, 20).await?;
+        return Err(CellaDockerError::ContainerExitedImmediately {
+            exit_code: info.exit_code.unwrap_or(-1),
+            logs_tail: logs,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn output_result(

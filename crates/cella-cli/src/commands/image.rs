@@ -95,10 +95,18 @@ pub async fn ensure_image(
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
     let cache = cella_features::FeatureCache::new();
+    let image_user = client.inspect_image_user(&base_image_tag).await?;
 
-    let resolved = cella_features::resolve_features(config, config_path, &platform, &cache)
-        .await
-        .map_err(|e| format!("feature resolution failed: {e}"))?;
+    let resolved = cella_features::resolve_features(
+        config,
+        config_path,
+        &platform,
+        &cache,
+        &base_image_tag,
+        &image_user,
+    )
+    .await
+    .map_err(|e| format!("feature resolution failed: {e}"))?;
 
     // Build the features layer image
     let features_image = build_features_layer(

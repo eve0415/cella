@@ -188,6 +188,36 @@ impl DockerClient {
             Err(e) => Err(CellaDockerError::DockerApi(e)),
         }
     }
+
+    /// Inspect an image and return its configured USER (defaulting to `"root"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors,
+    /// `CellaDockerError::ImageNotFound` if the image does not exist.
+    pub async fn inspect_image_user(&self, image: &str) -> Result<String, CellaDockerError> {
+        match self.inner().inspect_image(image).await {
+            Ok(details) => {
+                let user = details
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.user.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(if user.is_empty() {
+                    "root".to_string()
+                } else {
+                    user
+                })
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(CellaDockerError::ImageNotFound {
+                image: image.to_string(),
+            }),
+            Err(e) => Err(CellaDockerError::DockerApi(e)),
+        }
+    }
 }
 
 #[cfg(test)]

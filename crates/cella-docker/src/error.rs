@@ -43,6 +43,10 @@ pub enum CellaDockerError {
         source: std::io::Error,
     },
 
+    /// The container exited immediately after start.
+    #[error("container exited immediately (exit code {exit_code}):\n{logs_tail}")]
+    ContainerExitedImmediately { exit_code: i64, logs_tail: String },
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

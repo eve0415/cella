@@ -60,6 +60,8 @@ pub async fn resolve_features(
     config_path: &Path,
     platform: &Platform,
     cache: &FeatureCache,
+    base_image: &str,
+    image_user: &str,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
@@ -100,16 +102,6 @@ pub async fn resolve_features(
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
     // Step 8: Generate Dockerfile and build context.
-    let base_image = config
-        .get("image")
-        .and_then(|v| v.as_str())
-        .unwrap_or("ubuntu:latest");
-    let image_user = config
-        .get("remoteUser")
-        .or_else(|| config.get("containerUser"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("root");
-
     let dockerfile = generate_dockerfile(base_image, image_user, &resolved);
     let entrypoint_script = generate_entrypoint_script(&resolved);
 
@@ -665,6 +657,8 @@ mod tests {
                 architecture: "amd64".to_string(),
             },
             &cache,
+            "ubuntu:22.04",
+            "root",
         )
         .await
         .unwrap();
@@ -687,6 +681,8 @@ mod tests {
                 architecture: "amd64".to_string(),
             },
             &cache,
+            "ubuntu:22.04",
+            "root",
         )
         .await
         .unwrap();
@@ -728,9 +724,16 @@ mod tests {
             architecture: "amd64".to_string(),
         };
 
-        let result = resolve_features(&config, &config_path, &platform, &cache)
-            .await
-            .unwrap();
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            "ubuntu:22.04",
+            "root",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.features.len(), 1);
         assert_eq!(result.features[0].id, "my-feature");
@@ -788,9 +791,16 @@ mod tests {
             architecture: "amd64".to_string(),
         };
 
-        let result = resolve_features(&config, &config_path, &platform, &cache)
-            .await
-            .unwrap();
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            "ubuntu:22.04",
+            "root",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.features.len(), 1);
         assert!(!result.features[0].has_install_script);
@@ -841,9 +851,16 @@ mod tests {
             architecture: "amd64".to_string(),
         };
 
-        let result = resolve_features(&config, &config_path, &platform, &cache)
-            .await
-            .unwrap();
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            "ubuntu:22.04",
+            "root",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.features.len(), 2);
 
@@ -878,6 +895,8 @@ mod tests {
             Path::new("/workspace/devcontainer.json"),
             &platform,
             &cache,
+            "ubuntu:22.04",
+            "root",
         )
         .await;
 
@@ -914,7 +933,15 @@ mod tests {
         };
         let cache = FeatureCache::new();
 
-        let result = resolve_features(&config, &config_path, &platform, &cache).await;
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            "mcr.microsoft.com/devcontainers/base:ubuntu",
+            "root",
+        )
+        .await;
         let resolved = result.expect("resolve_features should succeed");
 
         // Verify features

@@ -775,11 +775,7 @@ mod tests {
         };
 
         let bollard_config = opts.to_bollard_config();
-        let mounts = bollard_config
-            .host_config
-            .unwrap()
-            .mounts
-            .unwrap();
+        let mounts = bollard_config.host_config.unwrap().mounts.unwrap();
 
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].source.as_deref(), Some("/second"));
@@ -817,11 +813,7 @@ mod tests {
         };
 
         let bollard_config = opts.to_bollard_config();
-        let mounts = bollard_config
-            .host_config
-            .unwrap()
-            .mounts
-            .unwrap();
+        let mounts = bollard_config.host_config.unwrap().mounts.unwrap();
 
         // Last occurrence wins — user mount overrides workspace mount
         assert_eq!(mounts.len(), 1);
