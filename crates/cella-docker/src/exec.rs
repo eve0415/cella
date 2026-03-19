@@ -5,6 +5,8 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
+use std::io::Write;
+
 use crate::CellaDockerError;
 use crate::client::DockerClient;
 
@@ -95,6 +97,77 @@ impl DockerClient {
         let exit_code = inspect.exit_code.unwrap_or(0);
 
         debug!("Exec exit code: {exit_code}");
+
+        Ok(ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Execute a command inside a running container (streams output).
+    ///
+    /// Like [`exec_command`](Self::exec_command), but writes output chunks to the
+    /// provided writers as they arrive.  Still accumulates full output strings in
+    /// the returned [`ExecResult`] for programmatic inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn exec_stream(
+        &self,
+        container_id: &str,
+        opts: &ExecOptions,
+        mut stdout_writer: impl Write + Send,
+        mut stderr_writer: impl Write + Send,
+    ) -> Result<ExecResult, CellaDockerError> {
+        let cmd: Vec<&str> = opts.cmd.iter().map(String::as_str).collect();
+        debug!("Exec stream in {container_id}: {}", opts.cmd.join(" "));
+
+        let env_refs: Option<Vec<&str>> = opts
+            .env
+            .as_ref()
+            .map(|e| e.iter().map(String::as_str).collect());
+
+        let create_opts = CreateExecOptions {
+            cmd: Some(cmd),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            user: opts.user.as_deref(),
+            working_dir: opts.working_dir.as_deref(),
+            env: env_refs,
+            ..Default::default()
+        };
+
+        let exec = self.inner().create_exec(container_id, create_opts).await?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+
+        let start_result = self.inner().start_exec(&exec.id, None).await?;
+
+        if let StartExecResults::Attached { mut output, .. } = start_result {
+            while let Some(chunk) = output.next().await {
+                match chunk? {
+                    bollard::container::LogOutput::StdOut { message } => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                        let _ = stdout_writer.write_all(&message);
+                        let _ = stdout_writer.flush();
+                    }
+                    bollard::container::LogOutput::StdErr { message } => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                        let _ = stderr_writer.write_all(&message);
+                        let _ = stderr_writer.flush();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let inspect = self.inner().inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code.unwrap_or(0);
+
+        debug!("Exec stream exit code: {exit_code}");
 
         Ok(ExecResult {
             exit_code,

@@ -127,33 +127,63 @@ impl UpArgs {
                 (ContainerState::Running, false) if !self.build_no_cache => {
                     // Re-inject env forwarding (git config + SSH files may have changed)
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-                    inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
-                        .await;
-
-                    if is_text {
-                        eprintln!("Running userEnvProbe...");
-                    }
-                    super::env_cache::probe_and_cache_user_env(
-                        &client,
-                        &container.id,
-                        &remote_user,
-                        probe_type,
+                    timed_step(
+                        is_text,
+                        "Configuring environment...",
+                        inject_post_start(
+                            &client,
+                            &container.id,
+                            &env_fwd.post_start,
+                            &remote_user,
+                        ),
                     )
                     .await;
 
-                    // Already running -- run postAttachCommand and exit
-                    if let Some(cmd) = config.get("postAttachCommand") {
-                        lifecycle::run_lifecycle_phase(
+                    timed_step(
+                        is_text,
+                        "Running userEnvProbe...",
+                        super::env_cache::probe_and_cache_user_env(
                             &client,
                             &container.id,
-                            "postAttachCommand",
-                            cmd,
-                            Some(remote_user.as_str()),
-                            &remote_env,
-                            workspace_folder,
-                        )
-                        .await?;
-                    }
+                            &remote_user,
+                            probe_type,
+                        ),
+                    )
+                    .await;
+
+                    // Already running -- run postAttachCommand from metadata (includes features)
+                    let metadata = container.labels.get("devcontainer.metadata");
+                    let entries = metadata.map_or_else(
+                        || {
+                            config
+                                .get("postAttachCommand")
+                                .filter(|v| !v.is_null())
+                                .map(|cmd| {
+                                    vec![cella_features::LifecycleEntry {
+                                        origin: "devcontainer.json".into(),
+                                        command: cmd.clone(),
+                                    }]
+                                })
+                                .unwrap_or_default()
+                        },
+                        |meta_json| {
+                            cella_features::lifecycle_from_metadata_label(
+                                meta_json,
+                                "postAttachCommand",
+                            )
+                        },
+                    );
+                    run_lifecycle_entries(
+                        &client,
+                        &container.id,
+                        "postAttachCommand",
+                        &entries,
+                        Some(remote_user.as_str()),
+                        &remote_env,
+                        workspace_folder,
+                        is_text,
+                    )
+                    .await?;
 
                     output_result(
                         &self.output,
@@ -182,47 +212,69 @@ impl UpArgs {
                         );
                     }
 
-                    client.start_container(&container.id).await?;
+                    timed_step(
+                        is_text,
+                        "Starting container...",
+                        client.start_container(&container.id),
+                    )
+                    .await?;
                     verify_container_running(&client, &container.id).await?;
 
                     // Re-inject env forwarding on restart
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-                    inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
-                        .await;
-
-                    if is_text {
-                        eprintln!("Running userEnvProbe...");
-                    }
-                    super::env_cache::probe_and_cache_user_env(
-                        &client,
-                        &container.id,
-                        &remote_user,
-                        probe_type,
+                    timed_step(
+                        is_text,
+                        "Configuring environment...",
+                        inject_post_start(
+                            &client,
+                            &container.id,
+                            &env_fwd.post_start,
+                            &remote_user,
+                        ),
                     )
                     .await;
 
-                    if let Some(cmd) = config.get("postStartCommand") {
-                        lifecycle::run_lifecycle_phase(
+                    timed_step(
+                        is_text,
+                        "Running userEnvProbe...",
+                        super::env_cache::probe_and_cache_user_env(
                             &client,
                             &container.id,
-                            "postStartCommand",
-                            cmd,
-                            Some(remote_user.as_str()),
-                            &remote_env,
-                            workspace_folder,
-                        )
-                        .await?;
-                    }
+                            &remote_user,
+                            probe_type,
+                        ),
+                    )
+                    .await;
 
-                    if let Some(cmd) = config.get("postAttachCommand") {
-                        lifecycle::run_lifecycle_phase(
+                    // Run lifecycle from metadata label (includes features)
+                    let metadata = container.labels.get("devcontainer.metadata");
+                    for phase in ["postStartCommand", "postAttachCommand"] {
+                        let entries = metadata.map_or_else(
+                            || {
+                                config
+                                    .get(phase)
+                                    .filter(|v| !v.is_null())
+                                    .map(|cmd| {
+                                        vec![cella_features::LifecycleEntry {
+                                            origin: "devcontainer.json".into(),
+                                            command: cmd.clone(),
+                                        }]
+                                    })
+                                    .unwrap_or_default()
+                            },
+                            |meta_json| {
+                                cella_features::lifecycle_from_metadata_label(meta_json, phase)
+                            },
+                        );
+                        run_lifecycle_entries(
                             &client,
                             &container.id,
-                            "postAttachCommand",
-                            cmd,
+                            phase,
+                            &entries,
                             Some(remote_user.as_str()),
                             &remote_env,
                             workspace_folder,
+                            is_text,
                         )
                         .await?;
                     }
@@ -256,16 +308,17 @@ impl UpArgs {
         }
 
         // 5. Ensure image (with optional features layer)
-        if is_text {
-            eprintln!("Building image...");
-        }
-        let (img_name, resolved_features) = ensure_image(
-            &client,
-            config,
-            &resolved.workspace_root,
-            config_name,
-            &resolved.config_path,
-            self.build_no_cache,
+        let (img_name, resolved_features) = timed_step(
+            is_text,
+            "Building image...",
+            ensure_image(
+                &client,
+                config,
+                &resolved.workspace_root,
+                config_name,
+                &resolved.config_path,
+                self.build_no_cache,
+            ),
         )
         .await?;
 
@@ -358,16 +411,20 @@ impl UpArgs {
             create_opts.env.extend(fwd_env);
         }
 
-        if is_text {
-            eprintln!("Creating container...");
-        }
-        let container_id = client.create_container(&create_opts).await?;
+        let container_id = timed_step(
+            is_text,
+            "Creating container...",
+            client.create_container(&create_opts),
+        )
+        .await?;
 
         // 8. Start container
-        if is_text {
-            eprintln!("Starting container...");
-        }
-        client.start_container(&container_id).await?;
+        timed_step(
+            is_text,
+            "Starting container...",
+            client.start_container(&container_id),
+        )
+        .await?;
         verify_container_running(&client, &container_id).await?;
 
         // 9. updateRemoteUserUID
@@ -390,10 +447,12 @@ impl UpArgs {
         }
 
         // 9.5. Inject post-start environment forwarding (SSH files, git config, credential helper)
-        if is_text {
-            eprintln!("Configuring environment...");
-        }
-        inject_post_start(&client, &container_id, &env_fwd.post_start, &remote_user).await;
+        timed_step(
+            is_text,
+            "Configuring environment...",
+            inject_post_start(&client, &container_id, &env_fwd.post_start, &remote_user),
+        )
+        .await;
 
         // 9.6. Probe and cache user environment (userEnvProbe)
         let probe_type = config
@@ -401,15 +460,15 @@ impl UpArgs {
             .and_then(|v| v.as_str())
             .unwrap_or("loginInteractiveShell");
 
-        if is_text {
-            eprintln!("Running userEnvProbe...");
-        }
-
-        super::env_cache::probe_and_cache_user_env(
-            &client,
-            &container_id,
-            &remote_user,
-            probe_type,
+        timed_step(
+            is_text,
+            "Running userEnvProbe...",
+            super::env_cache::probe_and_cache_user_env(
+                &client,
+                &container_id,
+                &remote_user,
+                probe_type,
+            ),
         )
         .await;
 
@@ -423,39 +482,46 @@ impl UpArgs {
         ];
 
         for phase in lifecycle_phases {
-            // Feature lifecycle commands run first (features don't have updateContentCommand)
-            if let Some(ref rf) = resolved_features {
-                let feature_cmds = match phase {
-                    "onCreateCommand" => &rf.container_config.lifecycle.on_create,
-                    "postCreateCommand" => &rf.container_config.lifecycle.post_create,
-                    "postStartCommand" => &rf.container_config.lifecycle.post_start,
-                    "postAttachCommand" => &rf.container_config.lifecycle.post_attach,
-                    _ => &Vec::new(),
-                };
-                for cmd in feature_cmds {
-                    lifecycle::run_lifecycle_phase(
-                        &client,
-                        &container_id,
-                        phase,
-                        cmd,
-                        Some(remote_user.as_str()),
-                        &create_opts.remote_env,
-                        workspace_folder,
-                    )
-                    .await?;
-                }
-            }
+            // Merged lifecycle entries include both feature and user commands with
+            // origins.  updateContentCommand is not part of feature lifecycle, so
+            // falls through to the config-only branch.
+            let empty = Vec::new();
+            let entries = resolved_features.as_ref().map_or(&empty, |rf| match phase {
+                "onCreateCommand" => &rf.container_config.lifecycle.on_create,
+                "postCreateCommand" => &rf.container_config.lifecycle.post_create,
+                "postStartCommand" => &rf.container_config.lifecycle.post_start,
+                "postAttachCommand" => &rf.container_config.lifecycle.post_attach,
+                _ => &empty,
+            });
 
-            // Then user lifecycle commands
-            if let Some(cmd) = config.get(phase) {
+            run_lifecycle_entries(
+                &client,
+                &container_id,
+                phase,
+                entries,
+                Some(remote_user.as_str()),
+                &create_opts.remote_env,
+                workspace_folder,
+                is_text,
+            )
+            .await?;
+
+            // For phases not in the merged lifecycle (updateContentCommand,
+            // or when no features are resolved), run user commands directly.
+            if entries.is_empty()
+                && let Some(cmd) = config.get(phase)
+                && !cmd.is_null()
+            {
                 lifecycle::run_lifecycle_phase(
                     &client,
                     &container_id,
                     phase,
                     cmd,
+                    "devcontainer.json",
                     Some(remote_user.as_str()),
                     &create_opts.remote_env,
                     workspace_folder,
+                    is_text,
                 )
                 .await?;
             }
@@ -705,6 +771,56 @@ async fn inject_post_start(
             }
         }
     }
+}
+
+/// Print a progress label, run an async operation, and optionally show elapsed time.
+async fn timed_step<F, T>(is_text: bool, label: &str, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if is_text {
+        eprint!("{label}");
+    }
+    let start = std::time::Instant::now();
+    let result = f.await;
+    if is_text {
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() >= 100 {
+            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
+        } else {
+            eprintln!();
+        }
+    }
+    result
+}
+
+/// Run a sequence of origin-tracked lifecycle entries.
+#[allow(clippy::too_many_arguments)]
+async fn run_lifecycle_entries(
+    client: &DockerClient,
+    container_id: &str,
+    phase: &str,
+    entries: &[cella_features::LifecycleEntry],
+    user: Option<&str>,
+    env: &[String],
+    working_dir: Option<&str>,
+    is_text: bool,
+) -> Result<(), CellaDockerError> {
+    for entry in entries {
+        lifecycle::run_lifecycle_phase(
+            client,
+            container_id,
+            phase,
+            &entry.command,
+            &entry.origin,
+            user,
+            env,
+            working_dir,
+            is_text,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Ensure the credential proxy daemon is running.

@@ -1,11 +1,11 @@
 //! Lifecycle command parsing and execution.
 
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
-use crate::exec::ExecOptions;
+use crate::exec::{ExecOptions, ExecResult};
 
 /// Parsed lifecycle command.
 pub enum ParsedLifecycle {
@@ -55,19 +55,28 @@ pub fn parse_lifecycle_command(value: &Value) -> ParsedLifecycle {
 
 /// Execute lifecycle commands for a phase.
 ///
+/// When `is_text` is true, prints origin-tracked progress (matching the original
+/// devcontainer CLI phrasing) and streams sequential command output to stderr.
+///
 /// # Errors
 ///
 /// Returns `CellaDockerError::LifecycleFailed` if any command fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_lifecycle_phase(
     client: &DockerClient,
     container_id: &str,
     phase: &str,
     value: &Value,
+    origin: &str,
     user: Option<&str>,
     env: &[String],
     working_dir: Option<&str>,
+    is_text: bool,
 ) -> Result<(), CellaDockerError> {
-    info!("Running {phase}");
+    if is_text {
+        eprintln!("Running the {phase} from {origin}...");
+    }
+    debug!("Running {phase} from {origin}");
 
     let parsed = parse_lifecycle_command(value);
 
@@ -78,17 +87,19 @@ pub async fn run_lifecycle_phase(
                     continue;
                 }
                 debug!("{phase}: {}", cmd.join(" "));
-                let result = client
-                    .exec_command(
-                        container_id,
-                        &ExecOptions {
-                            cmd,
-                            user: user.map(String::from),
-                            env: Some(env.to_vec()),
-                            working_dir: working_dir.map(String::from),
-                        },
-                    )
-                    .await?;
+                let opts = ExecOptions {
+                    cmd,
+                    user: user.map(String::from),
+                    env: Some(env.to_vec()),
+                    working_dir: working_dir.map(String::from),
+                };
+                let result = if is_text {
+                    client
+                        .exec_stream(container_id, &opts, std::io::stderr(), std::io::stderr())
+                        .await?
+                } else {
+                    client.exec_command(container_id, &opts).await?
+                };
 
                 if result.exit_code != 0 {
                     return Err(CellaDockerError::LifecycleFailed {
@@ -135,18 +146,30 @@ pub async fn run_lifecycle_phase(
                             ),
                         });
                     }
-                    Ok::<(), CellaDockerError>(())
+                    Ok::<ExecResult, CellaDockerError>(result)
                 });
             }
 
             let results = futures_util::future::join_all(futures).await;
+
+            if is_text {
+                for exec_result in results.iter().flatten() {
+                    if !exec_result.stdout.is_empty() {
+                        eprint!("{}", exec_result.stdout);
+                    }
+                    if !exec_result.stderr.is_empty() {
+                        eprint!("{}", exec_result.stderr);
+                    }
+                }
+            }
+
             for result in results {
-                result?;
+                let _ = result?;
             }
         }
     }
 
-    info!("{phase} completed");
+    debug!("{phase} completed");
     Ok(())
 }
 

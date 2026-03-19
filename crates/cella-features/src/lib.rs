@@ -24,6 +24,31 @@ pub use types::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Parse lifecycle commands for a phase from a `devcontainer.metadata` label.
+///
+/// Each metadata entry with an `"id"` field uses that as the origin; entries
+/// without use `"devcontainer.json"`.
+pub fn lifecycle_from_metadata_label(metadata_json: &str, phase: &str) -> Vec<LifecycleEntry> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let mut result = Vec::new();
+    for entry in &entries {
+        let origin = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("devcontainer.json")
+            .to_string();
+        if let Some(cmd) = entry.get(phase)
+            && !cmd.is_null()
+        {
+            result.push(LifecycleEntry {
+                origin,
+                command: cmd.clone(),
+            });
+        }
+    }
+    result
+}
+
 use futures_util::future::join_all;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -963,5 +988,67 @@ mod tests {
             .expect("metadata label should be valid JSON");
         assert!(label.is_array());
         assert!(!label.as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // lifecycle_from_metadata_label
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lifecycle_label_empty_metadata() {
+        let entries = lifecycle_from_metadata_label("", "postStartCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_label_invalid_json() {
+        let entries = lifecycle_from_metadata_label("not json", "postStartCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_label_entry_with_feature_id() {
+        let json = r#"[{"id": "node", "postStartCommand": "echo hello"}]"#;
+        let entries = lifecycle_from_metadata_label(json, "postStartCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "node");
+        assert_eq!(entries[0].command, json!("echo hello"));
+    }
+
+    #[test]
+    fn lifecycle_label_entry_without_id() {
+        let json = r#"[{"postStartCommand": "echo hello"}]"#;
+        let entries = lifecycle_from_metadata_label(json, "postStartCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "devcontainer.json");
+    }
+
+    #[test]
+    fn lifecycle_label_skips_entries_without_phase() {
+        let json = r#"[{"id": "node", "postCreateCommand": "echo create"}, {"id": "go"}]"#;
+        let entries = lifecycle_from_metadata_label(json, "postStartCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_label_skips_null_phase() {
+        let json = r#"[{"id": "node", "postStartCommand": null}]"#;
+        let entries = lifecycle_from_metadata_label(json, "postStartCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_label_multiple_entries_mixed() {
+        let json = r#"[
+            {"id": "node", "postStartCommand": "echo node"},
+            {"postStartCommand": "echo user"},
+            {"id": "go"}
+        ]"#;
+        let entries = lifecycle_from_metadata_label(json, "postStartCommand");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].origin, "node");
+        assert_eq!(entries[0].command, json!("echo node"));
+        assert_eq!(entries[1].origin, "devcontainer.json");
+        assert_eq!(entries[1].command, json!("echo user"));
     }
 }

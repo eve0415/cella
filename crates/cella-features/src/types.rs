@@ -63,6 +63,13 @@ pub enum OptionType {
     Boolean,
 }
 
+/// A lifecycle command paired with its origin (feature id or "devcontainer.json").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEntry {
+    pub origin: String,
+    pub command: serde_json::Value,
+}
+
 /// Merged container configuration from all features.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureContainerConfig {
@@ -80,10 +87,10 @@ pub struct FeatureContainerConfig {
 /// Feature lifecycle commands collected from all features.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureLifecycle {
-    pub on_create: Vec<serde_json::Value>,
-    pub post_create: Vec<serde_json::Value>,
-    pub post_start: Vec<serde_json::Value>,
-    pub post_attach: Vec<serde_json::Value>,
+    pub on_create: Vec<LifecycleEntry>,
+    pub post_create: Vec<LifecycleEntry>,
+    pub post_start: Vec<LifecycleEntry>,
+    pub post_attach: Vec<LifecycleEntry>,
 }
 
 /// Resolved features output -- everything needed to build and configure the container.

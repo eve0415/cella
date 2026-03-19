@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::FeatureWarning;
 use crate::types::{
-    FeatureContainerConfig, FeatureLifecycle, FeatureOption, OptionType, ResolvedFeature,
+    FeatureContainerConfig, FeatureLifecycle, FeatureOption, LifecycleEntry, OptionType,
+    ResolvedFeature,
 };
 
 /// Merge metadata from all resolved features into a single container config.
@@ -61,18 +62,30 @@ pub fn merge_features(features: &[ResolvedFeature]) -> FeatureContainerConfig {
             config.entrypoints.push(ep.clone());
         }
 
-        // Lifecycle commands: collect in install order.
+        // Lifecycle commands: collect in install order with origin tracking.
         if let Some(cmd) = &meta.on_create_command {
-            config.lifecycle.on_create.push(cmd.clone());
+            config.lifecycle.on_create.push(LifecycleEntry {
+                origin: feature.id.clone(),
+                command: cmd.clone(),
+            });
         }
         if let Some(cmd) = &meta.post_create_command {
-            config.lifecycle.post_create.push(cmd.clone());
+            config.lifecycle.post_create.push(LifecycleEntry {
+                origin: feature.id.clone(),
+                command: cmd.clone(),
+            });
         }
         if let Some(cmd) = &meta.post_start_command {
-            config.lifecycle.post_start.push(cmd.clone());
+            config.lifecycle.post_start.push(LifecycleEntry {
+                origin: feature.id.clone(),
+                command: cmd.clone(),
+            });
         }
         if let Some(cmd) = &meta.post_attach_command {
-            config.lifecycle.post_attach.push(cmd.clone());
+            config.lifecycle.post_attach.push(LifecycleEntry {
+                origin: feature.id.clone(),
+                command: cmd.clone(),
+            });
         }
 
         // Customizations: deep merge in install order.
@@ -320,16 +333,19 @@ fn merge_lifecycle(
     }
 }
 
-/// Merge a single lifecycle field: feature commands first, then user command (if present).
+/// Merge a single lifecycle field: feature entries first, then user command (if present).
 fn merge_lifecycle_field(
-    feature_cmds: &[serde_json::Value],
+    feature_entries: &[LifecycleEntry],
     user_cmd: Option<&serde_json::Value>,
-) -> Vec<serde_json::Value> {
-    let mut result: Vec<serde_json::Value> = feature_cmds.to_vec();
+) -> Vec<LifecycleEntry> {
+    let mut result: Vec<LifecycleEntry> = feature_entries.to_vec();
     if let Some(cmd) = user_cmd
         && !cmd.is_null()
     {
-        result.push(cmd.clone());
+        result.push(LifecycleEntry {
+            origin: "devcontainer.json".to_string(),
+            command: cmd.clone(),
+        });
     }
     result
 }
@@ -633,18 +649,30 @@ mod tests {
 
         let config = merge_features(&features);
 
+        assert_eq!(config.lifecycle.on_create.len(), 2);
+        assert_eq!(config.lifecycle.on_create[0].origin, "a");
         assert_eq!(
-            config.lifecycle.on_create,
-            vec![json!("echo a-create"), json!("echo b-create"),]
+            config.lifecycle.on_create[0].command,
+            json!("echo a-create")
         );
+        assert_eq!(config.lifecycle.on_create[1].origin, "b");
         assert_eq!(
-            config.lifecycle.post_create,
-            vec![json!("echo a-post-create")]
+            config.lifecycle.on_create[1].command,
+            json!("echo b-create")
         );
+
+        assert_eq!(config.lifecycle.post_create.len(), 1);
         assert_eq!(
-            config.lifecycle.post_start,
-            vec![json!(["echo", "b-start"])]
+            config.lifecycle.post_create[0].command,
+            json!("echo a-post-create")
         );
+
+        assert_eq!(config.lifecycle.post_start.len(), 1);
+        assert_eq!(
+            config.lifecycle.post_start[0].command,
+            json!(["echo", "b-start"])
+        );
+
         assert!(config.lifecycle.post_attach.is_empty());
     }
 
@@ -751,10 +779,18 @@ mod tests {
 
     #[test]
     fn feature_lifecycle_commands_before_user_commands() {
+        use crate::types::LifecycleEntry;
+
         let feature_config = FeatureContainerConfig {
             lifecycle: FeatureLifecycle {
-                on_create: vec![json!("echo feature-create")],
-                post_create: vec![json!("echo feature-post")],
+                on_create: vec![LifecycleEntry {
+                    origin: "feat-a".to_string(),
+                    command: json!("echo feature-create"),
+                }],
+                post_create: vec![LifecycleEntry {
+                    origin: "feat-a".to_string(),
+                    command: json!("echo feature-post"),
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -766,13 +802,26 @@ mod tests {
 
         let merged = merge_with_devcontainer(&feature_config, &devcontainer);
 
+        assert_eq!(merged.lifecycle.on_create.len(), 2);
+        assert_eq!(merged.lifecycle.on_create[0].origin, "feat-a");
         assert_eq!(
-            merged.lifecycle.on_create,
-            vec![json!("echo feature-create"), json!("echo user-create"),]
+            merged.lifecycle.on_create[0].command,
+            json!("echo feature-create")
+        );
+        assert_eq!(merged.lifecycle.on_create[1].origin, "devcontainer.json");
+        assert_eq!(
+            merged.lifecycle.on_create[1].command,
+            json!("echo user-create")
+        );
+
+        assert_eq!(merged.lifecycle.post_create.len(), 2);
+        assert_eq!(
+            merged.lifecycle.post_create[0].command,
+            json!("echo feature-post")
         );
         assert_eq!(
-            merged.lifecycle.post_create,
-            vec![json!("echo feature-post"), json!("echo user-post"),]
+            merged.lifecycle.post_create[1].command,
+            json!("echo user-post")
         );
     }
 
