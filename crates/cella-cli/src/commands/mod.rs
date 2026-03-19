@@ -4,6 +4,7 @@ mod config;
 mod doctor;
 mod down;
 mod exec;
+pub mod image;
 mod init;
 mod list;
 mod logs;

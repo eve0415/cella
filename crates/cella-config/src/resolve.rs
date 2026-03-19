@@ -31,12 +31,22 @@ pub struct ResolvedConfig {
 /// Discovers, parses, merges layers (global → workspace → local),
 /// and computes a config hash.
 ///
+/// When `config_path_override` is provided, discovery is skipped and the
+/// given path is used directly.
+///
 /// # Errors
 ///
 /// Returns `CellaConfigError` if discovery fails, a file cannot be read,
 /// or JSONC/JSON parsing fails.
-pub fn resolve_config(workspace_root: &Path) -> Result<ResolvedConfig, CellaConfigError> {
-    let config_path = discover_config(workspace_root)?;
+pub fn resolve_config(
+    workspace_root: &Path,
+    config_path_override: Option<&Path>,
+) -> Result<ResolvedConfig, CellaConfigError> {
+    let config_path = if let Some(override_path) = config_path_override {
+        override_path.to_path_buf()
+    } else {
+        discover_config(workspace_root)?
+    };
 
     let raw_text =
         std::fs::read_to_string(&config_path).map_err(|source| CellaConfigError::ReadFile {
@@ -138,7 +148,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
 
-        let resolved = resolve_config(tmp.path()).unwrap();
+        let resolved = resolve_config(tmp.path(), None).unwrap();
         assert_eq!(resolved.config["image"], "ubuntu");
         assert!(!resolved.config_hash.is_empty());
     }
@@ -148,8 +158,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
 
-        let r1 = resolve_config(tmp.path()).unwrap();
-        let r2 = resolve_config(tmp.path()).unwrap();
+        let r1 = resolve_config(tmp.path(), None).unwrap();
+        let r2 = resolve_config(tmp.path(), None).unwrap();
         assert_eq!(r1.config_hash, r2.config_hash);
     }
 
@@ -161,8 +171,8 @@ mod tests {
         let tmp2 = TempDir::new().unwrap();
         create_devcontainer(tmp2.path(), r#"{"image": "alpine"}"#);
 
-        let r1 = resolve_config(tmp1.path()).unwrap();
-        let r2 = resolve_config(tmp2.path()).unwrap();
+        let r1 = resolve_config(tmp1.path(), None).unwrap();
+        let r2 = resolve_config(tmp2.path(), None).unwrap();
         assert_ne!(r1.config_hash, r2.config_hash);
     }
 
@@ -179,15 +189,15 @@ mod tests {
         }"#,
         );
 
-        let r1 = resolve_config(tmp1.path()).unwrap();
-        let r2 = resolve_config(tmp2.path()).unwrap();
+        let r1 = resolve_config(tmp1.path(), None).unwrap();
+        let r2 = resolve_config(tmp2.path(), None).unwrap();
         assert_eq!(r1.config_hash, r2.config_hash);
     }
 
     #[test]
     fn resolve_not_found() {
         let tmp = TempDir::new().unwrap();
-        let result = resolve_config(tmp.path());
+        let result = resolve_config(tmp.path(), None);
         assert!(result.is_err());
     }
 
@@ -202,7 +212,7 @@ mod tests {
             .join("devcontainer.local.jsonc");
         std::fs::write(&local_path, r#"{"remoteUser": "vscode"}"#).unwrap();
 
-        let resolved = resolve_config(tmp.path()).unwrap();
+        let resolved = resolve_config(tmp.path(), None).unwrap();
         assert_eq!(resolved.config["remoteUser"], "vscode");
         assert_eq!(resolved.config["image"], "ubuntu");
     }
@@ -215,7 +225,7 @@ mod tests {
             r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder}/data,target=/data"]}"#,
         );
 
-        let resolved = resolve_config(tmp.path()).unwrap();
+        let resolved = resolve_config(tmp.path(), None).unwrap();
         let mount = resolved.config["mounts"][0].as_str().unwrap();
 
         // Should not contain the variable anymore
@@ -238,8 +248,8 @@ mod tests {
             r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder},target=/ws"]}"#,
         );
 
-        let r1 = resolve_config(tmp1.path()).unwrap();
-        let r2 = resolve_config(tmp2.path()).unwrap();
+        let r1 = resolve_config(tmp1.path(), None).unwrap();
+        let r2 = resolve_config(tmp2.path(), None).unwrap();
 
         // Same template but different workspace roots → different substituted values → different hashes
         assert_ne!(r1.config_hash, r2.config_hash);
