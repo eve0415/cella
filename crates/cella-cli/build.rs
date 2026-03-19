@@ -18,8 +18,13 @@ fn main() {
     for (triple, const_name) in &targets {
         let out_bin = format!("{out_dir}/tunnel-server-{}", const_name.to_lowercase());
 
+        // Watch the output binary: if it doesn't exist (previous compilation
+        // failed), cargo re-runs build.rs on the next build, giving us a
+        // chance to succeed after the user installs musl targets.
+        println!("cargo::rerun-if-changed={out_bin}");
+
         // Try cross-compilation with rustc + rust-lld
-        let ok = Command::new("rustc")
+        let output = Command::new("rustc")
             .args([
                 "--edition",
                 "2024",
@@ -39,18 +44,27 @@ fn main() {
                 &out_bin,
                 &src,
             ])
-            .status()
-            .is_ok_and(|s| s.success());
+            .output();
 
-        if ok {
-            writeln!(
-                consts,
-                "pub const TUNNEL_SERVER_{const_name}: &[u8] = include_bytes!(\"{out_bin}\");"
-            )
-            .unwrap();
-        } else {
-            println!("cargo::warning=cross-compile failed for {triple} (target not installed?)");
-            writeln!(consts, "pub const TUNNEL_SERVER_{const_name}: &[u8] = &[];").unwrap();
+        match output {
+            Ok(o) if o.status.success() => {
+                writeln!(
+                    consts,
+                    "pub const TUNNEL_SERVER_{const_name}: &[u8] = include_bytes!(\"{out_bin}\");"
+                )
+                .unwrap();
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // Show first line of error for diagnostics
+                let first_line = stderr.lines().next().unwrap_or("unknown error");
+                println!("cargo::warning=cross-compile {triple}: {first_line}");
+                writeln!(consts, "pub const TUNNEL_SERVER_{const_name}: &[u8] = &[];").unwrap();
+            }
+            Err(e) => {
+                println!("cargo::warning=cross-compile {triple}: {e}");
+                writeln!(consts, "pub const TUNNEL_SERVER_{const_name}: &[u8] = &[];").unwrap();
+            }
         }
     }
 

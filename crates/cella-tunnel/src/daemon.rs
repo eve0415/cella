@@ -111,6 +111,19 @@ pub fn start_daemon_background(
         message: format!("failed to get current exe: {e}"),
     })?;
 
+    // Log daemon output to a file next to the PID file for debugging
+    let stderr_cfg = pid_path
+        .parent()
+        .map(|p| p.join("tunnel-daemon.log"))
+        .and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        })
+        .map_or_else(std::process::Stdio::null, std::process::Stdio::from);
+
     std::process::Command::new(exe)
         .args([
             "tunnel",
@@ -120,9 +133,10 @@ pub fn start_daemon_background(
             "--pid-file",
             &pid_path.to_string_lossy(),
         ])
+        .env("RUST_LOG", "info")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_cfg)
         .spawn()
         .map_err(|e| CellaTunnelError::PidFile {
             message: format!("failed to spawn daemon: {e}"),

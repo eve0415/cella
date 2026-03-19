@@ -166,8 +166,14 @@ async fn run_tunnel_loop(container_id: &str, manager: &TunnelManager) {
 
         match run_single_tunnel(container_id, manager).await {
             Ok(()) => {
-                // Clean exit (container stopped or CLOSE)
+                // Clean exit (container stopped or EOF)
                 info!("Tunnel for {container_id} exited cleanly");
+                manager.update_status(
+                    container_id,
+                    TunnelStatus::Failed {
+                        reason: "tunnel-server exited".to_string(),
+                    },
+                );
                 return;
             }
             Err(e) => {
