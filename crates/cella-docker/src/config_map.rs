@@ -95,7 +95,11 @@ impl CreateContainerOptions {
         Config {
             image: Some(self.image.clone()),
             labels: Some(self.labels.clone()),
-            env: Some(self.env.clone()),
+            env: if self.env.is_empty() {
+                None
+            } else {
+                Some(self.env.clone())
+            },
             user: self.user.clone(),
             working_dir: Some(self.workspace_folder.clone()),
             entrypoint: self.entrypoint.clone(),
@@ -202,18 +206,21 @@ pub fn map_config(
         .unwrap_or(true);
 
     let (entrypoint, cmd) = if override_command {
-        if feature_config.is_some_and(|fc| !fc.entrypoints.is_empty()) {
-            // Features have entrypoints — use docker-init.sh which chains them
-            (
-                Some(vec!["/usr/local/share/docker-init.sh".to_string()]),
-                Some(vec!["while sleep 1000; do :; done".to_string()]),
-            )
-        } else {
-            (
-                Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-                Some(vec!["while sleep 1000; do :; done".to_string()]),
-            )
+        let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
+
+        if let Some(fc) = feature_config {
+            for ep in &fc.entrypoints {
+                script.push_str(ep);
+                script.push('\n');
+            }
         }
+
+        script.push_str("exec \"$@\"\nwhile sleep 1 & wait $!; do :; done");
+
+        (
+            Some(vec!["/bin/sh".to_string()]),
+            Some(vec!["-c".to_string(), script, "-".to_string()]),
+        )
     } else {
         (None, None)
     };
@@ -487,7 +494,11 @@ mod tests {
             Path::new("/tmp/test"),
             None,
         );
-        assert!(opts.entrypoint.is_some());
+        assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        let cmd = opts.cmd.unwrap();
+        assert_eq!(cmd[0], "-c");
+        assert!(cmd[1].contains("while sleep 1 & wait $!; do :; done"));
+        assert_eq!(cmd[2], "-");
     }
 
     #[test]
@@ -699,15 +710,13 @@ mod tests {
             &"SHARED=from_user".to_string()
         );
 
-        // Entrypoint should be docker-init.sh since features have entrypoints
-        assert_eq!(
-            opts.entrypoint,
-            Some(vec!["/usr/local/share/docker-init.sh".to_string()])
-        );
-        assert_eq!(
-            opts.cmd,
-            Some(vec!["while sleep 1000; do :; done".to_string()])
-        );
+        // Entrypoint should be /bin/sh; feature entrypoints embedded in CMD script
+        assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        let cmd = opts.cmd.unwrap();
+        assert_eq!(cmd[0], "-c");
+        assert!(cmd[1].contains("/usr/local/share/docker-init.sh"));
+        assert!(cmd[1].contains("while sleep 1 & wait $!; do :; done"));
+        assert_eq!(cmd[2], "-");
     }
 
     #[test]

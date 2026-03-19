@@ -29,7 +29,11 @@ pub fn generate_dockerfile(
     writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER={image_user}").unwrap();
     writeln!(out, "ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage").unwrap();
+    writeln!(
+        out,
+        "FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage"
+    )
+    .unwrap();
 
     // Track current USER context to avoid redundant directives.
     let mut current_user = image_user;
