@@ -143,7 +143,7 @@ impl UpArgs {
                     .await;
 
                     // Re-register tunnel (daemon may have restarted or timed out)
-                    if env_fwd.needs_tunnel {
+                    if env_fwd.needs_tunnel && has_tunnel_binary() {
                         setup_tunnel(&client, &container.id, is_text).await;
                     }
 
@@ -258,7 +258,7 @@ impl UpArgs {
                         .await;
 
                         // Re-establish tunnel after restart
-                        if env_fwd.needs_tunnel {
+                        if env_fwd.needs_tunnel && has_tunnel_binary() {
                             setup_tunnel(&client, &container.id, is_text).await;
                         }
 
@@ -373,11 +373,7 @@ impl UpArgs {
         // 6.6. Prepare environment forwarding (SSH agent, git config, credential proxy)
         let mut env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
 
-        // Check whether cross-compiled tunnel binaries are available
-        let has_tunnel_binary = !crate::tunnel_binaries::TUNNEL_SERVER_X86_64.is_empty()
-            || !crate::tunnel_binaries::TUNNEL_SERVER_AARCH64.is_empty();
-
-        if env_fwd.needs_tunnel && !has_tunnel_binary {
+        if env_fwd.needs_tunnel && !has_tunnel_binary() {
             // Strip tunnel env vars — container shouldn't advertise sockets that won't exist
             env_fwd
                 .env
@@ -508,7 +504,7 @@ impl UpArgs {
         .await;
 
         // 9.5.1. Start tunnel if needed (OrbStack, Colima, Unknown runtimes)
-        if env_fwd.needs_tunnel && has_tunnel_binary {
+        if env_fwd.needs_tunnel && has_tunnel_binary() {
             setup_tunnel(&client, &container_id, is_text).await;
         }
 
@@ -933,6 +929,12 @@ async fn setup_tunnel(client: &DockerClient, container_id: &str, is_text: bool) 
     success
 }
 
+/// Check whether at least one cross-compiled tunnel-server binary is available.
+const fn has_tunnel_binary() -> bool {
+    !crate::tunnel_binaries::TUNNEL_SERVER_X86_64.is_empty()
+        || !crate::tunnel_binaries::TUNNEL_SERVER_AARCH64.is_empty()
+}
+
 /// Upload the cella-tunnel-server binary into the container.
 async fn upload_tunnel_server(
     client: &DockerClient,
@@ -964,10 +966,7 @@ async fn upload_tunnel_server(
     };
 
     if binary.is_empty() {
-        warn!(
-            "Tunnel server binary not embedded (dev build), SSH/credential forwarding via tunnel unavailable"
-        );
-        return Ok(());
+        return Err("tunnel server binary not available (musl targets not installed)".into());
     }
 
     client
