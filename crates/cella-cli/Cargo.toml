@@ -17,6 +17,7 @@ cella-features.workspace = true
 cella-git.workspace = true
 cella-port.workspace = true
 cella-agent.workspace = true
+chrono.workspace = true
 clap.workspace = true
 hex.workspace = true
 miette.workspace = true

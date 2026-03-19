@@ -53,6 +53,9 @@ hex = "0.4.3"
 # Stream processing
 futures-util = "0.3.31"
 
+# Terminal
+crossterm = "0.28.1"
+
 # Timestamps
 chrono = "0.4.40"
 

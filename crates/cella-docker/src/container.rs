@@ -46,6 +46,14 @@ impl ContainerState {
     }
 }
 
+/// A port binding exposed by the container.
+#[derive(Debug, Clone)]
+pub struct PortBinding {
+    pub container_port: u16,
+    pub host_port: Option<u16>,
+    pub protocol: String,
+}
+
 /// Information about a container.
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
@@ -55,6 +63,8 @@ pub struct ContainerInfo {
     pub exit_code: Option<i64>,
     pub labels: HashMap<String, String>,
     pub config_hash: Option<String>,
+    pub ports: Vec<PortBinding>,
+    pub created_at: Option<String>,
 }
 
 impl DockerClient {
@@ -92,6 +102,24 @@ impl DockerClient {
                 ContainerState::from_str,
             );
 
+            let ports = summary
+                .ports
+                .unwrap_or_default()
+                .iter()
+                .map(|p| PortBinding {
+                    container_port: p.private_port,
+                    host_port: p.public_port,
+                    protocol: p
+                        .typ
+                        .map_or_else(|| "tcp".to_string(), |t| format!("{t:?}").to_lowercase()),
+                })
+                .collect();
+
+            let created_at = summary.created.map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map_or_else(|| ts.to_string(), |dt| dt.to_rfc3339())
+            });
+
             Ok(Some(ContainerInfo {
                 id: summary.id.unwrap_or_default(),
                 name: summary
@@ -104,6 +132,8 @@ impl DockerClient {
                 exit_code: None,
                 labels,
                 config_hash,
+                ports,
+                created_at,
             }))
         } else {
             Ok(None)
@@ -211,6 +241,27 @@ impl DockerClient {
             .trim_start_matches('/')
             .to_string();
 
+        let ports = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.ports.as_ref())
+            .map(|ports_map| {
+                ports_map
+                    .iter()
+                    .filter_map(|(key, _bindings)| {
+                        let parts: Vec<&str> = key.split('/').collect();
+                        let port = parts.first()?.parse::<u16>().ok()?;
+                        let protocol = parts.get(1).unwrap_or(&"tcp").to_string();
+                        Some(PortBinding {
+                            container_port: port,
+                            host_port: None,
+                            protocol,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(ContainerInfo {
             id: inspect.id.unwrap_or_default(),
             name,
@@ -218,7 +269,81 @@ impl DockerClient {
             exit_code,
             labels,
             config_hash,
+            ports,
+            created_at: inspect.created,
         })
+    }
+
+    /// List all cella-managed containers.
+    ///
+    /// Filters by the `dev.cella.workspace_path` label to find containers
+    /// created by cella.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn list_cella_containers(
+        &self,
+        running_only: bool,
+    ) -> Result<Vec<ContainerInfo>, CellaDockerError> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec!["dev.cella.workspace_path".to_string()],
+        )]);
+
+        let options = ListContainersOptions {
+            all: !running_only,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = self.inner().list_containers(Some(options)).await?;
+
+        let mut result = Vec::with_capacity(containers.len());
+        for summary in containers {
+            let labels = summary.labels.clone().unwrap_or_default();
+            let config_hash = labels.get("dev.cella.config_hash").cloned();
+            let state = summary.state.as_deref().map_or_else(
+                || ContainerState::Other("unknown".to_string()),
+                ContainerState::from_str,
+            );
+
+            let ports = summary
+                .ports
+                .unwrap_or_default()
+                .iter()
+                .map(|p| PortBinding {
+                    container_port: p.private_port,
+                    host_port: p.public_port,
+                    protocol: p
+                        .typ
+                        .map_or_else(|| "tcp".to_string(), |t| format!("{t:?}").to_lowercase()),
+                })
+                .collect();
+
+            let created_at = summary.created.map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map_or_else(|| ts.to_string(), |dt| dt.to_rfc3339())
+            });
+
+            result.push(ContainerInfo {
+                id: summary.id.unwrap_or_default(),
+                name: summary
+                    .names
+                    .and_then(|n| n.into_iter().next())
+                    .unwrap_or_default()
+                    .trim_start_matches('/')
+                    .to_string(),
+                state,
+                exit_code: None,
+                labels,
+                config_hash,
+                ports,
+                created_at,
+            });
+        }
+
+        Ok(result)
     }
 
     /// Fetch the last `tail` lines of container logs.

@@ -27,6 +27,10 @@ pub enum CellaDockerError {
     #[error("container not found for workspace: {workspace}")]
     ContainerNotFound { workspace: String },
 
+    /// Container exists but is not running.
+    #[error("{hint}")]
+    ContainerNotRunning { hint: String },
+
     /// A command executed inside the container failed.
     #[error("exec failed (exit code {exit_code}): {command}")]
     ExecFailed { command: String, exit_code: i64 },

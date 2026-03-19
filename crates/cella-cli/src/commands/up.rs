@@ -231,6 +231,19 @@ impl UpArgs {
             &resolved.config_hash,
         );
 
+        // Store exec metadata labels for fast exec/shell without config re-resolution
+        labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
+        labels.insert(
+            "dev.cella.workspace_folder".to_string(),
+            workspace_folder.unwrap_or("/workspaces").to_string(),
+        );
+        if !remote_env.is_empty() {
+            labels.insert(
+                "dev.cella.remote_env".to_string(),
+                serde_json::to_string(&remote_env).unwrap_or_default(),
+            );
+        }
+
         if let Some(ref rf) = resolved_features {
             labels.insert(
                 "devcontainer.metadata".to_string(),

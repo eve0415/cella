@@ -1,9 +1,11 @@
+use std::path::PathBuf;
+
 use clap::Args;
 use serde_json::json;
 use tracing::info;
 
 use super::up::OutputFormat;
-use cella_docker::{ContainerState, DockerClient};
+use cella_docker::{ContainerState, ContainerTarget, DockerClient};
 
 /// Stop the dev container for the current workspace.
 #[derive(Args)]
@@ -16,6 +18,18 @@ pub struct DownArgs {
     #[arg(long, requires = "rm")]
     volumes: bool,
 
+    /// Explicit workspace folder path (defaults to current directory).
+    #[arg(long)]
+    workspace_folder: Option<PathBuf>,
+
+    /// Target container by ID.
+    #[arg(long)]
+    container_id: Option<String>,
+
+    /// Target container by name.
+    #[arg(long)]
+    container_name: Option<String>,
+
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
     docker_host: Option<String>,
@@ -27,19 +41,19 @@ pub struct DownArgs {
 
 impl DownArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = std::env::current_dir()?;
-
-        // Connect to Docker
         let client = match &self.docker_host {
             Some(host) => DockerClient::connect_with_host(host)?,
             None => DockerClient::connect()?,
         };
 
-        // Find container
-        let container = client
-            .find_container(&cwd)
-            .await?
-            .ok_or_else(|| format!("no cella container found for workspace: {}", cwd.display()))?;
+        let target = ContainerTarget {
+            container_id: self.container_id,
+            container_name: self.container_name,
+            id_label: None,
+            workspace_folder: self.workspace_folder,
+        };
+
+        let container = target.resolve(&client, false).await?;
 
         // Stop if running
         if container.state == ContainerState::Running {
