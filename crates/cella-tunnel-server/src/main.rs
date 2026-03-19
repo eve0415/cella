@@ -174,6 +174,16 @@ fn run_server(ssh_agent_path: Option<&str>, credential_path: Option<&str>) {
     let channels: ChannelMap = Arc::new(Mutex::new(HashMap::new()));
     let next_channel = Arc::new(AtomicU32::new(1));
 
+    // Write magic handshake before any frames so the host daemon can
+    // distinguish our binary protocol from docker exec error text.
+    {
+        let mut w = writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = w.write_all(b"CELAMUX\x01\n");
+        let _ = w.flush();
+    }
+
     // Spawn SSH agent socket listener
     if let Some(path) = ssh_agent_path {
         let listener = bind_socket(path);

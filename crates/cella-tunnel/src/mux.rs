@@ -21,6 +21,57 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Maximum frame payload size (64 KiB).
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 
+/// Magic handshake bytes written by tunnel-server before any frames.
+/// Prevents ASCII error text (e.g. "OCI runtime exec failed...") from being
+/// parsed as binary mux frame headers.
+pub const MAGIC: &[u8] = b"CELAMUX\x01\n";
+
+/// Maximum bytes to scan before the magic handshake before giving up.
+const MAX_PRE_MAGIC_BYTES: usize = 4096;
+
+/// Scan for the magic handshake, returning any pre-magic bytes for logging.
+///
+/// Reads one byte at a time until `MAGIC` is found. Returns the bytes
+/// received before the magic (useful for diagnosing error output from
+/// `docker exec`).
+///
+/// # Errors
+///
+/// - `UnexpectedEof` if the stream ends before magic is found.
+/// - `InvalidData` if more than `MAX_PRE_MAGIC_BYTES` are read without finding magic.
+pub async fn read_magic_handshake<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let magic_len = MAGIC.len();
+    let limit = MAX_PRE_MAGIC_BYTES + magic_len;
+
+    loop {
+        let mut byte = [0u8; 1];
+        match reader.read_exact(&mut byte).await {
+            Ok(_) => buf.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF before magic handshake",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+
+        if buf.len() >= magic_len && buf[buf.len() - magic_len..] == *MAGIC {
+            // Remove the magic suffix, return pre-magic bytes
+            buf.truncate(buf.len() - magic_len);
+            return Ok(buf);
+        }
+
+        if buf.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no magic handshake found within {MAX_PRE_MAGIC_BYTES} bytes"),
+            ));
+        }
+    }
+}
+
 /// Frame types sent over the mux wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -470,5 +521,36 @@ mod tests {
         let mut cursor = io::Cursor::new(Vec::<u8>::new());
         let result = read_frame_async(&mut cursor).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn magic_found_immediately() {
+        let mut cursor = io::Cursor::new(MAGIC.to_vec());
+        let pre_magic = read_magic_handshake(&mut cursor).await.unwrap();
+        assert!(pre_magic.is_empty());
+    }
+
+    #[tokio::test]
+    async fn magic_found_after_preamble() {
+        let mut data = b"OCI runtime exec failed\n".to_vec();
+        data.extend_from_slice(MAGIC);
+        let mut cursor = io::Cursor::new(data);
+        let pre_magic = read_magic_handshake(&mut cursor).await.unwrap();
+        assert_eq!(pre_magic, b"OCI runtime exec failed\n");
+    }
+
+    #[tokio::test]
+    async fn magic_not_found_eof() {
+        let mut cursor = io::Cursor::new(b"partial data".to_vec());
+        let result = read_magic_handshake(&mut cursor).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn magic_not_found_limit() {
+        let noise = vec![0xAA; MAX_PRE_MAGIC_BYTES + MAGIC.len() + 100];
+        let mut cursor = io::Cursor::new(noise);
+        let result = read_magic_handshake(&mut cursor).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

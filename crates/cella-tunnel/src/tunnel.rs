@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::CellaTunnelError;
 use crate::mux::{
     ChannelKind, Frame, FrameType, heartbeat_ack_frame, heartbeat_frame, read_frame_async,
-    write_frame_async,
+    read_magic_handshake, write_frame_async,
 };
 
 /// Type alias for the exec stdin writer shared across tasks.
@@ -228,11 +228,41 @@ async fn run_single_tunnel(
         .ok_or_else(|| CellaTunnelError::Tunnel {
             message: "docker exec stdout not available".to_string(),
         })?;
+    let exec_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CellaTunnelError::Tunnel {
+            message: "docker exec stderr not available".to_string(),
+        })?;
+
+    // Spawn async task to read and log stderr from docker exec
+    let stderr_handle = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(exec_stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            warn!("[tunnel-server stderr] {line}");
+        }
+    });
 
     let exec_writer: ExecWriter = Arc::new(TokioMutex::new(exec_stdin));
 
     // Channel map: channel_id → sender for forwarding data to channel handlers
     let channels: ChannelMap = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // Wait for magic handshake before starting frame loop
+    let mut reader = BufReader::new(exec_stdout);
+    match read_magic_handshake(&mut reader).await {
+        Ok(pre_magic) if !pre_magic.is_empty() => {
+            let text = String::from_utf8_lossy(&pre_magic);
+            warn!("Pre-handshake output from container: {text}");
+        }
+        Ok(_) => { /* clean handshake */ }
+        Err(e) => {
+            stderr_handle.abort();
+            return Err(CellaTunnelError::Tunnel {
+                message: format!("handshake failed: {e}"),
+            });
+        }
+    }
 
     // Spawn heartbeat sender
     let heartbeat_writer = Arc::clone(&exec_writer);
@@ -251,7 +281,6 @@ async fn run_single_tunnel(
     });
 
     // Main read loop: read frames from docker exec stdout
-    let mut reader = BufReader::new(exec_stdout);
     let result = loop {
         match read_frame_async(&mut reader).await {
             Ok(None) => {
@@ -271,6 +300,7 @@ async fn run_single_tunnel(
     };
 
     heartbeat_handle.abort();
+    stderr_handle.abort();
 
     // Close all remaining channels
     channels.lock().await.clear();
