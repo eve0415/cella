@@ -79,6 +79,10 @@ impl ShellArgs {
             label_env
         };
         let mut env = base_env;
+
+        // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
+        super::env_cache::ensure_ssh_auth_sock(&client, &container.id, &user, &mut env).await;
+
         for var in TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 env.push(format!("{var}={val}"));

@@ -91,15 +91,37 @@ impl UpArgs {
 
         let remote_env = map_env_object(config.get("remoteEnv"));
         let workspace_folder = config.get("workspaceFolder").and_then(|v| v.as_str());
+        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
+            || "workspace".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+        let workspace_folder_str = workspace_folder.unwrap_or(&default_workspace_folder);
 
         if let Some(container) = existing {
-            // Resolve remote_user for existing container: label > container config > "root"
-            let remote_user = container
-                .labels
-                .get("dev.cella.remote_user")
-                .cloned()
-                .or_else(|| container.container_user.clone())
-                .unwrap_or_else(|| "root".to_string());
+            // Re-resolve remote_user from config (labels may be stale from older containers).
+            // Priority: remoteUser > containerUser > image USER > label fallback > "root"
+            let remote_user = if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
+                u.to_string()
+            } else if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
+                u.to_string()
+            } else if let Some(ref img) = container.image {
+                client
+                    .inspect_image_user(img)
+                    .await
+                    .unwrap_or_else(|_| "root".to_string())
+            } else {
+                container
+                    .labels
+                    .get("dev.cella.remote_user")
+                    .cloned()
+                    .unwrap_or_else(|| "root".to_string())
+            };
+
+            let probe_type = config
+                .get("userEnvProbe")
+                .and_then(|v| v.as_str())
+                .unwrap_or("loginInteractiveShell");
 
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
@@ -107,6 +129,17 @@ impl UpArgs {
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
                     inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
                         .await;
+
+                    if is_text {
+                        eprintln!("Running userEnvProbe...");
+                    }
+                    super::env_cache::probe_and_cache_user_env(
+                        &client,
+                        &container.id,
+                        &remote_user,
+                        probe_type,
+                    )
+                    .await;
 
                     // Already running -- run postAttachCommand and exit
                     if let Some(cmd) = config.get("postAttachCommand") {
@@ -127,7 +160,7 @@ impl UpArgs {
                         "existing",
                         &container.id,
                         &remote_user,
-                        workspace_folder.unwrap_or("/workspaces"),
+                        workspace_folder_str,
                     );
                     return Ok(());
                 }
@@ -156,6 +189,17 @@ impl UpArgs {
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
                     inject_post_start(&client, &container.id, &env_fwd.post_start, &remote_user)
                         .await;
+
+                    if is_text {
+                        eprintln!("Running userEnvProbe...");
+                    }
+                    super::env_cache::probe_and_cache_user_env(
+                        &client,
+                        &container.id,
+                        &remote_user,
+                        probe_type,
+                    )
+                    .await;
 
                     if let Some(cmd) = config.get("postStartCommand") {
                         lifecycle::run_lifecycle_phase(
@@ -188,7 +232,7 @@ impl UpArgs {
                         "started",
                         &container.id,
                         &remote_user,
-                        workspace_folder.unwrap_or("/workspaces"),
+                        workspace_folder_str,
                     );
                     return Ok(());
                 }
@@ -254,12 +298,18 @@ impl UpArgs {
         labels.insert("dev.cella.remote_user".to_string(), remote_user.clone());
         labels.insert(
             "dev.cella.workspace_folder".to_string(),
-            workspace_folder.unwrap_or("/workspaces").to_string(),
+            workspace_folder_str.to_string(),
         );
-        if !remote_env.is_empty() {
+        // Merge forwarding env (SSH_AUTH_SOCK, CELLA_CREDENTIAL_SOCKET, etc.) into the
+        // label so exec/shell can pick them up without re-resolving config.
+        let mut label_remote_env = remote_env.clone();
+        for e in &env_fwd.env {
+            label_remote_env.push(format!("{}={}", e.key, e.value));
+        }
+        if !label_remote_env.is_empty() {
             labels.insert(
                 "dev.cella.remote_env".to_string(),
-                serde_json::to_string(&remote_env).unwrap_or_default(),
+                serde_json::to_string(&label_remote_env).unwrap_or_default(),
             );
         }
 
@@ -417,7 +467,7 @@ impl UpArgs {
             "created",
             &container_id,
             &remote_user,
-            workspace_folder.unwrap_or("/workspaces"),
+            workspace_folder_str,
         );
 
         Ok(())

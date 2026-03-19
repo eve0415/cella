@@ -99,6 +99,9 @@ impl ExecArgs {
         let mut env = base_env;
         env.extend(self.remote_env);
 
+        // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
+        super::env_cache::ensure_ssh_auth_sock(&client, &container.id, &user, &mut env).await;
+
         // Forward terminal environment variables
         for var in TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
