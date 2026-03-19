@@ -10,7 +10,6 @@ use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol};
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-    OCI_IMAGE_MEDIA_TYPE,
 };
 use oci_distribution::secrets::RegistryAuth;
 use tracing::{debug, warn};
@@ -19,6 +18,9 @@ use crate::auth::resolve_credentials;
 use crate::cache::FeatureCache;
 use crate::reference::NormalizedRef;
 use crate::{FeatureError, Platform};
+
+/// Media type for devcontainer feature layers (plain tar).
+const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -253,17 +255,16 @@ fn is_extractable_layer(media_type: &str) -> bool {
         IMAGE_LAYER_GZIP_MEDIA_TYPE
             | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
             | IMAGE_LAYER_MEDIA_TYPE
-            | OCI_IMAGE_MEDIA_TYPE
+            | DEVCONTAINERS_LAYER_MEDIA_TYPE
     ) || media_type.contains("tar+gzip")
         || media_type.contains("tar.gzip")
 }
 
 /// Extract a layer blob (gzip tarball or plain tar) into `dest`.
 fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::io::Result<()> {
-    if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
-        // Check the gzip magic bytes to confirm the blob is actually gzipped.
-        let is_gzip = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
+    let is_gzip = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
 
+    if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
         if is_gzip {
             let gz = GzDecoder::new(blob);
             let mut archive = tar::Archive::new(gz);
@@ -273,8 +274,14 @@ fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::
             let mut archive = tar::Archive::new(blob);
             archive.unpack(dest)?;
         }
+    } else if is_gzip {
+        // Plain tar media type but gzip magic — publisher compressed the blob
+        // without reflecting it in the media type (common with devcontainer features).
+        warn!("layer declared as plain tar but has gzip magic; decompressing");
+        let gz = GzDecoder::new(blob);
+        let mut archive = tar::Archive::new(gz);
+        archive.unpack(dest)?;
     } else {
-        // Plain tar.
         let mut archive = tar::Archive::new(blob);
         archive.unpack(dest)?;
     }
@@ -306,6 +313,20 @@ mod tests {
     #[test]
     fn is_extractable_layer_recognises_plain_tar() {
         assert!(is_extractable_layer(IMAGE_LAYER_MEDIA_TYPE));
+    }
+
+    #[test]
+    fn is_extractable_layer_recognises_devcontainers_tar() {
+        assert!(is_extractable_layer(
+            "application/vnd.devcontainers.layer.v1+tar"
+        ));
+    }
+
+    #[test]
+    fn is_extractable_layer_rejects_manifest_type() {
+        assert!(!is_extractable_layer(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
     }
 
     #[test]
@@ -371,6 +392,65 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&extracted).unwrap(), "content");
     }
 
+    #[test]
+    fn extract_layer_devcontainers_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = tempfile::tempdir().unwrap();
+
+        let src_path = dir.path().join("install.sh");
+        std::fs::write(&src_path, "#!/bin/sh\necho hello").unwrap();
+
+        let buf = Vec::new();
+        let mut tar_builder = tar::Builder::new(buf);
+        tar_builder
+            .append_path_with_name(&src_path, "install.sh")
+            .unwrap();
+        let raw_tar = tar_builder.into_inner().unwrap();
+
+        extract_layer(&raw_tar, DEVCONTAINERS_LAYER_MEDIA_TYPE, staging_dir.path()).unwrap();
+
+        let extracted = staging_dir.path().join("install.sh");
+        assert!(extracted.exists());
+        assert_eq!(
+            std::fs::read_to_string(&extracted).unwrap(),
+            "#!/bin/sh\necho hello"
+        );
+    }
+
+    #[test]
+    fn extract_layer_plain_tar_media_type_with_gzip_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = tempfile::tempdir().unwrap();
+
+        let src_path = dir.path().join("feature.txt");
+        std::fs::write(&src_path, "gzipped-content").unwrap();
+
+        // Create a gzipped tarball.
+        let buf = Vec::new();
+        let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::fast());
+        let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder
+            .append_path_with_name(&src_path, "feature.txt")
+            .unwrap();
+        let encoder = tar_builder.into_inner().unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Pass with a plain tar media type (no "gzip" in the string).
+        extract_layer(
+            &compressed,
+            DEVCONTAINERS_LAYER_MEDIA_TYPE,
+            staging_dir.path(),
+        )
+        .unwrap();
+
+        let extracted = staging_dir.path().join("feature.txt");
+        assert!(extracted.exists());
+        assert_eq!(
+            std::fs::read_to_string(&extracted).unwrap(),
+            "gzipped-content"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Integration test -- requires network access
     // -----------------------------------------------------------------------
@@ -408,6 +488,42 @@ mod tests {
         );
 
         // Fetching again should hit the cache.
+        let path2 = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
+        assert_eq!(path, path2, "second fetch should return cached path");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to ghcr.io"]
+    async fn fetch_github_cli_feature_from_ghcr() {
+        let fetcher = OciFetcher::new();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path());
+
+        let reference = NormalizedRef::OciTarget {
+            registry: "ghcr.io".to_owned(),
+            repository: "devcontainers/features/github-cli".to_owned(),
+            tag: "1".to_owned(),
+        };
+
+        let platform = Platform {
+            os: "linux".to_owned(),
+            architecture: "amd64".to_owned(),
+        };
+
+        let path = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
+
+        assert!(
+            path.join("devcontainer-feature.json").exists(),
+            "devcontainer-feature.json should exist at {}",
+            path.display()
+        );
+        assert!(
+            path.join("install.sh").exists(),
+            "install.sh should exist at {}",
+            path.display()
+        );
+
+        // Second fetch should hit cache.
         let path2 = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
         assert_eq!(path, path2, "second fetch should return cached path");
     }
