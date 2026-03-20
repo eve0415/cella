@@ -45,6 +45,8 @@ impl ShellArgs {
 
         let container = target.resolve(&client, true).await?;
 
+        super::ensure_credential_proxy();
+
         // Read exec metadata from container labels
         let user = container
             .labels

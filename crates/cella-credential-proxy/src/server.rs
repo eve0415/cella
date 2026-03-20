@@ -76,13 +76,36 @@ pub async fn run_tcp_server(
     port_path: &Path,
     last_activity: Arc<AtomicU64>,
 ) -> Result<(), CellaCredentialProxyError> {
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let listener =
+    let preferred_port = std::fs::read_to_string(port_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let listener = if preferred_port != 0 {
+        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
+        match TcpListener::bind(addr).await {
+            Ok(l) => {
+                debug!("Reusing previous TCP port {preferred_port}");
+                l
+            }
+            Err(e) => {
+                warn!("Cannot reclaim TCP port {preferred_port} ({e}), binding new port");
+                let fallback: SocketAddr = ([127, 0, 0, 1], 0).into();
+                TcpListener::bind(fallback).await.map_err(|e| {
+                    CellaCredentialProxyError::Socket {
+                        message: format!("failed to bind TCP: {e}"),
+                    }
+                })?
+            }
+        }
+    } else {
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
         TcpListener::bind(addr)
             .await
             .map_err(|e| CellaCredentialProxyError::Socket {
                 message: format!("failed to bind TCP: {e}"),
-            })?;
+            })?
+    };
 
     let local_addr = listener
         .local_addr()
@@ -196,4 +219,44 @@ pub fn current_time_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TCP port binding"]
+    async fn tcp_server_reuses_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let port_path = dir.path().join("test.port");
+        let activity = Arc::new(AtomicU64::new(current_time_secs()));
+
+        // Write a known port to the port file
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Free the port
+        std::fs::write(&port_path, port.to_string()).unwrap();
+
+        // Start TCP server — should reuse the same port
+        let activity_clone = activity.clone();
+        let port_path_clone = port_path.clone();
+        let handle = tokio::spawn(async move {
+            run_tcp_server(&port_path_clone, activity_clone).await
+        });
+
+        // Give server time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify port file still has the same port
+        let written_port: u16 = std::fs::read_to_string(&port_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(written_port, port);
+
+        handle.abort();
+    }
 }

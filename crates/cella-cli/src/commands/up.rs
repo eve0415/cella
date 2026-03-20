@@ -5,13 +5,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use cella_config::resolve::resolve_config;
-use cella_credential_proxy::daemon;
 use cella_docker::{
     CellaDockerError, ContainerState, DockerClient, ExecOptions, FileToUpload, MountConfig,
     container_labels, container_name, lifecycle, update_remote_user_uid,
-};
-use cella_env::git_credential::{
-    credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
 };
 
 use super::image::ensure_image;
@@ -127,7 +123,7 @@ impl UpArgs {
 
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
-                    ensure_credential_proxy();
+                    super::ensure_credential_proxy();
                     // Re-inject env forwarding (git config + SSH files may have changed)
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
                     timed_step(
@@ -203,7 +199,7 @@ impl UpArgs {
                     client.remove_container(&container.id, false).await?;
                 }
                 (ContainerState::Stopped, false) => {
-                    ensure_credential_proxy();
+                    super::ensure_credential_proxy();
 
                     // Inspect for bind mounts with missing sources
                     let detailed = client.inspect_container(&container.id).await?;
@@ -358,7 +354,7 @@ impl UpArgs {
         };
 
         // 6.5. Ensure credential proxy daemon is running (if host has git credentials)
-        ensure_credential_proxy();
+        super::ensure_credential_proxy();
 
         // 6.6. Prepare environment forwarding (SSH agent, git config, credential proxy)
         let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
@@ -844,24 +840,4 @@ async fn run_lifecycle_entries(
         .await?;
     }
     Ok(())
-}
-
-/// Ensure the credential proxy daemon is running.
-///
-/// Starts it as a background process if not already running.
-/// Logs a warning and continues if it can't be started.
-fn ensure_credential_proxy() {
-    let Some(socket_path) = credential_proxy_socket_path() else {
-        return;
-    };
-    let Some(pid_path) = credential_proxy_pid_path() else {
-        return;
-    };
-    let Some(port_path) = credential_proxy_port_path() else {
-        return;
-    };
-
-    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path) {
-        warn!("Failed to start credential proxy daemon: {e}");
-    }
 }

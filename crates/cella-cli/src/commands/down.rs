@@ -2,10 +2,14 @@ use std::path::PathBuf;
 
 use clap::Args;
 use serde_json::json;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::up::OutputFormat;
+use cella_credential_proxy::daemon::{running_cella_container_count, stop_daemon};
 use cella_docker::{ContainerState, ContainerTarget, DockerClient};
+use cella_env::git_credential::{
+    credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
+};
 
 /// Stop the dev container for the current workspace.
 #[derive(Args)]
@@ -98,6 +102,18 @@ impl DownArgs {
                     );
                 }
             }
+        }
+
+        // Stop credential proxy if no cella containers remain
+        if running_cella_container_count() == 0
+            && let (Some(pid_path), Some(socket_path), Some(port_path)) = (
+                credential_proxy_pid_path(),
+                credential_proxy_socket_path(),
+                credential_proxy_port_path(),
+            )
+            && stop_daemon(&pid_path, &socket_path, &port_path).is_ok()
+        {
+            debug!("Credential proxy daemon stopped (no containers remain)");
         }
 
         Ok(())

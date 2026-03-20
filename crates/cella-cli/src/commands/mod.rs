@@ -19,6 +19,7 @@ mod template;
 mod up;
 
 use clap::Subcommand;
+use tracing::warn;
 
 /// Top-level CLI commands.
 #[derive(Subcommand)]
@@ -81,5 +82,30 @@ impl Command {
             Self::Nvim(args) => args.execute().await,
             Self::CredentialProxy(args) => args.execute().await,
         }
+    }
+}
+
+/// Ensure the credential proxy daemon is running.
+///
+/// Starts it as a background process if not already running.
+/// Logs a warning and continues if it can't be started.
+pub fn ensure_credential_proxy() {
+    use cella_credential_proxy::daemon;
+    use cella_env::git_credential::{
+        credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
+    };
+
+    let Some(socket_path) = credential_proxy_socket_path() else {
+        return;
+    };
+    let Some(pid_path) = credential_proxy_pid_path() else {
+        return;
+    };
+    let Some(port_path) = credential_proxy_port_path() else {
+        return;
+    };
+
+    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path) {
+        warn!("Failed to start credential proxy daemon: {e}");
     }
 }

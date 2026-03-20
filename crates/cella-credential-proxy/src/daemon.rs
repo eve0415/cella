@@ -50,7 +50,6 @@ pub async fn run_daemon(
     let la = last_activity.clone();
     let pid_path_owned = pid_path.to_path_buf();
     let socket_path_owned = socket_path.to_path_buf();
-    let port_path_owned = port_path.to_path_buf();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
@@ -60,15 +59,23 @@ pub async fn run_daemon(
             let elapsed = now.saturating_sub(last);
 
             if elapsed > IDLE_TIMEOUT_SECS {
+                let count = running_cella_container_count();
+                if count > 0 {
+                    debug!(
+                        "Idle timeout reached but {count} cella container(s) still running, staying alive"
+                    );
+                    la.store(current_time_secs(), Ordering::Relaxed);
+                    continue;
+                }
                 info!("Idle timeout ({IDLE_TIMEOUT_SECS}s) reached, shutting down");
-                cleanup(&pid_path_owned, &socket_path_owned, &port_path_owned);
+                cleanup_runtime(&pid_path_owned, &socket_path_owned);
                 std::process::exit(0);
             }
 
             // Check if Docker daemon is reachable
             if !is_docker_reachable() {
                 info!("Docker daemon not reachable, shutting down");
-                cleanup(&pid_path_owned, &socket_path_owned, &port_path_owned);
+                cleanup_runtime(&pid_path_owned, &socket_path_owned);
                 std::process::exit(0);
             }
 
@@ -97,7 +104,7 @@ pub async fn run_daemon(
 /// Check if the daemon is already running.
 ///
 /// Reads the PID file and checks if the process is alive.
-pub fn is_daemon_running(pid_path: &Path, socket_path: &Path, port_path: &Path) -> bool {
+pub fn is_daemon_running(pid_path: &Path, socket_path: &Path, _port_path: &Path) -> bool {
     let Some(pid) = read_pid_file(pid_path) else {
         return false;
     };
@@ -105,9 +112,9 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path, port_path: &Path) 
     // Check if process is alive (signal 0 = check existence)
     let alive = unsafe_process_alive(pid);
     if !alive {
-        // Stale PID file — clean up
+        // Stale PID file — clean up (preserve port file for reuse)
         debug!("Stale PID file found (PID {pid}), cleaning up");
-        cleanup(pid_path, socket_path, port_path);
+        cleanup_runtime(pid_path, socket_path);
         return false;
     }
 
@@ -265,11 +272,41 @@ fn is_docker_reachable() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Count running containers managed by cella.
+///
+/// Returns 0 on any error (Docker unreachable, parse failure, etc.).
+pub fn running_cella_container_count() -> usize {
+    std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=dev.cella.tool=cella",
+            "--filter",
+            "status=running",
+            "-q",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map_or(0, |o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        })
+}
+
 /// Clean up PID file, socket, and port file.
 fn cleanup(pid_path: &Path, socket_path: &Path, port_path: &Path) {
     let _ = std::fs::remove_file(pid_path);
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(port_path);
+}
+
+/// Clean up PID file and socket only, preserving the port file for reuse.
+fn cleanup_runtime(pid_path: &Path, socket_path: &Path) {
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(socket_path);
 }
 
 #[cfg(test)]
@@ -300,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_files() {
+    fn cleanup_removes_all_files() {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("test.pid");
         let socket_path = dir.path().join("test.sock");
@@ -314,6 +351,32 @@ mod tests {
         assert!(!pid_path.exists());
         assert!(!socket_path.exists());
         assert!(!port_path.exists());
+    }
+
+    #[test]
+    fn cleanup_runtime_preserves_port_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("test.pid");
+        let socket_path = dir.path().join("test.sock");
+        let port_path = dir.path().join("test.port");
+        std::fs::write(&pid_path, "12345").unwrap();
+        std::fs::write(&socket_path, "").unwrap();
+        std::fs::write(&port_path, "54321").unwrap();
+
+        cleanup_runtime(&pid_path, &socket_path);
+
+        assert!(!pid_path.exists());
+        assert!(!socket_path.exists());
+        assert!(port_path.exists());
+    }
+
+    #[test]
+    #[ignore = "requires Docker"]
+    fn running_container_count_with_no_containers() {
+        // Docker-dependent: requires Docker to be reachable
+        let count = running_cella_container_count();
+        // When no cella containers are running, count should be 0
+        assert_eq!(count, 0);
     }
 
     #[test]

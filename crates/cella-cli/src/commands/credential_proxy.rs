@@ -103,6 +103,10 @@ fn run_status() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Show container count
+    let container_count = daemon::running_cella_container_count();
+    eprintln!("  Active cella containers: {container_count}");
+
     // Show paths
     let data_dir =
         cella_data_dir().map_or_else(|| "(unknown)".to_string(), |d| d.display().to_string());

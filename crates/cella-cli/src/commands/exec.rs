@@ -65,6 +65,8 @@ impl ExecArgs {
 
         let container = target.resolve(&client, true).await?;
 
+        super::ensure_credential_proxy();
+
         // Read exec metadata from container labels
         let label_user = container.labels.get("dev.cella.remote_user").cloned();
         let label_workdir = container.labels.get("dev.cella.workspace_folder").cloned();
