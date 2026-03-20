@@ -1,26 +1,26 @@
 ---
-source: crates/cella-codegen/src/ir/lower.rs
+source: crates/cella-codegen/src/ir/lower/mod.rs
 expression: result
 ---
 [
     Enum(
         IrEnum {
-            name: "Level",
+            name: "ConfigMode",
             doc: None,
             variants: [
                 IrVariant {
-                    name: "Info",
+                    name: "Fast",
                     doc: None,
                     json_value: Some(
-                        String("info"),
+                        String("fast"),
                     ),
                     ty: None,
                 },
                 IrVariant {
-                    name: "Warn",
+                    name: "Slow",
                     doc: None,
                     json_value: Some(
-                        String("warn"),
+                        String("slow"),
                     ),
                     ty: None,
                 },
@@ -30,23 +30,15 @@ expression: result
     ),
     Struct(
         IrStruct {
-            name: "AppConfig",
+            name: "Config",
             doc: None,
             fields: [
                 IrField {
-                    name: "name",
-                    json_name: "name",
-                    doc: None,
-                    ty: String,
-                    required: true,
-                    deprecated: false,
-                },
-                IrField {
-                    name: "log_level",
-                    json_name: "log_level",
+                    name: "mode",
+                    json_name: "mode",
                     doc: None,
                     ty: Named(
-                        "Level",
+                        "ConfigMode",
                     ),
                     required: false,
                     deprecated: false,

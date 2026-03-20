@@ -1,5 +1,5 @@
 ---
-source: crates/cella-codegen/src/ir/lower.rs
+source: crates/cella-codegen/src/ir/lower/mod.rs
 expression: result
 ---
 [
@@ -9,12 +9,11 @@ expression: result
             doc: None,
             fields: [
                 IrField {
-                    name: "env",
-                    json_name: "env",
+                    name: "data",
+                    json_name: "data",
                     doc: None,
-                    ty: Map(
-                        String,
-                        String,
+                    ty: Vec(
+                        Value,
                     ),
                     required: false,
                     deprecated: false,

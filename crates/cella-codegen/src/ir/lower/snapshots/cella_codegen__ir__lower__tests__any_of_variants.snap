@@ -1,51 +1,58 @@
 ---
-source: crates/cella-codegen/src/ir/lower.rs
+source: crates/cella-codegen/src/ir/lower/mod.rs
 expression: result
 ---
 [
     Enum(
         IrEnum {
-            name: "ConfigValue",
+            name: "Mixed",
             doc: None,
             variants: [
                 IrVariant {
-                    name: "String",
+                    name: "OptA",
+                    doc: None,
+                    json_value: None,
+                    ty: Some(
+                        Named(
+                            "OptA",
+                        ),
+                    ),
+                },
+                IrVariant {
+                    name: "Variant1",
                     doc: None,
                     json_value: None,
                     ty: Some(
                         String,
                     ),
                 },
-                IrVariant {
-                    name: "Integer",
-                    doc: None,
-                    json_value: None,
-                    ty: Some(
-                        I64,
-                    ),
-                },
             ],
-            repr: MultiType,
+            repr: TypedVariants,
         },
     ),
     Struct(
         IrStruct {
-            name: "Config",
+            name: "OptA",
             doc: None,
             fields: [
                 IrField {
-                    name: "value",
-                    json_name: "value",
+                    name: "val",
+                    json_name: "val",
                     doc: None,
-                    ty: Named(
-                        "ConfigValue",
-                    ),
+                    ty: I64,
                     required: false,
                     deprecated: false,
                 },
             ],
             deny_unknown_fields: false,
             is_all_of: false,
+        },
+    ),
+    Alias(
+        IrAlias {
+            name: "Root",
+            doc: None,
+            ty: Value,
         },
     ),
 ]

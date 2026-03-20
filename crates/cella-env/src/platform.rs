@@ -16,6 +16,26 @@ pub enum DockerRuntime {
     Unknown,
 }
 
+impl DockerRuntime {
+    /// Stable label value for container metadata.
+    /// These strings are persisted in Docker labels — do not rename.
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::DockerDesktop => "docker-desktop",
+            Self::OrbStack => "orbstack",
+            Self::LinuxNative => "linux-native",
+            Self::Colima => "colima",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for DockerRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
 /// Detect the Docker runtime from environment variables and Docker context.
 pub fn detect_runtime() -> DockerRuntime {
     // 1. Check DOCKER_HOST for runtime-specific patterns (fast, reliable when set)
@@ -104,5 +124,27 @@ mod tests {
     fn runtime_variants_are_distinguishable() {
         assert_ne!(DockerRuntime::DockerDesktop, DockerRuntime::OrbStack);
         assert_ne!(DockerRuntime::LinuxNative, DockerRuntime::Unknown);
+    }
+
+    #[test]
+    fn as_label_returns_stable_strings() {
+        assert_eq!(DockerRuntime::DockerDesktop.as_label(), "docker-desktop");
+        assert_eq!(DockerRuntime::OrbStack.as_label(), "orbstack");
+        assert_eq!(DockerRuntime::LinuxNative.as_label(), "linux-native");
+        assert_eq!(DockerRuntime::Colima.as_label(), "colima");
+        assert_eq!(DockerRuntime::Unknown.as_label(), "unknown");
+    }
+
+    #[test]
+    fn display_matches_as_label() {
+        for runtime in [
+            DockerRuntime::DockerDesktop,
+            DockerRuntime::OrbStack,
+            DockerRuntime::LinuxNative,
+            DockerRuntime::Colima,
+            DockerRuntime::Unknown,
+        ] {
+            assert_eq!(format!("{runtime}"), runtime.as_label());
+        }
     }
 }

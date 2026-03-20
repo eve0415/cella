@@ -310,6 +310,12 @@ impl UpArgs {
                     client.remove_container(&container.id, false).await?;
                     // Fall through to create path
                 }
+                (ContainerState::Running, false) => {
+                    // build_no_cache=true with running container: stop, remove, rebuild
+                    info!("Stopping container for --build-no-cache...");
+                    client.stop_container(&container.id).await?;
+                    client.remove_container(&container.id, false).await?;
+                }
                 (_, true) => {
                     // Rebuild: stop if running, then remove
                     if container.state == ContainerState::Running {
@@ -317,9 +323,13 @@ impl UpArgs {
                     }
                     client.remove_container(&container.id, false).await?;
                 }
-                _ => {
-                    // Other state (Created, Removing, etc.) -- remove and recreate
-                    let _ = client.remove_container(&container.id, false).await;
+                (ContainerState::Created, false) => {
+                    // Created but never started — remove and recreate
+                    client.remove_container(&container.id, false).await?;
+                }
+                (_, false) => {
+                    // Other state (Removing, etc.) — remove and recreate
+                    client.remove_container(&container.id, false).await?;
                 }
             }
         }

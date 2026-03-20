@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config_map;
 pub mod container;
+mod docker_api_impl;
 mod error;
 pub mod exec;
 pub mod image;
@@ -10,7 +11,7 @@ pub mod resolve;
 pub mod uid;
 pub mod upload;
 
-pub use client::DockerClient;
+pub use client::{DockerApi, DockerClient};
 pub use config_map::{CreateContainerOptions, MountConfig};
 pub use container::{ContainerInfo, ContainerState, MountInfo, PortBinding};
 pub use error::CellaDockerError;

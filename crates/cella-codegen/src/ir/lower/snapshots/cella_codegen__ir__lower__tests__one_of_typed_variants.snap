@@ -1,34 +1,16 @@
 ---
-source: crates/cella-codegen/src/ir/lower.rs
+source: crates/cella-codegen/src/ir/lower/mod.rs
 expression: result
 ---
 [
     Struct(
         IrStruct {
-            name: "Base",
+            name: "Alpha",
             doc: None,
             fields: [
                 IrField {
-                    name: "id",
-                    json_name: "id",
-                    doc: None,
-                    ty: I64,
-                    required: false,
-                    deprecated: false,
-                },
-            ],
-            deny_unknown_fields: false,
-            is_all_of: false,
-        },
-    ),
-    Struct(
-        IrStruct {
-            name: "CombinedPart1",
-            doc: None,
-            fields: [
-                IrField {
-                    name: "extra",
-                    json_name: "extra",
+                    name: "x",
+                    json_name: "x",
                     doc: None,
                     ty: String,
                     required: false,
@@ -41,32 +23,49 @@ expression: result
     ),
     Struct(
         IrStruct {
-            name: "Combined",
+            name: "Beta",
             doc: None,
             fields: [
                 IrField {
-                    name: "base",
-                    json_name: "",
+                    name: "y",
+                    json_name: "y",
                     doc: None,
-                    ty: Named(
-                        "Base",
-                    ),
-                    required: true,
-                    deprecated: false,
-                },
-                IrField {
-                    name: "part_1",
-                    json_name: "",
-                    doc: None,
-                    ty: Named(
-                        "CombinedPart1",
-                    ),
-                    required: true,
+                    ty: I64,
+                    required: false,
                     deprecated: false,
                 },
             ],
             deny_unknown_fields: false,
-            is_all_of: true,
+            is_all_of: false,
+        },
+    ),
+    Enum(
+        IrEnum {
+            name: "Choice",
+            doc: None,
+            variants: [
+                IrVariant {
+                    name: "Alpha",
+                    doc: None,
+                    json_value: None,
+                    ty: Some(
+                        Named(
+                            "Alpha",
+                        ),
+                    ),
+                },
+                IrVariant {
+                    name: "Beta",
+                    doc: None,
+                    json_value: None,
+                    ty: Some(
+                        Named(
+                            "Beta",
+                        ),
+                    ),
+                },
+            ],
+            repr: TypedVariants,
         },
     ),
     Alias(

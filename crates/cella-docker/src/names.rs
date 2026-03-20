@@ -90,6 +90,7 @@ pub fn container_labels(
     workspace_root: &Path,
     config_path: &Path,
     config_hash: &str,
+    docker_runtime: &str,
 ) -> HashMap<String, String> {
     let mut labels = HashMap::new();
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
@@ -110,6 +111,10 @@ pub fn container_labels(
             .to_string(),
     );
     labels.insert("dev.cella.config_hash".to_string(), config_hash.to_string());
+    labels.insert(
+        "dev.cella.docker_runtime".to_string(),
+        docker_runtime.to_string(),
+    );
     labels.insert("dev.cella.created_at".to_string(), Utc::now().to_rfc3339());
     labels
 }
@@ -196,11 +201,24 @@ mod tests {
             &PathBuf::from("/tmp/test"),
             &PathBuf::from("/tmp/test/.devcontainer/devcontainer.json"),
             "abc123",
+            "linux-native",
         );
         assert_eq!(labels["dev.cella.tool"], "cella");
         assert_eq!(labels["dev.cella.config_hash"], "abc123");
+        assert_eq!(labels["dev.cella.docker_runtime"], "linux-native");
         assert!(labels.contains_key("dev.cella.workspace_path"));
         assert!(labels.contains_key("dev.cella.config_path"));
         assert!(labels.contains_key("dev.cella.created_at"));
+    }
+
+    #[test]
+    fn labels_contain_docker_runtime() {
+        let labels = container_labels(
+            &PathBuf::from("/tmp/test"),
+            &PathBuf::from("/tmp/test/.devcontainer/devcontainer.json"),
+            "hash",
+            "orbstack",
+        );
+        assert_eq!(labels["dev.cella.docker_runtime"], "orbstack");
     }
 }

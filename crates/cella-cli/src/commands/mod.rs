@@ -1,5 +1,5 @@
 mod branch;
-mod build_cmd;
+mod build;
 mod config;
 mod credential;
 mod credential_proxy;
@@ -34,7 +34,7 @@ pub enum Command {
     /// Execute a command inside the running dev container.
     Exec(exec::ExecArgs),
     /// Build the dev container image without starting it.
-    Build(build_cmd::BuildArgs),
+    Build(build::BuildArgs),
     /// List all dev containers managed by cella.
     List(list::ListArgs),
     /// View logs from the dev container.

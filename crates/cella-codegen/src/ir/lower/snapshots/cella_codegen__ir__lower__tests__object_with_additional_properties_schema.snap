@@ -1,5 +1,5 @@
 ---
-source: crates/cella-codegen/src/ir/lower.rs
+source: crates/cella-codegen/src/ir/lower/mod.rs
 expression: result
 ---
 [
@@ -9,10 +9,11 @@ expression: result
             doc: None,
             fields: [
                 IrField {
-                    name: "maybe",
-                    json_name: "maybe",
+                    name: "env",
+                    json_name: "env",
                     doc: None,
-                    ty: Option(
+                    ty: Map(
+                        String,
                         String,
                     ),
                     required: false,

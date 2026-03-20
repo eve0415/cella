@@ -1,11 +1,19 @@
 //! Map devcontainer.json config to Docker API types.
 
+mod env;
+mod mounts;
+mod ports;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use bollard::container::Config;
 use bollard::models::{HostConfig, Mount, MountTypeEnum, PortBinding, PortMap};
 use cella_features::FeatureContainerConfig;
+
+use env::{map_container_env, map_remote_env};
+use mounts::{map_additional_mounts, map_workspace_mount, parse_mount_string};
+use ports::map_port_bindings;
 
 /// Options for creating a container (pre-mapped from devcontainer.json).
 #[derive(Debug, Clone)]
@@ -255,161 +263,6 @@ pub fn map_config(
         security_opt,
         privileged,
     }
-}
-
-fn map_workspace_mount(
-    config: &serde_json::Value,
-    workspace_root: &Path,
-    workspace_folder: &str,
-) -> Option<MountConfig> {
-    if let Some(mount_str) = config.get("workspaceMount").and_then(|v| v.as_str()) {
-        if mount_str.is_empty() {
-            return None; // Explicitly disabled
-        }
-        return parse_mount_string(mount_str);
-    }
-
-    // Default workspace mount
-    Some(MountConfig {
-        mount_type: "bind".to_string(),
-        source: workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-        target: workspace_folder.to_string(),
-        consistency: Some("cached".to_string()),
-    })
-}
-
-fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
-    let Some(mounts) = config.get("mounts").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-
-    mounts
-        .iter()
-        .filter_map(|m| match m {
-            serde_json::Value::String(s) => parse_mount_string(s),
-            serde_json::Value::Object(obj) => {
-                let mount_type = obj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("bind")
-                    .to_string();
-                let source = obj
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let target = obj
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if target.is_empty() {
-                    return None;
-                }
-
-                Some(MountConfig {
-                    mount_type,
-                    source,
-                    target,
-                    consistency: None,
-                })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn parse_mount_string(s: &str) -> Option<MountConfig> {
-    let mut mount_type = "bind".to_string();
-    let mut source = String::new();
-    let mut target = String::new();
-    let mut consistency = None;
-
-    for part in s.split(',') {
-        if let Some((key, value)) = part.split_once('=') {
-            match key.trim() {
-                "type" => mount_type = value.to_string(),
-                "source" | "src" => source = value.to_string(),
-                "target" | "dst" | "destination" => target = value.to_string(),
-                "consistency" => consistency = Some(value.to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    if target.is_empty() {
-        return None;
-    }
-
-    Some(MountConfig {
-        mount_type,
-        source,
-        target,
-        consistency,
-    })
-}
-
-fn map_container_env(config: &serde_json::Value) -> Vec<String> {
-    let Some(env_obj) = config.get("containerEnv").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-
-    env_obj
-        .iter()
-        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
-        .collect()
-}
-
-fn map_remote_env(config: &serde_json::Value) -> Vec<String> {
-    let Some(env_obj) = config.get("remoteEnv").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-
-    env_obj
-        .iter()
-        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
-        .collect()
-}
-
-fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, Vec<PortBinding>> {
-    let Some(ports) = config.get("forwardPorts").and_then(|v| v.as_array()) else {
-        return HashMap::new();
-    };
-
-    let ports_attrs = config.get("portsAttributes").and_then(|v| v.as_object());
-    let mut bindings = HashMap::new();
-
-    for port_value in ports {
-        let port = match port_value {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            _ => continue,
-        };
-
-        let protocol = ports_attrs
-            .and_then(|attrs| attrs.get(&port))
-            .and_then(|attr| attr.get("protocol"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("tcp");
-
-        let container_port = format!("{port}/{protocol}");
-        let host_port = port.clone();
-
-        bindings.insert(
-            container_port,
-            vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(host_port),
-            }],
-        );
-    }
-
-    bindings
 }
 
 fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
