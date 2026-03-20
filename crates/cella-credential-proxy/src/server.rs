@@ -242,9 +242,8 @@ mod tests {
         // Start TCP server — should reuse the same port
         let activity_clone = activity.clone();
         let port_path_clone = port_path.clone();
-        let handle = tokio::spawn(async move {
-            run_tcp_server(&port_path_clone, activity_clone).await
-        });
+        let handle =
+            tokio::spawn(async move { run_tcp_server(&port_path_clone, activity_clone).await });
 
         // Give server time to bind
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

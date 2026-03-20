@@ -473,6 +473,18 @@ impl UpArgs {
         )
         .await;
 
+        // 9.7. Seed gh CLI credentials (first create only)
+        let settings = cella_config::CellaSettings::load(&resolved.workspace_root);
+        if settings.credentials.gh {
+            seed_gh_credentials(
+                &client,
+                &container_id,
+                &resolved.workspace_root,
+                &remote_user,
+            )
+            .await;
+        }
+
         // 9.6. Probe and cache user environment (userEnvProbe)
         let probe_type = config
             .get("userEnvProbe")
@@ -840,4 +852,101 @@ async fn run_lifecycle_entries(
         .await?;
     }
     Ok(())
+}
+
+/// Seed gh CLI credentials into a container.
+///
+/// Extracts tokens from the host's gh CLI and uploads `hosts.yml` and `config.yml`
+/// into the container. Skips silently if gh is not installed/authenticated or if
+/// credentials already exist in the container.
+async fn seed_gh_credentials(
+    client: &DockerClient,
+    container_id: &str,
+    workspace_root: &std::path::Path,
+    remote_user: &str,
+) {
+    let config_dir = cella_env::gh_credential::gh_config_dir_for_user(remote_user);
+
+    // Check if gh credentials already exist in container
+    let check_cmd = cella_env::gh_credential::gh_config_exists_in_container(&config_dir);
+    if client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: check_cmd,
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+    {
+        tracing::debug!("gh credentials already present in container, skipping seed");
+        return;
+    }
+
+    // Prepare credentials from host
+    let Some(gh_creds) =
+        cella_env::gh_credential::prepare_gh_credentials(workspace_root, remote_user)
+    else {
+        return;
+    };
+
+    // Create the config directory
+    if let Err(e) = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("mkdir -p {config_dir} && chmod 700 {config_dir}"),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        warn!("Failed to create gh config directory: {e}");
+        return;
+    }
+
+    // Upload credential files
+    let docker_files: Vec<FileToUpload> = gh_creds
+        .file_uploads
+        .iter()
+        .map(|f| FileToUpload {
+            path: f.container_path.clone(),
+            content: f.content.clone(),
+            mode: f.mode,
+        })
+        .collect();
+
+    if let Err(e) = client.upload_files(container_id, &docker_files).await {
+        warn!("Failed to upload gh credential files: {e}");
+        return;
+    }
+
+    // Fix ownership
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "chown".to_string(),
+                    "-R".to_string(),
+                    format!("{remote_user}:{remote_user}"),
+                    config_dir.clone(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    info!("Seeded gh CLI credentials into container");
 }

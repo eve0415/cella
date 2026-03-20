@@ -1,14 +1,9 @@
-pub mod diagnostic;
-pub mod discover;
-mod error;
-pub mod jsonc;
-pub mod merge;
-pub mod parse;
-pub mod resolve;
-pub mod span;
-pub mod subst;
+pub mod devcontainer;
+pub mod settings;
 
-pub use error::CellaConfigError;
+// Re-export all devcontainer modules at crate root for backward compatibility.
+pub use devcontainer::*;
+pub use settings::CellaSettings;
 
 /// Types and validators generated from the devcontainer JSON Schema.
 #[allow(

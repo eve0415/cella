@@ -5,6 +5,7 @@
 //! for the container.
 
 mod error;
+pub mod gh_credential;
 pub mod git_config;
 pub mod git_credential;
 pub mod platform;

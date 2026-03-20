@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
+use crate::CellaConfigError;
 use crate::diagnostic::ConfigDiagnostic;
 use crate::discover::discover_config;
-use crate::error::CellaConfigError;
 use crate::jsonc;
 use crate::merge::merge_layers;
 use crate::parse::parse_devcontainer;

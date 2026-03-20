@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn real_devcontainer_json() {
-        let input = include_str!("../../../.devcontainer/devcontainer.json");
+        let input = include_str!("../../../../.devcontainer/devcontainer.json");
         let result = parse_devcontainer("devcontainer.json", input, false);
         match result {
             Ok((_config, warnings)) => {
