@@ -1,11 +1,12 @@
-//! Unix socket listener and connection handler.
+//! Socket listener and connection handler (Unix + TCP).
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, info, warn};
 
 use crate::CellaCredentialProxyError;
@@ -51,7 +52,7 @@ pub async fn run_server(
             Ok((stream, _)) => {
                 last_activity.store(current_time_secs(), Ordering::Relaxed);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream).await {
+                    if let Err(e) = handle_stream(stream).await {
                         warn!("Connection handler error: {e}");
                     }
                 });
@@ -63,8 +64,67 @@ pub async fn run_server(
     }
 }
 
-/// Handle a single client connection.
-async fn handle_connection(mut stream: UnixStream) -> Result<(), CellaCredentialProxyError> {
+/// Start the credential proxy server on a TCP socket bound to localhost.
+///
+/// Binds to `127.0.0.1:0` (OS-assigned port) and writes the allocated port
+/// to `port_path` for clients to discover.
+///
+/// # Errors
+///
+/// Returns error if binding or port file writing fails.
+pub async fn run_tcp_server(
+    port_path: &Path,
+    last_activity: Arc<AtomicU64>,
+) -> Result<(), CellaCredentialProxyError> {
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let listener =
+        TcpListener::bind(addr)
+            .await
+            .map_err(|e| CellaCredentialProxyError::Socket {
+                message: format!("failed to bind TCP: {e}"),
+            })?;
+
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| CellaCredentialProxyError::Socket {
+            message: format!("failed to get local addr: {e}"),
+        })?;
+    let port = local_addr.port();
+
+    // Write port file so clients can discover the TCP port
+    if let Some(parent) = port_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(port_path, port.to_string()).map_err(|e| {
+        CellaCredentialProxyError::PidFile {
+            message: format!("failed to write port file: {e}"),
+        }
+    })?;
+
+    info!("Credential proxy TCP listening on 127.0.0.1:{port}");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                last_activity.store(current_time_secs(), Ordering::Relaxed);
+                debug!("TCP connection from {peer}");
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stream(stream).await {
+                        warn!("TCP connection handler error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("TCP accept error: {e}");
+            }
+        }
+    }
+}
+
+/// Handle a single client connection on any async stream.
+async fn handle_stream(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+) -> Result<(), CellaCredentialProxyError> {
     let mut buf = vec![0u8; 8192];
     let n = stream
         .read(&mut buf)

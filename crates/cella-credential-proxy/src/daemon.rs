@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::CellaCredentialProxyError;
-use crate::server::{current_time_secs, run_server};
+use crate::server::{current_time_secs, run_server, run_tcp_server};
 
 /// Default idle timeout (30 minutes).
 const IDLE_TIMEOUT_SECS: u64 = 30 * 60;
@@ -19,7 +19,8 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 /// Run the credential proxy daemon.
 ///
 /// This is the main entry point for `cella credential-proxy daemon`.
-/// Creates the PID file, starts the server, and monitors for shutdown conditions.
+/// Creates the PID file, starts both Unix socket and TCP listeners,
+/// and monitors for shutdown conditions.
 ///
 /// # Errors
 ///
@@ -27,6 +28,7 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 pub async fn run_daemon(
     socket_path: &Path,
     pid_path: &Path,
+    port_path: &Path,
 ) -> Result<(), CellaCredentialProxyError> {
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
@@ -48,6 +50,7 @@ pub async fn run_daemon(
     let la = last_activity.clone();
     let pid_path_owned = pid_path.to_path_buf();
     let socket_path_owned = socket_path.to_path_buf();
+    let port_path_owned = port_path.to_path_buf();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
@@ -58,14 +61,14 @@ pub async fn run_daemon(
 
             if elapsed > IDLE_TIMEOUT_SECS {
                 info!("Idle timeout ({IDLE_TIMEOUT_SECS}s) reached, shutting down");
-                cleanup(&pid_path_owned, &socket_path_owned);
+                cleanup(&pid_path_owned, &socket_path_owned, &port_path_owned);
                 std::process::exit(0);
             }
 
             // Check if Docker daemon is reachable
             if !is_docker_reachable() {
                 info!("Docker daemon not reachable, shutting down");
-                cleanup(&pid_path_owned, &socket_path_owned);
+                cleanup(&pid_path_owned, &socket_path_owned, &port_path_owned);
                 std::process::exit(0);
             }
 
@@ -73,11 +76,20 @@ pub async fn run_daemon(
         }
     });
 
-    // Run the server (blocks until error)
+    // Start TCP server alongside the Unix socket server
+    let tcp_activity = last_activity.clone();
+    let port_path_owned = port_path.to_path_buf();
+    tokio::spawn(async move {
+        if let Err(e) = run_tcp_server(&port_path_owned, tcp_activity).await {
+            warn!("TCP server error: {e}");
+        }
+    });
+
+    // Run the Unix socket server (blocks until error)
     let result = run_server(socket_path, last_activity).await;
 
     // Clean up on exit
-    cleanup(pid_path, socket_path);
+    cleanup(pid_path, socket_path, port_path);
 
     result
 }
@@ -85,7 +97,7 @@ pub async fn run_daemon(
 /// Check if the daemon is already running.
 ///
 /// Reads the PID file and checks if the process is alive.
-pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
+pub fn is_daemon_running(pid_path: &Path, socket_path: &Path, port_path: &Path) -> bool {
     let Some(pid) = read_pid_file(pid_path) else {
         return false;
     };
@@ -95,7 +107,7 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
     if !alive {
         // Stale PID file — clean up
         debug!("Stale PID file found (PID {pid}), cleaning up");
-        cleanup(pid_path, socket_path);
+        cleanup(pid_path, socket_path, port_path);
         return false;
     }
 
@@ -113,6 +125,7 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
 pub fn start_daemon_background(
     socket_path: &Path,
     pid_path: &Path,
+    port_path: &Path,
 ) -> Result<(), CellaCredentialProxyError> {
     let exe = std::env::current_exe().map_err(|e| CellaCredentialProxyError::PidFile {
         message: format!("failed to get current exe: {e}"),
@@ -126,6 +139,8 @@ pub fn start_daemon_background(
             &socket_path.to_string_lossy(),
             "--pid-file",
             &pid_path.to_string_lossy(),
+            "--port-file",
+            &port_path.to_string_lossy(),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -149,13 +164,14 @@ pub fn start_daemon_background(
 pub fn ensure_daemon_running(
     socket_path: &Path,
     pid_path: &Path,
+    port_path: &Path,
 ) -> Result<PathBuf, CellaCredentialProxyError> {
-    if is_daemon_running(pid_path, socket_path) {
+    if is_daemon_running(pid_path, socket_path, port_path) {
         debug!("Credential proxy daemon already running");
         return Ok(socket_path.to_path_buf());
     }
 
-    start_daemon_background(socket_path, pid_path)?;
+    start_daemon_background(socket_path, pid_path, port_path)?;
 
     // Brief wait for the daemon to create its socket
     for _ in 0..20 {
@@ -174,7 +190,11 @@ pub fn ensure_daemon_running(
 /// # Errors
 ///
 /// Returns `CellaCredentialProxyError::NotRunning` if no daemon is running.
-pub fn stop_daemon(pid_path: &Path, socket_path: &Path) -> Result<(), CellaCredentialProxyError> {
+pub fn stop_daemon(
+    pid_path: &Path,
+    socket_path: &Path,
+    port_path: &Path,
+) -> Result<(), CellaCredentialProxyError> {
     let pid = read_pid_file(pid_path).ok_or(CellaCredentialProxyError::NotRunning)?;
 
     // Send SIGTERM
@@ -194,7 +214,7 @@ pub fn stop_daemon(pid_path: &Path, socket_path: &Path) -> Result<(), CellaCrede
             .status();
     }
 
-    cleanup(pid_path, socket_path);
+    cleanup(pid_path, socket_path, port_path);
     info!("Credential proxy daemon stopped");
     Ok(())
 }
@@ -245,10 +265,11 @@ fn is_docker_reachable() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Clean up PID file and socket.
-fn cleanup(pid_path: &Path, socket_path: &Path) {
+/// Clean up PID file, socket, and port file.
+fn cleanup(pid_path: &Path, socket_path: &Path, port_path: &Path) {
     let _ = std::fs::remove_file(pid_path);
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(port_path);
 }
 
 #[cfg(test)]
@@ -283,13 +304,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("test.pid");
         let socket_path = dir.path().join("test.sock");
+        let port_path = dir.path().join("test.port");
         std::fs::write(&pid_path, "12345").unwrap();
         std::fs::write(&socket_path, "").unwrap();
+        std::fs::write(&port_path, "54321").unwrap();
 
-        cleanup(&pid_path, &socket_path);
+        cleanup(&pid_path, &socket_path, &port_path);
 
         assert!(!pid_path.exists());
         assert!(!socket_path.exists());
+        assert!(!port_path.exists());
     }
 
     #[test]
@@ -297,6 +321,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("test.pid");
         let socket_path = dir.path().join("test.sock");
-        assert!(!is_daemon_running(&pid_path, &socket_path));
+        let port_path = dir.path().join("test.port");
+        assert!(!is_daemon_running(&pid_path, &socket_path, &port_path));
     }
 }

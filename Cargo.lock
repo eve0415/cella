@@ -268,7 +268,6 @@ dependencies = [
  "cella-features",
  "cella-git",
  "cella-port",
- "cella-tunnel",
  "chrono",
  "clap",
  "hex",
@@ -387,20 +386,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
 ]
-
-[[package]]
-name = "cella-tunnel"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cella-tunnel-server"
-version = "0.1.0"
 
 [[package]]
 name = "cesu8"

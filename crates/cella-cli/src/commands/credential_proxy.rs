@@ -5,7 +5,8 @@ use clap::{Args, Subcommand};
 use cella_credential_proxy::client::daemon_status;
 use cella_credential_proxy::daemon;
 use cella_env::git_credential::{
-    cella_data_dir, credential_proxy_pid_path, credential_proxy_socket_path,
+    cella_data_dir, credential_proxy_pid_path, credential_proxy_port_path,
+    credential_proxy_socket_path,
 };
 
 /// Manage the credential proxy daemon (internal).
@@ -33,6 +34,9 @@ struct DaemonArgs {
     /// PID file path override.
     #[arg(long)]
     pid_file: Option<PathBuf>,
+    /// TCP port file path override.
+    #[arg(long)]
+    port_file: Option<PathBuf>,
 }
 
 impl CredentialProxyArgs {
@@ -54,8 +58,12 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> 
         .pid_file
         .or_else(credential_proxy_pid_path)
         .ok_or("cannot determine PID file path: HOME not set")?;
+    let port_path = args
+        .port_file
+        .or_else(credential_proxy_port_path)
+        .ok_or("cannot determine port file path: HOME not set")?;
 
-    daemon::run_daemon(&socket_path, &pid_path).await?;
+    daemon::run_daemon(&socket_path, &pid_path, &port_path).await?;
     Ok(())
 }
 
@@ -64,8 +72,10 @@ fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
         credential_proxy_socket_path().ok_or("cannot determine socket path: HOME not set")?;
     let pid_path =
         credential_proxy_pid_path().ok_or("cannot determine PID file path: HOME not set")?;
+    let port_path =
+        credential_proxy_port_path().ok_or("cannot determine port file path: HOME not set")?;
 
-    daemon::stop_daemon(&pid_path, &socket_path)?;
+    daemon::stop_daemon(&pid_path, &socket_path, &port_path)?;
     eprintln!("Credential proxy daemon stopped.");
     Ok(())
 }

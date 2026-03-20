@@ -10,9 +10,9 @@ use cella_docker::{
     CellaDockerError, ContainerState, DockerClient, ExecOptions, FileToUpload, MountConfig,
     container_labels, container_name, lifecycle, update_remote_user_uid,
 };
-use cella_env::git_credential::{credential_proxy_pid_path, credential_proxy_socket_path};
-
-use super::tunnel::{tunnel_pid_path, tunnel_socket_path};
+use cella_env::git_credential::{
+    credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
+};
 
 use super::image::ensure_image;
 
@@ -142,11 +142,6 @@ impl UpArgs {
                     )
                     .await;
 
-                    // Re-register tunnel (daemon may have restarted or timed out)
-                    if env_fwd.needs_tunnel && has_tunnel_binary() {
-                        setup_tunnel(&client, &container.id, is_text).await;
-                    }
-
                     timed_step(
                         is_text,
                         "Running userEnvProbe...",
@@ -257,11 +252,6 @@ impl UpArgs {
                         )
                         .await;
 
-                        // Re-establish tunnel after restart
-                        if env_fwd.needs_tunnel && has_tunnel_binary() {
-                            setup_tunnel(&client, &container.id, is_text).await;
-                        }
-
                         timed_step(
                             is_text,
                             "Running userEnvProbe...",
@@ -371,23 +361,7 @@ impl UpArgs {
         ensure_credential_proxy();
 
         // 6.6. Prepare environment forwarding (SSH agent, git config, credential proxy)
-        let mut env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-
-        if env_fwd.needs_tunnel && !has_tunnel_binary() {
-            // Strip tunnel env vars — container shouldn't advertise sockets that won't exist
-            env_fwd
-                .env
-                .retain(|e| e.key != "SSH_AUTH_SOCK" && e.key != "CELLA_CREDENTIAL_SOCKET");
-            env_fwd
-                .post_start
-                .git_config_commands
-                .retain(|cmd| !cmd.iter().any(|arg| arg.contains("cella-tunnel-server")));
-            eprintln!("\x1b[33mWARNING:\x1b[0m Tunnel server binary not available.");
-            eprintln!("  SSH agent and credential forwarding will not work in the container.");
-            eprintln!(
-                "  Install musl targets: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl"
-            );
-        }
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
 
         // 7. Create container
         let mut labels = container_labels(
@@ -502,11 +476,6 @@ impl UpArgs {
             inject_post_start(&client, &container_id, &env_fwd.post_start, &remote_user),
         )
         .await;
-
-        // 9.5.1. Start tunnel if needed (OrbStack, Colima, Unknown runtimes)
-        if env_fwd.needs_tunnel && has_tunnel_binary() {
-            setup_tunnel(&client, &container_id, is_text).await;
-        }
 
         // 9.6. Probe and cache user environment (userEnvProbe)
         let probe_type = config
@@ -877,126 +846,6 @@ async fn run_lifecycle_entries(
     Ok(())
 }
 
-/// Set up tunnel forwarding for a container.
-///
-/// Ensures the tunnel daemon is running, uploads the tunnel-server binary,
-/// and registers the container with the daemon.
-/// Returns `true` if tunnel was set up successfully, `false` on any failure.
-async fn setup_tunnel(client: &DockerClient, container_id: &str, is_text: bool) -> bool {
-    if is_text {
-        eprint!("Setting up tunnel forwarding...");
-    }
-    let start = std::time::Instant::now();
-    let mut success = false;
-
-    // 1. Ensure tunnel daemon is running
-    ensure_tunnel_daemon();
-
-    // 2. Upload tunnel-server binary to container
-    if let Err(e) = upload_tunnel_server(client, container_id).await {
-        warn!("Failed to upload tunnel server: {e}");
-        if is_text {
-            eprintln!(" (skipped)");
-        }
-        return false;
-    }
-
-    // 3. Register container with tunnel daemon
-    if let Some(socket_path) = tunnel_socket_path() {
-        match cella_tunnel::client::connect_container(&socket_path, container_id) {
-            Ok(response) if response.trim() == "ok" => {
-                info!("Tunnel registered for container {container_id}");
-                success = true;
-            }
-            Ok(response) => {
-                warn!("Tunnel registration response: {}", response.trim());
-            }
-            Err(e) => {
-                warn!("Failed to register tunnel: {e}");
-            }
-        }
-    }
-
-    if is_text {
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() >= 100 {
-            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-        } else {
-            eprintln!();
-        }
-    }
-
-    success
-}
-
-/// Check whether at least one cross-compiled tunnel-server binary is available.
-const fn has_tunnel_binary() -> bool {
-    !crate::tunnel_binaries::TUNNEL_SERVER_X86_64.is_empty()
-        || !crate::tunnel_binaries::TUNNEL_SERVER_AARCH64.is_empty()
-}
-
-/// Upload the cella-tunnel-server binary into the container.
-async fn upload_tunnel_server(
-    client: &DockerClient,
-    container_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Detect container architecture
-    let arch_result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["uname".to_string(), "-m".to_string()],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await?;
-
-    let arch = arch_result.stdout.trim().to_string();
-
-    // Select the embedded binary for this arch
-    let binary = match arch.as_str() {
-        "x86_64" | "amd64" => crate::tunnel_binaries::TUNNEL_SERVER_X86_64,
-        "aarch64" | "arm64" => crate::tunnel_binaries::TUNNEL_SERVER_AARCH64,
-        other => {
-            warn!("Unsupported arch {other} for tunnel server");
-            return Ok(());
-        }
-    };
-
-    if binary.is_empty() {
-        return Err("tunnel server binary not available (musl targets not installed)".into());
-    }
-
-    client
-        .upload_files(
-            container_id,
-            &[FileToUpload {
-                path: "/usr/local/bin/cella-tunnel-server".to_string(),
-                content: binary.to_vec(),
-                mode: 0o755,
-            }],
-        )
-        .await?;
-
-    Ok(())
-}
-
-/// Ensure the tunnel daemon is running.
-fn ensure_tunnel_daemon() {
-    let Some(socket_path) = tunnel_socket_path() else {
-        return;
-    };
-    let Some(pid_path) = tunnel_pid_path() else {
-        return;
-    };
-
-    if let Err(e) = cella_tunnel::daemon::ensure_daemon_running(&socket_path, &pid_path) {
-        warn!("Failed to start tunnel daemon: {e}");
-    }
-}
-
 /// Ensure the credential proxy daemon is running.
 ///
 /// Starts it as a background process if not already running.
@@ -1008,8 +857,11 @@ fn ensure_credential_proxy() {
     let Some(pid_path) = credential_proxy_pid_path() else {
         return;
     };
+    let Some(port_path) = credential_proxy_port_path() else {
+        return;
+    };
 
-    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path) {
+    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path) {
         warn!("Failed to start credential proxy daemon: {e}");
     }
 }

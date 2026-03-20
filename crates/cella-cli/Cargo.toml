@@ -3,7 +3,6 @@ name = "cella-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [[bin]]
 name = "cella"
@@ -18,7 +17,6 @@ cella-features.workspace = true
 cella-git.workspace = true
 cella-port.workspace = true
 cella-agent.workspace = true
-cella-tunnel.workspace = true
 chrono.workspace = true
 clap.workspace = true
 hex.workspace = true

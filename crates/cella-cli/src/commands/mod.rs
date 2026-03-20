@@ -3,8 +3,6 @@ mod build_cmd;
 mod config;
 mod credential_proxy;
 mod doctor;
-// Tunnel subcommand is defined below but the module is declared here
-// to keep alphabetical ordering consistent with other hidden commands.
 mod down;
 mod env_cache;
 mod exec;
@@ -18,7 +16,6 @@ mod shell;
 mod spawn;
 mod switch;
 mod template;
-mod tunnel;
 mod up;
 
 use clap::Subcommand;
@@ -61,9 +58,6 @@ pub enum Command {
     /// Manage the credential proxy daemon.
     #[command(name = "credential-proxy", hide = true)]
     CredentialProxy(credential_proxy::CredentialProxyArgs),
-    /// Manage the tunnel daemon.
-    #[command(name = "tunnel", hide = true)]
-    Tunnel(tunnel::TunnelArgs),
 }
 
 impl Command {
@@ -86,7 +80,6 @@ impl Command {
             Self::Init(args) => args.execute().await,
             Self::Nvim(args) => args.execute().await,
             Self::CredentialProxy(args) => args.execute().await,
-            Self::Tunnel(args) => args.execute().await,
         }
     }
 }

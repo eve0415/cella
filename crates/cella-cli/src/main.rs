@@ -1,7 +1,4 @@
 mod commands;
-mod tunnel_binaries {
-    include!(concat!(env!("OUT_DIR"), "/tunnel_binaries.rs"));
-}
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;

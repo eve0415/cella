@@ -54,8 +54,6 @@ pub struct EnvForwarding {
     pub env: Vec<ForwardEnv>,
     /// Post-start injection (after container start + UID remap).
     pub post_start: PostStartInjection,
-    /// Whether the container needs tunnel-based forwarding (`OrbStack`, Colima, Unknown).
-    pub needs_tunnel: bool,
 }
 
 /// Post-start injection commands and files.
@@ -130,35 +128,26 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
     }
 
     // Credential proxy forwarding
-    if ssh_agent::needs_tunnel(&runtime) {
-        // Tunnel runtimes: SSH and credential forwarding handled by the tunnel daemon.
-        // Sockets are created inside the container by cella-tunnel-server.
-        tracing::info!("Using tunnel-based forwarding for SSH and credentials");
-        fwd.needs_tunnel = true;
-
-        // Set SSH_AUTH_SOCK to tunnel-server's socket path (no mount needed)
-        if std::env::var("SSH_AUTH_SOCK")
-            .ok()
-            .is_some_and(|s| !s.is_empty())
-        {
+    if needs_tcp_credential_proxy(&runtime) {
+        // VM-based runtimes: use TCP via host.docker.internal
+        if let Some(tcp) = git_credential::credential_forwarding_tcp() {
+            tracing::info!(
+                "Credential proxy forwarding via TCP (host.docker.internal:{})",
+                tcp.port
+            );
             fwd.env.push(ForwardEnv {
-                key: "SSH_AUTH_SOCK".to_string(),
-                value: "/tmp/cella-ssh-agent.sock".to_string(),
+                key: "CELLA_CREDENTIAL_HOST".to_string(),
+                value: format!("host.docker.internal:{}", tcp.port),
             });
+            // No mount needed — TCP connection via Docker networking
+            fwd.post_start.credential_helper =
+                Some(git_credential::credential_helper_script(remote_user));
+            fwd.post_start
+                .git_config_commands
+                .push(credential_helper_git_config());
         }
-
-        // Set credential socket env var (no mount needed)
-        fwd.env.push(ForwardEnv {
-            key: "CELLA_CREDENTIAL_SOCKET".to_string(),
-            value: "/tmp/cella-credential-proxy.sock".to_string(),
-        });
-
-        // Configure git to use the tunnel-server binary as credential helper
-        fwd.post_start
-            .git_config_commands
-            .extend(git_credential::tunnel_credential_helper_commands());
     } else if let Some(cred) = git_credential::credential_forwarding() {
-        // Bind-mount runtimes: mount the credential proxy socket directly.
+        // Direct runtimes (Linux, Docker Desktop): bind-mount socket
         tracing::info!(
             "Credential proxy forwarding: {} -> {}",
             cred.mount_source,
@@ -174,16 +163,29 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
         });
         fwd.post_start.credential_helper =
             Some(git_credential::credential_helper_script(remote_user));
-
-        // Configure git to use the credential helper
-        fwd.post_start.git_config_commands.push(vec![
-            "git".to_string(),
-            "config".to_string(),
-            "--global".to_string(),
-            "credential.helper".to_string(),
-            "/usr/local/bin/cella-git-credential-helper".to_string(),
-        ]);
+        fwd.post_start
+            .git_config_commands
+            .push(credential_helper_git_config());
     }
 
     fwd
+}
+
+/// Whether a runtime needs TCP-based credential proxy instead of socket bind-mount.
+const fn needs_tcp_credential_proxy(runtime: &DockerRuntime) -> bool {
+    matches!(
+        runtime,
+        DockerRuntime::OrbStack | DockerRuntime::Colima | DockerRuntime::Unknown
+    )
+}
+
+/// Git config command to set the credential helper.
+fn credential_helper_git_config() -> Vec<String> {
+    vec![
+        "git".to_string(),
+        "config".to_string(),
+        "--global".to_string(),
+        "credential.helper".to_string(),
+        "/usr/local/bin/cella-git-credential-helper".to_string(),
+    ]
 }

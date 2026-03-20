@@ -4,7 +4,6 @@ use clap::Args;
 use serde_json::json;
 use tracing::info;
 
-use super::tunnel::tunnel_socket_path;
 use super::up::OutputFormat;
 use cella_docker::{ContainerState, ContainerTarget, DockerClient};
 
@@ -55,13 +54,6 @@ impl DownArgs {
         };
 
         let container = target.resolve(&client, false).await?;
-
-        // Best-effort tunnel disconnect
-        if let Some(socket_path) = tunnel_socket_path()
-            && let Err(e) = cella_tunnel::client::disconnect_container(&socket_path, &container.id)
-        {
-            tracing::debug!("Tunnel disconnect (best-effort): {e}");
-        }
 
         // Stop if running
         if container.state == ContainerState::Running {
