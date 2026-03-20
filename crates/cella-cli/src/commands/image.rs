@@ -23,6 +23,7 @@ pub async fn build_features_layer(
     config_name: Option<&str>,
     resolved: &ResolvedFeatures,
     base_image: &str,
+    image_user: &str,
     no_cache: bool,
     is_text: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -38,6 +39,10 @@ pub async fn build_features_layer(
     args.insert(
         "_DEV_CONTAINERS_BASE_IMAGE".to_string(),
         base_image.to_string(),
+    );
+    args.insert(
+        "_DEV_CONTAINERS_IMAGE_USER".to_string(),
+        image_user.to_string(),
     );
 
     let build_opts = BuildOptions {
@@ -155,6 +160,7 @@ pub async fn ensure_image(
         config_name,
         &resolved,
         &base_image_tag,
+        &image_user,
         no_cache,
         is_text,
     )

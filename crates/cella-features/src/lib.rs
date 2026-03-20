@@ -11,7 +11,10 @@ pub mod reference;
 pub mod types;
 
 pub use cache::FeatureCache;
-pub use dockerfile::{generate_dockerfile, generate_entrypoint_script};
+pub use dockerfile::{
+    generate_builtin_env, generate_dockerfile, generate_entrypoint_script, generate_feature_env,
+    generate_wrapper_script,
+};
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
 pub use merge::{merge_features, merge_with_devcontainer, validate_options};
@@ -127,8 +130,24 @@ pub async fn resolve_features(
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
     // Step 8: Generate Dockerfile and build context.
-    let dockerfile = generate_dockerfile(base_image, image_user, &resolved);
+    let container_user = config
+        .get("containerUser")
+        .and_then(|v| v.as_str())
+        .unwrap_or(image_user);
+    let remote_user = config
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .unwrap_or(container_user);
+
+    let dockerfile = generate_dockerfile(
+        base_image,
+        image_user,
+        container_user,
+        remote_user,
+        &resolved,
+    );
     let entrypoint_script = generate_entrypoint_script(&resolved);
+    let builtin_env = generate_builtin_env(container_user, remote_user);
 
     // Step 9: Prepare build context on disk.
     prepare_build_context(
@@ -136,6 +155,7 @@ pub async fn resolve_features(
         &resolved,
         &dockerfile,
         entrypoint_script.as_deref(),
+        &builtin_env,
     )?;
 
     // Step 10: Merge feature metadata.
@@ -362,14 +382,17 @@ fn assemble_resolved(
     resolved
 }
 
-/// Write the build context directory: feature dirs, Dockerfile, init script.
+/// Write the build context directory: feature dirs, Dockerfile, env files, wrapper scripts.
 fn prepare_build_context(
     build_context: &Path,
     resolved: &[ResolvedFeature],
     dockerfile: &str,
     entrypoint_script: Option<&str>,
+    builtin_env: &str,
 ) -> Result<(), FeatureError> {
     std::fs::create_dir_all(build_context)?;
+
+    let has_installable = resolved.iter().any(|f| f.has_install_script);
 
     for feature in resolved {
         let dest = build_context.join(&feature.id);
@@ -377,9 +400,29 @@ fn prepare_build_context(
             std::fs::remove_dir_all(&dest)?;
         }
         copy_dir_recursive(&feature.artifact_dir, &dest)?;
+
+        // Write per-feature env and wrapper script for installable features
+        if feature.has_install_script {
+            std::fs::write(
+                dest.join("devcontainer-features.env"),
+                generate_feature_env(feature),
+            )?;
+            std::fs::write(
+                dest.join("devcontainer-features-install.sh"),
+                generate_wrapper_script(&feature.id),
+            )?;
+        }
     }
 
     std::fs::write(build_context.join("Dockerfile.features"), dockerfile)?;
+
+    // Write builtin env file at build context root (only if features need it)
+    if has_installable {
+        std::fs::write(
+            build_context.join("devcontainer-features.builtin.env"),
+            builtin_env,
+        )?;
+    }
 
     if let Some(script) = entrypoint_script {
         std::fs::write(build_context.join("docker-init.sh"), script)?;
@@ -782,6 +825,50 @@ mod tests {
 
         // Verify Dockerfile contains the feature.
         assert!(result.dockerfile.contains("my-feature"));
+
+        // Verify new build context files: builtin env, per-feature env, wrapper script.
+        assert!(
+            result
+                .build_context
+                .join("devcontainer-features.builtin.env")
+                .exists()
+        );
+        assert!(
+            result
+                .build_context
+                .join("my-feature")
+                .join("devcontainer-features.env")
+                .exists()
+        );
+        assert!(
+            result
+                .build_context
+                .join("my-feature")
+                .join("devcontainer-features-install.sh")
+                .exists()
+        );
+
+        // Verify builtin env content.
+        let builtin_env = std::fs::read_to_string(
+            result
+                .build_context
+                .join("devcontainer-features.builtin.env"),
+        )
+        .unwrap();
+        assert!(builtin_env.contains("_CONTAINER_USER=root"));
+        assert!(builtin_env.contains("_REMOTE_USER=root"));
+
+        // Verify wrapper script sources env files.
+        let wrapper = std::fs::read_to_string(
+            result
+                .build_context
+                .join("my-feature")
+                .join("devcontainer-features-install.sh"),
+        )
+        .unwrap();
+        assert!(wrapper.contains(". ../devcontainer-features.builtin.env"));
+        assert!(wrapper.contains(". ./devcontainer-features.env"));
+        assert!(wrapper.contains("./install.sh"));
 
         // Verify metadata label is valid JSON.
         let label_parsed: serde_json::Value = serde_json::from_str(&result.metadata_label).unwrap();

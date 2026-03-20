@@ -1,0 +1,6 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: env
+---
+_CONTAINER_USER=developer
+_REMOTE_USER=admin

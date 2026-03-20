@@ -8,15 +8,25 @@ ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
 
 FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage
 
+USER root
+
+COPY devcontainer-features.builtin.env /tmp/dev-container-features/devcontainer-features.builtin.env
+RUN echo "_CONTAINER_USER_HOME=$( (command -v getent >/dev/null 2>&1 && getent passwd 'root' || grep -E '^root:' /etc/passwd || true) | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env \
+    && echo "_REMOTE_USER_HOME=$( (command -v getent >/dev/null 2>&1 && getent passwd 'root' || grep -E '^root:' /etc/passwd || true) | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env
+
 # Feature: installer (ghcr.io/example/installer:1)
 COPY --chown=root:root installer/ /tmp/dev-container-features/installer/
-RUN chmod +x /tmp/dev-container-features/installer/install.sh \
+RUN chmod -R 0755 /tmp/dev-container-features/installer \
     && cd /tmp/dev-container-features/installer \
-    && ./install.sh
+    && chmod +x ./devcontainer-features-install.sh \
+    && ./devcontainer-features-install.sh \
+    && rm -rf /tmp/dev-container-features/installer
 
 # Entrypoint init script
 COPY docker-init.sh /usr/local/share/docker-init.sh
 RUN chmod +x /usr/local/share/docker-init.sh
 
-# Cleanup
 RUN rm -rf /tmp/dev-container-features
+
+ARG _DEV_CONTAINERS_IMAGE_USER=root
+USER $_DEV_CONTAINERS_IMAGE_USER

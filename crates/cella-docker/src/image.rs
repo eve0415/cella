@@ -12,6 +12,19 @@ use tracing::{debug, info};
 use crate::CellaDockerError;
 use crate::client::DockerClient;
 
+/// Extract the user/uid portion from a Docker USER value.
+///
+/// Docker USER can be `"user"`, `"user:group"`, `"uid"`, or `"uid:gid"`.
+/// Returns just the user/uid part, or `"root"` if empty.
+pub(crate) fn normalize_user(raw: &str) -> String {
+    let user = raw.split(':').next().unwrap_or("");
+    if user.is_empty() {
+        "root".to_string()
+    } else {
+        user.to_string()
+    }
+}
+
 /// Options for building a Docker image from a Dockerfile.
 pub struct BuildOptions {
     pub image_name: String,
@@ -222,17 +235,12 @@ impl DockerClient {
     pub async fn inspect_image_user(&self, image: &str) -> Result<String, CellaDockerError> {
         match self.inner().inspect_image(image).await {
             Ok(details) => {
-                let user = details
+                let raw = details
                     .config
                     .as_ref()
                     .and_then(|c| c.user.as_deref())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(if user.is_empty() {
-                    "root".to_string()
-                } else {
-                    user
-                })
+                    .unwrap_or("");
+                Ok(normalize_user(raw))
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
@@ -323,5 +331,35 @@ mod tests {
         assert!(args.contains(&"--pull".to_string()));
         // Context path is always last
         assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    #[test]
+    fn normalize_user_plain_username() {
+        assert_eq!(normalize_user("vscode"), "vscode");
+    }
+
+    #[test]
+    fn normalize_user_with_group() {
+        assert_eq!(normalize_user("vscode:vscode"), "vscode");
+    }
+
+    #[test]
+    fn normalize_user_uid_only() {
+        assert_eq!(normalize_user("1000"), "1000");
+    }
+
+    #[test]
+    fn normalize_user_uid_gid() {
+        assert_eq!(normalize_user("1000:1000"), "1000");
+    }
+
+    #[test]
+    fn normalize_user_empty_defaults_to_root() {
+        assert_eq!(normalize_user(""), "root");
+    }
+
+    #[test]
+    fn normalize_user_colon_only_defaults_to_root() {
+        assert_eq!(normalize_user(":1000"), "root");
     }
 }

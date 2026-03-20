@@ -8,16 +8,21 @@ ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE
 
 FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage
 
-USER developer
+USER root
+
+COPY devcontainer-features.builtin.env /tmp/dev-container-features/devcontainer-features.builtin.env
+RUN echo "_CONTAINER_USER_HOME=$( (command -v getent >/dev/null 2>&1 && getent passwd 'vscode' || grep -E '^vscode:' /etc/passwd || true) | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env \
+    && echo "_REMOTE_USER_HOME=$( (command -v getent >/dev/null 2>&1 && getent passwd 'vscode' || grep -E '^vscode:' /etc/passwd || true) | cut -d: -f6)" >> /tmp/dev-container-features/devcontainer-features.builtin.env
 
 # Feature: custom-tool (ghcr.io/example/custom-tool:1)
 COPY --chown=root:root custom-tool/ /tmp/dev-container-features/custom-tool/
-RUN chmod +x /tmp/dev-container-features/custom-tool/install.sh \
+RUN chmod -R 0755 /tmp/dev-container-features/custom-tool \
     && cd /tmp/dev-container-features/custom-tool \
-    && ./install.sh
+    && chmod +x ./devcontainer-features-install.sh \
+    && ./devcontainer-features-install.sh \
+    && rm -rf /tmp/dev-container-features/custom-tool
 
-# Cleanup
 RUN rm -rf /tmp/dev-container-features
 
-# Reset user
-USER vscode
+ARG _DEV_CONTAINERS_IMAGE_USER=root
+USER $_DEV_CONTAINERS_IMAGE_USER

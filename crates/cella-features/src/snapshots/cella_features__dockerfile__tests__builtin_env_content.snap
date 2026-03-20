@@ -1,0 +1,6 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: env
+---
+_CONTAINER_USER=vscode
+_REMOTE_USER=vscode

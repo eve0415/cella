@@ -13,6 +13,7 @@ use tracing::{debug, info};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
+use crate::image::normalize_user;
 
 /// Container state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +285,7 @@ impl DockerClient {
             .as_ref()
             .and_then(|c| c.user.as_deref())
             .filter(|u| !u.is_empty())
-            .map(String::from);
+            .map(normalize_user);
 
         let image = inspect.config.as_ref().and_then(|c| c.image.clone());
 

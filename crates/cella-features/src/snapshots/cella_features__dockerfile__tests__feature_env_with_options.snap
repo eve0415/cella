@@ -1,0 +1,6 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: env
+---
+NODEGYPDEPENDENCIES="true"
+VERSION="18"

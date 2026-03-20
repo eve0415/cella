@@ -1,0 +1,13 @@
+---
+source: crates/cella-features/src/dockerfile.rs
+expression: script
+---
+#!/bin/sh
+set -e
+cd /tmp/dev-container-features/node
+chmod +x ./install.sh
+set -a
+. ../devcontainer-features.builtin.env
+. ./devcontainer-features.env
+set +a
+./install.sh
