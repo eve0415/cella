@@ -1,9 +1,69 @@
 # cella-config
 
-Devcontainer configuration parsing and management.
+> Devcontainer configuration parsing, validation, and layer merging.
 
-Responsibilities:
-- Parse devcontainer.json (with JSONC support)
-- Config layer merging (workspace → user → defaults)
-- Template management
-- Type-safe access to devcontainer schema fields via codegen
+Part of the [cella](../../README.md) workspace.
+
+## Overview
+
+cella-config handles everything related to devcontainer.json: discovering config files, parsing JSONC (JSON with comments), merging configuration layers, validating against the devcontainer schema, and providing type-safe access to all configuration properties.
+
+The crate uses build-time code generation via cella-codegen to produce typed Rust structs directly from the [devcontainer JSON Schema](https://containers.dev/implementors/json_reference/). This ensures that schema changes are automatically reflected in the Rust API without manual synchronization.
+
+Configuration is merged in layer order: global (`~/.config/cella/global.jsonc`) -> workspace (`devcontainer.json`) -> local (`devcontainer.local.jsonc`). Scalar values are overridden by lower layers, arrays are concatenated and deduplicated, and maps merge with lower layer keys winning.
+
+### Spec Coverage
+
+Parses all devcontainer.json properties defined in the [Dev Container specification](https://containers.dev/implementors/json_reference/): `image`, `build` (dockerfile, context, args, target), `features`, lifecycle commands (`initializeCommand`, `postCreateCommand`, `postStartCommand`, `postAttachCommand`), `remoteEnv`, `containerEnv`, `mounts`, `forwardPorts`, `portsAttributes`, `remoteUser`, `containerUser`, `customizations`, and more.
+
+## Architecture
+
+### Key Types
+
+- `DevContainer` — generated struct representing a fully parsed devcontainer.json (via `schema` module)
+- `CellaSettings` — cella-specific TOML configuration (`~/.cella/config.toml`, `.devcontainer/cella.toml`)
+
+### Modules
+
+| Module | Purpose |
+|--------|---------|
+| `devcontainer/discover` | Locates devcontainer.json files in workspace directories |
+| `devcontainer/jsonc` | Single-pass JSONC preprocessor (strips comments, preserves byte offsets) |
+| `devcontainer/parse` | Parses preprocessed JSON into typed config structs |
+| `devcontainer/merge` | Merges config layers (global -> workspace -> local) |
+| `devcontainer/resolve` | Resolves variable references and paths |
+| `devcontainer/subst` | Variable substitution (`${localWorkspaceFolder}`, etc.) |
+| `devcontainer/diagnostic` | Source-positioned error diagnostics via miette |
+| `devcontainer/span` | Byte offset tracking for mapping errors back to source locations |
+| `settings/` | CellaSettings parsing and credential forwarding configuration |
+| `schema` | Auto-generated types from devcontainer JSON Schema (via `build.rs`) |
+
+### Build System
+
+`build.rs` invokes cella-codegen to generate typed Rust structs from the devcontainer JSON Schema. The output is written to `OUT_DIR/generated.rs` and included via `include!()` in the `schema` module.
+
+## Crate Dependencies
+
+**Depends on:** [cella-codegen](../cella-codegen) (build-time only)
+
+**Depended on by:** [cella-cli](../cella-cli)
+
+## Testing
+
+```sh
+cargo test -p cella-config
+```
+
+Tests use snapshot assertions via insta for config parsing and merging. Tempfile-based tests verify config discovery and file I/O. After modifying parsing or codegen output:
+
+```sh
+cargo insta review
+```
+
+## Development
+
+The JSONC preprocessor is a single-pass state machine that preserves byte offsets. This is critical for diagnostics — every parse error can be traced back to the exact position in the original `.jsonc` file. Do not use string replacement on raw JSON as it breaks offset tracking.
+
+When the devcontainer schema changes upstream, update the schema JSON in the build inputs. Codegen will produce new types automatically. Run `cargo insta review` to accept the updated snapshots.
+
+Config merge logic has specific rules for different value types (scalars override, arrays concatenate, maps merge). When adding support for new config properties, ensure the merge behavior matches the devcontainer spec.
