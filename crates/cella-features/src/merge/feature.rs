@@ -14,8 +14,11 @@ use super::helpers::{deep_merge, extend_dedup};
 /// - `entrypoint`: collect into ordered list
 /// - lifecycle commands: collect in install order
 /// - `customizations`: deep merge in install order
-pub fn merge_features(features: &[ResolvedFeature]) -> FeatureContainerConfig {
-    let mut config = FeatureContainerConfig::default();
+pub fn merge_features(
+    features: &[ResolvedFeature],
+    base: Option<FeatureContainerConfig>,
+) -> FeatureContainerConfig {
+    let mut config = base.unwrap_or_default();
 
     for feature in features {
         let meta = &feature.metadata;
@@ -125,7 +128,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(
             config.mounts,
@@ -155,7 +158,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(
             config.cap_add,
@@ -185,7 +188,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(
             config.security_opt,
@@ -219,7 +222,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
         assert!(config.privileged);
     }
 
@@ -242,7 +245,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
         assert!(!config.privileged);
     }
 
@@ -265,7 +268,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
         assert!(config.init);
     }
 
@@ -294,7 +297,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(config.container_env.get("FOO").unwrap(), "from_b");
         assert_eq!(config.container_env.get("BAR").unwrap(), "from_a");
@@ -327,7 +330,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(
             config.entrypoints,
@@ -356,7 +359,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         assert_eq!(config.lifecycle.on_create.len(), 2);
         assert_eq!(config.lifecycle.on_create[0].origin, "a");
@@ -414,7 +417,7 @@ mod tests {
             ),
         ];
 
-        let config = merge_features(&features);
+        let config = merge_features(&features, None);
 
         // Deep merge: b's extensions replace a's (array is non-object, overlay wins),
         // but settings are merged at key level.
@@ -426,7 +429,7 @@ mod tests {
 
     #[test]
     fn empty_features_produces_default_config() {
-        let config = merge_features(&[]);
+        let config = merge_features(&[], None);
 
         assert!(config.mounts.is_empty());
         assert!(config.cap_add.is_empty());

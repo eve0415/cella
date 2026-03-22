@@ -12,7 +12,7 @@ use crate::CellaDockerError;
 use crate::config_map::CreateContainerOptions;
 use crate::container::ContainerInfo;
 use crate::exec::{ExecOptions, ExecResult, InteractiveExecOptions};
-use crate::image::BuildOptions;
+use crate::image::{BuildOptions, ImageDetails};
 use crate::upload::FileToUpload;
 
 /// Boxed future type alias for async trait methods.
@@ -158,15 +158,10 @@ pub trait DockerApi: Send + Sync {
 
     fn image_exists<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<bool, CellaDockerError>>;
 
-    fn inspect_image_env<'a>(
+    fn inspect_image_details<'a>(
         &'a self,
         image: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<String>, CellaDockerError>>;
-
-    fn inspect_image_user<'a>(
-        &'a self,
-        image: &'a str,
-    ) -> BoxFuture<'a, Result<String, CellaDockerError>>;
+    ) -> BoxFuture<'a, Result<ImageDetails, CellaDockerError>>;
 
     // -- Upload operations --
 
@@ -192,7 +187,7 @@ pub mod mock {
     use crate::config_map::CreateContainerOptions;
     use crate::container::ContainerInfo;
     use crate::exec::{ExecOptions, ExecResult, InteractiveExecOptions};
-    use crate::image::BuildOptions;
+    use crate::image::{BuildOptions, ImageDetails};
     use crate::upload::FileToUpload;
 
     use super::{BoxFuture, DockerApi};
@@ -251,10 +246,7 @@ pub mod mock {
         ImageExists {
             image: String,
         },
-        InspectImageEnv {
-            image: String,
-        },
-        InspectImageUser {
+        InspectImageDetails {
             image: String,
         },
         UploadFiles {
@@ -283,8 +275,8 @@ pub mod mock {
         pub pull_image_responses: Mutex<VecDeque<Result<(), CellaDockerError>>>,
         pub build_image_responses: Mutex<VecDeque<Result<String, CellaDockerError>>>,
         pub image_exists_responses: Mutex<VecDeque<Result<bool, CellaDockerError>>>,
-        pub inspect_image_env_responses: Mutex<VecDeque<Result<Vec<String>, CellaDockerError>>>,
-        pub inspect_image_user_responses: Mutex<VecDeque<Result<String, CellaDockerError>>>,
+        pub inspect_image_details_responses:
+            Mutex<VecDeque<Result<ImageDetails, CellaDockerError>>>,
         pub upload_files_responses: Mutex<VecDeque<Result<(), CellaDockerError>>>,
     }
 
@@ -309,8 +301,7 @@ pub mod mock {
                 pull_image_responses: Mutex::new(VecDeque::new()),
                 build_image_responses: Mutex::new(VecDeque::new()),
                 image_exists_responses: Mutex::new(VecDeque::new()),
-                inspect_image_env_responses: Mutex::new(VecDeque::new()),
-                inspect_image_user_responses: Mutex::new(VecDeque::new()),
+                inspect_image_details_responses: Mutex::new(VecDeque::new()),
                 upload_files_responses: Mutex::new(VecDeque::new()),
             }
         }
@@ -560,35 +551,19 @@ pub mod mock {
             Box::pin(async move { result })
         }
 
-        fn inspect_image_env(
+        fn inspect_image_details(
             &self,
             image: &str,
-        ) -> BoxFuture<'_, Result<Vec<String>, CellaDockerError>> {
-            self.record(MockCall::InspectImageEnv {
+        ) -> BoxFuture<'_, Result<ImageDetails, CellaDockerError>> {
+            self.record(MockCall::InspectImageDetails {
                 image: image.to_string(),
             });
             let result = self
-                .inspect_image_env_responses
+                .inspect_image_details_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("MockDockerClient: no inspect_image_env response configured");
-            Box::pin(async move { result })
-        }
-
-        fn inspect_image_user(
-            &self,
-            image: &str,
-        ) -> BoxFuture<'_, Result<String, CellaDockerError>> {
-            self.record(MockCall::InspectImageUser {
-                image: image.to_string(),
-            });
-            let result = self
-                .inspect_image_user_responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("MockDockerClient: no inspect_image_user response configured");
+                .expect("MockDockerClient: no inspect_image_details response configured");
             Box::pin(async move { result })
         }
 

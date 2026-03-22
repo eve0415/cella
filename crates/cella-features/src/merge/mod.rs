@@ -10,8 +10,10 @@
 mod devcontainer;
 mod feature;
 mod helpers;
+pub mod image_metadata;
 mod validation;
 
 pub use devcontainer::merge_with_devcontainer;
 pub use feature::merge_features;
+pub use image_metadata::{ImageMetadataUserInfo, parse_image_metadata};
 pub use validation::validate_options;

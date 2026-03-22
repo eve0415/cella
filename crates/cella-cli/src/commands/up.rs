@@ -98,22 +98,35 @@ impl UpArgs {
 
         if let Some(container) = existing {
             // Re-resolve remote_user from config (labels may be stale from older containers).
-            // Priority: remoteUser > containerUser > image USER > label fallback > "root"
+            // Priority: remoteUser (config) > containerUser (config) > remoteUser (image metadata)
+            //         > containerUser (image metadata) > image USER > label fallback > "root"
             let remote_user = if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
                 u.to_string()
             } else if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
                 u.to_string()
-            } else if let Some(ref img) = container.image {
-                client
-                    .inspect_image_user(img)
-                    .await
-                    .unwrap_or_else(|_| "root".to_string())
             } else {
-                container
+                // Check image metadata from stored container label
+                let meta_user = container
                     .labels
-                    .get("dev.cella.remote_user")
-                    .cloned()
-                    .unwrap_or_else(|| "root".to_string())
+                    .get("devcontainer.metadata")
+                    .map(|m| cella_features::parse_image_metadata(m).1);
+                if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
+                    u.to_string()
+                } else if let Some(u) = meta_user.as_ref().and_then(|m| m.container_user.as_deref())
+                {
+                    u.to_string()
+                } else if let Some(ref img) = container.image {
+                    client
+                        .inspect_image_user(img)
+                        .await
+                        .unwrap_or_else(|_| "root".to_string())
+                } else {
+                    container
+                        .labels
+                        .get("dev.cella.remote_user")
+                        .cloned()
+                        .unwrap_or_else(|| "root".to_string())
+                }
             };
 
             let probe_type = config
@@ -392,7 +405,7 @@ impl UpArgs {
         }
 
         // 5. Ensure image (with optional features layer)
-        let (img_name, resolved_features) = ensure_image(
+        let (img_name, resolved_features, base_image_details) = ensure_image(
             &client,
             config,
             &resolved.workspace_root,
@@ -403,16 +416,32 @@ impl UpArgs {
         )
         .await?;
 
-        // 6. Inspect image env for merging with user containerEnv
-        let image_env = client.inspect_image_env(&img_name).await?;
+        // 6. Image env for merging with user containerEnv
+        let image_env = base_image_details.env;
 
-        // 6.1. Resolve remote_user: remoteUser > containerUser > image USER
+        // 6.1. Resolve remote_user with full spec chain:
+        // remoteUser (config) > containerUser (config) > remoteUser (image metadata)
+        // > containerUser (image metadata) > Docker USER > "root"
+        let image_meta_user = base_image_details
+            .metadata
+            .as_deref()
+            .map(|m| cella_features::parse_image_metadata(m).1);
         let remote_user = if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
             u.to_string()
         } else if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
             u.to_string()
+        } else if let Some(u) = image_meta_user
+            .as_ref()
+            .and_then(|m| m.remote_user.as_deref())
+        {
+            u.to_string()
+        } else if let Some(u) = image_meta_user
+            .as_ref()
+            .and_then(|m| m.container_user.as_deref())
+        {
+            u.to_string()
         } else {
-            client.inspect_image_user(&img_name).await?
+            base_image_details.user
         };
 
         // 6.5. Ensure credential proxy daemon is running (if host has git credentials)
@@ -454,6 +483,15 @@ impl UpArgs {
                 "devcontainer.metadata".to_string(),
                 rf.metadata_label.clone(),
             );
+        } else if base_image_details.metadata.is_some() {
+            labels.insert(
+                "devcontainer.metadata".to_string(),
+                cella_features::generate_metadata_label(
+                    &[],
+                    config,
+                    base_image_details.metadata.as_deref(),
+                ),
+            );
         }
 
         // Store ports_attributes in a label for re-registration after daemon restart
@@ -472,13 +510,25 @@ impl UpArgs {
 
         let feature_config = resolved_features.as_ref().map(|r| &r.container_config);
 
+        // When no features are declared but image metadata exists, parse it
+        // into a config so image-level mounts/capAdd/etc. are applied.
+        let image_meta_config = if feature_config.is_none() {
+            base_image_details
+                .metadata
+                .as_deref()
+                .map(|m| cella_features::parse_image_metadata(m).0)
+        } else {
+            None // features path already incorporated image metadata
+        };
+        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
+
         let mut create_opts = cella_docker::config_map::map_config(
             config,
             &container_nm,
             &img_name,
             labels,
             &resolved.workspace_root,
-            feature_config,
+            effective_feature_config,
             &image_env,
         );
 

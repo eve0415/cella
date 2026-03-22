@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use cella_docker::{BuildOptions, DockerClient, image_name, image_name_with_features};
+use cella_docker::{
+    BuildOptions, DockerClient, ImageDetails, image_name, image_name_with_features,
+};
 use cella_features::ResolvedFeatures;
 
 /// Compute a SHA-256 digest of the features config for image tagging.
@@ -85,7 +87,7 @@ pub async fn ensure_image(
     config_path: &Path,
     no_cache: bool,
     is_text: bool,
-) -> Result<(String, Option<ResolvedFeatures>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<ResolvedFeatures>, ImageDetails), Box<dyn std::error::Error>> {
     let has_features = config
         .get("features")
         .and_then(|v| v.as_object())
@@ -128,9 +130,12 @@ pub async fn ensure_image(
         return Err("devcontainer.json must specify either 'image' or 'build'".into());
     };
 
+    // Inspect base image details (user, env, metadata) in a single API call
+    let base_image_details = client.inspect_image_details(&base_image_tag).await?;
+
     // If no features, return the base image directly
     if !has_features {
-        return Ok((base_image_tag, None));
+        return Ok((base_image_tag, None, base_image_details));
     }
 
     // Resolve features
@@ -139,7 +144,6 @@ pub async fn ensure_image(
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
     let cache = cella_features::FeatureCache::new();
-    let image_user = client.inspect_image_user(&base_image_tag).await?;
 
     let resolved = cella_features::resolve_features(
         config,
@@ -147,7 +151,8 @@ pub async fn ensure_image(
         &platform,
         &cache,
         &base_image_tag,
-        &image_user,
+        &base_image_details.user,
+        base_image_details.metadata.as_deref(),
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;
@@ -160,13 +165,13 @@ pub async fn ensure_image(
         config_name,
         &resolved,
         &base_image_tag,
-        &image_user,
+        &base_image_details.user,
         no_cache,
         is_text,
     )
     .await?;
 
-    Ok((features_image, Some(resolved)))
+    Ok((features_image, Some(resolved), base_image_details))
 }
 
 /// Parse build configuration from the `build` object in devcontainer.json.

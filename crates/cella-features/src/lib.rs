@@ -17,7 +17,10 @@ pub use dockerfile::{
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
-pub use merge::{merge_features, merge_with_devcontainer, validate_options};
+pub use merge::{
+    ImageMetadataUserInfo, merge_features, merge_with_devcontainer, parse_image_metadata,
+    validate_options,
+};
 pub use metadata::parse_feature_metadata;
 pub use oci::{FeatureFetcher, OciFetcher};
 pub use ordering::compute_install_order;
@@ -90,6 +93,7 @@ pub async fn resolve_features(
     cache: &FeatureCache,
     base_image: &str,
     image_user: &str,
+    base_image_metadata: Option<&str>,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
@@ -98,12 +102,18 @@ pub async fn resolve_features(
             debug!("no features declared in devcontainer.json");
             let build_context = cache.build_context_path("empty");
             std::fs::create_dir_all(&build_context)?;
+            let container_config = base_image_metadata
+                .map(|m| {
+                    let (cfg, _) = parse_image_metadata(m);
+                    merge_with_devcontainer(&cfg, config)
+                })
+                .unwrap_or_default();
             return Ok(ResolvedFeatures {
                 features: Vec::new(),
                 dockerfile: String::new(),
                 build_context,
-                container_config: FeatureContainerConfig::default(),
-                metadata_label: generate_metadata_label(&[], config, None),
+                container_config,
+                metadata_label: generate_metadata_label(&[], config, base_image_metadata),
             });
         }
     };
@@ -158,12 +168,13 @@ pub async fn resolve_features(
         &builtin_env,
     )?;
 
-    // Step 10: Merge feature metadata.
-    let feature_config = merge_features(&resolved);
+    // Step 10: Merge feature metadata (with image metadata as base layer).
+    let image_meta_config = base_image_metadata.map(|m| parse_image_metadata(m).0);
+    let feature_config = merge_features(&resolved, image_meta_config);
     let container_config = merge_with_devcontainer(&feature_config, config);
 
     // Step 11: Generate devcontainer.metadata label.
-    let metadata_label = generate_metadata_label(&resolved, config, None);
+    let metadata_label = generate_metadata_label(&resolved, config, base_image_metadata);
 
     debug!(
         "resolved {} features, build context at {}",
@@ -727,6 +738,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -751,6 +763,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -799,6 +812,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -910,6 +924,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -970,6 +985,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -1009,6 +1025,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await;
 
@@ -1052,6 +1069,7 @@ mod tests {
             &cache,
             "mcr.microsoft.com/devcontainers/base:ubuntu",
             "root",
+            None,
         )
         .await;
         let resolved = result.expect("resolve_features should succeed");
