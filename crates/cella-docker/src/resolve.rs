@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use bollard::container::ListContainersOptions;
+use bollard::query_parameters::ListContainersOptions;
 use tracing::debug;
 
 use crate::client::DockerClient;
@@ -101,7 +101,7 @@ impl ContainerTarget {
 
         let options = ListContainersOptions {
             all: true,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 

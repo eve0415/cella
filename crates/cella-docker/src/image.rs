@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
 
-use bollard::image::CreateImageOptions;
+use bollard::query_parameters::CreateImageOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
@@ -124,7 +124,7 @@ impl DockerClient {
         info!("Pulling image: {image}");
 
         let options = CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         };
 

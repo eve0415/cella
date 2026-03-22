@@ -8,14 +8,14 @@ license.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 syn = { version = "2.0.117", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"
+quote = "1.0.45"
+proc-macro2 = "1.0.106"
 prettyplease = "0.2.37"
-heck = "0.5"
-indexmap = { version = "2", features = ["serde"] }
+heck = "0.5.0"
+indexmap = { version = "2.13.0", features = ["serde"] }
 
 [dev-dependencies]
-insta = "1"
+insta = "1.46.3"
 
 [lints]
 workspace = true

@@ -24,7 +24,7 @@ pub const CELLA_NETWORK_NAME: &str = "cella";
 pub async fn ensure_network(docker: &Docker) -> Result<(), CellaDockerError> {
     // Check if network already exists
     match docker
-        .inspect_network::<String>(CELLA_NETWORK_NAME, None)
+        .inspect_network(CELLA_NETWORK_NAME, None)
         .await
     {
         Ok(_) => {
@@ -39,15 +39,17 @@ pub async fn ensure_network(docker: &Docker) -> Result<(), CellaDockerError> {
         Err(e) => return Err(e.into()),
     }
 
-    let config = bollard::network::CreateNetworkOptions {
+    let config = bollard::models::NetworkCreateRequest {
         name: CELLA_NETWORK_NAME.to_string(),
-        driver: "bridge".to_string(),
-        labels: [
-            ("dev.cella.tool".to_string(), "cella".to_string()),
-            ("dev.cella.managed".to_string(), "true".to_string()),
-        ]
-        .into_iter()
-        .collect(),
+        driver: Some("bridge".to_string()),
+        labels: Some(
+            [
+                ("dev.cella.tool".to_string(), "cella".to_string()),
+                ("dev.cella.managed".to_string(), "true".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
         ..Default::default()
     };
 
@@ -65,7 +67,7 @@ pub async fn connect_container(
     docker: &Docker,
     container_id: &str,
 ) -> Result<(), CellaDockerError> {
-    let config = bollard::network::ConnectNetworkOptions {
+    let config = bollard::models::NetworkConnectRequest {
         container: container_id.to_string(),
         ..Default::default()
     };
@@ -106,7 +108,7 @@ pub async fn is_container_connected(
     container_id: &str,
 ) -> Result<bool, CellaDockerError> {
     let network = docker
-        .inspect_network::<String>(CELLA_NETWORK_NAME, None)
+        .inspect_network(CELLA_NETWORK_NAME, None)
         .await?;
 
     if let Some(containers) = network.containers {
@@ -162,26 +164,28 @@ pub async fn ensure_repo_network(
     let net_name = repo_network_name(repo_path);
 
     // Check if network already exists
-    match docker.inspect_network::<String>(&net_name, None).await {
+    match docker.inspect_network(&net_name, None).await {
         Ok(_) => {
             debug!("Repo network '{net_name}' already exists");
         }
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => {
-            let config = bollard::network::CreateNetworkOptions {
+            let config = bollard::models::NetworkCreateRequest {
                 name: net_name.clone(),
-                driver: "bridge".to_string(),
-                labels: [
-                    ("dev.cella.tool".to_string(), "cella".to_string()),
-                    ("dev.cella.managed".to_string(), "true".to_string()),
-                    (
-                        "dev.cella.repo".to_string(),
-                        repo_path.to_string_lossy().to_string(),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
+                driver: Some("bridge".to_string()),
+                labels: Some(
+                    [
+                        ("dev.cella.tool".to_string(), "cella".to_string()),
+                        ("dev.cella.managed".to_string(), "true".to_string()),
+                        (
+                            "dev.cella.repo".to_string(),
+                            repo_path.to_string_lossy().to_string(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
                 ..Default::default()
             };
             let _ = docker.create_network(config).await?;
@@ -191,7 +195,7 @@ pub async fn ensure_repo_network(
     }
 
     // Connect container
-    let connect_config = bollard::network::ConnectNetworkOptions {
+    let connect_config = bollard::models::NetworkConnectRequest {
         container: container_id.to_string(),
         ..Default::default()
     };

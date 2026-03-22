@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use bollard::container::{
+use bollard::query_parameters::{
     CreateContainerOptions as BollardCreateOptions, ListContainersOptions, LogsOptions,
     RemoveContainerOptions, StopContainerOptions,
 };
@@ -91,9 +91,9 @@ pub(crate) fn container_info_from_summary(
 ) -> ContainerInfo {
     let labels = summary.labels.unwrap_or_default();
     let config_hash = labels.get("dev.cella.config_hash").cloned();
-    let state = summary.state.as_deref().map_or_else(
+    let state = summary.state.as_ref().map_or_else(
         || ContainerState::Other("unknown".to_string()),
-        ContainerState::from_str,
+        |s| ContainerState::from_str(s.as_ref()),
     );
 
     let ports = summary
@@ -154,7 +154,7 @@ impl DockerClient {
 
         let options = ListContainersOptions {
             all: true,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 
@@ -178,7 +178,7 @@ impl DockerClient {
         info!("Creating container: {}", opts.name);
 
         let bollard_opts = BollardCreateOptions {
-            name: opts.name.as_str(),
+            name: Some(opts.name.clone()),
             ..Default::default()
         };
 
@@ -203,7 +203,9 @@ impl DockerClient {
     /// Returns `CellaDockerError::DockerApi` on API errors.
     pub async fn start_container(&self, id: &str) -> Result<(), CellaDockerError> {
         info!("Starting container: {id}");
-        self.inner().start_container::<String>(id, None).await?;
+        self.inner()
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await?;
         Ok(())
     }
 
@@ -214,7 +216,10 @@ impl DockerClient {
     /// Returns `CellaDockerError::DockerApi` on API errors.
     pub async fn stop_container(&self, id: &str) -> Result<(), CellaDockerError> {
         info!("Stopping container: {id}");
-        let options = StopContainerOptions { t: 10 };
+        let options = StopContainerOptions {
+            t: Some(10),
+            ..Default::default()
+        };
         self.inner().stop_container(id, Some(options)).await?;
         Ok(())
     }
@@ -349,7 +354,7 @@ impl DockerClient {
 
         let options = ListContainersOptions {
             all: !running_only,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 
@@ -367,7 +372,7 @@ impl DockerClient {
     ///
     /// Returns `CellaDockerError::DockerApi` on API errors.
     pub async fn container_logs(&self, id: &str, tail: u32) -> Result<String, CellaDockerError> {
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             stdout: true,
             stderr: true,
             tail: tail.to_string(),
@@ -396,7 +401,9 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use bollard::models::{ContainerSummary, Port, PortTypeEnum};
+    use bollard::models::{
+        ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
+    };
 
     use super::*;
     use crate::client::DockerApi;
@@ -494,16 +501,16 @@ mod tests {
         id: Option<&str>,
         names: Option<Vec<&str>>,
         image: Option<&str>,
-        state: Option<&str>,
+        state: Option<ContainerSummaryStateEnum>,
         labels: Option<HashMap<String, String>>,
-        ports: Option<Vec<Port>>,
+        ports: Option<Vec<PortSummary>>,
         created: Option<i64>,
     ) -> ContainerSummary {
         ContainerSummary {
             id: id.map(String::from),
             names: names.map(|n| n.into_iter().map(String::from).collect()),
             image: image.map(String::from),
-            state: state.map(String::from),
+            state,
             labels,
             ports,
             created,
@@ -520,7 +527,7 @@ mod tests {
             Some("abc123"),
             Some(vec!["/my-container"]),
             Some("ubuntu:22.04"),
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             Some(labels.clone()),
             None,
             None,
@@ -540,7 +547,7 @@ mod tests {
             Some("id1"),
             Some(vec!["/slash-name"]),
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             None,
             None,
             None,
@@ -558,7 +565,7 @@ mod tests {
             Some("id2"),
             Some(vec!["/test"]),
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             Some(labels),
             None,
             None,
@@ -570,10 +577,10 @@ mod tests {
 
     #[test]
     fn summary_ports_mapping() {
-        let ports = vec![Port {
+        let ports = vec![PortSummary {
             private_port: 8080,
             public_port: Some(3000),
-            typ: Some(PortTypeEnum::TCP),
+            typ: Some(PortSummaryTypeEnum::TCP),
             ip: None,
         }];
 
@@ -581,7 +588,7 @@ mod tests {
             Some("id3"),
             Some(vec!["/web"]),
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             None,
             Some(ports),
             None,
@@ -596,10 +603,10 @@ mod tests {
 
     #[test]
     fn summary_port_udp_protocol() {
-        let ports = vec![Port {
+        let ports = vec![PortSummary {
             private_port: 53,
             public_port: None,
-            typ: Some(PortTypeEnum::UDP),
+            typ: Some(PortSummaryTypeEnum::UDP),
             ip: None,
         }];
 
@@ -607,7 +614,7 @@ mod tests {
             Some("id4"),
             None,
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             None,
             Some(ports),
             None,
@@ -620,7 +627,7 @@ mod tests {
 
     #[test]
     fn summary_port_no_type_defaults_tcp() {
-        let ports = vec![Port {
+        let ports = vec![PortSummary {
             private_port: 443,
             public_port: Some(8443),
             typ: None,
@@ -631,7 +638,7 @@ mod tests {
             Some("id5"),
             None,
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             None,
             Some(ports),
             None,
@@ -643,14 +650,14 @@ mod tests {
 
     #[test]
     fn summary_no_ports() {
-        let summary = make_summary(Some("id6"), None, None, Some("running"), None, None, None);
+        let summary = make_summary(Some("id6"), None, None, Some(ContainerSummaryStateEnum::RUNNING), None, None, None);
         let info = container_info_from_summary(summary);
         assert!(info.ports.is_empty());
     }
 
     #[test]
     fn summary_no_labels() {
-        let summary = make_summary(None, None, None, Some("running"), None, None, None);
+        let summary = make_summary(None, None, None, Some(ContainerSummaryStateEnum::RUNNING), None, None, None);
         let info = container_info_from_summary(summary);
         assert!(info.labels.is_empty());
         assert!(info.config_hash.is_none());
@@ -670,7 +677,7 @@ mod tests {
             Some("id8"),
             None,
             None,
-            Some("running"),
+            Some(ContainerSummaryStateEnum::RUNNING),
             None,
             None,
             Some(1_705_276_800),
@@ -685,7 +692,7 @@ mod tests {
 
     #[test]
     fn summary_no_names() {
-        let summary = make_summary(Some("id9"), None, None, Some("exited"), None, None, None);
+        let summary = make_summary(Some("id9"), None, None, Some(ContainerSummaryStateEnum::EXITED), None, None, None);
         let info = container_info_from_summary(summary);
         assert_eq!(info.name, "");
     }

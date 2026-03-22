@@ -5,12 +5,11 @@
 //! CLI version + architecture.
 
 use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions as BollardCreateOpts, RemoveContainerOptions,
+use bollard::models::{ContainerCreateBody, VolumeCreateRequest};
+use bollard::query_parameters::{
+    CreateContainerOptions as BollardCreateOpts, CreateImageOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions,
 };
-use bollard::image::CreateImageOptions;
-use bollard::volume::CreateVolumeOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
@@ -44,14 +43,16 @@ pub async fn ensure_agent_volume(docker: &Docker) -> Result<(), CellaDockerError
         Err(e) => return Err(e.into()),
     }
 
-    let config = CreateVolumeOptions {
-        name: AGENT_VOLUME_NAME.to_string(),
-        labels: [
-            ("dev.cella.tool".to_string(), "cella".to_string()),
-            ("dev.cella.managed".to_string(), "true".to_string()),
-        ]
-        .into_iter()
-        .collect(),
+    let config = VolumeCreateRequest {
+        name: Some(AGENT_VOLUME_NAME.to_string()),
+        labels: Some(
+            [
+                ("dev.cella.tool".to_string(), "cella".to_string()),
+                ("dev.cella.managed".to_string(), "true".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
         ..Default::default()
     };
 
@@ -131,7 +132,13 @@ pub fn version_marker_content() -> String {
 ///
 /// Returns error if Docker API call fails.
 pub async fn remove_agent_volume(docker: &Docker) -> Result<(), CellaDockerError> {
-    match docker.remove_volume(AGENT_VOLUME_NAME, None).await {
+    match docker
+        .remove_volume(
+            AGENT_VOLUME_NAME,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+    {
         Ok(()) => {
             info!("Removed Docker volume '{AGENT_VOLUME_NAME}'");
             Ok(())
@@ -200,7 +207,7 @@ async fn ensure_image_pulled(docker: &Docker, image: &str) -> Result<(), CellaDo
 
     info!("Pulling image {image}...");
     let options = CreateImageOptions {
-        from_image: image,
+        from_image: Some(image.to_string()),
         ..Default::default()
     };
 
@@ -239,7 +246,7 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
         )
         .await;
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some("alpine:3".to_string()),
         cmd: Some(vec!["cat".to_string(), "/cella/.version".to_string()]),
         host_config: Some(bollard::models::HostConfig {
@@ -258,7 +265,7 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
     docker
         .create_container(
             Some(BollardCreateOpts {
-                name: container_name,
+                name: Some(container_name.to_string()),
                 ..Default::default()
             }),
             config,
@@ -266,15 +273,13 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
         .await?;
 
     docker
-        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .start_container(container_name, None::<StartContainerOptions>)
         .await?;
 
     // Wait for container to finish
     let mut wait_stream = docker.wait_container(
         container_name,
-        Some(WaitContainerOptions {
-            condition: "not-running",
-        }),
+        Some(WaitContainerOptions::default()),
     );
     while let Some(result) = wait_stream.next().await {
         match result {
@@ -309,7 +314,7 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
     }
 
     // Read logs for the version content
-    let log_opts = bollard::container::LogsOptions::<String> {
+    let log_opts = bollard::query_parameters::LogsOptions {
         stdout: true,
         ..Default::default()
     };
@@ -427,7 +432,7 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
         .await;
 
     // Create build container with workspace bind-mounted
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some("rust:slim".to_string()),
         cmd: Some(vec![
             "cargo".to_string(),
@@ -452,7 +457,7 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
     docker
         .create_container(
             Some(BollardCreateOpts {
-                name: container_name,
+                name: Some(container_name.to_string()),
                 ..Default::default()
             }),
             config,
@@ -460,15 +465,13 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
         .await?;
 
     docker
-        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .start_container(container_name, None::<StartContainerOptions>)
         .await?;
 
     // Wait for build to complete
     let mut wait_stream = docker.wait_container(
         container_name,
-        Some(WaitContainerOptions {
-            condition: "not-running",
-        }),
+        Some(WaitContainerOptions::default()),
     );
 
     while let Some(result) = wait_stream.next().await {
@@ -476,7 +479,7 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
             Ok(resp) => {
                 if resp.status_code != 0 {
                     // Capture build logs for error message
-                    let log_opts = bollard::container::LogsOptions::<String> {
+                    let log_opts = bollard::query_parameters::LogsOptions {
                         stdout: true,
                         stderr: true,
                         tail: "30".to_string(),
@@ -527,7 +530,9 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
     let binary_path = "/src/target/release/cella-agent";
     let tar_stream = docker.download_from_container(
         container_name,
-        Some(bollard::container::DownloadFromContainerOptions { path: binary_path }),
+        Some(bollard::query_parameters::DownloadFromContainerOptions {
+            path: binary_path.to_string(),
+        }),
     );
 
     let tar_bytes: Vec<u8> = {
@@ -643,7 +648,7 @@ async fn upload_to_volume(
         )
         .await;
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some("alpine:3".to_string()),
         cmd: Some(vec!["sleep".to_string(), "30".to_string()]),
         host_config: Some(bollard::models::HostConfig {
@@ -661,7 +666,7 @@ async fn upload_to_volume(
     docker
         .create_container(
             Some(BollardCreateOpts {
-                name: container_name,
+                name: Some(container_name.to_string()),
                 ..Default::default()
             }),
             config,
@@ -669,7 +674,7 @@ async fn upload_to_volume(
         .await?;
 
     docker
-        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .start_container(container_name, None::<StartContainerOptions>)
         .await?;
 
     // Build tar archive with all files
@@ -679,11 +684,11 @@ async fn upload_to_volume(
     docker
         .upload_to_container(
             container_name,
-            Some(bollard::container::UploadToContainerOptions {
+            Some(bollard::query_parameters::UploadToContainerOptions {
                 path: "/".to_string(),
                 ..Default::default()
             }),
-            tar_bytes.into(),
+            bollard::body_full(tar_bytes.into()),
         )
         .await?;
 
@@ -691,7 +696,7 @@ async fn upload_to_volume(
     let _ = docker
         .stop_container(
             container_name,
-            None::<bollard::container::StopContainerOptions>,
+            None::<bollard::query_parameters::StopContainerOptions>,
         )
         .await;
     let _ = docker

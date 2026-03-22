@@ -7,7 +7,7 @@ pub mod ports;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use bollard::container::Config;
+use bollard::models::ContainerCreateBody;
 use bollard::models::{HostConfig, Mount, MountTypeEnum, PortBinding, PortMap};
 use cella_features::FeatureContainerConfig;
 
@@ -45,10 +45,9 @@ pub struct MountConfig {
 }
 
 impl CreateContainerOptions {
-    /// Convert to bollard `Config` for container creation.
-    #[allow(clippy::zero_sized_map_values)] // bollard API requires HashMap<(), ()>
-    pub fn to_bollard_config(&self) -> Config<String> {
-        let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+    /// Convert to bollard `ContainerCreateBody` for container creation.
+    pub fn to_bollard_config(&self) -> ContainerCreateBody {
+        let mut exposed_ports: Vec<String> = Vec::new();
         let mut port_bindings: PortMap = HashMap::new();
 
         for (container_port, bindings) in &self.port_bindings {
@@ -57,7 +56,7 @@ impl CreateContainerOptions {
             } else {
                 format!("{container_port}/tcp")
             };
-            exposed_ports.insert(port_key.clone(), HashMap::new());
+            exposed_ports.push(port_key.clone());
             port_bindings.insert(port_key, Some(bindings.clone()));
         }
 
@@ -101,7 +100,7 @@ impl CreateContainerOptions {
             ..Default::default()
         };
 
-        Config {
+        ContainerCreateBody {
             image: Some(self.image.clone()),
             labels: Some(self.labels.clone()),
             env: if self.env.is_empty() {

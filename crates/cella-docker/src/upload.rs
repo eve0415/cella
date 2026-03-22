@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use bollard::container::UploadToContainerOptions;
+use bollard::query_parameters::UploadToContainerOptions;
 use tracing::debug;
 
 use crate::CellaDockerError;
@@ -49,9 +49,10 @@ impl DockerClient {
                 container_id,
                 Some(UploadToContainerOptions {
                     path: "/".to_string(),
-                    no_overwrite_dir_non_dir: "false".to_string(),
+                    no_overwrite_dir_non_dir: Some("false".to_string()),
+                    ..Default::default()
                 }),
-                tar_bytes.into(),
+                bollard::body_full(tar_bytes.into()),
             )
             .await?;
 
