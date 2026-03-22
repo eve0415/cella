@@ -62,7 +62,7 @@ crossterm = "0.28.1"
 chrono = "0.4.40"
 
 # Tar archives
-tar = "0.4.43"
+tar = "0.4.45"
 
 # Testing
 tempfile = "3.15.0"
