@@ -80,30 +80,29 @@ fn create_tar_archive(files: &[FileToUpload]) -> Result<Vec<u8>, CellaDockerErro
         dirs.sort();
         dirs.dedup();
 
-        // Add directory entries
+        // Add directory entries (append_data handles GNU long name extensions
+        // for paths exceeding standard tar header field sizes)
         for dir in &dirs {
             let dir_path = dir.strip_prefix('/').unwrap_or(dir);
             if dir_path.is_empty() {
                 continue;
             }
             let mut header = tar::Header::new_gnu();
-            header.set_path(format!("{dir_path}/"))?;
             header.set_size(0);
             header.set_mode(0o755);
             header.set_entry_type(tar::EntryType::Directory);
             header.set_cksum();
-            ar.append(&header, &[][..])?;
+            ar.append_data(&mut header, format!("{dir_path}/"), &[][..])?;
         }
 
         // Add file entries
         for file in files {
             let path = file.path.strip_prefix('/').unwrap_or(&file.path);
             let mut header = tar::Header::new_gnu();
-            header.set_path(path)?;
             header.set_size(file.content.len() as u64);
             header.set_mode(file.mode);
             header.set_cksum();
-            ar.append(&header, &file.content[..])?;
+            ar.append_data(&mut header, path, &file.content[..])?;
         }
 
         ar.finish()?;
@@ -147,6 +146,30 @@ mod tests {
         let tar_bytes = create_tar_archive(&[]).unwrap();
         // Empty tar is still valid (just the end-of-archive markers)
         assert!(!tar_bytes.is_empty());
+    }
+
+    #[test]
+    fn create_tar_with_long_path() {
+        // Path exceeding standard tar header name field (100 bytes)
+        let long_dir = "a/".repeat(60);
+        let long_path = format!("/home/user/.claude/{long_dir}file.json");
+        let files = vec![FileToUpload {
+            path: long_path,
+            content: b"{}".to_vec(),
+            mode: 0o644,
+        }];
+
+        let tar_bytes = create_tar_archive(&files).unwrap();
+        assert!(!tar_bytes.is_empty());
+
+        // Verify the file can be read back from the archive
+        let mut archive = tar::Archive::new(&tar_bytes[..]);
+        let found = archive.entries().unwrap().filter_map(Result::ok).any(|e| {
+            e.path()
+                .ok()
+                .is_some_and(|p| p.to_string_lossy().contains("file.json"))
+        });
+        assert!(found, "Long path file should be present in archive");
     }
 
     #[test]

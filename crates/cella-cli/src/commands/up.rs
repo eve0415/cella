@@ -166,7 +166,7 @@ impl UpArgs {
                         .await;
                     }
 
-                    timed_step(
+                    let probed_env = timed_step(
                         is_text,
                         "Running userEnvProbe...",
                         super::env_cache::probe_and_cache_user_env(
@@ -177,6 +177,12 @@ impl UpArgs {
                         ),
                     )
                     .await;
+
+                    let lifecycle_env = if let Some(ref probed) = probed_env {
+                        cella_env::user_env_probe::merge_env(probed, &remote_env)
+                    } else {
+                        remote_env.clone()
+                    };
 
                     // Already running -- run postAttachCommand from metadata (includes features)
                     let metadata = container.labels.get("devcontainer.metadata");
@@ -206,7 +212,7 @@ impl UpArgs {
                         "postAttachCommand",
                         &entries,
                         Some(remote_user.as_str()),
-                        &remote_env,
+                        &lifecycle_env,
                         workspace_folder,
                         is_text,
                     )
@@ -308,7 +314,7 @@ impl UpArgs {
                                 .await;
                             }
 
-                            timed_step(
+                            let probed_env = timed_step(
                                 is_text,
                                 "Running userEnvProbe...",
                                 super::env_cache::probe_and_cache_user_env(
@@ -319,6 +325,12 @@ impl UpArgs {
                                 ),
                             )
                             .await;
+
+                            let lifecycle_env = if let Some(ref probed) = probed_env {
+                                cella_env::user_env_probe::merge_env(probed, &remote_env)
+                            } else {
+                                remote_env.clone()
+                            };
 
                             // Run lifecycle from metadata label (includes features)
                             let metadata = container.labels.get("devcontainer.metadata");
@@ -348,7 +360,7 @@ impl UpArgs {
                                     phase,
                                     &entries,
                                     Some(remote_user.as_str()),
-                                    &remote_env,
+                                    &lifecycle_env,
                                     workspace_folder,
                                     is_text,
                                 )
@@ -785,7 +797,7 @@ impl UpArgs {
             .and_then(|v| v.as_str())
             .unwrap_or("loginInteractiveShell");
 
-        timed_step(
+        let probed_env = timed_step(
             is_text,
             "Running userEnvProbe...",
             super::env_cache::probe_and_cache_user_env(
@@ -796,6 +808,14 @@ impl UpArgs {
             ),
         )
         .await;
+
+        // Merge probed environment with remoteEnv so lifecycle commands see
+        // the full PATH (including feature-installed tools like node/npm).
+        let lifecycle_env = if let Some(ref probed) = probed_env {
+            cella_env::user_env_probe::merge_env(probed, &create_opts.remote_env)
+        } else {
+            create_opts.remote_env.clone()
+        };
 
         // 10-14. Lifecycle commands (first create)
         let lifecycle_phases = [
@@ -825,7 +845,7 @@ impl UpArgs {
                 phase,
                 entries,
                 Some(remote_user.as_str()),
-                &create_opts.remote_env,
+                &lifecycle_env,
                 workspace_folder,
                 is_text,
             )
@@ -844,7 +864,7 @@ impl UpArgs {
                     cmd,
                     "devcontainer.json",
                     Some(remote_user.as_str()),
-                    &create_opts.remote_env,
+                    &lifecycle_env,
                     workspace_folder,
                     is_text,
                 )
@@ -1318,7 +1338,8 @@ async fn seed_claude_config(
 
     if let Err(e) = client.upload_files(container_id, &docker_files).await {
         warn!("Failed to upload Claude config files: {e}");
-        return;
+        // Continue to chown — directory must be owned by remote_user even if upload
+        // failed, otherwise the Claude Code installer gets permission denied.
     }
 
     // Fix ownership

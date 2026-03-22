@@ -19,6 +19,10 @@ const DEFAULT_COPY_DIRS: &[&str] = &["commands", "plugins", "hooks", "rules"];
 /// Files always excluded.
 const DEFAULT_EXCLUDE_FILES: &[&str] = &["history.jsonl"];
 
+/// Subdirectory names skipped when recursively walking `DEFAULT_COPY_DIRS`.
+/// These contain machine-generated, re-downloadable content.
+const WALK_SKIP_DIRS: &[&str] = &["cache"];
+
 /// Text file extensions that receive path rewriting.
 const REWRITE_EXTENSIONS: &[&str] = &["json", "jsonl", "md", "sh", "toml", "yml", "yaml", "txt"];
 
@@ -284,6 +288,11 @@ fn walk_dir(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if WALK_SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+            }
             walk_dir(&path, host_base, target_claude_dir, rewrites, uploads);
         } else if path.is_file() {
             let relative = match path.strip_prefix(host_base) {
