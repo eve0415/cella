@@ -3,7 +3,7 @@ pub mod settings;
 
 // Re-export all devcontainer modules at crate root for backward compatibility.
 pub use devcontainer::*;
-pub use settings::CellaSettings;
+pub use settings::{CellaSettings, ClaudeCodeSettings};
 
 /// Types and validators generated from the devcontainer JSON Schema.
 #[allow(

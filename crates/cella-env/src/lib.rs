@@ -4,6 +4,7 @@
 //! then produces mounts, env vars, and post-start injection commands
 //! for the container.
 
+pub mod claude_code;
 mod error;
 pub mod gh_credential;
 pub mod git_config;

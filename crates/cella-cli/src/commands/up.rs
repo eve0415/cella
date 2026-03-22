@@ -138,6 +138,21 @@ impl UpArgs {
                     )
                     .await;
 
+                    // Claude Code: re-sync auth + ensure installed
+                    let cc_settings = cella_config::CellaSettings::load(&resolved.workspace_root);
+                    if cc_settings.tools.claude_code.forward_config {
+                        resync_claude_auth(&client, &container.id, &remote_user).await;
+                    }
+                    if cc_settings.tools.claude_code.enabled {
+                        install_claude_code(
+                            &client,
+                            &container.id,
+                            &remote_user,
+                            &cc_settings.tools.claude_code,
+                        )
+                        .await;
+                    }
+
                     timed_step(
                         is_text,
                         "Running userEnvProbe...",
@@ -263,6 +278,22 @@ impl UpArgs {
                                 ),
                             )
                             .await;
+
+                            // Claude Code: re-sync auth + ensure installed on restart
+                            let cc_settings =
+                                cella_config::CellaSettings::load(&resolved.workspace_root);
+                            if cc_settings.tools.claude_code.forward_config {
+                                resync_claude_auth(&client, &container.id, &remote_user).await;
+                            }
+                            if cc_settings.tools.claude_code.enabled {
+                                install_claude_code(
+                                    &client,
+                                    &container.id,
+                                    &remote_user,
+                                    &cc_settings.tools.claude_code,
+                                )
+                                .await;
+                            }
 
                             timed_step(
                                 is_text,
@@ -461,6 +492,23 @@ impl UpArgs {
             });
         }
 
+        // 7.1. Auto-mount ~/.claude.json if Claude Code config forwarding is enabled
+        let settings = cella_config::CellaSettings::load(&resolved.workspace_root);
+        if settings.tools.claude_code.forward_config
+            && let Some(host_path) = cella_env::claude_code::host_claude_json_path()
+        {
+            let target = format!(
+                "{}/.claude.json",
+                cella_env::claude_code::container_home(&remote_user),
+            );
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+
         // Merge forwarding env vars
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -642,13 +690,41 @@ impl UpArgs {
         .await;
 
         // 9.7. Seed gh CLI credentials (first create only)
-        let settings = cella_config::CellaSettings::load(&resolved.workspace_root);
         if settings.credentials.gh {
             seed_gh_credentials(
                 &client,
                 &container_id,
                 &resolved.workspace_root,
                 &remote_user,
+            )
+            .await;
+        }
+
+        // 9.8. Claude Code: forward config + install (first create)
+        if settings.tools.claude_code.forward_config {
+            timed_step(
+                is_text,
+                "Forwarding Claude Code config...",
+                seed_claude_config(
+                    &client,
+                    &container_id,
+                    &resolved.workspace_root,
+                    &remote_user,
+                    &settings.tools.claude_code,
+                ),
+            )
+            .await;
+        }
+        if settings.tools.claude_code.enabled {
+            timed_step(
+                is_text,
+                "Installing Claude Code...",
+                install_claude_code(
+                    &client,
+                    &container_id,
+                    &remote_user,
+                    &settings.tools.claude_code,
+                ),
             )
             .await;
         }
@@ -1117,4 +1193,249 @@ async fn seed_gh_credentials(
         .await;
 
     info!("Seeded gh CLI credentials into container");
+}
+
+/// Seed Claude Code config files into a container (first create).
+///
+/// Copies `~/.claude/` from host with path rewriting, then fixes ownership.
+/// Skips silently if `~/.claude/` doesn't exist on host or config already
+/// exists in the container.
+async fn seed_claude_config(
+    client: &DockerClient,
+    container_id: &str,
+    workspace_root: &std::path::Path,
+    remote_user: &str,
+    settings: &cella_config::ClaudeCodeSettings,
+) {
+    let claude_dir = cella_env::claude_code::claude_dir_for_user(remote_user);
+
+    // Check if Claude config already exists in container
+    let check_cmd = cella_env::claude_code::claude_config_exists_command(&claude_dir);
+    if client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: check_cmd,
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+    {
+        tracing::debug!("Claude config already present in container, skipping seed");
+        return;
+    }
+
+    // Prepare config files from host with path rewriting
+    let Some(uploads) =
+        cella_env::claude_code::prepare_claude_config(remote_user, workspace_root, settings)
+    else {
+        return;
+    };
+
+    // Create the target directory
+    if let Err(e) = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("mkdir -p {claude_dir}"),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        warn!("Failed to create .claude directory: {e}");
+        return;
+    }
+
+    // Upload files
+    let docker_files: Vec<FileToUpload> = uploads
+        .iter()
+        .map(|f| FileToUpload {
+            path: f.container_path.clone(),
+            content: f.content.clone(),
+            mode: f.mode,
+        })
+        .collect();
+
+    if let Err(e) = client.upload_files(container_id, &docker_files).await {
+        warn!("Failed to upload Claude config files: {e}");
+        return;
+    }
+
+    // Fix ownership
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "chown".to_string(),
+                    "-R".to_string(),
+                    format!("{remote_user}:{remote_user}"),
+                    claude_dir,
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    info!("Seeded Claude Code config into container");
+}
+
+/// Re-sync Claude Code auth credentials on container restart.
+///
+/// Only re-uploads `.credentials.json` — does not overwrite other config.
+async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let Some(uploads) = cella_env::claude_code::prepare_claude_auth_resync(remote_user) else {
+        return;
+    };
+
+    let docker_files: Vec<FileToUpload> = uploads
+        .iter()
+        .map(|f| FileToUpload {
+            path: f.container_path.clone(),
+            content: f.content.clone(),
+            mode: f.mode,
+        })
+        .collect();
+
+    if let Err(e) = client.upload_files(container_id, &docker_files).await {
+        tracing::debug!("Failed to re-sync Claude auth: {e}");
+    }
+}
+
+/// Install Claude Code inside the container using the native installer.
+///
+/// Checks if already installed at the correct version first.
+/// On Alpine/musl, pre-installs required dependencies.
+/// Never fails `cella up` — logs errors and continues.
+async fn install_claude_code(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    settings: &cella_config::ClaudeCodeSettings,
+) {
+    // Check if already installed at correct version
+    let version_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["claude".to_string(), "--version".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if let Ok(result) = &version_check
+        && result.exit_code == 0
+    {
+        let installed_version = result.stdout.trim();
+        if settings.version == "latest" || settings.version == "stable" {
+            tracing::debug!("Claude Code already installed: {installed_version}");
+            return;
+        }
+        if installed_version.contains(&settings.version) {
+            tracing::debug!(
+                "Claude Code already at version {}: {installed_version}",
+                settings.version
+            );
+            return;
+        }
+    }
+
+    // Detect Alpine/musl and install dependencies
+    let is_alpine = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "/etc/alpine-release".to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
+
+    if is_alpine {
+        info!("Alpine detected, installing Claude Code dependencies...");
+        let _ = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "apk add --no-cache libgcc libstdc++ ripgrep".to_string(),
+                    ],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+    }
+
+    // Warn if version is pinned with native installer
+    if settings.version != "latest" && settings.version != "stable" {
+        info!(
+            "Installing Claude Code v{} (native installer will attempt version pinning)",
+            settings.version
+        );
+    }
+
+    // Install via native installer
+    let install_cmd = format!(
+        "curl -fsSL https://claude.ai/install.sh | bash -s {}",
+        settings.version
+    );
+
+    info!("Installing Claude Code ({})...", settings.version);
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd],
+                user: Some(remote_user.to_string()),
+                env: if is_alpine {
+                    Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
+                } else {
+                    None
+                },
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match result {
+        Ok(r) if r.exit_code == 0 => {
+            info!("Claude Code installed successfully");
+        }
+        Ok(r) => {
+            warn!(
+                "Claude Code installation exited with code {}: {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+        }
+        Err(e) => {
+            warn!("Claude Code installation failed: {e}");
+        }
+    }
 }
