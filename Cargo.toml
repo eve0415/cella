@@ -5,6 +5,7 @@ members = [
     "crates/cella-codegen",
     "crates/cella-config",
     "crates/cella-credential-proxy",
+    "crates/cella-daemon",
     "crates/cella-docker",
     "crates/cella-env",
     "crates/cella-git",
@@ -71,6 +72,7 @@ cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
 cella-config = { path = "crates/cella-config" }
 cella-credential-proxy = { path = "crates/cella-credential-proxy" }
+cella-daemon = { path = "crates/cella-daemon" }
 cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }

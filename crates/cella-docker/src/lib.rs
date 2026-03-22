@@ -7,9 +7,11 @@ pub mod exec;
 pub mod image;
 pub mod lifecycle;
 pub mod names;
+pub mod network;
 pub mod resolve;
 pub mod uid;
 pub mod upload;
+pub mod volume;
 
 pub use client::{DockerApi, DockerClient};
 pub use config_map::{CreateContainerOptions, MountConfig};

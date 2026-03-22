@@ -123,7 +123,7 @@ impl UpArgs {
 
             match (&container.state, remove_container) {
                 (ContainerState::Running, false) if !self.build_no_cache => {
-                    super::ensure_credential_proxy();
+                    super::ensure_cella_daemon().await;
                     // Re-inject env forwarding (git config + SSH files may have changed)
                     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
                     timed_step(
@@ -194,121 +194,142 @@ impl UpArgs {
                     return Ok(());
                 }
                 (ContainerState::Running, true) => {
+                    // Deregister from daemon before stopping (like down.rs)
+                    if let Some(mgmt_sock) =
+                        cella_env::git_credential::daemon_management_socket_path()
+                        && mgmt_sock.exists()
+                    {
+                        let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+                            container_name: container_nm.clone(),
+                        };
+                        let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req)
+                            .await;
+                    }
                     info!("Stopping container for rebuild...");
                     client.stop_container(&container.id).await?;
                     client.remove_container(&container.id, false).await?;
                 }
                 (ContainerState::Stopped, false) => {
-                    super::ensure_credential_proxy();
+                    super::ensure_cella_daemon().await;
 
-                    // Inspect for bind mounts with missing sources
-                    let detailed = client.inspect_container(&container.id).await?;
-                    let missing: Vec<_> = detailed
-                        .mounts
-                        .iter()
-                        .filter(|m| {
-                            m.mount_type == "bind"
-                                && !m.source.is_empty()
-                                && !std::path::Path::new(&m.source).exists()
-                        })
-                        .collect();
-
-                    if missing.is_empty() {
-                        // Start existing stopped container
-                        if let Some(old_hash) = &container.config_hash
-                            && *old_hash != resolved.config_hash
-                        {
-                            eprintln!(
-                                "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
-                            );
-                            eprintln!(
-                                "  Run `cella up --rebuild` to recreate with the updated config."
-                            );
-                        }
-
-                        timed_step(
-                            is_text,
-                            "Starting container...",
-                            client.start_container(&container.id),
-                        )
-                        .await?;
-                        verify_container_running(&client, &container.id).await?;
-
-                        // Re-inject env forwarding on restart
-                        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-                        timed_step(
-                            is_text,
-                            "Configuring environment...",
-                            inject_post_start(
-                                &client,
-                                &container.id,
-                                &env_fwd.post_start,
-                                &remote_user,
-                            ),
-                        )
-                        .await;
-
-                        timed_step(
-                            is_text,
-                            "Running userEnvProbe...",
-                            super::env_cache::probe_and_cache_user_env(
-                                &client,
-                                &container.id,
-                                &remote_user,
-                                probe_type,
-                            ),
-                        )
-                        .await;
-
-                        // Run lifecycle from metadata label (includes features)
-                        let metadata = container.labels.get("devcontainer.metadata");
-                        for phase in ["postStartCommand", "postAttachCommand"] {
-                            let entries = metadata.map_or_else(
-                                || {
-                                    config
-                                        .get(phase)
-                                        .filter(|v| !v.is_null())
-                                        .map(|cmd| {
-                                            vec![cella_features::LifecycleEntry {
-                                                origin: "devcontainer.json".into(),
-                                                command: cmd.clone(),
-                                            }]
-                                        })
-                                        .unwrap_or_default()
-                                },
-                                |meta_json| {
-                                    cella_features::lifecycle_from_metadata_label(meta_json, phase)
-                                },
-                            );
-                            run_lifecycle_entries(
-                                &client,
-                                &container.id,
-                                phase,
-                                &entries,
-                                Some(remote_user.as_str()),
-                                &remote_env,
-                                workspace_folder,
-                                is_text,
-                            )
-                            .await?;
-                        }
-
-                        output_result(
-                            &self.output,
-                            "started",
-                            &container.id,
-                            &remote_user,
-                            workspace_folder_str,
+                    // Warn if config has changed
+                    if let Some(old_hash) = &container.config_hash
+                        && *old_hash != resolved.config_hash
+                    {
+                        eprintln!(
+                            "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
                         );
-                        return Ok(());
+                        eprintln!(
+                            "  Run `cella up --rebuild` to recreate with the updated config."
+                        );
                     }
-                    eprintln!("\x1b[33mWARNING:\x1b[0m Bind mount source(s) no longer exist:");
-                    for m in &missing {
-                        eprintln!("  {} \u{2192} {}", m.source, m.destination);
+
+                    // Warn if Docker runtime has changed
+                    let current_runtime = cella_env::platform::detect_runtime();
+                    if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime") {
+                        let current_label = current_runtime.as_label();
+                        if old_runtime != current_label {
+                            eprintln!(
+                                "\x1b[33mWARNING:\x1b[0m Docker runtime changed ({old_runtime} \u{2192} {current_label})."
+                            );
+                            eprintln!(
+                                "  Run `cella up --rebuild` to recreate with the updated runtime."
+                            );
+                        }
                     }
-                    eprintln!("Recreating container...");
-                    client.remove_container(&container.id, false).await?;
-                    // Fall through to create path
+
+                    // Attempt to start directly — let Docker validate mounts
+                    let start_result = timed_step(
+                        is_text,
+                        "Starting container...",
+                        client.start_container(&container.id),
+                    )
+                    .await;
+
+                    match start_result {
+                        Ok(()) => {
+                            verify_container_running(&client, &container.id).await?;
+
+                            // Re-inject env forwarding on restart
+                            let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+                            timed_step(
+                                is_text,
+                                "Configuring environment...",
+                                inject_post_start(
+                                    &client,
+                                    &container.id,
+                                    &env_fwd.post_start,
+                                    &remote_user,
+                                ),
+                            )
+                            .await;
+
+                            timed_step(
+                                is_text,
+                                "Running userEnvProbe...",
+                                super::env_cache::probe_and_cache_user_env(
+                                    &client,
+                                    &container.id,
+                                    &remote_user,
+                                    probe_type,
+                                ),
+                            )
+                            .await;
+
+                            // Run lifecycle from metadata label (includes features)
+                            let metadata = container.labels.get("devcontainer.metadata");
+                            for phase in ["postStartCommand", "postAttachCommand"] {
+                                let entries = metadata.map_or_else(
+                                    || {
+                                        config
+                                            .get(phase)
+                                            .filter(|v| !v.is_null())
+                                            .map(|cmd| {
+                                                vec![cella_features::LifecycleEntry {
+                                                    origin: "devcontainer.json".into(),
+                                                    command: cmd.clone(),
+                                                }]
+                                            })
+                                            .unwrap_or_default()
+                                    },
+                                    |meta_json| {
+                                        cella_features::lifecycle_from_metadata_label(
+                                            meta_json, phase,
+                                        )
+                                    },
+                                );
+                                run_lifecycle_entries(
+                                    &client,
+                                    &container.id,
+                                    phase,
+                                    &entries,
+                                    Some(remote_user.as_str()),
+                                    &remote_env,
+                                    workspace_folder,
+                                    is_text,
+                                )
+                                .await?;
+                            }
+
+                            output_result(
+                                &self.output,
+                                "started",
+                                &container.id,
+                                &remote_user,
+                                workspace_folder_str,
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!("Failed to start existing container: {e}");
+                            eprintln!(
+                                "\x1b[33mWARNING:\x1b[0m Could not start existing container: {e}"
+                            );
+                            eprintln!("Recreating container...");
+                            let _ = client.remove_container(&container.id, false).await;
+                            // Fall through to creation path
+                        }
+                    }
                 }
                 (ContainerState::Running, false) => {
                     // build_no_cache=true with running container: stop, remove, rebuild
@@ -364,16 +385,18 @@ impl UpArgs {
         };
 
         // 6.5. Ensure credential proxy daemon is running (if host has git credentials)
-        super::ensure_credential_proxy();
+        super::ensure_cella_daemon().await;
 
         // 6.6. Prepare environment forwarding (SSH agent, git config, credential proxy)
         let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
 
         // 7. Create container
+        let docker_runtime = cella_env::platform::detect_runtime();
         let mut labels = container_labels(
             &resolved.workspace_root,
             &resolved.config_path,
             &resolved.config_hash,
+            docker_runtime.as_label(),
         );
 
         // Store exec metadata labels for fast exec/shell without config re-resolution
@@ -399,6 +422,20 @@ impl UpArgs {
             labels.insert(
                 "devcontainer.metadata".to_string(),
                 rf.metadata_label.clone(),
+            );
+        }
+
+        // Store ports_attributes in a label for re-registration after daemon restart
+        {
+            let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
+            let other_ports_attrs =
+                cella_docker::config_map::ports::parse_other_ports_attributes(config);
+            labels.insert(
+                "dev.cella.ports_attributes".to_string(),
+                cella_docker::config_map::ports::serialize_ports_attributes_label(
+                    &ports_attrs,
+                    other_ports_attrs.as_ref(),
+                ),
             );
         }
 
@@ -440,6 +477,69 @@ impl UpArgs {
             create_opts.env.extend(fwd_env);
         }
 
+        // Query daemon for control port + token to inject as env vars
+        let daemon_env = if let Some(mgmt_sock) =
+            cella_env::git_credential::daemon_management_socket_path()
+            && mgmt_sock.exists()
+        {
+            let status_resp = cella_daemon::management::send_management_request(
+                &mgmt_sock,
+                &cella_port::protocol::ManagementRequest::QueryStatus,
+            )
+            .await;
+
+            if let Ok(cella_port::protocol::ManagementResponse::Status {
+                control_port,
+                control_token,
+                ..
+            }) = &status_resp
+            {
+                vec![
+                    format!("CELLA_DAEMON_ADDR=host.docker.internal:{control_port}"),
+                    format!("CELLA_DAEMON_TOKEN={control_token}"),
+                    format!("CELLA_CONTAINER_NAME={container_nm}"),
+                ]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        if !daemon_env.is_empty() {
+            if create_opts.env.is_empty() {
+                create_opts.env = image_env.clone();
+            }
+            create_opts.env.extend(daemon_env);
+        }
+
+        // Populate agent volume with binary + browser helper
+        if let Err(e) = cella_docker::volume::ensure_agent_volume_populated(client.inner()).await {
+            warn!("Failed to populate agent volume: {e}");
+            eprintln!(
+                "\x1b[33mWARNING:\x1b[0m Port forwarding and BROWSER interception will not work."
+            );
+            eprintln!("  Agent volume population failed: {e}");
+        }
+
+        // Add agent volume mount and env vars
+        {
+            let agent_env = cella_docker::config_map::env::agent_env_vars();
+            if create_opts.env.is_empty() {
+                create_opts.env = image_env.clone();
+            }
+            create_opts.env.extend(agent_env);
+
+            // Add cella-agent volume mount (read-only)
+            let (vol_name, vol_target, _ro) = cella_docker::volume::agent_volume_mount();
+            create_opts.mounts.push(MountConfig {
+                mount_type: "volume".to_string(),
+                source: vol_name.to_string(),
+                target: vol_target.to_string(),
+                consistency: None,
+            });
+        }
+
         let container_id = timed_step(
             is_text,
             "Creating container...",
@@ -455,6 +555,64 @@ impl UpArgs {
         )
         .await?;
         verify_container_running(&client, &container_id).await?;
+
+        // 8.5. Connect container to cella bridge network (for cross-container comm)
+        if let Err(e) =
+            cella_docker::network::ensure_container_connected(client.inner(), &container_id).await
+        {
+            tracing::warn!("Failed to connect container to cella network: {e}");
+        }
+
+        // 8.6. Connect to per-repository network (enables inter-container DNS)
+        if let Err(e) = cella_docker::network::ensure_repo_network(
+            client.inner(),
+            &container_id,
+            &resolved.workspace_root,
+        )
+        .await
+        {
+            tracing::warn!("Failed to connect container to repo network: {e}");
+        }
+
+        // 8.7. Register container with daemon for port management
+        {
+            let container_ip =
+                cella_docker::network::get_container_cella_ip(client.inner(), &container_id).await;
+            if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
+                && mgmt_sock.exists()
+            {
+                // Parse forwardPorts from devcontainer.json
+                let forward_ports: Vec<u16> = config
+                    .get("forwardPorts")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
+                let other_ports_attrs =
+                    cella_docker::config_map::ports::parse_other_ports_attributes(config);
+                let req = cella_port::protocol::ManagementRequest::RegisterContainer {
+                    container_id: container_id.clone(),
+                    container_name: container_nm.clone(),
+                    container_ip,
+                    ports_attributes: ports_attrs,
+                    other_ports_attributes: other_ports_attrs,
+                    forward_ports,
+                };
+                match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
+                    Ok(resp) => {
+                        tracing::debug!("Container registered with daemon: {resp:?}");
+                    }
+                    Err(e) => {
+                        warn!("Failed to register container with daemon: {e}");
+                    }
+                }
+            }
+        }
 
         // 9. updateRemoteUserUID
         let update_uid = config

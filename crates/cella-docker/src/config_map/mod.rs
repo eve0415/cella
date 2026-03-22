@@ -1,8 +1,8 @@
 //! Map devcontainer.json config to Docker API types.
 
-mod env;
+pub mod env;
 mod mounts;
-mod ports;
+pub mod ports;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -97,6 +97,7 @@ impl CreateContainerOptions {
                 Some(self.security_opt.clone())
             },
             privileged: Some(self.privileged),
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
         };
 
@@ -221,6 +222,17 @@ pub fn map_config(
 
     let (entrypoint, cmd) = if override_command {
         let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
+
+        // Start cella-agent for port detection + credential forwarding
+        let version = env!("CARGO_PKG_VERSION");
+        let arch = crate::volume::detect_agent_arch();
+        let agent_path = crate::volume::agent_binary_path(version, arch);
+        script.push_str(&format!(
+            "if [ -x \"{agent_path}\" ]; then\n  \
+             \"{agent_path}\" daemon \
+             --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &\n\
+             fi\n"
+        ));
 
         if let Some(fc) = feature_config {
             for ep in &fc.entrypoints {
@@ -715,6 +727,30 @@ mod tests {
 
         // Feature containerEnv must NOT appear in runtime env
         assert!(opts.env.is_empty());
+    }
+
+    #[test]
+    fn host_docker_internal_injected() {
+        let opts = CreateContainerOptions {
+            name: "test".to_string(),
+            image: "ubuntu".to_string(),
+            labels: HashMap::new(),
+            env: Vec::new(),
+            remote_env: Vec::new(),
+            user: None,
+            workspace_folder: "/workspace".to_string(),
+            workspace_mount: None,
+            mounts: Vec::new(),
+            port_bindings: HashMap::new(),
+            entrypoint: None,
+            cmd: None,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            privileged: false,
+        };
+        let bollard_config = opts.to_bollard_config();
+        let extra_hosts = bollard_config.host_config.unwrap().extra_hosts.unwrap();
+        assert!(extra_hosts.contains(&"host.docker.internal:host-gateway".to_string()));
     }
 
     #[test]

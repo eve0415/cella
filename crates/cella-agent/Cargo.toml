@@ -4,13 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "cella-agent"
+path = "src/main.rs"
+
 [dependencies]
-cella-config.workspace = true
-cella-docker.workspace = true
-cella-git.workspace = true
 cella-port.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

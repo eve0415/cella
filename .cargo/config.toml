@@ -1,0 +1,18 @@
+# Cross-compilation targets for cella-agent (statically linked for containers)
+#
+# The agent binary must be statically linked (musl) so it runs in any
+# Linux container regardless of the base image's libc.
+#
+# To cross-compile:
+#   cargo build -p cella-agent --target x86_64-unknown-linux-musl --release
+#   cargo build -p cella-agent --target aarch64-unknown-linux-musl --release
+
+[target.x86_64-unknown-linux-musl]
+# Use the musl linker when cross-compiling to x86_64 musl
+# Uncomment if cross-compiling from a different arch:
+# linker = "x86_64-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-musl]
+# Use the musl linker when cross-compiling to aarch64 musl
+# Uncomment if cross-compiling from a different arch:
+# linker = "aarch64-linux-musl-gcc"

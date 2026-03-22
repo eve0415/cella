@@ -1,0 +1,916 @@
+//! Docker volume management for the cella-agent binary.
+//!
+//! The agent binary is stored in a Docker volume (`cella-agent`) and
+//! mounted read-only into containers. The volume is versioned by
+//! CLI version + architecture.
+
+use bollard::Docker;
+use bollard::container::{
+    Config, CreateContainerOptions as BollardCreateOpts, RemoveContainerOptions,
+    StartContainerOptions, WaitContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::volume::CreateVolumeOptions;
+use futures_util::StreamExt;
+use tracing::{debug, info};
+
+use crate::CellaDockerError;
+
+/// Docker volume name for the agent binary.
+pub const AGENT_VOLUME_NAME: &str = "cella-agent";
+
+/// Volume structure path prefix.
+const AGENT_PATH_PREFIX: &str = "/cella";
+
+/// Ensure the cella-agent volume exists.
+///
+/// Creates the volume if it doesn't already exist.
+///
+/// # Errors
+///
+/// Returns error if Docker API call fails.
+pub async fn ensure_agent_volume(docker: &Docker) -> Result<(), CellaDockerError> {
+    // Check if volume already exists
+    match docker.inspect_volume(AGENT_VOLUME_NAME).await {
+        Ok(_) => {
+            debug!("Volume '{AGENT_VOLUME_NAME}' already exists");
+            return Ok(());
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            // Volume doesn't exist — create it
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let config = CreateVolumeOptions {
+        name: AGENT_VOLUME_NAME.to_string(),
+        labels: [
+            ("dev.cella.tool".to_string(), "cella".to_string()),
+            ("dev.cella.managed".to_string(), "true".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    docker.create_volume(config).await?;
+    info!("Created Docker volume '{AGENT_VOLUME_NAME}'");
+    Ok(())
+}
+
+/// Get the agent binary path inside the container for a given version and arch.
+pub fn agent_binary_path(version: &str, arch: &str) -> String {
+    format!("{AGENT_PATH_PREFIX}/v{version}/{arch}/cella-agent")
+}
+
+/// Get the browser helper script path inside the container.
+pub fn browser_helper_path() -> String {
+    format!("{AGENT_PATH_PREFIX}/bin/cella-browser")
+}
+
+/// Generate the mount configuration for the agent volume.
+///
+/// Returns a tuple of (source, target, readonly) for the volume mount.
+pub const fn agent_volume_mount() -> (&'static str, &'static str, bool) {
+    (AGENT_VOLUME_NAME, AGENT_PATH_PREFIX, true)
+}
+
+/// Check if the dev override env var is set.
+///
+/// When `CELLA_AGENT_PATH` is set, we bind-mount that path
+/// instead of using the volume, allowing developers to test
+/// local agent builds.
+pub fn dev_agent_override() -> Option<String> {
+    std::env::var("CELLA_AGENT_PATH").ok()
+}
+
+/// Detect the target architecture for the agent binary.
+///
+/// Maps from Rust's `std::env::consts::ARCH` to the volume path convention.
+pub fn detect_agent_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        arch => arch, // fallback: use as-is
+    }
+}
+
+/// Generate the cella-browser helper script content.
+///
+/// This script is placed at `/cella/bin/cella-browser` and set as the
+/// `BROWSER` env var. When called, it forwards the URL to the agent
+/// which sends it to the host daemon via the control socket.
+pub fn browser_helper_script(version: &str, arch: &str) -> Vec<u8> {
+    let agent_path = agent_binary_path(version, arch);
+    let script = format!(
+        r#"#!/bin/sh
+# cella browser helper — forwards URLs to host via cella-agent.
+exec "{agent_path}" browser-open "$1"
+"#
+    );
+    script.into_bytes()
+}
+
+/// Version marker file path inside the volume.
+pub fn version_marker_path() -> &'static str {
+    "/cella/.version"
+}
+
+/// Generate the version marker content for the agent volume.
+pub fn version_marker_content() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = detect_agent_arch();
+    format!("{version}/{arch}\n")
+}
+
+/// Remove the cella-agent volume.
+///
+/// # Errors
+///
+/// Returns error if Docker API call fails.
+pub async fn remove_agent_volume(docker: &Docker) -> Result<(), CellaDockerError> {
+    match docker.remove_volume(AGENT_VOLUME_NAME, None).await {
+        Ok(()) => {
+            info!("Removed Docker volume '{AGENT_VOLUME_NAME}'");
+            Ok(())
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            debug!("Volume '{AGENT_VOLUME_NAME}' doesn't exist, nothing to remove");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Ensure the agent volume is populated with the correct version of the agent binary
+/// and browser helper script.
+///
+/// Steps:
+/// 1. Ensure the volume exists
+/// 2. Check version marker — if current, return early
+/// 3. Get agent binary bytes (CELLA_AGENT_PATH override, debug build, or release download)
+/// 4. Upload agent binary + browser helper + version marker via temp container
+pub async fn ensure_agent_volume_populated(docker: &Docker) -> Result<(), CellaDockerError> {
+    ensure_agent_volume(docker).await?;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = detect_agent_arch();
+    let expected_marker = format!("{version}/{arch}\n");
+
+    // In debug builds, always repopulate — code changes without version
+    // bumps would otherwise leave a stale agent binary in the volume.
+    if !cfg!(debug_assertions) && check_volume_version(docker, &expected_marker).await? {
+        debug!("Agent volume already up-to-date ({version}/{arch})");
+        return Ok(());
+    }
+
+    info!("Populating agent volume with v{version}/{arch}...");
+
+    // Get agent binary bytes
+    let agent_bytes = get_agent_binary_bytes(docker).await?;
+
+    // Generate browser helper script
+    let browser_script = browser_helper_script(version, arch);
+
+    // Upload all files to volume via temp container
+    upload_to_volume(
+        docker,
+        version,
+        arch,
+        &agent_bytes,
+        &browser_script,
+        &expected_marker,
+    )
+    .await?;
+
+    info!("Agent volume populated successfully");
+    Ok(())
+}
+
+/// Pull an image if it's not already available locally.
+async fn ensure_image_pulled(docker: &Docker, image: &str) -> Result<(), CellaDockerError> {
+    // Check if image exists locally
+    if docker.inspect_image(image).await.is_ok() {
+        return Ok(());
+    }
+
+    info!("Pulling image {image}...");
+    let options = CreateImageOptions {
+        from_image: image,
+        ..Default::default()
+    };
+
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(info) => {
+                if let Some(status) = &info.status {
+                    debug!("{status}");
+                }
+            }
+            Err(e) => {
+                return Err(CellaDockerError::AgentVolume {
+                    message: format!("failed to pull {image}: {e}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if the volume's version marker matches the expected content.
+async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, CellaDockerError> {
+    ensure_image_pulled(docker, "alpine:3").await?;
+
+    let container_name = "cella-volume-check";
+
+    // Remove stale check container if it exists
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let config = Config {
+        image: Some("alpine:3".to_string()),
+        cmd: Some(vec!["cat".to_string(), "/cella/.version".to_string()]),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/cella".to_string()),
+                source: Some(AGENT_VOLUME_NAME.to_string()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                read_only: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: container_name,
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .await?;
+
+    // Wait for container to finish
+    let mut wait_stream = docker.wait_container(
+        container_name,
+        Some(WaitContainerOptions {
+            condition: "not-running",
+        }),
+    );
+    while let Some(result) = wait_stream.next().await {
+        match result {
+            Ok(resp) => {
+                if resp.status_code != 0 {
+                    // .version file doesn't exist yet
+                    let _ = docker
+                        .remove_container(
+                            container_name,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    return Ok(false);
+                }
+            }
+            Err(_) => {
+                let _ = docker
+                    .remove_container(
+                        container_name,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Ok(false);
+            }
+        }
+    }
+
+    // Read logs for the version content
+    let log_opts = bollard::container::LogsOptions::<String> {
+        stdout: true,
+        ..Default::default()
+    };
+    let mut log_stream = docker.logs(container_name, Some(log_opts));
+    let mut output = String::new();
+    while let Some(Ok(chunk)) = log_stream.next().await {
+        output.push_str(&chunk.to_string());
+    }
+
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    Ok(output.trim() == expected.trim())
+}
+
+/// Get the agent binary bytes from the appropriate source.
+///
+/// Priority:
+/// 1. `CELLA_AGENT_PATH` env var — explicit override (escape hatch)
+/// 2. Debug builds on Linux — use local `cella-agent` from `target/debug/`
+/// 3. Debug builds on non-Linux — build in temp Rust container (cross-compile)
+/// 4. Release builds — download from GitHub releases (stub)
+async fn get_agent_binary_bytes(docker: &Docker) -> Result<Vec<u8>, CellaDockerError> {
+    // 1. Check for CELLA_AGENT_PATH override (fastest dev iteration)
+    if let Some(path) = dev_agent_override() {
+        info!("Using agent binary from CELLA_AGENT_PATH: {path}");
+        return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to read CELLA_AGENT_PATH ({path}): {e}"),
+        });
+    }
+
+    // 2. Debug builds
+    #[cfg(debug_assertions)]
+    {
+        // On Linux, the local binary is already the right platform
+        if std::env::consts::OS == "linux" {
+            if let Some(path) = detect_sibling_agent_binary() {
+                info!("Using agent binary from build output: {}", path.display());
+                return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
+                    message: format!("failed to read agent binary at {}: {e}", path.display()),
+                });
+            }
+        }
+
+        // Non-Linux (macOS) or binary not found: build in temp container
+        info!(
+            "Building cella-agent in container (host OS: {})...",
+            std::env::consts::OS
+        );
+        return build_agent_in_container(docker).await;
+    }
+
+    // 3. Release builds: stub with clear error for now
+    #[cfg(not(debug_assertions))]
+    {
+        Err(CellaDockerError::AgentVolume {
+            message: "Agent binary download from GitHub releases not yet implemented. \
+                      Set CELLA_AGENT_PATH to a pre-built linux agent binary."
+                .to_string(),
+        })
+    }
+}
+
+/// Try to find the cella-agent binary next to the running cella binary.
+///
+/// Only valid on Linux where the local build produces a Linux binary.
+#[cfg(debug_assertions)]
+fn detect_sibling_agent_binary() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let agent_path = dir.join("cella-agent");
+    if agent_path.exists() {
+        Some(agent_path)
+    } else {
+        None
+    }
+}
+
+/// Build cella-agent inside a temp Rust container with workspace source bind-mounted.
+///
+/// Used on non-Linux hosts (macOS) where `cargo build` produces a native binary
+/// that won't run inside Linux containers.
+#[cfg(debug_assertions)]
+async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDockerError> {
+    let container_name = "cella-agent-build";
+
+    // Find workspace root by walking up from current_exe
+    let workspace_root = find_workspace_root().ok_or_else(|| CellaDockerError::AgentVolume {
+        message: "cannot find workspace root (no Cargo.toml with [workspace])".to_string(),
+    })?;
+
+    info!(
+        "Building agent from workspace at {}",
+        workspace_root.display()
+    );
+
+    ensure_image_pulled(docker, "rust:slim").await?;
+
+    // Clean up stale build container
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    // Create build container with workspace bind-mounted
+    let config = Config {
+        image: Some("rust:slim".to_string()),
+        cmd: Some(vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "-p".to_string(),
+            "cella-agent".to_string(),
+            "--release".to_string(),
+        ]),
+        working_dir: Some("/src".to_string()),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/src".to_string()),
+                source: Some(workspace_root.to_string_lossy().to_string()),
+                typ: Some(bollard::models::MountTypeEnum::BIND),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: container_name,
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .await?;
+
+    // Wait for build to complete
+    let mut wait_stream = docker.wait_container(
+        container_name,
+        Some(WaitContainerOptions {
+            condition: "not-running",
+        }),
+    );
+
+    while let Some(result) = wait_stream.next().await {
+        match result {
+            Ok(resp) => {
+                if resp.status_code != 0 {
+                    // Capture build logs for error message
+                    let log_opts = bollard::container::LogsOptions::<String> {
+                        stdout: true,
+                        stderr: true,
+                        tail: "30".to_string(),
+                        ..Default::default()
+                    };
+                    let mut log_stream = docker.logs(container_name, Some(log_opts));
+                    let mut output = String::new();
+                    while let Some(Ok(chunk)) = log_stream.next().await {
+                        output.push_str(&chunk.to_string());
+                    }
+
+                    let _ = docker
+                        .remove_container(
+                            container_name,
+                            Some(RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+
+                    return Err(CellaDockerError::AgentVolume {
+                        message: format!(
+                            "agent build failed (exit code {}):\n{output}",
+                            resp.status_code
+                        ),
+                    });
+                }
+            }
+            Err(e) => {
+                let _ = docker
+                    .remove_container(
+                        container_name,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(CellaDockerError::AgentVolume {
+                    message: format!("build container wait failed: {e}"),
+                });
+            }
+        }
+    }
+
+    // Extract the built binary from the container
+    let binary_path = "/src/target/release/cella-agent";
+    let tar_stream = docker.download_from_container(
+        container_name,
+        Some(bollard::container::DownloadFromContainerOptions { path: binary_path }),
+    );
+
+    let tar_bytes: Vec<u8> = {
+        let mut buf = Vec::new();
+        let mut stream = tar_stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("download from container failed: {e}"),
+            })?;
+            buf.extend_from_slice(&chunk);
+        }
+        buf
+    };
+
+    // Extract binary from tar
+    let agent_bytes = extract_file_from_tar(&tar_bytes, "cella-agent")?;
+
+    // Clean up
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    info!(
+        "Agent binary built successfully ({} bytes)",
+        agent_bytes.len()
+    );
+    Ok(agent_bytes)
+}
+
+/// Extract a file by name from a tar archive.
+#[cfg(debug_assertions)]
+fn extract_file_from_tar(tar_bytes: &[u8], filename: &str) -> Result<Vec<u8>, CellaDockerError> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    for entry in archive
+        .entries()
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("tar entries: {e}"),
+        })?
+    {
+        let mut entry = entry.map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("tar entry: {e}"),
+        })?;
+        let path = entry.path().map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("tar path: {e}"),
+        })?;
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == filename)
+        {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| {
+                CellaDockerError::AgentVolume {
+                    message: format!("tar read: {e}"),
+                }
+            })?;
+            return Ok(buf);
+        }
+    }
+    Err(CellaDockerError::AgentVolume {
+        message: format!("file '{filename}' not found in tar archive"),
+    })
+}
+
+/// Find the workspace root by walking up from the current exe looking for
+/// a `Cargo.toml` that contains `[workspace]`.
+#[cfg(debug_assertions)]
+fn find_workspace_root() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+
+    // Walk up from the exe dir (typically target/debug/) looking for workspace root
+    for _ in 0..10 {
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.exists() {
+            if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
+                if content.contains("[workspace]") {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Upload agent binary, browser helper, and version marker to the volume.
+async fn upload_to_volume(
+    docker: &Docker,
+    version: &str,
+    arch: &str,
+    agent_bytes: &[u8],
+    browser_script: &[u8],
+    version_marker: &str,
+) -> Result<(), CellaDockerError> {
+    ensure_image_pulled(docker, "alpine:3").await?;
+
+    let container_name = "cella-volume-populate";
+
+    // Remove stale container if it exists
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let config = Config {
+        image: Some("alpine:3".to_string()),
+        cmd: Some(vec!["sleep".to_string(), "30".to_string()]),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/cella".to_string()),
+                source: Some(AGENT_VOLUME_NAME.to_string()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: container_name,
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .await?;
+
+    // Build tar archive with all files
+    let tar_bytes = build_volume_tar(version, arch, agent_bytes, browser_script, version_marker)?;
+
+    // Upload to container
+    docker
+        .upload_to_container(
+            container_name,
+            Some(bollard::container::UploadToContainerOptions {
+                path: "/".to_string(),
+                ..Default::default()
+            }),
+            tar_bytes.into(),
+        )
+        .await?;
+
+    // Stop and remove
+    let _ = docker
+        .stop_container(
+            container_name,
+            None::<bollard::container::StopContainerOptions>,
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    Ok(())
+}
+
+/// Build a tar archive containing agent binary, browser helper, and version marker.
+fn build_volume_tar(
+    version: &str,
+    arch: &str,
+    agent_bytes: &[u8],
+    browser_script: &[u8],
+    version_marker: &str,
+) -> Result<Vec<u8>, CellaDockerError> {
+    let mut buf = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut buf);
+
+        // Agent binary: /cella/v{version}/{arch}/cella-agent
+        let agent_path = format!("cella/v{version}/{arch}/cella-agent");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(agent_bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, &agent_path, agent_bytes)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append agent: {e}"),
+            })?;
+
+        // Browser helper: /cella/bin/cella-browser
+        let mut header = tar::Header::new_gnu();
+        header.set_size(browser_script.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cella/bin/cella-browser", browser_script)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append browser: {e}"),
+            })?;
+
+        // Version marker: /cella/.version
+        let marker_bytes = version_marker.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(marker_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cella/.version", marker_bytes)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append version: {e}"),
+            })?;
+
+        archive
+            .finish()
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar finish: {e}"),
+            })?;
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_binary_path_format() {
+        assert_eq!(
+            agent_binary_path("0.1.0", "x86_64"),
+            "/cella/v0.1.0/x86_64/cella-agent"
+        );
+    }
+
+    #[test]
+    fn browser_helper_path_format() {
+        assert_eq!(browser_helper_path(), "/cella/bin/cella-browser");
+    }
+
+    #[test]
+    fn agent_volume_mount_values() {
+        let (source, target, ro) = agent_volume_mount();
+        assert_eq!(source, "cella-agent");
+        assert_eq!(target, "/cella");
+        assert!(ro);
+    }
+
+    #[test]
+    fn browser_script_contains_agent_path() {
+        let script = browser_helper_script("0.1.0", "x86_64");
+        let content = String::from_utf8(script).unwrap();
+        assert!(content.contains("/cella/v0.1.0/x86_64/cella-agent"));
+        assert!(content.contains("browser-open"));
+    }
+
+    #[test]
+    fn version_marker_content_format() {
+        let content = version_marker_content();
+        assert!(content.contains('/'));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn detect_arch_returns_known() {
+        let arch = detect_agent_arch();
+        assert!(!arch.is_empty());
+    }
+
+    #[test]
+    fn build_volume_tar_creates_valid_archive() {
+        let agent_bytes = b"#!/bin/sh\necho agent";
+        let browser_bytes = b"#!/bin/sh\necho browser";
+        let marker = "0.1.0/aarch64\n";
+
+        let tar_bytes =
+            build_volume_tar("0.1.0", "aarch64", agent_bytes, browser_bytes, marker).unwrap();
+
+        // Verify tar contains expected entries
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        assert!(entries.iter().any(|e| e.contains("cella-agent")));
+        assert!(entries.iter().any(|e| e.contains("cella-browser")));
+        assert!(entries.iter().any(|e| e.contains(".version")));
+    }
+
+    #[test]
+    fn build_volume_tar_agent_is_executable() {
+        let agent_bytes = b"fake-binary";
+        let browser_bytes = b"#!/bin/sh";
+        let marker = "0.1.0/x86_64\n";
+
+        let tar_bytes =
+            build_volume_tar("0.1.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path.contains("cella-agent") {
+                assert_eq!(entry.header().mode().unwrap(), 0o755);
+            }
+        }
+    }
+
+    #[test]
+    fn detect_sibling_agent_binary_returns_path_or_none() {
+        // Should not panic regardless of whether the binary exists
+        let result = detect_sibling_agent_binary();
+        if let Some(path) = &result {
+            assert!(path.exists());
+            assert!(path.ends_with("cella-agent"));
+        }
+    }
+
+    #[test]
+    fn find_workspace_root_finds_cella() {
+        let root = find_workspace_root();
+        // Should find the workspace root (this test runs from within the workspace)
+        if let Some(path) = &root {
+            assert!(path.join("Cargo.toml").exists());
+            assert!(path.join("crates").exists());
+        }
+    }
+
+    #[test]
+    fn extract_file_from_tar_works() {
+        // Build a small tar with a test file
+        let mut buf = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut buf);
+            let content = b"hello world";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "some/path/myfile", &content[..])
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let result = extract_file_from_tar(&buf, "myfile").unwrap();
+        assert_eq!(result, b"hello world");
+    }
+
+    #[test]
+    fn extract_file_from_tar_missing_file() {
+        let mut buf = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut buf);
+            let content = b"data";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "other", &content[..])
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let result = extract_file_from_tar(&buf, "missing");
+        assert!(result.is_err());
+    }
+}

@@ -9,6 +9,7 @@ use cella_credential_proxy::daemon::{running_cella_container_count, stop_daemon}
 use cella_docker::{ContainerState, ContainerTarget, DockerClient};
 use cella_env::git_credential::{
     credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
+    daemon_management_socket_path,
 };
 
 /// Stop the dev container for the current workspace.
@@ -58,6 +59,20 @@ impl DownArgs {
         };
 
         let container = target.resolve(&client, false).await?;
+
+        // Deregister from daemon (before stop so proxy teardown is clean)
+        if let Some(mgmt_sock) = daemon_management_socket_path() {
+            if mgmt_sock.exists() {
+                let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+                    container_name: container.name.clone(),
+                };
+                if let Err(e) =
+                    cella_daemon::management::send_management_request(&mgmt_sock, &req).await
+                {
+                    debug!("Failed to deregister container with daemon: {e}");
+                }
+            }
+        }
 
         // Stop if running
         if container.state == ContainerState::Running {

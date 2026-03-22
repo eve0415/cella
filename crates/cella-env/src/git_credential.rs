@@ -122,6 +122,11 @@ pub fn cella_data_dir() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".cella"))
 }
 
+/// Get the daemon management socket path (`~/.cella/daemon.sock`).
+pub fn daemon_management_socket_path() -> Option<PathBuf> {
+    cella_data_dir().map(|d| d.join("daemon.sock"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +172,14 @@ mod tests {
                 path,
                 PathBuf::from(home).join(".cella/credential-proxy.port")
             );
+        }
+    }
+
+    #[test]
+    fn daemon_management_socket_path_format() {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = daemon_management_socket_path().unwrap();
+            assert_eq!(path, PathBuf::from(home).join(".cella/daemon.sock"));
         }
     }
 }

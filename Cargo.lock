@@ -248,12 +248,13 @@ dependencies = [
 name = "cella-agent"
 version = "0.1.0"
 dependencies = [
- "cella-config",
- "cella-docker",
- "cella-git",
  "cella-port",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -263,6 +264,7 @@ dependencies = [
  "cella-agent",
  "cella-config",
  "cella-credential-proxy",
+ "cella-daemon",
  "cella-docker",
  "cella-env",
  "cella-features",
@@ -321,12 +323,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-daemon"
+version = "0.1.0"
+dependencies = [
+ "cella-env",
+ "cella-port",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cella-docker"
 version = "0.1.0"
 dependencies = [
  "bollard",
  "cella-config",
  "cella-features",
+ "cella-port",
  "chrono",
  "crossterm",
  "futures-util",
@@ -384,6 +401,9 @@ dependencies = [
 name = "cella-port"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

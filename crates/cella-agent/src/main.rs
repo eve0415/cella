@@ -1,0 +1,185 @@
+//! cella-agent: in-container agent for port detection, proxying, and credential forwarding.
+//!
+//! This binary runs inside dev containers started by cella. It:
+//! - Polls /proc/net/tcp for new listeners and reports them to the host daemon
+//! - Proxies localhost-bound apps to 0.0.0.0 so they're reachable from outside
+//! - Handles BROWSER env var interception for opening URLs on the host
+//! - Forwards git credential requests to the host daemon
+
+mod browser;
+mod control;
+mod credential;
+mod port_proxy;
+mod port_watcher;
+mod reconnecting_client;
+
+use std::time::Duration;
+
+use tracing::{error, info};
+
+/// Agent CLI arguments (parsed manually to avoid clap dep for smaller binary).
+struct AgentArgs {
+    command: AgentCommand,
+}
+
+enum AgentCommand {
+    /// Run the agent daemon (port watching + credential helper).
+    Daemon { poll_interval_ms: u64 },
+    /// Open a URL in the host browser.
+    BrowserOpen { url: String },
+    /// Handle a git credential request.
+    Credential { operation: String },
+}
+
+fn parse_args() -> Result<AgentArgs, String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        return Err(format!(
+            "Usage: {} <daemon|browser-open|credential> [options]",
+            args[0]
+        ));
+    }
+
+    match args[1].as_str() {
+        "daemon" => {
+            let mut poll_interval_ms = 1000u64;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--poll-interval" => {
+                        i += 1;
+                        poll_interval_ms = args
+                            .get(i)
+                            .ok_or("missing --poll-interval value")?
+                            .parse()
+                            .map_err(|_| "invalid --poll-interval value")?;
+                    }
+                    other => return Err(format!("unknown flag: {other}")),
+                }
+                i += 1;
+            }
+
+            Ok(AgentArgs {
+                command: AgentCommand::Daemon { poll_interval_ms },
+            })
+        }
+        "browser-open" => {
+            let url = args.get(2).ok_or("missing URL argument")?.clone();
+            Ok(AgentArgs {
+                command: AgentCommand::BrowserOpen { url },
+            })
+        }
+        "credential" => {
+            let operation = args.get(2).ok_or("missing operation argument")?.clone();
+            Ok(AgentArgs {
+                command: AgentCommand::Credential { operation },
+            })
+        }
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("CELLA_AGENT_LOG")
+                .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("cella-agent: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match args.command {
+        AgentCommand::Daemon { poll_interval_ms } => {
+            info!("cella-agent daemon starting (poll interval: {poll_interval_ms}ms)");
+            run_daemon(poll_interval_ms).await;
+        }
+        AgentCommand::BrowserOpen { url } => {
+            if let Err(e) = browser::send_browser_open(&url).await {
+                error!("Failed to open browser: {e}");
+                std::process::exit(1);
+            }
+        }
+        AgentCommand::Credential { operation } => {
+            if let Err(e) = credential::handle_credential(&operation).await {
+                error!("Credential error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn run_daemon(poll_interval_ms: u64) {
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+    let connect_timeout = Duration::from_secs(30);
+
+    // Read connection info from env vars
+    let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") else {
+        info!("CELLA_DAEMON_ADDR not set, running in standalone mode");
+        port_watcher::run_standalone(poll_interval).await;
+        return;
+    };
+    let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
+    let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
+
+    // Wait for the host daemon to accept connections (race with cella up).
+    let client = reconnecting_client::ReconnectingClient::connect_with_retry(
+        &addr,
+        &container_name,
+        &token,
+        connect_timeout,
+    )
+    .await;
+
+    if !client.is_connected() {
+        info!("Running in standalone mode (no host daemon connection)");
+        port_watcher::run_standalone(poll_interval).await;
+        return;
+    }
+
+    let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+    let start = std::time::Instant::now();
+    let ports_detected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Spawn port watcher
+    let ctrl = control.clone();
+    let pd = ports_detected.clone();
+    let pm: port_watcher::PortMap =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let watcher_handle = tokio::spawn(async move {
+        port_watcher::run(poll_interval, ctrl, pd, pm).await;
+    });
+
+    // Spawn health reporter
+    let ctrl = control.clone();
+    let pd = ports_detected.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let uptime = start.elapsed().as_secs();
+            let msg = cella_port::protocol::AgentMessage::Health {
+                uptime_secs: uptime,
+                ports_detected: pd.load(std::sync::atomic::Ordering::Relaxed),
+            };
+            let mut c = ctrl.lock().await;
+            if let Err(e) = c.send(&msg).await {
+                tracing::warn!("Health report failed: {e}");
+            }
+        }
+    });
+
+    // Wait for watcher (runs forever)
+    let _ = watcher_handle.await;
+}
