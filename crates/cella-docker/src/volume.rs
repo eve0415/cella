@@ -277,10 +277,8 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
         .await?;
 
     // Wait for container to finish
-    let mut wait_stream = docker.wait_container(
-        container_name,
-        Some(WaitContainerOptions::default()),
-    );
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
     while let Some(result) = wait_stream.next().await {
         match result {
             Ok(resp) => {
@@ -469,10 +467,8 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
         .await?;
 
     // Wait for build to complete
-    let mut wait_stream = docker.wait_container(
-        container_name,
-        Some(WaitContainerOptions::default()),
-    );
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
 
     while let Some(result) = wait_stream.next().await {
         match result {

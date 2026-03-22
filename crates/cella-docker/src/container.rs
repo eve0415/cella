@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use bollard::models::ContainerStateStatusEnum;
 use bollard::query_parameters::{
     CreateContainerOptions as BollardCreateOptions, ListContainersOptions, LogsOptions,
     RemoveContainerOptions, StopContainerOptions,
 };
-use bollard::models::ContainerStateStatusEnum;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
@@ -650,14 +650,30 @@ mod tests {
 
     #[test]
     fn summary_no_ports() {
-        let summary = make_summary(Some("id6"), None, None, Some(ContainerSummaryStateEnum::RUNNING), None, None, None);
+        let summary = make_summary(
+            Some("id6"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
         let info = container_info_from_summary(summary);
         assert!(info.ports.is_empty());
     }
 
     #[test]
     fn summary_no_labels() {
-        let summary = make_summary(None, None, None, Some(ContainerSummaryStateEnum::RUNNING), None, None, None);
+        let summary = make_summary(
+            None,
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
         let info = container_info_from_summary(summary);
         assert!(info.labels.is_empty());
         assert!(info.config_hash.is_none());
@@ -692,7 +708,15 @@ mod tests {
 
     #[test]
     fn summary_no_names() {
-        let summary = make_summary(Some("id9"), None, None, Some(ContainerSummaryStateEnum::EXITED), None, None, None);
+        let summary = make_summary(
+            Some("id9"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::EXITED),
+            None,
+            None,
+            None,
+        );
         let info = container_info_from_summary(summary);
         assert_eq!(info.name, "");
     }

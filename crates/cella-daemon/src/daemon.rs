@@ -67,8 +67,7 @@ pub async fn run_daemon(
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();
     let port_manager = Arc::new(tokio::sync::Mutex::new(
-        PortManager::new(is_orbstack)
-            .with_port_checker(crate::port_manager::is_host_port_free),
+        PortManager::new(is_orbstack).with_port_checker(crate::port_manager::is_host_port_free),
     ));
     let browser_handler = Arc::new(BrowserHandler::new());
 

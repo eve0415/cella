@@ -23,10 +23,7 @@ pub const CELLA_NETWORK_NAME: &str = "cella";
 /// Returns error if Docker API call fails.
 pub async fn ensure_network(docker: &Docker) -> Result<(), CellaDockerError> {
     // Check if network already exists
-    match docker
-        .inspect_network(CELLA_NETWORK_NAME, None)
-        .await
-    {
+    match docker.inspect_network(CELLA_NETWORK_NAME, None).await {
         Ok(_) => {
             debug!("Network '{CELLA_NETWORK_NAME}' already exists");
             return Ok(());
@@ -107,9 +104,7 @@ pub async fn is_container_connected(
     docker: &Docker,
     container_id: &str,
 ) -> Result<bool, CellaDockerError> {
-    let network = docker
-        .inspect_network(CELLA_NETWORK_NAME, None)
-        .await?;
+    let network = docker.inspect_network(CELLA_NETWORK_NAME, None).await?;
 
     if let Some(containers) = network.containers {
         return Ok(containers.contains_key(container_id));

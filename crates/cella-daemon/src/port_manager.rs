@@ -138,9 +138,12 @@ impl PortManager {
 
         // Allocate host port, checking OS availability if a checker is configured
         let host_port = match &self.port_checker {
-            Some(checker) => self
-                .allocation
-                .allocate_with_check(port, container_id, require_local, checker.as_ref()),
+            Some(checker) => self.allocation.allocate_with_check(
+                port,
+                container_id,
+                require_local,
+                checker.as_ref(),
+            ),
             None => self.allocation.allocate(port, container_id, require_local),
         };
         let host_port = match host_port {
@@ -177,7 +180,9 @@ impl PortManager {
                 let url = format!("{proto_hint}://localhost:{host_port}");
                 info!("Auto-opening browser: {url}");
             }
-            OnAutoForward::Notify | OnAutoForward::Silent | OnAutoForward::OpenPreview
+            OnAutoForward::Notify
+            | OnAutoForward::Silent
+            | OnAutoForward::OpenPreview
             | OnAutoForward::Ignore => {}
         }
 
