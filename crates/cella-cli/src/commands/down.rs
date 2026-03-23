@@ -6,7 +6,7 @@ use tracing::{debug, info};
 
 use super::up::OutputFormat;
 use cella_credential_proxy::daemon::{running_cella_container_count, stop_daemon};
-use cella_docker::{ContainerState, ContainerTarget, DockerClient};
+use cella_docker::{ContainerInfo, ContainerState, ContainerTarget, DockerClient};
 use cella_env::git_credential::{
     credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
     daemon_management_socket_path,
@@ -60,21 +60,8 @@ impl DownArgs {
 
         let container = target.resolve(&client, false).await?;
 
-        // Deregister from daemon (before stop so proxy teardown is clean)
-        if let Some(mgmt_sock) = daemon_management_socket_path() {
-            if mgmt_sock.exists() {
-                let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
-                    container_name: container.name.clone(),
-                };
-                if let Err(e) =
-                    cella_daemon::management::send_management_request(&mgmt_sock, &req).await
-                {
-                    debug!("Failed to deregister container with daemon: {e}");
-                }
-            }
-        }
+        deregister_container(&container).await;
 
-        // Stop if running
         if container.state == ContainerState::Running {
             client.stop_container(&container.id).await?;
             info!("Container stopped");
@@ -82,55 +69,69 @@ impl DownArgs {
             info!("Container already stopped");
         }
 
-        // Remove if requested
-        if self.rm {
+        let outcome = if self.rm {
             client.remove_container(&container.id, self.volumes).await?;
-
-            match self.output {
-                OutputFormat::Text => {
-                    eprintln!("Container stopped and removed.");
-                }
-                OutputFormat::Json => {
-                    let output = json!({
-                        "outcome": "removed",
-                        "containerId": container.id,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&output).unwrap_or_default()
-                    );
-                }
-            }
+            "removed"
         } else {
-            match self.output {
-                OutputFormat::Text => {
-                    eprintln!("Container stopped.");
-                }
-                OutputFormat::Json => {
-                    let output = json!({
-                        "outcome": "stopped",
-                        "containerId": container.id,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&output).unwrap_or_default()
-                    );
-                }
-            }
-        }
+            "stopped"
+        };
 
-        // Stop credential proxy if no cella containers remain
-        if running_cella_container_count() == 0
-            && let (Some(pid_path), Some(socket_path), Some(port_path)) = (
-                credential_proxy_pid_path(),
-                credential_proxy_socket_path(),
-                credential_proxy_port_path(),
-            )
-            && stop_daemon(&pid_path, &socket_path, &port_path).is_ok()
-        {
-            debug!("Credential proxy daemon stopped (no containers remain)");
-        }
+        print_outcome(&self.output, outcome, &container.id);
+        cleanup_credential_proxy();
 
         Ok(())
+    }
+}
+
+/// Deregister a container from the daemon (before stop so proxy teardown is clean).
+async fn deregister_container(container: &ContainerInfo) {
+    let Some(mgmt_sock) = daemon_management_socket_path() else {
+        return;
+    };
+    if !mgmt_sock.exists() {
+        return;
+    }
+    let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+        container_name: container.name.clone(),
+    };
+    if let Err(e) = cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
+        debug!("Failed to deregister container with daemon: {e}");
+    }
+}
+
+/// Print the outcome in the requested output format.
+fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
+    match output {
+        OutputFormat::Text => {
+            if outcome == "removed" {
+                eprintln!("Container stopped and removed.");
+            } else {
+                eprintln!("Container stopped.");
+            }
+        }
+        OutputFormat::Json => {
+            let output = json!({
+                "outcome": outcome,
+                "containerId": container_id,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// Stop the credential proxy if no cella containers remain.
+fn cleanup_credential_proxy() {
+    if running_cella_container_count() == 0
+        && let (Some(pid_path), Some(socket_path), Some(port_path)) = (
+            credential_proxy_pid_path(),
+            credential_proxy_socket_path(),
+            credential_proxy_port_path(),
+        )
+        && stop_daemon(&pid_path, &socket_path, &port_path).is_ok()
+    {
+        debug!("Credential proxy daemon stopped (no containers remain)");
     }
 }

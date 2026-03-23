@@ -1,5 +1,5 @@
 /// Parse orchestrator: JSONC → `serde_json::Value` → validate → typed config.
-use crate::diagnostic::{ConfigDiagnostic, ConfigDiagnostics, Severity};
+use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
 use crate::jsonc;
 use crate::schema;
 use crate::span::SourceText;
@@ -11,21 +11,21 @@ use crate::span::SourceText;
 ///
 /// # Errors
 ///
-/// Returns `ConfigDiagnostics` if the input contains syntax errors or fails
+/// Returns `Diagnostics` if the input contains syntax errors or fails
 /// schema validation.
-pub fn parse_devcontainer(
+pub fn devcontainer(
     source_name: &str,
     raw_text: &str,
     strict: bool,
-) -> Result<(schema::DevContainer, Vec<ConfigDiagnostic>), ConfigDiagnostics> {
+) -> Result<(schema::DevContainer, Vec<Diagnostic>), Diagnostics> {
     // Step 1: Strip JSONC
-    let cleaned = match jsonc::strip_jsonc(raw_text) {
+    let cleaned = match jsonc::strip(raw_text) {
         Ok(c) => c,
         Err(e) => {
             let source = SourceText::new(source_name.into(), raw_text.into(), raw_text.into());
-            return Err(ConfigDiagnostics::new(
+            return Err(Diagnostics::new(
                 source,
-                vec![ConfigDiagnostic {
+                vec![Diagnostic {
                     severity: Severity::Error,
                     message: e.to_string(),
                     path: String::new(),
@@ -42,9 +42,9 @@ pub fn parse_devcontainer(
     let value: serde_json::Value = match serde_json::from_str(&cleaned) {
         Ok(v) => v,
         Err(e) => {
-            return Err(ConfigDiagnostics::new(
+            return Err(Diagnostics::new(
                 source,
-                vec![ConfigDiagnostic {
+                vec![Diagnostic {
                     severity: Severity::Error,
                     message: format!("JSON syntax error: {e}"),
                     path: String::new(),
@@ -59,7 +59,7 @@ pub fn parse_devcontainer(
     match schema::DevContainer::validate(&value, "") {
         Ok(config) => Ok((config, Vec::new())),
         Err(validation_errors) => {
-            let mut diagnostics: Vec<ConfigDiagnostic> = validation_errors
+            let mut diagnostics: Vec<Diagnostic> = validation_errors
                 .into_iter()
                 .map(|ve| {
                     let path_segments: Vec<&str> =
@@ -88,7 +88,7 @@ pub fn parse_devcontainer(
                         _ => None,
                     };
 
-                    ConfigDiagnostic {
+                    Diagnostic {
                         severity,
                         message: ve.message,
                         path: ve.path,
@@ -105,7 +105,7 @@ pub fn parse_devcontainer(
                 }
             }
 
-            Err(ConfigDiagnostics::new(source, diagnostics))
+            Err(Diagnostics::new(source, diagnostics))
         }
     }
 }
@@ -117,8 +117,8 @@ mod tests {
 
     /// Helper: unwrap Ok or panic with rendered diagnostics.
     fn unwrap_ok(
-        result: Result<(schema::DevContainer, Vec<ConfigDiagnostic>), ConfigDiagnostics>,
-    ) -> (schema::DevContainer, Vec<ConfigDiagnostic>) {
+        result: Result<(schema::DevContainer, Vec<Diagnostic>), Diagnostics>,
+    ) -> (schema::DevContainer, Vec<Diagnostic>) {
         match result {
             Ok(v) => v,
             Err(diags) => panic!("expected Ok, got errors:\n{}", diags.render()),
@@ -127,8 +127,8 @@ mod tests {
 
     /// Helper: unwrap Err or panic.
     fn unwrap_err(
-        result: Result<(schema::DevContainer, Vec<ConfigDiagnostic>), ConfigDiagnostics>,
-    ) -> ConfigDiagnostics {
+        result: Result<(schema::DevContainer, Vec<Diagnostic>), Diagnostics>,
+    ) -> Diagnostics {
         match result {
             Ok(_) => panic!("expected Err, got Ok"),
             Err(diags) => diags,
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn valid_minimal_config() {
-        let result = parse_devcontainer("test.json", r#"{"image": "ubuntu"}"#, false);
+        let result = devcontainer("test.json", r#"{"image": "ubuntu"}"#, false);
         let (_config, warnings) = unwrap_ok(result);
         assert!(
             warnings.is_empty(),
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn empty_object() {
         // An empty object has no required fields, so it should match DevContainerCommon
-        let result = parse_devcontainer("empty.json", "{}", false);
+        let result = devcontainer("empty.json", "{}", false);
         match result {
             Ok((_config, warnings)) => {
                 assert!(warnings.is_empty());
@@ -169,7 +169,7 @@ mod tests {
             // This is a line comment
             "image": "ubuntu"
         }"#;
-        let result = parse_devcontainer("comments.json", input, false);
+        let result = devcontainer("comments.json", input, false);
         let _ = unwrap_ok(result);
     }
 
@@ -179,7 +179,7 @@ mod tests {
             /* block comment */
             "image": "ubuntu"
         }"#;
-        let result = parse_devcontainer("block.json", input, false);
+        let result = devcontainer("block.json", input, false);
         let _ = unwrap_ok(result);
     }
 
@@ -188,14 +188,14 @@ mod tests {
         let input = r#"{
             "image": "ubuntu",
         }"#;
-        let result = parse_devcontainer("trailing.json", input, false);
+        let result = devcontainer("trailing.json", input, false);
         let _ = unwrap_ok(result);
     }
 
     #[test]
     fn unterminated_block_comment() {
         let input = r#"{"image": /* unterminated"#;
-        let result = parse_devcontainer("bad.json", input, false);
+        let result = devcontainer("bad.json", input, false);
         let err = unwrap_err(result);
         let messages: Vec<&str> = err
             .diagnostics()
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn invalid_json_syntax() {
         let input = "{not valid json}";
-        let result = parse_devcontainer("syntax.json", input, false);
+        let result = devcontainer("syntax.json", input, false);
         let err = unwrap_err(result);
         let messages: Vec<&str> = err
             .diagnostics()
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn unknown_field_non_strict() {
         let input = r#"{"image": "ubuntu", "unknownField": true}"#;
-        let result = parse_devcontainer("unknown.json", input, false);
+        let result = devcontainer("unknown.json", input, false);
         // Unknown fields in non-strict mode: either Ok with warnings or Err with warnings
         match result {
             Ok((_config, _warnings)) => {
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn unknown_field_strict() {
         let input = r#"{"image": "ubuntu", "unknownField": true}"#;
-        let result = parse_devcontainer("strict.json", input, true);
+        let result = devcontainer("strict.json", input, true);
         // In strict mode, unknown fields must be errors
         match result {
             Ok(_) => {
@@ -287,7 +287,7 @@ mod tests {
     fn source_name_preserved() {
         let source_name = "my-custom-source.json";
         let input = "{not valid json}";
-        let err = unwrap_err(parse_devcontainer(source_name, input, false));
+        let err = unwrap_err(devcontainer(source_name, input, false));
         let rendered = err.render();
         assert!(
             rendered.contains(source_name),
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn real_devcontainer_json() {
         let input = include_str!("../../../../.devcontainer/devcontainer.json");
-        let result = parse_devcontainer("devcontainer.json", input, false);
+        let result = devcontainer("devcontainer.json", input, false);
         match result {
             Ok((_config, warnings)) => {
                 // Real config parsed successfully — great
@@ -332,7 +332,7 @@ mod tests {
             "image": "ubuntu",
             "remoteUser": "vscode" // inline comment
         }"#;
-        let result = parse_devcontainer("all-features.json", input, false);
+        let result = devcontainer("all-features.json", input, false);
         let _ = unwrap_ok(result);
     }
 }

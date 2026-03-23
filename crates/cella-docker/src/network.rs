@@ -50,7 +50,7 @@ pub async fn ensure_network(docker: &Docker) -> Result<(), CellaDockerError> {
         ..Default::default()
     };
 
-    let _ = docker.create_network(config).await?;
+    docker.create_network(config).await?;
     info!("Created Docker network '{CELLA_NETWORK_NAME}'");
     Ok(())
 }
@@ -183,7 +183,7 @@ pub async fn ensure_repo_network(
                 ),
                 ..Default::default()
             };
-            let _ = docker.create_network(config).await?;
+            docker.create_network(config).await?;
             info!("Created repo network '{net_name}'");
         }
         Err(e) => return Err(e.into()),

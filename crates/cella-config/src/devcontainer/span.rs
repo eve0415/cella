@@ -2,7 +2,7 @@
 
 /// A byte range in the source text.
 #[derive(Debug, Clone, Copy)]
-pub struct ByteSpan {
+pub struct Range {
     pub offset: usize,
     pub length: usize,
 }
@@ -45,7 +45,7 @@ impl SourceText {
     ///
     /// Path segments correspond to JSON pointer components,
     /// e.g., `["build", "dockerfile"]`.
-    pub fn find_key_span(&self, path: &[&str]) -> Option<ByteSpan> {
+    pub fn find_key_span(&self, path: &[&str]) -> Option<Range> {
         let bytes = self.cleaned.as_bytes();
         let mut pos = 0;
 
@@ -61,14 +61,14 @@ impl SourceText {
         // pos points to the opening quote of the key
         let key_start = pos;
         let key_end = key_start + 1 + segment_byte_len(bytes, key_start + 1);
-        Some(ByteSpan {
+        Some(Range {
             offset: key_start,
             length: key_end - key_start + 1, // include closing quote
         })
     }
 
     /// Find the byte span of the value at the given JSON pointer path.
-    pub fn find_value_span(&self, path: &[&str]) -> Option<ByteSpan> {
+    pub fn find_value_span(&self, path: &[&str]) -> Option<Range> {
         let bytes = self.cleaned.as_bytes();
         let mut pos = 0;
 
@@ -86,7 +86,7 @@ impl SourceText {
         let value_start = skip_whitespace(bytes, pos);
         let value_end = find_value_end(bytes, value_start)?;
 
-        Some(ByteSpan {
+        Some(Range {
             offset: value_start,
             length: value_end - value_start,
         })

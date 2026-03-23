@@ -168,34 +168,52 @@ pub async fn ensure_agent_volume_populated(docker: &Docker) -> Result<(), CellaD
     let arch = detect_agent_arch();
     let expected_marker = format!("{version}/{arch}\n");
 
-    // In debug builds, always repopulate — code changes without version
-    // bumps would otherwise leave a stale agent binary in the volume.
-    if !cfg!(debug_assertions) && check_volume_version(docker, &expected_marker).await? {
+    if !needs_repopulation(docker, &expected_marker).await? {
         debug!("Agent volume already up-to-date ({version}/{arch})");
         return Ok(());
     }
 
     info!("Populating agent volume with v{version}/{arch}...");
+    populate_volume(docker, version, arch, &expected_marker).await?;
+    info!("Agent volume populated successfully");
+    Ok(())
+}
 
-    // Get agent binary bytes
+/// Check whether repopulation of the agent volume is needed.
+///
+/// In debug builds, always returns `true` (code changes without version
+/// bumps would otherwise leave a stale agent binary in the volume).
+/// In release builds, compares the volume version marker against the expected value.
+async fn needs_repopulation(
+    docker: &Docker,
+    expected_marker: &str,
+) -> Result<bool, CellaDockerError> {
+    if cfg!(debug_assertions) {
+        return Ok(true);
+    }
+    let up_to_date = check_volume_version(docker, expected_marker).await?;
+    Ok(!up_to_date)
+}
+
+/// Fetch agent bytes, build browser script, and upload everything to the volume.
+async fn populate_volume(
+    docker: &Docker,
+    version: &str,
+    arch: &str,
+    expected_marker: &str,
+) -> Result<(), CellaDockerError> {
     let agent_bytes = get_agent_binary_bytes(docker).await?;
-
-    // Generate browser helper script
     let browser_script = browser_helper_script(version, arch);
 
-    // Upload all files to volume via temp container
     upload_to_volume(
         docker,
         version,
         arch,
         &agent_bytes,
         &browser_script,
-        &expected_marker,
+        expected_marker,
     )
-    .await?;
-
-    info!("Agent volume populated successfully");
-    Ok(())
+    .await
 }
 
 /// Pull an image if it's not already available locally.

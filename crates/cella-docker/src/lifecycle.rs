@@ -69,6 +69,119 @@ pub struct LifecycleContext<'a> {
     pub is_text: bool,
 }
 
+/// Run sequential lifecycle commands, streaming output when `is_text`.
+async fn run_sequential(
+    ctx: &LifecycleContext<'_>,
+    phase: &str,
+    commands: Vec<Vec<String>>,
+) -> Result<(), CellaDockerError> {
+    for cmd in commands {
+        if cmd.is_empty() {
+            continue;
+        }
+        debug!("{phase}: {}", cmd.join(" "));
+        let opts = ExecOptions {
+            cmd,
+            user: ctx.user.map(String::from),
+            env: Some(ctx.env.to_vec()),
+            working_dir: ctx.working_dir.map(String::from),
+        };
+        let result = if ctx.is_text {
+            ctx.client
+                .exec_stream(
+                    ctx.container_id,
+                    &opts,
+                    std::io::stderr(),
+                    std::io::stderr(),
+                )
+                .await?
+        } else {
+            ctx.client.exec_command(ctx.container_id, &opts).await?
+        };
+
+        check_exit_code(&result, phase, None)?;
+    }
+    Ok(())
+}
+
+/// Run named lifecycle commands in parallel, collecting and printing output.
+async fn run_parallel(
+    ctx: &LifecycleContext<'_>,
+    phase: &str,
+    commands: Vec<(String, Vec<String>)>,
+) -> Result<(), CellaDockerError> {
+    let mut futures = Vec::new();
+    for (name, cmd) in commands {
+        let user = ctx.user.map(String::from);
+        let env = ctx.env.to_vec();
+        let working_dir = ctx.working_dir.map(String::from);
+        let phase = phase.to_string();
+        let container_id = ctx.container_id.to_string();
+
+        futures.push(async move {
+            debug!("{phase} [{name}]: {}", cmd.join(" "));
+            let result = ctx
+                .client
+                .exec_command(
+                    &container_id,
+                    &ExecOptions {
+                        cmd,
+                        user,
+                        env: Some(env),
+                        working_dir,
+                    },
+                )
+                .await?;
+
+            check_exit_code(&result, &phase, Some(&name))?;
+            Ok::<ExecResult, CellaDockerError>(result)
+        });
+    }
+
+    let results = futures_util::future::join_all(futures).await;
+
+    if ctx.is_text {
+        print_parallel_output(&results);
+    }
+
+    for result in results {
+        let _ = result?;
+    }
+    Ok(())
+}
+
+/// Check an exec result exit code, returning `LifecycleFailed` on non-zero.
+fn check_exit_code(
+    result: &ExecResult,
+    phase: &str,
+    name: Option<&str>,
+) -> Result<(), CellaDockerError> {
+    if result.exit_code != 0 {
+        let prefix = name.map_or(String::new(), |n| format!("[{n}] "));
+        return Err(CellaDockerError::LifecycleFailed {
+            phase: phase.to_string(),
+            message: format!(
+                "{prefix}exit code {}: {}",
+                result.exit_code,
+                result.stderr.trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Print stdout/stderr from parallel exec results to stderr.
+fn print_parallel_output(results: &[Result<ExecResult, CellaDockerError>]) {
+    for exec_result in results.iter().flatten() {
+        if !exec_result.stdout.is_empty() {
+            eprint!("{}", exec_result.stdout);
+        }
+        if !exec_result.stderr.is_empty() {
+            eprint!("{}", exec_result.stderr);
+        }
+    }
+}
+
 /// Execute lifecycle commands for a phase.
 ///
 /// When `ctx.is_text` is true, prints origin-tracked progress (matching the original
@@ -88,101 +201,9 @@ pub async fn run_lifecycle_phase(
     }
     debug!("Running {phase} from {origin}");
 
-    let parsed = parse_lifecycle_command(value);
-
-    match parsed {
-        ParsedLifecycle::Sequential(commands) => {
-            for cmd in commands {
-                if cmd.is_empty() {
-                    continue;
-                }
-                debug!("{phase}: {}", cmd.join(" "));
-                let opts = ExecOptions {
-                    cmd,
-                    user: ctx.user.map(String::from),
-                    env: Some(ctx.env.to_vec()),
-                    working_dir: ctx.working_dir.map(String::from),
-                };
-                let result = if ctx.is_text {
-                    ctx.client
-                        .exec_stream(
-                            ctx.container_id,
-                            &opts,
-                            std::io::stderr(),
-                            std::io::stderr(),
-                        )
-                        .await?
-                } else {
-                    ctx.client.exec_command(ctx.container_id, &opts).await?
-                };
-
-                if result.exit_code != 0 {
-                    return Err(CellaDockerError::LifecycleFailed {
-                        phase: phase.to_string(),
-                        message: format!(
-                            "exit code {}: {}",
-                            result.exit_code,
-                            result.stderr.trim()
-                        ),
-                    });
-                }
-            }
-        }
-        ParsedLifecycle::Parallel(commands) => {
-            let mut futures = Vec::new();
-            for (name, cmd) in commands {
-                let user = ctx.user.map(String::from);
-                let env = ctx.env.to_vec();
-                let working_dir = ctx.working_dir.map(String::from);
-                let phase = phase.to_string();
-                let container_id = ctx.container_id.to_string();
-
-                futures.push(async move {
-                    debug!("{phase} [{name}]: {}", cmd.join(" "));
-                    let result = ctx
-                        .client
-                        .exec_command(
-                            &container_id,
-                            &ExecOptions {
-                                cmd,
-                                user,
-                                env: Some(env),
-                                working_dir,
-                            },
-                        )
-                        .await?;
-
-                    if result.exit_code != 0 {
-                        return Err(CellaDockerError::LifecycleFailed {
-                            phase,
-                            message: format!(
-                                "[{name}] exit code {}: {}",
-                                result.exit_code,
-                                result.stderr.trim()
-                            ),
-                        });
-                    }
-                    Ok::<ExecResult, CellaDockerError>(result)
-                });
-            }
-
-            let results = futures_util::future::join_all(futures).await;
-
-            if ctx.is_text {
-                for exec_result in results.iter().flatten() {
-                    if !exec_result.stdout.is_empty() {
-                        eprint!("{}", exec_result.stdout);
-                    }
-                    if !exec_result.stderr.is_empty() {
-                        eprint!("{}", exec_result.stderr);
-                    }
-                }
-            }
-
-            for result in results {
-                let _ = result?;
-            }
-        }
+    match parse_lifecycle_command(value) {
+        ParsedLifecycle::Sequential(commands) => run_sequential(ctx, phase, commands).await?,
+        ParsedLifecycle::Parallel(commands) => run_parallel(ctx, phase, commands).await?,
     }
 
     debug!("{phase} completed");

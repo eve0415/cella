@@ -6,14 +6,14 @@ const fn default_true() -> bool {
 
 /// Credential forwarding settings.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CredentialSettings {
+pub struct Credentials {
     /// Forward gh CLI credentials into containers (default: true).
     #[serde(default = "default_true")]
     pub gh: bool,
     // Future: claude, codex, gemini
 }
 
-impl Default for CredentialSettings {
+impl Default for Credentials {
     fn default() -> Self {
         Self { gh: true }
     }
@@ -25,25 +25,25 @@ mod tests {
 
     #[test]
     fn default_enables_gh() {
-        let settings = CredentialSettings::default();
+        let settings = Credentials::default();
         assert!(settings.gh);
     }
 
     #[test]
     fn deserialize_empty_uses_defaults() {
-        let settings: CredentialSettings = toml::from_str("").unwrap();
+        let settings: Credentials = toml::from_str("").unwrap();
         assert!(settings.gh);
     }
 
     #[test]
     fn deserialize_explicit_false() {
-        let settings: CredentialSettings = toml::from_str("gh = false").unwrap();
+        let settings: Credentials = toml::from_str("gh = false").unwrap();
         assert!(!settings.gh);
     }
 
     #[test]
     fn deserialize_explicit_true() {
-        let settings: CredentialSettings = toml::from_str("gh = true").unwrap();
+        let settings: Credentials = toml::from_str("gh = true").unwrap();
         assert!(settings.gh);
     }
 }

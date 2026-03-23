@@ -202,7 +202,7 @@ async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         std::env::current_dir()?
     };
 
-    let settings = cella_config::CellaSettings::load(&cwd);
+    let settings = cella_config::Settings::load(&cwd);
     eprintln!();
     eprintln!("Settings:");
     eprintln!(

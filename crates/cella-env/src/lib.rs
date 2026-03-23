@@ -70,22 +70,13 @@ pub struct PostStartInjection {
     pub credential_helper: Option<FileUpload>,
 }
 
-/// Prepare environment forwarding for a container.
-///
-/// Detects the Docker runtime, probes host SSH agent and git config,
-/// checks for the credential proxy daemon, and assembles the forwarding
-/// configuration.
-///
-/// Never fails — individual features log warnings and are skipped
-/// on error, per the design principle of never failing `cella up`.
-pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> EnvForwarding {
-    let runtime = platform::detect_runtime();
-    tracing::debug!("Detected Docker runtime: {runtime:?}");
-
-    let mut fwd = EnvForwarding::default();
-
-    // SSH agent forwarding
-    if let Some(ssh) = ssh_agent::ssh_agent_forwarding(&runtime, config) {
+/// Apply SSH agent forwarding to the environment.
+fn apply_ssh_agent_forwarding(
+    fwd: &mut EnvForwarding,
+    runtime: &DockerRuntime,
+    config: &serde_json::Value,
+) {
+    if let Some(ssh) = ssh_agent::ssh_agent_forwarding(runtime, config) {
         tracing::info!(
             "SSH agent forwarding: {} -> {}",
             ssh.mount_source,
@@ -100,8 +91,10 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
             value: ssh.env_value,
         });
     }
+}
 
-    // SSH config files (known_hosts, config)
+/// Apply SSH config file uploads to the environment.
+fn apply_ssh_config_files(fwd: &mut EnvForwarding, remote_user: &str) {
     let ssh_files = ssh_config::read_ssh_config_files(remote_user);
     if !ssh_files.is_empty() {
         tracing::info!(
@@ -110,8 +103,10 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
         );
         fwd.post_start.file_uploads.extend(ssh_files);
     }
+}
 
-    // Host git config (safe subset)
+/// Apply host git config forwarding to the environment.
+fn apply_git_config(fwd: &mut EnvForwarding) {
     let git_entries = git_config::read_host_git_config();
     if !git_entries.is_empty() {
         tracing::info!(
@@ -128,28 +123,43 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
             ]);
         }
     }
+}
 
-    // Credential proxy forwarding
-    if needs_tcp_credential_proxy(&runtime) {
-        // VM-based runtimes: use TCP via host.docker.internal
-        if let Some(tcp) = git_credential::credential_forwarding_tcp() {
-            tracing::info!(
-                "Credential proxy forwarding via TCP (host.docker.internal:{})",
-                tcp.port
-            );
-            fwd.env.push(ForwardEnv {
-                key: "CELLA_CREDENTIAL_HOST".to_string(),
-                value: format!("host.docker.internal:{}", tcp.port),
-            });
-            // No mount needed — TCP connection via Docker networking
-            fwd.post_start.credential_helper =
-                Some(git_credential::credential_helper_script(remote_user));
-            fwd.post_start
-                .git_config_commands
-                .push(credential_helper_git_config());
-        }
-    } else if let Some(cred) = git_credential::credential_forwarding() {
-        // Direct runtimes (Linux, Docker Desktop): bind-mount socket
+/// Apply credential proxy forwarding to the environment.
+fn apply_credential_forwarding(
+    fwd: &mut EnvForwarding,
+    runtime: &DockerRuntime,
+    remote_user: &str,
+) {
+    if needs_tcp_credential_proxy(runtime) {
+        apply_tcp_credential_forwarding(fwd, remote_user);
+    } else {
+        apply_socket_credential_forwarding(fwd, remote_user);
+    }
+}
+
+/// Apply TCP-based credential forwarding (VM-based runtimes).
+fn apply_tcp_credential_forwarding(fwd: &mut EnvForwarding, remote_user: &str) {
+    if let Some(tcp) = git_credential::credential_forwarding_tcp() {
+        tracing::info!(
+            "Credential proxy forwarding via TCP (host.docker.internal:{})",
+            tcp.port
+        );
+        fwd.env.push(ForwardEnv {
+            key: "CELLA_CREDENTIAL_HOST".to_string(),
+            value: format!("host.docker.internal:{}", tcp.port),
+        });
+        fwd.post_start.credential_helper =
+            Some(git_credential::credential_helper_script(remote_user));
+        fwd.post_start
+            .git_config_commands
+            .push(credential_helper_git_config());
+    }
+}
+
+/// Apply socket-based credential forwarding (direct runtimes).
+fn apply_socket_credential_forwarding(fwd: &mut EnvForwarding, remote_user: &str) {
+    if let Some(cred) = git_credential::credential_forwarding() {
         tracing::info!(
             "Credential proxy forwarding: {} -> {}",
             cred.mount_source,
@@ -169,6 +179,26 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
             .git_config_commands
             .push(credential_helper_git_config());
     }
+}
+
+/// Prepare environment forwarding for a container.
+///
+/// Detects the Docker runtime, probes host SSH agent and git config,
+/// checks for the credential proxy daemon, and assembles the forwarding
+/// configuration.
+///
+/// Never fails — individual features log warnings and are skipped
+/// on error, per the design principle of never failing `cella up`.
+pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> EnvForwarding {
+    let runtime = platform::detect_runtime();
+    tracing::debug!("Detected Docker runtime: {runtime:?}");
+
+    let mut fwd = EnvForwarding::default();
+
+    apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
+    apply_ssh_config_files(&mut fwd, remote_user);
+    apply_git_config(&mut fwd);
+    apply_credential_forwarding(&mut fwd, &runtime, remote_user);
 
     fwd
 }

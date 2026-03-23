@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cella_port::protocol::{
-    AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION,
+    AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -58,6 +58,33 @@ pub struct ContainerHandle {
     pub agent_state: Arc<AgentConnectionState>,
 }
 
+/// Spawn a handler task for a new agent TCP connection.
+fn spawn_agent_handler(stream: tokio::net::TcpStream, ctx: Arc<ControlContext>) {
+    tokio::spawn(async move {
+        if let Err(e) = handle_agent_connection(stream, &ctx).await {
+            warn!("Agent connection error: {e}");
+        }
+    });
+}
+
+/// Handle an accepted TCP connection result.
+fn handle_accept_result(
+    result: std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+    ctx: &Arc<ControlContext>,
+    last_activity: &AtomicU64,
+) {
+    match result {
+        Ok((stream, peer)) => {
+            last_activity.store(current_time_secs(), Ordering::Relaxed);
+            debug!("Agent TCP connection from {peer}");
+            spawn_agent_handler(stream, ctx.clone());
+        }
+        Err(e) => {
+            warn!("Control server accept error: {e}");
+        }
+    }
+}
+
 /// Run the unified TCP control server.
 ///
 /// Accepts agent connections, validates auth tokens, looks up container names
@@ -73,22 +100,7 @@ pub(crate) async fn run_control_server(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                match result {
-                    Ok((stream, peer)) => {
-                        last_activity.store(current_time_secs(), Ordering::Relaxed);
-                        debug!("Agent TCP connection from {peer}");
-                        let ctx = ctx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_agent_connection(stream, &ctx).await
-                            {
-                                warn!("Agent connection error: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!("Control server accept error: {e}");
-                    }
-                }
+                handle_accept_result(result, &ctx, &last_activity);
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -297,6 +309,41 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub container_ip: Option<&'a str>,
 }
 
+/// Start a TCP proxy for a forwarded port and verify it bound successfully.
+///
+/// Returns `false` if the proxy bind failed and the allocation should be rolled back.
+async fn start_port_proxy(
+    host_port: u16,
+    container_ip: &str,
+    target_port: u16,
+    proxy_cmd_tx: &tokio::sync::mpsc::Sender<ProxyCommand>,
+) -> bool {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let _ = proxy_cmd_tx
+        .send(ProxyCommand::Start {
+            host_port,
+            container_ip: container_ip.to_string(),
+            container_port: target_port,
+            result_tx: Some(result_tx),
+        })
+        .await;
+
+    match result_rx.await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!(
+                "Proxy bind failed for port {host_port} (container port {target_port}): {e}. \
+                 Rolling back allocation."
+            );
+            false
+        }
+        Err(_) => {
+            warn!("Proxy coordinator dropped result channel for port {host_port}");
+            true
+        }
+    }
+}
+
 /// Handle a `PortOpen` message: allocate a host port, start a proxy, and respond.
 async fn handle_port_open(
     port: u16,
@@ -317,30 +364,10 @@ async fn handle_port_open(
     let target_port = proxy_port.unwrap_or(port);
 
     if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip) {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let _ = tx
-            .send(ProxyCommand::Start {
-                host_port: hp,
-                container_ip: ip.to_string(),
-                container_port: target_port,
-                result_tx: Some(result_tx),
-            })
-            .await;
-
-        match result_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(
-                    "Proxy bind failed for port {hp} (container port {port}): {e}. \
-                     Rolling back allocation."
-                );
-                let mut pm = ctx.port_manager.lock().await;
-                pm.handle_port_closed(&cid, port);
-                return None;
-            }
-            Err(_) => {
-                warn!("Proxy coordinator dropped result channel for port {hp}");
-            }
+        if !start_port_proxy(hp, ip, target_port, tx).await {
+            let mut pm = ctx.port_manager.lock().await;
+            pm.handle_port_closed(&cid, port);
+            return None;
         }
     }
 
@@ -348,6 +375,65 @@ async fn handle_port_open(
         container_port: port,
         host_port: hp,
     })
+}
+
+/// Handle a port closed message from an agent.
+async fn handle_port_closed(port: u16, protocol: PortProtocol, ctx: &AgentHandlerContext<'_>) {
+    let cid = ctx.container_id.unwrap_or("unknown").to_string();
+    debug!("Port closed: {port}/{protocol} from {cid}");
+    let host_port = {
+        let mut pm = ctx.port_manager.lock().await;
+        pm.handle_port_closed(&cid, port)
+    };
+
+    if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
+        let _ = tx.send(ProxyCommand::Stop { host_port: hp }).await;
+    }
+}
+
+/// Handle a browser open request from an agent.
+async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
+    let rewritten = if let Some(cid) = ctx.container_id {
+        rewrite_browser_url(&url, ctx.port_manager, cid).await
+    } else {
+        url.clone()
+    };
+    if rewritten != url {
+        info!("Browser open request: {url} -> {rewritten}");
+    } else {
+        info!("Browser open request: {url}");
+    }
+    if let Some(port) = extract_port(&rewritten) {
+        wait_for_proxy_ready(port).await;
+    }
+    ctx.browser_handler.open_url(&rewritten);
+}
+
+/// Handle a credential request from an agent.
+async fn handle_credential_request(
+    id: String,
+    operation: String,
+    fields: std::collections::HashMap<String, String>,
+) -> DaemonMessage {
+    debug!("Credential request: op={operation} id={id}");
+    let result =
+        tokio::task::spawn_blocking(move || invoke_git_credential(&operation, &fields)).await;
+
+    let response_fields = match result {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
+            warn!("Git credential error: {e}");
+            std::collections::HashMap::new()
+        }
+        Err(e) => {
+            warn!("Credential task join error: {e}");
+            std::collections::HashMap::new()
+        }
+    };
+    DaemonMessage::CredentialResponse {
+        id,
+        fields: response_fields,
+    }
 }
 
 /// Route an agent message to the appropriate handler.
@@ -370,67 +456,18 @@ pub(crate) async fn handle_agent_message(
             ..
         } => handle_port_open(port, protocol, process, proxy_port, ctx).await,
         AgentMessage::PortClosed { port, protocol } => {
-            let cid = ctx.container_id.unwrap_or("unknown").to_string();
-            debug!("Port closed: {port}/{protocol} from {cid}");
-            let host_port = {
-                let mut pm = ctx.port_manager.lock().await;
-                pm.handle_port_closed(&cid, port)
-            };
-
-            if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
-                let _ = tx.send(ProxyCommand::Stop { host_port: hp }).await;
-            }
-
+            handle_port_closed(port, protocol, ctx).await;
             None
         }
         AgentMessage::BrowserOpen { url } => {
-            let rewritten = if let Some(cid) = ctx.container_id {
-                rewrite_browser_url(&url, ctx.port_manager, cid).await
-            } else {
-                url.clone()
-            };
-            if rewritten != url {
-                info!("Browser open request: {url} -> {rewritten}");
-            } else {
-                info!("Browser open request: {url}");
-            }
-            if let Some(port) = extract_port(&rewritten) {
-                wait_for_proxy_ready(port).await;
-            }
-            ctx.browser_handler.open_url(&rewritten);
+            handle_browser_open(url, ctx).await;
             None
         }
         AgentMessage::CredentialRequest {
             id,
             operation,
             fields,
-        } => {
-            debug!("Credential request: op={operation} id={id}");
-            let result =
-                tokio::task::spawn_blocking(move || invoke_git_credential(&operation, &fields))
-                    .await;
-
-            match result {
-                Ok(Ok(response_fields)) => Some(DaemonMessage::CredentialResponse {
-                    id,
-                    fields: response_fields,
-                }),
-                Ok(Err(e)) => {
-                    warn!("Git credential error: {e}");
-                    Some(DaemonMessage::CredentialResponse {
-                        id,
-                        fields: std::collections::HashMap::new(),
-                    })
-                }
-                Err(e) => {
-                    warn!("Credential task join error: {e}");
-                    Some(DaemonMessage::CredentialResponse {
-                        id,
-                        fields: std::collections::HashMap::new(),
-                    })
-                }
-            }
-        }
+        } => Some(handle_credential_request(id, operation, fields).await),
         AgentMessage::Health {
             uptime_secs,
             ports_detected,

@@ -11,7 +11,7 @@ const PROBED_ENV_CACHE_PATH: &str = "/tmp/.cella-probed-env.json";
 /// Read the cached probed environment from a running container.
 ///
 /// Returns `None` if the cache file doesn't exist or can't be parsed
-/// (graceful fallback — never errors).
+/// (graceful fallback -- never errors).
 pub async fn read_probed_env_cache(
     client: &DockerClient,
     container_id: &str,
@@ -49,9 +49,21 @@ pub async fn probe_and_cache_user_env(
     user: &str,
     probe_type: &str,
 ) -> Option<HashMap<String, String>> {
+    let env = run_env_probe(client, container_id, user, probe_type).await?;
+    write_env_cache(client, container_id, &env).await;
+    Some(env)
+}
+
+/// Execute the environment probe command and parse the output.
+async fn run_env_probe(
+    client: &DockerClient,
+    container_id: &str,
+    user: &str,
+    probe_type: &str,
+) -> Option<HashMap<String, String>> {
     let probe_cmd = cella_env::user_env_probe::probe_command(probe_type, "/bin/sh")?;
 
-    debug!("Running userEnvProbe ({probe_type}): {:?}", probe_cmd);
+    debug!("Running userEnvProbe ({probe_type}): {probe_cmd:?}");
 
     let result = client
         .exec_command(
@@ -76,12 +88,14 @@ pub async fn probe_and_cache_user_env(
     }
 
     let env = cella_env::user_env_probe::parse_probed_env(&result.stdout);
-    if env.is_empty() {
-        return None;
-    }
+    if env.is_empty() { None } else { Some(env) }
+}
 
-    // Cache the result inside the container
-    let json = serde_json::to_string(&env).ok()?;
+/// Write the probed environment to a cache file inside the container.
+async fn write_env_cache(client: &DockerClient, container_id: &str, env: &HashMap<String, String>) {
+    let Some(json) = serde_json::to_string(env).ok() else {
+        return;
+    };
     let cache_file = cella_docker::FileToUpload {
         path: PROBED_ENV_CACHE_PATH.to_string(),
         content: json.into_bytes(),
@@ -90,10 +104,9 @@ pub async fn probe_and_cache_user_env(
 
     if let Err(e) = client.upload_files(container_id, &[cache_file]).await {
         debug!("Failed to cache probed env: {e}");
+    } else {
+        debug!("Cached {} probed env vars", env.len());
     }
-
-    debug!("Cached {} probed env vars", env.len());
-    Some(env)
 }
 
 /// If `SSH_AUTH_SOCK` is not already present in `env`, detect the runtime and

@@ -4,7 +4,7 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{info, warn};
 
-use cella_config::resolve::resolve_config;
+use cella_config::resolve;
 use cella_docker::DockerClient;
 
 use super::image::ensure_image;
@@ -50,7 +50,7 @@ impl BuildArgs {
 
         // 1. Resolve config
         info!("Resolving devcontainer config...");
-        let resolved = resolve_config(&cwd, self.file.as_deref())?;
+        let resolved = resolve::config(&cwd, self.file.as_deref())?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);

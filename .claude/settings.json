@@ -3,7 +3,8 @@
     "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1",
     "ENABLE_TOOL_SEARCH": "true",
     "ENABLE_EXPERIMENTAL_MCP_CLI": "false",
-    "CLAUDE_CODE_HIDE_ACCOUNT_INFO": "true"
+    "CLAUDE_CODE_HIDE_ACCOUNT_INFO": "true",
+    "CLAUDE_CODE_NEW_INIT": "1"
   },
   "permissions": {
     "defaultMode": "auto"

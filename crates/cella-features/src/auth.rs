@@ -115,32 +115,41 @@ fn resolve_credentials_from(registry: &str, config_path: Option<PathBuf>) -> Doc
     resolve_from_config(registry, &config)
 }
 
+/// Try inline `auths` entries in the config.
+fn try_inline_auths(registry: &str, config: &DockerConfig) -> Option<DockerCredentials> {
+    let entry = config.auths.get(registry)?;
+    let creds = decode_auth_field(entry.auth.as_deref())?;
+    debug!("resolved credentials for {registry} from inline auths");
+    Some(creds)
+}
+
+/// Try per-registry credential helper (`credHelpers`).
+fn try_cred_helper(registry: &str, config: &DockerConfig) -> Option<DockerCredentials> {
+    let helper = config.cred_helpers.get(registry)?;
+    let creds = invoke_credential_helper(helper, registry)?;
+    debug!("resolved credentials for {registry} from credHelper '{helper}'");
+    Some(creds)
+}
+
+/// Try global credential store (`credsStore`).
+fn try_creds_store(registry: &str, config: &DockerConfig) -> Option<DockerCredentials> {
+    let helper = config.creds_store.as_ref()?;
+    let creds = invoke_credential_helper(helper, registry)?;
+    debug!("resolved credentials for {registry} from credsStore '{helper}'");
+    Some(creds)
+}
+
 /// Walk the config resolution chain: auths -> credHelpers -> credsStore.
 fn resolve_from_config(registry: &str, config: &DockerConfig) -> DockerCredentials {
-    // 1. Inline auths
-    if let Some(entry) = config.auths.get(registry)
-        && let Some(creds) = decode_auth_field(entry.auth.as_deref())
-    {
-        debug!("resolved credentials for {registry} from inline auths");
+    if let Some(creds) = try_inline_auths(registry, config) {
         return creds;
     }
-
-    // 2. Per-registry credential helper
-    if let Some(helper) = config.cred_helpers.get(registry)
-        && let Some(creds) = invoke_credential_helper(helper, registry)
-    {
-        debug!("resolved credentials for {registry} from credHelper '{helper}'");
+    if let Some(creds) = try_cred_helper(registry, config) {
         return creds;
     }
-
-    // 3. Global credential store
-    if let Some(helper) = &config.creds_store
-        && let Some(creds) = invoke_credential_helper(helper, registry)
-    {
-        debug!("resolved credentials for {registry} from credsStore '{helper}'");
+    if let Some(creds) = try_creds_store(registry, config) {
         return creds;
     }
-
     debug!("no credentials found for {registry}");
     DockerCredentials::default()
 }

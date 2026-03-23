@@ -16,6 +16,38 @@ use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::run_proxy_coordinator;
 
+/// Write the PID file and ensure the parent directory exists.
+fn write_pid_and_ensure_dir(socket_path: &Path, pid_path: &Path) -> Result<u32, CellaDaemonError> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CellaDaemonError::PidFile {
+            message: format!("failed to create directory {}: {e}", parent.display()),
+        })?;
+    }
+
+    let pid = std::process::id();
+    std::fs::write(pid_path, pid.to_string()).map_err(|e| CellaDaemonError::PidFile {
+        message: format!("failed to write PID file: {e}"),
+    })?;
+    info!("Cella daemon started (PID {pid})");
+    Ok(pid)
+}
+
+/// Write the daemon.control file with port and auth token.
+fn write_control_file(
+    control_socket_path: &Path,
+    control_port: u16,
+    auth_token: &str,
+) -> Result<PathBuf, CellaDaemonError> {
+    let control_file_path = control_socket_path.with_file_name("daemon.control");
+    std::fs::write(&control_file_path, format!("{control_port}\n{auth_token}")).map_err(|e| {
+        CellaDaemonError::PidFile {
+            message: format!("failed to write daemon.control: {e}"),
+        }
+    })?;
+    info!("Control TCP server on 127.0.0.1:{control_port}");
+    Ok(control_file_path)
+}
+
 /// Run the unified cella daemon.
 ///
 /// Starts the control server, legacy credential servers, and health monitor.
@@ -29,19 +61,7 @@ pub async fn run_daemon(
     port_path: &Path,
     control_socket_path: &Path,
 ) -> Result<(), CellaDaemonError> {
-    // Ensure parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CellaDaemonError::PidFile {
-            message: format!("failed to create directory {}: {e}", parent.display()),
-        })?;
-    }
-
-    // Write PID file
-    let pid = std::process::id();
-    std::fs::write(pid_path, pid.to_string()).map_err(|e| CellaDaemonError::PidFile {
-        message: format!("failed to write PID file: {e}"),
-    })?;
-    info!("Cella daemon started (PID {pid})");
+    write_pid_and_ensure_dir(socket_path, pid_path)?;
 
     // Generate auth token for agent connections
     let auth_token = generate_auth_token();
@@ -56,13 +76,7 @@ pub async fn run_daemon(
         .port();
 
     // Persist port+token to daemon.control for reclaiming on restart
-    let control_file_path = control_socket_path.with_file_name("daemon.control");
-    std::fs::write(&control_file_path, format!("{control_port}\n{auth_token}")).map_err(|e| {
-        CellaDaemonError::PidFile {
-            message: format!("failed to write daemon.control: {e}"),
-        }
-    })?;
-    info!("Control TCP server on 127.0.0.1:{control_port}");
+    let control_file_path = write_control_file(control_socket_path, control_port, &auth_token)?;
 
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();
@@ -306,13 +320,9 @@ async fn handle_legacy_stream(
     Ok(())
 }
 
-/// Legacy TCP credential server (for VM-based runtimes).
-async fn run_legacy_tcp_server(
-    port_path: &Path,
-    last_activity: Arc<AtomicU64>,
-) -> Result<(), CellaDaemonError> {
+/// Bind a legacy TCP listener, attempting to reclaim a previously used port.
+async fn bind_legacy_tcp(port_path: &Path) -> Result<tokio::net::TcpListener, CellaDaemonError> {
     use std::net::SocketAddr;
-    use std::sync::atomic::Ordering;
     use tokio::net::TcpListener;
 
     let preferred_port = std::fs::read_to_string(port_path)
@@ -320,45 +330,50 @@ async fn run_legacy_tcp_server(
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(0);
 
-    let listener = if preferred_port != 0 {
+    if preferred_port != 0 {
         let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        match TcpListener::bind(addr).await {
-            Ok(l) => {
-                debug!("Reusing previous TCP port {preferred_port}");
-                l
-            }
-            Err(e) => {
-                warn!("Cannot reclaim TCP port {preferred_port} ({e}), binding new port");
-                let fallback: SocketAddr = ([127, 0, 0, 1], 0).into();
-                TcpListener::bind(fallback)
-                    .await
-                    .map_err(|e| CellaDaemonError::Socket {
-                        message: format!("failed to bind TCP: {e}"),
-                    })?
-            }
+        if let Ok(l) = TcpListener::bind(addr).await {
+            debug!("Reusing previous TCP port {preferred_port}");
+            return Ok(l);
         }
-    } else {
-        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        TcpListener::bind(addr)
-            .await
-            .map_err(|e| CellaDaemonError::Socket {
-                message: format!("failed to bind TCP: {e}"),
-            })?
-    };
+        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
+    }
 
-    let local_addr = listener
-        .local_addr()
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    TcpListener::bind(addr)
+        .await
         .map_err(|e| CellaDaemonError::Socket {
-            message: format!("failed to get local addr: {e}"),
-        })?;
-    let port = local_addr.port();
+            message: format!("failed to bind TCP: {e}"),
+        })
+}
 
+/// Write the port number to a file so clients can discover it.
+fn write_legacy_port_file(port_path: &Path, port: u16) -> Result<(), CellaDaemonError> {
     if let Some(parent) = port_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     std::fs::write(port_path, port.to_string()).map_err(|e| CellaDaemonError::PidFile {
         message: format!("failed to write port file: {e}"),
-    })?;
+    })
+}
+
+/// Legacy TCP credential server (for VM-based runtimes).
+async fn run_legacy_tcp_server(
+    port_path: &Path,
+    last_activity: Arc<AtomicU64>,
+) -> Result<(), CellaDaemonError> {
+    use std::sync::atomic::Ordering;
+
+    let listener = bind_legacy_tcp(port_path).await?;
+
+    let port = listener
+        .local_addr()
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("failed to get local addr: {e}"),
+        })?
+        .port();
+
+    write_legacy_port_file(port_path, port)?;
 
     info!("Legacy TCP credential server on 127.0.0.1:{port}");
 

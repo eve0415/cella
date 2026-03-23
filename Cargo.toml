@@ -23,7 +23,18 @@ repository = "https://github.com/eve0415/cella"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.50.0", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.50.0", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -92,10 +103,7 @@ cella-port = { path = "crates/cella-port" }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 # Allow common patterns that pedantic flags unnecessarily
-module_name_repetitions = "allow"
 must_use_candidate = "allow"
-# Stubs are async by design — they'll gain real awaits during implementation
-unused_async = "allow"
 # Domain naming (container_id/container_name/container_ip) is more readable than forced disambiguation
 similar_names = "allow"
 

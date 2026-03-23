@@ -100,6 +100,49 @@ impl PortManager {
             .and_then(|c| c.container_ip.as_deref())
     }
 
+    /// Allocate a host port using the port checker if configured.
+    fn allocate_host_port(
+        &mut self,
+        port: u16,
+        container_id: &str,
+        require_local: bool,
+    ) -> Option<u16> {
+        let result = match &self.port_checker {
+            Some(checker) => self.allocation.allocate_with_check(
+                port,
+                container_id,
+                require_local,
+                checker.as_ref(),
+            ),
+            None => self.allocation.allocate(port, container_id, require_local),
+        };
+        match result {
+            Ok(hp) => Some(hp),
+            Err(e) => {
+                warn!("Failed to allocate host port for {port}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Log the port forwarding event.
+    fn log_port_forwarding(
+        port: u16,
+        host_port: u16,
+        process: &Option<String>,
+        label: &Option<String>,
+    ) {
+        let process_str = process.as_deref().unwrap_or("unknown");
+        let display_label = label.as_deref().unwrap_or("");
+        if host_port == port {
+            info!("Forwarding port {port} ({process_str}) {display_label}-> localhost:{host_port}");
+        } else {
+            info!(
+                "Forwarding port {port} ({process_str}) {display_label}-> localhost:{host_port} (remapped)"
+            );
+        }
+    }
+
     /// Handle a port open event from an agent.
     ///
     /// Returns the allocated host port if successful.
@@ -136,33 +179,9 @@ impl PortManager {
             return None;
         }
 
-        // Allocate host port, checking OS availability if a checker is configured
-        let host_port = match &self.port_checker {
-            Some(checker) => self.allocation.allocate_with_check(
-                port,
-                container_id,
-                require_local,
-                checker.as_ref(),
-            ),
-            None => self.allocation.allocate(port, container_id, require_local),
-        };
-        let host_port = match host_port {
-            Ok(hp) => hp,
-            Err(e) => {
-                warn!("Failed to allocate host port for {port}: {e}");
-                return None;
-            }
-        };
+        let host_port = self.allocate_host_port(port, container_id, require_local)?;
 
-        let process_str = process.as_deref().unwrap_or("unknown");
-        let display_label = label.as_deref().unwrap_or("");
-        if host_port == port {
-            info!("Forwarding port {port} ({process_str}) {display_label}-> localhost:{host_port}");
-        } else {
-            info!(
-                "Forwarding port {port} ({process_str}) {display_label}-> localhost:{host_port} (remapped)"
-            );
-        }
+        Self::log_port_forwarding(port, host_port, &process, &label);
 
         let detected = DetectedPort {
             port,
@@ -175,15 +194,12 @@ impl PortManager {
             container.detected_ports.push(detected);
         }
 
-        match on_auto_forward {
-            OnAutoForward::OpenBrowser | OnAutoForward::OpenBrowserOnce => {
-                let url = format!("{proto_hint}://localhost:{host_port}");
-                info!("Auto-opening browser: {url}");
-            }
-            OnAutoForward::Notify
-            | OnAutoForward::Silent
-            | OnAutoForward::OpenPreview
-            | OnAutoForward::Ignore => {}
+        if matches!(
+            on_auto_forward,
+            OnAutoForward::OpenBrowser | OnAutoForward::OpenBrowserOnce
+        ) {
+            let url = format!("{proto_hint}://localhost:{host_port}");
+            info!("Auto-opening browser: {url}");
         }
 
         Some(host_port)

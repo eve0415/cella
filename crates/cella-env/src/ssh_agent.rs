@@ -20,6 +20,36 @@ const DOCKER_DESKTOP_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
 /// Container-side socket path for direct bind-mount forwarding.
 const CONTAINER_SSH_SOCK: &str = "/tmp/cella-ssh-agent.sock";
 
+/// SSH agent forwarding for Docker Desktop / OrbStack (VM-based runtimes).
+fn desktop_ssh_forwarding(host_socket: &Option<String>) -> SshAgentForwarding {
+    if host_socket.is_none() {
+        warn!("SSH_AUTH_SOCK not set on host, but Docker Desktop may still provide SSH agent");
+    }
+    SshAgentForwarding {
+        mount_source: DOCKER_DESKTOP_SSH_SOCK.to_string(),
+        mount_target: DOCKER_DESKTOP_SSH_SOCK.to_string(),
+        env_value: DOCKER_DESKTOP_SSH_SOCK.to_string(),
+    }
+}
+
+/// SSH agent forwarding via direct bind-mount of the host socket.
+fn direct_ssh_forwarding(host_socket: Option<String>) -> Option<SshAgentForwarding> {
+    let host_socket = host_socket?;
+
+    if !std::path::Path::new(&host_socket).exists() {
+        warn!(
+            "SSH_AUTH_SOCK points to {host_socket} which does not exist, skipping SSH agent forwarding"
+        );
+        return None;
+    }
+
+    Some(SshAgentForwarding {
+        mount_source: host_socket,
+        mount_target: CONTAINER_SSH_SOCK.to_string(),
+        env_value: CONTAINER_SSH_SOCK.to_string(),
+    })
+}
+
 /// Detect the host SSH agent socket and generate forwarding configuration.
 ///
 /// Returns `None` if:
@@ -43,32 +73,9 @@ pub fn ssh_agent_forwarding(
         runtime,
         DockerRuntime::DockerDesktop | DockerRuntime::OrbStack
     ) {
-        // Docker Desktop and OrbStack provide SSH agent via their VM at a well-known path.
-        // No host socket needed — the runtime forwards automatically.
-        if host_socket.is_none() {
-            warn!("SSH_AUTH_SOCK not set on host, but Docker Desktop may still provide SSH agent");
-        }
-        Some(SshAgentForwarding {
-            mount_source: DOCKER_DESKTOP_SSH_SOCK.to_string(),
-            mount_target: DOCKER_DESKTOP_SSH_SOCK.to_string(),
-            env_value: DOCKER_DESKTOP_SSH_SOCK.to_string(),
-        })
+        Some(desktop_ssh_forwarding(&host_socket))
     } else {
-        // Direct bind-mount of host SSH agent socket
-        let host_socket = host_socket?;
-
-        if !std::path::Path::new(&host_socket).exists() {
-            warn!(
-                "SSH_AUTH_SOCK points to {host_socket} which does not exist, skipping SSH agent forwarding"
-            );
-            return None;
-        }
-
-        Some(SshAgentForwarding {
-            mount_source: host_socket,
-            mount_target: CONTAINER_SSH_SOCK.to_string(),
-            env_value: CONTAINER_SSH_SOCK.to_string(),
-        })
+        direct_ssh_forwarding(host_socket)
     }
 }
 

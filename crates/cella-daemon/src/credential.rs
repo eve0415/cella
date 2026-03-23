@@ -140,7 +140,11 @@ pub fn invoke_git_credential<S: std::hash::BuildHasher>(
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(stdin_data.as_bytes());
+        stdin
+            .write_all(stdin_data.as_bytes())
+            .map_err(|e| CellaDaemonError::GitCredential {
+                message: format!("failed to write to git credential stdin: {e}"),
+            })?;
     }
 
     let output = child

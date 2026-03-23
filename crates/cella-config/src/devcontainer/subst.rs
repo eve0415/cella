@@ -111,7 +111,7 @@ impl SubstitutionContext {
             }
             "containerEnv" => {
                 // Container not running at resolve time — use default or empty
-                let _var_name = parts.next();
+                let _ = parts.next(); // advance past var name to reach default
                 let default = parts.next().unwrap_or("");
                 default.to_string()
             }

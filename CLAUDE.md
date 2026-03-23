@@ -22,7 +22,7 @@ cargo insta review               # accept/reject snapshot changes
 
 - Edition 2024, resolver v2
 - Clippy pedantic + nursery (warn), `unsafe_code` denied
-- Clippy allows: `module_name_repetitions`, `must_use_candidate`, `unused_async`
+- Clippy allows: `must_use_candidate`, `similar_names`
 - Pinned dependency versions (exact x.y.z)
 - Conventional commits, signed commits required
 - Error handling: `thiserror` for error types, `miette` for user-facing diagnostics

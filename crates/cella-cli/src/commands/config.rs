@@ -50,14 +50,14 @@ fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::erro
         p
     } else {
         let cwd = std::env::current_dir()?;
-        cella_config::discover::discover_config(&cwd)?
+        cella_config::discover::config(&cwd)?
     };
 
     let raw_text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let source_name = path.display().to_string();
 
-    match cella_config::parse::parse_devcontainer(&source_name, &raw_text, strict) {
+    match cella_config::parse::devcontainer(&source_name, &raw_text, strict) {
         Ok((_config, warnings)) => {
             if warnings.is_empty() {
                 eprintln!("✓ {source_name} is valid");

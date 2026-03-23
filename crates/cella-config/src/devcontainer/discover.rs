@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// Errors that can occur during config discovery.
 #[derive(Debug)]
-pub enum DiscoverError {
+pub enum Error {
     /// No devcontainer.json found in any standard location.
     NotFound,
     /// Multiple subfolder configs found — user must specify `--file`.
@@ -19,7 +19,7 @@ pub enum DiscoverError {
     },
 }
 
-impl std::fmt::Display for DiscoverError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(
@@ -43,7 +43,7 @@ impl std::fmt::Display for DiscoverError {
     }
 }
 
-impl std::error::Error for DiscoverError {
+impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ReadDir { source, .. } => Some(source),
@@ -59,13 +59,13 @@ impl std::error::Error for DiscoverError {
 /// 2. `{root}/.devcontainer.json`
 /// 3. `{root}/.devcontainer/<subfolder>/devcontainer.json` (one level deep)
 ///
-/// If step 3 finds multiple configs, returns [`DiscoverError::Ambiguous`].
+/// If step 3 finds multiple configs, returns [`Error::Ambiguous`].
 ///
 /// # Errors
 ///
-/// Returns [`DiscoverError`] if no config is found, multiple ambiguous configs
+/// Returns [`Error`] if no config is found, multiple ambiguous configs
 /// exist, or a directory cannot be read.
-pub fn discover_config(workspace_root: &Path) -> Result<PathBuf, DiscoverError> {
+pub fn config(workspace_root: &Path) -> Result<PathBuf, Error> {
     // 1. .devcontainer/devcontainer.json
     let primary = workspace_root
         .join(".devcontainer")
@@ -83,15 +83,14 @@ pub fn discover_config(workspace_root: &Path) -> Result<PathBuf, DiscoverError> 
     // 3. .devcontainer/<subfolder>/devcontainer.json
     let devcontainer_dir = workspace_root.join(".devcontainer");
     if devcontainer_dir.is_dir() {
-        let entries =
-            std::fs::read_dir(&devcontainer_dir).map_err(|source| DiscoverError::ReadDir {
-                path: devcontainer_dir.clone(),
-                source,
-            })?;
+        let entries = std::fs::read_dir(&devcontainer_dir).map_err(|source| Error::ReadDir {
+            path: devcontainer_dir.clone(),
+            source,
+        })?;
 
         let mut found = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|source| DiscoverError::ReadDir {
+            let entry = entry.map_err(|source| Error::ReadDir {
                 path: devcontainer_dir.clone(),
                 source,
             })?;
@@ -108,12 +107,12 @@ pub fn discover_config(workspace_root: &Path) -> Result<PathBuf, DiscoverError> 
             1 => return Ok(found.swap_remove(0)),
             _ => {
                 found.sort();
-                return Err(DiscoverError::Ambiguous(found));
+                return Err(Error::Ambiguous(found));
             }
         }
     }
 
-    Err(DiscoverError::NotFound)
+    Err(Error::NotFound)
 }
 
 #[cfg(test)]
@@ -137,7 +136,7 @@ mod tests {
         // Also create root-level to prove priority
         create_file(&tmp.path().join(".devcontainer.json"));
 
-        let result = discover_config(tmp.path()).unwrap();
+        let result = config(tmp.path()).unwrap();
         assert_eq!(result, primary);
     }
 
@@ -147,7 +146,7 @@ mod tests {
         let root_level = tmp.path().join(".devcontainer.json");
         create_file(&root_level);
 
-        let result = discover_config(tmp.path()).unwrap();
+        let result = config(tmp.path()).unwrap();
         assert_eq!(result, root_level);
     }
 
@@ -161,7 +160,7 @@ mod tests {
             .join("devcontainer.json");
         create_file(&subfolder);
 
-        let result = discover_config(tmp.path()).unwrap();
+        let result = config(tmp.path()).unwrap();
         assert_eq!(result, subfolder);
     }
 
@@ -181,9 +180,9 @@ mod tests {
                 .join("devcontainer.json"),
         );
 
-        let err = discover_config(tmp.path()).unwrap_err();
+        let err = config(tmp.path()).unwrap_err();
         assert!(
-            matches!(err, DiscoverError::Ambiguous(ref paths) if paths.len() == 2),
+            matches!(err, Error::Ambiguous(ref paths) if paths.len() == 2),
             "expected Ambiguous with 2 paths, got: {err}"
         );
         // Verify the display message
@@ -194,9 +193,9 @@ mod tests {
     #[test]
     fn not_found() {
         let tmp = TempDir::new().unwrap();
-        let err = discover_config(tmp.path()).unwrap_err();
+        let err = config(tmp.path()).unwrap_err();
         assert!(
-            matches!(err, DiscoverError::NotFound),
+            matches!(err, Error::NotFound),
             "expected NotFound, got: {err}"
         );
     }
@@ -213,7 +212,7 @@ mod tests {
                 .join("devcontainer.json"),
         );
 
-        let result = discover_config(tmp.path()).unwrap();
+        let result = config(tmp.path()).unwrap();
         assert_eq!(result, primary);
     }
 
@@ -222,7 +221,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".devcontainer")).unwrap();
 
-        let err = discover_config(tmp.path()).unwrap_err();
-        assert!(matches!(err, DiscoverError::NotFound));
+        let err = config(tmp.path()).unwrap_err();
+        assert!(matches!(err, Error::NotFound));
     }
 }

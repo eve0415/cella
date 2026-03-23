@@ -1,4 +1,4 @@
-use crate::discover::DiscoverError;
+use crate::discover;
 use thiserror::Error;
 
 /// Errors that can occur during configuration parsing and management.
@@ -26,5 +26,5 @@ pub enum CellaConfigError {
 
     /// Config discovery failed.
     #[error("config discovery failed: {0}")]
-    Discovery(#[from] DiscoverError),
+    Discovery(#[from] discover::Error),
 }

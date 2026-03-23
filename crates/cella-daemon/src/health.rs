@@ -15,6 +15,30 @@ const IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 /// Health check interval (5 minutes).
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 
+/// Check if the idle timeout has been exceeded.
+///
+/// Returns `true` if the daemon should shut down due to idle timeout.
+/// If containers are still running, resets the activity timer and returns `false`.
+fn check_idle_timeout(last_activity: &AtomicU64) -> bool {
+    let last = last_activity.load(Ordering::Relaxed);
+    let now = current_time_secs();
+    let elapsed = now.saturating_sub(last);
+
+    if elapsed <= IDLE_TIMEOUT_SECS {
+        return false;
+    }
+
+    let count = running_cella_container_count();
+    if count > 0 {
+        debug!("Idle timeout reached but {count} cella container(s) still running, staying alive");
+        last_activity.store(current_time_secs(), Ordering::Relaxed);
+        return false;
+    }
+
+    info!("Idle timeout ({IDLE_TIMEOUT_SECS}s) reached, shutting down");
+    true
+}
+
 /// Run the health monitor loop.
 ///
 /// Checks for idle timeout and Docker reachability, shutting down
@@ -30,20 +54,7 @@ pub async fn run_health_monitor(
     loop {
         tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
 
-        let last = last_activity.load(Ordering::Relaxed);
-        let now = current_time_secs();
-        let elapsed = now.saturating_sub(last);
-
-        if elapsed > IDLE_TIMEOUT_SECS {
-            let count = running_cella_container_count();
-            if count > 0 {
-                debug!(
-                    "Idle timeout reached but {count} cella container(s) still running, staying alive"
-                );
-                last_activity.store(current_time_secs(), Ordering::Relaxed);
-                continue;
-            }
-            info!("Idle timeout ({IDLE_TIMEOUT_SECS}s) reached, shutting down");
+        if check_idle_timeout(&last_activity) {
             cleanup_runtime(&pid_path, &socket_path);
             std::process::exit(0);
         }
@@ -54,6 +65,7 @@ pub async fn run_health_monitor(
             std::process::exit(0);
         }
 
+        let elapsed = current_time_secs().saturating_sub(last_activity.load(Ordering::Relaxed));
         debug!("Health check passed (idle {elapsed}s)");
     }
 }

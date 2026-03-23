@@ -80,7 +80,7 @@ pub fn claude_config_exists_command(claude_dir: &str) -> Vec<String> {
 pub fn prepare_claude_config(
     remote_user: &str,
     workspace_root: &Path,
-    settings: &cella_config::ClaudeCodeSettings,
+    settings: &cella_config::ClaudeCode,
 ) -> Option<Vec<FileUpload>> {
     let host_dir = host_claude_dir()?;
     let target_home = container_home(remote_user);
@@ -267,7 +267,7 @@ impl Collector<'_> {
     ///
     /// Includes files like `statusline-command.sh` that the user created,
     /// excluding known machine-generated files and directories.
-    fn user_root_files(&mut self, settings: &cella_config::ClaudeCodeSettings) {
+    fn user_root_files(&mut self, settings: &cella_config::ClaudeCode) {
         let Ok(entries) = std::fs::read_dir(self.host_dir) else {
             return;
         };

@@ -4,10 +4,11 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{info, warn};
 
-use cella_config::resolve::{ResolvedConfig, resolve_config};
+use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
     CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, FileToUpload,
-    MountConfig, container_labels, container_name, lifecycle, update_remote_user_uid,
+    LifecycleContext, MountConfig, container_labels, container_name, run_lifecycle_phase,
+    update_remote_user_uid,
 };
 
 use super::image::ensure_image;
@@ -80,7 +81,7 @@ impl UpContext {
         if is_text {
             eprintln!("Resolving devcontainer configuration...");
         }
-        let resolved = resolve_config(&cwd, args.file.as_deref())?;
+        let resolved = resolve::config(&cwd, args.file.as_deref())?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
@@ -206,7 +207,7 @@ impl UpContext {
         .await;
 
         // Claude Code: re-sync auth + ensure installed
-        let cc_settings = cella_config::CellaSettings::load(&self.resolved.workspace_root);
+        let cc_settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if cc_settings.tools.claude_code.forward_config {
             resync_claude_auth(&self.client, container_id, remote_user).await;
         }
@@ -259,7 +260,7 @@ impl UpContext {
             self.config(),
             "postAttachCommand",
         );
-        let lc_ctx = lifecycle::LifecycleContext {
+        let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container.id,
             user: Some(remote_user),
@@ -336,7 +337,7 @@ impl UpContext {
                         self.config(),
                         phase,
                     );
-                    let lc_ctx = lifecycle::LifecycleContext {
+                    let lc_ctx = LifecycleContext {
                         client: &self.client,
                         container_id: &container.id,
                         user: Some(remote_user),
@@ -457,7 +458,7 @@ impl UpContext {
         env_fwd: &cella_env::EnvForwarding,
         image_env: &[String],
         remote_user: &str,
-        settings: &cella_config::CellaSettings,
+        settings: &cella_config::Settings,
     ) {
         // Forwarding mounts
         for m in &env_fwd.mounts {
@@ -538,8 +539,6 @@ impl UpContext {
         &self,
         container_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let config = self.config();
-
         timed_step(
             self.is_text,
             "Starting container...",
@@ -565,44 +564,52 @@ impl UpContext {
             tracing::warn!("Failed to connect container to repo network: {e}");
         }
 
-        // Register container with daemon for port management
+        self.register_with_daemon(container_id).await;
+        Ok(())
+    }
+
+    /// Register the container with the daemon for port management.
+    async fn register_with_daemon(&self, container_id: &str) {
+        let config = self.config();
         let container_ip =
             cella_docker::network::get_container_cella_ip(self.client.inner(), container_id).await;
-        if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
-            && mgmt_sock.exists()
-        {
-            let forward_ports: Vec<u16> = config
-                .get("forwardPorts")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
-                        .collect()
-                })
-                .unwrap_or_default();
 
-            let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
-            let other_ports_attrs =
-                cella_docker::config_map::ports::parse_other_ports_attributes(config);
-            let req = cella_port::protocol::ManagementRequest::RegisterContainer {
-                container_id: container_id.to_string(),
-                container_name: self.container_nm.clone(),
-                container_ip,
-                ports_attributes: ports_attrs,
-                other_ports_attributes: other_ports_attrs,
-                forward_ports,
-            };
-            match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
-                Ok(resp) => {
-                    tracing::debug!("Container registered with daemon: {resp:?}");
-                }
-                Err(e) => {
-                    warn!("Failed to register container with daemon: {e}");
-                }
-            }
+        let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path() else {
+            return;
+        };
+        if !mgmt_sock.exists() {
+            return;
         }
 
-        Ok(())
+        let forward_ports: Vec<u16> = config
+            .get("forwardPorts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
+        let other_ports_attrs =
+            cella_docker::config_map::ports::parse_other_ports_attributes(config);
+        let req = cella_port::protocol::ManagementRequest::RegisterContainer {
+            container_id: container_id.to_string(),
+            container_name: self.container_nm.clone(),
+            container_ip,
+            ports_attributes: ports_attrs,
+            other_ports_attributes: other_ports_attrs,
+            forward_ports,
+        };
+        match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
+            Ok(resp) => {
+                tracing::debug!("Container registered with daemon: {resp:?}");
+            }
+            Err(e) => {
+                warn!("Failed to register container with daemon: {e}");
+            }
+        }
     }
 
     /// Run post-create setup: UID update, env injection, credentials, Claude Code, userEnvProbe.
@@ -611,7 +618,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::CellaSettings,
+        settings: &cella_config::Settings,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -772,7 +779,7 @@ impl UpContext {
             &image_env,
         );
 
-        let settings = cella_config::CellaSettings::load(&self.resolved.workspace_root);
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         self.apply_env_and_mounts(
             &mut create_opts,
             &env_fwd,
@@ -804,7 +811,7 @@ impl UpContext {
             .await;
 
         // Lifecycle commands (first create)
-        let lc_ctx = lifecycle::LifecycleContext {
+        let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container_id,
             user: Some(remote_user.as_str()),
@@ -918,7 +925,7 @@ fn lifecycle_entries_for_phase(
     )
 }
 
-/// Convert `cella_env::FileUpload` items to `cella_docker::FileToUpload`.
+/// Convert `cella_env::FileUpload` items to `cella_docker::File`.
 fn convert_uploads(uploads: &[cella_env::FileUpload]) -> Vec<FileToUpload> {
     uploads
         .iter()
@@ -1088,96 +1095,94 @@ async fn inject_post_start(
     post_start: &cella_env::PostStartInjection,
     remote_user: &str,
 ) {
-    // Upload SSH config files
-    if !post_start.file_uploads.is_empty() {
-        // Create .ssh directory with correct permissions
-        let ssh_dir = cella_env::ssh_config::remote_ssh_dir(remote_user);
-        let mkdir_result = client
+    upload_ssh_files(client, container_id, &post_start.file_uploads, remote_user).await;
+    install_credential_helper(client, container_id, &post_start.credential_helper).await;
+    apply_git_config(
+        client,
+        container_id,
+        &post_start.git_config_commands,
+        remote_user,
+    )
+    .await;
+}
+
+/// Upload SSH config files to the container's `.ssh` directory.
+async fn upload_ssh_files(
+    client: &DockerClient,
+    container_id: &str,
+    uploads: &[cella_env::FileUpload],
+    remote_user: &str,
+) {
+    if uploads.is_empty() {
+        return;
+    }
+
+    let ssh_dir = cella_env::ssh_config::remote_ssh_dir(remote_user);
+    if let Err(e) = mkdir_in_container(client, container_id, &ssh_dir, 0o700).await {
+        warn!("Failed to create .ssh directory: {e}");
+        return;
+    }
+
+    let docker_files = convert_uploads(uploads);
+    if let Err(e) = client.upload_files(container_id, &docker_files).await {
+        warn!("Failed to upload SSH config files: {e}");
+    } else {
+        chown_in_container(client, container_id, remote_user, &ssh_dir).await;
+    }
+}
+
+/// Upload the credential helper script into the container.
+async fn install_credential_helper(
+    client: &DockerClient,
+    container_id: &str,
+    helper: &Option<cella_env::FileUpload>,
+) {
+    let Some(helper) = helper else {
+        return;
+    };
+    let helper_file = FileToUpload {
+        path: helper.container_path.clone(),
+        content: helper.content.clone(),
+        mode: helper.mode,
+    };
+    if let Err(e) = client.upload_files(container_id, &[helper_file]).await {
+        warn!("Failed to install credential helper: {e}");
+    }
+}
+
+/// Apply git config commands inside the container.
+async fn apply_git_config(
+    client: &DockerClient,
+    container_id: &str,
+    commands: &[Vec<String>],
+    remote_user: &str,
+) {
+    for cmd in commands {
+        let result = client
             .exec_command(
                 container_id,
                 &ExecOptions {
-                    cmd: vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("mkdir -p {ssh_dir} && chmod 700 {ssh_dir}"),
-                    ],
-                    user: Some("root".to_string()),
+                    cmd: cmd.clone(),
+                    user: Some(remote_user.to_string()),
                     env: None,
                     working_dir: None,
                 },
             )
             .await;
-        if let Err(e) = mkdir_result {
-            warn!("Failed to create .ssh directory: {e}");
-        }
-
-        let docker_files = convert_uploads(&post_start.file_uploads);
-
-        if let Err(e) = client.upload_files(container_id, &docker_files).await {
-            warn!("Failed to upload SSH config files: {e}");
-        } else {
-            // Fix ownership
-            let _ = client
-                .exec_command(
-                    container_id,
-                    &ExecOptions {
-                        cmd: vec![
-                            "chown".to_string(),
-                            "-R".to_string(),
-                            format!("{remote_user}:{remote_user}"),
-                            ssh_dir,
-                        ],
-                        user: Some("root".to_string()),
-                        env: None,
-                        working_dir: None,
-                    },
-                )
-                .await;
-        }
-    }
-
-    // Install credential helper script
-    if let Some(ref helper) = post_start.credential_helper {
-        let helper_file = FileToUpload {
-            path: helper.container_path.clone(),
-            content: helper.content.clone(),
-            mode: helper.mode,
-        };
-        if let Err(e) = client.upload_files(container_id, &[helper_file]).await {
-            warn!("Failed to install credential helper: {e}");
-        }
-    }
-
-    // Set git config inside container
-    if !post_start.git_config_commands.is_empty() {
-        for cmd in &post_start.git_config_commands {
-            let result = client
-                .exec_command(
-                    container_id,
-                    &ExecOptions {
-                        cmd: cmd.clone(),
-                        user: Some(remote_user.to_string()),
-                        env: None,
-                        working_dir: None,
-                    },
-                )
-                .await;
-            match result {
-                Ok(r) if r.exit_code != 0 => {
-                    // git probably not installed in container
-                    warn!(
-                        "git config failed (exit {}): {}",
-                        r.exit_code,
-                        r.stderr.trim()
-                    );
-                    break;
-                }
-                Err(e) => {
-                    warn!("Failed to exec git config: {e}");
-                    break;
-                }
-                _ => {}
+        match result {
+            Ok(r) if r.exit_code != 0 => {
+                warn!(
+                    "git config failed (exit {}): {}",
+                    r.exit_code,
+                    r.stderr.trim()
+                );
+                break;
             }
+            Err(e) => {
+                warn!("Failed to exec git config: {e}");
+                break;
+            }
+            _ => {}
         }
     }
 }
@@ -1203,21 +1208,99 @@ where
     result
 }
 
+// ── Shared container-operation helpers ──────────────────────────────────────
+
+/// Create a directory inside the container with the given mode (as root).
+async fn mkdir_in_container(
+    client: &DockerClient,
+    container_id: &str,
+    dir: &str,
+    mode: u32,
+) -> Result<cella_docker::ExecResult, cella_docker::CellaDockerError> {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("mkdir -p {dir} && chmod {mode:o} {dir}"),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+}
+
+/// Recursively chown a directory inside the container.
+async fn chown_in_container(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    dir: &str,
+) {
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "chown".to_string(),
+                    "-R".to_string(),
+                    format!("{remote_user}:{remote_user}"),
+                    dir.to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+}
+
+/// Create a directory, upload files, and fix ownership -- the shared pattern
+/// used by both `seed_gh_credentials` and `seed_claude_config`.
+///
+/// Returns `true` on success, `false` on any step failure.
+async fn upload_to_container(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    dir: &str,
+    uploads: &[cella_env::FileUpload],
+    context_label: &str,
+) -> bool {
+    if let Err(e) = mkdir_in_container(client, container_id, dir, 0o700).await {
+        warn!("Failed to create {context_label} directory: {e}");
+        return false;
+    }
+
+    let docker_files = convert_uploads(uploads);
+    if let Err(e) = client.upload_files(container_id, &docker_files).await {
+        warn!("Failed to upload {context_label} files: {e}");
+        // For Claude config we still chown even on upload failure, so always chown.
+    }
+
+    chown_in_container(client, container_id, remote_user, dir).await;
+    true
+}
+
 /// Run a sequence of origin-tracked lifecycle entries.
 async fn run_lifecycle_entries(
-    ctx: &lifecycle::LifecycleContext<'_>,
+    ctx: &LifecycleContext<'_>,
     phase: &str,
     entries: &[cella_features::LifecycleEntry],
 ) -> Result<(), CellaDockerError> {
     for entry in entries {
-        lifecycle::run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await?;
+        run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await?;
     }
     Ok(())
 }
 
 /// Run all lifecycle phases for a first-create scenario.
 async fn run_all_lifecycle_phases(
-    lc_ctx: &lifecycle::LifecycleContext<'_>,
+    lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1245,7 +1328,7 @@ async fn run_all_lifecycle_phases(
             && let Some(cmd) = config.get(phase)
             && !cmd.is_null()
         {
-            lifecycle::run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await?;
+            run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await?;
         }
     }
 
@@ -1265,13 +1348,50 @@ async fn seed_gh_credentials(
 ) {
     let config_dir = cella_env::gh_credential::gh_config_dir_for_user(remote_user);
 
-    // Check if gh credentials already exist in container
-    let check_cmd = cella_env::gh_credential::gh_config_exists_in_container(&config_dir);
-    if client
+    if config_exists_in_container(
+        client,
+        container_id,
+        remote_user,
+        &cella_env::gh_credential::gh_config_exists_in_container(&config_dir),
+    )
+    .await
+    {
+        tracing::debug!("gh credentials already present in container, skipping seed");
+        return;
+    }
+
+    let Some(gh_creds) =
+        cella_env::gh_credential::prepare_gh_credentials(workspace_root, remote_user)
+    else {
+        return;
+    };
+
+    if upload_to_container(
+        client,
+        container_id,
+        remote_user,
+        &config_dir,
+        &gh_creds.file_uploads,
+        "gh config",
+    )
+    .await
+    {
+        info!("Seeded gh CLI credentials into container");
+    }
+}
+
+/// Check if a config already exists in the container (runs a test command).
+async fn config_exists_in_container(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    check_cmd: &[String],
+) -> bool {
+    client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: check_cmd,
+                cmd: check_cmd.to_vec(),
                 user: Some(remote_user.to_string()),
                 env: None,
                 working_dir: None,
@@ -1279,66 +1399,6 @@ async fn seed_gh_credentials(
         )
         .await
         .is_ok_and(|r| r.exit_code == 0)
-    {
-        tracing::debug!("gh credentials already present in container, skipping seed");
-        return;
-    }
-
-    // Prepare credentials from host
-    let Some(gh_creds) =
-        cella_env::gh_credential::prepare_gh_credentials(workspace_root, remote_user)
-    else {
-        return;
-    };
-
-    // Create the config directory
-    if let Err(e) = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("mkdir -p {config_dir} && chmod 700 {config_dir}"),
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-    {
-        warn!("Failed to create gh config directory: {e}");
-        return;
-    }
-
-    // Upload credential files
-    let docker_files = convert_uploads(&gh_creds.file_uploads);
-
-    if let Err(e) = client.upload_files(container_id, &docker_files).await {
-        warn!("Failed to upload gh credential files: {e}");
-        return;
-    }
-
-    // Fix ownership
-    let _ = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    format!("{remote_user}:{remote_user}"),
-                    config_dir.clone(),
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    info!("Seeded gh CLI credentials into container");
 }
 
 /// Seed Claude Code config files into a container (first create).
@@ -1351,83 +1411,37 @@ async fn seed_claude_config(
     container_id: &str,
     workspace_root: &std::path::Path,
     remote_user: &str,
-    settings: &cella_config::ClaudeCodeSettings,
+    settings: &cella_config::ClaudeCode,
 ) {
     let claude_dir = cella_env::claude_code::claude_dir_for_user(remote_user);
 
-    // Check if Claude config already exists in container
-    let check_cmd = cella_env::claude_code::claude_config_exists_command(&claude_dir);
-    if client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: check_cmd,
-                user: Some(remote_user.to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .is_ok_and(|r| r.exit_code == 0)
+    if config_exists_in_container(
+        client,
+        container_id,
+        remote_user,
+        &cella_env::claude_code::claude_config_exists_command(&claude_dir),
+    )
+    .await
     {
         tracing::debug!("Claude config already present in container, skipping seed");
         return;
     }
 
-    // Prepare config files from host with path rewriting
     let Some(uploads) =
         cella_env::claude_code::prepare_claude_config(remote_user, workspace_root, settings)
     else {
         return;
     };
 
-    // Create the target directory
-    if let Err(e) = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("mkdir -p {claude_dir}"),
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-    {
-        warn!("Failed to create .claude directory: {e}");
-        return;
-    }
-
-    // Upload files
-    let docker_files = convert_uploads(&uploads);
-
-    if let Err(e) = client.upload_files(container_id, &docker_files).await {
-        warn!("Failed to upload Claude config files: {e}");
-        // Continue to chown — directory must be owned by remote_user even if upload
-        // failed, otherwise the Claude Code installer gets permission denied.
-    }
-
-    // Fix ownership
-    let _ = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    format!("{remote_user}:{remote_user}"),
-                    claude_dir,
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
+    upload_to_container(
+        client,
+        container_id,
+        remote_user,
+        &claude_dir,
+        &uploads,
+        "Claude config",
+    )
+    .await;
 
     info!("Seeded Claude Code config into container");
 }
@@ -1533,43 +1547,61 @@ async fn install_claude_code(
     client: &DockerClient,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::ClaudeCodeSettings,
+    settings: &cella_config::ClaudeCode,
 ) {
     if is_claude_code_installed(client, container_id, remote_user, &settings.version).await {
         return;
     }
 
     let is_alpine = ensure_alpine_claude_deps(client, container_id).await;
+    run_claude_install(
+        client,
+        container_id,
+        remote_user,
+        &settings.version,
+        is_alpine,
+    )
+    .await;
+}
 
-    if settings.version != "latest" && settings.version != "stable" {
-        info!(
-            "Installing Claude Code v{} (native installer will attempt version pinning)",
-            settings.version
-        );
+/// Execute the Claude Code install script inside the container.
+async fn run_claude_install(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    version: &str,
+    is_alpine: bool,
+) {
+    if version != "latest" && version != "stable" {
+        info!("Installing Claude Code v{version} (native installer will attempt version pinning)");
     }
 
-    let install_cmd = format!(
-        "curl -fsSL https://claude.ai/install.sh | bash -s {}",
-        settings.version
-    );
+    let install_cmd = format!("curl -fsSL https://claude.ai/install.sh | bash -s {version}");
+    info!("Installing Claude Code ({version})...");
 
-    info!("Installing Claude Code ({})...", settings.version);
+    let env = if is_alpine {
+        Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
+    } else {
+        None
+    };
+
     let result = client
         .exec_command(
             container_id,
             &ExecOptions {
                 cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd],
                 user: Some(remote_user.to_string()),
-                env: if is_alpine {
-                    Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
-                } else {
-                    None
-                },
+                env,
                 working_dir: None,
             },
         )
         .await;
 
+    log_install_result(result);
+}
+
+/// Log the result of a Claude Code installation attempt.
+fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             info!("Claude Code installed successfully");

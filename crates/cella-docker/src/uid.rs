@@ -50,7 +50,90 @@ fi"#;
     format!("{header}{body}")
 }
 
-/// Update the remote user's UID/GID inside the container to match the host.
+/// Build [`ExecOptions`] for running a command as root.
+fn root_exec(cmd: Vec<String>) -> ExecOptions {
+    ExecOptions {
+        cmd,
+        user: Some("root".to_string()),
+        env: None,
+        working_dir: None,
+    }
+}
+
+/// Read the host UID and GID from the workspace root directory metadata.
+fn host_ids(workspace_root: &Path) -> Result<(u32, u32), CellaDockerError> {
+    let metadata = std::fs::metadata(workspace_root)?;
+    Ok((metadata.uid(), metadata.gid()))
+}
+
+/// Query the container current UID for the given user.
+async fn get_container_uid(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+) -> Result<u32, CellaDockerError> {
+    let opts = root_exec(vec![
+        "id".to_string(),
+        "-u".to_string(),
+        remote_user.to_string(),
+    ]);
+    let result = client.exec_command(container_id, &opts).await?;
+    Ok(result.stdout.trim().parse().unwrap_or(0))
+}
+
+/// Log the output of a successful UID update script execution.
+fn log_uid_update_result(result: &crate::exec::ExecResult) {
+    for line in result.stdout.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            info!("{line}");
+        }
+    }
+    if result.exit_code != 0 && !result.stderr.is_empty() {
+        warn!("UID update script stderr: {}", result.stderr.trim());
+    }
+}
+
+/// Execute the UID update script and log its output. Best-effort; failures are warned.
+async fn run_uid_update_script(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    host_uid: u32,
+    host_gid: u32,
+) {
+    let script = build_update_uid_script(remote_user, host_uid, host_gid);
+    let opts = root_exec(vec!["sh".to_string(), "-c".to_string(), script]);
+
+    match client.exec_command(container_id, &opts).await {
+        Ok(r) => log_uid_update_result(&r),
+        Err(e) => warn!("Failed to run UID update script: {e}"),
+    }
+}
+
+/// Check if a UID remap is needed by comparing host and container UIDs.
+/// Returns `Some((host_uid, host_gid))` if remap is needed, `None` if UIDs already match.
+async fn remap_needed(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    workspace_root: &Path,
+) -> Result<Option<(u32, u32)>, CellaDockerError> {
+    let (host_uid, host_gid) = host_ids(workspace_root)?;
+    debug!("Host UID: {host_uid}, GID: {host_gid}");
+
+    let container_uid = get_container_uid(client, container_id, remote_user).await?;
+
+    if container_uid == host_uid {
+        debug!("UID already matches ({host_uid}), skipping remap");
+        return Ok(None);
+    }
+
+    info!("Remapping {remote_user} UID {container_uid} -> {host_uid}");
+    Ok(Some((host_uid, host_gid)))
+}
+
+/// Update the remote user UID/GID inside the container to match the host.
 ///
 /// # Errors
 ///
@@ -62,65 +145,13 @@ pub async fn update_remote_user_uid(
     remote_user: &str,
     workspace_root: &Path,
 ) -> Result<(), CellaDockerError> {
-    let metadata = std::fs::metadata(workspace_root)?;
-    let host_uid = metadata.uid();
-    let host_gid = metadata.gid();
-
-    debug!("Host UID: {host_uid}, GID: {host_gid}");
-
-    // Quick check: if the container UID already matches, skip everything.
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["id".to_string(), "-u".to_string(), remote_user.to_string()],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await?;
-
-    let container_uid: u32 = result.stdout.trim().parse().unwrap_or(0);
-
-    if container_uid == host_uid {
-        debug!("UID already matches ({host_uid}), skipping remap");
+    let Some((host_uid, host_gid)) =
+        remap_needed(client, container_id, remote_user, workspace_root).await?
+    else {
         return Ok(());
-    }
+    };
 
-    info!("Remapping {remote_user} UID {container_uid} -> {host_uid}");
-
-    // Run the update script matching the original devcontainer CLI behaviour.
-    let script = build_update_uid_script(remote_user, host_uid, host_gid);
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), script],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    match result {
-        Ok(r) => {
-            for line in r.stdout.lines() {
-                let line = line.trim();
-                if !line.is_empty() {
-                    info!("{line}");
-                }
-            }
-            if r.exit_code != 0 && !r.stderr.is_empty() {
-                warn!("UID update script stderr: {}", r.stderr.trim());
-            }
-        }
-        Err(e) => {
-            warn!("Failed to run UID update script: {e}");
-        }
-    }
-
+    run_uid_update_script(client, container_id, remote_user, host_uid, host_gid).await;
     info!("UID/GID remapping complete");
     Ok(())
 }

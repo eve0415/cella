@@ -6,15 +6,15 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::debug;
 
-pub use claude_code::ClaudeCodeSettings;
-pub use credentials::CredentialSettings;
+pub use claude_code::ClaudeCode;
+pub use credentials::Credentials;
 
 /// Tool installation and forwarding settings.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct ToolSettings {
+pub struct Tools {
     /// Claude Code settings.
     #[serde(default, rename = "claude-code")]
-    pub claude_code: ClaudeCodeSettings,
+    pub claude_code: ClaudeCode,
 }
 
 /// Cella's own settings, loaded from TOML config files.
@@ -24,17 +24,17 @@ pub struct ToolSettings {
 ///
 /// Project settings override global settings per-key.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct CellaSettings {
+pub struct Settings {
     /// Credential forwarding settings.
     #[serde(default)]
-    pub credentials: CredentialSettings,
+    pub credentials: Credentials,
 
     /// Tool installation and forwarding settings.
     #[serde(default)]
-    pub tools: ToolSettings,
+    pub tools: Tools,
 }
 
-impl CellaSettings {
+impl Settings {
     /// Load settings by merging global (`~/.cella/config.toml`) and
     /// project (`.devcontainer/cella.toml`) config files.
     ///
@@ -81,10 +81,10 @@ impl CellaSettings {
             (Some(g), None) => g,
             (None, Some(p)) => p,
             (Some(_global), Some(p)) => Self {
-                credentials: CredentialSettings {
+                credentials: Credentials {
                     gh: p.credentials.gh,
                 },
-                tools: ToolSettings {
+                tools: Tools {
                     claude_code: p.tools.claude_code,
                 },
             },
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn default_settings() {
-        let settings = CellaSettings::default();
+        let settings = Settings::default();
         assert!(settings.credentials.gh);
         assert!(settings.tools.claude_code.enabled);
         assert!(settings.tools.claude_code.forward_config);
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn load_missing_files_returns_defaults() {
         let tmp = TempDir::new().unwrap();
-        let settings = CellaSettings::load(tmp.path());
+        let settings = Settings::load(tmp.path());
         assert!(settings.credentials.gh);
     }
 
@@ -120,7 +120,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cella.toml"), "[credentials]\ngh = false\n").unwrap();
 
-        let settings = CellaSettings::load(tmp.path());
+        let settings = Settings::load(tmp.path());
         assert!(!settings.credentials.gh);
     }
 
@@ -131,7 +131,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cella.toml"), "").unwrap();
 
-        let settings = CellaSettings::load(tmp.path());
+        let settings = Settings::load(tmp.path());
         assert!(settings.credentials.gh);
     }
 
@@ -145,7 +145,7 @@ gh = false
 enabled = false
 version = "stable"
 "#;
-        let settings: CellaSettings = toml::from_str(toml_str).unwrap();
+        let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.credentials.gh);
         assert!(!settings.tools.claude_code.enabled);
         assert_eq!(settings.tools.claude_code.version, "stable");
@@ -160,7 +160,7 @@ forward_config = false
 version = "1.0.58"
 exclude = ["plans/**"]
 "#;
-        let settings: CellaSettings = toml::from_str(toml_str).unwrap();
+        let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.tools.claude_code.enabled);
         assert!(!settings.tools.claude_code.forward_config);
         assert_eq!(settings.tools.claude_code.version, "1.0.58");
@@ -171,31 +171,31 @@ exclude = ["plans/**"]
 
     #[test]
     fn merge_project_overrides_global() {
-        let global = CellaSettings {
-            credentials: CredentialSettings { gh: true },
+        let global = Settings {
+            credentials: Credentials { gh: true },
             ..Default::default()
         };
-        let project = CellaSettings {
-            credentials: CredentialSettings { gh: false },
+        let project = Settings {
+            credentials: Credentials { gh: false },
             ..Default::default()
         };
-        let merged = CellaSettings::merge(Some(global), Some(project));
+        let merged = Settings::merge(Some(global), Some(project));
         assert!(!merged.credentials.gh);
     }
 
     #[test]
     fn merge_global_only() {
-        let global = CellaSettings {
-            credentials: CredentialSettings { gh: false },
+        let global = Settings {
+            credentials: Credentials { gh: false },
             ..Default::default()
         };
-        let merged = CellaSettings::merge(Some(global), None);
+        let merged = Settings::merge(Some(global), None);
         assert!(!merged.credentials.gh);
     }
 
     #[test]
     fn merge_neither() {
-        let merged = CellaSettings::merge(None, None);
+        let merged = Settings::merge(None, None);
         assert!(merged.credentials.gh);
     }
 
@@ -207,7 +207,7 @@ exclude = ["plans/**"]
         std::fs::write(dir.join("cella.toml"), "not valid toml {{{").unwrap();
 
         // Should not panic, just return defaults
-        let settings = CellaSettings::load(tmp.path());
+        let settings = Settings::load(tmp.path());
         assert!(settings.credentials.gh);
     }
 }

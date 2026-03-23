@@ -56,39 +56,53 @@ impl ContainerTarget {
     }
 
     async fn find(&self, client: &DockerClient) -> Result<ContainerInfo, CellaDockerError> {
-        // 1. Direct container ID
         if let Some(ref id) = self.container_id {
-            debug!("Resolving container by ID: {id}");
-            return client.inspect_container(id).await;
+            return self.find_by_id(client, id).await;
         }
-
-        // 2. Container name (Docker resolves names via inspect)
         if let Some(ref name) = self.container_name {
-            debug!("Resolving container by name: {name}");
-            return client.inspect_container(name).await;
+            return self.find_by_name(client, name).await;
         }
-
-        // 3. Arbitrary label filter
         if let Some(ref label) = self.id_label {
-            debug!("Resolving container by label: {label}");
             return self.find_by_label(client, label).await;
         }
+        self.find_by_workspace_or_cwd(client).await
+    }
 
-        // 4. Workspace folder
-        if let Some(ref folder) = self.workspace_folder {
-            debug!(
-                "Resolving container by workspace folder: {}",
-                folder.display()
-            );
-            return self.find_by_workspace(client, folder).await;
-        }
+    async fn find_by_id(
+        &self,
+        client: &DockerClient,
+        id: &str,
+    ) -> Result<ContainerInfo, CellaDockerError> {
+        debug!("Resolving container by ID: {id}");
+        client.inspect_container(id).await
+    }
 
-        // 5. CWD fallback
-        let cwd = std::env::current_dir().map_err(|_| CellaDockerError::ContainerNotFound {
-            workspace: "(unable to determine current directory)".to_string(),
-        })?;
-        debug!("Resolving container by CWD: {}", cwd.display());
-        self.find_by_workspace(client, &cwd).await
+    async fn find_by_name(
+        &self,
+        client: &DockerClient,
+        name: &str,
+    ) -> Result<ContainerInfo, CellaDockerError> {
+        debug!("Resolving container by name: {name}");
+        client.inspect_container(name).await
+    }
+
+    async fn find_by_workspace_or_cwd(
+        &self,
+        client: &DockerClient,
+    ) -> Result<ContainerInfo, CellaDockerError> {
+        let folder = self
+            .workspace_folder
+            .as_deref()
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| CellaDockerError::ContainerNotFound {
+                workspace: "(unable to determine current directory)".to_string(),
+            })?;
+        debug!(
+            "Resolving container by workspace folder: {}",
+            folder.display()
+        );
+        self.find_by_workspace(client, &folder).await
     }
 
     async fn find_by_label(

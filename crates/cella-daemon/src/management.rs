@@ -36,20 +36,8 @@ pub(crate) struct ManagementContext {
     pub control_port: u16,
 }
 
-/// Run the management server on the given Unix socket.
-///
-/// Also spawns the unified TCP control server for agent connections.
-///
-/// # Errors
-///
-/// Returns error if socket binding fails.
-pub(crate) async fn run_management_server(
-    socket_path: &Path,
-    ctx: ManagementContext,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    control_listener: tokio::net::TcpListener,
-) -> Result<(), CellaDaemonError> {
-    // Clean up stale socket
+/// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
+fn bind_management_socket(socket_path: &Path) -> Result<UnixListener, CellaDaemonError> {
     let _ = std::fs::remove_file(socket_path);
 
     if let Some(parent) = socket_path.parent() {
@@ -73,6 +61,23 @@ pub(crate) async fn run_management_server(
     }
 
     info!("Management server listening on {}", socket_path.display());
+    Ok(listener)
+}
+
+/// Run the management server on the given Unix socket.
+///
+/// Also spawns the unified TCP control server for agent connections.
+///
+/// # Errors
+///
+/// Returns error if socket binding fails.
+pub(crate) async fn run_management_server(
+    socket_path: &Path,
+    ctx: ManagementContext,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    control_listener: tokio::net::TcpListener,
+) -> Result<(), CellaDaemonError> {
+    let listener = bind_management_socket(socket_path)?;
 
     let container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>> =
         Arc::new(Mutex::new(HashMap::new()));

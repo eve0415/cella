@@ -84,6 +84,35 @@ pub async fn start_proxy(host_port: u16, target: ProxyTarget) -> Result<ProxyHan
     Ok(ProxyHandle { handle })
 }
 
+/// Handle a proxy start command: bind the proxy and report the result.
+async fn handle_proxy_start(
+    host_port: u16,
+    container_ip: String,
+    container_port: u16,
+    result_tx: Option<tokio::sync::oneshot::Sender<Result<(), io::Error>>>,
+    proxies: &mut HashMap<u16, ProxyHandle>,
+) {
+    let target = ProxyTarget::DirectIp {
+        ip: container_ip,
+        port: container_port,
+    };
+    match start_proxy(host_port, target).await {
+        Ok(handle) => {
+            debug!("Started proxy: localhost:{host_port} -> container:{container_port}");
+            proxies.insert(host_port, handle);
+            if let Some(tx) = result_tx {
+                let _ = tx.send(Ok(()));
+            }
+        }
+        Err(e) => {
+            warn!("Failed to start proxy on port {host_port}: {e}");
+            if let Some(tx) = result_tx {
+                let _ = tx.send(Err(e));
+            }
+        }
+    }
+}
+
 /// Run the proxy coordinator that manages TCP proxy lifecycle.
 ///
 /// Receives `ProxyCommand` messages and starts/stops TCP proxies accordingly.
@@ -98,27 +127,14 @@ pub async fn run_proxy_coordinator(mut rx: tokio::sync::mpsc::Receiver<ProxyComm
                 container_port,
                 result_tx,
             } => {
-                let target = ProxyTarget::DirectIp {
-                    ip: container_ip,
-                    port: container_port,
-                };
-                match start_proxy(host_port, target).await {
-                    Ok(handle) => {
-                        debug!(
-                            "Started proxy: localhost:{host_port} -> container:{container_port}"
-                        );
-                        proxies.insert(host_port, handle);
-                        if let Some(tx) = result_tx {
-                            let _ = tx.send(Ok(()));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to start proxy on port {host_port}: {e}");
-                        if let Some(tx) = result_tx {
-                            let _ = tx.send(Err(e));
-                        }
-                    }
-                }
+                handle_proxy_start(
+                    host_port,
+                    container_ip,
+                    container_port,
+                    result_tx,
+                    &mut proxies,
+                )
+                .await;
             }
             ProxyCommand::Stop { host_port } => {
                 if let Some(handle) = proxies.remove(&host_port) {

@@ -6,18 +6,18 @@
 
 /// Errors that can occur during JSONC stripping.
 #[derive(Debug)]
-pub struct JsoncError {
+pub struct Error {
     pub message: String,
     pub offset: usize,
 }
 
-impl std::fmt::Display for JsoncError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "JSONC error at byte {}: {}", self.offset, self.message)
     }
 }
 
-impl std::error::Error for JsoncError {}
+impl std::error::Error for Error {}
 
 #[derive(PartialEq)]
 enum State {
@@ -36,9 +36,9 @@ enum State {
 ///
 /// # Errors
 ///
-/// Returns `JsoncError` if the input contains an unterminated block comment
+/// Returns `Error` if the input contains an unterminated block comment
 /// or if comment stripping produces invalid UTF-8.
-pub fn strip_jsonc(input: &str) -> Result<String, JsoncError> {
+pub fn strip(input: &str) -> Result<String, Error> {
     let bytes = input.as_bytes();
     let len = bytes.len();
     let mut out = Vec::with_capacity(len);
@@ -114,7 +114,7 @@ pub fn strip_jsonc(input: &str) -> Result<String, JsoncError> {
     }
 
     if state == State::BlockComment {
-        return Err(JsoncError {
+        return Err(Error {
             message: "unterminated block comment".into(),
             offset: len,
         });
@@ -122,7 +122,7 @@ pub fn strip_jsonc(input: &str) -> Result<String, JsoncError> {
 
     debug_assert_eq!(out.len(), len, "output length must equal input length");
 
-    String::from_utf8(out).map_err(|e| JsoncError {
+    String::from_utf8(out).map_err(|e| Error {
         message: format!("produced invalid UTF-8: {e}"),
         offset: 0,
     })
@@ -150,7 +150,7 @@ mod tests {
     fn test_strip_line_comment() {
         let input = r#"{"key": "value" // comment
 }"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         assert!(output.contains(r#""key": "value""#));
         assert!(!output.contains("//"));
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_strip_block_comment() {
         let input = r#"{"key": /* comment */ "value"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["key"], "value");
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_strip_trailing_comma() {
         let input = r#"{"a": 1, "b": 2, }"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["a"], 1);
@@ -177,27 +177,27 @@ mod tests {
     #[test]
     fn test_string_with_slash() {
         let input = r#"{"url": "http://example.com"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(input, output);
     }
 
     #[test]
     fn test_escaped_quote_in_string() {
         let input = r#"{"key": "val\"ue"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(input, output);
     }
 
     #[test]
     fn test_unterminated_block_comment() {
         let input = r#"{"key": /* unterminated"#;
-        assert!(strip_jsonc(input).is_err());
+        assert!(strip(input).is_err());
     }
 
     #[test]
     fn test_preserves_newlines_in_block_comment() {
         let input = "{\n/* line1\nline2 */\n\"a\": 1\n}";
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         // Newlines inside the block comment should be preserved
         assert_eq!(
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn test_trailing_comma_in_array() {
         let input = r"[1, 2, 3, ]";
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 3);
@@ -220,7 +220,7 @@ mod tests {
         // JSONC does not support nested block comments. The first `*/` ends the comment.
         // So `/* /* */ */` leaves ` */` as literal text.
         let input = r#"{"a": 1 /* /* */ , "b": 2}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         // After first `*/`, the rest is normal text, so `"b"` should be present
         assert!(output.contains("\"b\": 2"));
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_multiple_comments_same_line() {
         let input = r#"{"a": 1 /* c1 */ , "b": 2 /* c2 */}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["a"], 1);
@@ -239,34 +239,34 @@ mod tests {
     #[test]
     fn test_comment_like_in_string() {
         let input = r#"{"a": "// not a comment"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(input, output);
     }
 
     #[test]
     fn test_block_comment_syntax_in_string() {
         let input = r#"{"a": "/* not a comment */"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(input, output);
     }
 
     #[test]
     fn test_empty_input() {
-        let output = strip_jsonc("").unwrap();
+        let output = strip("").unwrap();
         assert_eq!(output, "");
     }
 
     #[test]
     fn test_whitespace_only() {
         let input = "   ";
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output, "   ");
     }
 
     #[test]
     fn test_line_comment_at_eof() {
         let input = r#"{"a": 1} // comment"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["a"], 1);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_multiple_trailing_commas_nested() {
         let input = r#"{"a": {"b": 1, }, }"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["a"]["b"], 1);
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn test_consecutive_line_comments() {
         let input = "// first\n// second\n{\"a\": 1}";
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         assert!(!output.contains("//"));
         let trimmed = output.trim();
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_multi_line_block_comment() {
         let input = "/*\n  multi\n  line\n*/\n{\"a\": 1}";
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(output.len(), input.len());
         // Newlines should be preserved
         assert_eq!(
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_single_slash_not_comment() {
         let input = r#"{"a": "x/y"}"#;
-        let output = strip_jsonc(input).unwrap();
+        let output = strip(input).unwrap();
         assert_eq!(input, output);
     }
 }

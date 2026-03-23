@@ -115,8 +115,27 @@ impl ShellArgs {
 /// 2. `/etc/passwd` entry for the user
 /// 3. Probing `/bin/zsh`, `/bin/bash`, `/bin/sh`
 async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> String {
-    // Try $SHELL
-    if let Ok(result) = client
+    if let Some(shell) = detect_shell_from_env(client, container_id, user).await {
+        return shell;
+    }
+    if let Some(shell) = detect_shell_from_passwd(client, container_id, user).await {
+        return shell;
+    }
+    if let Some(shell) = detect_shell_by_probing(client, container_id, user).await {
+        return shell;
+    }
+
+    warn!("Could not detect shell, falling back to /bin/sh");
+    "/bin/sh".to_string()
+}
+
+/// Try to detect the shell from the `$SHELL` environment variable.
+async fn detect_shell_from_env(
+    client: &DockerClient,
+    container_id: &str,
+    user: &str,
+) -> Option<String> {
+    let result = client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -131,16 +150,23 @@ async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> 
             },
         )
         .await
-    {
-        let shell = result.stdout.trim().to_string();
-        if !shell.is_empty() && shell != "$SHELL" {
-            debug!("Detected shell from $SHELL: {shell}");
-            return shell;
-        }
-    }
+        .ok()?;
 
-    // Try /etc/passwd
-    if let Ok(result) = client
+    let shell = result.stdout.trim().to_string();
+    if !shell.is_empty() && shell != "$SHELL" {
+        debug!("Detected shell from $SHELL: {shell}");
+        return Some(shell);
+    }
+    None
+}
+
+/// Try to detect the shell from `/etc/passwd`.
+async fn detect_shell_from_passwd(
+    client: &DockerClient,
+    container_id: &str,
+    user: &str,
+) -> Option<String> {
+    let result = client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -155,18 +181,23 @@ async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> 
             },
         )
         .await
-    {
-        let output = result.stdout.trim().to_string();
-        if let Some(shell) = output.split(':').nth(6) {
-            let shell = shell.trim();
-            if !shell.is_empty() {
-                debug!("Detected shell from passwd: {shell}");
-                return shell.to_string();
-            }
-        }
-    }
+        .ok()?;
 
-    // Probe common shells
+    let output = result.stdout.trim().to_string();
+    let shell = output.split(':').nth(6)?.trim();
+    if !shell.is_empty() {
+        debug!("Detected shell from passwd: {shell}");
+        return Some(shell.to_string());
+    }
+    None
+}
+
+/// Probe common shell paths to find one that exists.
+async fn detect_shell_by_probing(
+    client: &DockerClient,
+    container_id: &str,
+    user: &str,
+) -> Option<String> {
     for candidate in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
         if let Ok(result) = client
             .exec_command(
@@ -186,12 +217,10 @@ async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> 
             && result.exit_code == 0
         {
             debug!("Detected shell by probing: {candidate}");
-            return (*candidate).to_string();
+            return Some((*candidate).to_string());
         }
     }
-
-    warn!("Could not detect shell, falling back to /bin/sh");
-    "/bin/sh".to_string()
+    None
 }
 
 /// Terminal environment variables to forward into the container.

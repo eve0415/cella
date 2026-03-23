@@ -74,6 +74,120 @@ impl Default for OciFetcher {
     }
 }
 
+/// Find the first extractable layer in a manifest, or return an error listing available types.
+fn find_feature_layer<'a>(
+    manifest: &'a oci_distribution::manifest::OciImageManifest,
+    registry: &str,
+    repository: &str,
+    tag: &str,
+) -> Result<&'a oci_distribution::manifest::OciDescriptor, FeatureError> {
+    manifest
+        .layers
+        .iter()
+        .find(|l| is_extractable_layer(&l.media_type))
+        .ok_or_else(|| FeatureError::InvalidArtifact {
+            feature_id: format!("{registry}/{repository}:{tag}"),
+            reason: format!(
+                "no extractable layer found in manifest; layer media types: [{}]",
+                manifest
+                    .layers
+                    .iter()
+                    .map(|l| l.media_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+}
+
+/// Extract a layer blob to a staging directory and atomically commit to the cache.
+fn extract_and_commit(
+    blob: &[u8],
+    media_type: &str,
+    cache: &FeatureCache,
+    registry: &str,
+    repository: &str,
+    tag: &str,
+    digest: &str,
+) -> Result<PathBuf, FeatureError> {
+    let final_path = cache.oci_path(registry, repository, digest);
+    let staging = FeatureCache::staging_path(&final_path);
+
+    std::fs::create_dir_all(&staging).map_err(|e| FeatureError::RegistryError {
+        registry: registry.to_owned(),
+        message: format!("failed to create staging directory: {e}"),
+    })?;
+
+    extract_layer(blob, media_type, &staging).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        FeatureError::InvalidArtifact {
+            feature_id: format!("{registry}/{repository}:{tag}"),
+            reason: format!("failed to extract layer: {e}"),
+        }
+    })?;
+
+    FeatureCache::commit(&staging, &final_path).map_err(|e| FeatureError::RegistryError {
+        registry: registry.to_owned(),
+        message: format!("failed to commit cache entry: {e}"),
+    })?;
+
+    debug!(
+        "cached {registry}/{repository}:{tag} at {}",
+        final_path.display()
+    );
+    Ok(final_path)
+}
+
+impl OciFetcher {
+    /// Pull the manifest and resolve the digest for the given reference.
+    async fn pull_manifest(
+        &self,
+        oci_ref: &Reference,
+        auth: &RegistryAuth,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+    ) -> Result<(oci_distribution::manifest::OciImageManifest, String), FeatureError> {
+        let (manifest, digest) = self
+            .client
+            .pull_image_manifest(oci_ref, auth)
+            .await
+            .map_err(|e| FeatureError::RegistryError {
+                registry: registry.to_owned(),
+                message: format!("failed to pull manifest for {repository}:{tag}: {e}"),
+            })?;
+
+        debug!(
+            "pulled manifest for {registry}/{repository}:{tag} (digest={digest}, layers={})",
+            manifest.layers.len()
+        );
+        Ok((manifest, digest))
+    }
+
+    /// Download a single layer blob from the registry.
+    async fn pull_layer_blob(
+        &self,
+        oci_ref: &Reference,
+        layer: &oci_distribution::manifest::OciDescriptor,
+        registry: &str,
+    ) -> Result<Vec<u8>, FeatureError> {
+        let capacity = usize::try_from(layer.size.max(0)).unwrap_or(0);
+        let mut blob = Vec::with_capacity(capacity);
+        self.client
+            .pull_blob(oci_ref, layer, &mut blob)
+            .await
+            .map_err(|e| FeatureError::RegistryError {
+                registry: registry.to_owned(),
+                message: format!("failed to pull layer blob: {e}"),
+            })?;
+        debug!(
+            "downloaded layer blob ({} bytes, media_type={})",
+            blob.len(),
+            layer.media_type
+        );
+        Ok(blob)
+    }
+}
+
 impl FeatureFetcher for OciFetcher {
     async fn fetch(
         &self,
@@ -93,105 +207,35 @@ impl FeatureFetcher for OciFetcher {
             });
         };
 
-        // Step 1: check cache by tag (best-effort; a digest-based check
-        // follows after manifest pull).
         if let Some(cached) = cache.get_oci(registry, repository, tag) {
             debug!("cache hit for {registry}/{repository}:{tag}");
             return Ok(cached);
         }
 
-        // Step 2: build an oci-distribution Reference.
         let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
-
-        // Step 3: resolve auth.
         let auth = build_registry_auth(registry);
 
-        // Step 4: pull manifest to discover layers.
         let (manifest, digest) = self
-            .client
-            .pull_image_manifest(&oci_ref, &auth)
-            .await
-            .map_err(|e| FeatureError::RegistryError {
-                registry: registry.clone(),
-                message: format!("failed to pull manifest for {repository}:{tag}: {e}"),
-            })?;
+            .pull_manifest(&oci_ref, &auth, registry, repository, tag)
+            .await?;
 
-        debug!(
-            "pulled manifest for {registry}/{repository}:{tag} (digest={digest}, layers={})",
-            manifest.layers.len()
-        );
-
-        // Check cache by digest (more precise than tag).
         if let Some(cached) = cache.get_oci(registry, repository, &digest) {
             debug!("cache hit by digest {digest}");
             return Ok(cached);
         }
 
-        // Step 5: find the feature layer (gzipped tarball).
-        let layer = manifest
-            .layers
-            .iter()
-            .find(|l| is_extractable_layer(&l.media_type))
-            .ok_or_else(|| FeatureError::InvalidArtifact {
-                feature_id: format!("{registry}/{repository}:{tag}"),
-                reason: format!(
-                    "no extractable layer found in manifest; layer media types: [{}]",
-                    manifest
-                        .layers
-                        .iter()
-                        .map(|l| l.media_type.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            })?;
+        let layer = find_feature_layer(&manifest, registry, repository, tag)?;
+        let blob = self.pull_layer_blob(&oci_ref, layer, registry).await?;
 
-        // Step 6: pull the layer blob into memory.
-        let capacity = usize::try_from(layer.size.max(0)).unwrap_or(0);
-        let mut blob = Vec::with_capacity(capacity);
-        self.client
-            .pull_blob(&oci_ref, layer, &mut blob)
-            .await
-            .map_err(|e| FeatureError::RegistryError {
-                registry: registry.clone(),
-                message: format!("failed to pull layer blob: {e}"),
-            })?;
-
-        debug!(
-            "downloaded layer blob ({} bytes, media_type={})",
-            blob.len(),
-            layer.media_type
-        );
-
-        // Step 7: extract to a staging directory.
-        let final_path = cache.oci_path(registry, repository, &digest);
-        let staging = FeatureCache::staging_path(&final_path);
-
-        std::fs::create_dir_all(&staging).map_err(|e| FeatureError::RegistryError {
-            registry: registry.clone(),
-            message: format!("failed to create staging directory: {e}"),
-        })?;
-
-        extract_layer(&blob, &layer.media_type, &staging).map_err(|e| {
-            // Clean up staging on failure.
-            let _ = std::fs::remove_dir_all(&staging);
-            FeatureError::InvalidArtifact {
-                feature_id: format!("{registry}/{repository}:{tag}"),
-                reason: format!("failed to extract layer: {e}"),
-            }
-        })?;
-
-        // Step 8: atomic commit.
-        FeatureCache::commit(&staging, &final_path).map_err(|e| FeatureError::RegistryError {
-            registry: registry.clone(),
-            message: format!("failed to commit cache entry: {e}"),
-        })?;
-
-        debug!(
-            "cached {registry}/{repository}:{tag} at {}",
-            final_path.display()
-        );
-
-        Ok(final_path)
+        extract_and_commit(
+            &blob,
+            &layer.media_type,
+            cache,
+            registry,
+            repository,
+            tag,
+            &digest,
+        )
     }
 }
 

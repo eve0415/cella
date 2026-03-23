@@ -6,11 +6,11 @@ use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::CellaConfigError;
-use crate::diagnostic::ConfigDiagnostic;
-use crate::discover::discover_config;
+use crate::diagnostic::Diagnostic;
+use crate::discover;
 use crate::jsonc;
-use crate::merge::merge_layers;
-use crate::parse::parse_devcontainer;
+use crate::merge;
+use crate::parse;
 
 /// Fully resolved devcontainer configuration.
 pub struct ResolvedConfig {
@@ -23,7 +23,7 @@ pub struct ResolvedConfig {
     /// SHA256 hex of the canonical JSON serialization of the merged config.
     pub config_hash: String,
     /// Diagnostics (warnings) from parsing.
-    pub warnings: Vec<ConfigDiagnostic>,
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Resolve devcontainer configuration from a workspace root.
@@ -38,14 +38,14 @@ pub struct ResolvedConfig {
 ///
 /// Returns `CellaConfigError` if discovery fails, a file cannot be read,
 /// or JSONC/JSON parsing fails.
-pub fn resolve_config(
+pub fn config(
     workspace_root: &Path,
     config_path_override: Option<&Path>,
 ) -> Result<ResolvedConfig, CellaConfigError> {
     let config_path = if let Some(override_path) = config_path_override {
         override_path.to_path_buf()
     } else {
-        discover_config(workspace_root)?
+        discover::config(workspace_root)?
     };
 
     let raw_text =
@@ -55,14 +55,13 @@ pub fn resolve_config(
         })?;
 
     // Parse for validation warnings (non-strict mode)
-    let warnings = match parse_devcontainer(&config_path.display().to_string(), &raw_text, false) {
+    let warnings = match parse::devcontainer(&config_path.display().to_string(), &raw_text, false) {
         Ok((_config, warnings)) => warnings,
         Err(diags) => diags.diagnostics().to_vec(),
     };
 
     // Get raw JSON Value for merging (strip JSONC, parse to Value)
-    let cleaned =
-        jsonc::strip_jsonc(&raw_text).map_err(|e| CellaConfigError::Jsonc(e.to_string()))?;
+    let cleaned = jsonc::strip(&raw_text).map_err(|e| CellaConfigError::Jsonc(e.to_string()))?;
     let mut config: serde_json::Value = serde_json::from_str(&cleaned)?;
 
     // Merge global config if exists (~/.config/cella/global.jsonc)
@@ -72,7 +71,7 @@ pub fn resolve_config(
             debug!("merging global config from {}", global_path.display());
             let global_value = read_jsonc_value(&global_path)?;
             let mut merged = global_value;
-            merge_layers(&mut merged, &config);
+            merge::layers(&mut merged, &config);
             config = merged;
         }
     }
@@ -84,7 +83,7 @@ pub fn resolve_config(
     if local_path.is_file() {
         debug!("merging local override from {}", local_path.display());
         let local_value = read_jsonc_value(&local_path)?;
-        merge_layers(&mut config, &local_value);
+        merge::layers(&mut config, &local_value);
     }
 
     // Substitute variables after merge, before hash
@@ -123,7 +122,7 @@ fn read_jsonc_value(path: &Path) -> Result<serde_json::Value, CellaConfigError> 
         path: path.display().to_string(),
         source,
     })?;
-    let cleaned = jsonc::strip_jsonc(&raw).map_err(|e| CellaConfigError::Jsonc(e.to_string()))?;
+    let cleaned = jsonc::strip(&raw).map_err(|e| CellaConfigError::Jsonc(e.to_string()))?;
     let value = serde_json::from_str(&cleaned)?;
     Ok(value)
 }
@@ -148,7 +147,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
 
-        let resolved = resolve_config(tmp.path(), None).unwrap();
+        let resolved = config(tmp.path(), None).unwrap();
         assert_eq!(resolved.config["image"], "ubuntu");
         assert!(!resolved.config_hash.is_empty());
     }
@@ -158,8 +157,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
 
-        let r1 = resolve_config(tmp.path(), None).unwrap();
-        let r2 = resolve_config(tmp.path(), None).unwrap();
+        let r1 = config(tmp.path(), None).unwrap();
+        let r2 = config(tmp.path(), None).unwrap();
         assert_eq!(r1.config_hash, r2.config_hash);
     }
 
@@ -171,8 +170,8 @@ mod tests {
         let tmp2 = TempDir::new().unwrap();
         create_devcontainer(tmp2.path(), r#"{"image": "alpine"}"#);
 
-        let r1 = resolve_config(tmp1.path(), None).unwrap();
-        let r2 = resolve_config(tmp2.path(), None).unwrap();
+        let r1 = config(tmp1.path(), None).unwrap();
+        let r2 = config(tmp2.path(), None).unwrap();
         assert_ne!(r1.config_hash, r2.config_hash);
     }
 
@@ -189,15 +188,15 @@ mod tests {
         }"#,
         );
 
-        let r1 = resolve_config(tmp1.path(), None).unwrap();
-        let r2 = resolve_config(tmp2.path(), None).unwrap();
+        let r1 = config(tmp1.path(), None).unwrap();
+        let r2 = config(tmp2.path(), None).unwrap();
         assert_eq!(r1.config_hash, r2.config_hash);
     }
 
     #[test]
     fn resolve_not_found() {
         let tmp = TempDir::new().unwrap();
-        let result = resolve_config(tmp.path(), None);
+        let result = config(tmp.path(), None);
         assert!(result.is_err());
     }
 
@@ -212,7 +211,7 @@ mod tests {
             .join("devcontainer.local.jsonc");
         std::fs::write(&local_path, r#"{"remoteUser": "vscode"}"#).unwrap();
 
-        let resolved = resolve_config(tmp.path(), None).unwrap();
+        let resolved = config(tmp.path(), None).unwrap();
         assert_eq!(resolved.config["remoteUser"], "vscode");
         assert_eq!(resolved.config["image"], "ubuntu");
     }
@@ -225,7 +224,7 @@ mod tests {
             r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder}/data,target=/data"]}"#,
         );
 
-        let resolved = resolve_config(tmp.path(), None).unwrap();
+        let resolved = config(tmp.path(), None).unwrap();
         let mount = resolved.config["mounts"][0].as_str().unwrap();
 
         // Should not contain the variable anymore
@@ -248,8 +247,8 @@ mod tests {
             r#"{"image": "ubuntu", "mounts": ["source=${localWorkspaceFolder},target=/ws"]}"#,
         );
 
-        let r1 = resolve_config(tmp1.path(), None).unwrap();
-        let r2 = resolve_config(tmp2.path(), None).unwrap();
+        let r1 = config(tmp1.path(), None).unwrap();
+        let r2 = config(tmp2.path(), None).unwrap();
 
         // Same template but different workspace roots → different substituted values → different hashes
         assert_ne!(r1.config_hash, r2.config_hash);

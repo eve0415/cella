@@ -64,6 +64,40 @@ pub async fn run_server(
     }
 }
 
+/// Bind a TCP listener, attempting to reclaim a previously used port.
+async fn bind_tcp_listener(port_path: &Path) -> Result<TcpListener, CellaCredentialProxyError> {
+    let preferred_port = std::fs::read_to_string(port_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+
+    if preferred_port != 0 {
+        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
+        if let Ok(l) = TcpListener::bind(addr).await {
+            debug!("Reusing previous TCP port {preferred_port}");
+            return Ok(l);
+        }
+        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
+    }
+
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| CellaCredentialProxyError::Socket {
+            message: format!("failed to bind TCP: {e}"),
+        })
+}
+
+/// Write the TCP port file so clients can discover the port.
+fn write_port_file(port_path: &Path, port: u16) -> Result<(), CellaCredentialProxyError> {
+    if let Some(parent) = port_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(port_path, port.to_string()).map_err(|e| CellaCredentialProxyError::PidFile {
+        message: format!("failed to write port file: {e}"),
+    })
+}
+
 /// Start the credential proxy server on a TCP socket bound to localhost.
 ///
 /// Binds to `127.0.0.1:0` (OS-assigned port) and writes the allocated port
@@ -76,53 +110,16 @@ pub async fn run_tcp_server(
     port_path: &Path,
     last_activity: Arc<AtomicU64>,
 ) -> Result<(), CellaCredentialProxyError> {
-    let preferred_port = std::fs::read_to_string(port_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(0);
+    let listener = bind_tcp_listener(port_path).await?;
 
-    let listener = if preferred_port != 0 {
-        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        match TcpListener::bind(addr).await {
-            Ok(l) => {
-                debug!("Reusing previous TCP port {preferred_port}");
-                l
-            }
-            Err(e) => {
-                warn!("Cannot reclaim TCP port {preferred_port} ({e}), binding new port");
-                let fallback: SocketAddr = ([127, 0, 0, 1], 0).into();
-                TcpListener::bind(fallback).await.map_err(|e| {
-                    CellaCredentialProxyError::Socket {
-                        message: format!("failed to bind TCP: {e}"),
-                    }
-                })?
-            }
-        }
-    } else {
-        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-        TcpListener::bind(addr)
-            .await
-            .map_err(|e| CellaCredentialProxyError::Socket {
-                message: format!("failed to bind TCP: {e}"),
-            })?
-    };
-
-    let local_addr = listener
+    let port = listener
         .local_addr()
         .map_err(|e| CellaCredentialProxyError::Socket {
             message: format!("failed to get local addr: {e}"),
-        })?;
-    let port = local_addr.port();
+        })?
+        .port();
 
-    // Write port file so clients can discover the TCP port
-    if let Some(parent) = port_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(port_path, port.to_string()).map_err(|e| {
-        CellaCredentialProxyError::PidFile {
-            message: format!("failed to write port file: {e}"),
-        }
-    })?;
+    write_port_file(port_path, port)?;
 
     info!("Credential proxy TCP listening on 127.0.0.1:{port}");
 

@@ -3,10 +3,10 @@
 
 use std::fmt::Write;
 
-use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
+use miette::{GraphicalReportHandler, GraphicalTheme, Report};
 use thiserror::Error;
 
-use crate::span::{ByteSpan, SourceText};
+use crate::span::{Range, SourceText};
 
 /// Severity level for a config diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,19 +17,19 @@ pub enum Severity {
 
 /// A single diagnostic from config validation.
 #[derive(Debug, Clone)]
-pub struct ConfigDiagnostic {
+pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub path: String,
-    pub span: Option<ByteSpan>,
+    pub span: Option<Range>,
     pub help: Option<String>,
 }
 
 /// A renderable diagnostic with source context, implementing `miette::Diagnostic`.
-#[derive(Debug, Error, Diagnostic)]
+#[derive(Debug, Error, miette::Diagnostic)]
 #[error("{message}")]
 #[allow(unused_assignments, clippy::missing_const_for_fn)]
-pub struct RenderableDiagnostic {
+pub struct Renderable {
     message: String,
 
     #[source_code]
@@ -46,20 +46,20 @@ pub struct RenderableDiagnostic {
 
 /// Collection of diagnostics with source context for rendering.
 #[derive(Debug)]
-pub struct ConfigDiagnostics {
+pub struct Diagnostics {
     source: SourceText,
-    diagnostics: Vec<ConfigDiagnostic>,
+    diagnostics: Vec<Diagnostic>,
 }
 
-impl ConfigDiagnostics {
-    pub const fn new(source: SourceText, diagnostics: Vec<ConfigDiagnostic>) -> Self {
+impl Diagnostics {
+    pub const fn new(source: SourceText, diagnostics: Vec<Diagnostic>) -> Self {
         Self {
             source,
             diagnostics,
         }
     }
 
-    pub fn diagnostics(&self) -> &[ConfigDiagnostic] {
+    pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
 
@@ -89,7 +89,7 @@ impl ConfigDiagnostics {
         let mut output = String::new();
 
         for diag in &self.diagnostics {
-            let renderable = RenderableDiagnostic {
+            let renderable = Renderable {
                 message: diag.message.clone(),
                 src: self.source.as_named_source(),
                 span: diag
@@ -129,8 +129,8 @@ mod tests {
         SourceText::new("test.json".into(), text.clone(), text)
     }
 
-    fn make_error(msg: &str, path: &str) -> ConfigDiagnostic {
-        ConfigDiagnostic {
+    fn make_error(msg: &str, path: &str) -> Diagnostic {
+        Diagnostic {
             severity: Severity::Error,
             message: msg.to_string(),
             path: path.to_string(),
@@ -139,8 +139,8 @@ mod tests {
         }
     }
 
-    fn make_warning(msg: &str, path: &str) -> ConfigDiagnostic {
-        ConfigDiagnostic {
+    fn make_warning(msg: &str, path: &str) -> Diagnostic {
+        Diagnostic {
             severity: Severity::Warning,
             message: msg.to_string(),
             path: path.to_string(),
@@ -151,25 +151,25 @@ mod tests {
 
     #[test]
     fn has_errors_true_with_error() {
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![make_error("bad", "$.image")]);
+        let diags = Diagnostics::new(dummy_source(), vec![make_error("bad", "$.image")]);
         assert!(diags.has_errors());
     }
 
     #[test]
     fn has_errors_false_warnings_only() {
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![make_warning("meh", "$.image")]);
+        let diags = Diagnostics::new(dummy_source(), vec![make_warning("meh", "$.image")]);
         assert!(!diags.has_errors());
     }
 
     #[test]
     fn has_errors_false_empty() {
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![]);
+        let diags = Diagnostics::new(dummy_source(), vec![]);
         assert!(!diags.has_errors());
     }
 
     #[test]
     fn error_count_mixed() {
-        let diags = ConfigDiagnostics::new(
+        let diags = Diagnostics::new(
             dummy_source(),
             vec![
                 make_error("e1", "$.a"),
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn error_count_zero() {
-        let diags = ConfigDiagnostics::new(
+        let diags = Diagnostics::new(
             dummy_source(),
             vec![make_warning("w1", "$.a"), make_warning("w2", "$.b")],
         );
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn warning_count_mixed() {
-        let diags = ConfigDiagnostics::new(
+        let diags = Diagnostics::new(
             dummy_source(),
             vec![
                 make_error("e1", "$.a"),
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn warning_count_zero() {
-        let diags = ConfigDiagnostics::new(
+        let diags = Diagnostics::new(
             dummy_source(),
             vec![make_error("e1", "$.a"), make_error("e2", "$.b")],
         );
@@ -213,8 +213,7 @@ mod tests {
 
     #[test]
     fn render_contains_message() {
-        let diags =
-            ConfigDiagnostics::new(dummy_source(), vec![make_error("invalid image", "$.image")]);
+        let diags = Diagnostics::new(dummy_source(), vec![make_error("invalid image", "$.image")]);
         let output = diags.render();
         assert!(
             output.contains("invalid image"),
@@ -224,8 +223,7 @@ mod tests {
 
     #[test]
     fn render_contains_source_name() {
-        let diags =
-            ConfigDiagnostics::new(dummy_source(), vec![make_error("bad value", "$.image")]);
+        let diags = Diagnostics::new(dummy_source(), vec![make_error("bad value", "$.image")]);
         let output = diags.render();
         assert!(
             output.contains("test.json"),
@@ -237,7 +235,7 @@ mod tests {
     fn render_contains_help() {
         let mut diag = make_error("bad value", "$.image");
         diag.help = Some("try using a valid image name".to_string());
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![diag]);
+        let diags = Diagnostics::new(dummy_source(), vec![diag]);
         let output = diags.render();
         assert!(
             output.contains("try using a valid image name"),
@@ -248,11 +246,11 @@ mod tests {
     #[test]
     fn render_with_span() {
         let mut diag = make_error("bad value", "$.image");
-        diag.span = Some(ByteSpan {
+        diag.span = Some(Range {
             offset: 10,
             length: 8,
         });
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![diag]);
+        let diags = Diagnostics::new(dummy_source(), vec![diag]);
         let output = diags.render();
         // The label (path) should appear in the rendered output when a span is present
         assert!(
@@ -263,8 +261,7 @@ mod tests {
 
     #[test]
     fn render_without_span() {
-        let diags =
-            ConfigDiagnostics::new(dummy_source(), vec![make_error("no span here", "$.image")]);
+        let diags = Diagnostics::new(dummy_source(), vec![make_error("no span here", "$.image")]);
         let output = diags.render();
         assert!(
             output.contains("no span here"),
@@ -274,7 +271,7 @@ mod tests {
 
     #[test]
     fn render_empty_diagnostics() {
-        let diags = ConfigDiagnostics::new(dummy_source(), vec![]);
+        let diags = Diagnostics::new(dummy_source(), vec![]);
         let output = diags.render();
         assert!(
             output.contains("0 error(s), 0 warning(s)"),
@@ -284,7 +281,7 @@ mod tests {
 
     #[test]
     fn render_summary_line() {
-        let diags = ConfigDiagnostics::new(
+        let diags = Diagnostics::new(
             dummy_source(),
             vec![
                 make_error("e1", "$.a"),

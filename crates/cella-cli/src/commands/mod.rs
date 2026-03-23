@@ -143,11 +143,7 @@ pub async fn ensure_cella_daemon() {
     let control_socket_path = data_dir.join("daemon.sock");
 
     if daemon::is_daemon_running(&pid_path, &socket_path) {
-        // Daemon is alive — check version
-        if check_daemon_needs_restart(&control_socket_path).await == Some(true) {
-            tracing::info!("Daemon version mismatch detected, restarting");
-            restart_daemon(&socket_path, &pid_path, &port_path, &control_socket_path).await;
-        }
+        check_and_restart_if_stale(&socket_path, &pid_path, &port_path, &control_socket_path).await;
         return;
     }
 
@@ -155,6 +151,19 @@ pub async fn ensure_cella_daemon() {
         daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path, &control_socket_path)
     {
         warn!("Failed to start cella daemon: {e}");
+    }
+}
+
+/// Check if the running daemon is stale and restart it if necessary.
+async fn check_and_restart_if_stale(
+    socket_path: &std::path::Path,
+    pid_path: &std::path::Path,
+    port_path: &std::path::Path,
+    control_socket_path: &std::path::Path,
+) {
+    if check_daemon_needs_restart(control_socket_path).await == Some(true) {
+        tracing::info!("Daemon version mismatch detected, restarting");
+        restart_daemon(socket_path, pid_path, port_path, control_socket_path).await;
     }
 }
 
@@ -183,31 +192,33 @@ async fn check_daemon_needs_restart(control_socket_path: &std::path::Path) -> Op
         return None;
     };
 
-    // Empty version means old daemon without version support — restart
     if daemon_version.is_empty() {
         return Some(true);
     }
 
     if cfg!(debug_assertions) {
-        // Debug: restart if CLI binary is newer than daemon start time
-        let Ok(exe) = std::env::current_exe() else {
-            return Some(false);
-        };
-        let Ok(meta) = exe.metadata() else {
-            return Some(false);
-        };
-        let Ok(mtime) = meta.modified() else {
-            return Some(false);
-        };
-        let mtime_secs = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Some(mtime_secs > daemon_started_at)
+        Some(is_binary_newer_than(daemon_started_at))
     } else {
-        // Release: restart on version mismatch
         Some(daemon_version != env!("CARGO_PKG_VERSION"))
     }
+}
+
+/// Check if the current CLI binary was modified after the given timestamp.
+fn is_binary_newer_than(daemon_started_at: u64) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(meta) = exe.metadata() else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let mtime_secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    mtime_secs > daemon_started_at
 }
 
 /// Shut down the old daemon and start a fresh one, then re-register containers.
@@ -218,9 +229,32 @@ async fn restart_daemon(
     control_socket_path: &std::path::Path,
 ) {
     use cella_daemon::daemon;
+
+    graceful_shutdown_daemon(socket_path, pid_path, port_path, control_socket_path).await;
+
+    if let Err(e) =
+        daemon::start_daemon_background(socket_path, pid_path, port_path, control_socket_path)
+    {
+        warn!("Failed to restart daemon: {e}");
+        return;
+    }
+
+    wait_for_socket(control_socket_path).await;
+
+    if let Err(e) = re_register_containers(control_socket_path).await {
+        warn!("Failed to re-register containers after restart: {e}");
+    }
+}
+
+/// Send shutdown request and wait for the old daemon to exit.
+async fn graceful_shutdown_daemon(
+    socket_path: &std::path::Path,
+    pid_path: &std::path::Path,
+    port_path: &std::path::Path,
+    control_socket_path: &std::path::Path,
+) {
     use cella_port::protocol::ManagementRequest;
 
-    // Send graceful shutdown
     if control_socket_path.exists() {
         let _ = cella_daemon::management::send_management_request(
             control_socket_path,
@@ -229,7 +263,6 @@ async fn restart_daemon(
         .await;
     }
 
-    // Wait for PID file removal (max 5s)
     for _ in 0..50 {
         if !pid_path.exists() {
             break;
@@ -237,33 +270,21 @@ async fn restart_daemon(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Force-clean stale files if daemon didn't clean up
     if pid_path.exists() {
         let _ = std::fs::remove_file(pid_path);
         let _ = std::fs::remove_file(socket_path);
         let _ = std::fs::remove_file(port_path);
         let _ = std::fs::remove_file(control_socket_path);
     }
+}
 
-    // Start new daemon
-    if let Err(e) =
-        daemon::start_daemon_background(socket_path, pid_path, port_path, control_socket_path)
-    {
-        warn!("Failed to restart daemon: {e}");
-        return;
-    }
-
-    // Wait for new socket
+/// Wait for the daemon's control socket to appear (max 2s).
+async fn wait_for_socket(control_socket_path: &std::path::Path) {
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if control_socket_path.exists() {
             break;
         }
-    }
-
-    // Re-register running containers
-    if let Err(e) = re_register_containers(control_socket_path).await {
-        warn!("Failed to re-register containers after restart: {e}");
     }
 }
 

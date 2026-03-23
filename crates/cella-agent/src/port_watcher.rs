@@ -66,6 +66,89 @@ async fn re_report_known_listeners(
     }
 }
 
+/// Start a localhost proxy for a listener bound to localhost only.
+///
+/// Returns the proxy port if a proxy was started, or `None` if not needed.
+async fn maybe_start_localhost_proxy(
+    listener: &DetectedListener,
+    proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
+    proxy_ports: &mut HashMap<u16, u16>,
+) -> Option<u16> {
+    if listener.bind != BindAddress::Localhost || proxy_handles.contains_key(&listener.port) {
+        return None;
+    }
+
+    let port = listener.port;
+    match port_proxy::proxy_localhost_to_all(port).await {
+        Ok((pp, handle)) => {
+            debug!("Agent proxy for port {port} on 0.0.0.0:{pp}");
+            proxy_ports.insert(port, pp);
+            proxy_handles.insert(port, handle);
+            Some(pp)
+        }
+        Err(e) => {
+            warn!("Localhost proxy for port {port} failed: {e}");
+            None
+        }
+    }
+}
+
+/// Record a port mapping received from the daemon.
+async fn record_port_mapping(port_map: &PortMap, container_port: u16, host_port: u16) {
+    debug!("Port mapping: container:{container_port} -> host:{host_port}");
+    port_map.lock().await.insert(container_port, host_port);
+    write_port_map(port_map).await;
+}
+
+/// Process the daemon's response to a PortOpen message.
+async fn process_port_open_response(
+    response: Result<DaemonMessage, cella_port::CellaPortError>,
+    port_map: &PortMap,
+) {
+    match response {
+        Ok(DaemonMessage::PortMapping {
+            container_port,
+            host_port,
+        }) => {
+            record_port_mapping(port_map, container_port, host_port).await;
+        }
+        Ok(_) => {
+            debug!("Unexpected response to PortOpen (no mapping allocated)");
+        }
+        Err(e) => {
+            debug!("No response to PortOpen: {e}");
+        }
+    }
+}
+
+/// Send a PortOpen message to the daemon and process the port mapping response.
+async fn send_port_open_and_record(
+    listener: &DetectedListener,
+    process: Option<String>,
+    agent_proxy_port: Option<u16>,
+    control: &Mutex<ReconnectingClient>,
+    port_map: &PortMap,
+) -> bool {
+    let msg = AgentMessage::PortOpen {
+        port: listener.port,
+        protocol: listener.protocol,
+        process,
+        bind: listener.bind,
+        proxy_port: agent_proxy_port,
+    };
+
+    let mut ctrl = control.lock().await;
+    if let Err(e) = ctrl.send(&msg).await {
+        warn!("Failed to report port open: {e}");
+        return false;
+    }
+
+    let response = ctrl.recv().await;
+    drop(ctrl);
+    process_port_open_response(response, port_map).await;
+    true
+}
+
 /// Handle a single newly-detected listener: start proxy if needed, report to daemon,
 /// and read the port mapping response.
 ///
@@ -83,63 +166,41 @@ async fn handle_new_listener(
         listener.port, listener.bind, process
     );
 
-    // Start localhost proxy BEFORE reporting to daemon, so the proxy
-    // is ready when the daemon starts its host-side proxy.
-    let mut agent_proxy_port = None;
-    if listener.bind == BindAddress::Localhost && !proxy_handles.contains_key(&listener.port) {
-        let port = listener.port;
-        match port_proxy::proxy_localhost_to_all(port).await {
-            Ok((pp, handle)) => {
-                debug!("Agent proxy for port {port} on 0.0.0.0:{pp}");
-                agent_proxy_port = Some(pp);
-                proxy_ports.insert(port, pp);
-                proxy_handles.insert(port, handle);
-            }
-            Err(e) => {
-                warn!("Localhost proxy for port {port} failed: {e}");
-            }
-        }
-    }
+    let agent_proxy_port = maybe_start_localhost_proxy(listener, proxy_handles, proxy_ports).await;
 
-    // Send port_open to daemon and read port mapping response
-    let msg = AgentMessage::PortOpen {
-        port: listener.port,
-        protocol: listener.protocol,
-        process: process.clone(),
-        bind: listener.bind,
-        proxy_port: agent_proxy_port,
+    send_port_open_and_record(listener, process, agent_proxy_port, control, port_map).await
+}
+
+/// Handle a single closed listener: report to daemon and clean up proxies.
+async fn handle_closed_listener(
+    key: (u16, PortProtocol),
+    control: &Mutex<ReconnectingClient>,
+    ports_detected: &AtomicUsize,
+    port_map: &PortMap,
+    proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
+    proxy_ports: &mut HashMap<u16, u16>,
+) {
+    info!("Listener closed: port {} ({:?})", key.0, key.1);
+
+    let msg = AgentMessage::PortClosed {
+        port: key.0,
+        protocol: key.1,
     };
-    let send_result = {
+    {
         let mut ctrl = control.lock().await;
-        match ctrl.send(&msg).await {
-            Ok(()) => Ok(ctrl.recv().await),
-            Err(e) => Err(e),
-        }
-    };
-
-    match send_result {
-        Ok(Ok(DaemonMessage::PortMapping {
-            container_port,
-            host_port,
-        })) => {
-            debug!("Port mapping: container:{container_port} -> host:{host_port}");
-            port_map.lock().await.insert(container_port, host_port);
+        if let Err(e) = ctrl.send(&msg).await {
+            warn!("Failed to report port closed: {e}");
+        } else {
+            ports_detected.fetch_sub(1, Ordering::Relaxed);
+            port_map.lock().await.remove(&key.0);
             write_port_map(port_map).await;
-            true
-        }
-        Ok(Ok(_)) => {
-            debug!("Unexpected response to PortOpen (no mapping allocated)");
-            true
-        }
-        Ok(Err(e)) => {
-            debug!("No response to PortOpen: {e}");
-            true
-        }
-        Err(e) => {
-            warn!("Failed to report port open: {e}");
-            false
         }
     }
+
+    if let Some(handle) = proxy_handles.remove(&key.0) {
+        handle.abort();
+    }
+    proxy_ports.remove(&key.0);
 }
 
 /// Run the port watcher loop with control socket connection.
@@ -180,12 +241,10 @@ pub async fn run(
             )
             .await;
 
-            if !send_ok {
-                continue;
+            if send_ok {
+                ports_detected.fetch_add(1, Ordering::Relaxed);
+                known.insert(key, listener.clone());
             }
-
-            ports_detected.fetch_add(1, Ordering::Relaxed);
-            known.insert(key, listener.clone());
         }
 
         // Detect closed listeners
@@ -196,30 +255,16 @@ pub async fn run(
             .collect();
 
         for key in closed_keys {
-            info!("Listener closed: port {} ({:?})", key.0, key.1);
             known.remove(&key);
-
-            // Send port_closed to daemon
-            let msg = AgentMessage::PortClosed {
-                port: key.0,
-                protocol: key.1,
-            };
-            {
-                let mut ctrl = control.lock().await;
-                if let Err(e) = ctrl.send(&msg).await {
-                    warn!("Failed to report port closed: {e}");
-                } else {
-                    ports_detected.fetch_sub(1, Ordering::Relaxed);
-                    port_map.lock().await.remove(&key.0);
-                    write_port_map(&port_map).await;
-                }
-            }
-
-            // Stop localhost proxy and clean up proxy port mapping
-            if let Some(handle) = proxy_handles.remove(&key.0) {
-                handle.abort();
-            }
-            proxy_ports.remove(&key.0);
+            handle_closed_listener(
+                key,
+                &control,
+                &ports_detected,
+                &port_map,
+                &mut proxy_handles,
+                &mut proxy_ports,
+            )
+            .await;
         }
     }
 }

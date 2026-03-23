@@ -160,6 +160,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn full_metadata() {
         let json = r#"{
             "id": "node",

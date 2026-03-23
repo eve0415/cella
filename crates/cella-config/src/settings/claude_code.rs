@@ -13,7 +13,7 @@ fn default_latest() -> String {
 /// Controls automatic installation and config forwarding of Claude Code
 /// into dev containers.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClaudeCodeSettings {
+pub struct ClaudeCode {
     /// Install Claude Code in the container (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -35,7 +35,7 @@ pub struct ClaudeCodeSettings {
     pub include: Vec<String>,
 }
 
-impl Default for ClaudeCodeSettings {
+impl Default for ClaudeCode {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn default_enables_all() {
-        let settings = ClaudeCodeSettings::default();
+        let settings = ClaudeCode::default();
         assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn deserialize_empty_uses_defaults() {
-        let settings: ClaudeCodeSettings = toml::from_str("").unwrap();
+        let settings: ClaudeCode = toml::from_str("").unwrap();
         assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn deserialize_disabled() {
-        let settings: ClaudeCodeSettings =
+        let settings: ClaudeCode =
             toml::from_str("enabled = false\nforward_config = false").unwrap();
         assert!(!settings.enabled);
         assert!(!settings.forward_config);
@@ -79,19 +79,19 @@ mod tests {
 
     #[test]
     fn deserialize_pinned_version() {
-        let settings: ClaudeCodeSettings = toml::from_str("version = \"1.0.58\"").unwrap();
+        let settings: ClaudeCode = toml::from_str("version = \"1.0.58\"").unwrap();
         assert_eq!(settings.version, "1.0.58");
     }
 
     #[test]
     fn deserialize_stable_version() {
-        let settings: ClaudeCodeSettings = toml::from_str("version = \"stable\"").unwrap();
+        let settings: ClaudeCode = toml::from_str("version = \"stable\"").unwrap();
         assert_eq!(settings.version, "stable");
     }
 
     #[test]
     fn deserialize_glob_patterns() {
-        let settings: ClaudeCodeSettings = toml::from_str(
+        let settings: ClaudeCode = toml::from_str(
             r#"
 exclude = ["plans/**", "sessions/**"]
 include = ["backups/important/**"]
@@ -104,7 +104,7 @@ include = ["backups/important/**"]
 
     #[test]
     fn deserialize_only_enabled() {
-        let settings: ClaudeCodeSettings = toml::from_str("enabled = true").unwrap();
+        let settings: ClaudeCode = toml::from_str("enabled = true").unwrap();
         assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");

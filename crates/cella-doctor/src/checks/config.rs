@@ -1,7 +1,7 @@
 //! Devcontainer configuration checks.
 
 use cella_config::devcontainer::discover;
-use cella_config::devcontainer::parse::parse_devcontainer;
+use cella_config::devcontainer::parse;
 
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
@@ -20,7 +20,7 @@ pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
     };
 
     // Discover devcontainer.json
-    match discover::discover_config(workspace) {
+    match discover::config(workspace) {
         Ok(config_path) => {
             checks.push(CheckResult {
                 name: "devcontainer.json".into(),
@@ -33,7 +33,7 @@ pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
             match std::fs::read_to_string(&config_path) {
                 Ok(raw_text) => {
                     let source_name = config_path.display().to_string();
-                    match parse_devcontainer(&source_name, &raw_text, false) {
+                    match parse::devcontainer(&source_name, &raw_text, false) {
                         Ok((_parsed, warnings)) => {
                             if warnings.is_empty() {
                                 checks.push(CheckResult {
@@ -76,7 +76,7 @@ pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
                 }
             }
         }
-        Err(discover::DiscoverError::NotFound) => {
+        Err(discover::Error::NotFound) => {
             checks.push(CheckResult {
                 name: "devcontainer.json".into(),
                 severity: Severity::Info,
@@ -84,7 +84,7 @@ pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
                 fix_hint: Some("Run `cella init` to create one".into()),
             });
         }
-        Err(discover::DiscoverError::Ambiguous(paths)) => {
+        Err(discover::Error::Ambiguous(paths)) => {
             let names: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
             checks.push(CheckResult {
                 name: "devcontainer.json".into(),
@@ -93,7 +93,7 @@ pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
                 fix_hint: Some("Use --file to specify which config to use".into()),
             });
         }
-        Err(discover::DiscoverError::ReadDir { path, source }) => {
+        Err(discover::Error::ReadDir { path, source }) => {
             checks.push(CheckResult {
                 name: "devcontainer.json".into(),
                 severity: Severity::Error,
