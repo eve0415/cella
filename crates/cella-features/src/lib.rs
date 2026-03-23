@@ -140,13 +140,17 @@ pub async fn resolve_features(
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
     // Step 8: Generate Dockerfile and build context.
+    // User resolution per spec: devcontainer.json > image metadata > Config.User > "root"
+    let meta_user = base_image_metadata.map(|m| parse_image_metadata(m).1);
     let container_user = config
         .get("containerUser")
         .and_then(|v| v.as_str())
+        .or_else(|| meta_user.as_ref().and_then(|m| m.container_user.as_deref()))
         .unwrap_or(image_user);
     let remote_user = config
         .get("remoteUser")
         .and_then(|v| v.as_str())
+        .or_else(|| meta_user.as_ref().and_then(|m| m.remote_user.as_deref()))
         .unwrap_or(container_user);
 
     let dockerfile = generate_dockerfile(
