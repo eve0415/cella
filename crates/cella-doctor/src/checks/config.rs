@@ -6,6 +6,7 @@ use cella_config::devcontainer::parse;
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
 /// Run configuration diagnostics.
+#[allow(clippy::unused_async)]
 pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
     let mut checks = Vec::new();
 

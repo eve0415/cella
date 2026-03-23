@@ -24,6 +24,7 @@ pub enum TemplateCommand {
 }
 
 impl TemplateArgs {
+    #[allow(clippy::unused_async)]
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             TemplateCommand::New { .. } | TemplateCommand::List | TemplateCommand::Edit { .. } => {

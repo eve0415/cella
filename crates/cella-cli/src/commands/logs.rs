@@ -9,6 +9,7 @@ pub struct LogsArgs {
 }
 
 impl LogsArgs {
+    #[allow(clippy::unused_async)]
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("cella logs: not yet implemented");
         Err("not yet implemented".into())

@@ -129,11 +129,11 @@ impl PortManager {
     fn log_port_forwarding(
         port: u16,
         host_port: u16,
-        process: &Option<String>,
-        label: &Option<String>,
+        process: Option<&String>,
+        label: Option<&String>,
     ) {
-        let process_str = process.as_deref().unwrap_or("unknown");
-        let display_label = label.as_deref().unwrap_or("");
+        let process_str = process.map_or("unknown", String::as_str);
+        let display_label = label.map_or("", String::as_str);
         if host_port == port {
             info!("Forwarding port {port} ({process_str}) {display_label}-> localhost:{host_port}");
         } else {
@@ -181,7 +181,7 @@ impl PortManager {
 
         let host_port = self.allocate_host_port(port, container_id, require_local)?;
 
-        Self::log_port_forwarding(port, host_port, &process, &label);
+        Self::log_port_forwarding(port, host_port, process.as_ref(), label.as_ref());
 
         let detected = DetectedPort {
             port,

@@ -1091,7 +1091,7 @@ async fn inject_post_start(
     remote_user: &str,
 ) {
     upload_ssh_files(client, container_id, &post_start.file_uploads, remote_user).await;
-    install_credential_helper(client, container_id, &post_start.credential_helper).await;
+    install_credential_helper(client, container_id, post_start.credential_helper.as_ref()).await;
     apply_git_config(
         client,
         container_id,
@@ -1130,7 +1130,7 @@ async fn upload_ssh_files(
 async fn install_credential_helper(
     client: &DockerClient,
     container_id: &str,
-    helper: &Option<cella_env::FileUpload>,
+    helper: Option<&cella_env::FileUpload>,
 ) {
     let Some(helper) = helper else {
         return;

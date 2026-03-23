@@ -31,6 +31,7 @@ pub enum ConfigCommand {
 }
 
 impl ConfigArgs {
+    #[allow(clippy::unused_async)]
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             ConfigCommand::Validate { file, strict } => validate(file, strict),

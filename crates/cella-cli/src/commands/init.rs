@@ -9,6 +9,7 @@ pub struct InitArgs {
 }
 
 impl InitArgs {
+    #[allow(clippy::unused_async)]
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("cella init: not yet implemented");
         Err("not yet implemented".into())

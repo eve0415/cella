@@ -117,7 +117,10 @@ fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbs
             if is_orbstack {
                 eprintln!(
                     "{:<20} {:<8} {:<12} {}.orb.local:{}",
-                    name, port_binding.container_port, "-", container.name,
+                    name,
+                    port_binding.container_port,
+                    "-",
+                    container.name,
                     port_binding.container_port,
                 );
             } else {
@@ -148,8 +151,7 @@ fn print_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack
             if is_orbstack {
                 eprintln!(
                     "{:<8} {:<12} {}.orb.local:{}",
-                    port_binding.container_port, "-", container.name,
-                    port_binding.container_port,
+                    port_binding.container_port, "-", container.name, port_binding.container_port,
                 );
             } else {
                 let host_port = port_binding

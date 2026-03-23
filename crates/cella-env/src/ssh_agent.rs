@@ -20,8 +20,8 @@ const DOCKER_DESKTOP_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
 /// Container-side socket path for direct bind-mount forwarding.
 const CONTAINER_SSH_SOCK: &str = "/tmp/cella-ssh-agent.sock";
 
-/// SSH agent forwarding for Docker Desktop / OrbStack (VM-based runtimes).
-fn desktop_ssh_forwarding(host_socket: &Option<String>) -> SshAgentForwarding {
+/// SSH agent forwarding for Docker Desktop / `OrbStack` (VM-based runtimes).
+fn desktop_ssh_forwarding(host_socket: Option<&String>) -> SshAgentForwarding {
     if host_socket.is_none() {
         warn!("SSH_AUTH_SOCK not set on host, but Docker Desktop may still provide SSH agent");
     }
@@ -73,7 +73,7 @@ pub fn ssh_agent_forwarding(
         runtime,
         DockerRuntime::DockerDesktop | DockerRuntime::OrbStack
     ) {
-        Some(desktop_ssh_forwarding(&host_socket))
+        Some(desktop_ssh_forwarding(host_socket.as_ref()))
     } else {
         direct_ssh_forwarding(host_socket)
     }
