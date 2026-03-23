@@ -17,7 +17,10 @@ pub use dockerfile::{
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
-pub use merge::{merge_features, merge_with_devcontainer, validate_options};
+pub use merge::{
+    ImageMetadataUserInfo, merge_features, merge_with_devcontainer, parse_image_metadata,
+    validate_options,
+};
 pub use metadata::parse_feature_metadata;
 pub use oci::{FeatureFetcher, OciFetcher};
 pub use ordering::compute_install_order;
@@ -82,7 +85,6 @@ struct FeatureEntry {
 ///
 /// Returns [`FeatureError`] when any feature reference cannot be parsed,
 /// normalized, or fetched, or when metadata is invalid.
-#[allow(clippy::too_many_lines)]
 pub async fn resolve_features(
     config: &serde_json::Value,
     config_path: &Path,
@@ -90,21 +92,13 @@ pub async fn resolve_features(
     cache: &FeatureCache,
     base_image: &str,
     image_user: &str,
+    base_image_metadata: Option<&str>,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
         Some(obj) if !obj.is_empty() => obj,
         _ => {
-            debug!("no features declared in devcontainer.json");
-            let build_context = cache.build_context_path("empty");
-            std::fs::create_dir_all(&build_context)?;
-            return Ok(ResolvedFeatures {
-                features: Vec::new(),
-                dockerfile: String::new(),
-                build_context,
-                container_config: FeatureContainerConfig::default(),
-                metadata_label: generate_metadata_label(&[], config, None),
-            });
+            return resolve_empty_features(config, cache, base_image_metadata);
         }
     };
 
@@ -130,40 +124,18 @@ pub async fn resolve_features(
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
     // Step 8: Generate Dockerfile and build context.
-    let container_user = config
-        .get("containerUser")
-        .and_then(|v| v.as_str())
-        .unwrap_or(image_user);
-    let remote_user = config
-        .get("remoteUser")
-        .and_then(|v| v.as_str())
-        .unwrap_or(container_user);
-
-    let dockerfile = generate_dockerfile(
-        base_image,
-        image_user,
-        container_user,
-        remote_user,
-        &resolved,
-    );
-    let entrypoint_script = generate_entrypoint_script(&resolved);
-    let builtin_env = generate_builtin_env(container_user, remote_user);
-
-    // Step 9: Prepare build context on disk.
-    prepare_build_context(
+    let dockerfile = generate_and_write_build_context(
         &build_context,
         &resolved,
-        &dockerfile,
-        entrypoint_script.as_deref(),
-        &builtin_env,
+        config,
+        base_image,
+        image_user,
+        base_image_metadata,
     )?;
 
-    // Step 10: Merge feature metadata.
-    let feature_config = merge_features(&resolved);
-    let container_config = merge_with_devcontainer(&feature_config, config);
-
-    // Step 11: Generate devcontainer.metadata label.
-    let metadata_label = generate_metadata_label(&resolved, config, None);
+    // Step 9: Merge feature metadata and generate label.
+    let container_config = merge_all_metadata(&resolved, config, base_image_metadata);
+    let metadata_label = generate_metadata_label(&resolved, config, base_image_metadata);
 
     debug!(
         "resolved {} features, build context at {}",
@@ -222,6 +194,86 @@ pub fn generate_metadata_label(
 // ---------------------------------------------------------------------------
 // Internal helpers -- resolve_features sub-steps
 // ---------------------------------------------------------------------------
+
+/// Handle the case where no features are declared (empty or missing `features` object).
+fn resolve_empty_features(
+    config: &serde_json::Value,
+    cache: &FeatureCache,
+    base_image_metadata: Option<&str>,
+) -> Result<ResolvedFeatures, FeatureError> {
+    debug!("no features declared in devcontainer.json");
+    let build_context = cache.build_context_path("empty");
+    std::fs::create_dir_all(&build_context)?;
+    let container_config = base_image_metadata
+        .map(|m| {
+            let (cfg, _) = parse_image_metadata(m);
+            merge_with_devcontainer(&cfg, config)
+        })
+        .unwrap_or_default();
+    Ok(ResolvedFeatures {
+        features: Vec::new(),
+        dockerfile: String::new(),
+        build_context,
+        container_config,
+        metadata_label: generate_metadata_label(&[], config, base_image_metadata),
+    })
+}
+
+/// Resolve user identities, generate the Dockerfile, and write the build context to disk.
+///
+/// Returns the generated Dockerfile content.
+fn generate_and_write_build_context(
+    build_context: &Path,
+    resolved: &[ResolvedFeature],
+    config: &serde_json::Value,
+    base_image: &str,
+    image_user: &str,
+    base_image_metadata: Option<&str>,
+) -> Result<String, FeatureError> {
+    // User resolution per spec: devcontainer.json > image metadata > Config.User > "root"
+    let meta_user = base_image_metadata.map(|m| parse_image_metadata(m).1);
+    let container_user = config
+        .get("containerUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta_user.as_ref().and_then(|m| m.container_user.as_deref()))
+        .unwrap_or(image_user);
+    let remote_user = config
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| meta_user.as_ref().and_then(|m| m.remote_user.as_deref()))
+        .unwrap_or(container_user);
+
+    let dockerfile = generate_dockerfile(
+        base_image,
+        image_user,
+        container_user,
+        remote_user,
+        resolved,
+    );
+    let entrypoint_script = generate_entrypoint_script(resolved);
+    let builtin_env = generate_builtin_env(container_user, remote_user);
+
+    prepare_build_context(
+        build_context,
+        resolved,
+        &dockerfile,
+        entrypoint_script.as_deref(),
+        &builtin_env,
+    )?;
+
+    Ok(dockerfile)
+}
+
+/// Merge feature metadata with image metadata and devcontainer.json config.
+fn merge_all_metadata(
+    resolved: &[ResolvedFeature],
+    config: &serde_json::Value,
+    base_image_metadata: Option<&str>,
+) -> FeatureContainerConfig {
+    let image_meta_config = base_image_metadata.map(|m| parse_image_metadata(m).0);
+    let feature_config = merge_features(resolved, image_meta_config);
+    merge_with_devcontainer(&feature_config, config)
+}
 
 /// Parse and normalize all feature references from the config.
 fn parse_and_normalize(
@@ -727,6 +779,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -751,6 +804,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -799,6 +853,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -910,6 +965,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -970,6 +1026,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await
         .unwrap();
@@ -1009,6 +1066,7 @@ mod tests {
             &cache,
             "ubuntu:22.04",
             "root",
+            None,
         )
         .await;
 
@@ -1052,6 +1110,7 @@ mod tests {
             &cache,
             "mcr.microsoft.com/devcontainers/base:ubuntu",
             "root",
+            None,
         )
         .await;
         let resolved = result.expect("resolve_features should succeed");

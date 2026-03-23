@@ -21,7 +21,6 @@ use crate::types::ResolvedFeature;
 /// 9. `USER` reset via build arg
 ///
 /// Features without `install.sh` (metadata-only) are skipped entirely.
-#[allow(clippy::too_many_lines)]
 pub fn generate_dockerfile(
     base_image: &str,
     image_user: &str,
@@ -31,7 +30,27 @@ pub fn generate_dockerfile(
 ) -> String {
     let mut out = String::new();
 
-    // ARG declarations before FROM
+    write_preamble(&mut out, base_image, image_user);
+
+    let installable: Vec<&ResolvedFeature> =
+        features.iter().filter(|f| f.has_install_script).collect();
+
+    if !installable.is_empty() {
+        write_builtin_env_resolution(&mut out, container_user, remote_user);
+        write_feature_install_blocks(&mut out, &installable);
+    }
+
+    write_entrypoint_section(&mut out, features);
+
+    if !installable.is_empty() {
+        write_cleanup_and_user_reset(&mut out);
+    }
+
+    out
+}
+
+/// Write ARG declarations and FROM line (the Dockerfile preamble).
+fn write_preamble(out: &mut String, base_image: &str, image_user: &str) {
     writeln!(out, "ARG _DEV_CONTAINERS_BASE_IMAGE={base_image}").unwrap();
     writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER={image_user}").unwrap();
     writeln!(out, "ARG _DEV_CONTAINERS_FEATURE_CONTENT_SOURCE").unwrap();
@@ -41,98 +60,103 @@ pub fn generate_dockerfile(
         "FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage"
     )
     .unwrap();
+}
 
-    let installable: Vec<&ResolvedFeature> =
-        features.iter().filter(|f| f.has_install_script).collect();
+/// Write USER root, COPY builtin env file, and RUN to resolve home directories.
+fn write_builtin_env_resolution(out: &mut String, container_user: &str, remote_user: &str) {
+    writeln!(out).unwrap();
+    writeln!(out, "USER root").unwrap();
 
-    if !installable.is_empty() {
-        // Always run as root for feature installs
-        writeln!(out).unwrap();
-        writeln!(out, "USER root").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "COPY devcontainer-features.builtin.env \
+         /tmp/dev-container-features/devcontainer-features.builtin.env"
+    )
+    .unwrap();
+    write!(
+        out,
+        "RUN echo \"_CONTAINER_USER_HOME=$( \
+         (command -v getent >/dev/null 2>&1 && getent passwd '{container_user}' \
+         || grep -E '^{container_user}:' /etc/passwd || true) \
+         | cut -d: -f6)\" \
+         >> /tmp/dev-container-features/devcontainer-features.builtin.env"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        " \\\n    && echo \"_REMOTE_USER_HOME=$( \
+         (command -v getent >/dev/null 2>&1 && getent passwd '{remote_user}' \
+         || grep -E '^{remote_user}:' /etc/passwd || true) \
+         | cut -d: -f6)\" \
+         >> /tmp/dev-container-features/devcontainer-features.builtin.env"
+    )
+    .unwrap();
+}
 
-        // Copy and resolve builtin env vars at build time
+/// Write per-feature COPY + RUN install blocks (including containerEnv ENV lines).
+fn write_feature_install_blocks(out: &mut String, installable: &[&ResolvedFeature]) {
+    for feature in installable {
+        write_feature_container_env(out, feature);
+
         writeln!(out).unwrap();
         writeln!(
             out,
-            "COPY devcontainer-features.builtin.env \
-             /tmp/dev-container-features/devcontainer-features.builtin.env"
+            "# Feature: {} ({})",
+            feature.metadata.id, feature.original_ref
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "COPY --chown=root:root {id}/ /tmp/dev-container-features/{id}/",
+            id = feature.id
         )
         .unwrap();
         write!(
             out,
-            "RUN echo \"_CONTAINER_USER_HOME=$( \
-             (command -v getent >/dev/null 2>&1 && getent passwd '{container_user}' \
-             || grep -E '^{container_user}:' /etc/passwd || true) \
-             | cut -d: -f6)\" \
-             >> /tmp/dev-container-features/devcontainer-features.builtin.env"
+            "RUN chmod -R 0755 /tmp/dev-container-features/{id}",
+            id = feature.id
         )
         .unwrap();
+        write!(
+            out,
+            " \\\n    && cd /tmp/dev-container-features/{id}",
+            id = feature.id
+        )
+        .unwrap();
+        write!(
+            out,
+            " \\\n    && chmod +x ./devcontainer-features-install.sh"
+        )
+        .unwrap();
+        write!(out, " \\\n    && ./devcontainer-features-install.sh").unwrap();
         writeln!(
             out,
-            " \\\n    && echo \"_REMOTE_USER_HOME=$( \
-             (command -v getent >/dev/null 2>&1 && getent passwd '{remote_user}' \
-             || grep -E '^{remote_user}:' /etc/passwd || true) \
-             | cut -d: -f6)\" \
-             >> /tmp/dev-container-features/devcontainer-features.builtin.env"
+            " \\\n    && rm -rf /tmp/dev-container-features/{id}",
+            id = feature.id
         )
         .unwrap();
+    }
+}
 
-        // Per-feature install blocks
-        for feature in &installable {
-            // Emit ENV instructions for feature containerEnv (before COPY+RUN so
-            // install scripts and subsequent layers see the values).
-            if !feature.metadata.container_env.is_empty() {
-                let mut keys: Vec<&String> = feature.metadata.container_env.keys().collect();
-                keys.sort();
-                writeln!(out).unwrap();
-                for key in keys {
-                    let value = &feature.metadata.container_env[key];
-                    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-                    writeln!(out, "ENV {key}=\"{escaped}\"").unwrap();
-                }
-            }
-
-            writeln!(out).unwrap();
-            writeln!(
-                out,
-                "# Feature: {} ({})",
-                feature.metadata.id, feature.original_ref
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "COPY --chown=root:root {id}/ /tmp/dev-container-features/{id}/",
-                id = feature.id
-            )
-            .unwrap();
-            write!(
-                out,
-                "RUN chmod -R 0755 /tmp/dev-container-features/{id}",
-                id = feature.id
-            )
-            .unwrap();
-            write!(
-                out,
-                " \\\n    && cd /tmp/dev-container-features/{id}",
-                id = feature.id
-            )
-            .unwrap();
-            write!(
-                out,
-                " \\\n    && chmod +x ./devcontainer-features-install.sh"
-            )
-            .unwrap();
-            write!(out, " \\\n    && ./devcontainer-features-install.sh").unwrap();
-            writeln!(
-                out,
-                " \\\n    && rm -rf /tmp/dev-container-features/{id}",
-                id = feature.id
-            )
-            .unwrap();
-        }
+/// Write ENV instructions for a feature's `containerEnv` (sorted by key).
+fn write_feature_container_env(out: &mut String, feature: &ResolvedFeature) {
+    if feature.metadata.container_env.is_empty() {
+        return;
     }
 
-    // Entrypoint init script (checks all features, not just installable)
+    let mut keys: Vec<&String> = feature.metadata.container_env.keys().collect();
+    keys.sort();
+    writeln!(out).unwrap();
+    for key in keys {
+        let value = &feature.metadata.container_env[key];
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(out, "ENV {key}=\"{escaped}\"").unwrap();
+    }
+}
+
+/// Write entrypoint init script COPY+RUN if any feature declares an entrypoint.
+fn write_entrypoint_section(out: &mut String, features: &[ResolvedFeature]) {
     let has_entrypoints = features.iter().any(|f| f.metadata.entrypoint.is_some());
 
     if has_entrypoints {
@@ -141,18 +165,16 @@ pub fn generate_dockerfile(
         writeln!(out, "COPY docker-init.sh /usr/local/share/docker-init.sh").unwrap();
         writeln!(out, "RUN chmod +x /usr/local/share/docker-init.sh").unwrap();
     }
+}
 
-    // Cleanup and user reset (only if we installed features)
-    if !installable.is_empty() {
-        writeln!(out).unwrap();
-        writeln!(out, "RUN rm -rf /tmp/dev-container-features").unwrap();
+/// Write final cleanup of /tmp/dev-container-features and USER reset via build arg.
+fn write_cleanup_and_user_reset(out: &mut String) {
+    writeln!(out).unwrap();
+    writeln!(out, "RUN rm -rf /tmp/dev-container-features").unwrap();
 
-        writeln!(out).unwrap();
-        writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER=root").unwrap();
-        writeln!(out, "USER $_DEV_CONTAINERS_IMAGE_USER").unwrap();
-    }
-
-    out
+    writeln!(out).unwrap();
+    writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER=root").unwrap();
+    writeln!(out, "USER $_DEV_CONTAINERS_IMAGE_USER").unwrap();
 }
 
 /// Generate the entrypoint init script content for features with entrypoints.

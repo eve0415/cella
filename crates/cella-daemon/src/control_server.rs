@@ -22,6 +22,15 @@ use crate::credential::invoke_git_credential;
 use crate::port_manager::PortManager;
 use crate::proxy::ProxyCommand;
 
+/// Shared context for the control server and its connection handlers.
+pub(crate) struct ControlContext {
+    pub auth_token: String,
+    pub port_manager: Arc<Mutex<PortManager>>,
+    pub browser_handler: Arc<BrowserHandler>,
+    pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    pub proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
+}
+
 /// Tracks whether an agent has actually connected and sent messages.
 pub struct AgentConnectionState {
     pub connected: AtomicBool,
@@ -53,18 +62,14 @@ pub struct ContainerHandle {
 ///
 /// Accepts agent connections, validates auth tokens, looks up container names
 /// in `container_handles`, and routes messages to existing handlers.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn run_control_server(
+pub(crate) async fn run_control_server(
     listener: TcpListener,
-    auth_token: String,
+    ctx: ControlContext,
     last_activity: Arc<AtomicU64>,
-    port_manager: Arc<Mutex<PortManager>>,
-    browser_handler: Arc<BrowserHandler>,
-    container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
-    is_orbstack: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let ctx = Arc::new(ctx);
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -72,16 +77,9 @@ pub async fn run_control_server(
                     Ok((stream, peer)) => {
                         last_activity.store(current_time_secs(), Ordering::Relaxed);
                         debug!("Agent TCP connection from {peer}");
-                        let pm = port_manager.clone();
-                        let bh = browser_handler.clone();
-                        let handles = container_handles.clone();
-                        let ptx = proxy_cmd_tx.clone();
-                        let token = auth_token.clone();
-                        let orbstack = is_orbstack;
+                        let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_agent_connection(stream, &token, pm, bh, handles, ptx, orbstack)
-                                    .await
+                            if let Err(e) = handle_agent_connection(stream, &ctx).await
                             {
                                 warn!("Agent connection error: {e}");
                             }
@@ -102,98 +100,86 @@ pub async fn run_control_server(
     }
 }
 
-/// Handle a single agent TCP connection (newline-delimited JSON).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn handle_agent_connection(
-    stream: tokio::net::TcpStream,
-    auth_token: &str,
-    port_manager: Arc<Mutex<PortManager>>,
-    browser_handler: Arc<BrowserHandler>,
-    container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
-    is_orbstack: bool,
-) -> Result<(), CellaDaemonError> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+/// Send a `DaemonHello` rejection and close the connection.
+async fn send_reject<W: AsyncWriteExt + Unpin>(writer: &mut W, error: String) {
+    let reject = DaemonHello {
+        protocol_version: PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        error: Some(error),
+    };
+    let mut json = serde_json::to_string(&reject).unwrap_or_default();
+    json.push('\n');
+    let _ = writer.write_all(json.as_bytes()).await;
+    let _ = writer.flush().await;
+}
 
-    // --- Hello handshake ---
+/// Validated handshake result from an agent connection.
+struct HandshakeResult {
+    container_name: String,
+    container_id: String,
+    container_ip: Option<String>,
+    agent_state: Arc<AgentConnectionState>,
+}
+
+/// Perform the hello handshake: read `AgentHello`, validate, look up container.
+///
+/// Returns `Ok(None)` if the connection should be cleanly closed (rejection sent).
+/// Returns `Ok(Some(..))` on success with validated handshake data.
+async fn perform_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    line: &mut String,
+    ctx: &ControlContext,
+) -> Result<Option<HandshakeResult>, CellaDaemonError>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let n = reader
-        .read_line(&mut line)
+        .read_line(line)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("hello read error: {e}"),
         })?;
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     let Ok(agent_hello) = serde_json::from_str::<AgentHello>(line.trim()) else {
-        let reject = DaemonHello {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            error: Some("Hello required as first message".to_string()),
-        };
-        let mut json = serde_json::to_string(&reject).unwrap_or_default();
-        json.push('\n');
-        let _ = writer.write_all(json.as_bytes()).await;
-        let _ = writer.flush().await;
-        return Ok(());
+        send_reject(writer, "Hello required as first message".to_string()).await;
+        return Ok(None);
     };
 
     if agent_hello.protocol_version != PROTOCOL_VERSION {
-        let reject = DaemonHello {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            error: Some(format!(
+        send_reject(
+            writer,
+            format!(
                 "protocol version mismatch: agent={} daemon={}",
                 agent_hello.protocol_version, PROTOCOL_VERSION
-            )),
-        };
-        let mut json = serde_json::to_string(&reject).unwrap_or_default();
-        json.push('\n');
-        let _ = writer.write_all(json.as_bytes()).await;
-        let _ = writer.flush().await;
-        return Ok(());
+            ),
+        )
+        .await;
+        return Ok(None);
     }
 
-    // Validate auth token
-    if agent_hello.auth_token != auth_token {
-        let reject = DaemonHello {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            error: Some("invalid auth token".to_string()),
-        };
-        let mut json = serde_json::to_string(&reject).unwrap_or_default();
-        json.push('\n');
-        let _ = writer.write_all(json.as_bytes()).await;
-        let _ = writer.flush().await;
-        return Ok(());
+    if agent_hello.auth_token != ctx.auth_token {
+        send_reject(writer, "invalid auth token".to_string()).await;
+        return Ok(None);
     }
 
-    // Look up container by name
     let container_name = agent_hello.container_name.clone();
     let (container_id, agent_state) = {
-        let handles = container_handles.lock().await;
+        let handles = ctx.container_handles.lock().await;
         if let Some(h) = handles.get(&container_name) {
             (h.container_id.clone(), h.agent_state.clone())
         } else {
-            let reject = DaemonHello {
-                protocol_version: PROTOCOL_VERSION,
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                error: Some(format!("unknown container: {container_name}")),
-            };
-            let mut json = serde_json::to_string(&reject).unwrap_or_default();
-            json.push('\n');
-            let _ = writer.write_all(json.as_bytes()).await;
-            let _ = writer.flush().await;
-            return Ok(());
+            send_reject(writer, format!("unknown container: {container_name}")).await;
+            return Ok(None);
         }
     };
 
-    // Retrieve container IP for TCP proxy creation
     let container_ip = {
-        let pm = port_manager.lock().await;
+        let pm = ctx.port_manager.lock().await;
         pm.container_ip(&container_id).map(String::from)
     };
 
@@ -205,29 +191,48 @@ async fn handle_agent_connection(
         );
     }
 
-    // Send DaemonHello
-    {
-        let hello = DaemonHello {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            error: None,
-        };
-        let mut json = serde_json::to_string(&hello).map_err(|e| CellaDaemonError::Protocol {
-            message: format!("hello serialize error: {e}"),
+    // Send DaemonHello success
+    let hello = DaemonHello {
+        protocol_version: PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        error: None,
+    };
+    let mut json = serde_json::to_string(&hello).map_err(|e| CellaDaemonError::Protocol {
+        message: format!("hello serialize error: {e}"),
+    })?;
+    json.push('\n');
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("hello write error: {e}"),
         })?;
-        json.push('\n');
-        writer
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| CellaDaemonError::Socket {
-                message: format!("hello write error: {e}"),
-            })?;
-        writer.flush().await.map_err(|e| CellaDaemonError::Socket {
-            message: format!("hello flush error: {e}"),
-        })?;
-    }
+    writer.flush().await.map_err(|e| CellaDaemonError::Socket {
+        message: format!("hello flush error: {e}"),
+    })?;
 
-    info!("Agent connected for container {container_name}");
+    Ok(Some(HandshakeResult {
+        container_name,
+        container_id,
+        container_ip,
+        agent_state,
+    }))
+}
+
+/// Handle a single agent TCP connection (newline-delimited JSON).
+async fn handle_agent_connection(
+    stream: tokio::net::TcpStream,
+    ctx: &ControlContext,
+) -> Result<(), CellaDaemonError> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    let Some(hs) = perform_handshake(&mut reader, &mut writer, &mut line, ctx).await? else {
+        return Ok(());
+    };
+
+    info!("Agent connected for container {}", hs.container_name);
 
     // --- Message loop ---
     loop {
@@ -253,17 +258,14 @@ async fn handle_agent_connection(
                 message: format!("invalid agent message: {e}"),
             })?;
 
-        let response = handle_agent_message(
-            msg,
-            &port_manager,
-            &browser_handler,
-            Some(&container_id),
-            Some(&proxy_cmd_tx),
-            container_ip.as_deref(),
-            &agent_state,
-            is_orbstack,
-        )
-        .await;
+        let handler_ctx = AgentHandlerContext {
+            port_manager: &ctx.port_manager,
+            browser_handler: &ctx.browser_handler,
+            container_id: Some(&hs.container_id),
+            proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
+            container_ip: hs.container_ip.as_deref(),
+        };
+        let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
 
         if let Some(resp) = response {
             let mut json =
@@ -286,17 +288,73 @@ async fn handle_agent_connection(
     Ok(())
 }
 
+/// Per-connection context shared across agent message handlers.
+pub(crate) struct AgentHandlerContext<'a> {
+    pub port_manager: &'a Arc<Mutex<PortManager>>,
+    pub browser_handler: &'a Arc<BrowserHandler>,
+    pub container_id: Option<&'a str>,
+    pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
+    pub container_ip: Option<&'a str>,
+}
+
+/// Handle a `PortOpen` message: allocate a host port, start a proxy, and respond.
+async fn handle_port_open(
+    port: u16,
+    protocol: cella_port::protocol::PortProtocol,
+    process: Option<String>,
+    proxy_port: Option<u16>,
+    ctx: &AgentHandlerContext<'_>,
+) -> Option<DaemonMessage> {
+    let cid = ctx.container_id.unwrap_or("unknown").to_string();
+    debug!(
+        "Port open: {port}/{protocol} (process: {process:?}, proxy_port: {proxy_port:?}) from {cid}"
+    );
+    let host_port = {
+        let mut pm = ctx.port_manager.lock().await;
+        pm.handle_port_open(&cid, port, protocol, process)
+    };
+
+    let target_port = proxy_port.unwrap_or(port);
+
+    if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip) {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _ = tx
+            .send(ProxyCommand::Start {
+                host_port: hp,
+                container_ip: ip.to_string(),
+                container_port: target_port,
+                result_tx: Some(result_tx),
+            })
+            .await;
+
+        match result_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    "Proxy bind failed for port {hp} (container port {port}): {e}. \
+                     Rolling back allocation."
+                );
+                let mut pm = ctx.port_manager.lock().await;
+                pm.handle_port_closed(&cid, port);
+                return None;
+            }
+            Err(_) => {
+                warn!("Proxy coordinator dropped result channel for port {hp}");
+            }
+        }
+    }
+
+    host_port.map(|hp| DaemonMessage::PortMapping {
+        container_port: port,
+        host_port: hp,
+    })
+}
+
 /// Route an agent message to the appropriate handler.
-#[allow(clippy::too_many_arguments, clippy::similar_names)]
-pub async fn handle_agent_message(
+pub(crate) async fn handle_agent_message(
     msg: AgentMessage,
-    port_manager: &Arc<Mutex<PortManager>>,
-    browser_handler: &Arc<BrowserHandler>,
-    container_id: Option<&str>,
-    proxy_cmd_tx: Option<&tokio::sync::mpsc::Sender<ProxyCommand>>,
-    container_ip: Option<&str>,
+    ctx: &AgentHandlerContext<'_>,
     agent_state: &Arc<AgentConnectionState>,
-    _is_orbstack: bool,
 ) -> Option<DaemonMessage> {
     agent_state.connected.store(true, Ordering::Relaxed);
     agent_state
@@ -308,78 +366,26 @@ pub async fn handle_agent_message(
             port,
             protocol,
             process,
-            bind,
             proxy_port,
-        } => {
-            let cid = container_id.unwrap_or("unknown").to_string();
-            debug!(
-                "Port open: {port}/{protocol} (process: {process:?}, bind: {bind:?}, proxy_port: {proxy_port:?}) from {cid}"
-            );
-            let host_port = {
-                let mut pm = port_manager.lock().await;
-                pm.handle_port_open(&cid, port, protocol, process)
-            };
-
-            // Use agent's proxy port if available (for localhost-bound services),
-            // otherwise connect directly to the app port.
-            let target_port = proxy_port.unwrap_or(port);
-
-            // Start TCP proxy on host for localhost access.
-            if let (Some(hp), Some(tx), Some(ip)) = (host_port, proxy_cmd_tx, container_ip) {
-                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                let _ = tx
-                    .send(ProxyCommand::Start {
-                        host_port: hp,
-                        container_ip: ip.to_string(),
-                        container_port: target_port,
-                        result_tx: Some(result_tx),
-                    })
-                    .await;
-
-                // If proxy bind fails (TOCTOU: port grabbed between allocation
-                // check and actual bind), roll back so the port isn't reported
-                // as forwarded.
-                match result_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(
-                            "Proxy bind failed for port {hp} (container port {port}): {e}. \
-                             Rolling back allocation."
-                        );
-                        let mut pm = port_manager.lock().await;
-                        pm.handle_port_closed(&cid, port, protocol);
-                        return None;
-                    }
-                    Err(_) => {
-                        warn!("Proxy coordinator dropped result channel for port {hp}");
-                    }
-                }
-            }
-
-            // Notify agent of the port mapping so it can expose it inside the container.
-            host_port.map(|hp| DaemonMessage::PortMapping {
-                container_port: port,
-                host_port: hp,
-            })
-        }
+            ..
+        } => handle_port_open(port, protocol, process, proxy_port, ctx).await,
         AgentMessage::PortClosed { port, protocol } => {
-            let cid = container_id.unwrap_or("unknown").to_string();
+            let cid = ctx.container_id.unwrap_or("unknown").to_string();
             debug!("Port closed: {port}/{protocol} from {cid}");
             let host_port = {
-                let mut pm = port_manager.lock().await;
-                pm.handle_port_closed(&cid, port, protocol)
+                let mut pm = ctx.port_manager.lock().await;
+                pm.handle_port_closed(&cid, port)
             };
 
-            // Stop TCP proxy
-            if let (Some(hp), Some(tx)) = (host_port, proxy_cmd_tx) {
+            if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
                 let _ = tx.send(ProxyCommand::Stop { host_port: hp }).await;
             }
 
             None
         }
         AgentMessage::BrowserOpen { url } => {
-            let rewritten = if let Some(cid) = container_id {
-                rewrite_browser_url(&url, port_manager, cid).await
+            let rewritten = if let Some(cid) = ctx.container_id {
+                rewrite_browser_url(&url, ctx.port_manager, cid).await
             } else {
                 url.clone()
             };
@@ -388,12 +394,10 @@ pub async fn handle_agent_message(
             } else {
                 info!("Browser open request: {url}");
             }
-            // Wait for the proxy to be ready before opening the browser.
-            // The proxy may have just been started by a preceding PortOpen.
             if let Some(port) = extract_port(&rewritten) {
                 wait_for_proxy_ready(port).await;
             }
-            browser_handler.open_url(&rewritten);
+            ctx.browser_handler.open_url(&rewritten);
             None
         }
         AgentMessage::CredentialRequest {

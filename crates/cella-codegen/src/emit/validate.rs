@@ -513,8 +513,7 @@ mod tests {
     use super::*;
     use crate::ir::*;
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn fmt(tokens: proc_macro2::TokenStream) -> String {
+    fn fmt(tokens: &proc_macro2::TokenStream) -> String {
         let raw = tokens.to_string();
         syn::parse_file(&raw)
             .map(|f| prettyplease::unparse(&f))
@@ -524,7 +523,7 @@ mod tests {
     #[test]
     fn validation_infra() {
         let tokens = emit_validation_infra();
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -544,7 +543,7 @@ mod tests {
             is_all_of: false,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -564,7 +563,7 @@ mod tests {
             is_all_of: false,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -594,7 +593,7 @@ mod tests {
             is_all_of: true,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -619,7 +618,7 @@ mod tests {
             repr: EnumRepr::StringEnum,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -650,7 +649,7 @@ mod tests {
             repr: EnumRepr::BoolMixed,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -675,7 +674,7 @@ mod tests {
             repr: EnumRepr::TypedVariants,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]
@@ -700,7 +699,7 @@ mod tests {
             repr: EnumRepr::MultiType,
         });
         let tokens = emit_validate(&ir);
-        insta::assert_snapshot!(fmt(tokens));
+        insta::assert_snapshot!(fmt(&tokens));
     }
 
     #[test]

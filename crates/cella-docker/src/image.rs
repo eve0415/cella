@@ -12,6 +12,17 @@ use tracing::{debug, info};
 use crate::CellaDockerError;
 use crate::client::DockerClient;
 
+/// Image inspection results from a single Docker API call.
+#[derive(Debug, Clone)]
+pub struct ImageDetails {
+    /// Normalized USER (user portion only, defaults to `"root"`).
+    pub user: String,
+    /// `KEY=value` environment entries from the image config.
+    pub env: Vec<String>,
+    /// Raw JSON from the `devcontainer.metadata` label, if present.
+    pub metadata: Option<String>,
+}
+
 /// Extract the user/uid portion from a Docker USER value.
 ///
 /// Docker USER can be `"user"`, `"user:group"`, `"uid"`, or `"uid:gid"`.
@@ -206,17 +217,34 @@ impl DockerClient {
         }
     }
 
-    /// Inspect an image and return its configured environment variables.
-    ///
-    /// Returns `Vec<String>` of `KEY=value` entries from the image config.
+    /// Inspect an image and return its user, env, and metadata in one API call.
     ///
     /// # Errors
     ///
     /// Returns `CellaDockerError::DockerApi` on API errors,
     /// `CellaDockerError::ImageNotFound` if the image does not exist.
-    pub async fn inspect_image_env(&self, image: &str) -> Result<Vec<String>, CellaDockerError> {
+    pub async fn inspect_image_details(
+        &self,
+        image: &str,
+    ) -> Result<ImageDetails, CellaDockerError> {
         match self.inner().inspect_image(image).await {
-            Ok(details) => Ok(details.config.and_then(|c| c.env).unwrap_or_default()),
+            Ok(details) => {
+                let config = details.config.as_ref();
+                let user = normalize_user(config.and_then(|c| c.user.as_deref()).unwrap_or(""));
+                let env = details
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.env.clone())
+                    .unwrap_or_default();
+                let metadata = config
+                    .and_then(|c| c.labels.as_ref())
+                    .and_then(|labels| labels.get("devcontainer.metadata").cloned());
+                Ok(ImageDetails {
+                    user,
+                    env,
+                    metadata,
+                })
+            }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => Err(CellaDockerError::ImageNotFound {
@@ -226,29 +254,24 @@ impl DockerClient {
         }
     }
 
-    /// Inspect an image and return its configured USER (defaulting to `"root"`).
+    /// Convenience: inspect an image and return only its environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors,
+    /// `CellaDockerError::ImageNotFound` if the image does not exist.
+    pub async fn inspect_image_env(&self, image: &str) -> Result<Vec<String>, CellaDockerError> {
+        self.inspect_image_details(image).await.map(|d| d.env)
+    }
+
+    /// Convenience: inspect an image and return only its USER (defaulting to `"root"`).
     ///
     /// # Errors
     ///
     /// Returns `CellaDockerError::DockerApi` on API errors,
     /// `CellaDockerError::ImageNotFound` if the image does not exist.
     pub async fn inspect_image_user(&self, image: &str) -> Result<String, CellaDockerError> {
-        match self.inner().inspect_image(image).await {
-            Ok(details) => {
-                let raw = details
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.user.as_deref())
-                    .unwrap_or("");
-                Ok(normalize_user(raw))
-            }
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Err(CellaDockerError::ImageNotFound {
-                image: image.to_string(),
-            }),
-            Err(e) => Err(CellaDockerError::DockerApi(e)),
-        }
+        self.inspect_image_details(image).await.map(|d| d.user)
     }
 }
 

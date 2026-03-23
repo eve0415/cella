@@ -44,9 +44,12 @@ pub fn parse_probed_env(output: &str) -> HashMap<String, String> {
 /// Merge probed environment with `remoteEnv` from config.
 ///
 /// `remote_env` values override `probed` values.
-#[allow(clippy::implicit_hasher)]
-pub fn merge_env(probed: &HashMap<String, String>, remote_env: &[String]) -> Vec<String> {
-    let mut merged = probed.clone();
+pub fn merge_env<S: std::hash::BuildHasher>(
+    probed: &HashMap<String, String, S>,
+    remote_env: &[String],
+) -> Vec<String> {
+    let mut merged: HashMap<String, String> =
+        probed.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     for entry in remote_env {
         if let Some((key, value)) = entry.split_once('=') {

@@ -68,7 +68,7 @@ impl BuildArgs {
 
         // 3. Build image via shared ensure_image logic
         let is_text = matches!(self.output, OutputFormat::Text);
-        let (img_name, _resolved_features) = ensure_image(
+        let (img_name, _resolved_features, _image_details) = ensure_image(
             &client,
             config,
             &resolved.workspace_root,

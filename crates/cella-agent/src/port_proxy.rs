@@ -40,8 +40,7 @@ pub async fn proxy_localhost_to_all(app_port: u16) -> Result<(u16, JoinHandle<()
                     tokio::spawn(async move {
                         match TcpStream::connect(("localhost", app_port)).await {
                             Ok(mut outbound) => {
-                                let _ =
-                                    copy_bidirectional(&mut inbound, &mut outbound).await;
+                                let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                             }
                             Err(e) => {
                                 warn!("Proxy connect to localhost:{app_port} failed: {e}");

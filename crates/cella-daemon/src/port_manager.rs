@@ -138,9 +138,12 @@ impl PortManager {
 
         // Allocate host port, checking OS availability if a checker is configured
         let host_port = match &self.port_checker {
-            Some(checker) => self
-                .allocation
-                .allocate_with_check(port, container_id, require_local, checker.as_ref()),
+            Some(checker) => self.allocation.allocate_with_check(
+                port,
+                container_id,
+                require_local,
+                checker.as_ref(),
+            ),
             None => self.allocation.allocate(port, container_id, require_local),
         };
         let host_port = match host_port {
@@ -177,7 +180,9 @@ impl PortManager {
                 let url = format!("{proto_hint}://localhost:{host_port}");
                 info!("Auto-opening browser: {url}");
             }
-            OnAutoForward::Notify | OnAutoForward::Silent | OnAutoForward::OpenPreview
+            OnAutoForward::Notify
+            | OnAutoForward::Silent
+            | OnAutoForward::OpenPreview
             | OnAutoForward::Ignore => {}
         }
 
@@ -187,12 +192,7 @@ impl PortManager {
     /// Handle a port closed event from an agent.
     ///
     /// Returns the host port that was released, if any.
-    pub fn handle_port_closed(
-        &mut self,
-        container_id: &str,
-        port: u16,
-        _protocol: PortProtocol,
-    ) -> Option<u16> {
+    pub fn handle_port_closed(&mut self, container_id: &str, port: u16) -> Option<u16> {
         let host_port = self.containers.get(container_id).and_then(|c| {
             c.detected_ports
                 .iter()
@@ -430,7 +430,7 @@ mod tests {
         let mut pm = PortManager::new(false);
         pm.register_container("c1", "test", None, vec![], None);
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
-        pm.handle_port_closed("c1", 3000, PortProtocol::Tcp);
+        pm.handle_port_closed("c1", 3000);
         // Re-opening should get the same port back, not 3001
         let hp = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         assert_eq!(hp, Some(3000));

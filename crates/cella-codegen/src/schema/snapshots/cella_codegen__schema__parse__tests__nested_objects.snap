@@ -1,15 +1,12 @@
 ---
 source: crates/cella-codegen/src/schema/parse.rs
-assertion_line: 245
 expression: result
 ---
 ParsedSchema {
     definitions: {},
     root: SchemaNode {
-        title: None,
         description: None,
         deprecated: false,
-        deprecation_message: None,
         schema_type: Some(
             Single(
                 Object,
@@ -17,10 +14,8 @@ ParsedSchema {
         ),
         properties: {
             "address": SchemaNode {
-                title: None,
                 description: None,
                 deprecated: false,
-                deprecation_message: None,
                 schema_type: Some(
                     Single(
                         Object,
@@ -28,10 +23,8 @@ ParsedSchema {
                 ),
                 properties: {
                     "city": SchemaNode {
-                        title: None,
                         description: None,
                         deprecated: false,
-                        deprecation_message: None,
                         schema_type: Some(
                             Single(
                                 String,
@@ -49,17 +42,12 @@ ParsedSchema {
                         ref: None,
                         minimum: None,
                         maximum: None,
-                        pattern: None,
-                        format: None,
-                        default_value: None,
                         unevaluated_properties: None,
                         definitions: {},
                     },
                     "street": SchemaNode {
-                        title: None,
                         description: None,
                         deprecated: false,
-                        deprecation_message: None,
                         schema_type: Some(
                             Single(
                                 String,
@@ -77,9 +65,6 @@ ParsedSchema {
                         ref: None,
                         minimum: None,
                         maximum: None,
-                        pattern: None,
-                        format: None,
-                        default_value: None,
                         unevaluated_properties: None,
                         definitions: {},
                     },
@@ -95,9 +80,6 @@ ParsedSchema {
                 ref: None,
                 minimum: None,
                 maximum: None,
-                pattern: None,
-                format: None,
-                default_value: None,
                 unevaluated_properties: None,
                 definitions: {},
             },
@@ -113,9 +95,6 @@ ParsedSchema {
         ref: None,
         minimum: None,
         maximum: None,
-        pattern: None,
-        format: None,
-        default_value: None,
         unevaluated_properties: None,
         definitions: {},
     },

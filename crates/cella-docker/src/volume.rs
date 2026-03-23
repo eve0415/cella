@@ -277,10 +277,8 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
         .await?;
 
     // Wait for container to finish
-    let mut wait_stream = docker.wait_container(
-        container_name,
-        Some(WaitContainerOptions::default()),
-    );
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
     while let Some(result) = wait_stream.next().await {
         match result {
             Ok(resp) => {
@@ -400,6 +398,93 @@ fn detect_sibling_agent_binary() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Force-remove a container, ignoring errors.
+#[cfg(debug_assertions)]
+async fn force_remove(docker: &Docker, container_name: &str) {
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+/// Wait for a build container to complete and return an error if it fails.
+#[cfg(debug_assertions)]
+async fn await_build_container(
+    docker: &Docker,
+    container_name: &str,
+) -> Result<(), CellaDockerError> {
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
+
+    while let Some(result) = wait_stream.next().await {
+        match result {
+            Ok(resp) => {
+                if resp.status_code != 0 {
+                    let log_opts = bollard::query_parameters::LogsOptions {
+                        stdout: true,
+                        stderr: true,
+                        tail: "30".to_string(),
+                        ..Default::default()
+                    };
+                    let mut log_stream = docker.logs(container_name, Some(log_opts));
+                    let mut output = String::new();
+                    while let Some(Ok(chunk)) = log_stream.next().await {
+                        output.push_str(&chunk.to_string());
+                    }
+
+                    force_remove(docker, container_name).await;
+
+                    return Err(CellaDockerError::AgentVolume {
+                        message: format!(
+                            "agent build failed (exit code {}):\n{output}",
+                            resp.status_code
+                        ),
+                    });
+                }
+            }
+            Err(e) => {
+                force_remove(docker, container_name).await;
+                return Err(CellaDockerError::AgentVolume {
+                    message: format!("build container wait failed: {e}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Download a single file from a container, extracting it from the tar stream.
+#[cfg(debug_assertions)]
+async fn download_binary_from_container(
+    docker: &Docker,
+    container_name: &str,
+    container_path: &str,
+    filename: &str,
+) -> Result<Vec<u8>, CellaDockerError> {
+    let tar_stream = docker.download_from_container(
+        container_name,
+        Some(bollard::query_parameters::DownloadFromContainerOptions {
+            path: container_path.to_string(),
+        }),
+    );
+
+    let mut buf = Vec::new();
+    let mut stream = tar_stream;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("download from container failed: {e}"),
+        })?;
+        buf.extend_from_slice(&chunk);
+    }
+
+    extract_file_from_tar(&buf, filename)
+}
+
 /// Build cella-agent inside a temp Rust container with workspace source bind-mounted.
 ///
 /// Used on non-Linux hosts (macOS) where `cargo build` produces a native binary
@@ -419,17 +504,7 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
     );
 
     ensure_image_pulled(docker, "rust:slim").await?;
-
-    // Clean up stale build container
-    let _ = docker
-        .remove_container(
-            container_name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
+    force_remove(docker, container_name).await;
 
     // Create build container with workspace bind-mounted
     let config = ContainerCreateBody {
@@ -468,98 +543,17 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
         .start_container(container_name, None::<StartContainerOptions>)
         .await?;
 
-    // Wait for build to complete
-    let mut wait_stream = docker.wait_container(
+    await_build_container(docker, container_name).await?;
+
+    let agent_bytes = download_binary_from_container(
+        docker,
         container_name,
-        Some(WaitContainerOptions::default()),
-    );
+        "/src/target/release/cella-agent",
+        "cella-agent",
+    )
+    .await?;
 
-    while let Some(result) = wait_stream.next().await {
-        match result {
-            Ok(resp) => {
-                if resp.status_code != 0 {
-                    // Capture build logs for error message
-                    let log_opts = bollard::query_parameters::LogsOptions {
-                        stdout: true,
-                        stderr: true,
-                        tail: "30".to_string(),
-                        ..Default::default()
-                    };
-                    let mut log_stream = docker.logs(container_name, Some(log_opts));
-                    let mut output = String::new();
-                    while let Some(Ok(chunk)) = log_stream.next().await {
-                        output.push_str(&chunk.to_string());
-                    }
-
-                    let _ = docker
-                        .remove_container(
-                            container_name,
-                            Some(RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await;
-
-                    return Err(CellaDockerError::AgentVolume {
-                        message: format!(
-                            "agent build failed (exit code {}):\n{output}",
-                            resp.status_code
-                        ),
-                    });
-                }
-            }
-            Err(e) => {
-                let _ = docker
-                    .remove_container(
-                        container_name,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(CellaDockerError::AgentVolume {
-                    message: format!("build container wait failed: {e}"),
-                });
-            }
-        }
-    }
-
-    // Extract the built binary from the container
-    let binary_path = "/src/target/release/cella-agent";
-    let tar_stream = docker.download_from_container(
-        container_name,
-        Some(bollard::query_parameters::DownloadFromContainerOptions {
-            path: binary_path.to_string(),
-        }),
-    );
-
-    let tar_bytes: Vec<u8> = {
-        let mut buf = Vec::new();
-        let mut stream = tar_stream;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("download from container failed: {e}"),
-            })?;
-            buf.extend_from_slice(&chunk);
-        }
-        buf
-    };
-
-    // Extract binary from tar
-    let agent_bytes = extract_file_from_tar(&tar_bytes, "cella-agent")?;
-
-    // Clean up
-    let _ = docker
-        .remove_container(
-            container_name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
+    force_remove(docker, container_name).await;
 
     info!(
         "Agent binary built successfully ({} bytes)",

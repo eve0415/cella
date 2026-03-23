@@ -8,7 +8,7 @@ use crate::client::{BoxFuture, DockerApi, DockerClient};
 use crate::config_map::CreateContainerOptions;
 use crate::container::ContainerInfo;
 use crate::exec::{ExecOptions, ExecResult, InteractiveExecOptions};
-use crate::image::BuildOptions;
+use crate::image::{BuildOptions, ImageDetails};
 use crate::upload::FileToUpload;
 
 #[allow(unconditional_recursion)] // false positive: delegates to inherent methods, not trait
@@ -121,18 +121,11 @@ impl DockerApi for DockerClient {
         Box::pin(DockerClient::image_exists(self, image))
     }
 
-    fn inspect_image_env<'a>(
+    fn inspect_image_details<'a>(
         &'a self,
         image: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<String>, CellaDockerError>> {
-        Box::pin(DockerClient::inspect_image_env(self, image))
-    }
-
-    fn inspect_image_user<'a>(
-        &'a self,
-        image: &'a str,
-    ) -> BoxFuture<'a, Result<String, CellaDockerError>> {
-        Box::pin(DockerClient::inspect_image_user(self, image))
+    ) -> BoxFuture<'a, Result<ImageDetails, CellaDockerError>> {
+        Box::pin(DockerClient::inspect_image_details(self, image))
     }
 
     fn upload_files<'a>(

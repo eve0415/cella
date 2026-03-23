@@ -1,14 +1,24 @@
 //! Execute commands inside a running container.
 
-use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
-use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
-
 use std::io::Write;
+use std::pin::Pin;
+
+use bollard::Docker;
+use bollard::container::LogOutput;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
+use futures_util::{Stream, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::task::JoinHandle;
+use tracing::debug;
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
+
+/// Pinned stream of container log output chunks.
+type OutputStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
+
+/// Pinned async writer for container stdin.
+type InputStream = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// Options for executing a command in a container (capture mode).
 pub struct ExecOptions {
@@ -185,7 +195,6 @@ impl DockerClient {
     ///
     /// Returns `CellaDockerError::DockerApi` on API errors, or
     /// `CellaDockerError::Io` on I/O errors.
-    #[allow(clippy::too_many_lines)]
     pub async fn exec_interactive(
         &self,
         container_id: &str,
@@ -211,108 +220,19 @@ impl DockerClient {
             ..Default::default()
         };
 
-        let exec = self.inner().create_exec(container_id, create_opts).await?;
-
-        let start_opts = StartExecOptions {
-            detach: false,
-            ..Default::default()
-        };
-
-        let start_result = self.inner().start_exec(&exec.id, Some(start_opts)).await?;
-
-        let StartExecResults::Attached { mut output, input } = start_result else {
+        let Some((exec_id, output, input)) =
+            start_attached_exec(self.inner(), container_id, create_opts).await?
+        else {
             return Ok(0);
         };
 
-        // Enable raw mode for TTY sessions
-        let raw_guard = if opts.tty {
-            crossterm::terminal::enable_raw_mode()?;
-            // Send initial terminal size
-            if let Ok((cols, rows)) = crossterm::terminal::size() {
-                let _ = self
-                    .inner()
-                    .resize_exec(
-                        &exec.id,
-                        ResizeExecOptions {
-                            width: cols,
-                            height: rows,
-                        },
-                    )
-                    .await;
-            }
-            Some(RawModeGuard)
-        } else {
-            None
-        };
+        let raw_guard = enable_tty_raw_mode(self.inner(), &exec_id, opts.tty).await?;
 
-        let exec_id = exec.id.clone();
         let docker = self.inner().clone();
+        let (stdin_handle, output_handle) = spawn_io_tasks(input, output);
 
-        // Stdin → container input
-        let stdin_handle = tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let mut input = input;
-            let mut buf = [0u8; 1024];
-            loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if input.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        // Container output → stdout
-        let output_handle = tokio::spawn(async move {
-            let mut stdout = tokio::io::stdout();
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(
-                        bollard::container::LogOutput::StdOut { message }
-                        | bollard::container::LogOutput::StdErr { message }
-                        | bollard::container::LogOutput::Console { message },
-                    ) => {
-                        if stdout.write_all(&message).await.is_err() {
-                            break;
-                        }
-                        let _ = stdout.flush().await;
-                    }
-                    Err(_) | Ok(_) => break,
-                }
-            }
-        });
-
-        // SIGWINCH handler for terminal resize (unix only)
         #[cfg(unix)]
-        let resize_handle = if opts.tty {
-            let exec_id_resize = exec_id.clone();
-            let docker_resize = docker.clone();
-            Some(tokio::spawn(async move {
-                let Ok(mut sig) =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                else {
-                    return;
-                };
-                while sig.recv().await.is_some() {
-                    if let Ok((cols, rows)) = crossterm::terminal::size() {
-                        let _ = docker_resize
-                            .resize_exec(
-                                &exec_id_resize,
-                                ResizeExecOptions {
-                                    width: cols,
-                                    height: rows,
-                                },
-                            )
-                            .await;
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+        let resize_handle = spawn_resize_handler(&exec_id, &docker, opts.tty);
 
         // Wait for output to finish (command exit)
         let _ = output_handle.await;
@@ -369,4 +289,135 @@ impl DockerClient {
 
         Ok(exec.id)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers extracted from exec_interactive
+// ---------------------------------------------------------------------------
+
+/// Create an exec instance and start it in attached mode.
+///
+/// Returns `None` if the exec started in detached mode (shouldn't happen with
+/// `detach: false`, but handles the enum variant gracefully).
+async fn start_attached_exec(
+    docker: &Docker,
+    container_id: &str,
+    create_opts: CreateExecOptions<&str>,
+) -> Result<Option<(String, OutputStream, InputStream)>, CellaDockerError> {
+    let exec = docker.create_exec(container_id, create_opts).await?;
+
+    let start_opts = StartExecOptions {
+        detach: false,
+        ..Default::default()
+    };
+
+    let start_result = docker.start_exec(&exec.id, Some(start_opts)).await?;
+
+    match start_result {
+        StartExecResults::Attached { output, input } => Ok(Some((exec.id, output, input))),
+        StartExecResults::Detached => Ok(None),
+    }
+}
+
+/// Enable terminal raw mode and send an initial resize for TTY sessions.
+///
+/// Returns a [`RawModeGuard`] that restores the terminal on drop, or `None`
+/// if TTY is disabled.
+async fn enable_tty_raw_mode(
+    docker: &Docker,
+    exec_id: &str,
+    tty: bool,
+) -> Result<Option<RawModeGuard>, CellaDockerError> {
+    if !tty {
+        return Ok(None);
+    }
+    crossterm::terminal::enable_raw_mode()?;
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = docker
+            .resize_exec(
+                exec_id,
+                ResizeExecOptions {
+                    width: cols,
+                    height: rows,
+                },
+            )
+            .await;
+    }
+    Ok(Some(RawModeGuard))
+}
+
+/// Spawn stdin-forwarding and output-forwarding tasks.
+///
+/// Returns `(stdin_handle, output_handle)`.
+fn spawn_io_tasks(
+    input: InputStream,
+    mut output: OutputStream,
+) -> (JoinHandle<()>, JoinHandle<()>) {
+    let stdin_handle = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut input = input;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if input.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let output_handle = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(
+                    LogOutput::StdOut { message }
+                    | LogOutput::StdErr { message }
+                    | LogOutput::Console { message },
+                ) => {
+                    if stdout.write_all(&message).await.is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush().await;
+                }
+                Err(_) | Ok(_) => break,
+            }
+        }
+    });
+
+    (stdin_handle, output_handle)
+}
+
+/// Spawn a SIGWINCH handler that forwards terminal resize events to the exec
+/// session.  Returns `None` if TTY is disabled.
+#[cfg(unix)]
+fn spawn_resize_handler(exec_id: &str, docker: &Docker, tty: bool) -> Option<JoinHandle<()>> {
+    if !tty {
+        return None;
+    }
+    let exec_id = exec_id.to_owned();
+    let docker = docker.clone();
+    Some(tokio::spawn(async move {
+        let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        else {
+            return;
+        };
+        while sig.recv().await.is_some() {
+            if let Ok((cols, rows)) = crossterm::terminal::size() {
+                let _ = docker
+                    .resize_exec(
+                        &exec_id,
+                        ResizeExecOptions {
+                            width: cols,
+                            height: rows,
+                        },
+                    )
+                    .await;
+            }
+        }
+    }))
 }

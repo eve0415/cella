@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::literal_string_with_formatting_args)]
+    #[allow(clippy::literal_string_with_formatting_args)] // devcontainer ${} syntax, not Rust format args
     fn multiple_variables_in_one_string() {
         let ctx = test_ctx();
         let input = "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json";
@@ -241,17 +241,20 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::literal_string_with_formatting_args)]
+    #[allow(clippy::literal_string_with_formatting_args)] // devcontainer ${} syntax, not Rust format args
     fn substitute_value_walks_json() {
         let ctx = test_ctx();
+        let mount_entry = "source=${localEnv:HOME}/.config,target=/home/user/.config";
+        let workspace_var = "${containerWorkspaceFolder}";
+        let env_var = "${localEnv:HOME}";
         let mut value = serde_json::json!({
             "mounts": [
-                "source=${localEnv:HOME}/.config,target=/home/user/.config",
+                mount_entry,
                 "plain"
             ],
-            "workspaceFolder": "${containerWorkspaceFolder}",
+            "workspaceFolder": workspace_var,
             "nested": {
-                "env": "${localEnv:HOME}"
+                "env": env_var
             },
             "number": 42,
             "bool": true

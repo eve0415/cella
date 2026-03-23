@@ -10,11 +10,10 @@ use crate::types::{FeatureOption, OptionType};
 /// - Unknown option keys not declared in the feature metadata
 /// - Type mismatches (e.g., string value for a boolean option)
 /// - Enum values not in the declared allowed set
-#[allow(clippy::implicit_hasher)]
-pub fn validate_options(
+pub fn validate_options<S: std::hash::BuildHasher, S2: std::hash::BuildHasher>(
     feature_id: &str,
-    user_options: &HashMap<String, serde_json::Value>,
-    declared_options: &HashMap<String, FeatureOption>,
+    user_options: &HashMap<String, serde_json::Value, S>,
+    declared_options: &HashMap<String, FeatureOption, S2>,
 ) -> Vec<FeatureWarning> {
     let mut warnings = Vec::new();
 

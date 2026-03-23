@@ -1,3 +1,4 @@
+mod claude_code;
 mod credentials;
 
 use std::path::Path;
@@ -5,7 +6,16 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::debug;
 
+pub use claude_code::ClaudeCodeSettings;
 pub use credentials::CredentialSettings;
+
+/// Tool installation and forwarding settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolSettings {
+    /// Claude Code settings.
+    #[serde(default, rename = "claude-code")]
+    pub claude_code: ClaudeCodeSettings,
+}
 
 /// Cella's own settings, loaded from TOML config files.
 ///
@@ -18,6 +28,10 @@ pub struct CellaSettings {
     /// Credential forwarding settings.
     #[serde(default)]
     pub credentials: CredentialSettings,
+
+    /// Tool installation and forwarding settings.
+    #[serde(default)]
+    pub tools: ToolSettings,
 }
 
 impl CellaSettings {
@@ -69,10 +83,9 @@ impl CellaSettings {
             (Some(_global), Some(p)) => Self {
                 credentials: CredentialSettings {
                     gh: p.credentials.gh,
-                    // For future fields: if a project config explicitly sets a value,
-                    // it wins. The current TOML deserialization with defaults means
-                    // the project file's parsed value always takes precedence when
-                    // the project file exists.
+                },
+                tools: ToolSettings {
+                    claude_code: p.tools.claude_code,
                 },
             },
         }
@@ -88,6 +101,9 @@ mod tests {
     fn default_settings() {
         let settings = CellaSettings::default();
         assert!(settings.credentials.gh);
+        assert!(settings.tools.claude_code.enabled);
+        assert!(settings.tools.claude_code.forward_config);
+        assert_eq!(settings.tools.claude_code.version, "latest");
     }
 
     #[test]
@@ -121,21 +137,47 @@ mod tests {
 
     #[test]
     fn parse_full_config() {
-        let toml_str = r"
+        let toml_str = r#"
 [credentials]
 gh = false
-";
+
+[tools.claude-code]
+enabled = false
+version = "stable"
+"#;
         let settings: CellaSettings = toml::from_str(toml_str).unwrap();
         assert!(!settings.credentials.gh);
+        assert!(!settings.tools.claude_code.enabled);
+        assert_eq!(settings.tools.claude_code.version, "stable");
+    }
+
+    #[test]
+    fn parse_tools_only() {
+        let toml_str = r#"
+[tools.claude-code]
+enabled = false
+forward_config = false
+version = "1.0.58"
+exclude = ["plans/**"]
+"#;
+        let settings: CellaSettings = toml::from_str(toml_str).unwrap();
+        assert!(!settings.tools.claude_code.enabled);
+        assert!(!settings.tools.claude_code.forward_config);
+        assert_eq!(settings.tools.claude_code.version, "1.0.58");
+        assert_eq!(settings.tools.claude_code.exclude, vec!["plans/**"]);
+        // credentials should still be default
+        assert!(settings.credentials.gh);
     }
 
     #[test]
     fn merge_project_overrides_global() {
         let global = CellaSettings {
             credentials: CredentialSettings { gh: true },
+            ..Default::default()
         };
         let project = CellaSettings {
             credentials: CredentialSettings { gh: false },
+            ..Default::default()
         };
         let merged = CellaSettings::merge(Some(global), Some(project));
         assert!(!merged.credentials.gh);
@@ -145,6 +187,7 @@ gh = false
     fn merge_global_only() {
         let global = CellaSettings {
             credentials: CredentialSettings { gh: false },
+            ..Default::default()
         };
         let merged = CellaSettings::merge(Some(global), None);
         assert!(!merged.credentials.gh);
