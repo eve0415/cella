@@ -16,7 +16,8 @@ pub struct BranchArgs {
 }
 
 impl BranchArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self;
         eprintln!("cella branch: not yet implemented");
         Err("not yet implemented".into())
     }

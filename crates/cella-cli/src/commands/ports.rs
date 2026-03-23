@@ -12,27 +12,27 @@ pub struct PortsArgs {
 impl PortsArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info
-        if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path() {
-            if mgmt_sock.exists() {
-                match cella_daemon::management::send_management_request(
-                    &mgmt_sock,
-                    &cella_port::protocol::ManagementRequest::QueryPorts,
-                )
-                .await
-                {
-                    Ok(cella_port::protocol::ManagementResponse::Ports { ports }) => {
-                        if !ports.is_empty() {
-                            print_daemon_ports(&ports);
-                            return Ok(());
-                        }
-                        // Fall through to Docker static ports
+        if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
+            && mgmt_sock.exists()
+        {
+            match cella_daemon::management::send_management_request(
+                &mgmt_sock,
+                &cella_port::protocol::ManagementRequest::QueryPorts,
+            )
+            .await
+            {
+                Ok(cella_port::protocol::ManagementResponse::Ports { ports }) => {
+                    if !ports.is_empty() {
+                        print_daemon_ports(&ports);
+                        return Ok(());
                     }
-                    Ok(_) => {
-                        debug!("Unexpected response from daemon");
-                    }
-                    Err(e) => {
-                        debug!("Daemon query failed, falling back to Docker: {e}");
-                    }
+                    // Fall through to Docker static ports
+                }
+                Ok(_) => {
+                    debug!("Unexpected response from daemon");
+                }
+                Err(e) => {
+                    debug!("Daemon query failed, falling back to Docker: {e}");
                 }
             }
         }
@@ -116,14 +116,12 @@ fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbs
         for port_binding in &container.ports {
             if is_orbstack {
                 eprintln!(
-                    "{:<20} {:<8} {:<12} {}",
+                    "{:<20} {:<8} {:<12} {}.orb.local:{}",
                     name,
                     port_binding.container_port,
                     "-",
-                    format!(
-                        "{}.orb.local:{}",
-                        container.name, port_binding.container_port
-                    ),
+                    container.name,
+                    port_binding.container_port,
                 );
             } else {
                 let host_port = port_binding
@@ -152,13 +150,8 @@ fn print_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack
         for port_binding in &container.ports {
             if is_orbstack {
                 eprintln!(
-                    "{:<8} {:<12} {}",
-                    port_binding.container_port,
-                    "-",
-                    format!(
-                        "{}.orb.local:{}",
-                        container.name, port_binding.container_port
-                    ),
+                    "{:<8} {:<12} {}.orb.local:{}",
+                    port_binding.container_port, "-", container.name, port_binding.container_port,
                 );
             } else {
                 let host_port = port_binding

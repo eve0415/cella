@@ -31,7 +31,7 @@ pub enum ConfigCommand {
 }
 
 impl ConfigArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             ConfigCommand::Validate { file, strict } => validate(file, strict),
             ConfigCommand::Show

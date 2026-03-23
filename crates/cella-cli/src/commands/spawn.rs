@@ -13,7 +13,8 @@ pub struct SpawnArgs {
 }
 
 impl SpawnArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self;
         eprintln!("cella spawn: not yet implemented");
         Err("not yet implemented".into())
     }

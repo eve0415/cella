@@ -24,7 +24,7 @@ pub enum TemplateCommand {
 }
 
 impl TemplateArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
             TemplateCommand::New { .. } | TemplateCommand::List | TemplateCommand::Edit { .. } => {
                 eprintln!("cella template: not yet implemented");

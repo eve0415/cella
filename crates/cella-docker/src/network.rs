@@ -100,6 +100,10 @@ pub async fn remove_network(docker: &Docker) -> Result<(), CellaDockerError> {
 }
 
 /// Check if a container is already connected to the cella network.
+///
+/// # Errors
+///
+/// Returns error if the Docker API call fails.
 pub async fn is_container_connected(
     docker: &Docker,
     container_id: &str,
@@ -115,6 +119,10 @@ pub async fn is_container_connected(
 
 /// Ensure a container is connected to the cella network.
 /// If already connected, this is a no-op.
+///
+/// # Errors
+///
+/// Returns error if the Docker API call fails.
 pub async fn ensure_container_connected(
     docker: &Docker,
     container_id: &str,

@@ -363,12 +363,11 @@ async fn handle_port_open(
 
     let target_port = proxy_port.unwrap_or(port);
 
-    if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip) {
-        if !start_port_proxy(hp, ip, target_port, tx).await {
-            let mut pm = ctx.port_manager.lock().await;
-            pm.handle_port_closed(&cid, port);
-            return None;
-        }
+    if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip)
+        && !start_port_proxy(hp, ip, target_port, tx).await
+    {
+        ctx.port_manager.lock().await.handle_port_closed(&cid, port);
+        return None;
     }
 
     host_port.map(|hp| DaemonMessage::PortMapping {
@@ -398,10 +397,10 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
     } else {
         url.clone()
     };
-    if rewritten != url {
-        info!("Browser open request: {url} -> {rewritten}");
-    } else {
+    if rewritten == url {
         info!("Browser open request: {url}");
+    } else {
+        info!("Browser open request: {url} -> {rewritten}");
     }
     if let Some(port) = extract_port(&rewritten) {
         wait_for_proxy_ready(port).await;
@@ -481,10 +480,7 @@ pub(crate) async fn handle_agent_message(
 /// Extract the port number from a URL like `http://localhost:3000/path`.
 fn extract_port(url: &str) -> Option<u16> {
     let rest = url.split_once("://")?.1;
-    let host_port = match rest.find('/') {
-        Some(i) => &rest[..i],
-        None => rest,
-    };
+    let host_port = rest.find('/').map_or(rest, |i| &rest[..i]);
     host_port.rsplit_once(':')?.1.parse().ok()
 }
 
@@ -518,14 +514,12 @@ async fn rewrite_browser_url(
     };
 
     // Extract host:port from the URL
-    let (host_port_part, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
+    let (host_port_part, path) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
 
-    let (host, port_str) = match host_port_part.rsplit_once(':') {
-        Some((h, p)) => (h, p),
-        None => return url.to_string(),
+    let Some((host, port_str)) = host_port_part.rsplit_once(':') else {
+        return url.to_string();
     };
 
     let Ok(container_port) = port_str.parse::<u16>() else {
@@ -538,16 +532,16 @@ async fn rewrite_browser_url(
     }
 
     // Look up the forwarded host port
-    let pm = port_manager.lock().await;
-    let forwarded = pm.all_forwarded_ports();
+    let forwarded = {
+        let pm = port_manager.lock().await;
+        pm.all_forwarded_ports()
+    };
     let mapping = forwarded
         .iter()
         .find(|p| p.container_id == container_id && p.container_port == container_port);
 
-    if let Some(info) = mapping {
-        if info.host_port != container_port {
-            return format!("{before_host}://localhost:{}{path}", info.host_port);
-        }
+    if let Some(info) = mapping.filter(|info| info.host_port != container_port) {
+        return format!("{before_host}://localhost:{}{path}", info.host_port);
     }
 
     url.to_string()

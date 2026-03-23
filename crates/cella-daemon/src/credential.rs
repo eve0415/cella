@@ -34,6 +34,10 @@ pub struct CredentialResponse {
 /// host=github.com\n
 /// \n
 /// ```
+///
+/// # Errors
+///
+/// Returns error if the request format is invalid.
 pub fn parse_request(data: &str) -> Result<CredentialRequest, CellaDaemonError> {
     let mut lines = data.lines();
 
@@ -111,6 +115,10 @@ pub fn parse_credential_output(output: &str) -> HashMap<String, String> {
 /// - `get` -> `git credential fill`
 /// - `store` -> `git credential approve`
 /// - `erase` -> `git credential reject`
+///
+/// # Errors
+///
+/// Returns error if the git credential command fails or the operation is unknown.
 pub fn invoke_git_credential<S: std::hash::BuildHasher>(
     operation: &str,
     fields: &HashMap<String, String, S>,

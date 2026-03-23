@@ -147,6 +147,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
     feature_config: Option<&FeatureContainerConfig>,
     image_env: &[String],
 ) -> CreateContainerOptions {
+    use std::fmt::Write;
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
@@ -225,12 +226,13 @@ pub fn map_config<S: std::hash::BuildHasher>(
         let version = env!("CARGO_PKG_VERSION");
         let arch = crate::volume::detect_agent_arch();
         let agent_path = crate::volume::agent_binary_path(version, arch);
-        script.push_str(&format!(
+        let _ = write!(
+            script,
             "if [ -x \"{agent_path}\" ]; then\n  \
              \"{agent_path}\" daemon \
              --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &\n\
              fi\n"
-        ));
+        );
 
         if let Some(fc) = feature_config {
             for ep in &fc.entrypoints {

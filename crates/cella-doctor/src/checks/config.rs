@@ -6,7 +6,7 @@ use cella_config::devcontainer::parse;
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
 /// Run configuration diagnostics.
-pub async fn check_config(ctx: &CheckContext) -> CategoryReport {
+pub fn check_config(ctx: &CheckContext) -> CategoryReport {
     let mut checks = Vec::new();
 
     let Some(ref workspace) = ctx.workspace_folder else {

@@ -179,6 +179,7 @@ async fn resolve_base_image(
 }
 
 /// Resolve features and build the features layer image.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_and_build_features(
     client: &DockerClient,
     config: &serde_json::Value,
