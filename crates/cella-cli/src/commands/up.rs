@@ -220,43 +220,61 @@ impl UpContext {
         )
         .await;
 
-        // Claude Code: re-sync auth + ensure installed
+        // Sequential prerequisites
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
             resync_claude_auth(&self.client, container_id, remote_user).await;
         }
-        if settings.tools.claude_code.enabled {
-            install_claude_code(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.claude_code,
-                probed_env.as_ref(),
-            )
-            .await;
-        }
 
-        // Codex/Gemini: no auth resync needed (bind mount), just ensure installed
-        if settings.tools.codex.enabled {
-            install_codex(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.codex,
-                probed_env.as_ref(),
-            )
-            .await;
-        }
-        if settings.tools.gemini.enabled {
-            install_gemini(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.gemini,
-                probed_env.as_ref(),
-            )
-            .await;
-        }
+        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+        let node_available = if needs_npm {
+            ensure_node_available(&self.client, container_id, probed_env.as_ref()).await
+        } else {
+            false
+        };
+
+        // Parallel branches: Claude Code (curl) || npm tools (Codex → Gemini)
+        let claude_branch = async {
+            if settings.tools.claude_code.enabled {
+                install_claude_code(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.claude_code,
+                    probed_env.as_ref(),
+                )
+                .await;
+            }
+        };
+
+        let npm_branch = async {
+            if needs_npm && !node_available {
+                warn!("Skipping npm tool installs: Node.js/npm not available");
+                return;
+            }
+            if settings.tools.codex.enabled {
+                install_codex(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.codex,
+                    probed_env.as_ref(),
+                )
+                .await;
+            }
+            if settings.tools.gemini.enabled {
+                install_gemini(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.gemini,
+                    probed_env.as_ref(),
+                )
+                .await;
+            }
+        };
+
+        tokio::join!(claude_branch, npm_branch);
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || self.remote_env.clone(),
@@ -741,6 +759,9 @@ impl UpContext {
     }
 
     /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
+    ///
+    /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
+    /// Codex and Gemini run sequentially to avoid npm global lock contention.
     async fn install_tools(
         &self,
         container_id: &str,
@@ -748,6 +769,7 @@ impl UpContext {
         settings: &cella_config::Settings,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
+        // Sequential prerequisite: forward Claude Code config before install
         if settings.tools.claude_code.forward_config {
             timed_step(
                 self.is_text,
@@ -762,48 +784,69 @@ impl UpContext {
             )
             .await;
         }
-        if settings.tools.claude_code.enabled {
-            timed_step(
-                self.is_text,
-                "Installing Claude Code...",
-                install_claude_code(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.claude_code,
-                    probed_env,
-                ),
-            )
-            .await;
-        }
-        if settings.tools.codex.enabled {
-            timed_step(
-                self.is_text,
-                "Installing Codex...",
-                install_codex(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.codex,
-                    probed_env,
-                ),
-            )
-            .await;
-        }
-        if settings.tools.gemini.enabled {
-            timed_step(
-                self.is_text,
-                "Installing Gemini CLI...",
-                install_gemini(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.gemini,
-                    probed_env,
-                ),
-            )
-            .await;
-        }
+
+        // Sequential prerequisite: ensure Node.js/npm once for all npm tools
+        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+        let node_available = if needs_npm {
+            ensure_node_available(&self.client, container_id, probed_env).await
+        } else {
+            false
+        };
+
+        // Parallel branches: Claude Code (curl) || npm tools (Codex → Gemini)
+        let claude_branch = async {
+            if settings.tools.claude_code.enabled {
+                timed_step(
+                    self.is_text,
+                    "Installing Claude Code...",
+                    install_claude_code(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.claude_code,
+                        probed_env,
+                    ),
+                )
+                .await;
+            }
+        };
+
+        let npm_branch = async {
+            if needs_npm && !node_available {
+                warn!("Skipping npm tool installs: Node.js/npm not available");
+                return;
+            }
+            if settings.tools.codex.enabled {
+                timed_step(
+                    self.is_text,
+                    "Installing Codex...",
+                    install_codex(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.codex,
+                        probed_env,
+                    ),
+                )
+                .await;
+            }
+            if settings.tools.gemini.enabled {
+                timed_step(
+                    self.is_text,
+                    "Installing Gemini CLI...",
+                    install_gemini(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.gemini,
+                        probed_env,
+                    ),
+                )
+                .await;
+            }
+        };
+
+        tokio::join!(claude_branch, npm_branch);
     }
 
     /// The full build/create/start/lifecycle path for a new container.
@@ -1864,6 +1907,7 @@ async fn is_npm_tool_installed(
 async fn npm_install_global(
     client: &DockerClient,
     container_id: &str,
+    remote_user: &str,
     package: &str,
     version: &str,
     probed_env: Option<&std::collections::HashMap<String, String>>,
@@ -1879,7 +1923,7 @@ async fn npm_install_global(
             container_id,
             &ExecOptions {
                 cmd: tool_shell_cmd(probed_env, &format!("npm install -g {pkg}")),
-                user: Some("root".to_string()),
+                user: Some(remote_user.to_string()),
                 env: tool_exec_env(probed_env),
                 working_dir: None,
             },
@@ -1911,8 +1955,8 @@ fn log_npm_install_result(
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Checks if already installed, ensures Node.js/npm are available,
-/// then runs `npm install -g @openai/codex`.
+/// Checks if already installed, then runs `npm install -g @openai/codex`.
+/// Caller must ensure Node.js/npm are available before calling this.
 async fn install_codex(
     client: &DockerClient,
     container_id: &str,
@@ -1933,15 +1977,11 @@ async fn install_codex(
         return;
     }
 
-    if !ensure_node_available(client, container_id, probed_env).await {
-        warn!("Cannot install Codex: Node.js/npm not available");
-        return;
-    }
-
     info!("Installing Codex ({})...", settings.version);
     let result = npm_install_global(
         client,
         container_id,
+        remote_user,
         "@openai/codex",
         &settings.version,
         probed_env,
@@ -1952,8 +1992,8 @@ async fn install_codex(
 
 /// Install Google Gemini CLI inside the container via npm.
 ///
-/// Checks if already installed, ensures Node.js/npm are available,
-/// then runs `npm install -g @google/gemini-cli`.
+/// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
+/// Caller must ensure Node.js/npm are available before calling this.
 async fn install_gemini(
     client: &DockerClient,
     container_id: &str,
@@ -1974,15 +2014,11 @@ async fn install_gemini(
         return;
     }
 
-    if !ensure_node_available(client, container_id, probed_env).await {
-        warn!("Cannot install Gemini CLI: Node.js/npm not available");
-        return;
-    }
-
     info!("Installing Gemini CLI ({})...", settings.version);
     let result = npm_install_global(
         client,
         container_id,
+        remote_user,
         "@google/gemini-cli",
         &settings.version,
         probed_env,
