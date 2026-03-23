@@ -100,23 +100,19 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --text > coverage-summary.txt
+        run: cargo llvm-cov --workspace --text > coverage-full.txt
 
       - name: Build coverage comment
         id: coverage
         run: |
+          summary=$(grep '^TOTAL' coverage-full.txt || echo 'TOTAL (no data)')
           {
             echo 'comment<<EOF'
             echo '## Coverage Report'
             echo ''
-            echo '<details>'
-            echo '<summary>Per-file breakdown (click to expand)</summary>'
-            echo ''
             echo '```'
-            cat coverage-summary.txt
+            echo "$summary"
             echo '```'
-            echo ''
-            echo '</details>'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 

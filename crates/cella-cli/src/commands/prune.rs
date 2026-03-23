@@ -9,8 +9,8 @@ pub struct PruneArgs {
 }
 
 impl PruneArgs {
-    #[allow(clippy::unused_async)]
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self;
         eprintln!("cella prune: not yet implemented");
         Err("not yet implemented".into())
     }

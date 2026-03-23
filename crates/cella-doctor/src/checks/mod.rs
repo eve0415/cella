@@ -222,7 +222,7 @@ pub async fn run_all_checks(ctx: &CheckContext) -> Report {
     }
 
     // Configuration checks
-    if let Ok(cat) = timeout(CHECK_TIMEOUT, config::check_config(ctx)).await {
+    if let Ok(cat) = timeout(CHECK_TIMEOUT, async { config::check_config(ctx) }).await {
         categories.push(cat);
     } else {
         categories.push(CategoryReport::new(

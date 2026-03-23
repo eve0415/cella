@@ -8,8 +8,8 @@ pub struct SwitchArgs {
 }
 
 impl SwitchArgs {
-    #[allow(clippy::unused_async)]
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self;
         eprintln!("cella switch: not yet implemented");
         Err("not yet implemented".into())
     }
