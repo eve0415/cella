@@ -9,6 +9,8 @@ use cella_docker::{
 };
 use cella_features::ResolvedFeatures;
 
+use crate::progress::Progress;
+
 /// Compute a SHA-256 digest of the features config for image tagging.
 pub fn compute_features_digest(config: &serde_json::Value) -> String {
     let features = config.get("features").unwrap_or(&serde_json::Value::Null);
@@ -26,7 +28,7 @@ pub struct FeaturesLayerContext<'a> {
     pub base_image: &'a str,
     pub image_user: &'a str,
     pub no_cache: bool,
-    pub is_text: bool,
+    pub progress: &'a Progress,
 }
 
 /// Build the features layer image on top of a base image.
@@ -66,15 +68,12 @@ pub async fn build_features_layer(
         "Building features layer image (context: {})",
         ctx.resolved.build_context.display()
     );
-    if ctx.is_text {
-        eprintln!("Building features layer...");
-    }
-    let start = std::time::Instant::now();
-    ctx.client.build_image(&build_opts).await?;
-    if ctx.is_text {
-        let elapsed = start.elapsed();
-        eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-    }
+    ctx.progress
+        .run_step(
+            "Building features layer...",
+            ctx.client.build_image(&build_opts),
+        )
+        .await?;
     Ok(features_image)
 }
 
@@ -90,7 +89,7 @@ pub async fn ensure_image(
     config_name: Option<&str>,
     config_path: &Path,
     no_cache: bool,
-    is_text: bool,
+    progress: &Progress,
 ) -> Result<(String, Option<ResolvedFeatures>, ImageDetails), Box<dyn std::error::Error>> {
     let has_features = config
         .get("features")
@@ -104,7 +103,7 @@ pub async fn ensure_image(
         workspace_root,
         config_name,
         no_cache,
-        is_text,
+        progress,
     )
     .await?;
 
@@ -126,7 +125,7 @@ pub async fn ensure_image(
         &base_image_tag,
         &base_image_details,
         no_cache,
-        is_text,
+        progress,
     )
     .await?;
 
@@ -140,38 +139,22 @@ async fn resolve_base_image(
     workspace_root: &Path,
     config_name: Option<&str>,
     no_cache: bool,
-    is_text: bool,
+    progress: &Progress,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
         // Pull base image if needed (force re-pull when no_cache)
         if no_cache || !client.image_exists(image).await? {
-            if is_text {
-                eprint!("Pulling base image...");
-            }
-            let start = std::time::Instant::now();
-            client.pull_image(image).await?;
-            if is_text {
-                let elapsed = start.elapsed();
-                if elapsed.as_millis() >= 100 {
-                    eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-                } else {
-                    eprintln!();
-                }
-            }
+            progress
+                .run_step("Pulling base image...", client.pull_image(image))
+                .await?;
         }
         Ok(image.to_string())
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
-        if is_text {
-            eprintln!("Building Dockerfile...");
-        }
-        let start = std::time::Instant::now();
-        client.build_image(&build_opts).await?;
-        if is_text {
-            let elapsed = start.elapsed();
-            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-        }
+        progress
+            .run_step("Building Dockerfile...", client.build_image(&build_opts))
+            .await?;
         Ok(img_name)
     } else {
         Err("devcontainer.json must specify either 'image' or 'build'".into())
@@ -189,7 +172,7 @@ async fn resolve_and_build_features(
     base_image_tag: &str,
     base_image_details: &ImageDetails,
     no_cache: bool,
-    is_text: bool,
+    progress: &Progress,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
     info!("Resolving devcontainer features...");
     let platform = cella_features::oci::detect_platform(client.inner())
@@ -218,7 +201,7 @@ async fn resolve_and_build_features(
         base_image: base_image_tag,
         image_user: &base_image_details.user,
         no_cache,
-        is_text,
+        progress,
     };
     let features_image = build_features_layer(&ctx).await?;
 

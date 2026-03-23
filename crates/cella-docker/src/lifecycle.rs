@@ -1,7 +1,7 @@
 //! Lifecycle command parsing and execution.
 
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
@@ -196,9 +196,7 @@ pub async fn run_lifecycle_phase(
     value: &Value,
     origin: &str,
 ) -> Result<(), CellaDockerError> {
-    if ctx.is_text {
-        eprintln!("Running the {phase} from {origin}...");
-    }
+    info!("Running the {phase} from {origin}...");
     debug!("Running {phase} from {origin}");
 
     match parse_lifecycle_command(value) {

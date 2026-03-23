@@ -45,6 +45,10 @@ pub struct DownArgs {
 }
 
 impl DownArgs {
+    pub const fn is_text_output(&self) -> bool {
+        matches!(self.output, OutputFormat::Text)
+    }
+
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         let client = match &self.docker_host {
             Some(host) => DockerClient::connect_with_host(host)?,

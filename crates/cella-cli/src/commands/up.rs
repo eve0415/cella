@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
@@ -52,6 +52,12 @@ pub enum OutputFormat {
     Json,
 }
 
+impl UpArgs {
+    pub const fn is_text_output(&self) -> bool {
+        matches!(self.output, OutputFormat::Text)
+    }
+}
+
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 struct UpContext {
     resolved: ResolvedConfig,
@@ -60,14 +66,17 @@ struct UpContext {
     remote_env: Vec<String>,
     workspace_folder_from_config: Option<String>,
     default_workspace_folder: String,
-    is_text: bool,
+    progress: crate::progress::Progress,
     output: OutputFormat,
     remove_container: bool,
     build_no_cache: bool,
 }
 
 impl UpContext {
-    async fn new(args: &UpArgs) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(
+        args: &UpArgs,
+        progress: crate::progress::Progress,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = if let Some(ref wf) = args.workspace_folder {
             wf.canonicalize().unwrap_or_else(|_| wf.clone())
         } else {
@@ -75,13 +84,13 @@ impl UpContext {
         };
 
         let remove_container = args.rebuild || args.remove_existing_container;
-        let is_text = matches!(&args.output, OutputFormat::Text);
 
         // 1. Resolve config
-        if is_text {
-            eprintln!("Resolving devcontainer configuration...");
-        }
-        let resolved = resolve::config(&cwd, args.file.as_deref())?;
+        let resolved = progress
+            .run_step("Resolving devcontainer configuration...", async {
+                resolve::config(&cwd, args.file.as_deref())
+            })
+            .await?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
@@ -116,7 +125,7 @@ impl UpContext {
             remote_env,
             workspace_folder_from_config,
             default_workspace_folder,
-            is_text,
+            progress,
             output: args.output.clone(),
             remove_container,
             build_no_cache: args.build_no_cache,
@@ -199,26 +208,27 @@ impl UpContext {
 
         // Re-inject env forwarding (git config + SSH files may have changed)
         let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
-        timed_step(
-            self.is_text,
-            "Configuring environment...",
-            inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
-        )
-        .await;
+        self.progress
+            .run_step(
+                "Configuring environment...",
+                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
+            )
+            .await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
-        let probed_env = timed_step(
-            self.is_text,
-            "Running userEnvProbe...",
-            super::env_cache::probe_and_cache_user_env(
-                &self.client,
-                container_id,
-                remote_user,
-                self.probe_type(),
-            ),
-        )
-        .await;
+        let probed_env = self
+            .progress
+            .run_step(
+                "Running userEnvProbe...",
+                super::env_cache::probe_and_cache_user_env(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    self.probe_type(),
+                ),
+            )
+            .await;
 
         // Sequential prerequisites
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
@@ -233,48 +243,62 @@ impl UpContext {
             false
         };
 
-        // Parallel branches: Claude Code (curl) || npm tools (Codex → Gemini)
-        let claude_branch = async {
-            if settings.tools.claude_code.enabled {
-                install_claude_code(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.claude_code,
-                    probed_env.as_ref(),
-                )
-                .await;
-            }
-        };
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
 
-        let npm_branch = async {
-            if needs_npm && !node_available {
-                warn!("Skipping npm tool installs: Node.js/npm not available");
-                return;
-            }
-            if settings.tools.codex.enabled {
-                install_codex(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.codex,
-                    probed_env.as_ref(),
-                )
-                .await;
-            }
-            if settings.tools.gemini.enabled {
-                install_gemini(
-                    &self.client,
-                    container_id,
-                    remote_user,
-                    &settings.tools.gemini,
-                    probed_env.as_ref(),
-                )
-                .await;
-            }
-        };
+        if any_tool {
+            let phase = self.progress.phase("Installing tools...");
 
-        tokio::join!(claude_branch, npm_branch);
+            let claude_branch = async {
+                if settings.tools.claude_code.enabled {
+                    let step = phase.step("Claude Code");
+                    install_claude_code(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.claude_code,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+            };
+
+            let npm_branch = async {
+                if needs_npm && !node_available {
+                    warn!("Skipping npm tool installs: Node.js/npm not available");
+                    return;
+                }
+                if settings.tools.codex.enabled {
+                    let step = phase.step("Codex");
+                    install_codex(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.codex,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+                if settings.tools.gemini.enabled {
+                    let step = phase.step("Gemini CLI");
+                    install_gemini(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.gemini,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+            };
+
+            tokio::join!(claude_branch, npm_branch);
+            phase.finish();
+        }
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || self.remote_env.clone(),
@@ -308,7 +332,7 @@ impl UpContext {
             user: Some(remote_user),
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
-            is_text: self.is_text,
+            is_text: self.progress.is_enabled(),
         };
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries).await?;
 
@@ -357,12 +381,13 @@ impl UpContext {
         }
 
         // Attempt to start directly -- let Docker validate mounts
-        let start_result = timed_step(
-            self.is_text,
-            "Starting container...",
-            self.client.start_container(&container.id),
-        )
-        .await;
+        let step = self.progress.step("Starting container...");
+        let start_result = self.client.start_container(&container.id).await;
+        if start_result.is_ok() {
+            step.finish();
+        } else {
+            step.fail("failed to start");
+        }
 
         match start_result {
             Ok(()) => {
@@ -385,7 +410,7 @@ impl UpContext {
                         user: Some(remote_user),
                         env: &lifecycle_env,
                         working_dir: self.workspace_folder(),
-                        is_text: self.is_text,
+                        is_text: self.progress.is_enabled(),
                     };
                     run_lifecycle_entries(&lc_ctx, phase, &entries).await?;
                 }
@@ -607,12 +632,12 @@ impl UpContext {
         &self,
         container_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        timed_step(
-            self.is_text,
-            "Starting container...",
-            self.client.start_container(container_id),
-        )
-        .await?;
+        self.progress
+            .run_step(
+                "Starting container...",
+                self.client.start_container(container_id),
+            )
+            .await?;
         verify_container_running(&self.client, container_id).await?;
 
         if let Err(e) =
@@ -714,12 +739,12 @@ impl UpContext {
         }
 
         // Inject post-start environment forwarding
-        timed_step(
-            self.is_text,
-            "Configuring environment...",
-            inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
-        )
-        .await;
+        self.progress
+            .run_step(
+                "Configuring environment...",
+                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
+            )
+            .await;
 
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
@@ -734,17 +759,18 @@ impl UpContext {
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
-        let probed_env = timed_step(
-            self.is_text,
-            "Running userEnvProbe...",
-            super::env_cache::probe_and_cache_user_env(
-                &self.client,
-                container_id,
-                remote_user,
-                self.probe_type(),
-            ),
-        )
-        .await;
+        let probed_env = self
+            .progress
+            .run_step(
+                "Running userEnvProbe...",
+                super::env_cache::probe_and_cache_user_env(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    self.probe_type(),
+                ),
+            )
+            .await;
 
         // Forward config and install AI coding tools
         self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
@@ -771,18 +797,18 @@ impl UpContext {
     ) {
         // Sequential prerequisite: forward Claude Code config before install
         if settings.tools.claude_code.forward_config {
-            timed_step(
-                self.is_text,
-                "Forwarding Claude Code config...",
-                seed_claude_config(
-                    &self.client,
-                    container_id,
-                    &self.resolved.workspace_root,
-                    remote_user,
-                    &settings.tools.claude_code,
-                ),
-            )
-            .await;
+            self.progress
+                .run_step(
+                    "Forwarding Claude Code config...",
+                    seed_claude_config(
+                        &self.client,
+                        container_id,
+                        &self.resolved.workspace_root,
+                        remote_user,
+                        &settings.tools.claude_code,
+                    ),
+                )
+                .await;
         }
 
         // Sequential prerequisite: ensure Node.js/npm once for all npm tools
@@ -793,21 +819,29 @@ impl UpContext {
             false
         };
 
-        // Parallel branches: Claude Code (curl) || npm tools (Codex → Gemini)
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
+
+        if !any_tool {
+            return;
+        }
+
+        // Grouped phase: parallel Claude Code (curl) || npm tools (Codex → Gemini)
+        let phase = self.progress.phase("Installing tools...");
+
         let claude_branch = async {
             if settings.tools.claude_code.enabled {
-                timed_step(
-                    self.is_text,
-                    "Installing Claude Code...",
-                    install_claude_code(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.claude_code,
-                        probed_env,
-                    ),
+                let step = phase.step("Claude Code");
+                install_claude_code(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.claude_code,
+                    probed_env,
                 )
                 .await;
+                step.finish();
             }
         };
 
@@ -817,36 +851,33 @@ impl UpContext {
                 return;
             }
             if settings.tools.codex.enabled {
-                timed_step(
-                    self.is_text,
-                    "Installing Codex...",
-                    install_codex(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.codex,
-                        probed_env,
-                    ),
+                let step = phase.step("Codex");
+                install_codex(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.codex,
+                    probed_env,
                 )
                 .await;
+                step.finish();
             }
             if settings.tools.gemini.enabled {
-                timed_step(
-                    self.is_text,
-                    "Installing Gemini CLI...",
-                    install_gemini(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.gemini,
-                        probed_env,
-                    ),
+                let step = phase.step("Gemini CLI");
+                install_gemini(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.gemini,
+                    probed_env,
                 )
                 .await;
+                step.finish();
             }
         };
 
         tokio::join!(claude_branch, npm_branch);
+        phase.finish();
     }
 
     /// The full build/create/start/lifecycle path for a new container.
@@ -869,7 +900,7 @@ impl UpContext {
             self.config_name(),
             &self.resolved.config_path,
             build_no_cache,
-            self.is_text,
+            &self.progress,
         )
         .await?;
 
@@ -924,12 +955,13 @@ impl UpContext {
         .await;
 
         // Create and start container
-        let container_id = timed_step(
-            self.is_text,
-            "Creating container...",
-            self.client.create_container(&create_opts),
-        )
-        .await?;
+        let container_id = self
+            .progress
+            .run_step(
+                "Creating container...",
+                self.client.create_container(&create_opts),
+            )
+            .await?;
 
         self.start_and_register(&container_id).await?;
 
@@ -951,7 +983,7 @@ impl UpContext {
             user: Some(remote_user.as_str()),
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
-            is_text: self.is_text,
+            is_text: self.progress.is_enabled(),
         };
         run_all_lifecycle_phases(&lc_ctx, config, resolved_features.as_ref()).await?;
 
@@ -968,8 +1000,11 @@ impl UpContext {
 }
 
 impl UpArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = UpContext::new(&self).await?;
+    pub async fn execute(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = UpContext::new(&self, progress).await?;
         let existing = ctx
             .client
             .find_container(&ctx.resolved.workspace_root)
@@ -1318,27 +1353,6 @@ async fn apply_git_config(
     }
 }
 
-/// Print a progress label, run an async operation, and optionally show elapsed time.
-async fn timed_step<F, T>(is_text: bool, label: &str, f: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if is_text {
-        eprint!("{label}");
-    }
-    let start = std::time::Instant::now();
-    let result = f.await;
-    if is_text {
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() >= 100 {
-            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-        } else {
-            eprintln!();
-        }
-    }
-    result
-}
-
 // ── Shared container-operation helpers ──────────────────────────────────────
 
 /// Create a directory inside the container with the given mode (as root).
@@ -1507,7 +1521,7 @@ async fn seed_gh_credentials(
     )
     .await
     {
-        info!("Seeded gh CLI credentials into container");
+        debug!("Seeded gh CLI credentials into container");
     }
 }
 
@@ -1574,7 +1588,7 @@ async fn seed_claude_config(
     )
     .await;
 
-    info!("Seeded Claude Code config into container");
+    debug!("Seeded Claude Code config into container");
 }
 
 /// Re-sync Claude Code auth credentials on container restart.
@@ -1655,7 +1669,7 @@ async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) ->
     let is_alpine = is_alpine_container(client, container_id).await;
 
     if is_alpine {
-        info!("Alpine detected, installing Claude Code dependencies...");
+        debug!("Alpine detected, installing Claude Code dependencies...");
         let _ = client
             .exec_command(
                 container_id,
@@ -1716,11 +1730,11 @@ async fn run_claude_install(
     probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
     if version != "latest" && version != "stable" {
-        info!("Installing Claude Code v{version} (native installer will attempt version pinning)");
+        debug!("Installing Claude Code v{version} (native installer will attempt version pinning)");
     }
 
     let install_cmd = format!("curl -fsSL https://claude.ai/install.sh | bash -s {version}");
-    info!("Installing Claude Code ({version})...");
+    debug!("Installing Claude Code ({version})...");
 
     let mut env = tool_exec_env(probed_env).unwrap_or_default();
     if is_alpine {
@@ -1747,7 +1761,7 @@ async fn run_claude_install(
 fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
-            info!("Claude Code installed successfully");
+            debug!("Claude Code installed successfully");
         }
         Ok(r) => {
             warn!(
@@ -1827,7 +1841,7 @@ async fn ensure_node_available(
         return true;
     }
 
-    info!("npm not found, installing Node.js...");
+    debug!("npm not found, installing Node.js...");
     let install_cmd = if is_alpine_container(client, container_id).await {
         "apk add --no-cache nodejs npm"
     } else {
@@ -1848,7 +1862,7 @@ async fn ensure_node_available(
 
     match &result {
         Ok(r) if r.exit_code == 0 => {
-            info!("Node.js installed successfully");
+            debug!("Node.js installed successfully");
             true
         }
         Ok(r) => {
@@ -1938,7 +1952,7 @@ fn log_npm_install_result(
 ) {
     match result {
         Ok(r) if r.exit_code == 0 => {
-            info!("{tool_name} installed successfully");
+            debug!("{tool_name} installed successfully");
         }
         Ok(r) => {
             warn!(
@@ -1977,7 +1991,7 @@ async fn install_codex(
         return;
     }
 
-    info!("Installing Codex ({})...", settings.version);
+    debug!("Installing Codex ({})...", settings.version);
     let result = npm_install_global(
         client,
         container_id,
@@ -2014,7 +2028,7 @@ async fn install_gemini(
         return;
     }
 
-    info!("Installing Gemini CLI ({})...", settings.version);
+    debug!("Installing Gemini CLI ({})...", settings.version);
     let result = npm_install_global(
         client,
         container_id,

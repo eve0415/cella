@@ -1,0 +1,272 @@
+//! Terminal progress display using indicatif spinners.
+//!
+//! Provides [`Progress`] as the central coordinator for all user-facing
+//! status output.  When enabled (text mode), operations show animated
+//! spinners that resolve to checkmarks on completion.  When disabled
+//! (JSON mode), every method is a silent no-op.
+//!
+//! Tracing integration: [`IndicatifMakeWriter`] routes `tracing` output
+//! through [`indicatif::MultiProgress::println`] so structured log lines
+//! never corrupt active spinners.
+
+use std::io;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tracing_subscriber::fmt::MakeWriter;
+
+// ── style constants ──────────────────────────────────────────────────
+
+const SPINNER_TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
+const TICK_INTERVAL: Duration = Duration::from_millis(80);
+
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .expect("hard-coded template")
+        .tick_chars(SPINNER_TICK_CHARS)
+}
+
+fn child_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+        .expect("hard-coded template")
+        .tick_chars(SPINNER_TICK_CHARS)
+}
+
+// ── Progress ─────────────────────────────────────────────────────────
+
+/// Shared progress context threaded through all commands.
+#[derive(Clone)]
+pub struct Progress {
+    inner: Arc<ProgressInner>,
+}
+
+struct ProgressInner {
+    multi: MultiProgress,
+    enabled: bool,
+}
+
+impl Progress {
+    /// Create a new progress context.
+    ///
+    /// When `enabled` is false (JSON mode), all methods are silent no-ops
+    /// and the [`MultiProgress`] is hidden.
+    pub fn new(enabled: bool) -> Self {
+        let multi = if enabled {
+            MultiProgress::new()
+        } else {
+            MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden())
+        };
+        Self {
+            inner: Arc::new(ProgressInner { multi, enabled }),
+        }
+    }
+
+    /// Whether spinners are active (text mode).
+    pub fn is_enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    /// Access the underlying [`MultiProgress`] for tracing writer setup.
+    pub fn multi(&self) -> &MultiProgress {
+        &self.inner.multi
+    }
+
+    /// Start a spinner for a single operation.
+    pub fn step(&self, label: &str) -> Step {
+        let bar = self.inner.multi.add(ProgressBar::new_spinner());
+        bar.set_style(spinner_style());
+        bar.set_message(label.to_string());
+        if self.inner.enabled {
+            bar.enable_steady_tick(TICK_INTERVAL);
+        }
+        Step {
+            bar,
+            label: label.to_string(),
+            start: Instant::now(),
+        }
+    }
+
+    /// Start a grouped phase with indented child spinners.
+    pub fn phase(&self, label: &str) -> Phase {
+        let bar = self.inner.multi.add(ProgressBar::new_spinner());
+        bar.set_style(spinner_style());
+        bar.set_message(label.to_string());
+        if self.inner.enabled {
+            bar.enable_steady_tick(TICK_INTERVAL);
+        }
+        Phase {
+            parent: bar,
+            multi: self.inner.multi.clone(),
+            label: label.to_string(),
+            start: Instant::now(),
+            enabled: self.inner.enabled,
+        }
+    }
+
+    /// Convenience: run an async operation with a spinner.
+    pub async fn run_step<F, T>(&self, label: &str, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let step = self.step(label);
+        let result = f.await;
+        step.finish();
+        result
+    }
+}
+
+// ── Step ─────────────────────────────────────────────────────────────
+
+/// Handle for a single timed operation (one spinner line).
+pub struct Step {
+    bar: ProgressBar,
+    label: String,
+    start: Instant,
+}
+
+impl Step {
+    /// Finish with checkmark and elapsed time.
+    pub fn finish(self) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        self.bar
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+    }
+
+    /// Finish with a custom completion message.
+    pub fn finish_with(self, msg: &str) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        self.bar
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {msg}{time_suffix}"));
+    }
+
+    /// Mark as failed.
+    pub fn fail(self, msg: &str) {
+        self.bar
+            .finish_with_message(format!("\x1b[31m✗\x1b[0m {}: {msg}", self.label));
+    }
+}
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        // If not yet finished (e.g. early error return), clear the spinner.
+        if !self.bar.is_finished() {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
+// ── Phase ────────────────────────────────────────────────────────────
+
+/// Grouped parent spinner that can have indented child steps.
+pub struct Phase {
+    parent: ProgressBar,
+    multi: MultiProgress,
+    label: String,
+    start: Instant,
+    enabled: bool,
+}
+
+impl Phase {
+    /// Add a child step under this phase (indented spinner).
+    pub fn step(&self, label: &str) -> Step {
+        let bar = self
+            .multi
+            .insert_after(&self.parent, ProgressBar::new_spinner());
+        bar.set_style(child_spinner_style());
+        bar.set_message(label.to_string());
+        if self.enabled {
+            bar.enable_steady_tick(TICK_INTERVAL);
+        }
+        Step {
+            bar,
+            label: label.to_string(),
+            start: Instant::now(),
+        }
+    }
+
+    /// Finish the phase with total elapsed time.
+    pub fn finish(self) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        self.parent
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        if !self.parent.is_finished() {
+            self.parent.finish_and_clear();
+        }
+    }
+}
+
+// ── Tracing writer ───────────────────────────────────────────────────
+
+/// Routes tracing output through [`MultiProgress::println`] so log lines
+/// appear above active spinners instead of corrupting them.
+#[derive(Clone)]
+pub struct IndicatifMakeWriter {
+    multi: MultiProgress,
+}
+
+impl IndicatifMakeWriter {
+    pub const fn new(multi: MultiProgress) -> Self {
+        Self { multi }
+    }
+}
+
+impl<'a> MakeWriter<'a> for IndicatifMakeWriter {
+    type Writer = IndicatifLineWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        IndicatifLineWriter {
+            multi: self.multi.clone(),
+            buf: Vec::with_capacity(256),
+        }
+    }
+}
+
+/// Buffers a single tracing event, then flushes via `MultiProgress::println` on drop.
+pub struct IndicatifLineWriter {
+    multi: MultiProgress,
+    buf: Vec<u8>,
+}
+
+impl io::Write for IndicatifLineWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let msg = String::from_utf8_lossy(&self.buf);
+            let trimmed = msg.trim_end();
+            if !trimmed.is_empty() {
+                let _ = self.multi.println(trimmed);
+            }
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IndicatifLineWriter {
+    fn drop(&mut self) {
+        let _ = io::Write::flush(self);
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_millis() >= 100 {
+        format!(" ({:.1}s)", elapsed.as_secs_f64())
+    } else {
+        String::new()
+    }
+}

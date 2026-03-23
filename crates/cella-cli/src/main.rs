@@ -1,7 +1,10 @@
 mod commands;
+pub mod progress;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use progress::{IndicatifMakeWriter, Progress};
 
 /// cella — Dev containers reinvented for the AI age
 #[derive(Parser)]
@@ -21,10 +24,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))
     .ok();
 
+    // Parse CLI first to determine output mode before creating progress.
+    let cli = Cli::parse();
+    let progress = Progress::new(cli.command.is_text_output());
+
+    // Route tracing through indicatif so log lines never corrupt spinners.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
         .init();
 
-    let cli = Cli::parse();
-    cli.command.execute().await
+    cli.command.execute(progress).await
 }
