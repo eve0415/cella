@@ -185,7 +185,7 @@ impl UpContext {
             .unwrap_or_else(|| "root".to_string())
     }
 
-    /// Run the env forwarding + tool auth/install + userEnvProbe sequence
+    /// Run the env forwarding + userEnvProbe + tool auth/install sequence
     /// that is shared between the running and stopped-restart paths.
     async fn prepare_container_env(
         &self,
@@ -206,41 +206,8 @@ impl UpContext {
         )
         .await;
 
-        // Claude Code: re-sync auth + ensure installed
-        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        if settings.tools.claude_code.forward_config {
-            resync_claude_auth(&self.client, container_id, remote_user).await;
-        }
-        if settings.tools.claude_code.enabled {
-            install_claude_code(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.claude_code,
-            )
-            .await;
-        }
-
-        // Codex/Gemini: no auth resync needed (bind mount), just ensure installed
-        if settings.tools.codex.enabled {
-            install_codex(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.codex,
-            )
-            .await;
-        }
-        if settings.tools.gemini.enabled {
-            install_gemini(
-                &self.client,
-                container_id,
-                remote_user,
-                &settings.tools.gemini,
-            )
-            .await;
-        }
-
+        // Probe user environment first so tool installs can use feature-provided PATH
+        // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = timed_step(
             self.is_text,
             "Running userEnvProbe...",
@@ -252,6 +219,44 @@ impl UpContext {
             ),
         )
         .await;
+
+        // Claude Code: re-sync auth + ensure installed
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
+        if settings.tools.claude_code.forward_config {
+            resync_claude_auth(&self.client, container_id, remote_user).await;
+        }
+        if settings.tools.claude_code.enabled {
+            install_claude_code(
+                &self.client,
+                container_id,
+                remote_user,
+                &settings.tools.claude_code,
+                probed_env.as_ref(),
+            )
+            .await;
+        }
+
+        // Codex/Gemini: no auth resync needed (bind mount), just ensure installed
+        if settings.tools.codex.enabled {
+            install_codex(
+                &self.client,
+                container_id,
+                remote_user,
+                &settings.tools.codex,
+                probed_env.as_ref(),
+            )
+            .await;
+        }
+        if settings.tools.gemini.enabled {
+            install_gemini(
+                &self.client,
+                container_id,
+                remote_user,
+                &settings.tools.gemini,
+                probed_env.as_ref(),
+            )
+            .await;
+        }
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || self.remote_env.clone(),
@@ -709,11 +714,8 @@ impl UpContext {
             .await;
         }
 
-        // Forward config and install AI coding tools
-        self.install_tools(container_id, remote_user, settings)
-            .await;
-
-        // Probe and cache user environment (userEnvProbe)
+        // Probe user environment first so tool installs can use feature-provided PATH
+        // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = timed_step(
             self.is_text,
             "Running userEnvProbe...",
@@ -725,6 +727,10 @@ impl UpContext {
             ),
         )
         .await;
+
+        // Forward config and install AI coding tools
+        self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
+            .await;
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || remote_env.to_vec(),
@@ -740,6 +746,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         settings: &cella_config::Settings,
+        probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
         if settings.tools.claude_code.forward_config {
             timed_step(
@@ -764,6 +771,7 @@ impl UpContext {
                     container_id,
                     remote_user,
                     &settings.tools.claude_code,
+                    probed_env,
                 ),
             )
             .await;
@@ -777,6 +785,7 @@ impl UpContext {
                     container_id,
                     remote_user,
                     &settings.tools.codex,
+                    probed_env,
                 ),
             )
             .await;
@@ -790,6 +799,7 @@ impl UpContext {
                     container_id,
                     remote_user,
                     &settings.tools.gemini,
+                    probed_env,
                 ),
             )
             .await;
@@ -1539,11 +1549,6 @@ async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_us
     }
 }
 
-/// Install Claude Code inside the container using the native installer.
-///
-/// Checks if already installed at the correct version first.
-/// On Alpine/musl, pre-installs required dependencies.
-/// Never fails `cella up` — logs errors and continues.
 /// Check if Claude Code is already installed at the desired version.
 /// Returns `true` if already installed and no (re)install is needed.
 async fn is_claude_code_installed(
@@ -1551,14 +1556,15 @@ async fn is_claude_code_installed(
     container_id: &str,
     remote_user: &str,
     version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> bool {
     let version_check = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec!["claude".to_string(), "--version".to_string()],
+                cmd: tool_shell_cmd(probed_env, "claude --version"),
                 user: Some(remote_user.to_string()),
-                env: None,
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
@@ -1631,8 +1637,17 @@ async fn install_claude_code(
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::ClaudeCode,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
-    if is_claude_code_installed(client, container_id, remote_user, &settings.version).await {
+    if is_claude_code_installed(
+        client,
+        container_id,
+        remote_user,
+        &settings.version,
+        probed_env,
+    )
+    .await
+    {
         return;
     }
 
@@ -1643,6 +1658,7 @@ async fn install_claude_code(
         remote_user,
         &settings.version,
         is_alpine,
+        probed_env,
     )
     .await;
 }
@@ -1654,6 +1670,7 @@ async fn run_claude_install(
     remote_user: &str,
     version: &str,
     is_alpine: bool,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
     if version != "latest" && version != "stable" {
         info!("Installing Claude Code v{version} (native installer will attempt version pinning)");
@@ -1662,11 +1679,11 @@ async fn run_claude_install(
     let install_cmd = format!("curl -fsSL https://claude.ai/install.sh | bash -s {version}");
     info!("Installing Claude Code ({version})...");
 
-    let env = if is_alpine {
-        Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
-    } else {
-        None
-    };
+    let mut env = tool_exec_env(probed_env).unwrap_or_default();
+    if is_alpine {
+        env.push("USE_BUILTIN_RIPGREP=0".to_string());
+    }
+    let env = if env.is_empty() { None } else { Some(env) };
 
     let result = client
         .exec_command(
@@ -1706,22 +1723,58 @@ fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>
 // Codex / Gemini CLI installation (npm-based)
 // ---------------------------------------------------------------------------
 
+/// Extract PATH from the probed user environment for tool exec calls.
+///
+/// Returns `Some(vec!["PATH=..."])` when the probed env contains PATH,
+/// `None` otherwise (caller should fall back to a login shell).
+fn tool_exec_env(
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> Option<Vec<String>> {
+    probed_env
+        .and_then(|env| env.get("PATH"))
+        .map(|path| vec![format!("PATH={path}")])
+}
+
+/// Build the shell command prefix for a tool exec call.
+///
+/// When the probed env is available (and thus PATH will be passed via `env`),
+/// uses a plain `sh -c`. Otherwise falls back to a login shell (`sh -l -c`)
+/// so that `/etc/profile.d/` scripts (e.g. nvm) are sourced.
+fn tool_shell_cmd(
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+    inner_cmd: &str,
+) -> Vec<String> {
+    if probed_env.and_then(|e| e.get("PATH")).is_some() {
+        vec!["sh".to_string(), "-c".to_string(), inner_cmd.to_string()]
+    } else {
+        vec![
+            "sh".to_string(),
+            "-l".to_string(),
+            "-c".to_string(),
+            inner_cmd.to_string(),
+        ]
+    }
+}
+
 /// Ensure Node.js and npm are available in the container.
 ///
-/// If npm is not found, attempts to install Node.js via the system package
-/// manager (apt-get or apk). Returns `true` if npm is available after the check.
-async fn ensure_node_available(client: &DockerClient, container_id: &str) -> bool {
+/// Uses the probed user environment PATH (from `userEnvProbe`) to detect
+/// npm installed by devcontainer features (e.g. nvm). Falls back to a login
+/// shell when no probed env is available. If npm is still not found, attempts
+/// to install Node.js via the system package manager (apt-get or apk).
+/// Returns `true` if npm is available after the check.
+async fn ensure_node_available(
+    client: &DockerClient,
+    container_id: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
     let npm_check = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "command -v npm".to_string(),
-                ],
+                cmd: tool_shell_cmd(probed_env, "command -v npm"),
                 user: Some("root".to_string()),
-                env: None,
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
@@ -1777,14 +1830,15 @@ async fn is_npm_tool_installed(
     remote_user: &str,
     binary_name: &str,
     version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> bool {
     let version_check = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec![binary_name.to_string(), "--version".to_string()],
+                cmd: tool_shell_cmd(probed_env, &format!("{binary_name} --version")),
                 user: Some(remote_user.to_string()),
-                env: None,
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
@@ -1812,6 +1866,7 @@ async fn npm_install_global(
     container_id: &str,
     package: &str,
     version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<cella_docker::ExecResult, CellaDockerError> {
     let pkg = if version == "latest" {
         package.to_string()
@@ -1823,13 +1878,9 @@ async fn npm_install_global(
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("npm install -g {pkg}"),
-                ],
+                cmd: tool_shell_cmd(probed_env, &format!("npm install -g {pkg}")),
                 user: Some("root".to_string()),
-                env: None,
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
@@ -1867,6 +1918,7 @@ async fn install_codex(
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::Codex,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
     if is_npm_tool_installed(
         client,
@@ -1874,19 +1926,27 @@ async fn install_codex(
         remote_user,
         "codex",
         &settings.version,
+        probed_env,
     )
     .await
     {
         return;
     }
 
-    if !ensure_node_available(client, container_id).await {
+    if !ensure_node_available(client, container_id, probed_env).await {
         warn!("Cannot install Codex: Node.js/npm not available");
         return;
     }
 
     info!("Installing Codex ({})...", settings.version);
-    let result = npm_install_global(client, container_id, "@openai/codex", &settings.version).await;
+    let result = npm_install_global(
+        client,
+        container_id,
+        "@openai/codex",
+        &settings.version,
+        probed_env,
+    )
+    .await;
     log_npm_install_result("Codex", result);
 }
 
@@ -1899,6 +1959,7 @@ async fn install_gemini(
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::Gemini,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
     if is_npm_tool_installed(
         client,
@@ -1906,13 +1967,14 @@ async fn install_gemini(
         remote_user,
         "gemini",
         &settings.version,
+        probed_env,
     )
     .await
     {
         return;
     }
 
-    if !ensure_node_available(client, container_id).await {
+    if !ensure_node_available(client, container_id, probed_env).await {
         warn!("Cannot install Gemini CLI: Node.js/npm not available");
         return;
     }
@@ -1923,6 +1985,7 @@ async fn install_gemini(
         container_id,
         "@google/gemini-cli",
         &settings.version,
+        probed_env,
     )
     .await;
     log_npm_install_result("Gemini CLI", result);
