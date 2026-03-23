@@ -115,7 +115,7 @@ exec "{agent_path}" browser-open "$1"
 }
 
 /// Version marker file path inside the volume.
-pub fn version_marker_path() -> &'static str {
+pub const fn version_marker_path() -> &'static str {
     "/cella/.version"
 }
 
@@ -159,8 +159,12 @@ pub async fn remove_agent_volume(docker: &Docker) -> Result<(), CellaDockerError
 /// Steps:
 /// 1. Ensure the volume exists
 /// 2. Check version marker — if current, return early
-/// 3. Get agent binary bytes (CELLA_AGENT_PATH override, debug build, or release download)
+/// 3. Get agent binary bytes (`CELLA_AGENT_PATH` override, debug build, or release download)
 /// 4. Upload agent binary + browser helper + version marker via temp container
+///
+/// # Errors
+///
+/// Returns error if volume creation, agent binary retrieval, or upload fails.
 pub async fn ensure_agent_volume_populated(docker: &Docker) -> Result<(), CellaDockerError> {
     ensure_agent_volume(docker).await?;
 
@@ -298,34 +302,17 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
     let mut wait_stream =
         docker.wait_container(container_name, Some(WaitContainerOptions::default()));
     while let Some(result) = wait_stream.next().await {
-        match result {
-            Ok(resp) => {
-                if resp.status_code != 0 {
-                    // .version file doesn't exist yet
-                    let _ = docker
-                        .remove_container(
-                            container_name,
-                            Some(RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await;
-                    return Ok(false);
-                }
-            }
-            Err(_) => {
-                let _ = docker
-                    .remove_container(
-                        container_name,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Ok(false);
-            }
+        if !result.is_ok_and(|resp| resp.status_code == 0) {
+            let _ = docker
+                .remove_container(
+                    container_name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Ok(false);
         }
     }
 
@@ -373,13 +360,13 @@ async fn get_agent_binary_bytes(docker: &Docker) -> Result<Vec<u8>, CellaDockerE
     #[cfg(debug_assertions)]
     {
         // On Linux, the local binary is already the right platform
-        if std::env::consts::OS == "linux" {
-            if let Some(path) = detect_sibling_agent_binary() {
-                info!("Using agent binary from build output: {}", path.display());
-                return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
-                    message: format!("failed to read agent binary at {}: {e}", path.display()),
-                });
-            }
+        if std::env::consts::OS == "linux"
+            && let Some(path) = detect_sibling_agent_binary()
+        {
+            info!("Using agent binary from build output: {}", path.display());
+            return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("failed to read agent binary at {}: {e}", path.display()),
+            });
         }
 
         // Non-Linux (macOS) or binary not found: build in temp container
@@ -624,12 +611,11 @@ fn find_workspace_root() -> Option<std::path::PathBuf> {
     // Walk up from the exe dir (typically target/debug/) looking for workspace root
     for _ in 0..10 {
         let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-                if content.contains("[workspace]") {
-                    return Some(dir.to_path_buf());
-                }
-            }
+        if cargo_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
     }

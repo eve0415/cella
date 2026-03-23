@@ -166,12 +166,12 @@ pub async fn run_daemon(
 
 /// Generate a hex-encoded random auth token.
 fn generate_auth_token() -> String {
+    use std::fmt::Write;
     let mut buf = [0u8; 32];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
         let _ = f.read_exact(&mut buf);
     }
-    use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in &buf {
         let _ = write!(s, "{b:02x}");

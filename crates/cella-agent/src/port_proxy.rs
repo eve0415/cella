@@ -6,8 +6,8 @@
 //! app through the container's external interface.
 //!
 //! The proxy uses a **different port** than the app to avoid a self-loop:
-//! binding 0.0.0.0:APP_PORT and connecting to 127.0.0.1:APP_PORT would
-//! connect back to the proxy itself (since 0.0.0.0 includes 127.0.0.1).
+//! binding `0.0.0.0:APP_PORT` and connecting to `127.0.0.1:APP_PORT` would
+//! connect back to the proxy itself (since `0.0.0.0` includes `127.0.0.1`).
 
 use std::io;
 
@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-/// Start a TCP proxy from a random port on all interfaces to localhost:app_port.
+/// Start a TCP proxy from a random port on all interfaces to `localhost:app_port`.
 ///
 /// Returns `(proxy_port, task_handle)`. The caller should communicate the
 /// proxy port to the daemon and keep the handle to abort the proxy later.

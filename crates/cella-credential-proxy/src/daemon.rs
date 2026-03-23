@@ -377,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("test.pid");
         let socket_path = dir.path().join("test.sock");
-        let port_path = dir.path().join("test.port");
+        let _port_path = dir.path().join("test.port");
         assert!(!is_daemon_running(&pid_path, &socket_path));
     }
 }

@@ -123,7 +123,7 @@ impl UpContext {
         })
     }
 
-    fn config(&self) -> &serde_json::Value {
+    const fn config(&self) -> &serde_json::Value {
         &self.resolved.config
     }
 
@@ -148,7 +148,7 @@ impl UpContext {
             .unwrap_or("loginInteractiveShell")
     }
 
-    /// Resolve remote_user from an existing container's labels and image metadata.
+    /// Resolve `remote_user` from an existing container's labels and image metadata.
     ///
     /// Priority: `remoteUser` (config) > `containerUser` (config) > `remoteUser` (image metadata)
     ///         > `containerUser` (image metadata) > image USER > label fallback > `"root"`
@@ -233,11 +233,10 @@ impl UpContext {
         )
         .await;
 
-        let lifecycle_env = if let Some(ref probed) = probed_env {
-            cella_env::user_env_probe::merge_env(probed, &self.remote_env)
-        } else {
-            self.remote_env.clone()
-        };
+        let lifecycle_env = probed_env.as_ref().map_or_else(
+            || self.remote_env.clone(),
+            |probed| cella_env::user_env_probe::merge_env(probed, &self.remote_env),
+        );
 
         (probed_env, lifecycle_env)
     }
@@ -394,7 +393,7 @@ impl UpContext {
     /// Build container labels from resolved config, features, and image metadata.
     fn build_labels(
         &self,
-        resolved_features: &Option<cella_features::ResolvedFeatures>,
+        resolved_features: Option<&cella_features::ResolvedFeatures>,
         base_metadata: Option<&str>,
         env_fwd: &cella_env::EnvForwarding,
         remote_user: &str,
@@ -706,11 +705,10 @@ impl UpContext {
         )
         .await;
 
-        let lifecycle_env = if let Some(ref probed) = probed_env {
-            cella_env::user_env_probe::merge_env(probed, remote_env)
-        } else {
-            remote_env.to_vec()
-        };
+        let lifecycle_env = probed_env.as_ref().map_or_else(
+            || remote_env.to_vec(),
+            |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
+        );
 
         (probed_env, lifecycle_env)
     }
@@ -752,7 +750,7 @@ impl UpContext {
 
         // Build labels and create options
         let labels = self.build_labels(
-            &resolved_features,
+            resolved_features.as_ref(),
             base_image_details.metadata.as_deref(),
             &env_fwd,
             &remote_user,
@@ -868,7 +866,7 @@ impl UpArgs {
                     }
                     ctx.client.remove_container(&container.id, false).await?;
                 }
-                (ContainerState::Created, false) | (_, false) => {
+                (_, false) => {
                     // Created but never started, or other state — remove and recreate
                     ctx.client.remove_container(&container.id, false).await?;
                 }
@@ -888,17 +886,14 @@ fn resolve_remote_user(
     image_meta_user: Option<&cella_features::ImageMetadataUserInfo>,
     fallback: &str,
 ) -> String {
-    if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
-        u.to_string()
-    } else if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
-        u.to_string()
-    } else if let Some(u) = image_meta_user.and_then(|m| m.remote_user.as_deref()) {
-        u.to_string()
-    } else if let Some(u) = image_meta_user.and_then(|m| m.container_user.as_deref()) {
-        u.to_string()
-    } else {
-        fallback.to_string()
-    }
+    config
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| config.get("containerUser").and_then(|v| v.as_str()))
+        .or_else(|| image_meta_user.and_then(|m| m.remote_user.as_deref()))
+        .or_else(|| image_meta_user.and_then(|m| m.container_user.as_deref()))
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Build lifecycle entries for a phase from the metadata label, falling back to

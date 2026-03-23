@@ -291,7 +291,7 @@ impl ForwardedPortInfo {
         format!("localhost:{}", self.host_port)
     }
 
-    /// Get the OrbStack-specific URL (container.orb.local), if on OrbStack.
+    /// Get the `OrbStack`-specific URL (container.orb.local), if on `OrbStack`.
     pub fn orb_url(&self) -> Option<String> {
         if self.is_orbstack {
             Some(format!(

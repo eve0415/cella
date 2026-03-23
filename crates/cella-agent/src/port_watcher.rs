@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::port_proxy;
 use crate::reconnecting_client::ReconnectingClient;
 
-/// Port mappings from daemon (container_port → host_port).
+/// Port mappings from daemon (`container_port` → `host_port`).
 pub type PortMap = Arc<Mutex<HashMap<u16, u16>>>;
 
 /// Path where port mappings are written as JSON for child processes.
@@ -153,6 +153,7 @@ async fn send_port_open_and_record(
 /// and read the port mapping response.
 ///
 /// Returns `true` if the listener was successfully reported and should be tracked.
+#[allow(clippy::significant_drop_tightening)]
 async fn handle_new_listener(
     listener: &DetectedListener,
     control: &Mutex<ReconnectingClient>,

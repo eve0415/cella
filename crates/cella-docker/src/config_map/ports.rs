@@ -161,7 +161,6 @@ fn parse_port_pattern(key: &str) -> Option<PortPattern> {
 /// Parse `onAutoForward` string value to enum.
 fn parse_on_auto_forward(value: &str) -> OnAutoForward {
     match value {
-        "notify" => OnAutoForward::Notify,
         "openBrowser" => OnAutoForward::OpenBrowser,
         "openBrowserOnce" => OnAutoForward::OpenBrowserOnce,
         "openPreview" => OnAutoForward::OpenPreview,
