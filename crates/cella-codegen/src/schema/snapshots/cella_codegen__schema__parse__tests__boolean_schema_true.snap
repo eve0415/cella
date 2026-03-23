@@ -1,13 +1,10 @@
 ---
 source: crates/cella-codegen/src/schema/parse.rs
-assertion_line: 350
 expression: result
 ---
 SchemaNode {
-    title: None,
     description: None,
     deprecated: false,
-    deprecation_message: None,
     schema_type: None,
     properties: {},
     required: [],
@@ -21,9 +18,6 @@ SchemaNode {
     ref: None,
     minimum: None,
     maximum: None,
-    pattern: None,
-    format: None,
-    default_value: None,
     unevaluated_properties: None,
     definitions: {},
 }

@@ -22,6 +22,20 @@ use crate::control_server::{AgentConnectionState, ContainerHandle, current_time_
 use crate::port_manager::PortManager;
 use crate::proxy::ProxyCommand;
 
+/// Shared context for the management server and its connection handlers.
+pub(crate) struct ManagementContext {
+    pub last_activity: Arc<AtomicU64>,
+    pub port_manager: Arc<Mutex<PortManager>>,
+    pub browser_handler: Arc<BrowserHandler>,
+    pub proxy_cmd_tx: mpsc::Sender<ProxyCommand>,
+    pub start_time: std::time::Instant,
+    pub is_orbstack: bool,
+    pub daemon_started_at: u64,
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub auth_token: String,
+    pub control_port: u16,
+}
+
 /// Run the management server on the given Unix socket.
 ///
 /// Also spawns the unified TCP control server for agent connections.
@@ -29,21 +43,11 @@ use crate::proxy::ProxyCommand;
 /// # Errors
 ///
 /// Returns error if socket binding fails.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_management_server(
+pub(crate) async fn run_management_server(
     socket_path: &Path,
-    last_activity: Arc<AtomicU64>,
-    port_manager: Arc<Mutex<PortManager>>,
-    browser_handler: Arc<BrowserHandler>,
-    proxy_cmd_tx: mpsc::Sender<ProxyCommand>,
-    start_time: std::time::Instant,
-    is_orbstack: bool,
-    daemon_started_at: u64,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ctx: ManagementContext,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     control_listener: tokio::net::TcpListener,
-    auth_token: String,
-    control_port: u16,
 ) -> Result<(), CellaDaemonError> {
     // Clean up stale socket
     let _ = std::fs::remove_file(socket_path);
@@ -73,25 +77,24 @@ pub async fn run_management_server(
     let container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let ctx = Arc::new(ctx);
+
     // Spawn the unified TCP control server for agent connections
-    let ctrl_shutdown_rx = shutdown_tx.subscribe();
+    let ctrl_shutdown_rx = ctx.shutdown_tx.subscribe();
     {
-        let pm = port_manager.clone();
-        let bh = browser_handler.clone();
-        let handles = container_handles.clone();
-        let activity = last_activity.clone();
-        let ptx = proxy_cmd_tx.clone();
-        let token = auth_token.clone();
+        let activity = ctx.last_activity.clone();
+        let ctrl_ctx = crate::control_server::ControlContext {
+            auth_token: ctx.auth_token.clone(),
+            port_manager: ctx.port_manager.clone(),
+            browser_handler: ctx.browser_handler.clone(),
+            container_handles: container_handles.clone(),
+            proxy_cmd_tx: ctx.proxy_cmd_tx.clone(),
+        };
         tokio::spawn(async move {
             crate::control_server::run_control_server(
                 control_listener,
-                token,
+                ctrl_ctx,
                 activity,
-                pm,
-                bh,
-                handles,
-                ptx,
-                is_orbstack,
                 ctrl_shutdown_rx,
             )
             .await;
@@ -103,24 +106,12 @@ pub async fn run_management_server(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
-                        last_activity.store(current_time_secs(), Ordering::Relaxed);
-                        let pm = port_manager.clone();
-                        let bh = browser_handler.clone();
+                        ctx.last_activity.store(current_time_secs(), Ordering::Relaxed);
+                        let ctx = ctx.clone();
                         let handles = container_handles.clone();
-                        let proxy_tx = proxy_cmd_tx.clone();
-                        let start = start_time;
-                        let orbstack = is_orbstack;
-                        let started_at = daemon_started_at;
-                        let stx = shutdown_tx.clone();
-                        let token = auth_token.clone();
-                        let cport = control_port;
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_management_connection(
-                                stream, pm, bh, handles, proxy_tx, start, orbstack,
-                                started_at, stx, &token, cport,
-                            )
-                            .await
+                            if let Err(e) = handle_management_connection(stream, &ctx, handles).await
                             {
                                 warn!("Management connection error: {e}");
                             }
@@ -144,19 +135,10 @@ pub async fn run_management_server(
 }
 
 /// Handle a single management connection (newline-delimited JSON).
-#[allow(clippy::too_many_arguments)]
 async fn handle_management_connection(
     stream: tokio::net::UnixStream,
-    port_manager: Arc<Mutex<PortManager>>,
-    browser_handler: Arc<BrowserHandler>,
+    ctx: &ManagementContext,
     container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    proxy_cmd_tx: mpsc::Sender<ProxyCommand>,
-    start_time: std::time::Instant,
-    is_orbstack: bool,
-    daemon_started_at: u64,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    auth_token: &str,
-    control_port: u16,
 ) -> Result<(), CellaDaemonError> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -185,20 +167,7 @@ async fn handle_management_connection(
                 message: format!("invalid management request: {e}"),
             })?;
 
-        let response = handle_management_request(
-            req,
-            &port_manager,
-            &browser_handler,
-            &container_handles,
-            &proxy_cmd_tx,
-            start_time,
-            is_orbstack,
-            daemon_started_at,
-            &shutdown_tx,
-            auth_token,
-            control_port,
-        )
-        .await;
+        let response = handle_management_request(req, ctx, &container_handles).await;
 
         let mut json =
             serde_json::to_string(&response).map_err(|e| CellaDaemonError::Protocol {
@@ -220,19 +189,10 @@ async fn handle_management_connection(
 }
 
 /// Route a management request to the appropriate handler.
-#[allow(clippy::too_many_arguments)]
 async fn handle_management_request(
     req: ManagementRequest,
-    port_manager: &Arc<Mutex<PortManager>>,
-    _browser_handler: &Arc<BrowserHandler>,
+    ctx: &ManagementContext,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    _proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
-    start_time: std::time::Instant,
-    is_orbstack: bool,
-    daemon_started_at: u64,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
-    auth_token: &str,
-    control_port: u16,
 ) -> ManagementResponse {
     match req {
         ManagementRequest::RegisterContainer {
@@ -243,31 +203,29 @@ async fn handle_management_request(
             other_ports_attributes,
             forward_ports,
         } => {
-            handle_register(
-                &container_id,
-                &container_name,
+            let reg = ContainerRegistration {
+                container_id,
+                container_name,
                 container_ip,
                 ports_attributes,
                 other_ports_attributes,
-                &forward_ports,
-                port_manager,
-                container_handles,
-            )
-            .await
+                forward_ports,
+            };
+            handle_register(reg, &ctx.port_manager, container_handles).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
-            handle_deregister(&container_name, port_manager, container_handles).await
+            handle_deregister(&container_name, &ctx.port_manager, container_handles).await
         }
-        ManagementRequest::QueryPorts => handle_query_ports(port_manager).await,
+        ManagementRequest::QueryPorts => handle_query_ports(&ctx.port_manager).await,
         ManagementRequest::QueryStatus => {
             handle_query_status(
-                port_manager,
+                &ctx.port_manager,
                 container_handles,
-                start_time,
-                is_orbstack,
-                daemon_started_at,
-                auth_token,
-                control_port,
+                ctx.start_time,
+                ctx.is_orbstack,
+                ctx.daemon_started_at,
+                &ctx.auth_token,
+                ctx.control_port,
             )
             .await
         }
@@ -275,21 +233,25 @@ async fn handle_management_request(
         ManagementRequest::Shutdown => {
             let pid = std::process::id();
             info!("Shutdown requested, sending signal");
-            let _ = shutdown_tx.send(true);
+            let _ = ctx.shutdown_tx.send(true);
             ManagementResponse::ShuttingDown { pid }
         }
     }
 }
 
-/// Handle container registration.
-#[allow(clippy::similar_names)]
-async fn handle_register(
-    container_id: &str,
-    container_name: &str,
+/// Data for a container registration request.
+struct ContainerRegistration {
+    container_id: String,
+    container_name: String,
     container_ip: Option<String>,
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
-    forward_ports: &[u16],
+    forward_ports: Vec<u16>,
+}
+
+/// Handle container registration.
+async fn handle_register(
+    reg: ContainerRegistration,
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
 ) -> ManagementResponse {
@@ -297,17 +259,17 @@ async fn handle_register(
     {
         let mut pm = port_manager.lock().await;
         pm.register_container(
-            container_id,
-            container_name,
-            container_ip,
-            ports_attributes,
-            other_ports_attributes,
+            &reg.container_id,
+            &reg.container_name,
+            reg.container_ip,
+            reg.ports_attributes,
+            reg.other_ports_attributes,
         );
 
         // Pre-allocate host ports for forwardPorts
-        for &fwd_port in forward_ports {
+        for &fwd_port in &reg.forward_ports {
             pm.handle_port_open(
-                container_id,
+                &reg.container_id,
                 fwd_port,
                 cella_port::protocol::PortProtocol::Tcp,
                 None,
@@ -319,18 +281,18 @@ async fn handle_register(
     {
         let mut handles = container_handles.lock().await;
         handles.insert(
-            container_name.to_string(),
+            reg.container_name.clone(),
             ContainerHandle {
-                container_id: container_id.to_string(),
+                container_id: reg.container_id,
                 agent_state: Arc::new(AgentConnectionState::new()),
             },
         );
     }
 
-    info!("Registered container {container_name}");
+    info!("Registered container {}", reg.container_name);
 
     ManagementResponse::ContainerRegistered {
-        container_name: container_name.to_string(),
+        container_name: reg.container_name,
     }
 }
 
@@ -491,10 +453,6 @@ mod tests {
     async fn management_ping_pong() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("mgmt.sock");
-        let pm = Arc::new(Mutex::new(PortManager::new(false)));
-        let bh = Arc::new(BrowserHandler::new());
-        let (proxy_tx, _proxy_rx) = mpsc::channel(16);
-        let start = std::time::Instant::now();
 
         // Create a TCP listener for the control server
         let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -502,27 +460,21 @@ mod tests {
 
         let sock = socket_path.clone();
         let server_handle = tokio::spawn({
-            let pm = pm.clone();
-            let bh = bh.clone();
-            let activity = Arc::new(AtomicU64::new(0));
+            let (stx, srx) = tokio::sync::watch::channel(false);
+            let ctx = ManagementContext {
+                last_activity: Arc::new(AtomicU64::new(0)),
+                port_manager: Arc::new(Mutex::new(PortManager::new(false))),
+                browser_handler: Arc::new(BrowserHandler::new()),
+                proxy_cmd_tx: mpsc::channel(16).0,
+                start_time: std::time::Instant::now(),
+                is_orbstack: false,
+                daemon_started_at: 0,
+                shutdown_tx: stx,
+                auth_token: "test-token".to_string(),
+                control_port: ctrl_port,
+            };
             async move {
-                let (stx, srx) = tokio::sync::watch::channel(false);
-                let _ = run_management_server(
-                    &sock,
-                    activity,
-                    pm,
-                    bh,
-                    proxy_tx,
-                    start,
-                    false,
-                    0,
-                    stx,
-                    srx,
-                    ctrl_listener,
-                    "test-token".to_string(),
-                    ctrl_port,
-                )
-                .await;
+                let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
             }
         });
 
@@ -546,37 +498,27 @@ mod tests {
     async fn management_register_and_query() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("mgmt.sock");
-        let pm = Arc::new(Mutex::new(PortManager::new(false)));
-        let bh = Arc::new(BrowserHandler::new());
-        let (proxy_tx, _proxy_rx) = mpsc::channel(16);
-        let start = std::time::Instant::now();
 
         let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ctrl_port = ctrl_listener.local_addr().unwrap().port();
 
         let sock = socket_path.clone();
         let server_handle = tokio::spawn({
-            let pm = pm.clone();
-            let bh = bh.clone();
-            let activity = Arc::new(AtomicU64::new(0));
+            let (stx, srx) = tokio::sync::watch::channel(false);
+            let ctx = ManagementContext {
+                last_activity: Arc::new(AtomicU64::new(0)),
+                port_manager: Arc::new(Mutex::new(PortManager::new(false))),
+                browser_handler: Arc::new(BrowserHandler::new()),
+                proxy_cmd_tx: mpsc::channel(16).0,
+                start_time: std::time::Instant::now(),
+                is_orbstack: false,
+                daemon_started_at: 0,
+                shutdown_tx: stx,
+                auth_token: "test-token".to_string(),
+                control_port: ctrl_port,
+            };
             async move {
-                let (stx, srx) = tokio::sync::watch::channel(false);
-                let _ = run_management_server(
-                    &sock,
-                    activity,
-                    pm,
-                    bh,
-                    proxy_tx,
-                    start,
-                    false,
-                    0,
-                    stx,
-                    srx,
-                    ctrl_listener,
-                    "test-token".to_string(),
-                    ctrl_port,
-                )
-                .await;
+                let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
             }
         });
 

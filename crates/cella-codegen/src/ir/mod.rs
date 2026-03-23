@@ -9,17 +9,6 @@ pub enum IrType {
     Alias(IrAlias),
 }
 
-impl IrType {
-    #[allow(dead_code)]
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Struct(s) => &s.name,
-            Self::Enum(e) => &e.name,
-            Self::Alias(a) => &a.name,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct IrStruct {
     pub name: String,

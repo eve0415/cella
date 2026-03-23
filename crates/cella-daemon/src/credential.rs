@@ -79,8 +79,9 @@ pub fn format_response(response: &CredentialResponse) -> String {
 }
 
 /// Format credential fields for piping into `git credential` stdin.
-#[allow(clippy::implicit_hasher)]
-pub fn format_fields_for_stdin(fields: &HashMap<String, String>) -> String {
+pub fn format_fields_for_stdin<S: std::hash::BuildHasher>(
+    fields: &HashMap<String, String, S>,
+) -> String {
     let mut output = String::new();
     for (key, value) in fields {
         output.push_str(key);
@@ -110,10 +111,9 @@ pub fn parse_credential_output(output: &str) -> HashMap<String, String> {
 /// - `get` -> `git credential fill`
 /// - `store` -> `git credential approve`
 /// - `erase` -> `git credential reject`
-#[allow(clippy::implicit_hasher)]
-pub fn invoke_git_credential(
+pub fn invoke_git_credential<S: std::hash::BuildHasher>(
     operation: &str,
-    fields: &HashMap<String, String>,
+    fields: &HashMap<String, String, S>,
 ) -> Result<HashMap<String, String>, CellaDaemonError> {
     let git_op = match operation {
         "get" => "fill",

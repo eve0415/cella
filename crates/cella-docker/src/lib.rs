@@ -19,7 +19,9 @@ pub use container::{ContainerInfo, ContainerState, MountInfo, PortBinding};
 pub use error::CellaDockerError;
 pub use exec::{ExecOptions, ExecResult, InteractiveExecOptions};
 pub use image::{BuildOptions, ImageDetails};
-pub use lifecycle::{ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase};
+pub use lifecycle::{
+    LifecycleContext, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,
+};
 pub use names::{container_labels, container_name, image_name, image_name_with_features};
 pub use resolve::ContainerTarget;
 pub use uid::update_remote_user_uid;

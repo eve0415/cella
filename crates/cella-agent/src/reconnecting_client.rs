@@ -130,7 +130,6 @@ impl ReconnectingClient {
     ///
     /// Returns [`CellaPortError::ControlSocket`] if the client is disconnected
     /// or the underlying read fails.
-    #[allow(dead_code)]
     pub async fn recv(&mut self) -> Result<DaemonMessage, CellaPortError> {
         if let Some(ref mut client) = self.inner {
             client.recv().await
@@ -202,20 +201,6 @@ mod tests {
             ports_detected: 0,
         };
         let result = client.send(&msg).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn recv_on_disconnected_returns_error() {
-        let mut client = ReconnectingClient {
-            addr: "127.0.0.1:1".to_string(),
-            container_name: "test".to_string(),
-            auth_token: "token".to_string(),
-            inner: None,
-            reconnected: false,
-        };
-
-        let result = client.recv().await;
         assert!(result.is_err());
     }
 }

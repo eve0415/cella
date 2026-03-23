@@ -1,15 +1,12 @@
 ---
 source: crates/cella-codegen/src/schema/parse.rs
-assertion_line: 316
 expression: result
 ---
 ParsedSchema {
     definitions: {
         "Bar": SchemaNode {
-            title: None,
             description: None,
             deprecated: false,
-            deprecation_message: None,
             schema_type: Some(
                 Single(
                     Integer,
@@ -27,17 +24,12 @@ ParsedSchema {
             ref: None,
             minimum: None,
             maximum: None,
-            pattern: None,
-            format: None,
-            default_value: None,
             unevaluated_properties: None,
             definitions: {},
         },
         "Foo": SchemaNode {
-            title: None,
             description: None,
             deprecated: false,
-            deprecation_message: None,
             schema_type: Some(
                 Single(
                     String,
@@ -55,18 +47,13 @@ ParsedSchema {
             ref: None,
             minimum: None,
             maximum: None,
-            pattern: None,
-            format: None,
-            default_value: None,
             unevaluated_properties: None,
             definitions: {},
         },
     },
     root: SchemaNode {
-        title: None,
         description: None,
         deprecated: false,
-        deprecation_message: None,
         schema_type: Some(
             Single(
                 Object,
@@ -84,16 +71,11 @@ ParsedSchema {
         ref: None,
         minimum: None,
         maximum: None,
-        pattern: None,
-        format: None,
-        default_value: None,
         unevaluated_properties: None,
         definitions: {
             "Bar": SchemaNode {
-                title: None,
                 description: None,
                 deprecated: false,
-                deprecation_message: None,
                 schema_type: Some(
                     Single(
                         Integer,
@@ -111,17 +93,12 @@ ParsedSchema {
                 ref: None,
                 minimum: None,
                 maximum: None,
-                pattern: None,
-                format: None,
-                default_value: None,
                 unevaluated_properties: None,
                 definitions: {},
             },
             "Foo": SchemaNode {
-                title: None,
                 description: None,
                 deprecated: false,
-                deprecation_message: None,
                 schema_type: Some(
                     Single(
                         String,
@@ -139,9 +116,6 @@ ParsedSchema {
                 ref: None,
                 minimum: None,
                 maximum: None,
-                pattern: None,
-                format: None,
-                default_value: None,
                 unevaluated_properties: None,
                 definitions: {},
             },

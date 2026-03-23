@@ -1,15 +1,12 @@
 ---
 source: crates/cella-codegen/src/schema/parse.rs
-assertion_line: 381
 expression: result
 ---
 ParsedSchema {
     definitions: {},
     root: SchemaNode {
-        title: None,
         description: None,
         deprecated: false,
-        deprecation_message: None,
         schema_type: Some(
             Single(
                 Integer,
@@ -31,9 +28,6 @@ ParsedSchema {
         maximum: Some(
             100.0,
         ),
-        pattern: None,
-        format: None,
-        default_value: None,
         unevaluated_properties: None,
         definitions: {},
     },

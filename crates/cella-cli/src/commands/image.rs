@@ -16,40 +16,45 @@ pub fn compute_features_digest(config: &serde_json::Value) -> String {
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
+/// Context for building a features layer image.
+pub struct FeaturesLayerContext<'a> {
+    pub client: &'a DockerClient,
+    pub config: &'a serde_json::Value,
+    pub workspace_root: &'a Path,
+    pub config_name: Option<&'a str>,
+    pub resolved: &'a ResolvedFeatures,
+    pub base_image: &'a str,
+    pub image_user: &'a str,
+    pub no_cache: bool,
+    pub is_text: bool,
+}
+
 /// Build the features layer image on top of a base image.
-#[allow(clippy::too_many_arguments)]
 pub async fn build_features_layer(
-    client: &DockerClient,
-    config: &serde_json::Value,
-    workspace_root: &Path,
-    config_name: Option<&str>,
-    resolved: &ResolvedFeatures,
-    base_image: &str,
-    image_user: &str,
-    no_cache: bool,
-    is_text: bool,
+    ctx: &FeaturesLayerContext<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let features_digest = compute_features_digest(config);
-    let features_image = image_name_with_features(workspace_root, config_name, &features_digest);
+    let features_digest = compute_features_digest(ctx.config);
+    let features_image =
+        image_name_with_features(ctx.workspace_root, ctx.config_name, &features_digest);
 
     let mut options = vec![];
-    if no_cache {
+    if ctx.no_cache {
         options.push("--no-cache".to_string());
     }
 
     let mut args = HashMap::new();
     args.insert(
         "_DEV_CONTAINERS_BASE_IMAGE".to_string(),
-        base_image.to_string(),
+        ctx.base_image.to_string(),
     );
     args.insert(
         "_DEV_CONTAINERS_IMAGE_USER".to_string(),
-        image_user.to_string(),
+        ctx.image_user.to_string(),
     );
 
     let build_opts = BuildOptions {
         image_name: features_image.clone(),
-        context_path: resolved.build_context.clone(),
+        context_path: ctx.resolved.build_context.clone(),
         dockerfile: "Dockerfile.features".to_string(),
         args,
         target: None,
@@ -59,14 +64,14 @@ pub async fn build_features_layer(
 
     info!(
         "Building features layer image (context: {})",
-        resolved.build_context.display()
+        ctx.resolved.build_context.display()
     );
-    if is_text {
+    if ctx.is_text {
         eprintln!("Building features layer...");
     }
     let start = std::time::Instant::now();
-    client.build_image(&build_opts).await?;
-    if is_text {
+    ctx.client.build_image(&build_opts).await?;
+    if ctx.is_text {
         let elapsed = start.elapsed();
         eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
     }
@@ -78,7 +83,6 @@ pub async fn build_features_layer(
 /// When `no_cache` is true, `--no-cache` and `--pull` are passed to the base
 /// image build (but only `--no-cache` for the features layer, since its FROM
 /// image is local-only) and image-based configs force re-pull.
-#[allow(clippy::too_many_lines)]
 pub async fn ensure_image(
     client: &DockerClient,
     config: &serde_json::Value,
@@ -94,7 +98,51 @@ pub async fn ensure_image(
         .is_some_and(|obj| !obj.is_empty());
 
     // Determine base image tag
-    let base_image_tag = if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
+    let base_image_tag = resolve_base_image(
+        client,
+        config,
+        workspace_root,
+        config_name,
+        no_cache,
+        is_text,
+    )
+    .await?;
+
+    // Inspect base image details (user, env, metadata) in a single API call
+    let base_image_details = client.inspect_image_details(&base_image_tag).await?;
+
+    // If no features, return the base image directly
+    if !has_features {
+        return Ok((base_image_tag, None, base_image_details));
+    }
+
+    // Resolve and build features layer
+    let (features_image, resolved) = resolve_and_build_features(
+        client,
+        config,
+        config_path,
+        workspace_root,
+        config_name,
+        &base_image_tag,
+        &base_image_details,
+        no_cache,
+        is_text,
+    )
+    .await?;
+
+    Ok((features_image, Some(resolved), base_image_details))
+}
+
+/// Pull or build the base image and return its tag.
+async fn resolve_base_image(
+    client: &DockerClient,
+    config: &serde_json::Value,
+    workspace_root: &Path,
+    config_name: Option<&str>,
+    no_cache: bool,
+    is_text: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
         // Pull base image if needed (force re-pull when no_cache)
         if no_cache || !client.image_exists(image).await? {
             if is_text {
@@ -111,9 +159,8 @@ pub async fn ensure_image(
                 }
             }
         }
-        image.to_string()
+        Ok(image.to_string())
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
-        // Build user Dockerfile
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
         if is_text {
@@ -125,20 +172,24 @@ pub async fn ensure_image(
             let elapsed = start.elapsed();
             eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
         }
-        img_name
+        Ok(img_name)
     } else {
-        return Err("devcontainer.json must specify either 'image' or 'build'".into());
-    };
-
-    // Inspect base image details (user, env, metadata) in a single API call
-    let base_image_details = client.inspect_image_details(&base_image_tag).await?;
-
-    // If no features, return the base image directly
-    if !has_features {
-        return Ok((base_image_tag, None, base_image_details));
+        Err("devcontainer.json must specify either 'image' or 'build'".into())
     }
+}
 
-    // Resolve features
+/// Resolve features and build the features layer image.
+async fn resolve_and_build_features(
+    client: &DockerClient,
+    config: &serde_json::Value,
+    config_path: &Path,
+    workspace_root: &Path,
+    config_name: Option<&str>,
+    base_image_tag: &str,
+    base_image_details: &ImageDetails,
+    no_cache: bool,
+    is_text: bool,
+) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
     info!("Resolving devcontainer features...");
     let platform = cella_features::oci::detect_platform(client.inner())
         .await
@@ -150,28 +201,27 @@ pub async fn ensure_image(
         config_path,
         &platform,
         &cache,
-        &base_image_tag,
+        base_image_tag,
         &base_image_details.user,
         base_image_details.metadata.as_deref(),
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;
 
-    // Build the features layer image
-    let features_image = build_features_layer(
+    let ctx = FeaturesLayerContext {
         client,
         config,
         workspace_root,
         config_name,
-        &resolved,
-        &base_image_tag,
-        &base_image_details.user,
+        resolved: &resolved,
+        base_image: base_image_tag,
+        image_user: &base_image_details.user,
         no_cache,
         is_text,
-    )
-    .await?;
+    };
+    let features_image = build_features_layer(&ctx).await?;
 
-    Ok((features_image, Some(resolved), base_image_details))
+    Ok((features_image, resolved))
 }
 
 /// Parse build configuration from the `build` object in devcontainer.json.

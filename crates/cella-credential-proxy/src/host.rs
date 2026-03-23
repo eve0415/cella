@@ -18,10 +18,9 @@ use crate::protocol::{format_fields_for_stdin, parse_credential_output};
 /// # Errors
 ///
 /// Returns error if git credential invocation fails or returns non-zero.
-#[allow(clippy::implicit_hasher)]
-pub fn invoke_git_credential(
+pub fn invoke_git_credential<S: std::hash::BuildHasher>(
     operation: &str,
-    fields: &HashMap<String, String>,
+    fields: &HashMap<String, String, S>,
 ) -> Result<HashMap<String, String>, CellaCredentialProxyError> {
     let git_op = match operation {
         "get" => "fill",

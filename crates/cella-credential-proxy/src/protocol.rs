@@ -93,8 +93,9 @@ pub fn format_response(response: &CredentialResponse) -> String {
 }
 
 /// Format credential fields for piping into `git credential` stdin.
-#[allow(clippy::implicit_hasher)]
-pub fn format_fields_for_stdin(fields: &HashMap<String, String>) -> String {
+pub fn format_fields_for_stdin<S: std::hash::BuildHasher>(
+    fields: &HashMap<String, String, S>,
+) -> String {
     let mut output = String::new();
     for (key, value) in fields {
         output.push_str(key);

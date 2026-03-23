@@ -88,50 +88,38 @@ pub fn prepare_claude_config(
     let rewrites = build_path_rewrites(&target_home);
 
     let mut uploads = Vec::new();
+    let mut collector = Collector {
+        host_dir: &host_dir,
+        target_claude_dir: &target_claude_dir,
+        rewrites: &rewrites,
+        uploads: &mut uploads,
+    };
 
     // 1. Copy default root files
     for &file in DEFAULT_COPY_FILES {
         if is_user_excluded(file, &settings.exclude) {
             continue;
         }
-        collect_file(&host_dir, file, &target_claude_dir, &rewrites, &mut uploads);
+        collector.file(file);
     }
 
     // 2. Copy user-created root files (*.sh, *.md, etc. not in exclude list)
-    collect_user_root_files(
-        &host_dir,
-        &target_claude_dir,
-        &rewrites,
-        settings,
-        &mut uploads,
-    );
+    collector.user_root_files(settings);
 
     // 3. Copy default directories
     for &dir in DEFAULT_COPY_DIRS {
         if is_user_excluded(dir, &settings.exclude) {
             continue;
         }
-        collect_directory(&host_dir, dir, &target_claude_dir, &rewrites, &mut uploads);
+        collector.directory(dir);
     }
 
     // 4. Copy matching projects/ subdirectory for current workspace
-    collect_workspace_project(
-        &host_dir,
-        workspace_root,
-        &target_claude_dir,
-        &rewrites,
-        &mut uploads,
-    );
+    collector.workspace_project(workspace_root);
 
     // 5. Apply user include patterns (for files/dirs beyond defaults)
     for pattern in &settings.include {
-        collect_by_glob(
-            &host_dir,
-            pattern,
-            &target_claude_dir,
-            &rewrites,
-            &mut uploads,
-        );
+        collector.glob(pattern);
     }
 
     if uploads.is_empty() {
@@ -181,12 +169,6 @@ fn build_path_rewrites(target_home: &str) -> Vec<(Regex, String)> {
             Regex::new(r#"/Users/[^/\s"']+/\.claude"#).expect("valid regex"),
             target.clone(),
         ),
-        // /root/.claude (not a trivial regex — we need replace_all semantics)
-        #[allow(clippy::trivial_regex)]
-        (
-            Regex::new(r"/root/\.claude").expect("valid regex"),
-            target.clone(),
-        ),
         // C:\\Users\\USERNAME\\.claude (JSON-escaped Windows backslash)
         (
             Regex::new(r#"[A-Z]:\\\\Users\\\\[^\\\\"'\s]+\\\\\.claude"#).expect("valid regex"),
@@ -207,6 +189,16 @@ fn rewrite_paths(content: &str, rewrites: &[(Regex, String)]) -> Option<String> 
         if new != result {
             changed = true;
             result = new.into_owned();
+        }
+    }
+
+    // Plain string replacement for /root/.claude (avoids trivial regex).
+    // The target replacement is the same as all regex replacements above.
+    if let Some((_, target)) = rewrites.first() {
+        let new = result.replace("/root/.claude", target);
+        if new != result {
+            changed = true;
+            result = new;
         }
     }
 
@@ -234,208 +226,184 @@ fn should_rewrite(path: &str) -> bool {
 // File collection
 // ---------------------------------------------------------------------------
 
-/// Collect a single file from the host `.claude/` directory.
-fn collect_file(
-    host_dir: &Path,
-    relative_path: &str,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    uploads: &mut Vec<FileUpload>,
-) {
-    let host_path = host_dir.join(relative_path);
-    if let Ok(content) = std::fs::read(&host_path) {
-        let content = maybe_rewrite(&content, relative_path, rewrites);
+/// Collects host `.claude/` files into container-ready [`FileUpload`]s.
+///
+/// Bundles the shared state (`host_dir`, `target_claude_dir`, `rewrites`,
+/// `uploads`) so every collection method can focus on its own filtering logic.
+struct Collector<'c> {
+    host_dir: &'c Path,
+    target_claude_dir: &'c str,
+    rewrites: &'c [(Regex, String)],
+    uploads: &'c mut Vec<FileUpload>,
+}
+
+impl Collector<'_> {
+    // -- public collection methods ------------------------------------------
+
+    /// Collect a single file from the host `.claude/` directory.
+    fn file(&mut self, relative_path: &str) {
+        let host_path = self.host_dir.join(relative_path);
+        let Ok(content) = std::fs::read(&host_path) else {
+            return;
+        };
         let is_sensitive = relative_path
             .rsplit('.')
             .next()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             && relative_path.starts_with('.');
         let mode = if is_sensitive { 0o600 } else { 0o644 };
-        uploads.push(FileUpload {
-            container_path: format!("{target_claude_dir}/{relative_path}"),
+        self.push_file(relative_path, &content, mode);
+    }
+
+    /// Collect all files in a directory recursively.
+    fn directory(&mut self, relative_dir: &str) {
+        let dir_path = self.host_dir.join(relative_dir);
+        if dir_path.is_dir() {
+            self.walk_dir(&dir_path);
+        }
+    }
+
+    /// Collect user-created files at the root of `~/.claude/` (not in subdirectories).
+    ///
+    /// Includes files like `statusline-command.sh` that the user created,
+    /// excluding known machine-generated files and directories.
+    fn user_root_files(&mut self, settings: &cella_config::ClaudeCodeSettings) {
+        let Ok(entries) = std::fs::read_dir(self.host_dir) else {
+            return;
+        };
+
+        let already_copied: Vec<&str> = DEFAULT_COPY_FILES.to_vec();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip files already in the default copy list
+            if already_copied.contains(&name) {
+                continue;
+            }
+
+            // Skip default exclude files
+            if DEFAULT_EXCLUDE_FILES.contains(&name) {
+                continue;
+            }
+
+            // Skip user-excluded files
+            if is_user_excluded(name, &settings.exclude) {
+                continue;
+            }
+
+            // Skip known machine-generated files
+            if name.starts_with("security_warnings_state_") {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read(&path) else {
+                continue;
+            };
+            let mode = if name
+                .rsplit('.')
+                .next()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+            {
+                0o755
+            } else {
+                0o644
+            };
+            self.push_file(name, &content, mode);
+        }
+    }
+
+    /// Collect the `projects/` subdirectory matching the current workspace.
+    ///
+    /// Claude Code encodes workspace paths by replacing `/` with `-`.
+    /// e.g., `/workspaces/cella` -> `projects/-workspaces-cella/`
+    fn workspace_project(&mut self, workspace_root: &Path) {
+        let workspace_str = workspace_root.to_string_lossy();
+        let encoded = workspace_str.replace('/', "-");
+        let project_dir = self.host_dir.join("projects").join(&encoded);
+
+        if project_dir.is_dir() {
+            let relative_prefix = format!("projects/{encoded}");
+            self.walk_dir(&project_dir);
+            tracing::debug!("Collected project config from {relative_prefix}");
+        }
+    }
+
+    /// Collect files matching a user-provided glob pattern.
+    fn glob(&mut self, pattern: &str) {
+        let full_pattern = format!("{}/{pattern}", self.host_dir.display());
+        let Ok(paths) = glob::glob(&full_pattern) else {
+            tracing::warn!("Invalid glob pattern: {pattern}");
+            return;
+        };
+
+        for entry in paths.flatten() {
+            if !entry.is_file() {
+                continue;
+            }
+            let relative = match entry.strip_prefix(self.host_dir) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+
+            // Skip if already in uploads (avoid duplicates)
+            if self
+                .uploads
+                .iter()
+                .any(|u| u.container_path.ends_with(&relative))
+            {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read(&entry) else {
+                continue;
+            };
+            self.push_file(&relative, &content, 0o644);
+        }
+    }
+
+    // -- private helpers ----------------------------------------------------
+
+    /// Read, rewrite, and push a single file into the uploads vec.
+    fn push_file(&mut self, relative_path: &str, content: &[u8], mode: u32) {
+        let content = maybe_rewrite(content, relative_path, self.rewrites);
+        self.uploads.push(FileUpload {
+            container_path: format!("{}/{relative_path}", self.target_claude_dir),
             content,
             mode,
         });
     }
-}
 
-/// Collect all files in a directory recursively.
-fn collect_directory(
-    host_dir: &Path,
-    relative_dir: &str,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    uploads: &mut Vec<FileUpload>,
-) {
-    let dir_path = host_dir.join(relative_dir);
-    if !dir_path.is_dir() {
-        return;
-    }
-    walk_dir(&dir_path, host_dir, target_claude_dir, rewrites, uploads);
-}
-
-/// Recursively walk a directory and collect files.
-fn walk_dir(
-    dir: &Path,
-    host_base: &Path,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    uploads: &mut Vec<FileUpload>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if WALK_SKIP_DIRS.contains(&name) {
+    /// Recursively walk a directory and collect files.
+    fn walk_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && WALK_SKIP_DIRS.contains(&name)
+                {
                     continue;
                 }
+                self.walk_dir(&path);
+            } else if path.is_file() {
+                let relative = match path.strip_prefix(self.host_dir) {
+                    Ok(r) => r.to_string_lossy().to_string(),
+                    Err(_) => continue,
+                };
+                let Ok(content) = std::fs::read(&path) else {
+                    continue;
+                };
+                self.push_file(&relative, &content, 0o644);
             }
-            walk_dir(&path, host_base, target_claude_dir, rewrites, uploads);
-        } else if path.is_file() {
-            let relative = match path.strip_prefix(host_base) {
-                Ok(r) => r.to_string_lossy().to_string(),
-                Err(_) => continue,
-            };
-            if let Ok(content) = std::fs::read(&path) {
-                let content = maybe_rewrite(&content, &relative, rewrites);
-                uploads.push(FileUpload {
-                    container_path: format!("{target_claude_dir}/{relative}"),
-                    content,
-                    mode: 0o644,
-                });
-            }
-        }
-    }
-}
-
-/// Collect user-created files at the root of `~/.claude/` (not in subdirectories).
-///
-/// Includes files like `statusline-command.sh` that the user created,
-/// excluding known machine-generated files and directories.
-fn collect_user_root_files(
-    host_dir: &Path,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    settings: &cella_config::ClaudeCodeSettings,
-    uploads: &mut Vec<FileUpload>,
-) {
-    let Ok(entries) = std::fs::read_dir(host_dir) else {
-        return;
-    };
-
-    let already_copied: Vec<&str> = DEFAULT_COPY_FILES.to_vec();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        // Skip files already in the default copy list
-        if already_copied.contains(&name) {
-            continue;
-        }
-
-        // Skip default exclude files
-        if DEFAULT_EXCLUDE_FILES.contains(&name) {
-            continue;
-        }
-
-        // Skip user-excluded files
-        if is_user_excluded(name, &settings.exclude) {
-            continue;
-        }
-
-        // Skip known machine-generated files
-        if name.starts_with("security_warnings_state_") {
-            continue;
-        }
-
-        if let Ok(content) = std::fs::read(&path) {
-            let content = maybe_rewrite(&content, name, rewrites);
-            uploads.push(FileUpload {
-                container_path: format!("{target_claude_dir}/{name}"),
-                content,
-                mode: if name
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
-                {
-                    0o755
-                } else {
-                    0o644
-                },
-            });
-        }
-    }
-}
-
-/// Collect the `projects/` subdirectory matching the current workspace.
-///
-/// Claude Code encodes workspace paths by replacing `/` with `-`.
-/// e.g., `/workspaces/cella` → `projects/-workspaces-cella/`
-fn collect_workspace_project(
-    host_dir: &Path,
-    workspace_root: &Path,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    uploads: &mut Vec<FileUpload>,
-) {
-    let workspace_str = workspace_root.to_string_lossy();
-    let encoded = workspace_str.replace('/', "-");
-    let project_dir = host_dir.join("projects").join(&encoded);
-
-    if project_dir.is_dir() {
-        let relative_prefix = format!("projects/{encoded}");
-        walk_dir(&project_dir, host_dir, target_claude_dir, rewrites, uploads);
-        tracing::debug!("Collected project config from {relative_prefix}");
-    }
-}
-
-/// Collect files matching a user-provided glob pattern.
-fn collect_by_glob(
-    host_dir: &Path,
-    pattern: &str,
-    target_claude_dir: &str,
-    rewrites: &[(Regex, String)],
-    uploads: &mut Vec<FileUpload>,
-) {
-    let full_pattern = format!("{}/{pattern}", host_dir.display());
-    let Ok(paths) = glob::glob(&full_pattern) else {
-        tracing::warn!("Invalid glob pattern: {pattern}");
-        return;
-    };
-
-    for entry in paths.flatten() {
-        if !entry.is_file() {
-            continue;
-        }
-        let relative = match entry.strip_prefix(host_dir) {
-            Ok(r) => r.to_string_lossy().to_string(),
-            Err(_) => continue,
-        };
-
-        // Skip if already in uploads (avoid duplicates)
-        if uploads
-            .iter()
-            .any(|u| u.container_path.ends_with(&relative))
-        {
-            continue;
-        }
-
-        if let Ok(content) = std::fs::read(&entry) {
-            let content = maybe_rewrite(&content, &relative, rewrites);
-            uploads.push(FileUpload {
-                container_path: format!("{target_claude_dir}/{relative}"),
-                content,
-                mode: 0o644,
-            });
         }
     }
 }

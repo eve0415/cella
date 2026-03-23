@@ -56,7 +56,6 @@ fi"#;
 ///
 /// Returns `CellaDockerError` if the initial UID lookup fails.
 /// The update script itself is best-effort; failures are logged but not fatal.
-#[allow(clippy::similar_names)]
 pub async fn update_remote_user_uid(
     client: &DockerClient,
     container_id: &str,

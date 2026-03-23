@@ -104,13 +104,13 @@ pub async fn run_daemon(
 /// Check if the daemon is already running.
 ///
 /// Reads the PID file and checks if the process is alive.
-pub fn is_daemon_running(pid_path: &Path, socket_path: &Path, _port_path: &Path) -> bool {
+pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
     let Some(pid) = read_pid_file(pid_path) else {
         return false;
     };
 
     // Check if process is alive (signal 0 = check existence)
-    let alive = unsafe_process_alive(pid);
+    let alive = is_process_alive(pid);
     if !alive {
         // Stale PID file — clean up (preserve port file for reuse)
         debug!("Stale PID file found (PID {pid}), cleaning up");
@@ -173,7 +173,7 @@ pub fn ensure_daemon_running(
     pid_path: &Path,
     port_path: &Path,
 ) -> Result<PathBuf, CellaCredentialProxyError> {
-    if is_daemon_running(pid_path, socket_path, port_path) {
+    if is_daemon_running(pid_path, socket_path) {
         debug!("Credential proxy daemon already running");
         return Ok(socket_path.to_path_buf());
     }
@@ -233,16 +233,19 @@ fn read_pid_file(pid_path: &Path) -> Option<u32> {
 }
 
 /// Check if a process is alive by sending signal 0.
-fn unsafe_process_alive(pid: u32) -> bool {
+fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // kill(pid, 0) checks if process exists without sending a signal
-        // SAFETY: We're only checking process existence via kill(pid, 0),
-        // which is a standard POSIX operation that doesn't affect the process.
-        #[allow(unsafe_code, clippy::cast_possible_wrap)]
-        unsafe {
-            libc_kill(pid as i32, 0) == 0
-        }
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        // Signal 0 checks process existence without sending a signal.
+        // EPERM means the process exists but we lack permission — still alive.
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        kill(Pid::from_raw(pid), None).is_ok()
+            || matches!(nix::errno::Errno::last(), nix::errno::Errno::EPERM)
     }
 
     #[cfg(not(unix))]
@@ -250,16 +253,6 @@ fn unsafe_process_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
-}
-
-/// Minimal wrapper for kill(2) without pulling in libc crate.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
-    unsafe extern "C" {
-        safe fn kill(pid: i32, sig: i32) -> i32;
-    }
-    kill(pid, sig)
 }
 
 /// Check if Docker is reachable by running `docker info`.
@@ -385,6 +378,6 @@ mod tests {
         let pid_path = dir.path().join("test.pid");
         let socket_path = dir.path().join("test.sock");
         let port_path = dir.path().join("test.port");
-        assert!(!is_daemon_running(&pid_path, &socket_path, &port_path));
+        assert!(!is_daemon_running(&pid_path, &socket_path));
     }
 }

@@ -41,8 +41,7 @@ impl Lowerer {
 
     // ── String enum ─────────────────────────────────────────────────────
 
-    #[allow(clippy::unused_self)]
-    pub(super) fn lower_string_enum(&self, name: &str, node: &SchemaNode) -> IrType {
+    pub(super) fn lower_string_enum(name: &str, node: &SchemaNode) -> IrType {
         let has_bool = node.enum_values.iter().any(serde_json::Value::is_boolean);
         let has_string = node.enum_values.iter().any(serde_json::Value::is_string);
 
@@ -97,7 +96,7 @@ impl Lowerer {
                 if node.enum_values.is_empty() {
                     IrTypeRef::String
                 } else {
-                    let ir = self.lower_string_enum(context_name, node);
+                    let ir = Self::lower_string_enum(context_name, node);
                     self.types.push(ir);
                     IrTypeRef::Named(context_name.to_string())
                 }

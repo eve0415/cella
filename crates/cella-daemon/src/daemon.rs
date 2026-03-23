@@ -11,7 +11,7 @@ use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
 use crate::control_server::current_time_secs;
 use crate::health::run_health_monitor;
-use crate::management::run_management_server;
+use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::run_proxy_coordinator;
@@ -110,9 +110,7 @@ pub async fn run_daemon(
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Run the management server (CLI protocol) — blocks until shutdown
-    let result = run_management_server(
-        control_socket_path,
+    let ctx = ManagementContext {
         last_activity,
         port_manager,
         browser_handler,
@@ -121,12 +119,13 @@ pub async fn run_daemon(
         is_orbstack,
         daemon_started_at,
         shutdown_tx,
-        shutdown_rx,
-        control_listener,
         auth_token,
         control_port,
-    )
-    .await;
+    };
+
+    // Run the management server (CLI protocol) — blocks until shutdown
+    let result =
+        run_management_server(control_socket_path, ctx, shutdown_rx, control_listener).await;
 
     // Clean up on exit with a 5s timeout
     let cleanup_fut = tokio::task::spawn_blocking({
@@ -244,7 +243,6 @@ async fn handle_legacy_stream(
     use crate::credential::{
         CredentialResponse, format_response, invoke_git_credential, parse_request,
     };
-    #[allow(unused_imports)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 8192];
@@ -386,7 +384,7 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
         return false;
     };
 
-    let alive = unsafe_process_alive(pid);
+    let alive = is_process_alive(pid);
     if !alive {
         debug!("Stale PID file found (PID {pid}), cleaning up");
         let _ = std::fs::remove_file(pid_path);
@@ -497,13 +495,19 @@ fn read_pid_file(pid_path: &Path) -> Option<u32> {
     content.trim().parse().ok()
 }
 
-fn unsafe_process_alive(pid: u32) -> bool {
+fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        #[allow(unsafe_code, clippy::cast_possible_wrap)]
-        unsafe {
-            libc_kill(pid as i32, 0) == 0
-        }
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        // Signal 0 checks process existence without sending a signal.
+        // EPERM means the process exists but we lack permission — still alive.
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        kill(Pid::from_raw(pid), None).is_ok()
+            || matches!(nix::errno::Errno::last(), nix::errno::Errno::EPERM)
     }
 
     #[cfg(not(unix))]
@@ -511,15 +515,6 @@ fn unsafe_process_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
-    unsafe extern "C" {
-        safe fn kill(pid: i32, sig: i32) -> i32;
-    }
-    kill(pid, sig)
 }
 
 fn cleanup(pid_path: &Path, socket_path: &Path, port_path: &Path, control_socket_path: &Path) {

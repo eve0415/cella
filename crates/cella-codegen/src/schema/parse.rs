@@ -54,17 +54,12 @@ pub fn parse_schema_node(value: &serde_json::Value) -> Result<SchemaNode, CellaC
     };
 
     let mut node = SchemaNode {
-        title: get_str(obj, "title"),
         description: get_str(obj, "description"),
         deprecated: obj
             .get("deprecated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        deprecation_message: get_str(obj, "deprecationMessage"),
-        format: get_str(obj, "format"),
-        pattern: get_str(obj, "pattern"),
         r#ref: get_str(obj, "$ref"),
-        default_value: obj.get("default").cloned(),
         ..SchemaNode::default()
     };
 
@@ -207,20 +202,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn parse(json: serde_json::Value) -> ParsedSchema {
-        parse_root_schema(&json).unwrap()
+    fn parse(json: &serde_json::Value) -> ParsedSchema {
+        parse_root_schema(json).unwrap()
     }
 
     #[test]
     fn empty_schema() {
-        let result = parse(json!({}));
+        let result = parse(&json!({}));
         insta::assert_debug_snapshot!(result);
     }
 
     #[test]
     fn single_string_property() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string" }
@@ -231,7 +225,7 @@ mod tests {
 
     #[test]
     fn nested_objects() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "properties": {
                 "address": {
@@ -248,7 +242,7 @@ mod tests {
 
     #[test]
     fn array_with_items() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "array",
             "items": { "type": "string" }
         }));
@@ -257,7 +251,7 @@ mod tests {
 
     #[test]
     fn enum_values() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "string",
             "enum": ["a", "b", "c"]
         }));
@@ -266,7 +260,7 @@ mod tests {
 
     #[test]
     fn one_of() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "oneOf": [
                 { "type": "string" },
                 { "type": "integer" }
@@ -277,7 +271,7 @@ mod tests {
 
     #[test]
     fn all_of() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "allOf": [
                 { "type": "object", "properties": { "a": { "type": "string" } } },
                 { "type": "object", "properties": { "b": { "type": "integer" } } }
@@ -288,7 +282,7 @@ mod tests {
 
     #[test]
     fn any_of() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "anyOf": [
                 { "type": "string" },
                 { "type": "boolean" }
@@ -299,7 +293,7 @@ mod tests {
 
     #[test]
     fn ref_node() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "$ref": "#/definitions/Foo"
         }));
         insta::assert_debug_snapshot!(result);
@@ -307,7 +301,7 @@ mod tests {
 
     #[test]
     fn definitions() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "definitions": {
                 "Foo": { "type": "string" },
@@ -319,7 +313,7 @@ mod tests {
 
     #[test]
     fn multi_type() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": ["string", "null"]
         }));
         insta::assert_debug_snapshot!(result);
@@ -327,7 +321,7 @@ mod tests {
 
     #[test]
     fn additional_properties_bool() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "additionalProperties": false
         }));
@@ -336,7 +330,7 @@ mod tests {
 
     #[test]
     fn additional_properties_schema() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "additionalProperties": { "type": "string" }
         }));
@@ -353,7 +347,7 @@ mod tests {
 
     #[test]
     fn deprecated_field() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "string",
             "deprecated": true,
             "deprecationMessage": "use X instead"
@@ -363,7 +357,7 @@ mod tests {
 
     #[test]
     fn pattern_properties() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "patternProperties": {
                 "^x-": { "type": "string" }
@@ -374,7 +368,7 @@ mod tests {
 
     #[test]
     fn numeric_constraints() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "integer",
             "minimum": 0,
             "maximum": 100
@@ -384,7 +378,7 @@ mod tests {
 
     #[test]
     fn required_fields() {
-        let result = parse(json!({
+        let result = parse(&json!({
             "type": "object",
             "properties": {
                 "a": { "type": "string" },

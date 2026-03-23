@@ -82,7 +82,7 @@ impl Lowerer {
                 let part_name = format!("{name}Part{i}");
                 let ty = self.lower_inline_to_named(&part_name, member);
                 (format!("part_{i}"), ty)
-            } else if !member.properties.is_empty() || self.is_object_type(member) {
+            } else if !member.properties.is_empty() || Self::is_object_type(member) {
                 // Inline object -> generate auxiliary struct
                 let part_name = format!("{name}Part{i}");
                 let st = self.lower_struct(&part_name, member);

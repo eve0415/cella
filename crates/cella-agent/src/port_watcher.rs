@@ -37,6 +37,111 @@ async fn write_port_map(port_map: &PortMap) {
     }
 }
 
+/// Re-report all known listeners after a reconnect so the daemon has an accurate picture.
+async fn re_report_known_listeners(
+    control: &Mutex<ReconnectingClient>,
+    known: &HashMap<(u16, PortProtocol), DetectedListener>,
+    proxy_ports: &HashMap<u16, u16>,
+) {
+    let mut ctrl = control.lock().await;
+    if !ctrl.take_reconnected() {
+        return;
+    }
+    info!(
+        "Reconnected to daemon, re-reporting {} known listeners",
+        known.len()
+    );
+    for listener in known.values() {
+        let process = cella_port::detection::process_name_for_inode(listener.inode);
+        let msg = AgentMessage::PortOpen {
+            port: listener.port,
+            protocol: listener.protocol,
+            process,
+            bind: listener.bind,
+            proxy_port: proxy_ports.get(&listener.port).copied(),
+        };
+        if let Err(e) = ctrl.send(&msg).await {
+            warn!("Failed to re-report port {}: {e}", listener.port);
+        }
+    }
+}
+
+/// Handle a single newly-detected listener: start proxy if needed, report to daemon,
+/// and read the port mapping response.
+///
+/// Returns `true` if the listener was successfully reported and should be tracked.
+async fn handle_new_listener(
+    listener: &DetectedListener,
+    control: &Mutex<ReconnectingClient>,
+    port_map: &PortMap,
+    proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
+    proxy_ports: &mut HashMap<u16, u16>,
+) -> bool {
+    let process = cella_port::detection::process_name_for_inode(listener.inode);
+    info!(
+        "New listener detected: port {} ({:?}) process={:?}",
+        listener.port, listener.bind, process
+    );
+
+    // Start localhost proxy BEFORE reporting to daemon, so the proxy
+    // is ready when the daemon starts its host-side proxy.
+    let mut agent_proxy_port = None;
+    if listener.bind == BindAddress::Localhost && !proxy_handles.contains_key(&listener.port) {
+        let port = listener.port;
+        match port_proxy::proxy_localhost_to_all(port).await {
+            Ok((pp, handle)) => {
+                debug!("Agent proxy for port {port} on 0.0.0.0:{pp}");
+                agent_proxy_port = Some(pp);
+                proxy_ports.insert(port, pp);
+                proxy_handles.insert(port, handle);
+            }
+            Err(e) => {
+                warn!("Localhost proxy for port {port} failed: {e}");
+            }
+        }
+    }
+
+    // Send port_open to daemon and read port mapping response
+    let msg = AgentMessage::PortOpen {
+        port: listener.port,
+        protocol: listener.protocol,
+        process: process.clone(),
+        bind: listener.bind,
+        proxy_port: agent_proxy_port,
+    };
+    let send_result = {
+        let mut ctrl = control.lock().await;
+        match ctrl.send(&msg).await {
+            Ok(()) => Ok(ctrl.recv().await),
+            Err(e) => Err(e),
+        }
+    };
+
+    match send_result {
+        Ok(Ok(DaemonMessage::PortMapping {
+            container_port,
+            host_port,
+        })) => {
+            debug!("Port mapping: container:{container_port} -> host:{host_port}");
+            port_map.lock().await.insert(container_port, host_port);
+            write_port_map(port_map).await;
+            true
+        }
+        Ok(Ok(_)) => {
+            debug!("Unexpected response to PortOpen (no mapping allocated)");
+            true
+        }
+        Ok(Err(e)) => {
+            debug!("No response to PortOpen: {e}");
+            true
+        }
+        Err(e) => {
+            warn!("Failed to report port open: {e}");
+            false
+        }
+    }
+}
+
 /// Run the port watcher loop with control socket connection.
 pub async fn run(
     poll_interval: Duration,
@@ -52,30 +157,7 @@ pub async fn run(
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        // After a reconnect, re-report all known listeners so the daemon has
-        // an accurate picture of the container's ports.
-        {
-            let mut ctrl = control.lock().await;
-            if ctrl.take_reconnected() {
-                info!(
-                    "Reconnected to daemon, re-reporting {} known listeners",
-                    known.len()
-                );
-                for listener in known.values() {
-                    let process = cella_port::detection::process_name_for_inode(listener.inode);
-                    let msg = AgentMessage::PortOpen {
-                        port: listener.port,
-                        protocol: listener.protocol,
-                        process,
-                        bind: listener.bind,
-                        proxy_port: proxy_ports.get(&listener.port).copied(),
-                    };
-                    if let Err(e) = ctrl.send(&msg).await {
-                        warn!("Failed to re-report port {}: {e}", listener.port);
-                    }
-                }
-            }
-        }
+        re_report_known_listeners(&control, &known, &proxy_ports).await;
 
         let Ok(current) = scan_listeners(proc_path) else {
             warn!("Failed to scan /proc/net/tcp, retrying");
@@ -89,74 +171,15 @@ pub async fn run(
                 continue;
             }
 
-            let process = cella_port::detection::process_name_for_inode(listener.inode);
-            info!(
-                "New listener detected: port {} ({:?}) process={:?}",
-                listener.port, listener.bind, process
-            );
+            let send_ok = handle_new_listener(
+                listener,
+                &control,
+                &port_map,
+                &mut proxy_handles,
+                &mut proxy_ports,
+            )
+            .await;
 
-            // Start localhost proxy BEFORE reporting to daemon, so the proxy
-            // is ready when the daemon starts its host-side proxy.
-            let mut agent_proxy_port = None;
-            if listener.bind == BindAddress::Localhost
-                && !proxy_handles.contains_key(&listener.port)
-            {
-                let port = listener.port;
-                match port_proxy::proxy_localhost_to_all(port).await {
-                    Ok((pp, handle)) => {
-                        debug!("Agent proxy for port {port} on 0.0.0.0:{pp}");
-                        agent_proxy_port = Some(pp);
-                        proxy_ports.insert(port, pp);
-                        proxy_handles.insert(port, handle);
-                    }
-                    Err(e) => {
-                        warn!("Localhost proxy for port {port} failed: {e}");
-                    }
-                }
-            }
-
-            // Send port_open to daemon and read port mapping response
-            let msg = AgentMessage::PortOpen {
-                port: listener.port,
-                protocol: listener.protocol,
-                process: process.clone(),
-                bind: listener.bind,
-                proxy_port: agent_proxy_port,
-            };
-            let send_ok = {
-                let mut ctrl = control.lock().await;
-                match ctrl.send(&msg).await {
-                    Ok(()) => {
-                        // Try to read the PortMapping response
-                        match ctrl.recv().await {
-                            Ok(DaemonMessage::PortMapping {
-                                container_port,
-                                host_port,
-                            }) => {
-                                debug!(
-                                    "Port mapping: container:{container_port} -> host:{host_port}"
-                                );
-                                port_map.lock().await.insert(container_port, host_port);
-                                write_port_map(&port_map).await;
-                            }
-                            Ok(_) => {
-                                debug!("Unexpected response to PortOpen (no mapping allocated)");
-                            }
-                            Err(e) => {
-                                debug!("No response to PortOpen: {e}");
-                            }
-                        }
-                        true
-                    }
-                    Err(e) => {
-                        warn!("Failed to report port open: {e}");
-                        false
-                    }
-                }
-            };
-
-            // Only track the listener if we successfully reported it to the
-            // daemon. On failure it will be retried on the next poll cycle.
             if !send_ok {
                 continue;
             }

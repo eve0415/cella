@@ -11,6 +11,91 @@ pub struct ImageMetadataUserInfo {
     pub container_user: Option<String>,
 }
 
+/// Apply collection fields (containerEnv, mounts, capAdd, securityOpt, etc.) from a
+/// single metadata entry onto the accumulated config.
+fn apply_collections(config: &mut FeatureContainerConfig, entry: &serde_json::Value) {
+    // containerEnv: merge maps, later overrides earlier for same key
+    if let Some(env) = entry.get("containerEnv").and_then(|v| v.as_object()) {
+        for (k, v) in env {
+            if let Some(s) = v.as_str() {
+                config.container_env.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    // mounts: accumulate
+    if let Some(mounts) = entry.get("mounts").and_then(|v| v.as_array()) {
+        for m in mounts {
+            if let Some(s) = m.as_str() {
+                config.mounts.push(s.to_string());
+            }
+        }
+    }
+
+    // capAdd, securityOpt: accumulate + deduplicate
+    if let Some(caps) = entry.get("capAdd").and_then(|v| v.as_array()) {
+        let strs: Vec<String> = caps
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        extend_dedup(&mut config.cap_add, &strs);
+    }
+    if let Some(sec) = entry.get("securityOpt").and_then(|v| v.as_array()) {
+        let strs: Vec<String> = sec
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        extend_dedup(&mut config.security_opt, &strs);
+    }
+
+    // privileged, init: OR
+    if entry.get("privileged").and_then(serde_json::Value::as_bool) == Some(true) {
+        config.privileged = true;
+    }
+    if entry.get("init").and_then(serde_json::Value::as_bool) == Some(true) {
+        config.init = true;
+    }
+
+    // entrypoint
+    if let Some(ep) = entry.get("entrypoint").and_then(|v| v.as_str()) {
+        config.entrypoints.push(ep.to_string());
+    }
+
+    // customizations: deep merge
+    if let Some(cust) = entry.get("customizations") {
+        config.customizations = deep_merge(&config.customizations, cust);
+    }
+}
+
+/// Accessor function that returns a mutable reference to a lifecycle phase's entry list.
+type LifecycleAccessor = fn(&mut crate::types::FeatureLifecycle) -> &mut Vec<LifecycleEntry>;
+
+/// Apply lifecycle commands from a single metadata entry onto the accumulated config.
+fn apply_lifecycle(config: &mut FeatureContainerConfig, entry: &serde_json::Value) {
+    let origin = entry
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("image-metadata")
+        .to_string();
+
+    let phases: &[(&str, LifecycleAccessor)] = &[
+        ("onCreateCommand", |lc| &mut lc.on_create),
+        ("postCreateCommand", |lc| &mut lc.post_create),
+        ("postStartCommand", |lc| &mut lc.post_start),
+        ("postAttachCommand", |lc| &mut lc.post_attach),
+    ];
+    for &(key, accessor) in phases {
+        if let Some(cmd) = entry.get(key)
+            && !cmd.is_null()
+        {
+            accessor(&mut config.lifecycle).push(LifecycleEntry {
+                origin: origin.clone(),
+                command: cmd.clone(),
+            });
+        }
+    }
+}
+
 /// Parse image metadata JSON into container config and user info.
 ///
 /// The metadata is a JSON array of objects. Each entry may contain
@@ -34,97 +119,8 @@ pub fn parse_image_metadata(
             user_info.container_user = Some(u.to_string());
         }
 
-        // containerEnv: merge maps, later overrides earlier for same key
-        if let Some(env) = entry.get("containerEnv").and_then(|v| v.as_object()) {
-            for (k, v) in env {
-                if let Some(s) = v.as_str() {
-                    config.container_env.insert(k.clone(), s.to_string());
-                }
-            }
-        }
-
-        // mounts: accumulate
-        if let Some(mounts) = entry.get("mounts").and_then(|v| v.as_array()) {
-            for m in mounts {
-                if let Some(s) = m.as_str() {
-                    config.mounts.push(s.to_string());
-                }
-            }
-        }
-
-        // capAdd, securityOpt: accumulate + deduplicate
-        if let Some(caps) = entry.get("capAdd").and_then(|v| v.as_array()) {
-            let strs: Vec<String> = caps
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            extend_dedup(&mut config.cap_add, &strs);
-        }
-        if let Some(sec) = entry.get("securityOpt").and_then(|v| v.as_array()) {
-            let strs: Vec<String> = sec
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            extend_dedup(&mut config.security_opt, &strs);
-        }
-
-        // privileged, init: OR
-        if entry.get("privileged").and_then(|v| v.as_bool()) == Some(true) {
-            config.privileged = true;
-        }
-        if entry.get("init").and_then(|v| v.as_bool()) == Some(true) {
-            config.init = true;
-        }
-
-        // entrypoint
-        if let Some(ep) = entry.get("entrypoint").and_then(|v| v.as_str()) {
-            config.entrypoints.push(ep.to_string());
-        }
-
-        // Lifecycle commands
-        let origin = entry
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("image-metadata")
-            .to_string();
-
-        if let Some(cmd) = entry.get("onCreateCommand")
-            && !cmd.is_null()
-        {
-            config.lifecycle.on_create.push(LifecycleEntry {
-                origin: origin.clone(),
-                command: cmd.clone(),
-            });
-        }
-        if let Some(cmd) = entry.get("postCreateCommand")
-            && !cmd.is_null()
-        {
-            config.lifecycle.post_create.push(LifecycleEntry {
-                origin: origin.clone(),
-                command: cmd.clone(),
-            });
-        }
-        if let Some(cmd) = entry.get("postStartCommand")
-            && !cmd.is_null()
-        {
-            config.lifecycle.post_start.push(LifecycleEntry {
-                origin: origin.clone(),
-                command: cmd.clone(),
-            });
-        }
-        if let Some(cmd) = entry.get("postAttachCommand")
-            && !cmd.is_null()
-        {
-            config.lifecycle.post_attach.push(LifecycleEntry {
-                origin: origin.clone(),
-                command: cmd.clone(),
-            });
-        }
-
-        // customizations: deep merge
-        if let Some(cust) = entry.get("customizations") {
-            config.customizations = deep_merge(&config.customizations, cust);
-        }
+        apply_collections(&mut config, entry);
+        apply_lifecycle(&mut config, entry);
     }
 
     (config, user_info)

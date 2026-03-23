@@ -138,12 +138,11 @@ fn to_bollard_mount(m: &MountConfig) -> Mount {
 }
 
 /// Map a resolved devcontainer config to container creation options.
-#[allow(clippy::implicit_hasher)]
-pub fn map_config(
+pub fn map_config<S: std::hash::BuildHasher>(
     config: &serde_json::Value,
     container_name: &str,
     image_name: &str,
-    labels: HashMap<String, String>,
+    labels: HashMap<String, String, S>,
     workspace_root: &Path,
     feature_config: Option<&FeatureContainerConfig>,
     image_env: &[String],
@@ -260,7 +259,7 @@ pub fn map_config(
     CreateContainerOptions {
         name: container_name.to_string(),
         image: image_name.to_string(),
-        labels,
+        labels: labels.into_iter().collect(),
         env,
         remote_env,
         user: container_user,

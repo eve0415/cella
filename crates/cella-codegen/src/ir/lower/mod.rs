@@ -13,10 +13,7 @@ pub fn lower(
     root: &SchemaNode,
     root_type_name: &str,
 ) -> Vec<IrType> {
-    let mut lowerer = Lowerer {
-        types: Vec::new(),
-        definitions: definitions.clone(),
-    };
+    let mut lowerer = Lowerer { types: Vec::new() };
 
     // Lower each definition as a named type
     for (name, node) in definitions {
@@ -32,8 +29,6 @@ pub fn lower(
 
 pub(super) struct Lowerer {
     pub(super) types: Vec<IrType>,
-    #[allow(dead_code)]
-    pub(super) definitions: IndexMap<String, SchemaNode>,
 }
 
 impl Lowerer {
@@ -47,8 +42,8 @@ impl Lowerer {
         } else if !node.any_of.is_empty() {
             self.lower_any_of(name, node)
         } else if !node.enum_values.is_empty() && node.properties.is_empty() {
-            self.lower_string_enum(name, node)
-        } else if !node.properties.is_empty() || self.is_object_type(node) {
+            Self::lower_string_enum(name, node)
+        } else if !node.properties.is_empty() || Self::is_object_type(node) {
             self.lower_struct(name, node)
         } else {
             IrType::Alias(IrAlias {
@@ -118,7 +113,7 @@ impl Lowerer {
 
         // Enum values without a type
         if !node.enum_values.is_empty() {
-            let ir = self.lower_string_enum(context_name, node);
+            let ir = Self::lower_string_enum(context_name, node);
             self.types.push(ir);
             return IrTypeRef::Named(context_name.to_string());
         }
@@ -147,9 +142,9 @@ impl Lowerer {
             let ir = self.lower_any_of(name, node);
             self.types.push(ir);
         } else if !node.enum_values.is_empty() && node.properties.is_empty() {
-            let ir = self.lower_string_enum(name, node);
+            let ir = Self::lower_string_enum(name, node);
             self.types.push(ir);
-        } else if !node.properties.is_empty() || self.is_object_type(node) {
+        } else if !node.properties.is_empty() || Self::is_object_type(node) {
             let ir = self.lower_struct(name, node);
             self.types.push(ir);
         } else if node.schema_type.is_some() {
@@ -165,8 +160,7 @@ impl Lowerer {
         IrTypeRef::Named(name.to_string())
     }
 
-    #[allow(clippy::unused_self)]
-    pub(super) const fn is_object_type(&self, node: &SchemaNode) -> bool {
+    pub(super) const fn is_object_type(node: &SchemaNode) -> bool {
         matches!(
             node.schema_type,
             Some(SchemaType::Single(PrimitiveType::Object))

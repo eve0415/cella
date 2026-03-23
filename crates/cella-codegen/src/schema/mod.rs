@@ -1,16 +1,12 @@
 pub mod parse;
-pub mod resolve;
 
 use indexmap::IndexMap;
 
 /// A node in the JSON Schema AST. Faithfully represents JSON Schema structure.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct SchemaNode {
-    pub title: Option<String>,
     pub description: Option<String>,
     pub deprecated: bool,
-    pub deprecation_message: Option<String>,
     pub schema_type: Option<SchemaType>,
     pub properties: IndexMap<String, Self>,
     pub required: Vec<String>,
@@ -24,9 +20,6 @@ pub struct SchemaNode {
     pub r#ref: Option<String>,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
-    pub pattern: Option<String>,
-    pub format: Option<String>,
-    pub default_value: Option<serde_json::Value>,
     pub unevaluated_properties: Option<bool>,
     pub definitions: IndexMap<String, Self>,
 }
@@ -61,14 +54,5 @@ impl SchemaNode {
             self.additional_properties,
             Some(AdditionalProperties::Bool(false))
         )
-    }
-
-    /// Returns true if this node is a simple object (has properties, no composition keywords).
-    #[allow(dead_code)]
-    pub fn is_simple_object(&self) -> bool {
-        !self.properties.is_empty()
-            && self.one_of.is_empty()
-            && self.all_of.is_empty()
-            && self.any_of.is_empty()
     }
 }

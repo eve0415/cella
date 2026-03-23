@@ -256,6 +256,7 @@ pub mod mock {
     }
 
     /// Hand-rolled mock with FIFO response queues per method and call recording.
+    #[derive(Default)]
     pub struct MockDockerClient {
         pub calls: Mutex<Vec<MockCall>>,
         pub find_container_responses:
@@ -280,37 +281,18 @@ pub mod mock {
         pub upload_files_responses: Mutex<VecDeque<Result<(), CellaDockerError>>>,
     }
 
-    #[allow(clippy::new_without_default)]
     impl MockDockerClient {
-        #[allow(clippy::missing_panics_doc)]
         pub fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                find_container_responses: Mutex::new(VecDeque::new()),
-                create_container_responses: Mutex::new(VecDeque::new()),
-                start_container_responses: Mutex::new(VecDeque::new()),
-                stop_container_responses: Mutex::new(VecDeque::new()),
-                remove_container_responses: Mutex::new(VecDeque::new()),
-                inspect_container_responses: Mutex::new(VecDeque::new()),
-                list_cella_containers_responses: Mutex::new(VecDeque::new()),
-                container_logs_responses: Mutex::new(VecDeque::new()),
-                exec_command_responses: Mutex::new(VecDeque::new()),
-                exec_stream_responses: Mutex::new(VecDeque::new()),
-                exec_interactive_responses: Mutex::new(VecDeque::new()),
-                exec_detached_responses: Mutex::new(VecDeque::new()),
-                pull_image_responses: Mutex::new(VecDeque::new()),
-                build_image_responses: Mutex::new(VecDeque::new()),
-                image_exists_responses: Mutex::new(VecDeque::new()),
-                inspect_image_details_responses: Mutex::new(VecDeque::new()),
-                upload_files_responses: Mutex::new(VecDeque::new()),
-            }
+            Self::default()
         }
 
         fn record(&self, call: MockCall) {
             self.calls.lock().unwrap().push(call);
         }
 
-        #[allow(clippy::missing_panics_doc)]
+        /// # Panics
+        ///
+        /// Panics if the internal mutex is poisoned.
         pub fn get_calls(&self) -> Vec<MockCall> {
             self.calls.lock().unwrap().clone()
         }

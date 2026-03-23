@@ -53,27 +53,37 @@ pub fn parse_lifecycle_command(value: &Value) -> ParsedLifecycle {
     }
 }
 
+/// Shared container context for lifecycle phase execution.
+pub struct LifecycleContext<'a> {
+    /// Docker client.
+    pub client: &'a DockerClient,
+    /// Container to run commands in.
+    pub container_id: &'a str,
+    /// User to run commands as.
+    pub user: Option<&'a str>,
+    /// Environment variables.
+    pub env: &'a [String],
+    /// Working directory inside the container.
+    pub working_dir: Option<&'a str>,
+    /// Whether to print progress and stream output to stderr.
+    pub is_text: bool,
+}
+
 /// Execute lifecycle commands for a phase.
 ///
-/// When `is_text` is true, prints origin-tracked progress (matching the original
+/// When `ctx.is_text` is true, prints origin-tracked progress (matching the original
 /// devcontainer CLI phrasing) and streams sequential command output to stderr.
 ///
 /// # Errors
 ///
 /// Returns `CellaDockerError::LifecycleFailed` if any command fails.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_lifecycle_phase(
-    client: &DockerClient,
-    container_id: &str,
+    ctx: &LifecycleContext<'_>,
     phase: &str,
     value: &Value,
     origin: &str,
-    user: Option<&str>,
-    env: &[String],
-    working_dir: Option<&str>,
-    is_text: bool,
 ) -> Result<(), CellaDockerError> {
-    if is_text {
+    if ctx.is_text {
         eprintln!("Running the {phase} from {origin}...");
     }
     debug!("Running {phase} from {origin}");
@@ -89,16 +99,21 @@ pub async fn run_lifecycle_phase(
                 debug!("{phase}: {}", cmd.join(" "));
                 let opts = ExecOptions {
                     cmd,
-                    user: user.map(String::from),
-                    env: Some(env.to_vec()),
-                    working_dir: working_dir.map(String::from),
+                    user: ctx.user.map(String::from),
+                    env: Some(ctx.env.to_vec()),
+                    working_dir: ctx.working_dir.map(String::from),
                 };
-                let result = if is_text {
-                    client
-                        .exec_stream(container_id, &opts, std::io::stderr(), std::io::stderr())
+                let result = if ctx.is_text {
+                    ctx.client
+                        .exec_stream(
+                            ctx.container_id,
+                            &opts,
+                            std::io::stderr(),
+                            std::io::stderr(),
+                        )
                         .await?
                 } else {
-                    client.exec_command(container_id, &opts).await?
+                    ctx.client.exec_command(ctx.container_id, &opts).await?
                 };
 
                 if result.exit_code != 0 {
@@ -116,15 +131,16 @@ pub async fn run_lifecycle_phase(
         ParsedLifecycle::Parallel(commands) => {
             let mut futures = Vec::new();
             for (name, cmd) in commands {
-                let user = user.map(String::from);
-                let env = env.to_vec();
-                let working_dir = working_dir.map(String::from);
+                let user = ctx.user.map(String::from);
+                let env = ctx.env.to_vec();
+                let working_dir = ctx.working_dir.map(String::from);
                 let phase = phase.to_string();
-                let container_id = container_id.to_string();
+                let container_id = ctx.container_id.to_string();
 
                 futures.push(async move {
                     debug!("{phase} [{name}]: {}", cmd.join(" "));
-                    let result = client
+                    let result = ctx
+                        .client
                         .exec_command(
                             &container_id,
                             &ExecOptions {
@@ -152,7 +168,7 @@ pub async fn run_lifecycle_phase(
 
             let results = futures_util::future::join_all(futures).await;
 
-            if is_text {
+            if ctx.is_text {
                 for exec_result in results.iter().flatten() {
                     if !exec_result.stdout.is_empty() {
                         eprint!("{}", exec_result.stdout);
