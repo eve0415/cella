@@ -43,7 +43,7 @@ jobs:
           components: clippy
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::all
 
   test:
     name: Test
