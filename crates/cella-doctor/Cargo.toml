@@ -1,0 +1,20 @@
+[package]
+name = "cella-doctor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cella-config.workspace = true
+cella-daemon.workspace = true
+cella-docker.workspace = true
+cella-env.workspace = true
+cella-port.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

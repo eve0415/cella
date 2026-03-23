@@ -1,0 +1,389 @@
+//! Core types and orchestration for doctor checks.
+
+pub mod config;
+pub mod container;
+pub mod daemon;
+pub mod docker;
+pub mod git;
+pub mod system;
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Serialize;
+use tokio::time::timeout;
+
+use cella_docker::DockerClient;
+
+/// Default timeout per check category.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Severity level for a check result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Check passed.
+    Pass,
+    /// Non-blocking issue.
+    Warning,
+    /// Blocking issue.
+    Error,
+    /// Informational (not pass/fail).
+    Info,
+}
+
+/// Result of a single diagnostic check.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckResult {
+    /// Short name for the check.
+    pub name: String,
+    /// Outcome severity.
+    #[serde(rename = "status")]
+    pub severity: Severity,
+    /// Human-readable detail.
+    pub detail: String,
+    /// Suggested fix command or action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_hint: Option<String>,
+}
+
+/// Results for one category of checks.
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryReport {
+    /// Category display name.
+    #[serde(skip)]
+    pub name: String,
+    /// Worst severity across all checks in this category.
+    pub status: Severity,
+    /// Individual check results.
+    pub checks: Vec<CheckResult>,
+}
+
+impl CategoryReport {
+    fn new(name: impl Into<String>, checks: Vec<CheckResult>) -> Self {
+        let status = checks
+            .iter()
+            .map(|c| c.severity)
+            .max_by_key(|s| match s {
+                Severity::Error => 3,
+                Severity::Warning => 2,
+                Severity::Pass => 1,
+                Severity::Info => 0,
+            })
+            .unwrap_or(Severity::Pass);
+        Self {
+            name: name.into(),
+            status,
+            checks,
+        }
+    }
+}
+
+/// Full diagnostic report across all categories.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub categories: Vec<CategoryReport>,
+}
+
+impl Report {
+    /// Whether any check produced an error.
+    pub fn has_errors(&self) -> bool {
+        self.categories
+            .iter()
+            .flat_map(|c| &c.checks)
+            .any(|r| r.severity == Severity::Error)
+    }
+
+    /// Redact sensitive information from all check results.
+    pub fn redact(&mut self, redactor: &crate::redact::Redactor) {
+        for category in &mut self.categories {
+            for check in &mut category.checks {
+                check.detail = redactor.redact(&check.detail);
+                if let Some(ref hint) = check.fix_hint {
+                    check.fix_hint = Some(redactor.redact(hint));
+                }
+            }
+        }
+    }
+
+    /// Overall status string.
+    fn overall_status(&self) -> &'static str {
+        if self.has_errors() {
+            "error"
+        } else if self
+            .categories
+            .iter()
+            .flat_map(|c| &c.checks)
+            .any(|r| r.severity == Severity::Warning)
+        {
+            "warn"
+        } else {
+            "ok"
+        }
+    }
+
+    /// Serialize to JSON for machine-readable output.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut categories = serde_json::Map::new();
+        for cat in &self.categories {
+            let key = cat
+                .name
+                .to_lowercase()
+                .replace(" & ", "_")
+                .replace(' ', "_");
+            categories.insert(key, serde_json::to_value(cat).unwrap_or_default());
+        }
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "overall": self.overall_status(),
+            "categories": categories,
+        })
+    }
+}
+
+/// Shared context for all checks.
+pub struct CheckContext {
+    /// Current workspace folder, if detected.
+    pub workspace_folder: Option<PathBuf>,
+    /// Whether to check all containers (--all flag).
+    pub all: bool,
+    /// Docker client, if connection succeeded.
+    pub docker_client: Option<DockerClient>,
+}
+
+impl CheckContext {
+    /// Build a new context, attempting Docker connection.
+    pub fn new(workspace_folder: Option<PathBuf>, all: bool) -> Self {
+        let docker_client = DockerClient::connect().ok();
+        Self {
+            workspace_folder,
+            all,
+            docker_client,
+        }
+    }
+}
+
+/// Run all diagnostic checks and produce a report.
+pub async fn run_all_checks(ctx: &CheckContext) -> Report {
+    let mut categories = Vec::new();
+
+    // System info (no timeout needed, all local)
+    categories.push(system::check_system(ctx).await);
+
+    // Docker checks
+    if let Ok(cat) = timeout(CHECK_TIMEOUT, docker::check_docker(ctx)).await {
+        categories.push(cat);
+    } else {
+        categories.push(CategoryReport::new(
+            "Docker",
+            vec![CheckResult {
+                name: "timeout".into(),
+                severity: Severity::Error,
+                detail: "Docker checks timed out after 5s".into(),
+                fix_hint: Some("Docker daemon may be unresponsive".into()),
+            }],
+        ));
+    }
+
+    // Git & Credentials checks
+    if let Ok(cat) = timeout(CHECK_TIMEOUT, git::check_git(ctx)).await {
+        categories.push(cat);
+    } else {
+        categories.push(CategoryReport::new(
+            "Git & Credentials",
+            vec![CheckResult {
+                name: "timeout".into(),
+                severity: Severity::Warning,
+                detail: "Git checks timed out after 5s".into(),
+                fix_hint: None,
+            }],
+        ));
+    }
+
+    // Daemon checks
+    let daemon_running;
+    if let Ok(cat) = timeout(CHECK_TIMEOUT, daemon::check_daemon()).await {
+        daemon_running = cat
+            .checks
+            .iter()
+            .any(|c| c.name == "running" && c.severity == Severity::Pass);
+        categories.push(cat);
+    } else {
+        daemon_running = false;
+        categories.push(CategoryReport::new(
+            "Daemon",
+            vec![CheckResult {
+                name: "timeout".into(),
+                severity: Severity::Warning,
+                detail: "Daemon checks timed out after 5s".into(),
+                fix_hint: None,
+            }],
+        ));
+    }
+
+    // Configuration checks
+    if let Ok(cat) = timeout(CHECK_TIMEOUT, config::check_config(ctx)).await {
+        categories.push(cat);
+    } else {
+        categories.push(CategoryReport::new(
+            "Configuration",
+            vec![CheckResult {
+                name: "timeout".into(),
+                severity: Severity::Warning,
+                detail: "Configuration checks timed out after 5s".into(),
+                fix_hint: None,
+            }],
+        ));
+    }
+
+    // Container checks
+    if let Ok(mut cats) = timeout(
+        CHECK_TIMEOUT,
+        container::check_containers(ctx, daemon_running),
+    )
+    .await
+    {
+        categories.append(&mut cats);
+    } else {
+        categories.push(CategoryReport::new(
+            "Containers",
+            vec![CheckResult {
+                name: "timeout".into(),
+                severity: Severity::Warning,
+                detail: "Container checks timed out after 5s".into(),
+                fix_hint: None,
+            }],
+        ));
+    }
+
+    Report { categories }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_has_errors_with_error() {
+        let report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "check".into(),
+                    severity: Severity::Error,
+                    detail: "bad".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn report_has_errors_without_error() {
+        let report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![
+                    CheckResult {
+                        name: "ok".into(),
+                        severity: Severity::Pass,
+                        detail: "good".into(),
+                        fix_hint: None,
+                    },
+                    CheckResult {
+                        name: "warn".into(),
+                        severity: Severity::Warning,
+                        detail: "meh".into(),
+                        fix_hint: None,
+                    },
+                ],
+            )],
+        };
+        assert!(!report.has_errors());
+    }
+
+    #[test]
+    fn report_overall_status() {
+        let ok_report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "ok".into(),
+                    severity: Severity::Pass,
+                    detail: "good".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        assert_eq!(ok_report.overall_status(), "ok");
+
+        let warn_report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "w".into(),
+                    severity: Severity::Warning,
+                    detail: "warn".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        assert_eq!(warn_report.overall_status(), "warn");
+
+        let err_report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "e".into(),
+                    severity: Severity::Error,
+                    detail: "err".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        assert_eq!(err_report.overall_status(), "error");
+    }
+
+    #[test]
+    fn report_to_json_structure() {
+        let report = Report {
+            categories: vec![CategoryReport::new(
+                "Docker",
+                vec![CheckResult {
+                    name: "daemon".into(),
+                    severity: Severity::Pass,
+                    detail: "running".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        let json = report.to_json();
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["overall"], "ok");
+        assert!(json["categories"]["docker"].is_object());
+        assert_eq!(json["categories"]["docker"]["checks"][0]["name"], "daemon");
+    }
+
+    #[test]
+    fn category_report_status_is_worst() {
+        let cat = CategoryReport::new(
+            "test",
+            vec![
+                CheckResult {
+                    name: "a".into(),
+                    severity: Severity::Pass,
+                    detail: String::new(),
+                    fix_hint: None,
+                },
+                CheckResult {
+                    name: "b".into(),
+                    severity: Severity::Warning,
+                    detail: String::new(),
+                    fix_hint: None,
+                },
+            ],
+        );
+        assert_eq!(cat.status, Severity::Warning);
+    }
+}

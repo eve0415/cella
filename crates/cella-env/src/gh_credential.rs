@@ -79,13 +79,45 @@ pub fn gh_config_dir_for_user(remote_user: &str) -> String {
 }
 
 /// Check if `gh auth status` succeeds (exit code 0).
-fn gh_is_authenticated() -> bool {
+pub fn gh_is_authenticated() -> bool {
     Command::new("gh")
         .args(["auth", "status"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Host-side GitHub CLI status.
+pub struct HostGhStatus {
+    /// Whether `gh` is installed.
+    pub installed: bool,
+    /// Whether `gh auth status` succeeds.
+    pub authenticated: bool,
+    /// stderr output from `gh auth status` when authenticated.
+    pub status_output: Option<String>,
+}
+
+/// Probe the host's GitHub CLI installation and auth status.
+pub fn probe_host_gh_status() -> HostGhStatus {
+    let output = Command::new("gh").args(["auth", "status"]).output();
+    match output {
+        Ok(o) if o.status.success() => HostGhStatus {
+            installed: true,
+            authenticated: true,
+            status_output: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+        },
+        Ok(_) => HostGhStatus {
+            installed: true,
+            authenticated: false,
+            status_output: None,
+        },
+        Err(_) => HostGhStatus {
+            installed: false,
+            authenticated: false,
+            status_output: None,
+        },
+    }
 }
 
 /// Extract GitHub hostnames from workspace git remotes.

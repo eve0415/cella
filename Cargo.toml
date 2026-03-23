@@ -6,6 +6,7 @@ members = [
     "crates/cella-config",
     "crates/cella-credential-proxy",
     "crates/cella-daemon",
+    "crates/cella-doctor",
     "crates/cella-docker",
     "crates/cella-env",
     "crates/cella-git",
@@ -77,6 +78,7 @@ tempfile = "3.27.0"
 # Internal crates
 cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
+cella-doctor = { path = "crates/cella-doctor" }
 cella-config = { path = "crates/cella-config" }
 cella-credential-proxy = { path = "crates/cella-credential-proxy" }
 cella-daemon = { path = "crates/cella-daemon" }

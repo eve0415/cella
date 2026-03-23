@@ -265,6 +265,7 @@ dependencies = [
  "cella-credential-proxy",
  "cella-daemon",
  "cella-docker",
+ "cella-doctor",
  "cella-env",
  "cella-features",
  "cella-git",
@@ -349,6 +350,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cella-doctor"
+version = "0.1.0"
+dependencies = [
+ "cella-config",
+ "cella-daemon",
+ "cella-docker",
+ "cella-env",
+ "cella-port",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

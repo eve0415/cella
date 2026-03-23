@@ -12,6 +12,7 @@ path = "src/main.rs"
 cella-config.workspace = true
 cella-credential-proxy.workspace = true
 cella-daemon.workspace = true
+cella-doctor.workspace = true
 cella-docker.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true

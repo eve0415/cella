@@ -174,28 +174,25 @@ async fn sync_gh(
 }
 
 async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let redactor = cella_doctor::redact::Redactor::new();
+
     // Host section: check gh auth status
     eprintln!("Host:");
-    let gh_status = std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .output();
-
-    match gh_status {
-        Ok(output) if output.status.success() => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
+    let gh_status = cella_env::gh_credential::probe_host_gh_status();
+    if !gh_status.installed {
+        eprintln!("  gh CLI: not installed");
+    } else if gh_status.authenticated {
+        if let Some(ref output) = gh_status.status_output {
+            let redacted = redactor.redact(output);
+            for line in redacted.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     eprintln!("  {trimmed}");
                 }
             }
         }
-        Ok(_) => {
-            eprintln!("  gh CLI: not authenticated");
-        }
-        Err(_) => {
-            eprintln!("  gh CLI: not installed");
-        }
+    } else {
+        eprintln!("  gh CLI: not authenticated");
     }
 
     // Config section
