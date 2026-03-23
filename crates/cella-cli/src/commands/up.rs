@@ -185,8 +185,8 @@ impl UpContext {
             .unwrap_or_else(|| "root".to_string())
     }
 
-    /// Run the env forwarding + Claude auth + Claude Code install + userEnvProbe
-    /// sequence that is shared between the running and stopped-restart paths.
+    /// Run the env forwarding + tool auth/install + userEnvProbe sequence
+    /// that is shared between the running and stopped-restart paths.
     async fn prepare_container_env(
         &self,
         container_id: &str,
@@ -207,16 +207,36 @@ impl UpContext {
         .await;
 
         // Claude Code: re-sync auth + ensure installed
-        let cc_settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        if cc_settings.tools.claude_code.forward_config {
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
+        if settings.tools.claude_code.forward_config {
             resync_claude_auth(&self.client, container_id, remote_user).await;
         }
-        if cc_settings.tools.claude_code.enabled {
+        if settings.tools.claude_code.enabled {
             install_claude_code(
                 &self.client,
                 container_id,
                 remote_user,
-                &cc_settings.tools.claude_code,
+                &settings.tools.claude_code,
+            )
+            .await;
+        }
+
+        // Codex/Gemini: no auth resync needed (bind mount), just ensure installed
+        if settings.tools.codex.enabled {
+            install_codex(
+                &self.client,
+                container_id,
+                remote_user,
+                &settings.tools.codex,
+            )
+            .await;
+        }
+        if settings.tools.gemini.enabled {
+            install_gemini(
+                &self.client,
+                container_id,
+                remote_user,
+                &settings.tools.gemini,
             )
             .await;
         }
@@ -485,6 +505,32 @@ impl UpContext {
             });
         }
 
+        // Auto-mount ~/.codex if Codex config forwarding is enabled
+        if settings.tools.codex.forward_config
+            && let Some(host_path) = cella_env::codex::host_codex_dir()
+        {
+            let target = cella_env::codex::container_codex_dir(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+
+        // Auto-mount ~/.gemini if Gemini config forwarding is enabled
+        if settings.tools.gemini.forward_config
+            && let Some(host_path) = cella_env::gemini::host_gemini_dir()
+        {
+            let target = cella_env::gemini::container_gemini_dir(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+
         // Forwarding env vars
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -663,7 +709,38 @@ impl UpContext {
             .await;
         }
 
-        // Claude Code: forward config + install (first create)
+        // Forward config and install AI coding tools
+        self.install_tools(container_id, remote_user, settings)
+            .await;
+
+        // Probe and cache user environment (userEnvProbe)
+        let probed_env = timed_step(
+            self.is_text,
+            "Running userEnvProbe...",
+            super::env_cache::probe_and_cache_user_env(
+                &self.client,
+                container_id,
+                remote_user,
+                self.probe_type(),
+            ),
+        )
+        .await;
+
+        let lifecycle_env = probed_env.as_ref().map_or_else(
+            || remote_env.to_vec(),
+            |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
+        );
+
+        (probed_env, lifecycle_env)
+    }
+
+    /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
+    async fn install_tools(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::Settings,
+    ) {
         if settings.tools.claude_code.forward_config {
             timed_step(
                 self.is_text,
@@ -691,26 +768,32 @@ impl UpContext {
             )
             .await;
         }
-
-        // Probe and cache user environment (userEnvProbe)
-        let probed_env = timed_step(
-            self.is_text,
-            "Running userEnvProbe...",
-            super::env_cache::probe_and_cache_user_env(
-                &self.client,
-                container_id,
-                remote_user,
-                self.probe_type(),
-            ),
-        )
-        .await;
-
-        let lifecycle_env = probed_env.as_ref().map_or_else(
-            || remote_env.to_vec(),
-            |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
-        );
-
-        (probed_env, lifecycle_env)
+        if settings.tools.codex.enabled {
+            timed_step(
+                self.is_text,
+                "Installing Codex...",
+                install_codex(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.codex,
+                ),
+            )
+            .await;
+        }
+        if settings.tools.gemini.enabled {
+            timed_step(
+                self.is_text,
+                "Installing Gemini CLI...",
+                install_gemini(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.gemini,
+                ),
+            )
+            .await;
+        }
     }
 
     /// The full build/create/start/lifecycle path for a new container.
@@ -1497,10 +1580,9 @@ async fn is_claude_code_installed(
     false
 }
 
-/// Detect Alpine and install Claude Code native dependencies if needed.
-/// Returns `true` if the container is Alpine-based.
-async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) -> bool {
-    let is_alpine = client
+/// Check if the container is Alpine-based.
+async fn is_alpine_container(client: &DockerClient, container_id: &str) -> bool {
+    client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -1515,7 +1597,13 @@ async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) ->
             },
         )
         .await
-        .is_ok_and(|r| r.exit_code == 0);
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
+/// Detect Alpine and install Claude Code native dependencies if needed.
+/// Returns `true` if the container is Alpine-based.
+async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) -> bool {
+    let is_alpine = is_alpine_container(client, container_id).await;
 
     if is_alpine {
         info!("Alpine detected, installing Claude Code dependencies...");
@@ -1612,4 +1700,230 @@ fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>
             warn!("Claude Code installation failed: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codex / Gemini CLI installation (npm-based)
+// ---------------------------------------------------------------------------
+
+/// Ensure Node.js and npm are available in the container.
+///
+/// If npm is not found, attempts to install Node.js via the system package
+/// manager (apt-get or apk). Returns `true` if npm is available after the check.
+async fn ensure_node_available(client: &DockerClient, container_id: &str) -> bool {
+    let npm_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "command -v npm".to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if npm_check.is_ok_and(|r| r.exit_code == 0) {
+        return true;
+    }
+
+    info!("npm not found, installing Node.js...");
+    let install_cmd = if is_alpine_container(client, container_id).await {
+        "apk add --no-cache nodejs npm"
+    } else {
+        "apt-get update -qq && apt-get install -y -qq nodejs npm"
+    };
+
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match &result {
+        Ok(r) if r.exit_code == 0 => {
+            info!("Node.js installed successfully");
+            true
+        }
+        Ok(r) => {
+            warn!(
+                "Node.js installation failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+            false
+        }
+        Err(e) => {
+            warn!("Node.js installation failed: {e}");
+            false
+        }
+    }
+}
+
+/// Check if an npm-installed CLI tool is already present at the desired version.
+async fn is_npm_tool_installed(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    binary_name: &str,
+    version: &str,
+) -> bool {
+    let version_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![binary_name.to_string(), "--version".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if let Ok(result) = &version_check
+        && result.exit_code == 0
+    {
+        let installed = result.stdout.trim();
+        if version == "latest" {
+            tracing::debug!("{binary_name} already installed: {installed}");
+            return true;
+        }
+        if installed.contains(version) {
+            tracing::debug!("{binary_name} already at version {version}: {installed}");
+            return true;
+        }
+    }
+    false
+}
+
+/// Install an npm package globally inside the container.
+async fn npm_install_global(
+    client: &DockerClient,
+    container_id: &str,
+    package: &str,
+    version: &str,
+) -> Result<cella_docker::ExecResult, CellaDockerError> {
+    let pkg = if version == "latest" {
+        package.to_string()
+    } else {
+        format!("{package}@{version}")
+    };
+
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("npm install -g {pkg}"),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+}
+
+/// Log the result of an npm tool installation attempt.
+fn log_npm_install_result(
+    tool_name: &str,
+    result: Result<cella_docker::ExecResult, CellaDockerError>,
+) {
+    match result {
+        Ok(r) if r.exit_code == 0 => {
+            info!("{tool_name} installed successfully");
+        }
+        Ok(r) => {
+            warn!(
+                "{tool_name} installation exited with code {}: {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+        }
+        Err(e) => {
+            warn!("{tool_name} installation failed: {e}");
+        }
+    }
+}
+
+/// Install `OpenAI` Codex CLI inside the container via npm.
+///
+/// Checks if already installed, ensures Node.js/npm are available,
+/// then runs `npm install -g @openai/codex`.
+async fn install_codex(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    settings: &cella_config::Codex,
+) {
+    if is_npm_tool_installed(
+        client,
+        container_id,
+        remote_user,
+        "codex",
+        &settings.version,
+    )
+    .await
+    {
+        return;
+    }
+
+    if !ensure_node_available(client, container_id).await {
+        warn!("Cannot install Codex: Node.js/npm not available");
+        return;
+    }
+
+    info!("Installing Codex ({})...", settings.version);
+    let result = npm_install_global(client, container_id, "@openai/codex", &settings.version).await;
+    log_npm_install_result("Codex", result);
+}
+
+/// Install Google Gemini CLI inside the container via npm.
+///
+/// Checks if already installed, ensures Node.js/npm are available,
+/// then runs `npm install -g @google/gemini-cli`.
+async fn install_gemini(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    settings: &cella_config::Gemini,
+) {
+    if is_npm_tool_installed(
+        client,
+        container_id,
+        remote_user,
+        "gemini",
+        &settings.version,
+    )
+    .await
+    {
+        return;
+    }
+
+    if !ensure_node_available(client, container_id).await {
+        warn!("Cannot install Gemini CLI: Node.js/npm not available");
+        return;
+    }
+
+    info!("Installing Gemini CLI ({})...", settings.version);
+    let result = npm_install_global(
+        client,
+        container_id,
+        "@google/gemini-cli",
+        &settings.version,
+    )
+    .await;
+    log_npm_install_result("Gemini CLI", result);
 }

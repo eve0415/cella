@@ -5,7 +5,9 @@
 //! for the container.
 
 pub mod claude_code;
+pub mod codex;
 mod error;
+pub mod gemini;
 pub mod gh_credential;
 pub mod git_config;
 pub mod git_credential;
