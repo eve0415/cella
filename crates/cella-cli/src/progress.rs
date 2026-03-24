@@ -20,9 +20,9 @@
 //! [`indicatif::MultiProgress::println`] so structured log lines never
 //! corrupt active spinners.
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
-use std::future::Future;
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};

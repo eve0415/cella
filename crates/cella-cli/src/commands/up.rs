@@ -2514,10 +2514,7 @@ async fn npm_install_global(
 }
 
 /// Log the result of an npm tool installation attempt.
-fn log_npm_install_result(
-    tool_name: &str,
-    result: Result<ExecResult, CellaDockerError>,
-) {
+fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("{tool_name} installed successfully");

@@ -165,12 +165,7 @@ async fn run_sequential(
             } else {
                 // Fallback: stream directly to stderr
                 ctx.client
-                    .exec_stream(
-                        ctx.container_id,
-                        &opts,
-                        io::stderr(),
-                        io::stderr(),
-                    )
+                    .exec_stream(ctx.container_id, &opts, io::stderr(), io::stderr())
                     .await?
             }
         } else {
