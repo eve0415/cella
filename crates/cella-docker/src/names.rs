@@ -119,6 +119,25 @@ pub fn container_labels(
     labels
 }
 
+/// Additional Docker labels for worktree-backed containers.
+///
+/// These are merged into the standard labels when a container is created
+/// via `cella branch`.
+pub fn worktree_labels(branch_name: &str, parent_repo: &Path) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert("dev.cella.worktree".to_string(), "true".to_string());
+    labels.insert("dev.cella.branch".to_string(), branch_name.to_string());
+    labels.insert(
+        "dev.cella.parent_repo".to_string(),
+        parent_repo
+            .canonicalize()
+            .unwrap_or_else(|_| parent_repo.to_path_buf())
+            .to_string_lossy()
+            .to_string(),
+    );
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +239,19 @@ mod tests {
             "orbstack",
         );
         assert_eq!(labels["dev.cella.docker_runtime"], "orbstack");
+    }
+
+    #[test]
+    fn worktree_labels_contain_required_keys() {
+        let labels = worktree_labels("feature/auth", &PathBuf::from("/tmp/repo"));
+        assert_eq!(labels["dev.cella.worktree"], "true");
+        assert_eq!(labels["dev.cella.branch"], "feature/auth");
+        assert!(labels.contains_key("dev.cella.parent_repo"));
+    }
+
+    #[test]
+    fn worktree_labels_preserve_branch_name() {
+        let labels = worktree_labels("feature/auth/oauth2", &PathBuf::from("/tmp/repo"));
+        assert_eq!(labels["dev.cella.branch"], "feature/auth/oauth2");
     }
 }

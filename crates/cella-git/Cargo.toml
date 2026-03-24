@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta = "1.46.3"
 
 [lints]
 workspace = true

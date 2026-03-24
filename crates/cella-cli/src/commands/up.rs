@@ -59,10 +59,10 @@ impl UpArgs {
 }
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
-struct UpContext {
+pub struct UpContext {
     resolved: ResolvedConfig,
-    client: DockerClient,
-    container_nm: String,
+    pub client: DockerClient,
+    pub container_nm: String,
     remote_env: Vec<String>,
     workspace_folder_from_config: Option<String>,
     default_workspace_folder: String,
@@ -70,6 +70,8 @@ struct UpContext {
     output: OutputFormat,
     remove_container: bool,
     build_no_cache: bool,
+    /// Extra Docker labels to merge into the container (e.g., worktree labels).
+    extra_labels: std::collections::HashMap<String, String>,
 }
 
 /// Resolved image configuration for container creation.
@@ -137,6 +139,69 @@ impl UpContext {
             output: args.output.clone(),
             remove_container,
             build_no_cache: args.build_no_cache,
+            extra_labels: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Create an `UpContext` for a workspace path (used by `cella branch`).
+    ///
+    /// Unlike `new()`, this does not take `UpArgs` — it accepts the workspace
+    /// path and options directly. Always sets `remove_container` and
+    /// `build_no_cache` to false.
+    pub async fn for_workspace(
+        workspace_path: &std::path::Path,
+        docker_host: Option<&str>,
+        extra_labels: std::collections::HashMap<String, String>,
+        progress: crate::progress::Progress,
+        output: OutputFormat,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cwd = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.to_path_buf());
+
+        let resolved = progress
+            .run_step("Resolving devcontainer configuration...", async {
+                resolve::config(&cwd, None)
+            })
+            .await?;
+
+        for w in &resolved.warnings {
+            warn!("{}", w.message);
+        }
+
+        let config = &resolved.config;
+        let config_name = config.get("name").and_then(|v| v.as_str());
+
+        let client = match docker_host {
+            Some(host) => DockerClient::connect_with_host(host)?,
+            None => DockerClient::connect()?,
+        };
+        client.ping().await?;
+
+        let container_nm = container_name(&resolved.workspace_root, config_name);
+        let remote_env = map_env_object(config.get("remoteEnv"));
+        let workspace_folder_from_config = config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
+            || "workspace".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+
+        Ok(Self {
+            resolved,
+            client,
+            container_nm,
+            remote_env,
+            workspace_folder_from_config,
+            default_workspace_folder,
+            progress,
+            output,
+            remove_container: false,
+            build_no_cache: false,
+            extra_labels,
         })
     }
 
@@ -536,6 +601,9 @@ impl UpContext {
                 other_ports_attrs.as_ref(),
             ),
         );
+
+        // Merge extra labels (e.g., worktree labels from `cella branch`)
+        labels.extend(self.extra_labels.clone());
 
         labels
     }
@@ -964,10 +1032,12 @@ impl UpContext {
     }
 
     /// The full build/create/start/lifecycle path for a new container.
-    async fn create_and_start(
+    ///
+    /// Returns the container ID and remote user on success.
+    pub async fn create_and_start(
         &self,
         build_no_cache: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<CreateResult, Box<dyn std::error::Error>> {
         let config = self.config();
 
         // Run initializeCommand on host (runs every invocation per spec)
@@ -1070,8 +1140,17 @@ impl UpContext {
             self.workspace_folder_str(),
         );
 
-        Ok(())
+        Ok(CreateResult {
+            container_id: container_id.clone(),
+            remote_user: remote_user.clone(),
+        })
     }
+}
+
+/// Result of creating and starting a container.
+pub struct CreateResult {
+    pub container_id: String,
+    pub remote_user: String,
 }
 
 impl UpArgs {
@@ -1119,7 +1198,8 @@ impl UpArgs {
             }
         }
 
-        ctx.create_and_start(self.build_no_cache).await
+        ctx.create_and_start(self.build_no_cache).await?;
+        Ok(())
     }
 }
 

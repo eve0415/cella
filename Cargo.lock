@@ -414,7 +414,10 @@ dependencies = [
 name = "cella-git"
 version = "0.1.0"
 dependencies = [
+ "insta",
+ "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

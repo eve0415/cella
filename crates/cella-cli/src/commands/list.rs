@@ -104,8 +104,8 @@ fn print_table(containers: &[ContainerInfo]) {
 
     // Print header
     println!(
-        "{:<28} {:<12} {:<10} {:<40} {:<12} AGE",
-        "NAME", "ID", "STATE", "WORKSPACE", "PORTS"
+        "{:<28} {:<12} {:<10} {:<16} {:<40} {:<12} AGE",
+        "NAME", "ID", "STATE", "BRANCH", "WORKSPACE", "PORTS"
     );
 
     for c in containers {
@@ -113,12 +113,14 @@ fn print_table(containers: &[ContainerInfo]) {
             .labels
             .get("dev.cella.workspace_path")
             .map_or("-", String::as_str);
+        let branch = c.labels.get("dev.cella.branch").map_or("-", String::as_str);
 
         println!(
-            "{:<28} {:<12} {:<10} {:<40} {:<12} {}",
+            "{:<28} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
             c.name,
             short_id(&c.id),
             state_str(&c.state),
+            branch,
             workspace,
             format_ports(c),
             format_age(c.created_at.as_deref()),
@@ -134,6 +136,7 @@ fn print_json(containers: &[ContainerInfo]) {
                 "name": c.name,
                 "id": short_id(&c.id),
                 "state": state_str(&c.state),
+                "branch": c.labels.get("dev.cella.branch").unwrap_or(&String::new()),
                 "workspace": c.labels.get("dev.cella.workspace_path").unwrap_or(&String::new()),
                 "ports": format_ports(c),
                 "age": format_age(c.created_at.as_deref()),

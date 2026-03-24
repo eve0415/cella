@@ -22,7 +22,9 @@ pub use image::{BuildOptions, ImageDetails};
 pub use lifecycle::{
     LifecycleContext, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,
 };
-pub use names::{container_labels, container_name, image_name, image_name_with_features};
+pub use names::{
+    container_labels, container_name, image_name, image_name_with_features, worktree_labels,
+};
 pub use resolve::ContainerTarget;
 pub use uid::update_remote_user_uid;
 pub use upload::FileToUpload;
