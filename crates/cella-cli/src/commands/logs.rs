@@ -48,11 +48,7 @@ impl LogsArgs {
     async fn show_container_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
         let client = super::connect_docker(self.docker_host.as_deref())?;
 
-        let cwd = if let Some(ref wf) = self.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         let container = client
             .find_container(&cwd)

@@ -27,11 +27,7 @@ pub struct ReadConfigurationArgs {
 
 impl ReadConfigurationArgs {
     pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = if let Some(ref wf) = self.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         let resolved = resolve::config(&cwd, self.config.as_deref())?;
 

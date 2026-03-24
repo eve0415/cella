@@ -96,11 +96,7 @@ impl UpContext {
         args: &UpArgs,
         progress: crate::progress::Progress,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let cwd = if let Some(ref wf) = args.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
         let remove_container = args.rebuild || args.remove_existing_container;
 
@@ -1363,14 +1359,7 @@ pub fn run_host_command(
             run_single_host_command(phase, &["sh", "-c", s])?;
         }
         serde_json::Value::Array(arr) => {
-            let cmd: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if !cmd.is_empty() {
-                let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                run_single_host_command(phase, &refs)?;
-            }
+            run_json_array_command(phase, arr)?;
         }
         serde_json::Value::Object(map) => {
             for (name, v) in map {
@@ -1380,14 +1369,7 @@ pub fn run_host_command(
                         run_single_host_command(phase, &["sh", "-c", s])?;
                     }
                     serde_json::Value::Array(arr) => {
-                        let cmd: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
-                        if !cmd.is_empty() {
-                            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                            run_single_host_command(phase, &refs)?;
-                        }
+                        run_json_array_command(phase, arr)?;
                     }
                     _ => {}
                 }
@@ -1396,6 +1378,21 @@ pub fn run_host_command(
         _ => {}
     }
 
+    Ok(())
+}
+
+fn run_json_array_command(
+    phase: &str,
+    arr: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cmd: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if !cmd.is_empty() {
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        run_single_host_command(phase, &refs)?;
+    }
     Ok(())
 }
 

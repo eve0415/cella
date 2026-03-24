@@ -49,11 +49,7 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = if let Some(ref wf) = self.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         // 1. Resolve config
         info!("Resolving devcontainer config...");

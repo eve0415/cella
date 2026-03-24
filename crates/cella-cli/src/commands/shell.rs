@@ -45,28 +45,8 @@ impl ShellArgs {
         };
 
         let container = target.resolve(&client, true).await?;
-
-        // If --service is specified and this is a compose container, resolve the service container
-        let container = if let Some(ref svc) = self.service {
-            if let Some(project) =
-                cella_compose::discovery::compose_project_from_labels(&container.labels)
-            {
-                client
-                    .find_compose_container(project, svc)
-                    .await?
-                    .ok_or_else(|| {
-                        format!("Service '{svc}' not found in compose project '{project}'")
-                    })?
-            } else {
-                return Err(format!(
-                    "--service flag requires a compose-based devcontainer, but '{}' is not",
-                    container.name
-                )
-                .into());
-            }
-        } else {
-            container
-        };
+        let container =
+            super::resolve_service_container(&client, container, self.service.as_deref()).await?;
 
         super::ensure_credential_proxy();
 
@@ -108,7 +88,7 @@ impl ShellArgs {
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
         super::env_cache::ensure_ssh_auth_sock(&client, &container.id, &user, &mut env).await;
 
-        for var in TERMINAL_ENV_VARS {
+        for var in super::TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 env.push(format!("{var}={val}"));
             }
@@ -246,13 +226,3 @@ async fn detect_shell_by_probing(
     None
 }
 
-/// Terminal environment variables to forward into the container.
-const TERMINAL_ENV_VARS: &[&str] = &[
-    "TERM",
-    "COLORTERM",
-    "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
-    "LANG",
-    "COLUMNS",
-    "LINES",
-];
