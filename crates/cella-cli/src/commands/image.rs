@@ -70,6 +70,8 @@ pub async fn build_features_layer(
     );
     let start = std::time::Instant::now();
     let progress_ref = ctx.progress.clone();
+    ctx.progress
+        .println("  \x1b[36m▸\x1b[0m Building features layer...");
     let result = ctx
         .client
         .build_image(&build_opts, |line| {
@@ -80,12 +82,12 @@ pub async fn build_features_layer(
         .await;
     let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
     match &result {
-        Ok(_) => ctx.progress.println(&format!(
-            "  \x1b[32m✓\x1b[0m Building features layer...{elapsed}"
-        )),
-        Err(e) => ctx.progress.println(&format!(
-            "  \x1b[31m✗\x1b[0m Building features layer...: {e}"
-        )),
+        Ok(_) => ctx
+            .progress
+            .println(&format!("  \x1b[32m✓\x1b[0m Built features layer{elapsed}")),
+        Err(e) => ctx
+            .progress
+            .println(&format!("  \x1b[31m✗\x1b[0m Building features layer: {e}")),
     }
     result?;
     Ok(features_image)
@@ -168,6 +170,7 @@ async fn resolve_base_image(
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
         let start = std::time::Instant::now();
         let progress_ref = progress.clone();
+        progress.println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
         let result = client
             .build_image(&build_opts, |line| {
                 if !line.trim().is_empty() {
@@ -177,10 +180,8 @@ async fn resolve_base_image(
             .await;
         let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
         match &result {
-            Ok(_) => progress.println(&format!(
-                "  \x1b[32m✓\x1b[0m Building Dockerfile...{elapsed}"
-            )),
-            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m Building Dockerfile...: {e}")),
+            Ok(_) => progress.println(&format!("  \x1b[32m✓\x1b[0m Built Dockerfile{elapsed}")),
+            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m Building Dockerfile: {e}")),
         }
         result?;
         Ok(img_name)
