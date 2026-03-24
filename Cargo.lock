@@ -333,6 +333,7 @@ dependencies = [
 name = "cella-credential-proxy"
 version = "0.0.1"
 dependencies = [
+ "cella-daemon",
  "nix",
  "tempfile",
  "thiserror 2.0.18",

@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 
 use cella_compose::discovery;
-use cella_docker::{ContainerInfo, ContainerState, DockerClient};
+use cella_docker::{ContainerInfo, ContainerState};
 
 /// List all dev containers managed by cella.
 #[derive(Args)]
@@ -24,10 +24,7 @@ pub struct ListArgs {
 
 impl ListArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let containers = client.list_cella_containers(self.running).await?;
 

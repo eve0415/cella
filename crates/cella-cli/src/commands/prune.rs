@@ -4,8 +4,6 @@ use std::io::{self, BufRead, Write};
 use clap::Args;
 use tracing::{debug, info};
 
-use cella_docker::DockerClient;
-
 /// Remove stale worktrees and their associated containers.
 ///
 /// Identifies worktrees whose branches have been fully merged into the
@@ -59,10 +57,7 @@ impl PruneArgs {
         debug!("merged branches: {merged:?}");
 
         // 4. Connect to Docker for container lookup
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
 
         // 5. Find prunable worktrees
         let mut candidates = Vec::new();

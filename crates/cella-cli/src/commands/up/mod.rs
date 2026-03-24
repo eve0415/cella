@@ -119,10 +119,7 @@ impl UpContext {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
-        let client = match &args.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(args.docker_host.as_deref())?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -181,10 +178,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = match docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(docker_host)?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);

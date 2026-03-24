@@ -125,6 +125,20 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
     args
 }
 
+/// Spawn a task that reads lines from an async stream and forwards them to a channel.
+fn spawn_line_reader(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = tx.send(line);
+        }
+    });
+}
+
 impl DockerClient {
     /// Pull an image by reference (e.g., `mcr.microsoft.com/devcontainers/rust:1`).
     ///
@@ -199,25 +213,11 @@ impl DockerClient {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         if let Some(stdout) = child.stdout.take() {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(line);
-                }
-            });
+            spawn_line_reader(stdout, tx.clone());
         }
 
         if let Some(stderr) = child.stderr.take() {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(line);
-                }
-            });
+            spawn_line_reader(stderr, tx.clone());
         }
 
         // Drop our sender so rx closes when spawned tasks finish.

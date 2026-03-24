@@ -38,6 +38,29 @@ struct PortAllocation {
     container_id: String,
 }
 
+/// Scan a range of ports for the first available one in the allocation table.
+fn scan_range(
+    allocations: &mut HashMap<u16, PortAllocation>,
+    range: impl Iterator<Item = u16>,
+    container_port: u16,
+    container_id: &str,
+    is_available: &impl Fn(u16) -> bool,
+) -> Option<u16> {
+    for port in range {
+        if let std::collections::hash_map::Entry::Vacant(e) = allocations.entry(port)
+            && is_available(port)
+        {
+            e.insert(PortAllocation {
+                host_port: port,
+                container_port,
+                container_id: container_id.to_string(),
+            });
+            return Some(port);
+        }
+    }
+    None
+}
+
 impl PortAllocationTable {
     /// Create a new allocation table with default port range.
     pub fn new() -> Self {
@@ -113,33 +136,16 @@ impl PortAllocationTable {
             return Err(CellaPortError::PortInUse(container_port));
         }
 
-        // Sequential scan from container_port + 1
+        // Sequential scan from container_port + 1, then wrap around from range_start
         let start = container_port.saturating_add(1).max(self.range_start);
-        for port in start..=self.range_end {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.allocations.entry(port)
-                && is_available(port)
-            {
-                e.insert(PortAllocation {
-                    host_port: port,
-                    container_port,
-                    container_id: container_id.to_string(),
-                });
-                return Ok(port);
-            }
-        }
-
-        // Wrap around from range_start
-        for port in self.range_start..container_port {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.allocations.entry(port)
-                && is_available(port)
-            {
-                e.insert(PortAllocation {
-                    host_port: port,
-                    container_port,
-                    container_id: container_id.to_string(),
-                });
-                return Ok(port);
-            }
+        if let Some(port) = scan_range(
+            &mut self.allocations,
+            (start..=self.range_end).chain(self.range_start..container_port),
+            container_port,
+            container_id,
+            &is_available,
+        ) {
+            return Ok(port);
         }
 
         Err(CellaPortError::NoAvailablePorts)

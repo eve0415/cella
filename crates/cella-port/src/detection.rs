@@ -94,6 +94,25 @@ fn classify_bind_address(addr_hex: &str) -> BindAddress {
     }
 }
 
+/// Read a single proc tcp file and insert any detected listeners.
+fn read_proc_tcp_listeners(
+    path: &Path,
+    protocol: PortProtocol,
+    listeners: &mut HashSet<DetectedListener>,
+    at_least_one_read: &mut bool,
+    last_error: &mut Option<std::io::Error>,
+) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            *at_least_one_read = true;
+            for listener in parse_proc_net_tcp(&content, protocol) {
+                listeners.insert(listener);
+            }
+        }
+        Err(e) => *last_error = Some(e),
+    }
+}
+
 /// Scan `/proc/net/tcp` and `/proc/net/tcp6` for listening ports.
 ///
 /// Returns the set of all detected listeners.
@@ -106,30 +125,23 @@ pub fn scan_listeners(proc_path: &Path) -> Result<HashSet<DetectedListener>, std
     let mut last_error: Option<std::io::Error> = None;
     let mut at_least_one_read = false;
 
-    // Read /proc/net/tcp (IPv4)
+    // Read /proc/net/tcp (IPv4) and /proc/net/tcp6 (IPv6)
     let tcp_path = proc_path.join("net/tcp");
-    match std::fs::read_to_string(&tcp_path) {
-        Ok(content) => {
-            at_least_one_read = true;
-            for listener in parse_proc_net_tcp(&content, PortProtocol::Tcp) {
-                listeners.insert(listener);
-            }
-        }
-        Err(e) => last_error = Some(e),
-    }
-
-    // Read /proc/net/tcp6 (IPv6)
+    read_proc_tcp_listeners(
+        &tcp_path,
+        PortProtocol::Tcp,
+        &mut listeners,
+        &mut at_least_one_read,
+        &mut last_error,
+    );
     let tcp6_path = proc_path.join("net/tcp6");
-    match std::fs::read_to_string(&tcp6_path) {
-        Ok(content) => {
-            at_least_one_read = true;
-            // IPv6 listeners with protocol Tcp — the underlying protocol is still TCP
-            for listener in parse_proc_net_tcp(&content, PortProtocol::Tcp) {
-                listeners.insert(listener);
-            }
-        }
-        Err(e) => last_error = Some(e),
-    }
+    read_proc_tcp_listeners(
+        &tcp6_path,
+        PortProtocol::Tcp,
+        &mut listeners,
+        &mut at_least_one_read,
+        &mut last_error,
+    );
 
     if !at_least_one_read {
         return Err(last_error.unwrap_or_else(|| {

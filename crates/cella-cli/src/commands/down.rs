@@ -8,7 +8,7 @@ use super::up::OutputFormat;
 use cella_compose::discovery;
 use cella_credential_proxy::daemon::stop_daemon;
 use cella_daemon::shared::running_cella_container_count;
-use cella_docker::{ContainerInfo, ContainerState, ContainerTarget, DockerClient};
+use cella_docker::{ContainerInfo, ContainerState, ContainerTarget};
 use cella_env::git_credential::{
     credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
     daemon_management_socket_path,
@@ -56,10 +56,7 @@ impl DownArgs {
     }
 
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let target = ContainerTarget {
             container_id: self.container_id,

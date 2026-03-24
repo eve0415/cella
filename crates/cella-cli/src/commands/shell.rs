@@ -35,10 +35,7 @@ pub struct ShellArgs {
 
 impl ShellArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let target = ContainerTarget {
             container_id: self.container_id,

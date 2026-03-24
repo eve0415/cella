@@ -67,10 +67,7 @@ impl BuildArgs {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
         client.ping().await?;
 
         // Docker Compose: build all services + feature-enriched primary image

@@ -121,6 +121,19 @@ impl Command {
     }
 }
 
+/// Connect to the Docker daemon, optionally using an explicit host URL.
+///
+/// # Errors
+///
+/// Returns error if the Docker client cannot connect.
+pub fn connect_docker(
+    docker_host: Option<&str>,
+) -> Result<cella_docker::DockerClient, cella_docker::CellaDockerError> {
+    docker_host.map_or_else(cella_docker::DockerClient::connect, |host| {
+        cella_docker::DockerClient::connect_with_host(host)
+    })
+}
+
 /// Ensure the credential proxy daemon is running (legacy).
 ///
 /// Starts it as a background process if not already running.

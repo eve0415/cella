@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::warn;
 
-use cella_docker::{ContainerTarget, DockerClient, ExecOptions, InteractiveExecOptions};
+use cella_docker::{ContainerTarget, ExecOptions, InteractiveExecOptions};
 
 /// Execute a command inside the running dev container.
 #[derive(Args)]
@@ -55,10 +55,7 @@ pub struct ExecArgs {
 
 impl ExecArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let target = ContainerTarget {
             container_id: self.container_id,
