@@ -1,0 +1,36 @@
+class Cella < Formula
+  desc "Dev containers reinvented"
+  homepage "https://github.com/eve0415/cella"
+  version "VERSION"
+  license "GPL-3.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/eve0415/cella/releases/download/vVERSION/cella-vVERSION-aarch64-apple-darwin.tar.gz"
+      sha256 "SHA256_MACOS_ARM"
+    end
+    on_intel do
+      url "https://github.com/eve0415/cella/releases/download/vVERSION/cella-vVERSION-x86_64-apple-darwin.tar.gz"
+      sha256 "SHA256_MACOS_INTEL"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/eve0415/cella/releases/download/vVERSION/cella-vVERSION-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "SHA256_LINUX_ARM"
+    end
+    on_intel do
+      url "https://github.com/eve0415/cella/releases/download/vVERSION/cella-vVERSION-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "SHA256_LINUX_INTEL"
+    end
+  end
+
+  def install
+    bin.install "cella"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/cella --version")
+  end
+end
