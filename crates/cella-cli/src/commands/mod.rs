@@ -17,7 +17,7 @@ mod nvim;
 mod ports;
 mod prune;
 mod shell;
-mod spawn;
+
 mod switch;
 mod template;
 mod up;
@@ -48,8 +48,6 @@ pub enum Command {
     Doctor(doctor::DoctorArgs),
     /// Create a new worktree-backed branch with its own dev container.
     Branch(branch::BranchArgs),
-    /// Spawn an AI agent sandbox.
-    Spawn(spawn::SpawnArgs),
     /// Switch to a different worktree-backed branch.
     Switch(switch::SwitchArgs),
     /// Remove stale worktrees and their associated containers.
@@ -102,7 +100,7 @@ impl Command {
             Self::Logs(args) => args.execute().await,
             Self::Doctor(args) => args.execute().await,
             Self::Branch(args) => args.execute(progress).await,
-            Self::Spawn(args) => args.execute(),
+
             Self::Switch(args) => args.execute(),
             Self::Prune(args) => args.execute().await,
             Self::Config(args) => args.execute(),

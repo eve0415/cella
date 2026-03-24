@@ -23,7 +23,6 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `logs` | View logs from the dev container |
 | `doctor` | Check system dependencies and configuration |
 | `branch` | Create a new worktree-backed branch with its own dev container |
-| `spawn` | Spawn an AI agent sandbox |
 | `switch` | Switch to a different worktree-backed branch |
 | `prune` | Remove stale worktrees and their associated containers |
 | `config` | View and manage cella configuration |
@@ -58,7 +57,6 @@ Hidden internal commands: `daemon`, `credential-proxy`.
 | `commands/credential.rs` | Credential forwarding management |
 | `commands/ports.rs` | Port forwarding status |
 | `commands/branch.rs` | Worktree-backed branch creation |
-| `commands/spawn.rs` | AI agent sandbox spawning |
 | `commands/init.rs` | Repository initialization |
 
 Each command file defines an args struct and an `execute()` method.

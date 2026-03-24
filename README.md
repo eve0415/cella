@@ -107,7 +107,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 ### Planned
 
 - [ ] Git worktree integration (1 branch = 1 container)
-- [ ] AI agent spawning (`cella spawn`)
+- [ ] AI agent launching (`cella branch --agent`)
 - [ ] tmux integration
 - [ ] Neovim integration
 - [ ] Templates & global config
