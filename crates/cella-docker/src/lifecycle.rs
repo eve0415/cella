@@ -98,7 +98,7 @@ impl<'a> CallbackWriter<'a> {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]);
             if !line.trim().is_empty() {
-                (self.callback)(&format!("    {line}"));
+                (self.callback)(&format!("      {line}"));
             }
             self.buf.drain(..=pos);
         }
@@ -108,7 +108,7 @@ impl<'a> CallbackWriter<'a> {
         if !self.buf.is_empty() {
             let line = String::from_utf8_lossy(&self.buf);
             if !line.trim().is_empty() {
-                (self.callback)(&format!("    {line}"));
+                (self.callback)(&format!("      {line}"));
             }
             self.buf.clear();
         }
@@ -356,22 +356,22 @@ mod tests {
     fn callback_writer_indents_lines() {
         let lines = collect_callback_lines(b"first line\nsecond line\n");
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "    first line");
-        assert_eq!(lines[1], "    second line");
+        assert_eq!(lines[0], "      first line");
+        assert_eq!(lines[1], "      second line");
     }
 
     #[test]
     fn callback_writer_flushes_partial_line_on_drop() {
         let lines = collect_callback_lines(b"no newline");
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], "    no newline");
+        assert_eq!(lines[0], "      no newline");
     }
 
     #[test]
     fn callback_writer_skips_blank_lines() {
         let lines = collect_callback_lines(b"content\n\n  \nanother\n");
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "    content");
-        assert_eq!(lines[1], "    another");
+        assert_eq!(lines[0], "      content");
+        assert_eq!(lines[1], "      another");
     }
 }
