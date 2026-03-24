@@ -70,9 +70,6 @@ pub async fn build_features_layer(
     );
     let start = std::time::Instant::now();
     let progress_ref = ctx.progress.clone();
-    // Print header before streaming build output.
-    ctx.progress
-        .println("  \x1b[36m▸\x1b[0m Building features layer...");
     let result = ctx
         .client
         .build_image(&build_opts, |line| {
@@ -171,7 +168,6 @@ async fn resolve_base_image(
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
         let start = std::time::Instant::now();
         let progress_ref = progress.clone();
-        progress.println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
         let result = client
             .build_image(&build_opts, |line| {
                 if !line.trim().is_empty() {
