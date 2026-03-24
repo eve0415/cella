@@ -294,6 +294,16 @@ impl UpContext {
             .unwrap_or_else(|| "root".to_string())
     }
 
+    /// Detect the container architecture from the Docker daemon.
+    async fn detect_arch(&self) -> String {
+        cella_docker::volume::detect_container_arch(self.client.inner())
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Container arch detection failed, defaulting to x86_64: {e}");
+                "x86_64".to_string()
+            })
+    }
+
     /// Run the env forwarding + userEnvProbe + tool auth/install sequence
     /// that is shared between the running and stopped-restart paths.
     async fn prepare_container_env(
@@ -1131,7 +1141,6 @@ impl UpContext {
         build_no_cache: bool,
     ) -> Result<CreateResult, Box<dyn std::error::Error>> {
         let config = self.config();
-
         // Run initializeCommand on host (runs every invocation per spec)
         if let Some(init_cmd) = config.get("initializeCommand") {
             run_host_command("initializeCommand", init_cmd)?;
@@ -1148,14 +1157,7 @@ impl UpContext {
             &self.progress,
         )
         .await?;
-
-        let agent_arch = cella_docker::volume::detect_container_arch(self.client.inner())
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Container arch detection failed, defaulting to x86_64: {e}");
-                "x86_64".to_string()
-            });
-
+        let agent_arch = self.detect_arch().await;
         let ImageConfig {
             image_env,
             remote_user,
