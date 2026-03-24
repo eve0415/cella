@@ -128,9 +128,7 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
 ///
 /// Returns `io::Error` if the current executable cannot be determined or the
 /// process cannot be spawned.
-pub fn start_background_process(
-    args: &[&str],
-) -> Result<std::process::Child, std::io::Error> {
+pub fn start_background_process(args: &[&str]) -> Result<std::process::Child, std::io::Error> {
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe)
         .args(args)

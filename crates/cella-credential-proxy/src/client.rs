@@ -13,10 +13,8 @@ pub use cella_daemon::shared::DaemonStatus;
 ///
 /// Returns `CellaCredentialProxyError::Socket` if connection or I/O fails.
 pub fn ping_daemon(socket_path: &Path) -> Result<bool, CellaCredentialProxyError> {
-    cella_daemon::shared::ping_daemon(socket_path).map_err(|e| {
-        CellaCredentialProxyError::Socket {
-            message: format!("ping failed for {}: {e}", socket_path.display()),
-        }
+    cella_daemon::shared::ping_daemon(socket_path).map_err(|e| CellaCredentialProxyError::Socket {
+        message: format!("ping failed for {}: {e}", socket_path.display()),
     })
 }
 

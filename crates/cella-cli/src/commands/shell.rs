@@ -225,4 +225,3 @@ async fn detect_shell_by_probing(
     }
     None
 }
-

@@ -14,9 +14,7 @@ use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::run_proxy_coordinator;
-use crate::shared::{
-    cleanup_files, current_time_secs, read_pid_file, set_socket_permissions,
-};
+use crate::shared::{cleanup_files, current_time_secs, read_pid_file, set_socket_permissions};
 
 /// Write the PID file and ensure the parent directory exists.
 fn write_pid_and_ensure_dir(socket_path: &Path, pid_path: &Path) -> Result<u32, CellaDaemonError> {
