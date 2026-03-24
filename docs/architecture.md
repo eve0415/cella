@@ -3,18 +3,29 @@
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   cella-cli                      │
-│         (command parsing, user output)           │
-├──────────┬──────────┬──────────┬────────────────┤
-│cella-git │cella-dock│cella-port│  cella-agent   │
-│(worktree)│(container│(port     │  (AI sandbox   │
-│          │ runtime) │ mgmt)    │   lifecycle)   │
-├──────────┴──────────┴──────────┴────────────────┤
-│                 cella-config                     │
-│        (devcontainer.json, templates)            │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                          cella-cli                           │
+│               (command parsing, user output)                 │
+├──────────┬──────────┬─────────┬─────────┬────────┬──────────┤
+│cella-    │cella-    │cella-git│cella-env│cella-  │cella-    │
+│docker    │compose   │(worktree│(env     │daemon  │doctor    │
+│(container│(compose  │ mgmt)   │ fwding) │(host   │(health   │
+│ runtime) │ orchestr)│         │         │ daemon)│ checks)  │
+├──────────┴──────┬───┴─────────┴─────────┴────────┴──────────┤
+│  cella-agent    │  cella-config    cella-features            │
+│  (in-container  │  (devcontainer   (OCI feature              │
+│   agent)        │   parsing)       resolution)               │
+├─────────────────┼────────────────────────────────────────────┤
+│  cella-port     │  cella-codegen   cella-credential-proxy    │
+│  (IPC protocol) │  (schema codegen)(legacy credential proxy) │
+└─────────────────┴────────────────────────────────────────────┘
 ```
+
+**Tier 1 — CLI:** cella-cli is the only binary entry point. It contains no business logic.
+
+**Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, and the in-container agent.
+
+**Tier 3 — Foundation:** Shared infrastructure crates. Configuration parsing, feature resolution, port protocol, code generation, and the legacy credential proxy.
 
 ## Crate Responsibilities
 
@@ -22,37 +33,61 @@
 
 The binary entry point. Handles argument parsing via clap, initializes tracing, and dispatches to the appropriate command handler. Contains no business logic — it delegates everything to the library crates.
 
-### cella-config
-
-Parses and manages devcontainer.json configuration files. Handles JSONC (comments + trailing commas), merges configuration layers (workspace, user, defaults), and provides type-safe access to schema fields. Uses typify for codegen from the devcontainer JSON Schema where possible.
-
 ### cella-docker
 
-Abstracts container runtime operations. Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Designed as a trait-based abstraction to allow future support for alternative runtimes.
+Abstracts container runtime operations. Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Wraps the bollard Docker API client behind a `DockerApi` trait for testability and future runtime support (Podman). Handles `runArgs` parsing (30+ docker create flags), lifecycle command execution, UID remapping, file uploads, and spec compliance features like `shutdownAction`, `waitFor`, and `appPort` deprecation.
+
+### cella-compose
+
+Docker Compose orchestration. Generates override compose files that layer cella's customizations on top of user compose files, shells out to the `docker compose` V2 CLI, discovers compose-managed containers via Docker labels, and detects config changes via multi-file SHA-256 hashing.
 
 ### cella-git
 
-Handles git worktree operations and branch management. Creates, lists, and removes worktrees, manages the relationship between branches and their worktree directories, and coordinates with cella-docker to bind worktrees to containers.
+Git worktree management and branch resolution. Creates, lists, and removes worktrees, resolves branch state (new, existing, merged, tracking-gone), discovers repository metadata, and computes content hashes (git HEAD + dirty files) for `updateContentCommand` change detection. All git operations run through a central command runner with exponential backoff retry on lock contention.
 
-### cella-port
+### cella-env
 
-Manages port allocation for dev containers. Handles auto-allocation to avoid conflicts between multiple concurrent containers, port forwarding setup, and configurable port ranges.
+Environment forwarding orchestration. Detects the host environment (SSH agent, git config, credential proxies, AI agent tools) and produces the mounts, environment variables, and post-start commands needed to forward that environment into containers. Includes platform-aware runtime detection (Docker Desktop, OrbStack, Linux native, Colima) and AI agent config forwarding for Claude Code, Codex, and Gemini CLI.
+
+### cella-daemon
+
+Unified host-side daemon for port forwarding, credential proxying, and browser handling. Runs as a background process, accepting TCP connections from in-container agents. Includes OrbStack-specific port coordination, health monitoring, auth token management, and file-based logging.
 
 ### cella-agent
 
-Manages AI agent sandboxes. Handles agent preset configuration, sandbox creation and lifecycle management, resource isolation, and coordinates with other crates to provide agents with their own isolated worktree + container environments.
+In-container binary uploaded during `cella up`. Polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding. Proxies localhost-bound applications to `0.0.0.0`, handles `BROWSER` environment variable interception for OAuth callbacks, and forwards git credential requests to the host. Uses manual argument parsing (no clap) to minimize binary size.
+
+### cella-doctor
+
+System diagnostics and health checking. Runs structured checks across six categories (system, Docker, git/credentials, daemon, configuration, containers) with per-category timeouts. Validates `hostRequirements` from the devcontainer spec (CPU, memory, storage, GPU). Includes PII redaction for safe sharing of diagnostic output.
+
+### cella-config
+
+Devcontainer configuration parsing, validation, and layer merging. Handles JSONC (comments + trailing commas) with byte offset preservation for source-positioned diagnostics. Uses build-time code generation via cella-codegen to produce typed Rust structs from the devcontainer JSON Schema. Manages cella-specific TOML settings (`~/.cella/config.toml`, `.devcontainer/cella.toml`).
+
+### cella-features
+
+Dev Container Features resolution. Parses feature references (OCI, local path, HTTP URL), fetches artifacts from OCI registries with authentication, reads feature metadata, computes install ordering via topological sort, generates multi-stage Dockerfiles, caches artifacts locally, and merges feature configuration back into the devcontainer config.
+
+### cella-port
+
+Port allocation, detection, and IPC protocol. Defines the wire format for daemon-agent communication (`AgentMessage`, `DaemonMessage`), provides `/proc/net/tcp` parsing for port detection, and manages host port allocation to avoid conflicts across concurrent containers.
+
+### cella-codegen
+
+Build-time code generator. Transforms the devcontainer JSON Schema into typed Rust structs and validators. Runs during `cargo build` via cella-config's `build.rs` and produces formatted Rust source for `include!()`. Not a runtime dependency.
+
+### cella-credential-proxy
+
+Legacy git credential forwarding proxy over Unix socket and TCP. Being consolidated into cella-daemon. Runs as a host daemon, forwarding git credential requests from containers to the host's credential store with automatic idle timeout.
 
 ## Dependency Graph
 
-```
-cella-cli ──┬── cella-agent ──┬── cella-docker ── cella-config
-            │                 ├── cella-git
-            │                 ├── cella-port
-            │                 └── cella-config
-            ├── cella-docker
-            ├── cella-git
-            ├── cella-port
-            └── cella-config
+The dependency graph evolves as crates are added. To view the current graph:
+
+```sh
+cargo tree --depth 1 -p cella-cli    # direct dependencies of the CLI
+cargo tree -i cella-port --depth 1   # reverse dependencies of a specific crate
 ```
 
 ## Config Layer Merge Order
@@ -62,7 +97,7 @@ Configuration is resolved by merging layers from lowest to highest priority:
 1. **Defaults** — built-in cella defaults
 2. **Template** — values from the selected template
 3. **Workspace** — `.devcontainer/devcontainer.json` in the repo
-4. **User** — user-level overrides (`~/.config/cella/`)
+4. **User** — user-level overrides (`~/.cella/config.toml`)
 
 Later layers override earlier ones for scalar values. Arrays and objects follow devcontainer spec merge semantics.
 
