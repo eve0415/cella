@@ -107,14 +107,18 @@ pub fn detect_agent_arch() -> &'static str {
 /// Uses the Docker daemon's reported architecture rather than the host
 /// architecture, which correctly handles Docker Desktop on macOS where
 /// the daemon runs in a Linux VM matching the default container arch.
+///
+/// # Errors
+///
+/// Returns error if the Docker version API call fails.
 pub async fn detect_container_arch(docker: &Docker) -> Result<String, CellaDockerError> {
     let version = docker.version().await.map_err(|e| CellaDockerError::AgentVolume {
         message: format!("failed to detect Docker platform: {e}"),
     })?;
     let arch = version.arch.unwrap_or_default();
     Ok(match arch.as_str() {
-        "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
+        // Default to x86_64 for unknown or x86_64/amd64 architectures
         _ => "x86_64",
     }
     .to_string())
