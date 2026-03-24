@@ -121,6 +121,9 @@ impl Progress {
     }
 
     /// Start a spinner for a single operation.
+    ///
+    /// Top-level steps are permanent: their completion line survives
+    /// streaming output from Docker builds and lifecycle commands.
     pub fn step(&self, label: &str) -> Step {
         let bar = self.inner.multi.add(ProgressBar::new_spinner());
         bar.set_style(spinner_style());
@@ -130,6 +133,7 @@ impl Progress {
         }
         Step {
             bar,
+            multi: Some(self.inner.multi.clone()),
             label: label.to_string(),
             start: Instant::now(),
         }
@@ -158,6 +162,7 @@ impl Progress {
             label: label.to_string(),
             start: Instant::now(),
             enabled: self.inner.enabled,
+            completed_children: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -213,8 +218,17 @@ impl Progress {
 // ── Step ─────────────────────────────────────────────────────────────
 
 /// Handle for a single timed operation (one spinner line).
+///
+/// Top-level steps (created via [`Progress::step`]) finish as permanent
+/// terminal output that survives streaming output (docker build, lifecycle).
+/// Phase children (created via [`Phase::step`]) finish in-place to preserve
+/// parent-above-children ordering.
 pub struct Step {
     bar: ProgressBar,
+    /// When set, finish prints a permanent line via `MultiProgress::println`
+    /// and then clears the ephemeral spinner. This prevents the line from
+    /// being scrolled away when streaming output follows.
+    multi: Option<MultiProgress>,
     label: String,
     start: Instant,
 }
@@ -224,22 +238,33 @@ impl Step {
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        self.bar
-            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+        let msg = format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
+        self.finish_impl(&msg);
     }
 
     /// Finish with a custom completion message.
     pub fn finish_with(self, msg: &str) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        self.bar
-            .finish_with_message(format!("\x1b[32m✓\x1b[0m {msg}{time_suffix}"));
+        let line = format!("\x1b[32m✓\x1b[0m {msg}{time_suffix}");
+        self.finish_impl(&line);
     }
 
     /// Mark as failed.
     pub fn fail(self, msg: &str) {
-        self.bar
-            .finish_with_message(format!("\x1b[31m✗\x1b[0m {}: {msg}", self.label));
+        let line = format!("\x1b[31m✗\x1b[0m {}: {msg}", self.label);
+        self.finish_impl(&line);
+    }
+
+    fn finish_impl(&self, msg: &str) {
+        if let Some(ref multi) = self.multi {
+            // Top-level: print permanent line, then clear spinner from managed region.
+            let _ = multi.println(format!("  {msg}"));
+            self.bar.finish_and_clear();
+        } else {
+            // Phase child: finish in-place to preserve ordering.
+            self.bar.finish_with_message(msg.to_string());
+        }
     }
 }
 
@@ -255,17 +280,24 @@ impl Drop for Step {
 // ── Phase ────────────────────────────────────────────────────────────
 
 /// Grouped parent spinner that can have indented child steps.
+///
+/// On finish, prints the parent line followed by all completed child
+/// lines as permanent output, then clears all bars from the managed
+/// region. This ensures correct ordering (parent above children) AND
+/// permanence (lines survive subsequent streaming output).
 pub struct Phase {
     parent: ProgressBar,
     multi: MultiProgress,
     label: String,
     start: Instant,
     enabled: bool,
+    /// Completed child descriptions, collected as children finish.
+    completed_children: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Phase {
     /// Add a child step under this phase (indented spinner).
-    pub fn step(&self, label: &str) -> Step {
+    pub fn step(&self, label: &str) -> PhaseChild {
         let bar = self
             .multi
             .insert_after(&self.parent, ProgressBar::new_spinner());
@@ -274,19 +306,37 @@ impl Phase {
         if self.enabled {
             bar.enable_steady_tick(TICK_INTERVAL);
         }
-        Step {
+        PhaseChild {
             bar,
             label: label.to_string(),
             start: Instant::now(),
+            completed: Arc::clone(&self.completed_children),
         }
     }
 
     /// Finish the phase with total elapsed time.
+    ///
+    /// Prints parent + children as permanent output in correct order,
+    /// then clears all bars from the managed region.
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        self.parent
-            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+
+        // Print parent line first (permanent).
+        let _ = self
+            .multi
+            .println(format!("  \x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+
+        // Print completed children in the order they finished (permanent).
+        let Ok(children) = self.completed_children.lock() else {
+            self.parent.finish_and_clear();
+            return;
+        };
+        for child_line in children.iter() {
+            let _ = self.multi.println(child_line);
+        }
+
+        self.parent.finish_and_clear();
     }
 }
 
@@ -294,6 +344,38 @@ impl Drop for Phase {
     fn drop(&mut self) {
         if !self.parent.is_finished() {
             self.parent.finish_and_clear();
+        }
+    }
+}
+
+/// Handle for a child step within a [`Phase`].
+///
+/// On finish, records its completion message for the parent Phase
+/// to print in order, then clears its spinner.
+pub struct PhaseChild {
+    bar: ProgressBar,
+    label: String,
+    start: Instant,
+    completed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl PhaseChild {
+    /// Finish with checkmark and elapsed time.
+    pub fn finish(self) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        let msg = format!("      \x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
+        if let Ok(mut children) = self.completed.lock() {
+            children.push(msg);
+        }
+        self.bar.finish_and_clear();
+    }
+}
+
+impl Drop for PhaseChild {
+    fn drop(&mut self) {
+        if !self.bar.is_finished() {
+            self.bar.finish_and_clear();
         }
     }
 }
