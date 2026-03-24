@@ -24,6 +24,10 @@ pub struct ExecArgs {
     #[arg(long)]
     id_label: Option<String>,
 
+    /// Target a specific compose service (defaults to primary service).
+    #[arg(long)]
+    service: Option<String>,
+
     /// Working directory inside the container.
     #[arg(long)]
     workdir: Option<String>,
@@ -64,6 +68,28 @@ impl ExecArgs {
         };
 
         let container = target.resolve(&client, true).await?;
+
+        // If --service is specified and this is a compose container, resolve the service container
+        let container = if let Some(ref svc) = self.service {
+            if let Some(project) =
+                cella_compose::discovery::compose_project_from_labels(&container.labels)
+            {
+                client
+                    .find_compose_container(project, svc)
+                    .await?
+                    .ok_or_else(|| {
+                        format!("Service '{svc}' not found in compose project '{project}'")
+                    })?
+            } else {
+                return Err(format!(
+                    "--service flag requires a compose-based devcontainer, but '{}' is not",
+                    container.name
+                )
+                .into());
+            }
+        } else {
+            container
+        };
 
         super::ensure_credential_proxy();
 

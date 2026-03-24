@@ -6,42 +6,47 @@ use super::{CategoryReport, CheckContext, CheckResult, Severity};
 pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
     let mut checks = Vec::new();
 
-    // Docker daemon reachable
-    match ctx.docker_client {
-        Some(ref client) => match client.ping().await {
-            Ok(()) => {
-                checks.push(CheckResult {
-                    name: "daemon reachable".into(),
-                    severity: Severity::Pass,
-                    detail: "Docker daemon is running".into(),
-                    fix_hint: None,
-                });
-            }
-            Err(e) => {
-                checks.push(CheckResult {
-                    name: "daemon reachable".into(),
-                    severity: Severity::Error,
-                    detail: format!("ping failed: {e}"),
-                    fix_hint: Some("Is Docker running? Check `docker ps`".into()),
-                });
-            }
-        },
-        None => {
-            checks.push(CheckResult {
-                name: "daemon reachable".into(),
-                severity: Severity::Error,
-                detail: "could not connect to Docker".into(),
-                fix_hint: Some("Is Docker running? Check `docker ps`".into()),
-            });
-        }
-    }
+    checks.push(check_daemon_reachable(ctx).await);
 
-    // Docker socket accessible
     if let Some(check) = check_socket_accessible() {
         checks.push(check);
     }
 
-    // Docker CLI available
+    checks.push(check_docker_cli().await);
+    checks.push(check_buildx().await);
+    checks.push(check_compose().await);
+
+    CategoryReport::new("Docker", checks)
+}
+
+/// Check whether the Docker daemon is reachable via ping.
+async fn check_daemon_reachable(ctx: &CheckContext) -> CheckResult {
+    match ctx.docker_client {
+        Some(ref client) => match client.ping().await {
+            Ok(()) => CheckResult {
+                name: "daemon reachable".into(),
+                severity: Severity::Pass,
+                detail: "Docker daemon is running".into(),
+                fix_hint: None,
+            },
+            Err(e) => CheckResult {
+                name: "daemon reachable".into(),
+                severity: Severity::Error,
+                detail: format!("ping failed: {e}"),
+                fix_hint: Some("Is Docker running? Check `docker ps`".into()),
+            },
+        },
+        None => CheckResult {
+            name: "daemon reachable".into(),
+            severity: Severity::Error,
+            detail: "could not connect to Docker".into(),
+            fix_hint: Some("Is Docker running? Check `docker ps`".into()),
+        },
+    }
+}
+
+/// Check that the Docker CLI is available in PATH.
+async fn check_docker_cli() -> CheckResult {
     match tokio::process::Command::new("docker")
         .arg("--version")
         .output()
@@ -49,24 +54,24 @@ pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
     {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            checks.push(CheckResult {
+            CheckResult {
                 name: "docker CLI".into(),
                 severity: Severity::Pass,
                 detail: version,
                 fix_hint: None,
-            });
+            }
         }
-        _ => {
-            checks.push(CheckResult {
-                name: "docker CLI".into(),
-                severity: Severity::Warning,
-                detail: "not found in PATH".into(),
-                fix_hint: Some("Ensure docker CLI is in your PATH".into()),
-            });
-        }
+        _ => CheckResult {
+            name: "docker CLI".into(),
+            severity: Severity::Warning,
+            detail: "not found in PATH".into(),
+            fix_hint: Some("Ensure docker CLI is in your PATH".into()),
+        },
     }
+}
 
-    // buildx available
+/// Check that Docker Buildx is available.
+async fn check_buildx() -> CheckResult {
     match tokio::process::Command::new("docker")
         .args(["buildx", "version"])
         .output()
@@ -74,24 +79,47 @@ pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
     {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            checks.push(CheckResult {
+            CheckResult {
                 name: "buildx".into(),
                 severity: Severity::Pass,
                 detail: version,
                 fix_hint: None,
-            });
+            }
         }
-        _ => {
-            checks.push(CheckResult {
-                name: "buildx".into(),
-                severity: Severity::Warning,
-                detail: "not available".into(),
-                fix_hint: Some("Install buildx for faster builds".into()),
-            });
-        }
+        _ => CheckResult {
+            name: "buildx".into(),
+            severity: Severity::Warning,
+            detail: "not available".into(),
+            fix_hint: Some("Install buildx for faster builds".into()),
+        },
     }
+}
 
-    CategoryReport::new("Docker", checks)
+/// Check that Docker Compose V2 is available.
+async fn check_compose() -> CheckResult {
+    match tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            CheckResult {
+                name: "compose".into(),
+                severity: Severity::Pass,
+                detail: version,
+                fix_hint: None,
+            }
+        }
+        _ => CheckResult {
+            name: "compose".into(),
+            severity: Severity::Warning,
+            detail: "Docker Compose V2 not found".into(),
+            fix_hint: Some(
+                "Install Docker Compose V2: https://docs.docker.com/compose/install/".into(),
+            ),
+        },
+    }
 }
 
 /// Check Docker socket accessibility (Linux/macOS only, skip for TCP hosts).

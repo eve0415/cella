@@ -27,6 +27,10 @@ pub struct ShellArgs {
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
     docker_host: Option<String>,
+
+    /// Target a specific compose service (defaults to primary service).
+    #[arg(long)]
+    service: Option<String>,
 }
 
 impl ShellArgs {
@@ -44,6 +48,28 @@ impl ShellArgs {
         };
 
         let container = target.resolve(&client, true).await?;
+
+        // If --service is specified and this is a compose container, resolve the service container
+        let container = if let Some(ref svc) = self.service {
+            if let Some(project) =
+                cella_compose::discovery::compose_project_from_labels(&container.labels)
+            {
+                client
+                    .find_compose_container(project, svc)
+                    .await?
+                    .ok_or_else(|| {
+                        format!("Service '{svc}' not found in compose project '{project}'")
+                    })?
+            } else {
+                return Err(format!(
+                    "--service flag requires a compose-based devcontainer, but '{}' is not",
+                    container.name
+                )
+                .into());
+            }
+        } else {
+            container
+        };
 
         super::ensure_credential_proxy();
 

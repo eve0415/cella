@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use clap::Args;
 use serde_json::json;
 
+use cella_compose::discovery;
 use cella_docker::{ContainerInfo, ContainerState, DockerClient};
 
 /// List all dev containers managed by cella.
@@ -102,13 +105,67 @@ fn print_table(containers: &[ContainerInfo]) {
         return;
     }
 
+    // Separate compose and non-compose containers
+    let mut compose_projects: BTreeMap<String, Vec<&ContainerInfo>> = BTreeMap::new();
+    let mut standalone: Vec<&ContainerInfo> = Vec::new();
+
+    for c in containers {
+        if let Some(project) = discovery::compose_project_from_labels(&c.labels) {
+            compose_projects
+                .entry(project.to_string())
+                .or_default()
+                .push(c);
+        } else {
+            standalone.push(c);
+        }
+    }
+
     // Print header
     println!(
-        "{:<28} {:<12} {:<10} {:<16} {:<40} {:<12} AGE",
+        "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} AGE",
         "NAME", "ID", "STATE", "BRANCH", "WORKSPACE", "PORTS"
     );
 
-    for c in containers {
+    // Print compose projects with tree display
+    for (project_name, services) in &compose_projects {
+        // Find primary service label
+        let primary_svc = services
+            .iter()
+            .find(|c| discovery::is_primary_service(&c.labels));
+        let workspace = primary_svc
+            .and_then(|c| c.labels.get("dev.cella.workspace_path"))
+            .map_or("-", String::as_str);
+
+        println!(
+            "{:<30} {:<12} {:<10} {:<16} {:<40}",
+            project_name, "(compose)", "", "", workspace,
+        );
+
+        for c in services {
+            let svc_name = discovery::compose_service_from_labels(&c.labels).unwrap_or(&c.name);
+            let is_primary = discovery::is_primary_service(&c.labels);
+            let label = if is_primary {
+                format!("  {svc_name} (primary)")
+            } else {
+                format!("  {svc_name}")
+            };
+            let branch = c.labels.get("dev.cella.branch").map_or("-", String::as_str);
+
+            println!(
+                "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
+                label,
+                short_id(&c.id),
+                state_str(&c.state),
+                branch,
+                if is_primary { workspace } else { "-" },
+                format_ports(c),
+                format_age(c.created_at.as_deref()),
+            );
+        }
+    }
+
+    // Print standalone containers
+    for c in &standalone {
         let workspace = c
             .labels
             .get("dev.cella.workspace_path")
@@ -116,7 +173,7 @@ fn print_table(containers: &[ContainerInfo]) {
         let branch = c.labels.get("dev.cella.branch").map_or("-", String::as_str);
 
         println!(
-            "{:<28} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
+            "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
             c.name,
             short_id(&c.id),
             state_str(&c.state),

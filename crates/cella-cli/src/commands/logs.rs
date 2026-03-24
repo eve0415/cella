@@ -30,6 +30,10 @@ pub struct LogsArgs {
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
     docker_host: Option<String>,
+
+    /// Filter logs to a specific compose service (compose only).
+    #[arg(long)]
+    service: Option<String>,
 }
 
 impl LogsArgs {
@@ -59,6 +63,21 @@ impl LogsArgs {
             .find_container(&cwd)
             .await?
             .ok_or("No cella container found for this workspace")?;
+
+        // Docker Compose: use docker compose logs for all/specific services
+        if let Some(project_name) =
+            cella_compose::discovery::compose_project_from_labels(&container.labels)
+        {
+            let compose_cmd = cella_compose::ComposeCommand::from_project_name(project_name);
+            let services = self.service.as_ref().map(|s| vec![s.clone()]);
+            compose_cmd
+                .logs(self.follow, self.tail, services.as_deref())
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("docker compose logs failed: {e}").into()
+                })?;
+            return Ok(());
+        }
 
         if self.follow {
             // Use docker CLI for follow mode (bollard streaming is complex)

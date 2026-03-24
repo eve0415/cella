@@ -73,6 +73,20 @@ impl BuildArgs {
         };
         client.ping().await?;
 
+        // Docker Compose: build all services + feature-enriched primary image
+        if config.get("dockerComposeFile").is_some() {
+            return execute_compose_build(
+                config,
+                &resolved,
+                config_name,
+                &client,
+                self.no_cache,
+                &self.output,
+                &progress,
+            )
+            .await;
+        }
+
         // 3. Build image via shared ensure_image logic
         let (img_name, _resolved_features, _image_details) = ensure_image(
             &client,
@@ -115,4 +129,85 @@ impl BuildArgs {
 
         Ok(())
     }
+}
+
+/// Execute the Docker Compose build path: build feature image, write override, compose build.
+async fn execute_compose_build(
+    config: &serde_json::Value,
+    resolved: &resolve::ResolvedConfig,
+    config_name: Option<&str>,
+    client: &DockerClient,
+    no_cache: bool,
+    output: &OutputFormat,
+    progress: &crate::progress::Progress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = cella_compose::ComposeProject::from_resolved(
+        config,
+        &resolved.config_path,
+        &resolved.workspace_root,
+    )?;
+
+    // Build feature-enriched image if features configured
+    let image_override = if config
+        .get("features")
+        .is_some_and(|v| v.is_object() && !v.as_object().unwrap().is_empty())
+    {
+        let (img_name, _, _) = ensure_image(
+            client,
+            config,
+            &resolved.workspace_root,
+            config_name,
+            &resolved.config_path,
+            no_cache,
+            progress,
+        )
+        .await?;
+        Some(img_name)
+    } else {
+        None
+    };
+
+    // Write override file (needed for image swap)
+    if image_override.is_some() {
+        let (agent_vol_name, agent_vol_target, _) = cella_docker::volume::agent_volume_mount();
+        let override_config = cella_compose::OverrideConfig {
+            primary_service: project.primary_service.clone(),
+            image_override: image_override.clone(),
+            override_command: project.override_command,
+            agent_volume_name: agent_vol_name.to_string(),
+            agent_volume_target: agent_vol_target.to_string(),
+            extra_env: Vec::new(),
+            extra_labels: std::collections::BTreeMap::new(),
+        };
+        let yaml = cella_compose::override_file::generate_override_yaml(&override_config);
+        cella_compose::override_file::write_override_file(&project.override_file, &yaml)?;
+    }
+
+    // Run docker compose build
+    let compose_cmd = cella_compose::ComposeCommand::new(&project);
+    compose_cmd
+        .build(None)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("docker compose build failed: {e}").into()
+        })?;
+
+    let img_name = image_override.unwrap_or_else(|| "(compose)".to_string());
+    match output {
+        OutputFormat::Text => {
+            eprintln!("Compose services built. Primary image: {img_name}");
+        }
+        OutputFormat::Json => {
+            let result = json!({
+                "outcome": "built",
+                "imageName": img_name,
+                "compose": true,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }

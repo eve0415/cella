@@ -119,6 +119,39 @@ pub fn container_labels(
     labels
 }
 
+/// Generate compose project name: `cella-<name|folder>-<hash8>`.
+///
+/// Same naming scheme as `container_name` — compose projects and containers
+/// share the namespace.
+pub fn compose_project_name(workspace_root: &Path, config_name: Option<&str>) -> String {
+    let identifier = identifier_from(workspace_root, config_name);
+    let hash = workspace_hash(workspace_root);
+    format!("cella-{identifier}-{hash}")
+}
+
+/// Docker labels for compose-managed devcontainers.
+///
+/// Includes all standard cella labels plus compose-specific identifiers.
+pub fn compose_labels(
+    workspace_root: &Path,
+    config_path: &Path,
+    config_hash: &str,
+    docker_runtime: &str,
+    project_name: &str,
+    primary_service: &str,
+) -> HashMap<String, String> {
+    let mut labels = container_labels(workspace_root, config_path, config_hash, docker_runtime);
+    labels.insert(
+        "dev.cella.compose_project".to_string(),
+        project_name.to_string(),
+    );
+    labels.insert(
+        "dev.cella.primary_service".to_string(),
+        primary_service.to_string(),
+    );
+    labels
+}
+
 /// Additional Docker labels for worktree-backed containers.
 ///
 /// These are merged into the standard labels when a container is created

@@ -58,6 +58,25 @@ impl DockerApi for DockerClient {
         Box::pin(DockerClient::list_cella_containers(self, running_only))
     }
 
+    fn find_compose_container<'a>(
+        &'a self,
+        project_name: &'a str,
+        service_name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, CellaDockerError>> {
+        Box::pin(DockerClient::find_compose_container(
+            self,
+            project_name,
+            service_name,
+        ))
+    }
+
+    fn list_compose_containers<'a>(
+        &'a self,
+        project_name: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, CellaDockerError>> {
+        Box::pin(DockerClient::list_compose_containers(self, project_name))
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

@@ -113,6 +113,17 @@ pub trait DockerApi: Send + Sync {
         running_only: bool,
     ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, CellaDockerError>>;
 
+    fn find_compose_container<'a>(
+        &'a self,
+        project_name: &'a str,
+        service_name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, CellaDockerError>>;
+
+    fn list_compose_containers<'a>(
+        &'a self,
+        project_name: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, CellaDockerError>>;
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,
@@ -217,6 +228,13 @@ pub mod mock {
         ListCellaContainers {
             running_only: bool,
         },
+        FindComposeContainer {
+            project_name: String,
+            service_name: String,
+        },
+        ListComposeContainers {
+            project_name: String,
+        },
         ContainerLogs {
             id: String,
             tail: u32,
@@ -267,6 +285,10 @@ pub mod mock {
         pub remove_container_responses: Mutex<VecDeque<Result<(), CellaDockerError>>>,
         pub inspect_container_responses: Mutex<VecDeque<Result<ContainerInfo, CellaDockerError>>>,
         pub list_cella_containers_responses:
+            Mutex<VecDeque<Result<Vec<ContainerInfo>, CellaDockerError>>>,
+        pub find_compose_container_responses:
+            Mutex<VecDeque<Result<Option<ContainerInfo>, CellaDockerError>>>,
+        pub list_compose_containers_responses:
             Mutex<VecDeque<Result<Vec<ContainerInfo>, CellaDockerError>>>,
         pub container_logs_responses: Mutex<VecDeque<Result<String, CellaDockerError>>>,
         pub exec_command_responses: Mutex<VecDeque<Result<ExecResult, CellaDockerError>>>,
@@ -396,6 +418,40 @@ pub mod mock {
                 .unwrap()
                 .pop_front()
                 .expect("MockDockerClient: no list_cella_containers response configured");
+            Box::pin(async move { result })
+        }
+
+        fn find_compose_container<'a>(
+            &'a self,
+            project_name: &'a str,
+            service_name: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, CellaDockerError>> {
+            self.record(MockCall::FindComposeContainer {
+                project_name: project_name.to_string(),
+                service_name: service_name.to_string(),
+            });
+            let result = self
+                .find_compose_container_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockDockerClient: no find_compose_container response configured");
+            Box::pin(async move { result })
+        }
+
+        fn list_compose_containers<'a>(
+            &'a self,
+            project_name: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, CellaDockerError>> {
+            self.record(MockCall::ListComposeContainers {
+                project_name: project_name.to_string(),
+            });
+            let result = self
+                .list_compose_containers_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockDockerClient: no list_compose_containers response configured");
             Box::pin(async move { result })
         }
 

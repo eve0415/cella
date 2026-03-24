@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cella-cli",
     "crates/cella-codegen",
+    "crates/cella-compose",
     "crates/cella-config",
     "crates/cella-credential-proxy",
     "crates/cella-daemon",
@@ -39,6 +40,7 @@ tokio = { version = "1.50.0", features = [
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+serde_yaml = "0.9.34"
 toml = "1.0.7"
 
 # Encoding
@@ -92,6 +94,7 @@ tempfile = "3.27.0"
 # Internal crates
 cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
+cella-compose = { path = "crates/cella-compose" }
 cella-doctor = { path = "crates/cella-doctor" }
 cella-config = { path = "crates/cella-config" }
 cella-credential-proxy = { path = "crates/cella-credential-proxy" }

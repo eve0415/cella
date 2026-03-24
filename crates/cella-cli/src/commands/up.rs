@@ -60,16 +60,16 @@ impl UpArgs {
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
-    resolved: ResolvedConfig,
+    pub(crate) resolved: ResolvedConfig,
     pub client: DockerClient,
     pub container_nm: String,
-    remote_env: Vec<String>,
+    pub(crate) remote_env: Vec<String>,
     workspace_folder_from_config: Option<String>,
     default_workspace_folder: String,
-    progress: crate::progress::Progress,
-    output: OutputFormat,
-    remove_container: bool,
-    build_no_cache: bool,
+    pub(crate) progress: crate::progress::Progress,
+    pub(crate) output: OutputFormat,
+    pub(crate) remove_container: bool,
+    pub(crate) build_no_cache: bool,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
 }
@@ -205,25 +205,25 @@ impl UpContext {
         })
     }
 
-    const fn config(&self) -> &serde_json::Value {
+    pub(crate) const fn config(&self) -> &serde_json::Value {
         &self.resolved.config
     }
 
-    fn config_name(&self) -> Option<&str> {
+    pub(crate) fn config_name(&self) -> Option<&str> {
         self.config().get("name").and_then(|v| v.as_str())
     }
 
-    fn workspace_folder(&self) -> Option<&str> {
+    pub(crate) fn workspace_folder(&self) -> Option<&str> {
         self.workspace_folder_from_config.as_deref()
     }
 
-    fn workspace_folder_str(&self) -> &str {
+    pub(crate) fn workspace_folder_str(&self) -> &str {
         self.workspace_folder_from_config
             .as_deref()
             .unwrap_or(&self.default_workspace_folder)
     }
 
-    fn probe_type(&self) -> &str {
+    pub(crate) fn probe_type(&self) -> &str {
         self.config()
             .get("userEnvProbe")
             .and_then(|v| v.as_str())
@@ -758,7 +758,7 @@ impl UpContext {
     }
 
     /// Register the container with the daemon for port management.
-    async fn register_with_daemon(&self, container_id: &str) {
+    pub(crate) async fn register_with_daemon(&self, container_id: &str) {
         let config = self.config();
         let container_ip =
             cella_docker::network::get_container_cella_ip(self.client.inner(), container_id).await;
@@ -802,7 +802,7 @@ impl UpContext {
     }
 
     /// Run post-create setup: UID update, env injection, credentials, Claude Code, userEnvProbe.
-    async fn post_create_setup(
+    pub(crate) async fn post_create_setup(
         &self,
         container_id: &str,
         remote_user: &str,
@@ -1159,6 +1159,12 @@ impl UpArgs {
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ctx = UpContext::new(&self, progress).await?;
+
+        // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
+        if ctx.config().get("dockerComposeFile").is_some() {
+            return super::compose_up::compose_up(ctx).await;
+        }
+
         let existing = ctx
             .client
             .find_container(&ctx.resolved.workspace_root)
@@ -1207,7 +1213,7 @@ impl UpArgs {
 ///
 /// Priority: `remoteUser` (config) > `containerUser` (config) > `remoteUser` (image metadata)
 /// > `containerUser` (image metadata) > `fallback` (typically Docker USER or `"root"`)
-fn resolve_remote_user(
+pub fn resolve_remote_user(
     config: &serde_json::Value,
     image_meta_user: Option<&cella_features::ImageMetadataUserInfo>,
     fallback: &str,
@@ -1258,7 +1264,7 @@ fn convert_uploads(uploads: &[cella_env::FileUpload]) -> Vec<FileToUpload> {
         .collect()
 }
 
-fn run_host_command(
+pub fn run_host_command(
     phase: &str,
     value: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1325,7 +1331,7 @@ fn run_single_host_command(phase: &str, cmd: &[&str]) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
+pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_object())
         .map(|obj| {
@@ -1336,7 +1342,7 @@ fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn verify_container_running(
+pub async fn verify_container_running(
     client: &DockerClient,
     container_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1352,7 +1358,7 @@ async fn verify_container_running(
     Ok(())
 }
 
-fn output_result(
+pub fn output_result(
     format: &OutputFormat,
     outcome: &str,
     container_id: &str,
@@ -1380,7 +1386,7 @@ fn output_result(
 }
 
 /// Query the daemon for control port + auth token, returning env vars to inject.
-async fn query_daemon_env(container_nm: &str) -> Vec<String> {
+pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
     if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
         && mgmt_sock.exists()
     {
@@ -1410,7 +1416,7 @@ async fn query_daemon_env(container_nm: &str) -> Vec<String> {
 ///
 /// Uploads SSH config files, sets git config, and installs credential helper.
 /// Never fails — individual steps log warnings and are skipped on error.
-async fn inject_post_start(
+pub async fn inject_post_start(
     client: &DockerClient,
     container_id: &str,
     post_start: &cella_env::PostStartInjection,
@@ -1613,7 +1619,7 @@ async fn run_lifecycle_entries(
 }
 
 /// Run all lifecycle phases for a first-create scenario.
-async fn run_all_lifecycle_phases(
+pub async fn run_all_lifecycle_phases(
     lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,

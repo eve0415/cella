@@ -9,6 +9,7 @@ name = "cella"
 path = "src/main.rs"
 
 [dependencies]
+cella-compose.workspace = true
 cella-config.workspace = true
 cella-credential-proxy.workspace = true
 cella-daemon.workspace = true

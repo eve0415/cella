@@ -1,5 +1,6 @@
 mod branch;
 mod build;
+mod compose_up;
 mod config;
 mod credential;
 mod credential_proxy;

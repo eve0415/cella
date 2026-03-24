@@ -366,6 +366,71 @@ impl DockerClient {
             .collect())
     }
 
+    /// Find a compose project container by project name and service name.
+    ///
+    /// Filters by Docker Compose labels `com.docker.compose.project` and
+    /// `com.docker.compose.service`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn find_compose_container(
+        &self,
+        project_name: &str,
+        service_name: &str,
+    ) -> Result<Option<ContainerInfo>, CellaDockerError> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec![
+                format!("com.docker.compose.project={project_name}"),
+                format!("com.docker.compose.service={service_name}"),
+            ],
+        )]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(filters),
+            ..Default::default()
+        };
+
+        let containers = self.inner().list_containers(Some(options)).await?;
+
+        Ok(containers
+            .into_iter()
+            .next()
+            .map(container_info_from_summary))
+    }
+
+    /// List all containers belonging to a Docker Compose project.
+    ///
+    /// Filters by the `com.docker.compose.project` label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` on API errors.
+    pub async fn list_compose_containers(
+        &self,
+        project_name: &str,
+    ) -> Result<Vec<ContainerInfo>, CellaDockerError> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={project_name}")],
+        )]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(filters),
+            ..Default::default()
+        };
+
+        let containers = self.inner().list_containers(Some(options)).await?;
+
+        Ok(containers
+            .into_iter()
+            .map(container_info_from_summary)
+            .collect())
+    }
+
     /// Fetch the last `tail` lines of container logs.
     ///
     /// # Errors

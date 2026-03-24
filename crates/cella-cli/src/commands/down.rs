@@ -5,6 +5,7 @@ use serde_json::json;
 use tracing::{debug, info};
 
 use super::up::OutputFormat;
+use cella_compose::discovery;
 use cella_credential_proxy::daemon::{running_cella_container_count, stop_daemon};
 use cella_docker::{ContainerInfo, ContainerState, ContainerTarget, DockerClient};
 use cella_env::git_credential::{
@@ -65,6 +66,33 @@ impl DownArgs {
         let container = target.resolve(&client, false).await?;
 
         deregister_container(&container).await;
+
+        // Docker Compose branch: use `docker compose down` for compose containers
+        if discovery::is_compose_container(&container.labels)
+            && let Some(project_name) = discovery::compose_project_from_labels(&container.labels)
+        {
+            info!("Stopping compose project: {project_name}");
+            let compose_cmd = cella_compose::ComposeCommand::from_project_name(project_name);
+            compose_cmd
+                .down()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("docker compose down failed: {e}").into()
+                })?;
+
+            // Clean up override file
+            if let Some(data_dir) = cella_env::git_credential::cella_data_dir() {
+                let override_path = data_dir
+                    .join("compose")
+                    .join(project_name)
+                    .join("docker-compose.cella.yml");
+                cella_compose::override_file::cleanup_override_file(&override_path);
+            }
+
+            print_outcome(&self.output, "stopped", &container.id);
+            cleanup_credential_proxy();
+            return Ok(());
+        }
 
         if container.state == ContainerState::Running {
             client.stop_container(&container.id).await?;
