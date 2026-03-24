@@ -60,8 +60,11 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | Git credential forwarding | gh CLI via socket + TCP, auto-on | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/4202) |
 | BROWSER interception | Host browser opens for OAuth | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/9935) |
 | Container listing | `cella list` | No ([cli#843](https://github.com/devcontainers/cli/issues/843)) |
+| `runArgs` | 30+ docker create flags parsed | Yes |
+| `hostRequirements` | CPU/memory/storage/GPU validation | Partial (informational only) |
+| `waitFor` | Return after specified lifecycle phase | No |
 | Config validation | Source-positioned diagnostics | Basic |
-| Docker Compose | Not yet | Yes |
+| Docker Compose | Yes | Yes |
 | Podman | Not yet | Yes |
 | Editor requirement | None (any terminal) | VS Code for full feature set |
 
@@ -74,21 +77,34 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] `cella exec` — run commands (interactive and detached)
 - [x] `cella build` — pre-build images
 - [x] `cella list` — list containers with status and ports
+- [x] `cella logs` — container logs with `--follow`
+- [x] `cella doctor` — system diagnostics with PII redaction
+- [x] `read-configuration` — resolved devcontainer config output (devcontainer CLI compatible)
+- [x] Docker Compose support (`dockerComposeFile`)
+- [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
-- [x] Lifecycle commands (postCreate, postStart, postAttach)
+- [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
 - [x] Config validation with source-positioned diagnostics
-- [ ] Docker Compose support
-- [ ] Container logs streaming
-- [ ] Diagnostics (`cella doctor`)
 
 ### Environment & Credentials
 
 - [x] SSH agent forwarding (Docker Desktop, OrbStack, Linux)
 - [x] Git config forwarding
 - [x] gh CLI credential forwarding (auto-on)
+- [x] AI agent config forwarding (Claude Code, Codex, Gemini CLI)
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
+
+### Spec Compliance
+
+- [x] `runArgs` (30+ docker create flags — networking, resources, security, devices, GPU)
+- [x] `hostRequirements` validation (CPU, memory, storage, GPU)
+- [x] `waitFor` lifecycle phasing
+- [x] `shutdownAction`
+- [x] `updateContentCommand` on workspace change detection
+- [x] GPU passthrough (`hostRequirements.gpu` + `runArgs --gpus`)
+- [x] `appPort` deprecation warning
 
 ### Port Forwarding
 
@@ -106,29 +122,77 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
-- [ ] Git worktree integration (1 branch = 1 container)
 - [ ] AI agent launching (`cella branch --agent`)
 - [ ] tmux integration
 - [ ] Neovim integration
 - [ ] Templates & global config
 - [ ] Project initialization (`cella init`)
 
+## Commands
+
+### Container Lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `cella up` | Start a dev container for the current workspace |
+| `cella down` | Stop and remove the dev container |
+| `cella shell` | Open a shell inside the running container |
+| `cella exec` | Execute a command inside the running container |
+| `cella build` | Build the dev container image without starting it |
+| `cella list` | List all dev containers with status and ports |
+| `cella logs` | View container logs (`--follow` for streaming) |
+
+### Git Worktrees
+
+| Command | Description |
+|---------|-------------|
+| `cella branch <name>` | Create a new worktree-backed branch with its own container |
+| `cella switch <name>` | Switch to a different worktree-backed branch |
+| `cella prune` | Remove stale worktrees and their associated containers |
+
+### Configuration & Diagnostics
+
+| Command | Description |
+|---------|-------------|
+| `cella config` | View and manage cella configuration |
+| `cella read-configuration` | Output resolved devcontainer config as JSON |
+| `cella doctor` | Check system dependencies and configuration |
+| `cella init` | Initialize cella in the current repository |
+
+### Port & Credential Management
+
+| Command | Description |
+|---------|-------------|
+| `cella ports` | View port forwarding status |
+| `cella credential` | Manage credential forwarding |
+
+### Editor Integration
+
+| Command | Description |
+|---------|-------------|
+| `cella nvim` | Open Neovim connected to the container |
+
 ## Architecture
 
-cella is a Rust workspace with 11 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 13 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   cella-cli                     │
-│         (command parsing, user output)          │
-├──────────┬──────────┬──────────┬────────────────┤
-│cella-git │cella-dock│cella-port│  cella-agent   │
-│(worktree)│(container│(port     │  (in-container │
-│          │ runtime) │ mgmt)    │   agent)       │
-├──────────┴──────────┴──────────┴────────────────┤
-│                 cella-config                    │
-│        (devcontainer.json, JSONC, TOML)         │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                          cella-cli                           │
+│               (command parsing, user output)                 │
+├──────────┬──────────┬─────────┬─────────┬────────┬──────────┤
+│cella-    │cella-    │cella-git│cella-env│cella-  │cella-    │
+│docker    │compose   │(worktree│(env     │daemon  │doctor    │
+│(container│(compose  │ mgmt)   │ fwding) │(host   │(health   │
+│ runtime) │ orchestr)│         │         │ daemon)│ checks)  │
+├──────────┴──────┬───┴─────────┴─────────┴────────┴──────────┤
+│  cella-agent    │  cella-config    cella-features            │
+│  (in-container  │  (devcontainer   (OCI feature              │
+│   agent)        │   parsing)       resolution)               │
+├─────────────────┼────────────────────────────────────────────┤
+│  cella-port     │  cella-codegen   cella-credential-proxy    │
+│  (IPC protocol) │  (schema codegen)(legacy credential proxy) │
+└─────────────────┴────────────────────────────────────────────┘
 ```
 
 See [docs/architecture.md](docs/architecture.md) for details.
