@@ -130,10 +130,8 @@ impl Progress {
         }
         Step {
             bar,
-            multi: self.inner.multi.clone(),
             label: label.to_string(),
             start: Instant::now(),
-            enabled: self.inner.enabled,
         }
     }
 
@@ -217,10 +215,8 @@ impl Progress {
 /// Handle for a single timed operation (one spinner line).
 pub struct Step {
     bar: ProgressBar,
-    multi: MultiProgress,
     label: String,
     start: Instant,
-    enabled: bool,
 }
 
 impl Step {
@@ -228,38 +224,22 @@ impl Step {
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let msg = format!("  \x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
-        // Print as permanent line, then clear the ephemeral spinner.
-        if self.enabled {
-            let _ = self.multi.println(&msg);
-            self.bar.finish_and_clear();
-        } else {
-            self.bar.finish_with_message(msg);
-        }
+        self.bar
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
     }
 
     /// Finish with a custom completion message.
     pub fn finish_with(self, msg: &str) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let line = format!("  \x1b[32m✓\x1b[0m {msg}{time_suffix}");
-        if self.enabled {
-            let _ = self.multi.println(&line);
-            self.bar.finish_and_clear();
-        } else {
-            self.bar.finish_with_message(line);
-        }
+        self.bar
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {msg}{time_suffix}"));
     }
 
     /// Mark as failed.
     pub fn fail(self, msg: &str) {
-        let line = format!("  \x1b[31m✗\x1b[0m {}: {msg}", self.label);
-        if self.enabled {
-            let _ = self.multi.println(&line);
-            self.bar.finish_and_clear();
-        } else {
-            self.bar.finish_with_message(line);
-        }
+        self.bar
+            .finish_with_message(format!("\x1b[31m✗\x1b[0m {}: {msg}", self.label));
     }
 }
 
@@ -296,10 +276,8 @@ impl Phase {
         }
         Step {
             bar,
-            multi: self.multi.clone(),
             label: label.to_string(),
             start: Instant::now(),
-            enabled: self.enabled,
         }
     }
 
@@ -307,13 +285,8 @@ impl Phase {
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let msg = format!("  \x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
-        if self.enabled {
-            let _ = self.multi.println(&msg);
-            self.parent.finish_and_clear();
-        } else {
-            self.parent.finish_with_message(msg);
-        }
+        self.parent
+            .finish_with_message(format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
     }
 }
 

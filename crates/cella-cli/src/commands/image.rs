@@ -73,7 +73,9 @@ pub async fn build_features_layer(
     let result = ctx
         .client
         .build_image(&build_opts, |line| {
-            progress_ref.println(line);
+            if !line.trim().is_empty() {
+                progress_ref.println(line);
+            }
         })
         .await;
     match &result {
@@ -163,7 +165,9 @@ async fn resolve_base_image(
         let progress_ref = progress.clone();
         let result = client
             .build_image(&build_opts, |line| {
-                progress_ref.println(line);
+                if !line.trim().is_empty() {
+                    progress_ref.println(line);
+                }
             })
             .await;
         match &result {

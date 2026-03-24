@@ -195,47 +195,37 @@ impl DockerClient {
                 source,
             })?;
 
-        // Read stdout and stderr concurrently, collecting lines.
-        let stdout_task = child.stdout.take().map(|stdout| {
+        // Stream stdout and stderr lines in real-time via a channel.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        if let Some(stdout) = child.stdout.take() {
+            let tx = tx.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut lines = BufReader::new(stdout).lines();
-                let mut collected = Vec::new();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    collected.push(line);
+                    let _ = tx.send(line);
                 }
-                collected
-            })
-        });
+            });
+        }
 
-        let stderr_task = child.stderr.take().map(|stderr| {
+        if let Some(stderr) = child.stderr.take() {
+            let tx = tx.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut lines = BufReader::new(stderr).lines();
-                let mut collected = Vec::new();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    collected.push(line);
+                    let _ = tx.send(line);
                 }
-                collected
-            })
-        });
-
-        // Wait for output collection and process exit
-        let stdout_lines = match stdout_task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let stderr_lines = match stderr_task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-
-        // Forward collected lines through the callback
-        for line in &stdout_lines {
-            on_output(line);
+            });
         }
-        for line in &stderr_lines {
-            on_output(line);
+
+        // Drop our sender so rx closes when spawned tasks finish.
+        drop(tx);
+
+        // Forward lines to the callback as they arrive.
+        while let Some(line) = rx.recv().await {
+            on_output(&line);
         }
 
         let status = child
