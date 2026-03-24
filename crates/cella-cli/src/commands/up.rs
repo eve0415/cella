@@ -616,14 +616,17 @@ impl UpContext {
         }
 
         // Agent volume mount and env vars
-        if let Err(e) =
-            cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await
-        {
-            warn!("Failed to populate agent volume: {e}");
-            self.progress
-                .warn("Port forwarding and BROWSER interception will not work.");
-            self.progress
-                .hint(&format!("Agent volume population failed: {e}"));
+        let agent_step = self.progress.step("Populating agent volume...");
+        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await {
+            Ok(()) => agent_step.finish(),
+            Err(e) => {
+                agent_step.fail("failed");
+                warn!("Failed to populate agent volume: {e}");
+                self.progress
+                    .warn("Port forwarding and BROWSER interception will not work.");
+                self.progress
+                    .hint(&format!("Agent volume population failed: {e}"));
+            }
         }
 
         let agent_env = cella_docker::config_map::env::agent_env_vars();
