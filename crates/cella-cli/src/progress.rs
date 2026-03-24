@@ -447,6 +447,12 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+/// Public version of [`format_elapsed`] for use by command modules
+/// that manually format completion lines (e.g., Docker build output).
+pub fn format_elapsed_pub(elapsed: Duration) -> String {
+    format_elapsed(elapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

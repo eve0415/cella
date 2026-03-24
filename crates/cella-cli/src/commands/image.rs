@@ -68,19 +68,24 @@ pub async fn build_features_layer(
         "Building features layer image (context: {})",
         ctx.resolved.build_context.display()
     );
-    let step = ctx.progress.step("Building features layer...");
+    let start = std::time::Instant::now();
     let progress_ref = ctx.progress.clone();
     let result = ctx
         .client
         .build_image(&build_opts, |line| {
             if !line.trim().is_empty() {
-                progress_ref.println(line);
+                progress_ref.println(&format!("  {line}"));
             }
         })
         .await;
+    let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
     match &result {
-        Ok(_) => step.finish(),
-        Err(e) => step.fail(&e.to_string()),
+        Ok(_) => ctx.progress.println(&format!(
+            "  \x1b[32m✓\x1b[0m Building features layer...{elapsed}"
+        )),
+        Err(e) => ctx.progress.println(&format!(
+            "  \x1b[31m✗\x1b[0m Building features layer...: {e}"
+        )),
     }
     result?;
     Ok(features_image)
@@ -161,18 +166,21 @@ async fn resolve_base_image(
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
-        let step = progress.step("Building Dockerfile...");
+        let start = std::time::Instant::now();
         let progress_ref = progress.clone();
         let result = client
             .build_image(&build_opts, |line| {
                 if !line.trim().is_empty() {
-                    progress_ref.println(line);
+                    progress_ref.println(&format!("  {line}"));
                 }
             })
             .await;
+        let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
         match &result {
-            Ok(_) => step.finish(),
-            Err(e) => step.fail(&e.to_string()),
+            Ok(_) => progress.println(&format!(
+                "  \x1b[32m✓\x1b[0m Building Dockerfile...{elapsed}"
+            )),
+            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m Building Dockerfile...: {e}")),
         }
         result?;
         Ok(img_name)

@@ -1467,6 +1467,9 @@ async fn upload_to_container(
 }
 
 /// Run a sequence of origin-tracked lifecycle entries with progress tracking.
+///
+/// Prints a permanent header line before each lifecycle command, then streams
+/// the command's output indented below it, then prints the completion status.
 async fn run_lifecycle_entries(
     ctx: &LifecycleContext<'_>,
     phase: &str,
@@ -1474,11 +1477,15 @@ async fn run_lifecycle_entries(
     progress: &crate::progress::Progress,
 ) -> Result<(), CellaDockerError> {
     for entry in entries {
-        let step = progress.step(&format!("Running the {phase} from {}...", entry.origin));
+        let label = format!("Running the {phase} from {}...", entry.origin);
+        let start = std::time::Instant::now();
+        // Print header so user knows what's running during streaming.
+        progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
         let result = run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await;
+        let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
         match &result {
-            Ok(()) => step.finish(),
-            Err(e) => step.fail(&e.to_string()),
+            Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
+            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
         }
         result?;
     }
@@ -1516,11 +1523,14 @@ async fn run_all_lifecycle_phases(
             && let Some(cmd) = config.get(phase)
             && !cmd.is_null()
         {
-            let step = progress.step(&format!("Running the {phase} from devcontainer.json..."));
+            let label = format!("Running the {phase} from devcontainer.json...");
+            let start = std::time::Instant::now();
+            progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
             let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
+            let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
             match &result {
-                Ok(()) => step.finish(),
-                Err(e) => step.fail(&e.to_string()),
+                Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
+                Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
             }
             result?;
         }
