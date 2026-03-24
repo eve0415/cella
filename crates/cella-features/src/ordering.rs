@@ -27,6 +27,15 @@ struct SortKey {
     declaration_index: usize,
 }
 
+/// Build a lookup from feature ID to its index in the slice.
+fn build_id_index<'a>(features: &'a [(String, &FeatureMetadata)]) -> HashMap<&'a str, usize> {
+    features
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id.as_str(), i))
+        .collect()
+}
+
 /// Compute the install order for a set of features.
 ///
 /// Takes features in their declaration order and returns them reordered
@@ -54,11 +63,7 @@ pub fn compute_install_order(
     let mut warnings = Vec::new();
 
     // Build lookup: id -> declaration index
-    let id_to_index: HashMap<&str, usize> = features
-        .iter()
-        .enumerate()
-        .map(|(i, (id, _))| (id.as_str(), i))
-        .collect();
+    let id_to_index = build_id_index(features);
 
     // Determine whether any feature is official (for tiebreaking).
     let has_official = features
@@ -107,11 +112,7 @@ fn apply_override(
         .collect();
 
     if !unlisted.is_empty() {
-        let unlisted_id_to_index: HashMap<&str, usize> = unlisted
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| (id.as_str(), i))
-            .collect();
+        let unlisted_id_to_index = build_id_index(&unlisted);
 
         // For unlisted features, only consider dependencies among unlisted features.
         // Use the original declaration order for tiebreaking.
