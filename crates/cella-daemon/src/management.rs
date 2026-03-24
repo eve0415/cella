@@ -207,6 +207,7 @@ async fn handle_management_request(
             ports_attributes,
             other_ports_attributes,
             forward_ports,
+            shutdown_action: _,
         } => {
             let reg = ContainerRegistration {
                 container_id,
@@ -545,6 +546,7 @@ mod tests {
                 ports_attributes: vec![],
                 other_ports_attributes: None,
                 forward_ports: vec![],
+                shutdown_action: None,
             },
         )
         .await

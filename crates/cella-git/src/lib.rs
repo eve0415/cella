@@ -1,5 +1,6 @@
 mod branch;
 mod cmd;
+pub mod content_hash;
 mod error;
 mod repo;
 mod sanitize;

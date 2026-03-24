@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::CellaConfigError;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Severity};
 use crate::discover;
 use crate::jsonc;
 use crate::merge;
@@ -102,6 +102,18 @@ pub fn config(
         std::env::vars().collect(),
     );
     ctx.substitute_value(&mut config);
+
+    // Deprecation warnings for legacy properties
+    let mut warnings = warnings;
+    if config.get("appPort").is_some() {
+        warnings.push(Diagnostic {
+            severity: Severity::Warning,
+            message: "\"appPort\" is deprecated. Use \"forwardPorts\" instead. Ports declared in \"appPort\" will not be bound.".into(),
+            path: "$.appPort".into(),
+            span: None,
+            help: Some("Replace \"appPort\" with \"forwardPorts\" in your devcontainer.json".into()),
+        });
+    }
 
     // Compute hash of canonical JSON
     let canonical = serde_json::to_string(&config)?;
@@ -231,6 +243,36 @@ mod tests {
         assert!(!mount.contains("${localWorkspaceFolder}"));
         // Should contain the actual temp directory path
         assert!(mount.contains("/data,target=/data"));
+    }
+
+    #[test]
+    fn resolve_app_port_emits_deprecation_warning() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "appPort": 3000}"#);
+
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("appPort") && w.message.contains("deprecated")),
+            "expected deprecation warning for appPort"
+        );
+    }
+
+    #[test]
+    fn resolve_no_app_port_no_deprecation_warning() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(
+            !resolved
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("appPort")),
+            "should not have appPort warning without appPort"
+        );
     }
 
     #[test]

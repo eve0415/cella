@@ -80,6 +80,7 @@ fn apply_lifecycle(config: &mut FeatureContainerConfig, entry: &serde_json::Valu
 
     let phases: &[(&str, LifecycleAccessor)] = &[
         ("onCreateCommand", |lc| &mut lc.on_create),
+        ("updateContentCommand", |lc| &mut lc.update_content),
         ("postCreateCommand", |lc| &mut lc.post_create),
         ("postStartCommand", |lc| &mut lc.post_start),
         ("postAttachCommand", |lc| &mut lc.post_attach),

@@ -514,6 +514,9 @@ fn build_feature_metadata_entry(feature: &ResolvedFeature) -> serde_json::Value 
     if let Some(cmd) = &feature.metadata.on_create_command {
         entry.insert("onCreateCommand".into(), cmd.clone());
     }
+    if let Some(cmd) = &feature.metadata.update_content_command {
+        entry.insert("updateContentCommand".into(), cmd.clone());
+    }
     if let Some(cmd) = &feature.metadata.post_create_command {
         entry.insert("postCreateCommand".into(), cmd.clone());
     }

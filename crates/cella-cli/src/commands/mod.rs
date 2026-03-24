@@ -16,6 +16,7 @@ mod logs;
 mod nvim;
 mod ports;
 mod prune;
+mod read_configuration;
 mod shell;
 
 mod switch;
@@ -64,6 +65,9 @@ pub enum Command {
     Ports(ports::PortsArgs),
     /// Manage credential forwarding for dev containers.
     Credential(credential::CredentialArgs),
+    /// Read and output the resolved devcontainer configuration.
+    #[command(name = "read-configuration")]
+    ReadConfiguration(read_configuration::ReadConfigurationArgs),
     /// Manage the credential proxy daemon (legacy).
     #[command(name = "credential-proxy", hide = true)]
     CredentialProxy(credential_proxy::CredentialProxyArgs),
@@ -79,6 +83,7 @@ impl Command {
             Self::Up(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
+            Self::ReadConfiguration(_) => false,
             _ => true,
         }
     }
@@ -103,6 +108,7 @@ impl Command {
 
             Self::Switch(args) => args.execute(),
             Self::Prune(args) => args.execute().await,
+            Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Init(args) => args.execute(),
@@ -326,6 +332,8 @@ async fn re_register_containers(
             .map(|label| cella_docker::config_map::ports::deserialize_ports_attributes_label(label))
             .unwrap_or_default();
 
+        let shutdown_action = container.labels.get("dev.cella.shutdown_action").cloned();
+
         let req = ManagementRequest::RegisterContainer {
             container_id: container.id.clone(),
             container_name: container.name.clone(),
@@ -333,6 +341,7 @@ async fn re_register_containers(
             ports_attributes: ports_attrs,
             other_ports_attributes: other_ports_attrs,
             forward_ports: vec![],
+            shutdown_action,
         };
 
         match cella_daemon::management::send_management_request(control_socket_path, &req).await {

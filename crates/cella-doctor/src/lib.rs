@@ -4,4 +4,5 @@
 //! daemon status, configuration, and running containers.
 
 pub mod checks;
+pub mod host_requirements;
 pub mod redact;

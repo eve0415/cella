@@ -55,6 +55,7 @@ struct FeatureMetadataDto {
     container_env: HashMap<String, String>,
     customizations: Option<serde_json::Value>,
     on_create_command: Option<serde_json::Value>,
+    update_content_command: Option<serde_json::Value>,
     post_create_command: Option<serde_json::Value>,
     post_start_command: Option<serde_json::Value>,
     post_attach_command: Option<serde_json::Value>,
@@ -119,6 +120,7 @@ impl FeatureMetadataDto {
             container_env: self.container_env,
             customizations: self.customizations,
             on_create_command: self.on_create_command,
+            update_content_command: self.update_content_command,
             post_create_command: self.post_create_command,
             post_start_command: self.post_start_command,
             post_attach_command: self.post_attach_command,
@@ -152,6 +154,7 @@ mod tests {
         assert!(meta.container_env.is_empty());
         assert!(meta.customizations.is_none());
         assert!(meta.on_create_command.is_none());
+        assert!(meta.update_content_command.is_none());
         assert!(meta.post_create_command.is_none());
         assert!(meta.post_start_command.is_none());
         assert!(meta.post_attach_command.is_none());

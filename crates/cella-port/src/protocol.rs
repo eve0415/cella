@@ -82,6 +82,9 @@ pub enum ManagementRequest {
         /// Ports from `forwardPorts` in devcontainer.json (pre-allocate on registration).
         #[serde(default)]
         forward_ports: Vec<u16>,
+        /// The `shutdownAction` from devcontainer.json (`"none"` or `"stopContainer"`).
+        #[serde(default)]
+        shutdown_action: Option<String>,
     },
     /// Deregister a container (stop proxies, release ports).
     DeregisterContainer { container_name: String },
@@ -425,6 +428,7 @@ mod tests {
             ports_attributes: vec![],
             other_ports_attributes: None,
             forward_ports: vec![],
+            shutdown_action: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"register_container\""));

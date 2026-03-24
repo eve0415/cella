@@ -59,6 +59,12 @@ pub fn merge_features(
                 command: cmd.clone(),
             });
         }
+        if let Some(cmd) = &meta.update_content_command {
+            config.lifecycle.update_content.push(LifecycleEntry {
+                origin: feature.id.clone(),
+                command: cmd.clone(),
+            });
+        }
         if let Some(cmd) = &meta.post_create_command {
             config.lifecycle.post_create.push(LifecycleEntry {
                 origin: feature.id.clone(),

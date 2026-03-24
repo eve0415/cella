@@ -40,6 +40,7 @@ pub struct FeatureMetadata {
     pub container_env: HashMap<String, String>,
     pub customizations: Option<serde_json::Value>,
     pub on_create_command: Option<serde_json::Value>,
+    pub update_content_command: Option<serde_json::Value>,
     pub post_create_command: Option<serde_json::Value>,
     pub post_start_command: Option<serde_json::Value>,
     pub post_attach_command: Option<serde_json::Value>,
@@ -88,6 +89,7 @@ pub struct FeatureContainerConfig {
 #[derive(Debug, Clone, Default)]
 pub struct FeatureLifecycle {
     pub on_create: Vec<LifecycleEntry>,
+    pub update_content: Vec<LifecycleEntry>,
     pub post_create: Vec<LifecycleEntry>,
     pub post_start: Vec<LifecycleEntry>,
     pub post_attach: Vec<LifecycleEntry>,

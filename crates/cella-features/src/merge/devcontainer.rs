@@ -134,6 +134,10 @@ fn merge_lifecycle(
             &feature_lifecycle.on_create,
             obj.and_then(|o| o.get("onCreateCommand")),
         ),
+        update_content: merge_lifecycle_field(
+            &feature_lifecycle.update_content,
+            obj.and_then(|o| o.get("updateContentCommand")),
+        ),
         post_create: merge_lifecycle_field(
             &feature_lifecycle.post_create,
             obj.and_then(|o| o.get("postCreateCommand")),

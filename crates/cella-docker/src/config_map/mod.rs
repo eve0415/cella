@@ -3,17 +3,21 @@
 pub mod env;
 mod mounts;
 pub mod ports;
+pub mod run_args;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use bollard::models::ContainerCreateBody;
-use bollard::models::{HostConfig, Mount, MountTypeEnum, PortBinding, PortMap};
+use bollard::models::{
+    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, Mount, MountTypeEnum,
+    PortBinding, PortMap, ResourcesUlimits, RestartPolicy, RestartPolicyNameEnum,
+};
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
 use mounts::{map_additional_mounts, map_workspace_mount, parse_mount_string};
 use ports::map_port_bindings;
+use run_args::{GpuSpec, RunArgsOverrides};
 
 /// Options for creating a container (pre-mapped from devcontainer.json).
 #[derive(Debug, Clone)]
@@ -33,6 +37,9 @@ pub struct CreateContainerOptions {
     pub cap_add: Vec<String>,
     pub security_opt: Vec<String>,
     pub privileged: bool,
+    pub run_args_overrides: Option<RunArgsOverrides>,
+    /// GPU device request from `hostRequirements.gpu` (lower precedence than runArgs `--gpus`).
+    pub gpu_device_request: Option<DeviceRequest>,
 }
 
 /// A mount configuration (abstracted from Docker's Mount type).
@@ -44,9 +51,60 @@ pub struct MountConfig {
     pub consistency: Option<String>,
 }
 
+/// Merged overrides applied during `to_bollard_config`.
+struct MergedOverrides {
+    labels: HashMap<String, String>,
+    hostname: Option<String>,
+    cap_add: Vec<String>,
+    security_opt: Vec<String>,
+    privileged: bool,
+}
+
 impl CreateContainerOptions {
     /// Convert to bollard `ContainerCreateBody` for container creation.
     pub fn to_bollard_config(&self) -> ContainerCreateBody {
+        let (exposed_ports, port_bindings) = self.build_port_mappings();
+        let mounts = self.build_deduped_mounts();
+        let mut host_config = build_host_config(mounts, port_bindings);
+        let merged = self.apply_overrides(&mut host_config);
+
+        host_config.cap_add = if merged.cap_add.is_empty() {
+            None
+        } else {
+            Some(merged.cap_add)
+        };
+        host_config.security_opt = if merged.security_opt.is_empty() {
+            None
+        } else {
+            Some(merged.security_opt)
+        };
+        host_config.privileged = Some(merged.privileged);
+
+        ContainerCreateBody {
+            image: Some(self.image.clone()),
+            labels: Some(merged.labels),
+            env: if self.env.is_empty() {
+                None
+            } else {
+                Some(self.env.clone())
+            },
+            user: self.user.clone(),
+            hostname: merged.hostname,
+            working_dir: Some(self.workspace_folder.clone()),
+            entrypoint: self.entrypoint.clone(),
+            cmd: self.cmd.clone(),
+            exposed_ports: if exposed_ports.is_empty() {
+                None
+            } else {
+                Some(exposed_ports)
+            },
+            host_config: Some(host_config),
+            ..Default::default()
+        }
+    }
+
+    /// Build exposed ports and port bindings from `self.port_bindings`.
+    fn build_port_mappings(&self) -> (Vec<String>, PortMap) {
         let mut exposed_ports: Vec<String> = Vec::new();
         let mut port_bindings: PortMap = HashMap::new();
 
@@ -60,6 +118,11 @@ impl CreateContainerOptions {
             port_bindings.insert(port_key, Some(bindings.clone()));
         }
 
+        (exposed_ports, port_bindings)
+    }
+
+    /// Build deduplicated mount list (last occurrence wins per target path).
+    fn build_deduped_mounts(&self) -> Vec<Mount> {
         let mut mounts: Vec<Mount> = Vec::new();
         if let Some(ws_mount) = &self.workspace_mount {
             mounts.push(to_bollard_mount(ws_mount));
@@ -68,58 +131,271 @@ impl CreateContainerOptions {
             mounts.push(to_bollard_mount(m));
         }
 
-        // Deduplicate by target path — last occurrence wins (matches devcontainer CLI)
         let mut seen = HashSet::new();
         mounts.reverse();
         mounts.retain(|m| m.target.as_ref().is_none_or(|t| seen.insert(t.clone())));
         mounts.reverse();
+        mounts
+    }
 
-        let host_config = HostConfig {
-            mounts: if mounts.is_empty() {
-                None
-            } else {
-                Some(mounts)
-            },
-            port_bindings: if port_bindings.is_empty() {
-                None
-            } else {
-                Some(port_bindings)
-            },
-            cap_add: if self.cap_add.is_empty() {
-                None
-            } else {
-                Some(self.cap_add.clone())
-            },
-            security_opt: if self.security_opt.is_empty() {
-                None
-            } else {
-                Some(self.security_opt.clone())
-            },
-            privileged: Some(self.privileged),
-            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
-            ..Default::default()
-        };
+    /// Apply `run_args` overrides and GPU device requests to host config.
+    fn apply_overrides(&self, host_config: &mut HostConfig) -> MergedOverrides {
+        let mut extra_hosts = vec!["host.docker.internal:host-gateway".to_string()];
+        let mut security_opt = self.security_opt.clone();
+        let mut privileged = self.privileged;
+        let cap_add = self.cap_add.clone();
+        let mut labels = self.labels.clone();
+        let mut hostname = None;
 
-        ContainerCreateBody {
-            image: Some(self.image.clone()),
-            labels: Some(self.labels.clone()),
-            env: if self.env.is_empty() {
-                None
-            } else {
-                Some(self.env.clone())
-            },
-            user: self.user.clone(),
-            working_dir: Some(self.workspace_folder.clone()),
-            entrypoint: self.entrypoint.clone(),
-            cmd: self.cmd.clone(),
-            exposed_ports: if exposed_ports.is_empty() {
-                None
-            } else {
-                Some(exposed_ports)
-            },
-            host_config: Some(host_config),
-            ..Default::default()
+        if let Some(ref ra) = self.run_args_overrides {
+            apply_run_args_to_host_config(host_config, ra);
+            extra_hosts.extend(ra.extra_hosts.clone());
+            security_opt.extend(ra.security_opt.clone());
+            if let Some(p) = ra.privileged {
+                privileged = p || privileged;
+            }
+            for (k, v) in &ra.labels {
+                labels.insert(k.clone(), v.clone());
+            }
+            hostname.clone_from(&ra.hostname);
+            let _ = &ra.mac_address;
+
+            if let Some(ref gpu) = ra.gpus {
+                host_config
+                    .device_requests
+                    .get_or_insert_with(Vec::new)
+                    .push(gpu_spec_to_device_request(gpu));
+            }
         }
+
+        let has_run_args_gpu = self
+            .run_args_overrides
+            .as_ref()
+            .is_some_and(|ra| ra.gpus.is_some());
+        if !has_run_args_gpu && let Some(ref dr) = self.gpu_device_request {
+            host_config
+                .device_requests
+                .get_or_insert_with(Vec::new)
+                .push(dr.clone());
+        }
+
+        host_config.extra_hosts = Some(extra_hosts);
+
+        MergedOverrides {
+            labels,
+            hostname,
+            cap_add,
+            security_opt,
+            privileged,
+        }
+    }
+}
+
+/// Build initial `HostConfig` with mounts and port bindings.
+fn build_host_config(mounts: Vec<Mount>, port_bindings: PortMap) -> HostConfig {
+    HostConfig {
+        mounts: if mounts.is_empty() {
+            None
+        } else {
+            Some(mounts)
+        },
+        port_bindings: if port_bindings.is_empty() {
+            None
+        } else {
+            Some(port_bindings)
+        },
+        ..Default::default()
+    }
+}
+
+/// Apply `RunArgsOverrides` to a bollard `HostConfig`.
+fn apply_run_args_to_host_config(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    apply_network_overrides(hc, ra);
+    apply_resource_overrides(hc, ra);
+    apply_security_overrides(hc, ra);
+    apply_device_overrides(hc, ra);
+    apply_misc_overrides(hc, ra);
+}
+
+/// Apply networking-related overrides to `HostConfig`.
+fn apply_network_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    if let Some(ref v) = ra.network_mode {
+        hc.network_mode = Some(v.clone());
+    }
+    if !ra.dns.is_empty() {
+        hc.dns = Some(ra.dns.clone());
+    }
+    if !ra.dns_search.is_empty() {
+        hc.dns_search = Some(ra.dns_search.clone());
+    }
+}
+
+/// Apply resource-related overrides to `HostConfig`.
+fn apply_resource_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    if let Some(v) = ra.memory {
+        hc.memory = Some(v);
+    }
+    if let Some(v) = ra.memory_swap {
+        hc.memory_swap = Some(v);
+    }
+    if let Some(v) = ra.memory_reservation {
+        hc.memory_reservation = Some(v);
+    }
+    if let Some(v) = ra.nano_cpus {
+        hc.nano_cpus = Some(v);
+    }
+    if let Some(v) = ra.cpu_shares {
+        hc.cpu_shares = Some(v);
+    }
+    if let Some(v) = ra.cpu_period {
+        hc.cpu_period = Some(v);
+    }
+    if let Some(v) = ra.cpu_quota {
+        hc.cpu_quota = Some(v);
+    }
+    if let Some(ref v) = ra.cpuset_cpus {
+        hc.cpuset_cpus = Some(v.clone());
+    }
+    if let Some(ref v) = ra.cpuset_mems {
+        hc.cpuset_mems = Some(v.clone());
+    }
+    if let Some(v) = ra.shm_size {
+        hc.shm_size = Some(v);
+    }
+    if let Some(v) = ra.pids_limit {
+        hc.pids_limit = Some(v);
+    }
+}
+
+/// Apply security-related overrides to `HostConfig`.
+fn apply_security_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    if let Some(ref v) = ra.userns_mode {
+        hc.userns_mode = Some(v.clone());
+    }
+    if let Some(ref v) = ra.cgroup_parent {
+        hc.cgroup_parent = Some(v.clone());
+    }
+    if let Some(ref v) = ra.cgroupns_mode {
+        hc.cgroupns_mode = Some(match v.as_str() {
+            "host" => bollard::models::HostConfigCgroupnsModeEnum::HOST,
+            _ => bollard::models::HostConfigCgroupnsModeEnum::PRIVATE,
+        });
+    }
+}
+
+/// Apply device-related overrides to `HostConfig`.
+fn apply_device_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    if !ra.devices.is_empty() {
+        let devs = ra
+            .devices
+            .iter()
+            .map(|d| DeviceMapping {
+                path_on_host: Some(d.path_on_host.clone()),
+                path_in_container: Some(d.path_in_container.clone()),
+                cgroup_permissions: Some(d.cgroup_permissions.clone()),
+            })
+            .collect();
+        hc.devices = Some(devs);
+    }
+    if !ra.device_cgroup_rules.is_empty() {
+        hc.device_cgroup_rules = Some(ra.device_cgroup_rules.clone());
+    }
+}
+
+/// Apply miscellaneous overrides (ulimits, sysctls, logging, restart, etc.).
+fn apply_misc_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
+    if !ra.ulimits.is_empty() {
+        let ulimits = ra
+            .ulimits
+            .iter()
+            .map(|u| ResourcesUlimits {
+                name: Some(u.name.clone()),
+                soft: Some(u.soft),
+                hard: Some(u.hard),
+            })
+            .collect();
+        hc.ulimits = Some(ulimits);
+    }
+    if !ra.sysctls.is_empty() {
+        hc.sysctls = Some(ra.sysctls.clone());
+    }
+    if !ra.tmpfs.is_empty() {
+        hc.tmpfs = Some(ra.tmpfs.clone());
+    }
+    if let Some(ref v) = ra.pid_mode {
+        hc.pid_mode = Some(v.clone());
+    }
+    if let Some(ref v) = ra.ipc_mode {
+        hc.ipc_mode = Some(v.clone());
+    }
+    if let Some(ref v) = ra.uts_mode {
+        hc.uts_mode = Some(v.clone());
+    }
+    if let Some(ref v) = ra.runtime {
+        hc.runtime = Some(v.clone());
+    }
+    if !ra.storage_opt.is_empty() {
+        hc.storage_opt = Some(ra.storage_opt.clone());
+    }
+    if let Some(ref v) = ra.log_driver {
+        let log_config = bollard::models::HostConfigLogConfig {
+            typ: Some(v.clone()),
+            config: if ra.log_opt.is_empty() {
+                None
+            } else {
+                Some(ra.log_opt.clone())
+            },
+        };
+        hc.log_config = Some(log_config);
+    } else if !ra.log_opt.is_empty() {
+        let log_config = bollard::models::HostConfigLogConfig {
+            typ: None,
+            config: Some(ra.log_opt.clone()),
+        };
+        hc.log_config = Some(log_config);
+    }
+    if let Some(ref v) = ra.restart_policy {
+        let (name, max) = v.strip_prefix("on-failure:").map_or_else(
+            || {
+                let name = match v.as_str() {
+                    "always" => RestartPolicyNameEnum::ALWAYS,
+                    "unless-stopped" => RestartPolicyNameEnum::UNLESS_STOPPED,
+                    "on-failure" => RestartPolicyNameEnum::ON_FAILURE,
+                    _ => RestartPolicyNameEnum::EMPTY,
+                };
+                (name, None)
+            },
+            |count| (RestartPolicyNameEnum::ON_FAILURE, count.parse::<i64>().ok()),
+        );
+        hc.restart_policy = Some(RestartPolicy {
+            name: Some(name),
+            maximum_retry_count: max,
+        });
+    }
+    if let Some(v) = ra.init {
+        hc.init = Some(v);
+    }
+}
+
+/// Convert a `GpuSpec` to a bollard `DeviceRequest`.
+fn gpu_spec_to_device_request(gpu: &GpuSpec) -> DeviceRequest {
+    let capabilities = Some(vec![vec!["gpu".to_string()]]);
+    match gpu {
+        GpuSpec::All => DeviceRequest {
+            count: Some(-1),
+            capabilities,
+            ..Default::default()
+        },
+        GpuSpec::Count(n) => DeviceRequest {
+            count: Some(*n),
+            capabilities,
+            ..Default::default()
+        },
+        GpuSpec::DeviceIds(ids) => DeviceRequest {
+            device_ids: Some(ids.clone()),
+            capabilities,
+            ..Default::default()
+        },
     }
 }
 
@@ -147,7 +423,6 @@ pub fn map_config<S: std::hash::BuildHasher>(
     feature_config: Option<&FeatureContainerConfig>,
     image_env: &[String],
 ) -> CreateContainerOptions {
-    use std::fmt::Write;
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
@@ -159,104 +434,32 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
 
     let workspace_mount = map_workspace_mount(config, workspace_root, &workspace_folder);
-
-    // Mounts: from feature config (already includes user mounts via merge) or directly from config
-    let mut mounts = Vec::new();
-    if let Some(fc) = feature_config {
-        for mount_str in &fc.mounts {
-            if let Some(mc) = parse_mount_string(mount_str) {
-                mounts.push(mc);
-            }
-        }
-    } else {
-        mounts.extend(map_additional_mounts(config));
-    }
-
-    // Build container env: image env as base, user containerEnv overlays.
-    // Feature containerEnv is NOT included here — it's baked into the image
-    // via Dockerfile ENV instructions (see cella-features/src/dockerfile.rs).
-    let user_env = map_container_env(config);
-    let env = if user_env.is_empty() {
-        // No user overrides — image env preserved via None in to_bollard_config()
-        Vec::new()
-    } else {
-        // Merge: image env first, user env last (Docker API replaces by key)
-        let mut merged = image_env.to_vec();
-        merged.extend(user_env);
-        merged
-    };
-
+    let mounts = map_merged_mounts(config, feature_config);
+    let env = map_merged_env(config, image_env);
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
-
-    // capAdd: feature + user, deduplicated
-    let mut cap_add = Vec::new();
-    if let Some(fc) = feature_config {
-        cap_add.extend(fc.cap_add.clone());
-    }
-    cap_add.extend(map_string_array(config, "capAdd"));
-    cap_add.sort();
-    cap_add.dedup();
-
-    // securityOpt: feature + user, deduplicated
-    let mut security_opt = Vec::new();
-    if let Some(fc) = feature_config {
-        security_opt.extend(fc.security_opt.clone());
-    }
-    security_opt.extend(map_string_array(config, "securityOpt"));
-    security_opt.sort();
-    security_opt.dedup();
+    let cap_add = map_merged_string_list(config, "capAdd", feature_config.map(|fc| &fc.cap_add));
+    let security_opt = map_merged_string_list(
+        config,
+        "securityOpt",
+        feature_config.map(|fc| &fc.security_opt),
+    );
 
     let container_user = config
         .get("containerUser")
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    // overrideCommand: if false, preserve image CMD/ENTRYPOINT
-    // if true or unset, override with sleep infinity
-    let override_command = config
-        .get("overrideCommand")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config);
 
-    let (entrypoint, cmd) = if override_command {
-        let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
-
-        // Start cella-agent for port detection + credential forwarding
-        let version = env!("CARGO_PKG_VERSION");
-        let arch = crate::volume::detect_agent_arch();
-        let agent_path = crate::volume::agent_binary_path(version, arch);
-        let _ = write!(
-            script,
-            "if [ -x \"{agent_path}\" ]; then\n  \
-             \"{agent_path}\" daemon \
-             --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &\n\
-             fi\n"
-        );
-
-        if let Some(fc) = feature_config {
-            for ep in &fc.entrypoints {
-                script.push_str(ep);
-                script.push('\n');
-            }
-        }
-
-        script.push_str("exec \"$@\"\nwhile sleep 1 & wait $!; do :; done");
-
-        (
-            Some(vec!["/bin/sh".to_string()]),
-            Some(vec!["-c".to_string(), script, "-".to_string()]),
-        )
-    } else {
-        (None, None)
-    };
-
-    // privileged: OR of feature and user config
     let privileged = config
         .get("privileged")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
         || feature_config.is_some_and(|fc| fc.privileged);
+
+    let gpu_device_request = map_gpu_device_request(config);
+    let run_args_overrides = parse_run_args_from_config(config);
 
     CreateContainerOptions {
         name: container_name.to_string(),
@@ -274,7 +477,136 @@ pub fn map_config<S: std::hash::BuildHasher>(
         cap_add,
         security_opt,
         privileged,
+        run_args_overrides,
+        gpu_device_request,
     }
+}
+
+/// Build mounts from feature config (includes user mounts via merge) or directly from config.
+fn map_merged_mounts(
+    config: &serde_json::Value,
+    feature_config: Option<&FeatureContainerConfig>,
+) -> Vec<MountConfig> {
+    let mut mounts = Vec::new();
+    if let Some(fc) = feature_config {
+        for mount_str in &fc.mounts {
+            if let Some(mc) = parse_mount_string(mount_str) {
+                mounts.push(mc);
+            }
+        }
+    } else {
+        mounts.extend(map_additional_mounts(config));
+    }
+    mounts
+}
+
+/// Build container env: image env as base, user `containerEnv` overlays.
+/// Feature `containerEnv` is NOT included here -- it's baked into the image
+/// via Dockerfile ENV instructions.
+fn map_merged_env(config: &serde_json::Value, image_env: &[String]) -> Vec<String> {
+    let user_env = map_container_env(config);
+    if user_env.is_empty() {
+        Vec::new()
+    } else {
+        let mut merged = image_env.to_vec();
+        merged.extend(user_env);
+        merged
+    }
+}
+
+/// Merge a string-array config key with optional feature values, deduplicated.
+fn map_merged_string_list(
+    config: &serde_json::Value,
+    key: &str,
+    feature_values: Option<&Vec<String>>,
+) -> Vec<String> {
+    let mut list = Vec::new();
+    if let Some(fv) = feature_values {
+        list.extend(fv.clone());
+    }
+    list.extend(map_string_array(config, key));
+    list.sort();
+    list.dedup();
+    list
+}
+
+/// Build the entrypoint and cmd for the container.
+fn build_entrypoint_cmd(
+    config: &serde_json::Value,
+    feature_config: Option<&FeatureContainerConfig>,
+) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    use std::fmt::Write;
+
+    let override_command = config
+        .get("overrideCommand")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    if !override_command {
+        return (None, None);
+    }
+
+    let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
+
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = crate::volume::detect_agent_arch();
+    let agent_path = crate::volume::agent_binary_path(version, arch);
+    let _ = write!(
+        script,
+        "if [ -x \"{agent_path}\" ]; then\n  \
+         \"{agent_path}\" daemon \
+         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &\n\
+         fi\n"
+    );
+
+    if let Some(fc) = feature_config {
+        for ep in &fc.entrypoints {
+            script.push_str(ep);
+            script.push('\n');
+        }
+    }
+
+    script.push_str("exec \"$@\"\nwhile sleep 1 & wait $!; do :; done");
+
+    (
+        Some(vec!["/bin/sh".to_string()]),
+        Some(vec!["-c".to_string(), script, "-".to_string()]),
+    )
+}
+
+/// Map `hostRequirements.gpu` to a `DeviceRequest` (runArgs `--gpus` takes precedence).
+fn map_gpu_device_request(config: &serde_json::Value) -> Option<DeviceRequest> {
+    config
+        .get("hostRequirements")
+        .and_then(|h| h.get("gpu"))
+        .and_then(|gpu| {
+            let spec = match gpu {
+                serde_json::Value::Bool(true) => Some(GpuSpec::All),
+                serde_json::Value::String(s) if s == "optional" => Some(GpuSpec::All),
+                serde_json::Value::Object(obj) => {
+                    let count = obj
+                        .get("cores")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(-1);
+                    Some(GpuSpec::Count(count))
+                }
+                _ => None,
+            };
+            spec.map(|s| gpu_spec_to_device_request(&s))
+        })
+}
+
+/// Parse `runArgs` from config if present.
+fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverrides> {
+    config.get("runArgs").and_then(|v| v.as_array()).map(|arr| {
+        let args: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let overrides = run_args::parse_run_args(&args);
+        run_args::warn_unrecognized(&overrides);
+        overrides
+    })
 }
 
 fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
@@ -653,6 +985,8 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            run_args_overrides: None,
+            gpu_device_request: None,
         };
 
         let bollard_config = opts.to_bollard_config();
@@ -691,6 +1025,8 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            run_args_overrides: None,
+            gpu_device_request: None,
         };
 
         let bollard_config = opts.to_bollard_config();
@@ -747,6 +1083,8 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            run_args_overrides: None,
+            gpu_device_request: None,
         };
         let bollard_config = opts.to_bollard_config();
         let extra_hosts = bollard_config.host_config.unwrap().extra_hosts.unwrap();

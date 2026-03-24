@@ -40,6 +40,10 @@ pub struct DownArgs {
     #[arg(long)]
     docker_host: Option<String>,
 
+    /// Force stop even when shutdownAction is "none".
+    #[arg(long)]
+    force: bool,
+
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     output: OutputFormat,
@@ -64,6 +68,34 @@ impl DownArgs {
         };
 
         let container = target.resolve(&client, false).await?;
+
+        // For non-compose containers, honour shutdownAction from label
+        if !discovery::is_compose_container(&container.labels) {
+            let shutdown_action = container
+                .labels
+                .get("dev.cella.shutdown_action")
+                .map_or("stopContainer", String::as_str);
+
+            if shutdown_action == "none" && !self.force {
+                match &self.output {
+                    OutputFormat::Text => {
+                        eprintln!("Container has shutdownAction=\"none\". Use --force to stop it.");
+                    }
+                    OutputFormat::Json => {
+                        let output = json!({
+                            "outcome": "refused",
+                            "reason": "shutdownAction is none",
+                            "containerId": container.id,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&output).unwrap_or_default()
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        }
 
         deregister_container(&container).await;
 
