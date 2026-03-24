@@ -6,8 +6,8 @@ use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
-    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, FileToUpload,
-    ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
+    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, ExecResult,
+    FileToUpload, ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
     run_lifecycle_phase, update_remote_user_uid,
 };
 
@@ -1650,7 +1650,7 @@ async fn mkdir_in_container(
     container_id: &str,
     dir: &str,
     mode: u32,
-) -> Result<cella_docker::ExecResult, cella_docker::CellaDockerError> {
+) -> Result<ExecResult, CellaDockerError> {
     client
         .exec_command(
             container_id,
@@ -2326,7 +2326,7 @@ async fn run_claude_install(
 }
 
 /// Log the result of a Claude Code installation attempt.
-fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>) {
+fn log_install_result(result: Result<ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("Claude Code installed successfully");
@@ -2493,7 +2493,7 @@ async fn npm_install_global(
     package: &str,
     version: &str,
     probed_env: Option<&std::collections::HashMap<String, String>>,
-) -> Result<cella_docker::ExecResult, CellaDockerError> {
+) -> Result<ExecResult, CellaDockerError> {
     let pkg = if version == "latest" {
         package.to_string()
     } else {
@@ -2516,7 +2516,7 @@ async fn npm_install_global(
 /// Log the result of an npm tool installation attempt.
 fn log_npm_install_result(
     tool_name: &str,
-    result: Result<cella_docker::ExecResult, CellaDockerError>,
+    result: Result<ExecResult, CellaDockerError>,
 ) {
     match result {
         Ok(r) if r.exit_code == 0 => {

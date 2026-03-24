@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn parse_file_not_found() {
-        let result = parse_service_names(&[std::path::Path::new("/nonexistent/compose.yml")]);
+        let result = parse_service_names(&[Path::new("/nonexistent/compose.yml")]);
         assert!(matches!(
             result.unwrap_err(),
             CellaComposeError::FileNotFound { .. }

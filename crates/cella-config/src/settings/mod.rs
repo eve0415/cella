@@ -61,7 +61,7 @@ impl Settings {
 
     fn load_global() -> Option<Self> {
         let home = std::env::var("HOME").ok()?;
-        let path = std::path::Path::new(&home)
+        let path = Path::new(&home)
             .join(".cella")
             .join("config.toml");
         Self::load_file(&path)

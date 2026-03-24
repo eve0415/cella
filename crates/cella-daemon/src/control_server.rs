@@ -347,7 +347,7 @@ async fn start_port_proxy(
 /// Handle a `PortOpen` message: allocate a host port, start a proxy, and respond.
 async fn handle_port_open(
     port: u16,
-    protocol: cella_port::protocol::PortProtocol,
+    protocol: PortProtocol,
     process: Option<String>,
     proxy_port: Option<u16>,
     ctx: &AgentHandlerContext<'_>,
@@ -412,7 +412,7 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
 async fn handle_credential_request(
     id: String,
     operation: String,
-    fields: std::collections::HashMap<String, String>,
+    fields: HashMap<String, String>,
 ) -> DaemonMessage {
     debug!("Credential request: op={operation} id={id}");
     let result =
@@ -422,11 +422,11 @@ async fn handle_credential_request(
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
             warn!("Git credential error: {e}");
-            std::collections::HashMap::new()
+            HashMap::new()
         }
         Err(e) => {
             warn!("Credential task join error: {e}");
-            std::collections::HashMap::new()
+            HashMap::new()
         }
     };
     DaemonMessage::CredentialResponse {

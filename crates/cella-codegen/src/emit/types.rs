@@ -136,7 +136,7 @@ mod tests {
     use super::*;
     use crate::ir::*;
 
-    fn fmt(tokens: &proc_macro2::TokenStream) -> String {
+    fn fmt(tokens: &TokenStream) -> String {
         let raw = tokens.to_string();
         syn::parse_file(&raw)
             .map(|f| prettyplease::unparse(&f))

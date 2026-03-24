@@ -168,8 +168,8 @@ async fn run_sequential(
                     .exec_stream(
                         ctx.container_id,
                         &opts,
-                        std::io::stderr(),
-                        std::io::stderr(),
+                        io::stderr(),
+                        io::stderr(),
                     )
                     .await?
             }

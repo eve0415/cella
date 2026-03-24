@@ -207,7 +207,7 @@ fn get_available_storage(path: &Path) -> Option<u64> {
 
 /// Check if a GPU is available on the system.
 fn check_gpu_available() -> bool {
-    if std::path::Path::new("/dev/nvidia0").exists() {
+    if Path::new("/dev/nvidia0").exists() {
         return true;
     }
     if let Ok(output) = std::process::Command::new("nvidia-smi")

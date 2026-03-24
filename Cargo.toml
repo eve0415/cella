@@ -129,3 +129,4 @@ similar_names = "allow"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unused_qualifications = "deny"

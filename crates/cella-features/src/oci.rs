@@ -3,6 +3,7 @@
 //! Pulls feature artifacts from OCI-compliant registries (e.g. `ghcr.io`),
 //! extracts the gzipped tarball layer, and caches the result on disk.
 
+use std::future::Future;
 use std::path::PathBuf;
 
 use flate2::read::GzDecoder;
@@ -38,7 +39,7 @@ pub trait FeatureFetcher: Send + Sync {
         reference: &NormalizedRef,
         platform: &Platform,
         cache: &FeatureCache,
-    ) -> impl std::future::Future<Output = Result<PathBuf, FeatureError>> + Send;
+    ) -> impl Future<Output = Result<PathBuf, FeatureError>> + Send;
 }
 
 // ---------------------------------------------------------------------------

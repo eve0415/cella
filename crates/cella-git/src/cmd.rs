@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn run_in_nonexistent_dir() {
-        let result = run(std::path::Path::new("/nonexistent-dir-xyz"), &["status"]);
+        let result = run(Path::new("/nonexistent-dir-xyz"), &["status"]);
         assert!(result.is_err());
     }
 
