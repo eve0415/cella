@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-port",
  "serde",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-agent",
  "cella-compose",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "heck",
  "indexmap",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bollard",
  "cella-docker",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-codegen",
  "hex",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "cella-credential-proxy"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "nix",
  "tempfile",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-port",
  "nix",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bollard",
  "cella-features",
@@ -369,6 +369,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "hex",
+ "reqwest 0.13.2",
  "serde_json",
  "sha2",
  "tar",
@@ -379,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-config",
  "cella-daemon",
@@ -395,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cella-config",
  "glob",
@@ -407,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "bollard",
@@ -431,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "insta",
  "tempfile",
@@ -441,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
