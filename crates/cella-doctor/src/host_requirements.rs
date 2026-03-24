@@ -118,30 +118,7 @@ fn check_gpu(checks: &mut Vec<RequirementCheck>, gpu: &Value) {
 
 /// Parse a memory/storage string like "8gb", "512mb", "4096" into bytes.
 pub fn parse_memory_string(s: &str) -> Option<u64> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return None;
-    }
-
-    let multipliers: &[(&str, u64)] = &[
-        ("tb", 1024 * 1024 * 1024 * 1024),
-        ("gb", 1024 * 1024 * 1024),
-        ("mb", 1024 * 1024),
-        ("kb", 1024),
-        ("t", 1024 * 1024 * 1024 * 1024),
-        ("g", 1024 * 1024 * 1024),
-        ("m", 1024 * 1024),
-        ("k", 1024),
-        ("b", 1),
-    ];
-
-    for (suffix, mult) in multipliers {
-        if let Some(num_str) = s.strip_suffix(suffix) {
-            return num_str.trim().parse::<u64>().ok().map(|n| n * mult);
-        }
-    }
-
-    s.parse::<u64>().ok()
+    cella_docker::config_map::run_args::parse_byte_size(s).and_then(|v| u64::try_from(v).ok())
 }
 
 /// Get total system memory in bytes.

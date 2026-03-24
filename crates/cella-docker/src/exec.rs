@@ -53,6 +53,23 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Build base `CreateExecOptions` from `ExecOptions`, collecting owned reference vectors.
+fn build_base_exec_options(opts: &ExecOptions) -> CreateExecOptions<&str> {
+    let cmd: Vec<&str> = opts.cmd.iter().map(String::as_str).collect();
+    let env_refs: Option<Vec<&str>> = opts
+        .env
+        .as_ref()
+        .map(|e| e.iter().map(String::as_str).collect());
+
+    CreateExecOptions {
+        cmd: Some(cmd),
+        user: opts.user.as_deref(),
+        working_dir: opts.working_dir.as_deref(),
+        env: env_refs,
+        ..Default::default()
+    }
+}
+
 impl DockerClient {
     /// Execute a command inside a running container (captures output).
     ///
@@ -64,22 +81,12 @@ impl DockerClient {
         container_id: &str,
         opts: &ExecOptions,
     ) -> Result<ExecResult, CellaDockerError> {
-        let cmd: Vec<&str> = opts.cmd.iter().map(String::as_str).collect();
         debug!("Exec in {container_id}: {}", opts.cmd.join(" "));
 
-        let env_refs: Option<Vec<&str>> = opts
-            .env
-            .as_ref()
-            .map(|e| e.iter().map(String::as_str).collect());
-
         let create_opts = CreateExecOptions {
-            cmd: Some(cmd),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            user: opts.user.as_deref(),
-            working_dir: opts.working_dir.as_deref(),
-            env: env_refs,
-            ..Default::default()
+            ..build_base_exec_options(opts)
         };
 
         let exec = self.inner().create_exec(container_id, create_opts).await?;
@@ -131,22 +138,12 @@ impl DockerClient {
         mut stdout_writer: impl Write + Send,
         mut stderr_writer: impl Write + Send,
     ) -> Result<ExecResult, CellaDockerError> {
-        let cmd: Vec<&str> = opts.cmd.iter().map(String::as_str).collect();
         debug!("Exec stream in {container_id}: {}", opts.cmd.join(" "));
 
-        let env_refs: Option<Vec<&str>> = opts
-            .env
-            .as_ref()
-            .map(|e| e.iter().map(String::as_str).collect());
-
         let create_opts = CreateExecOptions {
-            cmd: Some(cmd),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            user: opts.user.as_deref(),
-            working_dir: opts.working_dir.as_deref(),
-            env: env_refs,
-            ..Default::default()
+            ..build_base_exec_options(opts)
         };
 
         let exec = self.inner().create_exec(container_id, create_opts).await?;
@@ -262,21 +259,9 @@ impl DockerClient {
         container_id: &str,
         opts: &ExecOptions,
     ) -> Result<String, CellaDockerError> {
-        let cmd: Vec<&str> = opts.cmd.iter().map(String::as_str).collect();
         debug!("Detached exec in {container_id}: {}", opts.cmd.join(" "));
 
-        let env_refs: Option<Vec<&str>> = opts
-            .env
-            .as_ref()
-            .map(|e| e.iter().map(String::as_str).collect());
-
-        let create_opts = CreateExecOptions {
-            cmd: Some(cmd),
-            user: opts.user.as_deref(),
-            working_dir: opts.working_dir.as_deref(),
-            env: env_refs,
-            ..Default::default()
-        };
+        let create_opts = build_base_exec_options(opts);
 
         let exec = self.inner().create_exec(container_id, create_opts).await?;
 
