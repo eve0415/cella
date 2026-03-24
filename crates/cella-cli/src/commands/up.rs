@@ -7,8 +7,8 @@ use tracing::{debug, info, warn};
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
     CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, FileToUpload,
-    LifecycleContext, MountConfig, container_labels, container_name, run_lifecycle_phase,
-    update_remote_user_uid,
+    ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
+    run_lifecycle_phase, update_remote_user_uid,
 };
 
 use super::image::ensure_image;
@@ -70,6 +70,14 @@ struct UpContext {
     output: OutputFormat,
     remove_container: bool,
     build_no_cache: bool,
+}
+
+/// Resolved image configuration for container creation.
+struct ImageConfig {
+    image_env: Vec<String>,
+    remote_user: String,
+    env_fwd: cella_env::EnvForwarding,
+    create_opts: cella_docker::config_map::CreateContainerOptions,
 }
 
 impl UpContext {
@@ -900,6 +908,61 @@ impl UpContext {
         phase.finish();
     }
 
+    /// Resolve image metadata, environment forwarding, and container creation options.
+    async fn resolve_image_config(
+        &self,
+        config: &serde_json::Value,
+        img_name: &str,
+        base_image_details: ImageDetails,
+        resolved_features: Option<&cella_features::ResolvedFeatures>,
+    ) -> ImageConfig {
+        let image_env = base_image_details.env;
+        let image_meta_user = base_image_details
+            .metadata
+            .as_deref()
+            .map(|m| cella_features::parse_image_metadata(m).1);
+        let remote_user =
+            resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
+
+        super::ensure_cella_daemon().await;
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+
+        let labels = self.build_labels(
+            resolved_features,
+            base_image_details.metadata.as_deref(),
+            &env_fwd,
+            &remote_user,
+        );
+
+        let feature_config = resolved_features.map(|r| &r.container_config);
+        let image_meta_config = if feature_config.is_none() {
+            base_image_details
+                .metadata
+                .as_deref()
+                .map(|m| cella_features::parse_image_metadata(m).0)
+        } else {
+            None
+        };
+        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
+
+        let create_opts = cella_docker::config_map::map_config(
+            config,
+            &self.container_nm,
+            img_name,
+            labels,
+            &self.resolved.workspace_root,
+            effective_feature_config,
+            &image_env,
+        );
+
+        ImageConfig {
+            image_env,
+            remote_user,
+            env_fwd,
+            create_opts,
+        }
+    }
+
     /// The full build/create/start/lifecycle path for a new container.
     async fn create_and_start(
         &self,
@@ -924,45 +987,19 @@ impl UpContext {
         )
         .await?;
 
-        let image_env = base_image_details.env;
-        let image_meta_user = base_image_details
-            .metadata
-            .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
-        let remote_user =
-            resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
-
-        super::ensure_cella_daemon().await;
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-
-        // Build labels and create options
-        let labels = self.build_labels(
-            resolved_features.as_ref(),
-            base_image_details.metadata.as_deref(),
-            &env_fwd,
-            &remote_user,
-        );
-
-        let feature_config = resolved_features.as_ref().map(|r| &r.container_config);
-        let image_meta_config = if feature_config.is_none() {
-            base_image_details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).0)
-        } else {
-            None
-        };
-        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
-
-        let mut create_opts = cella_docker::config_map::map_config(
-            config,
-            &self.container_nm,
-            &img_name,
-            labels,
-            &self.resolved.workspace_root,
-            effective_feature_config,
-            &image_env,
-        );
+        let ImageConfig {
+            image_env,
+            remote_user,
+            env_fwd,
+            mut create_opts,
+        } = self
+            .resolve_image_config(
+                config,
+                &img_name,
+                base_image_details,
+                resolved_features.as_ref(),
+            )
+            .await;
 
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         self.apply_env_and_mounts(

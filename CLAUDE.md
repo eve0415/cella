@@ -13,7 +13,7 @@ cargo build                      # build
 cargo test --workspace           # all tests
 cargo test -p <crate>            # single crate
 cargo test -p <crate> -- <name>  # single test
-cargo clippy --workspace --all-targets  # lint
+cargo clippy --workspace --all-targets -- -D warnings -D clippy::all  # lint (CI denies warnings)
 cargo fmt --all                  # format
 cargo insta review               # accept/reject snapshot changes
 ```
@@ -29,7 +29,7 @@ cargo insta review               # accept/reject snapshot changes
 
 ## Crates
 
-cella-cli, cella-config, cella-codegen, cella-docker, cella-git, cella-port, cella-agent
+cella-agent, cella-cli, cella-codegen, cella-config, cella-credential-proxy, cella-daemon, cella-doctor, cella-docker, cella-env, cella-features, cella-git, cella-port
 
 ## Testing
 
