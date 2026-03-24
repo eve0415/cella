@@ -1,33 +1,52 @@
 # cella-git
 
-> Git operations and error handling for cella.
+> Git worktree management, branch resolution, and repository operations.
 
 Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-git provides git-related error types and will serve as the home for git worktree operations. Currently, the crate defines error types for common git failures (missing git binary, command failures, non-repository directories) used by other crates when invoking git commands.
+cella-git provides the git operations that power cella's "1 branch = 1 worktree = 1 container" model. It manages the full worktree lifecycle (create, list, remove), resolves branch state (new, existing, merged, tracking-gone), discovers repository information, and computes content hashes for change detection.
 
-This crate is intentionally minimal today. The worktree integration — creating, listing, and removing worktrees, binding worktrees to containers, and managing worktree-based branches — is a major planned feature that will make this a central crate in the workspace.
+The crate wraps the git CLI rather than using a git library. All commands run through a central command runner (`cmd` module) that handles output parsing and retries git operations with exponential backoff when lock contention is detected (`.git/index.lock`). Branch names are sanitized into directory-safe names for worktree paths.
+
+Content hashing (git HEAD + dirty file status) enables `updateContentCommand` — cella stores the hash in a container label and re-runs lifecycle commands when the workspace changes between `cella up` invocations.
 
 ## Architecture
 
 ### Key Types
 
-- `CellaGitError` — error enum with variants:
-  - `GitNotFound` — git binary not found in PATH
-  - `CommandFailed(String)` — git command returned an error
-  - `NotARepository` — current directory is not a git repository
+- `WorktreeInfo` — a discovered worktree (path, branch, HEAD commit)
+- `BranchState` — resolution result for a branch name (new, existing local, existing remote, merged)
+- `RepoInfo` — repository metadata (root path, current branch, HEAD)
+- `CellaGitError` — error enum with 10 variants covering git failures, lock contention, worktree conflicts, branch issues, and parse errors
+
+### Key Functions
+
+- `discover(path)` — find the git repository root from a path
+- `default_branch(repo)` — detect the default branch (main/master)
+- `resolve_branch(repo, name)` — determine if a branch is new, local, remote, or merged
+- `create(repo, branch, path)` — create a new worktree for a branch
+- `list(repo)` — list all worktrees
+- `remove(repo, path)` — remove a worktree and optionally its branch
+- `content_hash::compute(repo)` — compute hash of git HEAD + dirty files for change detection
+- `branch_to_dir_name(branch)` — sanitize a branch name into a valid directory name
 
 ### Modules
 
 | Module | Purpose |
 |--------|---------|
-| `error` | `CellaGitError` definition |
+| `branch` | Branch state resolution (`resolve_branch`), merged branch detection, tracking-gone detection |
+| `cmd` | Git CLI command runner with output capture and exponential backoff retry on lock contention |
+| `content_hash` | Workspace content hashing (git HEAD + dirty file status) for `updateContentCommand` change detection |
+| `error` | `CellaGitError` enum (10 variants) with display formatting |
+| `repo` | Repository discovery, default branch detection, container detection (`is_inside_container`) |
+| `sanitize` | Branch name to directory name conversion (strips `refs/heads/`, replaces `/` with `-`) |
+| `worktree` | Worktree lifecycle — create, list, remove, path resolution |
 
 ## Crate Dependencies
 
-**Depends on:** none (only thiserror)
+**Depends on:** none (only thiserror, tracing)
 
 **Depended on by:** [cella-cli](../cella-cli)
 
@@ -37,15 +56,16 @@ This crate is intentionally minimal today. The worktree integration — creating
 cargo test -p cella-git
 ```
 
-Minimal test surface currently, matching the crate's minimal implementation.
+Error display tests use insta snapshot assertions. Worktree and branch tests use tempfile for isolated git repositories.
 
-## Planned
-
-- Git worktree creation, listing, and removal
-- Branch management tied to worktrees (1 branch = 1 worktree = 1 container)
-- Repository state detection and validation
-- Worktree-container binding coordination
+```sh
+cargo insta review  # after changing error messages
+```
 
 ## Development
 
-When worktree support is implemented, this crate will likely depend on a git library (e.g., gix) for pure-Rust git operations. The error types are already designed to accommodate worktree-related failures.
+The `cmd` module is the only place that invokes `git`. All other modules call through it. Lock contention retry is important because concurrent `cella branch` invocations on the same repo can race on the git index lock.
+
+`BranchState` is the key abstraction for the `cella branch` command — it determines whether to create a new branch, check out an existing one, or fetch from a remote tracking branch. When adding new branch operations, work through `resolve_branch` to handle all cases.
+
+The `content_hash` module hashes both the git HEAD ref and the list of dirty files (from `git status --porcelain`). This means both committed and uncommitted changes trigger `updateContentCommand` re-execution — matching the spec's intent that workspace content changes should re-run setup.

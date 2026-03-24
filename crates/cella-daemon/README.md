@@ -36,12 +36,13 @@ The daemon has special handling for OrbStack, which provides its own port forwar
 | `health` | Monitors agent connections, detects stale/dead connections |
 | `orbstack` | OrbStack-specific port handling (coordinates with OrbStack's built-in forwarding) |
 | `client` | Client connection types and session management |
+| `logging` | File-based tracing to `~/.cella/daemon.log` with size rotation |
 
 ## Crate Dependencies
 
 **Depends on:** [cella-port](../cella-port) (for protocol message types)
 
-**Depended on by:** [cella-cli](../cella-cli)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 
 ## Testing
 

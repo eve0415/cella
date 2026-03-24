@@ -32,9 +32,9 @@ JSON Schema string
 
 | Module | Purpose |
 |--------|---------|
-| `schema/parse` | Parses root JSON Schema into internal representation |
-| `schema/resolve` | Resolves `$ref` references within the schema |
-| `ir/lower` | Lowers parsed schema into an intermediate type representation |
+| `schema/parse` | Parses root JSON Schema into internal representation (including inline `$ref` resolution) |
+| `ir/lower/` | Lowers parsed schema into an intermediate type representation (submodules: `primitives`, `composite`) |
+| `ir/naming` | Naming conventions for generated types (case conversion, deduplication) |
 | `emit/types` | Emits Rust type definitions as token streams |
 | `emit/validate` | Emits validation logic for schema constraints |
 | `emit/format` | Formats token streams via prettyplease |

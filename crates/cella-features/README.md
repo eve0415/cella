@@ -62,13 +62,16 @@ Implements the `features` property from the [Dev Container specification](https:
 | `cache` | Local artifact caching with content-addressed storage (SHA-256) |
 | `merge/feature` | Merges multiple features' configurations together |
 | `merge/devcontainer` | Merges feature configuration back into the devcontainer config |
+| `merge/image_metadata` | Extracts and merges lifecycle commands from image metadata labels |
+| `merge/helpers` | Shared merge utilities (array deduplication, map merging) |
+| `merge/validation` | Validates merged configuration for conflicts and missing requirements |
 | `types` | Shared type definitions (`ResolvedFeature`, `Platform`, `FeatureMetadata`, etc.) |
 
 ## Crate Dependencies
 
 **Depends on:** none (uses oci-distribution, reqwest, bollard, flate2, tar directly)
 
-**Depended on by:** [cella-docker](../cella-docker)
+**Depended on by:** [cella-docker](../cella-docker), [cella-cli](../cella-cli)
 
 ## Testing
 

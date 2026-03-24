@@ -35,7 +35,7 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 
 **Depends on:** none (only serde, serde_json, thiserror)
 
-**Depended on by:** [cella-docker](../cella-docker), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon)
+**Depended on by:** [cella-docker](../cella-docker), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 
 ## Testing
 
@@ -47,7 +47,7 @@ Unit tests cover `/proc/net/tcp` parsing with synthetic data via tempfile, port 
 
 ## Development
 
-This crate is a shared dependency across three consumers (cella-docker, cella-agent, cella-daemon). The protocol module defines the wire format for daemon-agent communication — any changes to message types must be coordinated across both sides:
+This crate is a shared dependency across five consumers (cella-docker, cella-agent, cella-daemon, cella-cli, cella-doctor). The protocol module defines the wire format for daemon-agent communication — any changes to message types must be coordinated across both sides:
 
 - **Host side:** cella-daemon reads `AgentMessage` and sends `DaemonMessage`
 - **Container side:** cella-agent sends `AgentMessage` and reads `DaemonMessage`

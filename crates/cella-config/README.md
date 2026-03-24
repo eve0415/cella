@@ -10,7 +10,7 @@ cella-config handles everything related to devcontainer.json: discovering config
 
 The crate uses build-time code generation via cella-codegen to produce typed Rust structs directly from the [devcontainer JSON Schema](https://containers.dev/implementors/json_reference/). This ensures that schema changes are automatically reflected in the Rust API without manual synchronization.
 
-Configuration is merged in layer order: global (`~/.config/cella/global.jsonc`) -> workspace (`devcontainer.json`) -> local (`devcontainer.local.jsonc`). Scalar values are overridden by lower layers, arrays are concatenated and deduplicated, and maps merge with lower layer keys winning.
+Devcontainer configuration is discovered and parsed from the workspace. cella-specific settings live in TOML files: global (`~/.cella/config.toml`) and project (`.devcontainer/cella.toml`). Project settings override global settings per-key.
 
 ### Spec Coverage
 
@@ -22,6 +22,10 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 - `DevContainer` — generated struct representing a fully parsed devcontainer.json (via `schema` module)
 - `CellaSettings` — cella-specific TOML configuration (`~/.cella/config.toml`, `.devcontainer/cella.toml`)
+- `Settings` — top-level settings struct with tool-specific config
+- `ClaudeCode`, `Codex`, `Gemini` — AI agent tool configuration
+- `Tools` — tool detection and forwarding configuration
+- `Credentials` — credential forwarding options
 
 ### Modules
 
@@ -46,7 +50,7 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 **Depends on:** [cella-codegen](../cella-codegen) (build-time only)
 
-**Depended on by:** [cella-cli](../cella-cli)
+**Depended on by:** [cella-cli](../cella-cli), [cella-env](../cella-env), [cella-doctor](../cella-doctor)
 
 ## Testing
 

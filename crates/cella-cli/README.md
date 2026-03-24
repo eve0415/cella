@@ -31,6 +31,7 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `nvim` | Open neovim connected to the dev container |
 | `ports` | View port forwarding status for dev containers |
 | `credential` | Manage credential forwarding for dev containers |
+| `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
 
 Hidden internal commands: `daemon`, `credential-proxy`.
 
@@ -46,24 +47,35 @@ Hidden internal commands: `daemon`, `credential-proxy`.
 | Module | Purpose |
 |--------|---------|
 | `commands/mod.rs` | `Command` enum and dispatch logic |
-| `commands/up.rs` | Container startup orchestration (largest command at ~1100 lines) |
+| `commands/up.rs` | Container startup orchestration (largest command — handles single-container and compose paths) |
+| `commands/compose_up.rs` | Docker Compose orchestration (called by `up` when `dockerComposeFile` is present) |
 | `commands/down.rs` | Container teardown |
 | `commands/shell.rs` | Interactive shell attach |
 | `commands/exec.rs` | Command execution inside containers |
 | `commands/build.rs` | Image building |
 | `commands/list.rs` | Container listing with status and ports |
-| `commands/config.rs` | Configuration management |
-| `commands/daemon.rs` | Daemon lifecycle management |
-| `commands/credential.rs` | Credential forwarding management |
-| `commands/ports.rs` | Port forwarding status |
+| `commands/logs.rs` | Container log streaming (`--follow`, `--lifecycle`, `--daemon`) |
+| `commands/doctor.rs` | System diagnostics orchestration |
 | `commands/branch.rs` | Worktree-backed branch creation |
+| `commands/switch.rs` | Worktree branch switching |
+| `commands/prune.rs` | Stale worktree and container cleanup |
+| `commands/config.rs` | Configuration management |
+| `commands/read_configuration.rs` | Resolved devcontainer config output (JSON, compatible with devcontainer CLI) |
+| `commands/template.rs` | Template management |
 | `commands/init.rs` | Repository initialization |
+| `commands/nvim.rs` | Neovim container connection |
+| `commands/ports.rs` | Port forwarding status |
+| `commands/credential.rs` | Credential forwarding management |
+| `commands/daemon.rs` | Daemon lifecycle management (hidden) |
+| `commands/credential_proxy.rs` | Legacy credential proxy management (hidden) |
+| `commands/env_cache.rs` | Environment cache management (internal helper) |
+| `commands/image.rs` | Image inspection (internal helper) |
 
 Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-config](../cella-config), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-port](../cella-port), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-credential-proxy](../cella-credential-proxy)
+**Depends on:** [cella-config](../cella-config), [cella-docker](../cella-docker), [cella-compose](../cella-compose), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-port](../cella-port), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-credential-proxy](../cella-credential-proxy)
 
 **Depended on by:** none (top of the dependency tree)
 
