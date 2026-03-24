@@ -16,5 +16,6 @@ pub mod management;
 pub mod orbstack;
 pub mod port_manager;
 pub mod proxy;
+pub mod shared;
 
 pub use error::CellaDaemonError;

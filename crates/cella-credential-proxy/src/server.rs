@@ -9,6 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, info, warn};
 
+use cella_daemon::shared::{current_time_secs, set_socket_permissions};
+
 use crate::CellaCredentialProxyError;
 use crate::host::invoke_git_credential;
 use crate::protocol::{CredentialResponse, format_response, parse_request};
@@ -33,17 +35,7 @@ pub async fn run_server(
             message: format!("failed to bind {}: {e}", socket_path.display()),
         })?;
 
-    // Set socket permissions to 0o600 (owner only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(socket_path, perms).map_err(|e| {
-            CellaCredentialProxyError::Socket {
-                message: format!("failed to set socket permissions: {e}"),
-            }
-        })?;
-    }
+    set_socket_permissions(socket_path);
 
     info!("Credential proxy listening on {}", socket_path.display());
 
@@ -208,14 +200,6 @@ async fn handle_stream(
     }
 
     Ok(())
-}
-
-/// Get the current time in seconds since the Unix epoch.
-pub fn current_time_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

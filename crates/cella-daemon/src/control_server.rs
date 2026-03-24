@@ -547,13 +547,7 @@ async fn rewrite_browser_url(
     url.to_string()
 }
 
-/// Get the current time in seconds since the Unix epoch.
-pub fn current_time_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+pub use crate::shared::current_time_secs;
 
 #[cfg(test)]
 mod tests {

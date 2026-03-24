@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-daemon.workspace = true
 nix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

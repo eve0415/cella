@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 
 use cella_daemon::client::daemon_status;
 use cella_daemon::daemon;
-use cella_daemon::health::running_cella_container_count;
+use cella_daemon::shared::running_cella_container_count;
 use cella_env::git_credential::cella_data_dir;
 
 /// Manage the cella daemon (internal).

@@ -53,12 +53,7 @@ fn bind_management_socket(socket_path: &Path) -> Result<UnixListener, CellaDaemo
         ),
     })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(socket_path, perms);
-    }
+    crate::shared::set_socket_permissions(socket_path);
 
     info!("Management server listening on {}", socket_path.display());
     Ok(listener)

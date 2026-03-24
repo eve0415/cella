@@ -104,7 +104,7 @@ fn run_status() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Show container count
-    let container_count = daemon::running_cella_container_count();
+    let container_count = cella_daemon::shared::running_cella_container_count();
     eprintln!("  Active cella containers: {container_count}");
 
     // Show paths
