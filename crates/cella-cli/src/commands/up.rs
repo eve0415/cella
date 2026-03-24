@@ -697,6 +697,7 @@ impl UpContext {
         image_env: &[String],
         remote_user: &str,
         settings: &cella_config::Settings,
+        agent_arch: &str,
     ) {
         // Forwarding mounts
         for m in &env_fwd.mounts {
@@ -774,7 +775,9 @@ impl UpContext {
 
         // Agent volume mount and env vars
         let agent_step = self.progress.step("Populating agent volume...");
-        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await {
+        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner(), agent_arch)
+            .await
+        {
             Ok(()) => agent_step.finish(),
             Err(e) => {
                 agent_step.fail("failed");
@@ -1069,6 +1072,7 @@ impl UpContext {
         img_name: &str,
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
+        agent_arch: &str,
     ) -> ImageConfig {
         let image_env = base_image_details.env;
         let image_meta_user = base_image_details
@@ -1107,6 +1111,7 @@ impl UpContext {
             &self.resolved.workspace_root,
             effective_feature_config,
             &image_env,
+            agent_arch,
         );
 
         ImageConfig {
@@ -1143,6 +1148,14 @@ impl UpContext {
         )
         .await?;
 
+        // Detect container architecture from Docker daemon (once, used throughout)
+        let agent_arch = cella_docker::volume::detect_container_arch(self.client.inner())
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Failed to detect container arch, defaulting to x86_64: {e}");
+                "x86_64".to_string()
+            });
+
         let ImageConfig {
             image_env,
             remote_user,
@@ -1154,6 +1167,7 @@ impl UpContext {
                 &img_name,
                 base_image_details,
                 resolved_features.as_ref(),
+                &agent_arch,
             )
             .await;
 
@@ -1164,6 +1178,7 @@ impl UpContext {
             &image_env,
             &remote_user,
             &settings,
+            &agent_arch,
         )
         .await;
 

@@ -422,6 +422,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
     workspace_root: &Path,
     feature_config: Option<&FeatureContainerConfig>,
     image_env: &[String],
+    agent_arch: &str,
 ) -> CreateContainerOptions {
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
@@ -450,7 +451,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config);
+    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config, agent_arch);
 
     let privileged = config
         .get("privileged")
@@ -534,6 +535,7 @@ fn map_merged_string_list(
 fn build_entrypoint_cmd(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
+    agent_arch: &str,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     use std::fmt::Write;
 
@@ -549,8 +551,7 @@ fn build_entrypoint_cmd(
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
     let version = env!("CARGO_PKG_VERSION");
-    let arch = crate::volume::detect_agent_arch();
-    let agent_path = crate::volume::agent_binary_path(version, arch);
+    let agent_path = crate::volume::agent_binary_path(version, agent_arch);
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \
@@ -642,6 +643,7 @@ mod tests {
             Path::new("/tmp/my-project"),
             None,
             &[],
+            "x86_64",
         );
 
         assert_eq!(opts.image, "ubuntu");
@@ -663,6 +665,7 @@ mod tests {
             Path::new("/tmp/my-project"),
             None,
             &[],
+            "x86_64",
         );
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
@@ -683,6 +686,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
 
         assert!(opts.env.contains(&"FOO=bar".to_string()));
@@ -700,6 +704,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
         assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
         let cmd = opts.cmd.unwrap();
@@ -719,6 +724,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
         assert!(opts.entrypoint.is_none());
         assert!(opts.cmd.is_none());
@@ -762,6 +768,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
         assert!(opts.port_bindings.contains_key("3000/tcp"));
         assert!(opts.port_bindings.contains_key("8080/tcp"));
@@ -783,6 +790,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
         assert!(opts.port_bindings.contains_key("3000/udp"));
     }
@@ -802,6 +810,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
         assert_eq!(opts.mounts.len(), 1);
         assert_eq!(opts.mounts[0].target, "/b");
@@ -818,6 +827,7 @@ mod tests {
             Path::new("/tmp/my-project"),
             None,
             &[],
+            "x86_64",
         );
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
@@ -838,6 +848,7 @@ mod tests {
             Path::new("/tmp/test"),
             None,
             &[],
+            "x86_64",
         );
     }
 
@@ -878,6 +889,7 @@ mod tests {
             Path::new("/tmp/test"),
             Some(&feature_config),
             &[],
+            "x86_64",
         );
 
         // Feature mounts come first, then user mounts
@@ -946,6 +958,7 @@ mod tests {
             Path::new("/tmp/test"),
             Some(&feature_config),
             &[],
+            "x86_64",
         );
 
         // Each mount target appears exactly once
@@ -1059,6 +1072,7 @@ mod tests {
             Path::new("/tmp/test"),
             Some(&feature_config),
             &[],
+            "x86_64",
         );
 
         // Feature containerEnv must NOT appear in runtime env
