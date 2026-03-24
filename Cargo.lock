@@ -274,6 +274,7 @@ dependencies = [
  "clap",
  "hex",
  "indicatif",
+ "insta",
  "miette",
  "serde_json",
  "sha2",

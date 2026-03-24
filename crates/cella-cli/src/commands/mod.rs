@@ -92,7 +92,7 @@ impl Command {
             Self::Exec(args) => args.execute().await,
             Self::Build(args) => args.execute(progress).await,
             Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute(),
+            Self::Logs(args) => args.execute().await,
             Self::Doctor(args) => args.execute().await,
             Self::Branch(args) => args.execute(),
             Self::Spawn(args) => args.execute(),

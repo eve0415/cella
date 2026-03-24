@@ -326,6 +326,7 @@ impl UpContext {
             self.config(),
             "postAttachCommand",
         );
+        let progress_ref = self.progress.clone();
         let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container.id,
@@ -333,8 +334,13 @@ impl UpContext {
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
             is_text: self.progress.is_enabled(),
+            on_output: if self.progress.is_enabled() {
+                Some(Box::new(move |line| progress_ref.println(line)))
+            } else {
+                None
+            },
         };
-        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries).await?;
+        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
         output_result(
             &self.output,
@@ -362,10 +368,10 @@ impl UpContext {
         if let Some(old_hash) = &container.config_hash
             && *old_hash != self.resolved.config_hash
         {
-            eprintln!(
-                "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
-            );
-            eprintln!("  Run `cella up --rebuild` to recreate with the updated config.");
+            self.progress
+                .warn("Config has changed since this container was created.");
+            self.progress
+                .hint("Run `cella up --rebuild` to recreate with the updated config.");
         }
 
         // Warn if Docker runtime has changed
@@ -373,10 +379,11 @@ impl UpContext {
         if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime") {
             let current_label = current_runtime.as_label();
             if old_runtime != current_label {
-                eprintln!(
-                    "\x1b[33mWARNING:\x1b[0m Docker runtime changed ({old_runtime} \u{2192} {current_label})."
-                );
-                eprintln!("  Run `cella up --rebuild` to recreate with the updated runtime.");
+                self.progress.warn(&format!(
+                    "Docker runtime changed ({old_runtime} \u{2192} {current_label})."
+                ));
+                self.progress
+                    .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
             }
         }
 
@@ -404,6 +411,7 @@ impl UpContext {
                         self.config(),
                         phase,
                     );
+                    let progress_ref = self.progress.clone();
                     let lc_ctx = LifecycleContext {
                         client: &self.client,
                         container_id: &container.id,
@@ -411,8 +419,13 @@ impl UpContext {
                         env: &lifecycle_env,
                         working_dir: self.workspace_folder(),
                         is_text: self.progress.is_enabled(),
+                        on_output: if self.progress.is_enabled() {
+                            Some(Box::new(move |line| progress_ref.println(line)))
+                        } else {
+                            None
+                        },
                     };
-                    run_lifecycle_entries(&lc_ctx, phase, &entries).await?;
+                    run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
                 }
 
                 output_result(
@@ -426,8 +439,9 @@ impl UpContext {
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
-                eprintln!("\x1b[33mWARNING:\x1b[0m Could not start existing container: {e}");
-                eprintln!("Recreating container...");
+                self.progress
+                    .warn(&format!("Could not start existing container: {e}"));
+                self.progress.hint("Recreating container...");
                 let _ = self.client.remove_container(&container.id, false).await;
                 // Fall through to creation path
                 Ok(false)
@@ -606,10 +620,10 @@ impl UpContext {
             cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await
         {
             warn!("Failed to populate agent volume: {e}");
-            eprintln!(
-                "\x1b[33mWARNING:\x1b[0m Port forwarding and BROWSER interception will not work."
-            );
-            eprintln!("  Agent volume population failed: {e}");
+            self.progress
+                .warn("Port forwarding and BROWSER interception will not work.");
+            self.progress
+                .hint(&format!("Agent volume population failed: {e}"));
         }
 
         let agent_env = cella_docker::config_map::env::agent_env_vars();
@@ -632,11 +646,14 @@ impl UpContext {
         &self,
         container_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let start_label = if self.progress.is_verbose() {
+            let short_id = &container_id[..12.min(container_id.len())];
+            format!("Starting container: {short_id}...")
+        } else {
+            "Starting container...".to_string()
+        };
         self.progress
-            .run_step(
-                "Starting container...",
-                self.client.start_container(container_id),
-            )
+            .run_step(&start_label, self.client.start_container(container_id))
             .await?;
         verify_container_running(&self.client, container_id).await?;
 
@@ -955,13 +972,24 @@ impl UpContext {
         .await;
 
         // Create and start container
-        let container_id = self
-            .progress
-            .run_step(
-                "Creating container...",
-                self.client.create_container(&create_opts),
-            )
-            .await?;
+        let container_id = if self.progress.is_verbose() {
+            let step = self
+                .progress
+                .step(&format!("Creating container: {}...", self.container_nm));
+            let result = self.client.create_container(&create_opts).await;
+            match &result {
+                Ok(_) => step.finish(),
+                Err(e) => step.fail(&e.to_string()),
+            }
+            result?
+        } else {
+            self.progress
+                .run_step(
+                    "Creating container...",
+                    self.client.create_container(&create_opts),
+                )
+                .await?
+        };
 
         self.start_and_register(&container_id).await?;
 
@@ -977,6 +1005,7 @@ impl UpContext {
             .await;
 
         // Lifecycle commands (first create)
+        let progress_ref = self.progress.clone();
         let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container_id,
@@ -984,8 +1013,14 @@ impl UpContext {
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
             is_text: self.progress.is_enabled(),
+            on_output: if self.progress.is_enabled() {
+                Some(Box::new(move |line| progress_ref.println(line)))
+            } else {
+                None
+            },
         };
-        run_all_lifecycle_phases(&lc_ctx, config, resolved_features.as_ref()).await?;
+        run_all_lifecycle_phases(&lc_ctx, config, resolved_features.as_ref(), &self.progress)
+            .await?;
 
         output_result(
             &self.output,
@@ -1431,14 +1466,21 @@ async fn upload_to_container(
     true
 }
 
-/// Run a sequence of origin-tracked lifecycle entries.
+/// Run a sequence of origin-tracked lifecycle entries with progress tracking.
 async fn run_lifecycle_entries(
     ctx: &LifecycleContext<'_>,
     phase: &str,
     entries: &[cella_features::LifecycleEntry],
+    progress: &crate::progress::Progress,
 ) -> Result<(), CellaDockerError> {
     for entry in entries {
-        run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await?;
+        let step = progress.step(&format!("Running the {phase} from {}...", entry.origin));
+        let result = run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await;
+        match &result {
+            Ok(()) => step.finish(),
+            Err(e) => step.fail(&e.to_string()),
+        }
+        result?;
     }
     Ok(())
 }
@@ -1448,6 +1490,7 @@ async fn run_all_lifecycle_phases(
     lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
+    progress: &crate::progress::Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let phases = [
         "onCreateCommand",
@@ -1467,13 +1510,19 @@ async fn run_all_lifecycle_phases(
             _ => &empty,
         });
 
-        run_lifecycle_entries(lc_ctx, phase, entries).await?;
+        run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
 
         if entries.is_empty()
             && let Some(cmd) = config.get(phase)
             && !cmd.is_null()
         {
-            run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await?;
+            let step = progress.step(&format!("Running the {phase} from devcontainer.json..."));
+            let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
+            match &result {
+                Ok(()) => step.finish(),
+                Err(e) => step.fail(&e.to_string()),
+            }
+            result?;
         }
     }
 

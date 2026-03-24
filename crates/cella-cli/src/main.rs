@@ -1,15 +1,21 @@
 mod commands;
 pub mod progress;
 
+use std::io::IsTerminal;
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use progress::{IndicatifMakeWriter, Progress};
+use progress::{IndicatifMakeWriter, Progress, Verbosity};
 
 /// cella — Dev containers reinvented for the AI age
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Show expanded step details (container names, feature resolution, etc.).
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: commands::Command,
 }
@@ -26,7 +32,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse CLI first to determine output mode before creating progress.
     let cli = Cli::parse();
-    let progress = Progress::new(cli.command.is_text_output());
+
+    let verbosity = if cli.verbose {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Normal
+    };
+
+    // Spinners are active when: text output mode AND no RUST_LOG AND stderr is a TTY.
+    let rust_log_set = std::env::var_os("RUST_LOG").is_some();
+    let is_tty = std::io::stderr().is_terminal();
+    let spinners_enabled = cli.command.is_text_output() && !rust_log_set && is_tty;
+
+    let progress = Progress::new(spinners_enabled, verbosity);
 
     // Route tracing through indicatif so log lines never corrupt spinners.
     tracing_subscriber::fmt()

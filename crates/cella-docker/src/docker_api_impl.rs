@@ -114,7 +114,7 @@ impl DockerApi for DockerClient {
         &'a self,
         opts: &'a BuildOptions,
     ) -> BoxFuture<'a, Result<String, CellaDockerError>> {
-        Box::pin(DockerClient::build_image(self, opts))
+        Box::pin(DockerClient::build_image(self, opts, |_| {}))
     }
 
     fn image_exists<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<bool, CellaDockerError>> {

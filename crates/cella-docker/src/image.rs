@@ -160,10 +160,17 @@ impl DockerClient {
     /// Prefers `docker buildx build` when available. Falls back to
     /// `docker build` with `DOCKER_BUILDKIT=1` otherwise.
     ///
+    /// Build output (stdout/stderr) is captured and forwarded to the
+    /// provided callback line by line. Pass `|_| {}` to discard output.
+    ///
     /// # Errors
     ///
     /// Returns error if the docker CLI is not found or the build fails.
-    pub async fn build_image(&self, opts: &BuildOptions) -> Result<String, CellaDockerError> {
+    pub async fn build_image(
+        &self,
+        opts: &BuildOptions,
+        mut on_output: impl FnMut(&str),
+    ) -> Result<String, CellaDockerError> {
         info!("Building image: {}", opts.image_name);
 
         let bin = docker_binary()?;
@@ -174,15 +181,65 @@ impl DockerClient {
 
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(&args)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         if !use_buildx {
             cmd.env("DOCKER_BUILDKIT", "1");
         }
 
-        let status = cmd
-            .status()
+        let mut child = cmd
+            .spawn()
+            .map_err(|source| CellaDockerError::HostCommandFailed {
+                command: format!("{bin} {}", args.join(" ")),
+                source,
+            })?;
+
+        // Read stdout and stderr concurrently, collecting lines.
+        let stdout_task = child.stdout.take().map(|stdout| {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stdout).lines();
+                let mut collected = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    collected.push(line);
+                }
+                collected
+            })
+        });
+
+        let stderr_task = child.stderr.take().map(|stderr| {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stderr).lines();
+                let mut collected = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    collected.push(line);
+                }
+                collected
+            })
+        });
+
+        // Wait for output collection and process exit
+        let stdout_lines = match stdout_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let stderr_lines = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        // Forward collected lines through the callback
+        for line in &stdout_lines {
+            on_output(line);
+        }
+        for line in &stderr_lines {
+            on_output(line);
+        }
+
+        let status = child
+            .wait()
             .await
             .map_err(|source| CellaDockerError::HostCommandFailed {
                 command: format!("{bin} {}", args.join(" ")),

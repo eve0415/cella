@@ -68,12 +68,19 @@ pub async fn build_features_layer(
         "Building features layer image (context: {})",
         ctx.resolved.build_context.display()
     );
-    ctx.progress
-        .run_step(
-            "Building features layer...",
-            ctx.client.build_image(&build_opts),
-        )
-        .await?;
+    let step = ctx.progress.step("Building features layer...");
+    let progress_ref = ctx.progress.clone();
+    let result = ctx
+        .client
+        .build_image(&build_opts, |line| {
+            progress_ref.println(line);
+        })
+        .await;
+    match &result {
+        Ok(_) => step.finish(),
+        Err(e) => step.fail(&e.to_string()),
+    }
+    result?;
     Ok(features_image)
 }
 
@@ -152,9 +159,18 @@ async fn resolve_base_image(
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
-        progress
-            .run_step("Building Dockerfile...", client.build_image(&build_opts))
-            .await?;
+        let step = progress.step("Building Dockerfile...");
+        let progress_ref = progress.clone();
+        let result = client
+            .build_image(&build_opts, |line| {
+                progress_ref.println(line);
+            })
+            .await;
+        match &result {
+            Ok(_) => step.finish(),
+            Err(e) => step.fail(&e.to_string()),
+        }
+        result?;
         Ok(img_name)
     } else {
         Err("devcontainer.json must specify either 'image' or 'build'".into())

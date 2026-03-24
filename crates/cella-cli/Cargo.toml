@@ -30,5 +30,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 indicatif.workspace = true
 
+[dev-dependencies]
+insta = { version = "1.46.3", features = ["json", "redactions"] }
+
 [lints]
 workspace = true
