@@ -13,7 +13,7 @@ use crate::error::CellaComposeError;
 #[derive(Deserialize)]
 struct ComposeFile {
     #[serde(default)]
-    services: HashMap<String, serde_yaml::Value>,
+    services: HashMap<String, yaml_serde::Value>,
 }
 
 /// Parse one or more compose files and return the merged set of service names.
@@ -34,7 +34,7 @@ pub fn parse_service_names(
             std::fs::read_to_string(path).map_err(|_| CellaComposeError::FileNotFound {
                 path: path.to_path_buf(),
             })?;
-        let parsed: ComposeFile = serde_yaml::from_str(&content)
+        let parsed: ComposeFile = yaml_serde::from_str(&content)
             .map_err(|e| CellaComposeError::YamlParse(e.to_string()))?;
         for name in parsed.services.keys() {
             if !all_services.contains(name) {

@@ -10,7 +10,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-insta = "1.46.3"
+insta.workspace = true
 
 [lints]
 workspace = true

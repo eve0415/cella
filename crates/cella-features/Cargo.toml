@@ -17,13 +17,13 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tar = "0.4.45"
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-insta = { version = "1.46.3", features = ["json", "redactions"] }
+insta.workspace = true
 tempfile.workspace = true
 
 [lints]
