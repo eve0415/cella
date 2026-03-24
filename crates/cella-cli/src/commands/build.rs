@@ -41,7 +41,14 @@ enum OutputFormat {
 }
 
 impl BuildArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub const fn is_text_output(&self) -> bool {
+        matches!(self.output, OutputFormat::Text)
+    }
+
+    pub async fn execute(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = if let Some(ref wf) = self.workspace_folder {
             wf.canonicalize().unwrap_or_else(|_| wf.clone())
         } else {
@@ -67,7 +74,6 @@ impl BuildArgs {
         client.ping().await?;
 
         // 3. Build image via shared ensure_image logic
-        let is_text = matches!(self.output, OutputFormat::Text);
         let (img_name, _resolved_features, _image_details) = ensure_image(
             &client,
             config,
@@ -75,7 +81,7 @@ impl BuildArgs {
             config_name,
             &resolved.config_path,
             self.no_cache,
-            is_text,
+            &progress,
         )
         .await?;
 

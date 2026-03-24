@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
     CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, FileToUpload,
-    LifecycleContext, MountConfig, container_labels, container_name, run_lifecycle_phase,
-    update_remote_user_uid,
+    ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
+    run_lifecycle_phase, update_remote_user_uid,
 };
 
 use super::image::ensure_image;
@@ -52,6 +52,12 @@ pub enum OutputFormat {
     Json,
 }
 
+impl UpArgs {
+    pub const fn is_text_output(&self) -> bool {
+        matches!(self.output, OutputFormat::Text)
+    }
+}
+
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 struct UpContext {
     resolved: ResolvedConfig,
@@ -60,14 +66,25 @@ struct UpContext {
     remote_env: Vec<String>,
     workspace_folder_from_config: Option<String>,
     default_workspace_folder: String,
-    is_text: bool,
+    progress: crate::progress::Progress,
     output: OutputFormat,
     remove_container: bool,
     build_no_cache: bool,
 }
 
+/// Resolved image configuration for container creation.
+struct ImageConfig {
+    image_env: Vec<String>,
+    remote_user: String,
+    env_fwd: cella_env::EnvForwarding,
+    create_opts: cella_docker::config_map::CreateContainerOptions,
+}
+
 impl UpContext {
-    async fn new(args: &UpArgs) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(
+        args: &UpArgs,
+        progress: crate::progress::Progress,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = if let Some(ref wf) = args.workspace_folder {
             wf.canonicalize().unwrap_or_else(|_| wf.clone())
         } else {
@@ -75,13 +92,13 @@ impl UpContext {
         };
 
         let remove_container = args.rebuild || args.remove_existing_container;
-        let is_text = matches!(&args.output, OutputFormat::Text);
 
         // 1. Resolve config
-        if is_text {
-            eprintln!("Resolving devcontainer configuration...");
-        }
-        let resolved = resolve::config(&cwd, args.file.as_deref())?;
+        let resolved = progress
+            .run_step("Resolving devcontainer configuration...", async {
+                resolve::config(&cwd, args.file.as_deref())
+            })
+            .await?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
@@ -116,7 +133,7 @@ impl UpContext {
             remote_env,
             workspace_folder_from_config,
             default_workspace_folder,
-            is_text,
+            progress,
             output: args.output.clone(),
             remove_container,
             build_no_cache: args.build_no_cache,
@@ -185,8 +202,8 @@ impl UpContext {
             .unwrap_or_else(|| "root".to_string())
     }
 
-    /// Run the env forwarding + Claude auth + Claude Code install + userEnvProbe
-    /// sequence that is shared between the running and stopped-restart paths.
+    /// Run the env forwarding + userEnvProbe + tool auth/install sequence
+    /// that is shared between the running and stopped-restart paths.
     async fn prepare_container_env(
         &self,
         container_id: &str,
@@ -199,39 +216,97 @@ impl UpContext {
 
         // Re-inject env forwarding (git config + SSH files may have changed)
         let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
-        timed_step(
-            self.is_text,
-            "Configuring environment...",
-            inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
-        )
-        .await;
-
-        // Claude Code: re-sync auth + ensure installed
-        let cc_settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        if cc_settings.tools.claude_code.forward_config {
-            resync_claude_auth(&self.client, container_id, remote_user).await;
-        }
-        if cc_settings.tools.claude_code.enabled {
-            install_claude_code(
-                &self.client,
-                container_id,
-                remote_user,
-                &cc_settings.tools.claude_code,
+        self.progress
+            .run_step(
+                "Configuring environment...",
+                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
             )
             .await;
+
+        // Probe user environment first so tool installs can use feature-provided PATH
+        // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
+        let probed_env = self
+            .progress
+            .run_step(
+                "Running userEnvProbe...",
+                super::env_cache::probe_and_cache_user_env(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    self.probe_type(),
+                ),
+            )
+            .await;
+
+        // Sequential prerequisites
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
+        if settings.tools.claude_code.forward_config {
+            resync_claude_auth(&self.client, container_id, remote_user).await;
         }
 
-        let probed_env = timed_step(
-            self.is_text,
-            "Running userEnvProbe...",
-            super::env_cache::probe_and_cache_user_env(
-                &self.client,
-                container_id,
-                remote_user,
-                self.probe_type(),
-            ),
-        )
-        .await;
+        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+        let node_available = if needs_npm {
+            ensure_node_available(&self.client, container_id, probed_env.as_ref()).await
+        } else {
+            false
+        };
+
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
+
+        if any_tool {
+            let phase = self.progress.phase("Installing tools...");
+
+            let claude_branch = async {
+                if settings.tools.claude_code.enabled {
+                    let step = phase.step("Claude Code");
+                    install_claude_code(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.claude_code,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+            };
+
+            let npm_branch = async {
+                if needs_npm && !node_available {
+                    warn!("Skipping npm tool installs: Node.js/npm not available");
+                    return;
+                }
+                if settings.tools.codex.enabled {
+                    let step = phase.step("Codex");
+                    install_codex(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.codex,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+                if settings.tools.gemini.enabled {
+                    let step = phase.step("Gemini CLI");
+                    install_gemini(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        &settings.tools.gemini,
+                        probed_env.as_ref(),
+                    )
+                    .await;
+                    step.finish();
+                }
+            };
+
+            tokio::join!(claude_branch, npm_branch);
+            phase.finish();
+        }
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || self.remote_env.clone(),
@@ -259,15 +334,21 @@ impl UpContext {
             self.config(),
             "postAttachCommand",
         );
+        let progress_ref = self.progress.clone();
         let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container.id,
             user: Some(remote_user),
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
-            is_text: self.is_text,
+            is_text: self.progress.is_enabled(),
+            on_output: if self.progress.is_enabled() {
+                Some(Box::new(move |line| progress_ref.println(line)))
+            } else {
+                None
+            },
         };
-        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries).await?;
+        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
         output_result(
             &self.output,
@@ -295,10 +376,10 @@ impl UpContext {
         if let Some(old_hash) = &container.config_hash
             && *old_hash != self.resolved.config_hash
         {
-            eprintln!(
-                "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
-            );
-            eprintln!("  Run `cella up --rebuild` to recreate with the updated config.");
+            self.progress
+                .warn("Config has changed since this container was created.");
+            self.progress
+                .hint("Run `cella up --rebuild` to recreate with the updated config.");
         }
 
         // Warn if Docker runtime has changed
@@ -306,20 +387,22 @@ impl UpContext {
         if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime") {
             let current_label = current_runtime.as_label();
             if old_runtime != current_label {
-                eprintln!(
-                    "\x1b[33mWARNING:\x1b[0m Docker runtime changed ({old_runtime} \u{2192} {current_label})."
-                );
-                eprintln!("  Run `cella up --rebuild` to recreate with the updated runtime.");
+                self.progress.warn(&format!(
+                    "Docker runtime changed ({old_runtime} \u{2192} {current_label})."
+                ));
+                self.progress
+                    .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
             }
         }
 
         // Attempt to start directly -- let Docker validate mounts
-        let start_result = timed_step(
-            self.is_text,
-            "Starting container...",
-            self.client.start_container(&container.id),
-        )
-        .await;
+        let step = self.progress.step("Starting container...");
+        let start_result = self.client.start_container(&container.id).await;
+        if start_result.is_ok() {
+            step.finish();
+        } else {
+            step.fail("failed to start");
+        }
 
         match start_result {
             Ok(()) => {
@@ -336,15 +419,21 @@ impl UpContext {
                         self.config(),
                         phase,
                     );
+                    let progress_ref = self.progress.clone();
                     let lc_ctx = LifecycleContext {
                         client: &self.client,
                         container_id: &container.id,
                         user: Some(remote_user),
                         env: &lifecycle_env,
                         working_dir: self.workspace_folder(),
-                        is_text: self.is_text,
+                        is_text: self.progress.is_enabled(),
+                        on_output: if self.progress.is_enabled() {
+                            Some(Box::new(move |line| progress_ref.println(line)))
+                        } else {
+                            None
+                        },
                     };
-                    run_lifecycle_entries(&lc_ctx, phase, &entries).await?;
+                    run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
                 }
 
                 output_result(
@@ -358,8 +447,9 @@ impl UpContext {
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
-                eprintln!("\x1b[33mWARNING:\x1b[0m Could not start existing container: {e}");
-                eprintln!("Recreating container...");
+                self.progress
+                    .warn(&format!("Could not start existing container: {e}"));
+                self.progress.hint("Recreating container...");
                 let _ = self.client.remove_container(&container.id, false).await;
                 // Fall through to creation path
                 Ok(false)
@@ -485,6 +575,32 @@ impl UpContext {
             });
         }
 
+        // Auto-mount ~/.codex if Codex config forwarding is enabled
+        if settings.tools.codex.forward_config
+            && let Some(host_path) = cella_env::codex::host_codex_dir()
+        {
+            let target = cella_env::codex::container_codex_dir(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+
+        // Auto-mount ~/.gemini if Gemini config forwarding is enabled
+        if settings.tools.gemini.forward_config
+            && let Some(host_path) = cella_env::gemini::host_gemini_dir()
+        {
+            let target = cella_env::gemini::container_gemini_dir(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+
         // Forwarding env vars
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -508,14 +624,17 @@ impl UpContext {
         }
 
         // Agent volume mount and env vars
-        if let Err(e) =
-            cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await
-        {
-            warn!("Failed to populate agent volume: {e}");
-            eprintln!(
-                "\x1b[33mWARNING:\x1b[0m Port forwarding and BROWSER interception will not work."
-            );
-            eprintln!("  Agent volume population failed: {e}");
+        let agent_step = self.progress.step("Populating agent volume...");
+        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await {
+            Ok(()) => agent_step.finish(),
+            Err(e) => {
+                agent_step.fail("failed");
+                warn!("Failed to populate agent volume: {e}");
+                self.progress
+                    .warn("Port forwarding and BROWSER interception will not work.");
+                self.progress
+                    .hint(&format!("Agent volume population failed: {e}"));
+            }
         }
 
         let agent_env = cella_docker::config_map::env::agent_env_vars();
@@ -538,12 +657,15 @@ impl UpContext {
         &self,
         container_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        timed_step(
-            self.is_text,
-            "Starting container...",
-            self.client.start_container(container_id),
-        )
-        .await?;
+        let start_label = if self.progress.is_verbose() {
+            let short_id = &container_id[..12.min(container_id.len())];
+            format!("Starting container: {short_id}...")
+        } else {
+            "Starting container...".to_string()
+        };
+        self.progress
+            .run_step(&start_label, self.client.start_container(container_id))
+            .await?;
         verify_container_running(&self.client, container_id).await?;
 
         if let Err(e) =
@@ -645,12 +767,12 @@ impl UpContext {
         }
 
         // Inject post-start environment forwarding
-        timed_step(
-            self.is_text,
-            "Configuring environment...",
-            inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
-        )
-        .await;
+        self.progress
+            .run_step(
+                "Configuring environment...",
+                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
+            )
+            .await;
 
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
@@ -663,47 +785,24 @@ impl UpContext {
             .await;
         }
 
-        // Claude Code: forward config + install (first create)
-        if settings.tools.claude_code.forward_config {
-            timed_step(
-                self.is_text,
-                "Forwarding Claude Code config...",
-                seed_claude_config(
-                    &self.client,
-                    container_id,
-                    &self.resolved.workspace_root,
-                    remote_user,
-                    &settings.tools.claude_code,
-                ),
-            )
-            .await;
-        }
-        if settings.tools.claude_code.enabled {
-            timed_step(
-                self.is_text,
-                "Installing Claude Code...",
-                install_claude_code(
+        // Probe user environment first so tool installs can use feature-provided PATH
+        // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
+        let probed_env = self
+            .progress
+            .run_step(
+                "Running userEnvProbe...",
+                super::env_cache::probe_and_cache_user_env(
                     &self.client,
                     container_id,
                     remote_user,
-                    &settings.tools.claude_code,
+                    self.probe_type(),
                 ),
             )
             .await;
-        }
 
-        // Probe and cache user environment (userEnvProbe)
-        let probed_env = timed_step(
-            self.is_text,
-            "Running userEnvProbe...",
-            super::env_cache::probe_and_cache_user_env(
-                &self.client,
-                container_id,
-                remote_user,
-                self.probe_type(),
-            ),
-        )
-        .await;
+        // Forward config and install AI coding tools
+        self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
+            .await;
 
         let lifecycle_env = probed_env.as_ref().map_or_else(
             || remote_env.to_vec(),
@@ -711,6 +810,157 @@ impl UpContext {
         );
 
         (probed_env, lifecycle_env)
+    }
+
+    /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
+    ///
+    /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
+    /// Codex and Gemini run sequentially to avoid npm global lock contention.
+    async fn install_tools(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::Settings,
+        probed_env: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        // Sequential prerequisite: forward Claude Code config before install
+        if settings.tools.claude_code.forward_config {
+            self.progress
+                .run_step(
+                    "Forwarding Claude Code config...",
+                    seed_claude_config(
+                        &self.client,
+                        container_id,
+                        &self.resolved.workspace_root,
+                        remote_user,
+                        &settings.tools.claude_code,
+                    ),
+                )
+                .await;
+        }
+
+        // Sequential prerequisite: ensure Node.js/npm once for all npm tools
+        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+        let node_available = if needs_npm {
+            ensure_node_available(&self.client, container_id, probed_env).await
+        } else {
+            false
+        };
+
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
+
+        if !any_tool {
+            return;
+        }
+
+        // Grouped phase: parallel Claude Code (curl) || npm tools (Codex → Gemini)
+        let phase = self.progress.phase("Installing tools...");
+
+        let claude_branch = async {
+            if settings.tools.claude_code.enabled {
+                let step = phase.step("Claude Code");
+                install_claude_code(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.claude_code,
+                    probed_env,
+                )
+                .await;
+                step.finish();
+            }
+        };
+
+        let npm_branch = async {
+            if needs_npm && !node_available {
+                warn!("Skipping npm tool installs: Node.js/npm not available");
+                return;
+            }
+            if settings.tools.codex.enabled {
+                let step = phase.step("Codex");
+                install_codex(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.codex,
+                    probed_env,
+                )
+                .await;
+                step.finish();
+            }
+            if settings.tools.gemini.enabled {
+                let step = phase.step("Gemini CLI");
+                install_gemini(
+                    &self.client,
+                    container_id,
+                    remote_user,
+                    &settings.tools.gemini,
+                    probed_env,
+                )
+                .await;
+                step.finish();
+            }
+        };
+
+        tokio::join!(claude_branch, npm_branch);
+        phase.finish();
+    }
+
+    /// Resolve image metadata, environment forwarding, and container creation options.
+    async fn resolve_image_config(
+        &self,
+        config: &serde_json::Value,
+        img_name: &str,
+        base_image_details: ImageDetails,
+        resolved_features: Option<&cella_features::ResolvedFeatures>,
+    ) -> ImageConfig {
+        let image_env = base_image_details.env;
+        let image_meta_user = base_image_details
+            .metadata
+            .as_deref()
+            .map(|m| cella_features::parse_image_metadata(m).1);
+        let remote_user =
+            resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
+
+        super::ensure_cella_daemon().await;
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+
+        let labels = self.build_labels(
+            resolved_features,
+            base_image_details.metadata.as_deref(),
+            &env_fwd,
+            &remote_user,
+        );
+
+        let feature_config = resolved_features.map(|r| &r.container_config);
+        let image_meta_config = if feature_config.is_none() {
+            base_image_details
+                .metadata
+                .as_deref()
+                .map(|m| cella_features::parse_image_metadata(m).0)
+        } else {
+            None
+        };
+        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
+
+        let create_opts = cella_docker::config_map::map_config(
+            config,
+            &self.container_nm,
+            img_name,
+            labels,
+            &self.resolved.workspace_root,
+            effective_feature_config,
+            &image_env,
+        );
+
+        ImageConfig {
+            image_env,
+            remote_user,
+            env_fwd,
+            create_opts,
+        }
     }
 
     /// The full build/create/start/lifecycle path for a new container.
@@ -733,49 +983,23 @@ impl UpContext {
             self.config_name(),
             &self.resolved.config_path,
             build_no_cache,
-            self.is_text,
+            &self.progress,
         )
         .await?;
 
-        let image_env = base_image_details.env;
-        let image_meta_user = base_image_details
-            .metadata
-            .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
-        let remote_user =
-            resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
-
-        super::ensure_cella_daemon().await;
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
-
-        // Build labels and create options
-        let labels = self.build_labels(
-            resolved_features.as_ref(),
-            base_image_details.metadata.as_deref(),
-            &env_fwd,
-            &remote_user,
-        );
-
-        let feature_config = resolved_features.as_ref().map(|r| &r.container_config);
-        let image_meta_config = if feature_config.is_none() {
-            base_image_details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).0)
-        } else {
-            None
-        };
-        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
-
-        let mut create_opts = cella_docker::config_map::map_config(
-            config,
-            &self.container_nm,
-            &img_name,
-            labels,
-            &self.resolved.workspace_root,
-            effective_feature_config,
-            &image_env,
-        );
+        let ImageConfig {
+            image_env,
+            remote_user,
+            env_fwd,
+            mut create_opts,
+        } = self
+            .resolve_image_config(
+                config,
+                &img_name,
+                base_image_details,
+                resolved_features.as_ref(),
+            )
+            .await;
 
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         self.apply_env_and_mounts(
@@ -788,12 +1012,24 @@ impl UpContext {
         .await;
 
         // Create and start container
-        let container_id = timed_step(
-            self.is_text,
-            "Creating container...",
-            self.client.create_container(&create_opts),
-        )
-        .await?;
+        let container_id = if self.progress.is_verbose() {
+            let step = self
+                .progress
+                .step(&format!("Creating container: {}...", self.container_nm));
+            let result = self.client.create_container(&create_opts).await;
+            match &result {
+                Ok(_) => step.finish(),
+                Err(e) => step.fail(&e.to_string()),
+            }
+            result?
+        } else {
+            self.progress
+                .run_step(
+                    "Creating container...",
+                    self.client.create_container(&create_opts),
+                )
+                .await?
+        };
 
         self.start_and_register(&container_id).await?;
 
@@ -809,15 +1045,22 @@ impl UpContext {
             .await;
 
         // Lifecycle commands (first create)
+        let progress_ref = self.progress.clone();
         let lc_ctx = LifecycleContext {
             client: &self.client,
             container_id: &container_id,
             user: Some(remote_user.as_str()),
             env: &lifecycle_env,
             working_dir: self.workspace_folder(),
-            is_text: self.is_text,
+            is_text: self.progress.is_enabled(),
+            on_output: if self.progress.is_enabled() {
+                Some(Box::new(move |line| progress_ref.println(line)))
+            } else {
+                None
+            },
         };
-        run_all_lifecycle_phases(&lc_ctx, config, resolved_features.as_ref()).await?;
+        run_all_lifecycle_phases(&lc_ctx, config, resolved_features.as_ref(), &self.progress)
+            .await?;
 
         output_result(
             &self.output,
@@ -832,8 +1075,11 @@ impl UpContext {
 }
 
 impl UpArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = UpContext::new(&self).await?;
+    pub async fn execute(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = UpContext::new(&self, progress).await?;
         let existing = ctx
             .client
             .find_container(&ctx.resolved.workspace_root)
@@ -1182,27 +1428,6 @@ async fn apply_git_config(
     }
 }
 
-/// Print a progress label, run an async operation, and optionally show elapsed time.
-async fn timed_step<F, T>(is_text: bool, label: &str, f: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if is_text {
-        eprint!("{label}");
-    }
-    let start = std::time::Instant::now();
-    let result = f.await;
-    if is_text {
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() >= 100 {
-            eprintln!(" ({:.1}s)", elapsed.as_secs_f64());
-        } else {
-            eprintln!();
-        }
-    }
-    result
-}
-
 // ── Shared container-operation helpers ──────────────────────────────────────
 
 /// Create a directory inside the container with the given mode (as root).
@@ -1281,14 +1506,28 @@ async fn upload_to_container(
     true
 }
 
-/// Run a sequence of origin-tracked lifecycle entries.
+/// Run a sequence of origin-tracked lifecycle entries with progress tracking.
+///
+/// Prints a permanent header line before each lifecycle command, then streams
+/// the command's output indented below it, then prints the completion status.
 async fn run_lifecycle_entries(
     ctx: &LifecycleContext<'_>,
     phase: &str,
     entries: &[cella_features::LifecycleEntry],
+    progress: &crate::progress::Progress,
 ) -> Result<(), CellaDockerError> {
     for entry in entries {
-        run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await?;
+        let label = format!("Running the {phase} from {}...", entry.origin);
+        let start = std::time::Instant::now();
+        // Print header so user knows what's running during streaming.
+        progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
+        let result = run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await;
+        let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
+        match &result {
+            Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
+            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
+        }
+        result?;
     }
     Ok(())
 }
@@ -1298,6 +1537,7 @@ async fn run_all_lifecycle_phases(
     lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
+    progress: &crate::progress::Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let phases = [
         "onCreateCommand",
@@ -1317,13 +1557,22 @@ async fn run_all_lifecycle_phases(
             _ => &empty,
         });
 
-        run_lifecycle_entries(lc_ctx, phase, entries).await?;
+        run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
 
         if entries.is_empty()
             && let Some(cmd) = config.get(phase)
             && !cmd.is_null()
         {
-            run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await?;
+            let label = format!("Running the {phase} from devcontainer.json...");
+            let start = std::time::Instant::now();
+            progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
+            let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
+            let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
+            match &result {
+                Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
+                Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
+            }
+            result?;
         }
     }
 
@@ -1371,7 +1620,7 @@ async fn seed_gh_credentials(
     )
     .await
     {
-        info!("Seeded gh CLI credentials into container");
+        debug!("Seeded gh CLI credentials into container");
     }
 }
 
@@ -1438,7 +1687,7 @@ async fn seed_claude_config(
     )
     .await;
 
-    info!("Seeded Claude Code config into container");
+    debug!("Seeded Claude Code config into container");
 }
 
 /// Re-sync Claude Code auth credentials on container restart.
@@ -1456,11 +1705,6 @@ async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_us
     }
 }
 
-/// Install Claude Code inside the container using the native installer.
-///
-/// Checks if already installed at the correct version first.
-/// On Alpine/musl, pre-installs required dependencies.
-/// Never fails `cella up` — logs errors and continues.
 /// Check if Claude Code is already installed at the desired version.
 /// Returns `true` if already installed and no (re)install is needed.
 async fn is_claude_code_installed(
@@ -1468,14 +1712,15 @@ async fn is_claude_code_installed(
     container_id: &str,
     remote_user: &str,
     version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> bool {
     let version_check = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec!["claude".to_string(), "--version".to_string()],
+                cmd: tool_shell_cmd(probed_env, "claude --version"),
                 user: Some(remote_user.to_string()),
-                env: None,
+                env: tool_exec_env(probed_env),
                 working_dir: None,
             },
         )
@@ -1497,10 +1742,9 @@ async fn is_claude_code_installed(
     false
 }
 
-/// Detect Alpine and install Claude Code native dependencies if needed.
-/// Returns `true` if the container is Alpine-based.
-async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) -> bool {
-    let is_alpine = client
+/// Check if the container is Alpine-based.
+async fn is_alpine_container(client: &DockerClient, container_id: &str) -> bool {
+    client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -1515,10 +1759,16 @@ async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) ->
             },
         )
         .await
-        .is_ok_and(|r| r.exit_code == 0);
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
+/// Detect Alpine and install Claude Code native dependencies if needed.
+/// Returns `true` if the container is Alpine-based.
+async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) -> bool {
+    let is_alpine = is_alpine_container(client, container_id).await;
 
     if is_alpine {
-        info!("Alpine detected, installing Claude Code dependencies...");
+        debug!("Alpine detected, installing Claude Code dependencies...");
         let _ = client
             .exec_command(
                 container_id,
@@ -1543,8 +1793,17 @@ async fn install_claude_code(
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::ClaudeCode,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
-    if is_claude_code_installed(client, container_id, remote_user, &settings.version).await {
+    if is_claude_code_installed(
+        client,
+        container_id,
+        remote_user,
+        &settings.version,
+        probed_env,
+    )
+    .await
+    {
         return;
     }
 
@@ -1555,6 +1814,7 @@ async fn install_claude_code(
         remote_user,
         &settings.version,
         is_alpine,
+        probed_env,
     )
     .await;
 }
@@ -1566,19 +1826,20 @@ async fn run_claude_install(
     remote_user: &str,
     version: &str,
     is_alpine: bool,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
 ) {
     if version != "latest" && version != "stable" {
-        info!("Installing Claude Code v{version} (native installer will attempt version pinning)");
+        debug!("Installing Claude Code v{version} (native installer will attempt version pinning)");
     }
 
     let install_cmd = format!("curl -fsSL https://claude.ai/install.sh | bash -s {version}");
-    info!("Installing Claude Code ({version})...");
+    debug!("Installing Claude Code ({version})...");
 
-    let env = if is_alpine {
-        Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
-    } else {
-        None
-    };
+    let mut env = tool_exec_env(probed_env).unwrap_or_default();
+    if is_alpine {
+        env.push("USE_BUILTIN_RIPGREP=0".to_string());
+    }
+    let env = if env.is_empty() { None } else { Some(env) };
 
     let result = client
         .exec_command(
@@ -1599,7 +1860,7 @@ async fn run_claude_install(
 fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
-            info!("Claude Code installed successfully");
+            debug!("Claude Code installed successfully");
         }
         Ok(r) => {
             warn!(
@@ -1612,4 +1873,269 @@ fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>
             warn!("Claude Code installation failed: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codex / Gemini CLI installation (npm-based)
+// ---------------------------------------------------------------------------
+
+/// Extract PATH from the probed user environment for tool exec calls.
+///
+/// Returns `Some(vec!["PATH=..."])` when the probed env contains PATH,
+/// `None` otherwise (caller should fall back to a login shell).
+fn tool_exec_env(
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> Option<Vec<String>> {
+    probed_env
+        .and_then(|env| env.get("PATH"))
+        .map(|path| vec![format!("PATH={path}")])
+}
+
+/// Build the shell command prefix for a tool exec call.
+///
+/// When the probed env is available (and thus PATH will be passed via `env`),
+/// uses a plain `sh -c`. Otherwise falls back to a login shell (`sh -l -c`)
+/// so that `/etc/profile.d/` scripts (e.g. nvm) are sourced.
+fn tool_shell_cmd(
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+    inner_cmd: &str,
+) -> Vec<String> {
+    if probed_env.and_then(|e| e.get("PATH")).is_some() {
+        vec!["sh".to_string(), "-c".to_string(), inner_cmd.to_string()]
+    } else {
+        vec![
+            "sh".to_string(),
+            "-l".to_string(),
+            "-c".to_string(),
+            inner_cmd.to_string(),
+        ]
+    }
+}
+
+/// Ensure Node.js and npm are available in the container.
+///
+/// Uses the probed user environment PATH (from `userEnvProbe`) to detect
+/// npm installed by devcontainer features (e.g. nvm). Falls back to a login
+/// shell when no probed env is available. If npm is still not found, attempts
+/// to install Node.js via the system package manager (apt-get or apk).
+/// Returns `true` if npm is available after the check.
+async fn ensure_node_available(
+    client: &DockerClient,
+    container_id: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    let npm_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, "command -v npm"),
+                user: Some("root".to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if npm_check.is_ok_and(|r| r.exit_code == 0) {
+        return true;
+    }
+
+    debug!("npm not found, installing Node.js...");
+    let install_cmd = if is_alpine_container(client, container_id).await {
+        "apk add --no-cache nodejs npm"
+    } else {
+        "apt-get update -qq && apt-get install -y -qq nodejs npm"
+    };
+
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match &result {
+        Ok(r) if r.exit_code == 0 => {
+            debug!("Node.js installed successfully");
+            true
+        }
+        Ok(r) => {
+            warn!(
+                "Node.js installation failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+            false
+        }
+        Err(e) => {
+            warn!("Node.js installation failed: {e}");
+            false
+        }
+    }
+}
+
+/// Check if an npm-installed CLI tool is already present at the desired version.
+async fn is_npm_tool_installed(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    binary_name: &str,
+    version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    let version_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, &format!("{binary_name} --version")),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if let Ok(result) = &version_check
+        && result.exit_code == 0
+    {
+        let installed = result.stdout.trim();
+        if version == "latest" {
+            tracing::debug!("{binary_name} already installed: {installed}");
+            return true;
+        }
+        if installed.contains(version) {
+            tracing::debug!("{binary_name} already at version {version}: {installed}");
+            return true;
+        }
+    }
+    false
+}
+
+/// Install an npm package globally inside the container.
+async fn npm_install_global(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    package: &str,
+    version: &str,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<cella_docker::ExecResult, CellaDockerError> {
+    let pkg = if version == "latest" {
+        package.to_string()
+    } else {
+        format!("{package}@{version}")
+    };
+
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: tool_shell_cmd(probed_env, &format!("npm install -g {pkg}")),
+                user: Some(remote_user.to_string()),
+                env: tool_exec_env(probed_env),
+                working_dir: None,
+            },
+        )
+        .await
+}
+
+/// Log the result of an npm tool installation attempt.
+fn log_npm_install_result(
+    tool_name: &str,
+    result: Result<cella_docker::ExecResult, CellaDockerError>,
+) {
+    match result {
+        Ok(r) if r.exit_code == 0 => {
+            debug!("{tool_name} installed successfully");
+        }
+        Ok(r) => {
+            warn!(
+                "{tool_name} installation exited with code {}: {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+        }
+        Err(e) => {
+            warn!("{tool_name} installation failed: {e}");
+        }
+    }
+}
+
+/// Install `OpenAI` Codex CLI inside the container via npm.
+///
+/// Checks if already installed, then runs `npm install -g @openai/codex`.
+/// Caller must ensure Node.js/npm are available before calling this.
+async fn install_codex(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    settings: &cella_config::Codex,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) {
+    if is_npm_tool_installed(
+        client,
+        container_id,
+        remote_user,
+        "codex",
+        &settings.version,
+        probed_env,
+    )
+    .await
+    {
+        return;
+    }
+
+    debug!("Installing Codex ({})...", settings.version);
+    let result = npm_install_global(
+        client,
+        container_id,
+        remote_user,
+        "@openai/codex",
+        &settings.version,
+        probed_env,
+    )
+    .await;
+    log_npm_install_result("Codex", result);
+}
+
+/// Install Google Gemini CLI inside the container via npm.
+///
+/// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
+/// Caller must ensure Node.js/npm are available before calling this.
+async fn install_gemini(
+    client: &DockerClient,
+    container_id: &str,
+    remote_user: &str,
+    settings: &cella_config::Gemini,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) {
+    if is_npm_tool_installed(
+        client,
+        container_id,
+        remote_user,
+        "gemini",
+        &settings.version,
+        probed_env,
+    )
+    .await
+    {
+        return;
+    }
+
+    debug!("Installing Gemini CLI ({})...", settings.version);
+    let result = npm_install_global(
+        client,
+        container_id,
+        remote_user,
+        "@google/gemini-cli",
+        &settings.version,
+        probed_env,
+    )
+    .await;
+    log_npm_install_result("Gemini CLI", result);
 }

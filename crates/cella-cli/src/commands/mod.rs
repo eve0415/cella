@@ -24,6 +24,8 @@ mod up;
 use clap::Subcommand;
 use tracing::warn;
 
+use crate::progress::Progress;
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {
@@ -72,15 +74,31 @@ pub enum Command {
 }
 
 impl Command {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Whether this command uses text (non-JSON) output, i.e. spinners should be active.
+    pub const fn is_text_output(&self) -> bool {
         match self {
-            Self::Up(args) => args.execute().await,
+            Self::Up(args) => args.is_text_output(),
+            Self::Build(args) => args.is_text_output(),
+            Self::Down(args) => args.is_text_output(),
+            _ => true,
+        }
+    }
+
+    /// Whether this is the `daemon start` subcommand, which initializes
+    /// its own file-based tracing instead of the normal indicatif writer.
+    pub const fn is_daemon_start(&self) -> bool {
+        matches!(self, Self::Daemon(_))
+    }
+
+    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Up(args) => args.execute(progress).await,
             Self::Down(args) => args.execute().await,
             Self::Shell(args) => args.execute().await,
             Self::Exec(args) => args.execute().await,
-            Self::Build(args) => args.execute().await,
+            Self::Build(args) => args.execute(progress).await,
             Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute(),
+            Self::Logs(args) => args.execute().await,
             Self::Doctor(args) => args.execute().await,
             Self::Branch(args) => args.execute(),
             Self::Spawn(args) => args.execute(),

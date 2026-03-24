@@ -1,7 +1,9 @@
 //! Lifecycle command parsing and execution.
 
+use std::io;
+
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
@@ -53,6 +55,9 @@ pub fn parse_lifecycle_command(value: &Value) -> ParsedLifecycle {
     }
 }
 
+/// Callback type for routing lifecycle output through a progress system.
+pub type OutputCallback<'a> = Box<dyn Fn(&str) + Send + Sync + 'a>;
+
 /// Shared container context for lifecycle phase execution.
 pub struct LifecycleContext<'a> {
     /// Docker client.
@@ -67,6 +72,66 @@ pub struct LifecycleContext<'a> {
     pub working_dir: Option<&'a str>,
     /// Whether to print progress and stream output to stderr.
     pub is_text: bool,
+    /// Optional callback for routing output lines through a progress system.
+    ///
+    /// When set, sequential lifecycle output is written through this callback
+    /// (e.g., indented under an active spinner) instead of directly to stderr.
+    pub on_output: Option<OutputCallback<'a>>,
+}
+
+/// A `Write` adapter that buffers lines and forwards each complete line
+/// through a callback with indentation.
+struct CallbackWriter<'a> {
+    callback: &'a (dyn Fn(&str) + Send + Sync),
+    buf: Vec<u8>,
+}
+
+impl<'a> CallbackWriter<'a> {
+    fn new(callback: &'a (dyn Fn(&str) + Send + Sync)) -> Self {
+        Self {
+            callback,
+            buf: Vec::with_capacity(256),
+        }
+    }
+
+    fn flush_lines(&mut self) {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[..pos]);
+            if !line.trim().is_empty() {
+                (self.callback)(&format!("      {line}"));
+            }
+            self.buf.drain(..=pos);
+        }
+    }
+
+    fn flush_remaining(&mut self) {
+        if !self.buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.buf);
+            if !line.trim().is_empty() {
+                (self.callback)(&format!("      {line}"));
+            }
+            self.buf.clear();
+        }
+    }
+}
+
+impl io::Write for CallbackWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        self.flush_lines();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_remaining();
+        Ok(())
+    }
+}
+
+impl Drop for CallbackWriter<'_> {
+    fn drop(&mut self) {
+        self.flush_remaining();
+    }
 }
 
 /// Run sequential lifecycle commands, streaming output when `is_text`.
@@ -87,14 +152,27 @@ async fn run_sequential(
             working_dir: ctx.working_dir.map(String::from),
         };
         let result = if ctx.is_text {
-            ctx.client
-                .exec_stream(
-                    ctx.container_id,
-                    &opts,
-                    std::io::stderr(),
-                    std::io::stderr(),
-                )
-                .await?
+            if let Some(ref on_output) = ctx.on_output {
+                // Route through progress system with indentation
+                ctx.client
+                    .exec_stream(
+                        ctx.container_id,
+                        &opts,
+                        CallbackWriter::new(on_output.as_ref()),
+                        CallbackWriter::new(on_output.as_ref()),
+                    )
+                    .await?
+            } else {
+                // Fallback: stream directly to stderr
+                ctx.client
+                    .exec_stream(
+                        ctx.container_id,
+                        &opts,
+                        std::io::stderr(),
+                        std::io::stderr(),
+                    )
+                    .await?
+            }
         } else {
             ctx.client.exec_command(ctx.container_id, &opts).await?
         };
@@ -196,9 +274,7 @@ pub async fn run_lifecycle_phase(
     value: &Value,
     origin: &str,
 ) -> Result<(), CellaDockerError> {
-    if ctx.is_text {
-        eprintln!("Running the {phase} from {origin}...");
-    }
+    info!("Running the {phase} from {origin}...");
     debug!("Running {phase} from {origin}");
 
     match parse_lifecycle_command(value) {
@@ -259,5 +335,43 @@ mod tests {
             }
             ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
         }
+    }
+
+    fn collect_callback_lines(input: &[u8]) -> Vec<String> {
+        use std::sync::Mutex;
+
+        let collected = Mutex::new(Vec::new());
+        let callback = |line: &str| {
+            collected.lock().unwrap().push(line.to_string());
+        };
+
+        let mut writer = CallbackWriter::new(&callback);
+        io::Write::write_all(&mut writer, input).unwrap();
+        drop(writer);
+
+        collected.into_inner().unwrap()
+    }
+
+    #[test]
+    fn callback_writer_indents_lines() {
+        let lines = collect_callback_lines(b"first line\nsecond line\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "      first line");
+        assert_eq!(lines[1], "      second line");
+    }
+
+    #[test]
+    fn callback_writer_flushes_partial_line_on_drop() {
+        let lines = collect_callback_lines(b"no newline");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "      no newline");
+    }
+
+    #[test]
+    fn callback_writer_skips_blank_lines() {
+        let lines = collect_callback_lines(b"content\n\n  \nanother\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "      content");
+        assert_eq!(lines[1], "      another");
     }
 }

@@ -53,6 +53,9 @@ impl DaemonArgs {
 async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
 
+    // Initialize file-based logging for the daemon process.
+    cella_daemon::logging::init_daemon_logging(&data_dir.join("daemon.log"));
+
     let socket_path = args
         .socket
         .unwrap_or_else(|| data_dir.join("credential-proxy.sock"));

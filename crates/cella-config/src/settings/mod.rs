@@ -1,5 +1,7 @@
 mod claude_code;
+mod codex;
 mod credentials;
+mod gemini;
 
 use std::path::Path;
 
@@ -7,7 +9,9 @@ use serde::Deserialize;
 use tracing::debug;
 
 pub use claude_code::ClaudeCode;
+pub use codex::Codex;
 pub use credentials::Credentials;
+pub use gemini::Gemini;
 
 /// Tool installation and forwarding settings.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -15,6 +19,14 @@ pub struct Tools {
     /// Claude Code settings.
     #[serde(default, rename = "claude-code")]
     pub claude_code: ClaudeCode,
+
+    /// `OpenAI` Codex CLI settings.
+    #[serde(default)]
+    pub codex: Codex,
+
+    /// Google Gemini CLI settings.
+    #[serde(default)]
+    pub gemini: Gemini,
 }
 
 /// Cella's own settings, loaded from TOML config files.
@@ -74,20 +86,34 @@ impl Settings {
         }
     }
 
-    /// Merge global and project settings. Project overrides global per-key.
+    /// Merge global and project settings. Project overrides global per-section.
+    ///
+    /// Destructuring both sides forces a compile error when new fields are added
+    /// to `Settings` or `Tools` without updating this method.
     fn merge(global: Option<Self>, project: Option<Self>) -> Self {
         match (global, project) {
             (None, None) => Self::default(),
             (Some(g), None) => g,
             (None, Some(p)) => p,
-            (Some(_global), Some(p)) => Self {
-                credentials: Credentials {
-                    gh: p.credentials.gh,
-                },
-                tools: Tools {
-                    claude_code: p.tools.claude_code,
-                },
-            },
+            (Some(_g), Some(p)) => {
+                let Self {
+                    credentials: pc,
+                    tools: pt,
+                } = p;
+                let Tools {
+                    claude_code: pt_claude,
+                    codex: pt_codex,
+                    gemini: pt_gemini,
+                } = pt;
+                Self {
+                    credentials: pc,
+                    tools: Tools {
+                        claude_code: pt_claude,
+                        codex: pt_codex,
+                        gemini: pt_gemini,
+                    },
+                }
+            }
         }
     }
 }
@@ -104,6 +130,12 @@ mod tests {
         assert!(settings.tools.claude_code.enabled);
         assert!(settings.tools.claude_code.forward_config);
         assert_eq!(settings.tools.claude_code.version, "latest");
+        assert!(settings.tools.codex.enabled);
+        assert!(settings.tools.codex.forward_config);
+        assert_eq!(settings.tools.codex.version, "latest");
+        assert!(settings.tools.gemini.enabled);
+        assert!(settings.tools.gemini.forward_config);
+        assert_eq!(settings.tools.gemini.version, "latest");
     }
 
     #[test]
@@ -144,11 +176,23 @@ gh = false
 [tools.claude-code]
 enabled = false
 version = "stable"
+
+[tools.codex]
+enabled = false
+version = "0.1.2"
+
+[tools.gemini]
+enabled = false
+version = "0.5.0"
 "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.credentials.gh);
         assert!(!settings.tools.claude_code.enabled);
         assert_eq!(settings.tools.claude_code.version, "stable");
+        assert!(!settings.tools.codex.enabled);
+        assert_eq!(settings.tools.codex.version, "0.1.2");
+        assert!(!settings.tools.gemini.enabled);
+        assert_eq!(settings.tools.gemini.version, "0.5.0");
     }
 
     #[test]
@@ -165,8 +209,44 @@ exclude = ["plans/**"]
         assert!(!settings.tools.claude_code.forward_config);
         assert_eq!(settings.tools.claude_code.version, "1.0.58");
         assert_eq!(settings.tools.claude_code.exclude, vec!["plans/**"]);
-        // credentials should still be default
+        // credentials and other tools should still be default
         assert!(settings.credentials.gh);
+        assert!(settings.tools.codex.enabled);
+        assert!(settings.tools.gemini.enabled);
+    }
+
+    #[test]
+    fn parse_codex_only() {
+        let toml_str = r#"
+[tools.codex]
+enabled = false
+forward_config = false
+version = "0.1.2"
+"#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(!settings.tools.codex.enabled);
+        assert!(!settings.tools.codex.forward_config);
+        assert_eq!(settings.tools.codex.version, "0.1.2");
+        // other tools default
+        assert!(settings.tools.claude_code.enabled);
+        assert!(settings.tools.gemini.enabled);
+    }
+
+    #[test]
+    fn parse_gemini_only() {
+        let toml_str = r#"
+[tools.gemini]
+enabled = false
+forward_config = false
+version = "0.5.0"
+"#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(!settings.tools.gemini.enabled);
+        assert!(!settings.tools.gemini.forward_config);
+        assert_eq!(settings.tools.gemini.version, "0.5.0");
+        // other tools default
+        assert!(settings.tools.claude_code.enabled);
+        assert!(settings.tools.codex.enabled);
     }
 
     #[test]
