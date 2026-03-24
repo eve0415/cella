@@ -511,14 +511,8 @@ fn emit_value_validation(ty: &IrTypeRef, value: &TokenStream, path: &TokenStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::test_utils::fmt;
     use crate::ir::*;
-
-    fn fmt(tokens: &TokenStream) -> String {
-        let raw = tokens.to_string();
-        syn::parse_file(&raw)
-            .map(|f| prettyplease::unparse(&f))
-            .unwrap_or(raw)
-    }
 
     #[test]
     fn validation_infra() {
