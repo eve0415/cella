@@ -1,6 +1,5 @@
 //! Socket listener and connection handler (Unix + TCP).
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +12,7 @@ use cella_daemon::shared::{current_time_secs, set_socket_permissions};
 
 use crate::CellaCredentialProxyError;
 use crate::host::invoke_git_credential;
-use crate::protocol::{CredentialResponse, format_response, parse_request};
+use crate::protocol::{CredentialResponse, format_credential_fields, parse_request};
 
 /// Start the credential proxy server on a Unix socket.
 ///
@@ -63,17 +62,7 @@ async fn bind_tcp_listener(port_path: &Path) -> Result<TcpListener, CellaCredent
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(0);
 
-    if preferred_port != 0 {
-        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        if let Ok(l) = TcpListener::bind(addr).await {
-            debug!("Reusing previous TCP port {preferred_port}");
-            return Ok(l);
-        }
-        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
-    }
-
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    TcpListener::bind(addr)
+    cella_daemon::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaCredentialProxyError::Socket {
             message: format!("failed to bind TCP: {e}"),
@@ -180,7 +169,7 @@ async fn handle_stream(
             let response = CredentialResponse {
                 fields: response_fields,
             };
-            let output = format_response(&response);
+            let output = format_credential_fields(&response.fields);
             stream.write_all(output.as_bytes()).await.map_err(|e| {
                 CellaCredentialProxyError::Socket {
                     message: format!("write error: {e}"),
@@ -204,6 +193,8 @@ async fn handle_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     #[tokio::test]

@@ -3,7 +3,10 @@
 //! Extracted from `cella-daemon` and `cella-credential-proxy` to eliminate
 //! duplication. Both crates import from this module.
 
+use std::io::{Read, Write};
 use std::path::Path;
+
+use tracing::{debug, warn};
 
 /// Read the PID from a PID file.
 pub fn read_pid_file(pid_path: &Path) -> Option<u32> {
@@ -96,6 +99,110 @@ pub fn current_time_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Check if a daemon is running: PID file valid, process alive, socket exists.
+///
+/// Cleans up stale PID/socket files if the process is no longer alive.
+pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
+    let Some(pid) = read_pid_file(pid_path) else {
+        return false;
+    };
+
+    let alive = is_process_alive(pid);
+    if !alive {
+        debug!("Stale PID file found (PID {pid}), cleaning up");
+        cleanup_files(&[pid_path, socket_path]);
+        return false;
+    }
+
+    socket_path.exists()
+}
+
+/// Spawn the current executable as a detached background process.
+///
+/// Returns the spawned child. The caller is responsible for mapping errors
+/// to its own error type.
+///
+/// # Errors
+///
+/// Returns `io::Error` if the current executable cannot be determined or the
+/// process cannot be spawned.
+pub fn start_background_process(
+    args: &[&str],
+) -> Result<std::process::Child, std::io::Error> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+/// Bind a TCP listener on localhost, attempting to reclaim a previously used port.
+///
+/// If `preferred_port` is non-zero, tries to bind it first. Falls back to
+/// an OS-assigned port on failure.
+///
+/// # Errors
+///
+/// Returns `io::Error` if binding fails entirely.
+pub async fn bind_tcp_reclaim(
+    preferred_port: u16,
+) -> Result<tokio::net::TcpListener, std::io::Error> {
+    use std::net::SocketAddr;
+
+    if preferred_port != 0 {
+        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
+        if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+            debug!("Reclaimed TCP port {preferred_port}");
+            return Ok(listener);
+        }
+        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
+    }
+
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    tokio::net::TcpListener::bind(addr).await
+}
+
+/// Ping a daemon over its Unix socket and check if it responds with "pong".
+///
+/// # Errors
+///
+/// Returns `io::Error` if connection or I/O fails.
+pub fn ping_daemon(socket_path: &Path) -> Result<bool, std::io::Error> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.write_all(b"ping\n\n")?;
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf)?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    Ok(response.trim() == "pong")
+}
+
+/// Status of a daemon process.
+pub struct DaemonStatus {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub socket_exists: bool,
+    pub responsive: bool,
+}
+
+/// Check the full status of a daemon.
+pub fn daemon_status(socket_path: &Path, pid_path: &Path) -> DaemonStatus {
+    let pid = read_pid_file(pid_path);
+    let socket_exists = socket_path.exists();
+    let responsive = socket_exists && ping_daemon(socket_path).unwrap_or(false);
+    let running = pid.is_some() && responsive;
+
+    DaemonStatus {
+        running,
+        pid,
+        socket_exists,
+        responsive,
+    }
 }
 
 /// Common daemon lifecycle trait.

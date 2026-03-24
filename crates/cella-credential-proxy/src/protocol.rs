@@ -5,8 +5,7 @@
 //! to map `CellaDaemonError` to `CellaCredentialProxyError`.
 
 pub use cella_daemon::credential::{
-    CredentialRequest, CredentialResponse, format_fields_for_stdin, format_response,
-    parse_credential_output,
+    CredentialRequest, CredentialResponse, format_credential_fields, parse_credential_output,
 };
 
 use crate::CellaCredentialProxyError;

@@ -8,8 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use cella_daemon::shared::{
-    cleanup_files, current_time_secs, is_docker_reachable, is_process_alive, read_pid_file,
-    running_cella_container_count,
+    cleanup_files, current_time_secs, is_docker_reachable, running_cella_container_count,
 };
 
 use crate::CellaCredentialProxyError;
@@ -107,24 +106,8 @@ pub async fn run_daemon(
 }
 
 /// Check if the daemon is already running.
-///
-/// Reads the PID file and checks if the process is alive.
 pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
-    let Some(pid) = read_pid_file(pid_path) else {
-        return false;
-    };
-
-    // Check if process is alive (signal 0 = check existence)
-    let alive = is_process_alive(pid);
-    if !alive {
-        // Stale PID file — clean up (preserve port file for reuse)
-        debug!("Stale PID file found (PID {pid}), cleaning up");
-        cleanup_files(&[pid_path, socket_path]);
-        return false;
-    }
-
-    // Also verify the socket exists and is responsive
-    socket_path.exists()
+    cella_daemon::shared::is_daemon_running(pid_path, socket_path)
 }
 
 /// Start the daemon as a detached background process.
@@ -139,28 +122,21 @@ pub fn start_daemon_background(
     pid_path: &Path,
     port_path: &Path,
 ) -> Result<(), CellaCredentialProxyError> {
-    let exe = std::env::current_exe().map_err(|e| CellaCredentialProxyError::PidFile {
-        message: format!("failed to get current exe: {e}"),
-    })?;
-
-    std::process::Command::new(exe)
-        .args([
-            "credential-proxy",
-            "daemon",
-            "--socket",
-            &socket_path.to_string_lossy(),
-            "--pid-file",
-            &pid_path.to_string_lossy(),
-            "--port-file",
-            &port_path.to_string_lossy(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| CellaCredentialProxyError::PidFile {
+    let args = [
+        "credential-proxy",
+        "daemon",
+        "--socket",
+        &socket_path.to_string_lossy(),
+        "--pid-file",
+        &pid_path.to_string_lossy(),
+        "--port-file",
+        &port_path.to_string_lossy(),
+    ];
+    cella_daemon::shared::start_background_process(&args).map_err(|e| {
+        CellaCredentialProxyError::PidFile {
             message: format!("failed to spawn daemon: {e}"),
-        })?;
+        }
+    })?;
 
     info!("Credential proxy daemon started in background");
     Ok(())
@@ -207,7 +183,8 @@ pub fn stop_daemon(
     socket_path: &Path,
     port_path: &Path,
 ) -> Result<(), CellaCredentialProxyError> {
-    let pid = read_pid_file(pid_path).ok_or(CellaCredentialProxyError::NotRunning)?;
+    let pid = cella_daemon::shared::read_pid_file(pid_path)
+        .ok_or(CellaCredentialProxyError::NotRunning)?;
 
     // Send SIGTERM
     #[cfg(unix)]
