@@ -112,9 +112,12 @@ pub fn detect_agent_arch() -> &'static str {
 ///
 /// Returns error if the Docker version API call fails.
 pub async fn detect_container_arch(docker: &Docker) -> Result<String, CellaDockerError> {
-    let version = docker.version().await.map_err(|e| CellaDockerError::AgentVolume {
-        message: format!("failed to detect Docker platform: {e}"),
-    })?;
+    let version = docker
+        .version()
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to detect Docker platform: {e}"),
+        })?;
     let arch = version.arch.unwrap_or_default();
     Ok(match arch.as_str() {
         "aarch64" | "arm64" => "aarch64",
@@ -376,10 +379,7 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
 ///
 /// Release builds:
 /// 1. Download from GitHub releases
-async fn get_agent_binary_bytes(
-    docker: &Docker,
-    arch: &str,
-) -> Result<Vec<u8>, CellaDockerError> {
+async fn get_agent_binary_bytes(docker: &Docker, arch: &str) -> Result<Vec<u8>, CellaDockerError> {
     #[cfg(debug_assertions)]
     {
         let _ = arch; // arch is only used in release builds (download URL)
@@ -421,14 +421,15 @@ async fn get_agent_binary_bytes(
 #[cfg(not(debug_assertions))]
 async fn download_agent_from_release(arch: &str) -> Result<Vec<u8>, CellaDockerError> {
     let version = env!("CARGO_PKG_VERSION");
-    let url = format!(
-        "https://github.com/eve0415/cella/releases/download/v{version}/cella-agent-{arch}"
-    );
+    let url =
+        format!("https://github.com/eve0415/cella/releases/download/v{version}/cella-agent-{arch}");
     info!("Downloading cella-agent-{arch} v{version} from GitHub releases...");
 
-    let response = reqwest::get(&url).await.map_err(|e| CellaDockerError::AgentVolume {
-        message: format!("failed to download agent binary from {url}: {e}"),
-    })?;
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to download agent binary from {url}: {e}"),
+        })?;
 
     if !response.status().is_success() {
         return Err(CellaDockerError::AgentVolume {
@@ -439,9 +440,12 @@ async fn download_agent_from_release(arch: &str) -> Result<Vec<u8>, CellaDockerE
         });
     }
 
-    let bytes = response.bytes().await.map_err(|e| CellaDockerError::AgentVolume {
-        message: format!("failed to read agent binary response: {e}"),
-    })?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to read agent binary response: {e}"),
+        })?;
 
     info!("Downloaded cella-agent-{arch} ({} bytes)", bytes.len());
     Ok(bytes.to_vec())

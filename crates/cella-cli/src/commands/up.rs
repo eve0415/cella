@@ -1103,8 +1103,8 @@ impl UpContext {
         };
         let effective_feature_config = feature_config.or(image_meta_config.as_ref());
 
-        let create_opts = cella_docker::config_map::map_config(
-            cella_docker::config_map::MapConfigParams {
+        let create_opts =
+            cella_docker::config_map::map_config(cella_docker::config_map::MapConfigParams {
                 config,
                 container_name: &self.container_nm,
                 image_name: img_name,
@@ -1113,8 +1113,7 @@ impl UpContext {
                 feature_config: effective_feature_config,
                 image_env: &image_env,
                 agent_arch,
-            },
-        );
+            });
 
         ImageConfig {
             image_env,
@@ -1152,7 +1151,10 @@ impl UpContext {
 
         let agent_arch = cella_docker::volume::detect_container_arch(self.client.inner())
             .await
-            .unwrap_or_else(|e| { warn!("Container arch detection failed, defaulting to x86_64: {e}"); "x86_64".to_string() });
+            .unwrap_or_else(|e| {
+                warn!("Container arch detection failed, defaulting to x86_64: {e}");
+                "x86_64".to_string()
+            });
 
         let ImageConfig {
             image_env,
