@@ -84,6 +84,12 @@ impl Command {
         }
     }
 
+    /// Whether this is the `daemon start` subcommand, which initializes
+    /// its own file-based tracing instead of the normal indicatif writer.
+    pub const fn is_daemon_start(&self) -> bool {
+        matches!(self, Self::Daemon(_))
+    }
+
     pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Up(args) => args.execute(progress).await,

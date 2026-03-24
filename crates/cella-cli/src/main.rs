@@ -46,11 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let progress = Progress::new(spinners_enabled, verbosity);
 
-    // Route tracing through indicatif so log lines never corrupt spinners.
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
-        .init();
+    // The daemon subprocess initializes its own file-based tracing.
+    // Skip the normal indicatif-based tracing for daemon start.
+    if !cli.command.is_daemon_start() {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
+            .init();
+    }
 
     cli.command.execute(progress).await
 }

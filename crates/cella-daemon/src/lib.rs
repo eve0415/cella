@@ -11,6 +11,7 @@ pub mod credential;
 pub mod daemon;
 mod error;
 pub mod health;
+pub mod logging;
 pub mod management;
 pub mod orbstack;
 pub mod port_manager;
