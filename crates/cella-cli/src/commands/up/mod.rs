@@ -790,7 +790,7 @@ impl UpContext {
             cella_docker::network::ensure_container_connected(self.client.inner(), container_id)
                 .await
         {
-            tracing::warn!("Failed to connect container to cella network: {e}");
+            warn!("Failed to connect container to cella network: {e}");
         }
 
         if let Err(e) = cella_docker::network::ensure_repo_network(
@@ -800,7 +800,7 @@ impl UpContext {
         )
         .await
         {
-            tracing::warn!("Failed to connect container to repo network: {e}");
+            warn!("Failed to connect container to repo network: {e}");
         }
 
         self.register_with_daemon(container_id).await;
@@ -848,7 +848,7 @@ impl UpContext {
         };
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
-                tracing::debug!("Container registered with daemon: {resp:?}");
+                debug!("Container registered with daemon: {resp:?}");
             }
             Err(e) => {
                 warn!("Failed to register container with daemon: {e}");
@@ -1698,7 +1698,7 @@ async fn seed_gh_credentials(
     )
     .await
     {
-        tracing::debug!("gh credentials already present in container, skipping seed");
+        debug!("gh credentials already present in container, skipping seed");
         return;
     }
 
@@ -1765,7 +1765,7 @@ async fn seed_claude_config(
     )
     .await
     {
-        tracing::debug!("Claude config already present in container, skipping seed");
+        debug!("Claude config already present in container, skipping seed");
         return;
     }
 
@@ -1799,7 +1799,7 @@ async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_us
     let docker_files = convert_uploads(&uploads);
 
     if let Err(e) = client.upload_files(container_id, &docker_files).await {
-        tracing::debug!("Failed to re-sync Claude auth: {e}");
+        debug!("Failed to re-sync Claude auth: {e}");
     }
 }
 
@@ -1829,11 +1829,11 @@ async fn is_claude_code_installed(
     {
         let installed = result.stdout.trim();
         if version == "latest" || version == "stable" {
-            tracing::debug!("Claude Code already installed: {installed}");
+            debug!("Claude Code already installed: {installed}");
             return true;
         }
         if installed.contains(version) {
-            tracing::debug!("Claude Code already at version {version}: {installed}");
+            debug!("Claude Code already at version {version}: {installed}");
             return true;
         }
     }
@@ -2103,11 +2103,11 @@ async fn is_npm_tool_installed(
     {
         let installed = result.stdout.trim();
         if version == "latest" {
-            tracing::debug!("{binary_name} already installed: {installed}");
+            debug!("{binary_name} already installed: {installed}");
             return true;
         }
         if installed.contains(version) {
-            tracing::debug!("{binary_name} already at version {version}: {installed}");
+            debug!("{binary_name} already at version {version}: {installed}");
             return true;
         }
     }

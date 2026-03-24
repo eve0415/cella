@@ -132,7 +132,7 @@ async fn prepare_and_start(
     let agent_arch = cella_docker::volume::detect_container_arch(ctx.client.inner())
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!("Failed to detect container arch, defaulting to x86_64: {e}");
+            warn!("Failed to detect container arch, defaulting to x86_64: {e}");
             "x86_64".to_string()
         });
 
