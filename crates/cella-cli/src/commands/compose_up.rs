@@ -85,7 +85,8 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
     }
 
     // 5-13. Prepare environment, write override, start services
-    let (remote_user, resolved_features) = prepare_and_start(&ctx, &config, &project).await?;
+    let (remote_user, resolved_features, agent_arch) =
+        prepare_and_start(&ctx, &config, &project).await?;
 
     // 14-20. Post-start: find container, setup, lifecycle, output
     finalize_compose(
@@ -94,6 +95,7 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
         &project,
         &remote_user,
         resolved_features.as_ref(),
+        &agent_arch,
     )
     .await
 }
@@ -103,7 +105,8 @@ async fn prepare_and_start(
     ctx: &UpContext,
     config: &serde_json::Value,
     project: &ComposeProject,
-) -> Result<(String, Option<cella_features::ResolvedFeatures>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
+{
     // 5. Build feature-enriched image if features are configured
     let (image_override, resolved_features) = if has_features(config) {
         let (img_name, rf, _details) = super::image::ensure_image(
@@ -125,10 +128,18 @@ async fn prepare_and_start(
     super::ensure_credential_proxy();
     let daemon_env = query_daemon_env(&ctx.container_nm).await;
 
-    // 7. Ensure agent volume is populated
+    // 7. Detect container architecture and ensure agent volume is populated
+    let agent_arch = cella_docker::volume::detect_container_arch(ctx.client.inner())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to detect container arch, defaulting to x86_64: {e}");
+            "x86_64".to_string()
+        });
+
     ctx.progress
         .run_step("Preparing agent volume...", async {
-            cella_docker::volume::ensure_agent_volume_populated(ctx.client.inner()).await
+            cella_docker::volume::ensure_agent_volume_populated(ctx.client.inner(), &agent_arch)
+                .await
         })
         .await?;
 
@@ -182,7 +193,7 @@ async fn prepare_and_start(
         })
         .await?;
 
-    Ok((remote_user, resolved_features))
+    Ok((remote_user, resolved_features, agent_arch))
 }
 
 /// Find primary container, run post-create setup, lifecycle phases, and output result (steps 14-20).
@@ -192,6 +203,7 @@ async fn finalize_compose(
     project: &ComposeProject,
     remote_user: &str,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
+    agent_arch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 14. Find primary container via bollard labels
     let primary = ctx
@@ -226,7 +238,7 @@ async fn finalize_compose(
         .await;
 
     // 18. Launch agent as background process via exec
-    launch_agent(ctx, &primary.id).await;
+    launch_agent(ctx, &primary.id, agent_arch).await;
 
     // 19. Run lifecycle phases (primary service only)
     let progress_ref = ctx.progress.clone();
@@ -369,10 +381,9 @@ fn build_compose_labels(
 ///
 /// Since compose's `overrideCommand` defaults to `false`, the container runs its
 /// own entrypoint. The agent is started via `exec` as a background daemon.
-async fn launch_agent(ctx: &UpContext, container_id: &str) {
+async fn launch_agent(ctx: &UpContext, container_id: &str, agent_arch: &str) {
     let version = env!("CARGO_PKG_VERSION");
-    let arch = cella_docker::volume::detect_agent_arch();
-    let agent_path = format!("/cella/v{version}/{arch}/cella-agent");
+    let agent_path = format!("/cella/v{version}/{agent_arch}/cella-agent");
 
     let script = format!(
         "if [ -x \"{agent_path}\" ]; then \

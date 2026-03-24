@@ -83,6 +83,10 @@ pub const fn agent_volume_mount() -> (&'static str, &'static str, bool) {
 /// When `CELLA_AGENT_PATH` is set, we bind-mount that path
 /// instead of using the volume, allowing developers to test
 /// local agent builds.
+///
+/// Only available in debug builds — release builds download
+/// the agent from GitHub releases.
+#[cfg(debug_assertions)]
 pub fn dev_agent_override() -> Option<String> {
     std::env::var("CELLA_AGENT_PATH").ok()
 }
@@ -96,6 +100,31 @@ pub fn detect_agent_arch() -> &'static str {
         "aarch64" => "aarch64",
         arch => arch, // fallback: use as-is
     }
+}
+
+/// Detect the target architecture from the Docker daemon.
+///
+/// Uses the Docker daemon's reported architecture rather than the host
+/// architecture, which correctly handles Docker Desktop on macOS where
+/// the daemon runs in a Linux VM matching the default container arch.
+///
+/// # Errors
+///
+/// Returns error if the Docker version API call fails.
+pub async fn detect_container_arch(docker: &Docker) -> Result<String, CellaDockerError> {
+    let version = docker
+        .version()
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to detect Docker platform: {e}"),
+        })?;
+    let arch = version.arch.unwrap_or_default();
+    Ok(match arch.as_str() {
+        "aarch64" | "arm64" => "aarch64",
+        // Default to x86_64 for unknown or x86_64/amd64 architectures
+        _ => "x86_64",
+    }
+    .to_string())
 }
 
 /// Generate the cella-browser helper script content.
@@ -120,9 +149,8 @@ pub const fn version_marker_path() -> &'static str {
 }
 
 /// Generate the version marker content for the agent volume.
-pub fn version_marker_content() -> String {
+pub fn version_marker_content(arch: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let arch = detect_agent_arch();
     format!("{version}/{arch}\n")
 }
 
@@ -159,17 +187,19 @@ pub async fn remove_agent_volume(docker: &Docker) -> Result<(), CellaDockerError
 /// Steps:
 /// 1. Ensure the volume exists
 /// 2. Check version marker — if current, return early
-/// 3. Get agent binary bytes (`CELLA_AGENT_PATH` override, debug build, or release download)
+/// 3. Get agent binary bytes (debug: local/container build; release: GitHub download)
 /// 4. Upload agent binary + browser helper + version marker via temp container
 ///
 /// # Errors
 ///
 /// Returns error if volume creation, agent binary retrieval, or upload fails.
-pub async fn ensure_agent_volume_populated(docker: &Docker) -> Result<(), CellaDockerError> {
+pub async fn ensure_agent_volume_populated(
+    docker: &Docker,
+    arch: &str,
+) -> Result<(), CellaDockerError> {
     ensure_agent_volume(docker).await?;
 
     let version = env!("CARGO_PKG_VERSION");
-    let arch = detect_agent_arch();
     let expected_marker = format!("{version}/{arch}\n");
 
     if !needs_repopulation(docker, &expected_marker).await? {
@@ -206,7 +236,7 @@ async fn populate_volume(
     arch: &str,
     expected_marker: &str,
 ) -> Result<(), CellaDockerError> {
-    let agent_bytes = get_agent_binary_bytes(docker).await?;
+    let agent_bytes = get_agent_binary_bytes(docker, arch).await?;
     let browser_script = browser_helper_script(version, arch);
 
     upload_to_volume(
@@ -342,23 +372,26 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
 
 /// Get the agent binary bytes from the appropriate source.
 ///
-/// Priority:
+/// Debug builds:
 /// 1. `CELLA_AGENT_PATH` env var — explicit override (escape hatch)
-/// 2. Debug builds on Linux — use local `cella-agent` from `target/debug/`
-/// 3. Debug builds on non-Linux — build in temp Rust container (cross-compile)
-/// 4. Release builds — download from GitHub releases (stub)
-async fn get_agent_binary_bytes(docker: &Docker) -> Result<Vec<u8>, CellaDockerError> {
-    // 1. Check for CELLA_AGENT_PATH override (fastest dev iteration)
-    if let Some(path) = dev_agent_override() {
-        info!("Using agent binary from CELLA_AGENT_PATH: {path}");
-        return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
-            message: format!("failed to read CELLA_AGENT_PATH ({path}): {e}"),
-        });
-    }
-
-    // 2. Debug builds
+/// 2. On Linux — use local `cella-agent` from `target/debug/`
+/// 3. On non-Linux — build in temp Rust container (cross-compile)
+///
+/// Release builds:
+/// 1. Download from GitHub releases
+async fn get_agent_binary_bytes(docker: &Docker, arch: &str) -> Result<Vec<u8>, CellaDockerError> {
     #[cfg(debug_assertions)]
     {
+        let _ = arch; // arch is only used in release builds (download URL)
+
+        // Check for CELLA_AGENT_PATH override (fastest dev iteration)
+        if let Some(path) = dev_agent_override() {
+            info!("Using agent binary from CELLA_AGENT_PATH: {path}");
+            return std::fs::read(&path).map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("failed to read CELLA_AGENT_PATH ({path}): {e}"),
+            });
+        }
+
         // On Linux, the local binary is already the right platform
         if std::env::consts::OS == "linux"
             && let Some(path) = detect_sibling_agent_binary()
@@ -377,15 +410,45 @@ async fn get_agent_binary_bytes(docker: &Docker) -> Result<Vec<u8>, CellaDockerE
         return build_agent_in_container(docker).await;
     }
 
-    // 3. Release builds: stub with clear error for now
     #[cfg(not(debug_assertions))]
     {
-        Err(CellaDockerError::AgentVolume {
-            message: "Agent binary download from GitHub releases not yet implemented. \
-                      Set CELLA_AGENT_PATH to a pre-built linux agent binary."
-                .to_string(),
-        })
+        let _ = docker; // suppress unused warning in release
+        download_agent_from_release(arch).await
     }
+}
+
+/// Download the agent binary from the matching GitHub release.
+#[cfg(not(debug_assertions))]
+async fn download_agent_from_release(arch: &str) -> Result<Vec<u8>, CellaDockerError> {
+    let version = env!("CARGO_PKG_VERSION");
+    let url =
+        format!("https://github.com/eve0415/cella/releases/download/v{version}/cella-agent-{arch}");
+    info!("Downloading cella-agent-{arch} v{version} from GitHub releases...");
+
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to download agent binary from {url}: {e}"),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(CellaDockerError::AgentVolume {
+            message: format!(
+                "agent binary download failed: HTTP {} from {url}",
+                response.status()
+            ),
+        });
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to read agent binary response: {e}"),
+        })?;
+
+    info!("Downloaded cella-agent-{arch} ({} bytes)", bytes.len());
+    Ok(bytes.to_vec())
 }
 
 /// Try to find the cella-agent binary next to the running cella binary.
@@ -801,9 +864,10 @@ mod tests {
 
     #[test]
     fn version_marker_content_format() {
-        let content = version_marker_content();
+        let content = version_marker_content("x86_64");
         assert!(content.contains('/'));
         assert!(content.ends_with('\n'));
+        assert!(content.contains("x86_64"));
     }
 
     #[test]

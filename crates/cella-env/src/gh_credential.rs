@@ -261,7 +261,7 @@ fn extract_token_info(hostname: &str) -> Option<TokenInfo> {
 /// Read the host's `~/.config/gh/config.yml` file.
 fn read_host_gh_config() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home)
+    let path = Path::new(&home)
         .join(".config")
         .join("gh")
         .join("config.yml");

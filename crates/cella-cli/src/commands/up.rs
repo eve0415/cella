@@ -6,8 +6,8 @@ use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
-    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, FileToUpload,
-    ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
+    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, ExecResult,
+    FileToUpload, ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
     run_lifecycle_phase, update_remote_user_uid,
 };
 
@@ -292,6 +292,16 @@ impl UpContext {
             .get("dev.cella.remote_user")
             .cloned()
             .unwrap_or_else(|| "root".to_string())
+    }
+
+    /// Detect the container architecture from the Docker daemon.
+    async fn detect_arch(&self) -> String {
+        cella_docker::volume::detect_container_arch(self.client.inner())
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Container arch detection failed, defaulting to x86_64: {e}");
+                "x86_64".to_string()
+            })
     }
 
     /// Run the env forwarding + userEnvProbe + tool auth/install sequence
@@ -697,6 +707,7 @@ impl UpContext {
         image_env: &[String],
         remote_user: &str,
         settings: &cella_config::Settings,
+        agent_arch: &str,
     ) {
         // Forwarding mounts
         for m in &env_fwd.mounts {
@@ -774,7 +785,9 @@ impl UpContext {
 
         // Agent volume mount and env vars
         let agent_step = self.progress.step("Populating agent volume...");
-        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner()).await {
+        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner(), agent_arch)
+            .await
+        {
             Ok(()) => agent_step.finish(),
             Err(e) => {
                 agent_step.fail("failed");
@@ -1069,6 +1082,7 @@ impl UpContext {
         img_name: &str,
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
+        agent_arch: &str,
     ) -> ImageConfig {
         let image_env = base_image_details.env;
         let image_meta_user = base_image_details
@@ -1099,15 +1113,17 @@ impl UpContext {
         };
         let effective_feature_config = feature_config.or(image_meta_config.as_ref());
 
-        let create_opts = cella_docker::config_map::map_config(
-            config,
-            &self.container_nm,
-            img_name,
-            labels,
-            &self.resolved.workspace_root,
-            effective_feature_config,
-            &image_env,
-        );
+        let create_opts =
+            cella_docker::config_map::map_config(cella_docker::config_map::MapConfigParams {
+                config,
+                container_name: &self.container_nm,
+                image_name: img_name,
+                labels,
+                workspace_root: &self.resolved.workspace_root,
+                feature_config: effective_feature_config,
+                image_env: &image_env,
+                agent_arch,
+            });
 
         ImageConfig {
             image_env,
@@ -1125,7 +1141,6 @@ impl UpContext {
         build_no_cache: bool,
     ) -> Result<CreateResult, Box<dyn std::error::Error>> {
         let config = self.config();
-
         // Run initializeCommand on host (runs every invocation per spec)
         if let Some(init_cmd) = config.get("initializeCommand") {
             run_host_command("initializeCommand", init_cmd)?;
@@ -1142,7 +1157,7 @@ impl UpContext {
             &self.progress,
         )
         .await?;
-
+        let agent_arch = self.detect_arch().await;
         let ImageConfig {
             image_env,
             remote_user,
@@ -1154,6 +1169,7 @@ impl UpContext {
                 &img_name,
                 base_image_details,
                 resolved_features.as_ref(),
+                &agent_arch,
             )
             .await;
 
@@ -1164,6 +1180,7 @@ impl UpContext {
             &image_env,
             &remote_user,
             &settings,
+            &agent_arch,
         )
         .await;
 
@@ -1633,7 +1650,7 @@ async fn mkdir_in_container(
     container_id: &str,
     dir: &str,
     mode: u32,
-) -> Result<cella_docker::ExecResult, cella_docker::CellaDockerError> {
+) -> Result<ExecResult, CellaDockerError> {
     client
         .exec_command(
             container_id,
@@ -2309,7 +2326,7 @@ async fn run_claude_install(
 }
 
 /// Log the result of a Claude Code installation attempt.
-fn log_install_result(result: Result<cella_docker::ExecResult, CellaDockerError>) {
+fn log_install_result(result: Result<ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("Claude Code installed successfully");
@@ -2476,7 +2493,7 @@ async fn npm_install_global(
     package: &str,
     version: &str,
     probed_env: Option<&std::collections::HashMap<String, String>>,
-) -> Result<cella_docker::ExecResult, CellaDockerError> {
+) -> Result<ExecResult, CellaDockerError> {
     let pkg = if version == "latest" {
         package.to_string()
     } else {
@@ -2497,10 +2514,7 @@ async fn npm_install_global(
 }
 
 /// Log the result of an npm tool installation attempt.
-fn log_npm_install_result(
-    tool_name: &str,
-    result: Result<cella_docker::ExecResult, CellaDockerError>,
-) {
+fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, CellaDockerError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("{tool_name} installed successfully");

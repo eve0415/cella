@@ -20,6 +20,7 @@
 //! [`indicatif::MultiProgress::println`] so structured log lines never
 //! corrupt active spinners.
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -169,7 +170,7 @@ impl Progress {
     /// Convenience: run an async operation with a spinner.
     pub async fn run_step<F, T>(&self, label: &str, f: F) -> T
     where
-        F: std::future::Future<Output = T>,
+        F: Future<Output = T>,
     {
         let step = self.step(label);
         let result = f.await;

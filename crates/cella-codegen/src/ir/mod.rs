@@ -79,7 +79,7 @@ pub enum IrTypeRef {
     Option(Box<Self>),
     Map(Box<Self>, Box<Self>),
     /// Reference to a named generated type.
-    Named(std::string::String),
+    Named(String),
     /// Fallback: `serde_json::Value`.
     Value,
 }

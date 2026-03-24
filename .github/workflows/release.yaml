@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Extract and validate version
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+  build-agent:
+    name: Agent (${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agent
+        run: cargo build --package cella-agent --target ${{ matrix.target }} --release
+
+      - name: Upload agent binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cella-agent-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/cella-agent
+          if-no-files-found: error
+
+  build-cli:
+    name: CLI (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+
+          - target: x86_64-apple-darwin
+            runner: macos-13
+
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build CLI
+        run: cargo build --package cella-cli --target ${{ matrix.target }} --release
+
+      - name: Package archive
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGING="staging"
+          mkdir -p "$STAGING"
+          cp "target/${TARGET}/release/cella" "$STAGING/"
+          tar czf "cella-v${VERSION}-${TARGET}.tar.gz" -C "$STAGING" .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}
+          path: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [validate, build-agent, build-cli]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          mkdir -p release
+
+          # Move CLI archives
+          for dir in artifacts/cella-v${VERSION}-*; do
+            cp "$dir"/*.tar.gz release/
+          done
+
+          # Move agent binaries
+          cp artifacts/cella-agent-x86_64/cella-agent release/cella-agent-x86_64
+          cp artifacts/cella-agent-aarch64/cella-agent release/cella-agent-aarch64
+
+          # Generate checksums
+          cd release
+          sha256sum cella-v*.tar.gz cella-agent-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --generate-notes \
+            release/*
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          cd release
+
+          SHA_MACOS_ARM=$(sha256sum "cella-v${VERSION}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)
+          SHA_MACOS_INTEL=$(sha256sum "cella-v${VERSION}-x86_64-apple-darwin.tar.gz" | cut -d' ' -f1)
+          SHA_LINUX_ARM=$(sha256sum "cella-v${VERSION}-aarch64-unknown-linux-musl.tar.gz" | cut -d' ' -f1)
+          SHA_LINUX_INTEL=$(sha256sum "cella-v${VERSION}-x86_64-unknown-linux-musl.tar.gz" | cut -d' ' -f1)
+
+          cd ..
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/eve0415/homebrew-tap.git" tap
+
+          mkdir -p tap/Formula
+          sed -e "s/VERSION/${VERSION}/g" \
+              -e "s/SHA256_MACOS_ARM/${SHA_MACOS_ARM}/g" \
+              -e "s/SHA256_MACOS_INTEL/${SHA_MACOS_INTEL}/g" \
+              -e "s/SHA256_LINUX_ARM/${SHA_LINUX_ARM}/g" \
+              -e "s/SHA256_LINUX_INTEL/${SHA_LINUX_INTEL}/g" \
+              .github/formula/cella.rb.tmpl > tap/Formula/cella.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cella.rb
+          git commit -m "cella ${VERSION}"
+          git push

@@ -92,10 +92,10 @@ impl DockerClient {
         if let StartExecResults::Attached { mut output, .. } = start_result {
             while let Some(chunk) = output.next().await {
                 match chunk? {
-                    bollard::container::LogOutput::StdOut { message } => {
+                    LogOutput::StdOut { message } => {
                         stdout.push_str(&String::from_utf8_lossy(&message));
                     }
-                    bollard::container::LogOutput::StdErr { message } => {
+                    LogOutput::StdErr { message } => {
                         stderr.push_str(&String::from_utf8_lossy(&message));
                     }
                     _ => {}
@@ -159,12 +159,12 @@ impl DockerClient {
         if let StartExecResults::Attached { mut output, .. } = start_result {
             while let Some(chunk) = output.next().await {
                 match chunk? {
-                    bollard::container::LogOutput::StdOut { message } => {
+                    LogOutput::StdOut { message } => {
                         stdout.push_str(&String::from_utf8_lossy(&message));
                         let _ = stdout_writer.write_all(&message);
                         let _ = stdout_writer.flush();
                     }
-                    bollard::container::LogOutput::StdErr { message } => {
+                    LogOutput::StdErr { message } => {
                         stderr.push_str(&String::from_utf8_lossy(&message));
                         let _ = stderr_writer.write_all(&message);
                         let _ = stderr_writer.flush();

@@ -413,16 +413,32 @@ fn to_bollard_mount(m: &MountConfig) -> Mount {
     }
 }
 
+/// Parameters for mapping a devcontainer config to container creation options.
+pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
+    pub config: &'a serde_json::Value,
+    pub container_name: &'a str,
+    pub image_name: &'a str,
+    pub labels: HashMap<String, String, S>,
+    pub workspace_root: &'a Path,
+    pub feature_config: Option<&'a FeatureContainerConfig>,
+    pub image_env: &'a [String],
+    pub agent_arch: &'a str,
+}
+
 /// Map a resolved devcontainer config to container creation options.
 pub fn map_config<S: std::hash::BuildHasher>(
-    config: &serde_json::Value,
-    container_name: &str,
-    image_name: &str,
-    labels: HashMap<String, String, S>,
-    workspace_root: &Path,
-    feature_config: Option<&FeatureContainerConfig>,
-    image_env: &[String],
+    params: MapConfigParams<'_, S>,
 ) -> CreateContainerOptions {
+    let MapConfigParams {
+        config,
+        container_name,
+        image_name,
+        labels,
+        workspace_root,
+        feature_config,
+        image_env,
+        agent_arch,
+    } = params;
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
@@ -450,7 +466,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config);
+    let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config, agent_arch);
 
     let privileged = config
         .get("privileged")
@@ -534,6 +550,7 @@ fn map_merged_string_list(
 fn build_entrypoint_cmd(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
+    agent_arch: &str,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     use std::fmt::Write;
 
@@ -549,8 +566,7 @@ fn build_entrypoint_cmd(
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
     let version = env!("CARGO_PKG_VERSION");
-    let arch = crate::volume::detect_agent_arch();
-    let agent_path = crate::volume::agent_binary_path(version, arch);
+    let agent_path = crate::volume::agent_binary_path(version, agent_arch);
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \
@@ -627,6 +643,23 @@ mod tests {
     use cella_features::FeatureLifecycle;
     use serde_json::json;
 
+    fn test_map_config(
+        config: &serde_json::Value,
+        feature_config: Option<&FeatureContainerConfig>,
+        image_env: &[String],
+    ) -> CreateContainerOptions {
+        map_config(MapConfigParams {
+            config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/tmp/test"),
+            feature_config,
+            image_env,
+            agent_arch: "x86_64",
+        })
+    }
+
     #[test]
     fn map_image_config() {
         let config = json!({
@@ -634,15 +667,16 @@ mod tests {
             "remoteUser": "vscode",
         });
 
-        let opts = map_config(
-            &config,
-            "test-container",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/my-project"),
-            None,
-            &[],
-        );
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test-container",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/tmp/my-project"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+        });
 
         assert_eq!(opts.image, "ubuntu");
         assert_eq!(opts.workspace_folder, "/workspaces/my-project");
@@ -655,15 +689,16 @@ mod tests {
             "workspaceFolder": "/home/user/project",
         });
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/my-project"),
-            None,
-            &[],
-        );
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/tmp/my-project"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+        });
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
     }
@@ -675,15 +710,7 @@ mod tests {
             "containerEnv": {"FOO": "bar", "BAZ": "qux"},
         });
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
 
         assert!(opts.env.contains(&"FOO=bar".to_string()));
         assert!(opts.env.contains(&"BAZ=qux".to_string()));
@@ -692,15 +719,7 @@ mod tests {
     #[test]
     fn map_override_command_default_true() {
         let config = json!({"image": "ubuntu"});
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
         assert_eq!(opts.entrypoint, Some(vec!["/bin/sh".to_string()]));
         let cmd = opts.cmd.unwrap();
         assert_eq!(cmd[0], "-c");
@@ -711,15 +730,7 @@ mod tests {
     #[test]
     fn map_override_command_false() {
         let config = json!({"image": "ubuntu", "overrideCommand": false});
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
         assert!(opts.entrypoint.is_none());
         assert!(opts.cmd.is_none());
     }
@@ -754,15 +765,7 @@ mod tests {
             "forwardPorts": [3000, 8080],
         });
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
         assert!(opts.port_bindings.contains_key("3000/tcp"));
         assert!(opts.port_bindings.contains_key("8080/tcp"));
     }
@@ -775,15 +778,7 @@ mod tests {
             "portsAttributes": {"3000": {"protocol": "udp"}},
         });
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
         assert!(opts.port_bindings.contains_key("3000/udp"));
     }
 
@@ -794,15 +789,7 @@ mod tests {
             "mounts": [{"type": "bind", "source": "/a", "target": "/b"}],
         });
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let opts = test_map_config(&config, None, &[]);
         assert_eq!(opts.mounts.len(), 1);
         assert_eq!(opts.mounts[0].target, "/b");
     }
@@ -810,15 +797,16 @@ mod tests {
     #[test]
     fn map_default_workspace_mount() {
         let config = json!({"image": "ubuntu"});
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/my-project"),
-            None,
-            &[],
-        );
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/tmp/my-project"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+        });
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
         assert_eq!(mount.target, "/workspaces/my-project");
@@ -830,15 +818,7 @@ mod tests {
             "image": "ubuntu",
             "features": {"ghcr.io/devcontainers/features/node:1": {}},
         });
-        let _ = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &[],
-        );
+        let _ = test_map_config(&config, None, &[]);
     }
 
     #[test]
@@ -870,15 +850,7 @@ mod tests {
             customizations: serde_json::Value::Null,
         };
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            Some(&feature_config),
-            &[],
-        );
+        let opts = test_map_config(&config, Some(&feature_config), &[]);
 
         // Feature mounts come first, then user mounts
         assert_eq!(opts.mounts.len(), 2);
@@ -938,15 +910,7 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            Some(&feature_config),
-            &[],
-        );
+        let opts = test_map_config(&config, Some(&feature_config), &[]);
 
         // Each mount target appears exactly once
         assert_eq!(opts.mounts.len(), 2);
@@ -1051,15 +1015,7 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            Some(&feature_config),
-            &[],
-        );
+        let opts = test_map_config(&config, Some(&feature_config), &[]);
 
         // Feature containerEnv must NOT appear in runtime env
         assert!(opts.env.is_empty());
@@ -1100,15 +1056,7 @@ mod tests {
 
         let image_env = vec!["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()];
 
-        let opts = map_config(
-            &config,
-            "test",
-            "ubuntu",
-            HashMap::new(),
-            Path::new("/tmp/test"),
-            None,
-            &image_env,
-        );
+        let opts = test_map_config(&config, None, &image_env);
 
         // Image env preserved as base, user env appended
         assert!(opts.env.contains(&"PATH=/usr/bin:/bin".to_string()));
