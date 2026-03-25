@@ -129,10 +129,17 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+
+          - target: aarch64-apple-darwin
+            runner: macos-26
+
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -143,7 +150,12 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build
+      - name: Build agent
+        if: contains(matrix.target, 'linux')
         run: cargo build --package cella-agent --target ${{ matrix.target }}
+
+      - name: Build CLI
+        run: cargo build --package cella-cli --target ${{ matrix.target }}
