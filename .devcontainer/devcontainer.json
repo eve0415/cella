@@ -43,6 +43,9 @@
         "files.eol": "\n",
         "files.trimFinalNewlines": true,
         "files.trimTrailingWhitespace": true,
+        "search.exclude": {
+          "Cargo.lock": true
+        },
         "terminal.integrated.defaultProfile.linux": "zsh",
         "terminal.integrated.profiles.linux": {
           "zsh": {
