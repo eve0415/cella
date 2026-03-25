@@ -43,30 +43,27 @@ impl PortsArgs {
 }
 
 fn print_daemon_ports(ports: &[cella_port::protocol::ForwardedPortDetail]) {
-    eprintln!(
-        "{:<20} {:<8} {:<12} {:<12} URL",
-        "CONTAINER", "PORT", "PROCESS", "HOST PORT"
-    );
+    use crate::table::{Column, Table};
+
+    let mut table = Table::new(vec![
+        Column::shrinkable("CONTAINER"),
+        Column::fixed("PORT"),
+        Column::fixed("PROCESS"),
+        Column::fixed("HOST PORT"),
+        Column::fixed("URL"),
+    ]);
 
     for port in ports {
-        let process = port.process.as_deref().unwrap_or("-");
-        eprintln!(
-            "{:<20} {:<8} {:<12} {:<12} {}",
-            truncate_name(&port.container_name, 20),
-            port.container_port,
-            process,
-            port.host_port,
-            port.url,
-        );
+        table.add_row(vec![
+            port.container_name.clone(),
+            port.container_port.to_string(),
+            port.process.as_deref().unwrap_or("-").to_string(),
+            port.host_port.to_string(),
+            port.url.clone(),
+        ]);
     }
-}
 
-fn truncate_name(name: &str, max_len: usize) -> &str {
-    if name.len() > max_len {
-        &name[..max_len]
-    } else {
-        name
-    }
+    table.eprint();
 }
 
 async fn print_docker_ports(all: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,14 +90,24 @@ async fn print_docker_ports(all: bool) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack: bool) {
-    if is_orbstack {
-        eprintln!("{:<20} {:<8} {:<12} URL", "WORKTREE", "PORT", "PROCESS");
+    use crate::table::{Column, Table};
+
+    let mut table = if is_orbstack {
+        Table::new(vec![
+            Column::shrinkable("WORKTREE"),
+            Column::fixed("PORT"),
+            Column::fixed("PROCESS"),
+            Column::fixed("URL"),
+        ])
     } else {
-        eprintln!(
-            "{:<20} {:<8} {:<12} {:<12} URL",
-            "WORKTREE", "PORT", "PROCESS", "HOST PORT"
-        );
-    }
+        Table::new(vec![
+            Column::shrinkable("WORKTREE"),
+            Column::fixed("PORT"),
+            Column::fixed("PROCESS"),
+            Column::fixed("HOST PORT"),
+            Column::fixed("URL"),
+        ])
+    };
 
     for container in containers {
         let name = container
@@ -115,14 +122,15 @@ fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbs
 
         for port_binding in &container.ports {
             if is_orbstack {
-                eprintln!(
-                    "{:<20} {:<8} {:<12} {}.orb.local:{}",
-                    name,
-                    port_binding.container_port,
-                    "-",
-                    container.name,
-                    port_binding.container_port,
-                );
+                table.add_row(vec![
+                    name.clone(),
+                    port_binding.container_port.to_string(),
+                    "-".to_string(),
+                    format!(
+                        "{}.orb.local:{}",
+                        container.name, port_binding.container_port
+                    ),
+                ]);
             } else {
                 let host_port = port_binding
                     .host_port
@@ -130,29 +138,49 @@ fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbs
                 let url = port_binding
                     .host_port
                     .map_or_else(|| "-".to_string(), |p| format!("localhost:{p}"));
-                eprintln!(
-                    "{:<20} {:<8} {:<12} {:<12} {}",
-                    name, port_binding.container_port, "-", host_port, url,
-                );
+                table.add_row(vec![
+                    name.clone(),
+                    port_binding.container_port.to_string(),
+                    "-".to_string(),
+                    host_port,
+                    url,
+                ]);
             }
         }
     }
+
+    table.eprint();
 }
 
 fn print_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack: bool) {
-    if is_orbstack {
-        eprintln!("{:<8} {:<12} URL", "PORT", "PROCESS");
+    use crate::table::{Column, Table};
+
+    let mut table = if is_orbstack {
+        Table::new(vec![
+            Column::fixed("PORT"),
+            Column::fixed("PROCESS"),
+            Column::fixed("URL"),
+        ])
     } else {
-        eprintln!("{:<8} {:<12} {:<12} URL", "PORT", "PROCESS", "HOST PORT");
-    }
+        Table::new(vec![
+            Column::fixed("PORT"),
+            Column::fixed("PROCESS"),
+            Column::fixed("HOST PORT"),
+            Column::fixed("URL"),
+        ])
+    };
 
     for container in containers {
         for port_binding in &container.ports {
             if is_orbstack {
-                eprintln!(
-                    "{:<8} {:<12} {}.orb.local:{}",
-                    port_binding.container_port, "-", container.name, port_binding.container_port,
-                );
+                table.add_row(vec![
+                    port_binding.container_port.to_string(),
+                    "-".to_string(),
+                    format!(
+                        "{}.orb.local:{}",
+                        container.name, port_binding.container_port
+                    ),
+                ]);
             } else {
                 let host_port = port_binding
                     .host_port
@@ -160,11 +188,15 @@ fn print_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack
                 let url = port_binding
                     .host_port
                     .map_or_else(|| "-".to_string(), |p| format!("localhost:{p}"));
-                eprintln!(
-                    "{:<8} {:<12} {:<12} {}",
-                    port_binding.container_port, "-", host_port, url,
-                );
+                table.add_row(vec![
+                    port_binding.container_port.to_string(),
+                    "-".to_string(),
+                    host_port,
+                    url,
+                ]);
             }
         }
     }
+
+    table.eprint();
 }

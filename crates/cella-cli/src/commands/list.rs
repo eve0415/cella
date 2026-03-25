@@ -97,10 +97,22 @@ fn short_id(id: &str) -> &str {
 }
 
 fn print_table(containers: &[ContainerInfo]) {
+    use crate::table::{Column, Table};
+
     if containers.is_empty() {
         eprintln!("No cella containers found.");
         return;
     }
+
+    let mut table = Table::new(vec![
+        Column::shrinkable("NAME"),
+        Column::fixed("ID"),
+        Column::fixed("STATE"),
+        Column::fixed("BRANCH"),
+        Column::shrinkable("WORKSPACE"),
+        Column::fixed("PORTS"),
+        Column::fixed("AGE"),
+    ]);
 
     // Separate compose and non-compose containers
     let mut compose_projects: BTreeMap<String, Vec<&ContainerInfo>> = BTreeMap::new();
@@ -117,15 +129,8 @@ fn print_table(containers: &[ContainerInfo]) {
         }
     }
 
-    // Print header
-    println!(
-        "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} AGE",
-        "NAME", "ID", "STATE", "BRANCH", "WORKSPACE", "PORTS"
-    );
-
-    // Print compose projects with tree display
+    // Compose projects with tree display
     for (project_name, services) in &compose_projects {
-        // Find primary service label
         let primary_svc = services
             .iter()
             .find(|c| discovery::is_primary_service(&c.labels));
@@ -133,10 +138,15 @@ fn print_table(containers: &[ContainerInfo]) {
             .and_then(|c| c.labels.get("dev.cella.workspace_path"))
             .map_or("-", String::as_str);
 
-        println!(
-            "{:<30} {:<12} {:<10} {:<16} {:<40}",
-            project_name, "(compose)", "", "", workspace,
-        );
+        table.add_row(vec![
+            project_name.clone(),
+            "(compose)".to_string(),
+            String::new(),
+            String::new(),
+            workspace.to_string(),
+            String::new(),
+            String::new(),
+        ]);
 
         for c in services {
             let svc_name = discovery::compose_service_from_labels(&c.labels).unwrap_or(&c.name);
@@ -148,20 +158,19 @@ fn print_table(containers: &[ContainerInfo]) {
             };
             let branch = c.labels.get("dev.cella.branch").map_or("-", String::as_str);
 
-            println!(
-                "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
+            table.add_row(vec![
                 label,
-                short_id(&c.id),
-                state_str(&c.state),
-                branch,
-                if is_primary { workspace } else { "-" },
+                short_id(&c.id).to_string(),
+                state_str(&c.state).to_string(),
+                branch.to_string(),
+                if is_primary { workspace } else { "-" }.to_string(),
                 format_ports(c),
                 format_age(c.created_at.as_deref()),
-            );
+            ]);
         }
     }
 
-    // Print standalone containers
+    // Standalone containers
     for c in &standalone {
         let workspace = c
             .labels
@@ -169,17 +178,18 @@ fn print_table(containers: &[ContainerInfo]) {
             .map_or("-", String::as_str);
         let branch = c.labels.get("dev.cella.branch").map_or("-", String::as_str);
 
-        println!(
-            "{:<30} {:<12} {:<10} {:<16} {:<40} {:<12} {}",
-            c.name,
-            short_id(&c.id),
-            state_str(&c.state),
-            branch,
-            workspace,
+        table.add_row(vec![
+            c.name.clone(),
+            short_id(&c.id).to_string(),
+            state_str(&c.state).to_string(),
+            branch.to_string(),
+            workspace.to_string(),
             format_ports(c),
             format_age(c.created_at.as_deref()),
-        );
+        ]);
     }
+
+    table.eprint();
 }
 
 fn print_json(containers: &[ContainerInfo]) {

@@ -277,6 +277,7 @@ dependencies = [
  "miette",
  "serde_json",
  "sha2",
+ "terminal_size",
  "tokio",
  "tracing",
  "tracing-subscriber",

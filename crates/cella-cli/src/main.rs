@@ -1,5 +1,6 @@
 mod commands;
 pub mod progress;
+mod table;
 
 use std::io::IsTerminal;
 

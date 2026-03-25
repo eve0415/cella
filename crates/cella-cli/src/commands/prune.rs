@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 
 use clap::Args;
@@ -163,21 +162,25 @@ impl PruneArgs {
 }
 
 fn format_candidates(candidates: &[PruneCandidate]) -> String {
-    let mut buf = format!(
-        "{:<20} {:<44} {:<24} STATE\n",
-        "BRANCH", "WORKTREE", "CONTAINER"
-    );
+    use crate::table::{Column, Table};
+
+    let mut table = Table::new(vec![
+        Column::fixed("BRANCH"),
+        Column::shrinkable("WORKTREE"),
+        Column::fixed("CONTAINER"),
+        Column::fixed("STATE"),
+    ]);
+
     for c in candidates {
-        let _ = writeln!(
-            buf,
-            "{:<20} {:<44} {:<24} {}",
-            c.branch,
-            c.worktree_path.display(),
-            c.container_name.as_deref().unwrap_or("-"),
-            c.container_state.as_deref().unwrap_or("-"),
-        );
+        table.add_row(vec![
+            c.branch.clone(),
+            c.worktree_path.display().to_string(),
+            c.container_name.as_deref().unwrap_or("-").to_string(),
+            c.container_state.as_deref().unwrap_or("-").to_string(),
+        ]);
     }
-    buf
+
+    table.render()
 }
 
 fn print_candidates(candidates: &[PruneCandidate]) {
@@ -210,9 +213,9 @@ mod tests {
 
         let output = format_candidates(&candidates);
         insta::assert_snapshot!(output, @r"
-        BRANCH               WORKTREE                                     CONTAINER                STATE
-        fix/typo             /workspaces/cella-worktrees/fix-typo         cella-fix-typo-abc12     stopped
-        feat/old             /workspaces/cella-worktrees/feat-old         cella-feat-old-def34     running
+        BRANCH    WORKTREE                              CONTAINER             STATE
+        fix/typo  /workspaces/cella-worktrees/fix-typo  cella-fix-typo-abc12  stopped
+        feat/old  /workspaces/cella-worktrees/feat-old  cella-feat-old-def34  running
         ");
     }
 
@@ -228,8 +231,8 @@ mod tests {
 
         let output = format_candidates(&candidates);
         insta::assert_snapshot!(output, @r"
-        BRANCH               WORKTREE                                     CONTAINER                STATE
-        orphan               /worktrees/orphan                            -                        -
+        BRANCH  WORKTREE           CONTAINER  STATE
+        orphan  /worktrees/orphan  -          -
         ");
     }
 
