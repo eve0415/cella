@@ -125,7 +125,10 @@ jobs:
 
   release:
     name: Release
-    needs: [validate, build-agent, build-cli]
+    needs:
+      - validate
+      - build-agent
+      - build-cli
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
