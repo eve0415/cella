@@ -17,6 +17,9 @@ use cella_env::git_credential::{
 /// Stop the dev container for the current workspace.
 #[derive(Args)]
 pub struct DownArgs {
+    #[command(flatten)]
+    pub verbose: super::VerboseArgs,
+
     /// Remove the container after stopping.
     #[arg(long)]
     rm: bool,

@@ -8,7 +8,7 @@
 //!
 //! ## Two output axes
 //!
-//! - **User verbosity** (`--verbose`/`-v`): controls which progress steps
+//! - **User verbosity** (`--verbose`): controls which progress steps
 //!   and details are shown. Managed by [`Verbosity`].
 //! - **Developer tracing** (`RUST_LOG`): controls `tracing` subscriber
 //!   filtering. When `RUST_LOG` is set, spinners are automatically

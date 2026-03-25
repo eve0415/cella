@@ -12,6 +12,9 @@ use super::image::ensure_image;
 /// Build the dev container image without starting it.
 #[derive(Args)]
 pub struct BuildArgs {
+    #[command(flatten)]
+    pub verbose: super::VerboseArgs,
+
     /// Do not use cache when building the image.
     #[arg(long)]
     no_cache: bool,

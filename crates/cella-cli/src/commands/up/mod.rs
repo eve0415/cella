@@ -22,6 +22,9 @@ use super::image::ensure_image;
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)] // CLI arg structs naturally accumulate boolean flags
 pub struct UpArgs {
+    #[command(flatten)]
+    pub verbose: super::VerboseArgs,
+
     /// Rebuild the container image before starting.
     #[arg(long)]
     rebuild: bool,

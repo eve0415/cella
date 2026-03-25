@@ -8,6 +8,9 @@ use cella_git::WorktreeInfo;
 /// Create a new worktree-backed branch with its own dev container.
 #[derive(Args)]
 pub struct BranchArgs {
+    #[command(flatten)]
+    pub verbose: super::VerboseArgs,
+
     /// Name for the new branch (or existing branch to check out).
     pub name: String,
 

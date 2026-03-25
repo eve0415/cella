@@ -6,15 +6,15 @@ use std::io::IsTerminal;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use progress::{IndicatifMakeWriter, Progress, Verbosity};
+use progress::{IndicatifMakeWriter, Progress};
 
 /// cella — Dev containers reinvented for the AI age
 #[derive(Parser)]
-#[command(version, about)]
+#[command(name = "cella", version, about, disable_version_flag = true)]
 struct Cli {
-    /// Show expanded step details (container names, feature resolution, etc.).
-    #[arg(short, long, global = true)]
-    verbose: bool,
+    /// Print version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    _version: (),
 
     #[command(subcommand)]
     command: commands::Command,
@@ -33,11 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI first to determine output mode before creating progress.
     let cli = Cli::parse();
 
-    let verbosity = if cli.verbose {
-        Verbosity::Verbose
-    } else {
-        Verbosity::Normal
-    };
+    let verbosity = cli.command.verbosity();
 
     // Spinners are active when: text output mode AND no RUST_LOG AND stderr is a TTY.
     let rust_log_set = std::env::var_os("RUST_LOG").is_some();

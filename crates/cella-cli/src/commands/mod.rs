@@ -23,10 +23,18 @@ mod switch;
 mod template;
 mod up;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use tracing::warn;
 
-use crate::progress::Progress;
+use crate::progress::{Progress, Verbosity};
+
+/// Common flags for commands that support verbose output.
+#[derive(Args, Clone)]
+pub struct VerboseArgs {
+    /// Show expanded step details (container names, feature resolution, etc.).
+    #[arg(short, long)]
+    pub verbose: bool,
+}
 
 /// Top-level CLI commands.
 #[derive(Subcommand)]
@@ -85,6 +93,22 @@ impl Command {
             Self::Down(args) => args.is_text_output(),
             Self::ReadConfiguration(_) => false,
             _ => true,
+        }
+    }
+
+    /// Extract verbosity from subcommands that support `--verbose`.
+    pub const fn verbosity(&self) -> Verbosity {
+        let verbose = match self {
+            Self::Up(args) => args.verbose.verbose,
+            Self::Build(args) => args.verbose.verbose,
+            Self::Branch(args) => args.verbose.verbose,
+            Self::Down(args) => args.verbose.verbose,
+            _ => false,
+        };
+        if verbose {
+            Verbosity::Verbose
+        } else {
+            Verbosity::Normal
         }
     }
 
