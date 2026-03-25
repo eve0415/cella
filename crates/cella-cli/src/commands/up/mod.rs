@@ -888,6 +888,26 @@ impl UpContext {
     ) {
         let config = self.config();
 
+        // Fix /tmp permissions (must be world-writable with sticky bit).
+        // The feature Dockerfile layer can reset /tmp from 1777 to 755;
+        // some base images may also lack the sticky bit.
+        let _ = self
+            .client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "chmod 1777 /tmp 2>/dev/null || true".into(),
+                    ],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+
         // updateRemoteUserUID
         let update_uid = config
             .get("updateRemoteUserUID")

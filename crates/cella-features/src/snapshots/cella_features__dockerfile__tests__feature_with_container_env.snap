@@ -25,7 +25,7 @@ RUN chmod -R 0755 /tmp/dev-container-features/node \
     && ./devcontainer-features-install.sh \
     && rm -rf /tmp/dev-container-features/node
 
-RUN rm -rf /tmp/dev-container-features
+RUN rm -rf /tmp/dev-container-features && chmod 1777 /tmp
 
 ARG _DEV_CONTAINERS_IMAGE_USER=root
 USER $_DEV_CONTAINERS_IMAGE_USER

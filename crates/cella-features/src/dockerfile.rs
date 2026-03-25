@@ -170,7 +170,11 @@ fn write_entrypoint_section(out: &mut String, features: &[ResolvedFeature]) {
 /// Write final cleanup of /tmp/dev-container-features and USER reset via build arg.
 fn write_cleanup_and_user_reset(out: &mut String) {
     writeln!(out).unwrap();
-    writeln!(out, "RUN rm -rf /tmp/dev-container-features").unwrap();
+    writeln!(
+        out,
+        "RUN rm -rf /tmp/dev-container-features && chmod 1777 /tmp"
+    )
+    .unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER=root").unwrap();
