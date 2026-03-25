@@ -65,7 +65,7 @@ jobs:
         run: cargo build --package cella-agent --target ${{ matrix.target }} --release
 
       - name: Upload agent binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: cella-agent-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/cella-agent
@@ -80,11 +80,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            runner: macos-14
-
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-26-intel
+
+          - target: aarch64-apple-darwin
+            runner: macos-26
 
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
@@ -117,7 +117,7 @@ jobs:
           tar czf "cella-v${VERSION}-${TARGET}.tar.gz" -C "$STAGING" .
 
       - name: Upload archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}
           path: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
@@ -134,7 +134,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
 
