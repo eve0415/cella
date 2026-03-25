@@ -204,6 +204,18 @@ async fn handle_closed_listener(
     proxy_ports.remove(&key.0);
 }
 
+/// Collect keys from `known` that are no longer present in `current` listeners.
+fn collect_closed_keys(
+    known: &HashMap<(u16, PortProtocol), DetectedListener>,
+    current: &std::collections::HashSet<DetectedListener>,
+) -> Vec<(u16, PortProtocol)> {
+    known
+        .keys()
+        .filter(|key| !current.iter().any(|l| (l.port, l.protocol) == **key))
+        .copied()
+        .collect()
+}
+
 /// Run the port watcher loop with control socket connection.
 pub async fn run(
     poll_interval: Duration,
@@ -249,11 +261,7 @@ pub async fn run(
         }
 
         // Detect closed listeners
-        let closed_keys: Vec<(u16, PortProtocol)> = known
-            .keys()
-            .filter(|key| !current.iter().any(|l| (l.port, l.protocol) == **key))
-            .copied()
-            .collect();
+        let closed_keys = collect_closed_keys(&known, &current);
 
         for key in closed_keys {
             known.remove(&key);
@@ -308,11 +316,7 @@ pub async fn run_standalone(poll_interval: Duration) {
         }
 
         // Clean up closed
-        let closed: Vec<(u16, PortProtocol)> = known
-            .keys()
-            .filter(|k| !current.iter().any(|l| (l.port, l.protocol) == **k))
-            .copied()
-            .collect();
+        let closed = collect_closed_keys(&known, &current);
 
         for key in closed {
             known.remove(&key);

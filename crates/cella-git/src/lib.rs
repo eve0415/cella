@@ -4,6 +4,8 @@ pub mod content_hash;
 mod error;
 mod repo;
 mod sanitize;
+#[cfg(test)]
+mod test_utils;
 mod worktree;
 
 pub use branch::{BranchState, is_tracking_gone, merged_branches, resolve_branch};

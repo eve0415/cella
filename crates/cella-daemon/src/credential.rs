@@ -69,21 +69,10 @@ pub fn parse_request(data: &str) -> Result<CredentialRequest, CellaDaemonError> 
     Ok(CredentialRequest { operation, fields })
 }
 
-/// Format credential fields for response.
-pub fn format_response(response: &CredentialResponse) -> String {
-    let mut output = String::new();
-    for (key, value) in &response.fields {
-        output.push_str(key);
-        output.push('=');
-        output.push_str(value);
-        output.push('\n');
-    }
-    output.push('\n');
-    output
-}
-
-/// Format credential fields for piping into `git credential` stdin.
-pub fn format_fields_for_stdin<S: std::hash::BuildHasher>(
+/// Format credential fields as key=value lines (terminated by a blank line).
+///
+/// Used both for formatting responses and for piping into `git credential` stdin.
+pub fn format_credential_fields<S: std::hash::BuildHasher>(
     fields: &HashMap<String, String, S>,
 ) -> String {
     let mut output = String::new();
@@ -134,7 +123,7 @@ pub fn invoke_git_credential<S: std::hash::BuildHasher>(
         }
     };
 
-    let stdin_data = format_fields_for_stdin(fields);
+    let stdin_data = format_credential_fields(fields);
 
     let mut child = std::process::Command::new("git")
         .args(["credential", git_op])
@@ -194,11 +183,10 @@ mod tests {
     }
 
     #[test]
-    fn format_response_output() {
+    fn format_credential_fields_output() {
         let mut fields = HashMap::new();
         fields.insert("protocol".to_string(), "https".to_string());
-        let response = CredentialResponse { fields };
-        let output = format_response(&response);
+        let output = format_credential_fields(&fields);
         assert!(output.contains("protocol=https\n"));
         assert!(output.ends_with("\n\n"));
     }

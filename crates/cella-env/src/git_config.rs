@@ -32,19 +32,7 @@ pub fn read_host_git_config() -> Vec<GitConfigEntry> {
     let entries = parse_null_delimited_config(&raw);
     let mut safe = filter_safe_config(&entries);
 
-    // Detect SSH signing and include related keys
-    let has_ssh_signing = entries.iter().any(|(k, v)| k == "gpg.format" && v == "ssh");
-
-    if has_ssh_signing {
-        for (key, value) in &entries {
-            if is_ssh_signing_key(key) && !safe.iter().any(|e| e.key == *key) {
-                safe.push(GitConfigEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
-        }
-    }
+    include_ssh_signing_keys(&entries, &mut safe);
 
     safe
 }
@@ -129,6 +117,21 @@ fn is_ssh_signing_key(key: &str) -> bool {
             | "tag.gpgsign"
             | "gpg.ssh.allowedsignersfile"
     )
+}
+
+/// If SSH signing is configured, include related keys that aren't already present.
+fn include_ssh_signing_keys(entries: &[(String, String)], safe: &mut Vec<GitConfigEntry>) {
+    let has_ssh_signing = entries.iter().any(|(k, v)| k == "gpg.format" && v == "ssh");
+    if has_ssh_signing {
+        for (key, value) in entries {
+            if is_ssh_signing_key(key) && !safe.iter().any(|e| e.key == *key) {
+                safe.push(GitConfigEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+    }
 }
 
 /// Check if a git config key is in the blocklist (never copy).
@@ -260,20 +263,7 @@ mod tests {
         let raw = "gpg.format\nssh\0user.signingkey\n~/.ssh/id_ed25519.pub\0commit.gpgsign\ntrue\0credential.helper\nstore\0";
         let entries = parse_null_delimited_config(raw);
         let mut safe = filter_safe_config(&entries);
-
-        let has_ssh_signing = entries.iter().any(|(k, v)| k == "gpg.format" && v == "ssh");
-        assert!(has_ssh_signing);
-
-        if has_ssh_signing {
-            for (key, value) in &entries {
-                if is_ssh_signing_key(key) && !safe.iter().any(|e| e.key == *key) {
-                    safe.push(GitConfigEntry {
-                        key: key.clone(),
-                        value: value.clone(),
-                    });
-                }
-            }
-        }
+        include_ssh_signing_keys(&entries, &mut safe);
 
         assert!(safe.iter().any(|e| e.key == "gpg.format"));
         assert!(safe.iter().any(|e| e.key == "user.signingkey"));

@@ -1,6 +1,5 @@
 //! Socket listener and connection handler (Unix + TCP).
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,9 +8,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, info, warn};
 
+use cella_daemon::shared::{current_time_secs, set_socket_permissions};
+
 use crate::CellaCredentialProxyError;
 use crate::host::invoke_git_credential;
-use crate::protocol::{CredentialResponse, format_response, parse_request};
+use crate::protocol::{CredentialResponse, format_credential_fields, parse_request};
 
 /// Start the credential proxy server on a Unix socket.
 ///
@@ -33,17 +34,7 @@ pub async fn run_server(
             message: format!("failed to bind {}: {e}", socket_path.display()),
         })?;
 
-    // Set socket permissions to 0o600 (owner only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(socket_path, perms).map_err(|e| {
-            CellaCredentialProxyError::Socket {
-                message: format!("failed to set socket permissions: {e}"),
-            }
-        })?;
-    }
+    set_socket_permissions(socket_path);
 
     info!("Credential proxy listening on {}", socket_path.display());
 
@@ -71,17 +62,7 @@ async fn bind_tcp_listener(port_path: &Path) -> Result<TcpListener, CellaCredent
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(0);
 
-    if preferred_port != 0 {
-        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        if let Ok(l) = TcpListener::bind(addr).await {
-            debug!("Reusing previous TCP port {preferred_port}");
-            return Ok(l);
-        }
-        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
-    }
-
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    TcpListener::bind(addr)
+    cella_daemon::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaCredentialProxyError::Socket {
             message: format!("failed to bind TCP: {e}"),
@@ -188,7 +169,7 @@ async fn handle_stream(
             let response = CredentialResponse {
                 fields: response_fields,
             };
-            let output = format_response(&response);
+            let output = format_credential_fields(&response.fields);
             stream.write_all(output.as_bytes()).await.map_err(|e| {
                 CellaCredentialProxyError::Socket {
                     message: format!("write error: {e}"),
@@ -210,16 +191,10 @@ async fn handle_stream(
     Ok(())
 }
 
-/// Get the current time in seconds since the Unix epoch.
-pub fn current_time_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     #[tokio::test]

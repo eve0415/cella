@@ -121,6 +121,76 @@ impl Command {
     }
 }
 
+/// Connect to the Docker daemon, optionally using an explicit host URL.
+///
+/// # Errors
+///
+/// Returns error if the Docker client cannot connect.
+pub fn connect_docker(
+    docker_host: Option<&str>,
+) -> Result<cella_docker::DockerClient, cella_docker::CellaDockerError> {
+    docker_host.map_or_else(cella_docker::DockerClient::connect, |host| {
+        cella_docker::DockerClient::connect_with_host(host)
+    })
+}
+
+/// Resolve the workspace folder from an optional argument or the current directory.
+///
+/// # Errors
+///
+/// Returns error if the current directory cannot be determined.
+pub fn resolve_workspace_folder(
+    opt: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Some(wf) = opt {
+        Ok(wf.canonicalize().unwrap_or_else(|_| wf.to_path_buf()))
+    } else {
+        Ok(std::env::current_dir()?)
+    }
+}
+
+/// Resolve a specific compose service container from a base container.
+///
+/// If `service` is `Some`, looks up the compose project from the container's
+/// labels and finds the matching service container.
+///
+/// # Errors
+///
+/// Returns error if the container is not compose-based or the service is not found.
+pub async fn resolve_service_container(
+    client: &cella_docker::DockerClient,
+    container: cella_docker::ContainerInfo,
+    service: Option<&str>,
+) -> Result<cella_docker::ContainerInfo, Box<dyn std::error::Error>> {
+    let Some(svc) = service else {
+        return Ok(container);
+    };
+
+    let project = cella_compose::discovery::compose_project_from_labels(&container.labels)
+        .ok_or_else(|| {
+            format!(
+                "--service flag requires a compose-based devcontainer, but '{}' is not",
+                container.name
+            )
+        })?;
+
+    client
+        .find_compose_container(project, svc)
+        .await?
+        .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
+}
+
+/// Terminal environment variables to forward into the container.
+pub const TERMINAL_ENV_VARS: &[&str] = &[
+    "TERM",
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LANG",
+    "COLUMNS",
+    "LINES",
+];
+
 /// Ensure the credential proxy daemon is running (legacy).
 ///
 /// Starts it as a background process if not already running.

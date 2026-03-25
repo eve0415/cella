@@ -8,8 +8,13 @@ use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
     CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, ExecResult,
     FileToUpload, ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
-    run_lifecycle_phase, update_remote_user_uid,
+    update_remote_user_uid,
 };
+
+mod lifecycle;
+
+pub use lifecycle::{WaitForPhase, run_all_lifecycle_phases, run_lifecycle_phases_with_wait_for};
+use lifecycle::{check_and_run_content_update, run_lifecycle_entries, write_content_hash};
 
 use super::image::ensure_image;
 
@@ -91,11 +96,7 @@ impl UpContext {
         args: &UpArgs,
         progress: crate::progress::Progress,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let cwd = if let Some(ref wf) = args.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
         let remove_container = args.rebuild || args.remove_existing_container;
 
@@ -114,10 +115,7 @@ impl UpContext {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
-        let client = match &args.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(args.docker_host.as_deref())?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -176,10 +174,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = match docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(docker_host)?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -457,20 +452,7 @@ impl UpContext {
         let metadata = container.labels.get("devcontainer.metadata");
 
         // Check for workspace content changes (updateContentCommand)
-        let progress_ref_content = self.progress.clone();
-        let lc_ctx_content = LifecycleContext {
-            client: &self.client,
-            container_id: &container.id,
-            user: Some(remote_user),
-            env: &lifecycle_env,
-            working_dir: self.workspace_folder(),
-            is_text: self.progress.is_enabled(),
-            on_output: if self.progress.is_enabled() {
-                Some(Box::new(move |line| progress_ref_content.println(line)))
-            } else {
-                None
-            },
-        };
+        let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         check_and_run_content_update(
             &lc_ctx_content,
             self.config(),
@@ -486,20 +468,7 @@ impl UpContext {
             self.config(),
             "postAttachCommand",
         );
-        let progress_ref = self.progress.clone();
-        let lc_ctx = LifecycleContext {
-            client: &self.client,
-            container_id: &container.id,
-            user: Some(remote_user),
-            env: &lifecycle_env,
-            working_dir: self.workspace_folder(),
-            is_text: self.progress.is_enabled(),
-            on_output: if self.progress.is_enabled() {
-                Some(Box::new(move |line| progress_ref.println(line)))
-            } else {
-                None
-            },
-        };
+        let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
         output_result(
@@ -565,26 +534,13 @@ impl UpContext {
 
                 // Run lifecycle from metadata label (includes features)
                 let metadata = container.labels.get("devcontainer.metadata");
+                let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
                 for phase in ["postStartCommand", "postAttachCommand"] {
                     let entries = lifecycle_entries_for_phase(
                         metadata.map(String::as_str),
                         self.config(),
                         phase,
                     );
-                    let progress_ref = self.progress.clone();
-                    let lc_ctx = LifecycleContext {
-                        client: &self.client,
-                        container_id: &container.id,
-                        user: Some(remote_user),
-                        env: &lifecycle_env,
-                        working_dir: self.workspace_folder(),
-                        is_text: self.progress.is_enabled(),
-                        on_output: if self.progress.is_enabled() {
-                            Some(Box::new(move |line| progress_ref.println(line)))
-                        } else {
-                            None
-                        },
-                    };
                     run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
                 }
 
@@ -834,7 +790,7 @@ impl UpContext {
             cella_docker::network::ensure_container_connected(self.client.inner(), container_id)
                 .await
         {
-            tracing::warn!("Failed to connect container to cella network: {e}");
+            warn!("Failed to connect container to cella network: {e}");
         }
 
         if let Err(e) = cella_docker::network::ensure_repo_network(
@@ -844,7 +800,7 @@ impl UpContext {
         )
         .await
         {
-            tracing::warn!("Failed to connect container to repo network: {e}");
+            warn!("Failed to connect container to repo network: {e}");
         }
 
         self.register_with_daemon(container_id).await;
@@ -892,7 +848,7 @@ impl UpContext {
         };
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
-                tracing::debug!("Container registered with daemon: {resp:?}");
+                debug!("Container registered with daemon: {resp:?}");
             }
             Err(e) => {
                 warn!("Failed to register container with daemon: {e}");
@@ -1403,14 +1359,7 @@ pub fn run_host_command(
             run_single_host_command(phase, &["sh", "-c", s])?;
         }
         serde_json::Value::Array(arr) => {
-            let cmd: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if !cmd.is_empty() {
-                let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                run_single_host_command(phase, &refs)?;
-            }
+            run_json_array_command(phase, arr)?;
         }
         serde_json::Value::Object(map) => {
             for (name, v) in map {
@@ -1420,14 +1369,7 @@ pub fn run_host_command(
                         run_single_host_command(phase, &["sh", "-c", s])?;
                     }
                     serde_json::Value::Array(arr) => {
-                        let cmd: Vec<String> = arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
-                        if !cmd.is_empty() {
-                            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                            run_single_host_command(phase, &refs)?;
-                        }
+                        run_json_array_command(phase, arr)?;
                     }
                     _ => {}
                 }
@@ -1436,6 +1378,21 @@ pub fn run_host_command(
         _ => {}
     }
 
+    Ok(())
+}
+
+fn run_json_array_command(
+    phase: &str,
+    arr: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cmd: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if !cmd.is_empty() {
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        run_single_host_command(phase, &refs)?;
+    }
     Ok(())
 }
 
@@ -1720,334 +1677,6 @@ async fn upload_to_container(
     true
 }
 
-/// Run a sequence of origin-tracked lifecycle entries with progress tracking.
-///
-/// Prints a permanent header line before each lifecycle command, then streams
-/// the command's output indented below it, then prints the completion status.
-async fn run_lifecycle_entries(
-    ctx: &LifecycleContext<'_>,
-    phase: &str,
-    entries: &[cella_features::LifecycleEntry],
-    progress: &crate::progress::Progress,
-) -> Result<(), CellaDockerError> {
-    for entry in entries {
-        let label = format!("Running the {phase} from {}...", entry.origin);
-        let start = std::time::Instant::now();
-        // Print header so user knows what's running during streaming.
-        progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
-        let result = run_lifecycle_phase(ctx, phase, &entry.command, &entry.origin).await;
-        let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
-        match &result {
-            Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
-            Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
-        }
-        result?;
-    }
-    Ok(())
-}
-
-/// Run all lifecycle phases for a first-create scenario.
-pub async fn run_all_lifecycle_phases(
-    lc_ctx: &LifecycleContext<'_>,
-    config: &serde_json::Value,
-    resolved_features: Option<&cella_features::ResolvedFeatures>,
-    progress: &crate::progress::Progress,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let phases = [
-        "onCreateCommand",
-        "updateContentCommand",
-        "postCreateCommand",
-        "postStartCommand",
-        "postAttachCommand",
-    ];
-
-    for phase in phases {
-        let empty = Vec::new();
-        let entries = resolved_features.map_or(&empty, |rf| match phase {
-            "onCreateCommand" => &rf.container_config.lifecycle.on_create,
-            "updateContentCommand" => &rf.container_config.lifecycle.update_content,
-            "postCreateCommand" => &rf.container_config.lifecycle.post_create,
-            "postStartCommand" => &rf.container_config.lifecycle.post_start,
-            "postAttachCommand" => &rf.container_config.lifecycle.post_attach,
-            _ => &empty,
-        });
-
-        run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
-
-        if entries.is_empty()
-            && let Some(cmd) = config.get(phase)
-            && !cmd.is_null()
-        {
-            let label = format!("Running the {phase} from devcontainer.json...");
-            let start = std::time::Instant::now();
-            progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
-            let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
-            let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
-            match &result {
-                Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
-                Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
-            }
-            result?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Store the workspace content hash inside the container for future change detection.
-async fn write_content_hash(
-    client: &DockerClient,
-    container_id: &str,
-    user: &str,
-    workspace_root: &std::path::Path,
-) {
-    let hash = cella_git::content_hash::compute(workspace_root);
-    let _ = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "mkdir -p /tmp/.cella && printf '%s' '{hash}' > /tmp/.cella/content_hash"
-                    ),
-                ],
-                user: Some(user.to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-}
-
-/// Which lifecycle phase to wait for before returning from `cella up`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitForPhase {
-    Initialize,
-    OnCreate,
-    UpdateContent,
-    PostCreate,
-    PostStart,
-}
-
-impl WaitForPhase {
-    /// Parse from the `waitFor` config property. Default: `UpdateContentCommand`.
-    pub fn from_config(config: &serde_json::Value) -> Self {
-        match config.get("waitFor").and_then(|v| v.as_str()) {
-            Some("initializeCommand") => Self::Initialize,
-            Some("onCreateCommand") => Self::OnCreate,
-            Some("postCreateCommand") => Self::PostCreate,
-            Some("postStartCommand") => Self::PostStart,
-            _ => Self::UpdateContent,
-        }
-    }
-
-    /// Index into the in-container lifecycle phases array.
-    const fn ordinal(self) -> usize {
-        match self {
-            Self::Initialize => 0,
-            Self::OnCreate => 1,
-            Self::UpdateContent => 2,
-            Self::PostCreate => 3,
-            Self::PostStart => 4,
-        }
-    }
-}
-
-/// Run lifecycle phases up to `wait_for`, then spawn remaining phases in background.
-///
-/// Returns after the `wait_for` phase completes. Remaining phases run as a detached
-/// exec inside the container.
-pub async fn run_lifecycle_phases_with_wait_for(
-    lc_ctx: &LifecycleContext<'_>,
-    config: &serde_json::Value,
-    resolved_features: Option<&cella_features::ResolvedFeatures>,
-    progress: &crate::progress::Progress,
-    wait_for: WaitForPhase,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let phases: &[&str] = &[
-        "onCreateCommand",
-        "updateContentCommand",
-        "postCreateCommand",
-        "postStartCommand",
-        "postAttachCommand",
-    ];
-
-    // initializeCommand (index 0) runs on host, not in these phases.
-    // The ordinal maps to in-container phases starting at 1 for onCreateCommand.
-    let wait_index = match wait_for {
-        WaitForPhase::Initialize => 0,
-        _ => wait_for.ordinal(),
-    };
-
-    let mut background_cmds: Vec<String> = Vec::new();
-
-    for (i, &phase) in phases.iter().enumerate() {
-        let is_foreground = i < wait_index;
-        let empty = Vec::new();
-        let entries = resolved_features.map_or(&empty, |rf| match phase {
-            "onCreateCommand" => &rf.container_config.lifecycle.on_create,
-            "updateContentCommand" => &rf.container_config.lifecycle.update_content,
-            "postCreateCommand" => &rf.container_config.lifecycle.post_create,
-            "postStartCommand" => &rf.container_config.lifecycle.post_start,
-            "postAttachCommand" => &rf.container_config.lifecycle.post_attach,
-            _ => &empty,
-        });
-
-        if is_foreground {
-            // Run synchronously
-            run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
-
-            if entries.is_empty()
-                && let Some(cmd) = config.get(phase)
-                && !cmd.is_null()
-            {
-                let label = format!("Running the {phase} from devcontainer.json...");
-                let start = std::time::Instant::now();
-                progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
-                let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
-                let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
-                match &result {
-                    Ok(()) => {
-                        progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}"));
-                    }
-                    Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
-                }
-                result?;
-            }
-        } else {
-            // Collect for background execution
-            for entry in entries {
-                if let Some(s) = entry.command.as_str() {
-                    background_cmds.push(s.to_string());
-                } else if let Some(arr) = entry.command.as_array() {
-                    let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    if !cmd.is_empty() {
-                        background_cmds.push(cmd.join(" "));
-                    }
-                }
-            }
-            if entries.is_empty()
-                && let Some(cmd) = config.get(phase)
-                && let Some(s) = cmd.as_str()
-            {
-                background_cmds.push(s.to_string());
-            }
-        }
-    }
-
-    // Spawn remaining phases in background
-    if !background_cmds.is_empty() {
-        let script = background_cmds.join("\n");
-        let full_script = format!(
-            "mkdir -p /tmp/.cella\n\
-             {script}\n\
-             printf '{{\"status\":\"completed\"}}' > /tmp/.cella/lifecycle_status.json\n"
-        );
-
-        debug!(
-            "Spawning background lifecycle: {} commands",
-            background_cmds.len()
-        );
-        let _ = lc_ctx
-            .client
-            .exec_detached(
-                lc_ctx.container_id,
-                &ExecOptions {
-                    cmd: vec!["sh".to_string(), "-c".to_string(), full_script],
-                    user: lc_ctx.user.map(String::from),
-                    env: Some(lc_ctx.env.to_vec()),
-                    working_dir: lc_ctx.working_dir.map(String::from),
-                },
-            )
-            .await;
-    }
-
-    Ok(())
-}
-
-/// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
-///
-/// Computes a content hash from the workspace, compares it to the stored hash
-/// inside the container at `/tmp/.cella/content_hash`. If different, runs the
-/// updateContentCommand and postCreateCommand phases, then writes the new hash.
-async fn check_and_run_content_update(
-    lc_ctx: &LifecycleContext<'_>,
-    config: &serde_json::Value,
-    metadata: Option<&str>,
-    workspace_root: &std::path::Path,
-    progress: &crate::progress::Progress,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let current_hash = cella_git::content_hash::compute(workspace_root);
-
-    // Read stored hash from container
-    let read_result = lc_ctx
-        .client
-        .exec_command(
-            lc_ctx.container_id,
-            &ExecOptions {
-                cmd: vec!["cat".to_string(), "/tmp/.cella/content_hash".to_string()],
-                user: lc_ctx.user.map(String::from),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    let stored_hash = read_result
-        .ok()
-        .filter(|r| r.exit_code == 0)
-        .map(|r| r.stdout.trim().to_string());
-
-    if stored_hash.as_deref() == Some(&current_hash) {
-        return Ok(());
-    }
-
-    progress.println("  Content changed, re-running updateContentCommand + postCreateCommand...");
-
-    for phase in ["updateContentCommand", "postCreateCommand"] {
-        let entries = lifecycle_entries_for_phase(metadata, config, phase);
-        run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
-
-        if entries.is_empty()
-            && let Some(cmd) = config.get(phase)
-            && !cmd.is_null()
-        {
-            let label = format!("Running the {phase} from devcontainer.json...");
-            let start = std::time::Instant::now();
-            progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
-            let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
-            let elapsed = crate::progress::format_elapsed_pub(start.elapsed());
-            match &result {
-                Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
-                Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
-            }
-            result?;
-        }
-    }
-
-    // Write updated hash
-    let _ = lc_ctx
-        .client
-        .exec_command(
-            lc_ctx.container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("mkdir -p /tmp/.cella && printf '%s' '{current_hash}' > /tmp/.cella/content_hash"),
-                ],
-                user: lc_ctx.user.map(String::from),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    Ok(())
-}
-
 /// Seed gh CLI credentials into a container.
 ///
 /// Extracts tokens from the host's gh CLI and uploads `hosts.yml` and `config.yml`
@@ -2069,7 +1698,7 @@ async fn seed_gh_credentials(
     )
     .await
     {
-        tracing::debug!("gh credentials already present in container, skipping seed");
+        debug!("gh credentials already present in container, skipping seed");
         return;
     }
 
@@ -2136,7 +1765,7 @@ async fn seed_claude_config(
     )
     .await
     {
-        tracing::debug!("Claude config already present in container, skipping seed");
+        debug!("Claude config already present in container, skipping seed");
         return;
     }
 
@@ -2170,7 +1799,7 @@ async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_us
     let docker_files = convert_uploads(&uploads);
 
     if let Err(e) = client.upload_files(container_id, &docker_files).await {
-        tracing::debug!("Failed to re-sync Claude auth: {e}");
+        debug!("Failed to re-sync Claude auth: {e}");
     }
 }
 
@@ -2200,11 +1829,11 @@ async fn is_claude_code_installed(
     {
         let installed = result.stdout.trim();
         if version == "latest" || version == "stable" {
-            tracing::debug!("Claude Code already installed: {installed}");
+            debug!("Claude Code already installed: {installed}");
             return true;
         }
         if installed.contains(version) {
-            tracing::debug!("Claude Code already at version {version}: {installed}");
+            debug!("Claude Code already at version {version}: {installed}");
             return true;
         }
     }
@@ -2474,11 +2103,11 @@ async fn is_npm_tool_installed(
     {
         let installed = result.stdout.trim();
         if version == "latest" {
-            tracing::debug!("{binary_name} already installed: {installed}");
+            debug!("{binary_name} already installed: {installed}");
             return true;
         }
         if installed.contains(version) {
-            tracing::debug!("{binary_name} already at version {version}: {installed}");
+            debug!("{binary_name} already at version {version}: {installed}");
             return true;
         }
     }

@@ -70,11 +70,7 @@ async fn sync_gh(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = DockerClient::connect()?;
 
-    let cwd = if let Some(ref wf) = workspace_folder {
-        wf.canonicalize().unwrap_or_else(|_| wf.clone())
-    } else {
-        std::env::current_dir()?
-    };
+    let cwd = super::resolve_workspace_folder(workspace_folder.as_deref())?;
 
     // Find target container
     let target = ContainerTarget {

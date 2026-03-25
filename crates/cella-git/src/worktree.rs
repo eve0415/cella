@@ -227,28 +227,7 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
 
-    fn init_repo(path: &Path) {
-        StdCommand::new("git")
-            .args(["init"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        StdCommand::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        StdCommand::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        StdCommand::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-    }
+    use crate::test_utils::init_repo;
 
     #[test]
     fn worktree_path_default_sibling() {

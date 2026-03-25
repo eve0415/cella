@@ -53,12 +53,7 @@ fn bind_management_socket(socket_path: &Path) -> Result<UnixListener, CellaDaemo
         ),
     })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(socket_path, perms);
-    }
+    crate::shared::set_socket_permissions(socket_path);
 
     info!("Management server listening on {}", socket_path.display());
     Ok(listener)
@@ -455,6 +450,25 @@ pub async fn send_management_request(
 mod tests {
     use super::*;
 
+    fn test_management_context(
+        ctrl_port: u16,
+    ) -> (ManagementContext, tokio::sync::watch::Receiver<bool>) {
+        let (stx, srx) = tokio::sync::watch::channel(false);
+        let ctx = ManagementContext {
+            last_activity: Arc::new(AtomicU64::new(0)),
+            port_manager: Arc::new(Mutex::new(PortManager::new(false))),
+            browser_handler: Arc::new(BrowserHandler::new()),
+            proxy_cmd_tx: mpsc::channel(16).0,
+            start_time: std::time::Instant::now(),
+            is_orbstack: false,
+            daemon_started_at: 0,
+            shutdown_tx: stx,
+            auth_token: "test-token".to_string(),
+            control_port: ctrl_port,
+        };
+        (ctx, srx)
+    }
+
     #[tokio::test]
     async fn management_ping_pong() {
         let dir = tempfile::tempdir().unwrap();
@@ -466,19 +480,7 @@ mod tests {
 
         let sock = socket_path.clone();
         let server_handle = tokio::spawn({
-            let (stx, srx) = tokio::sync::watch::channel(false);
-            let ctx = ManagementContext {
-                last_activity: Arc::new(AtomicU64::new(0)),
-                port_manager: Arc::new(Mutex::new(PortManager::new(false))),
-                browser_handler: Arc::new(BrowserHandler::new()),
-                proxy_cmd_tx: mpsc::channel(16).0,
-                start_time: std::time::Instant::now(),
-                is_orbstack: false,
-                daemon_started_at: 0,
-                shutdown_tx: stx,
-                auth_token: "test-token".to_string(),
-                control_port: ctrl_port,
-            };
+            let (ctx, srx) = test_management_context(ctrl_port);
             async move {
                 let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
             }
@@ -510,19 +512,7 @@ mod tests {
 
         let sock = socket_path.clone();
         let server_handle = tokio::spawn({
-            let (stx, srx) = tokio::sync::watch::channel(false);
-            let ctx = ManagementContext {
-                last_activity: Arc::new(AtomicU64::new(0)),
-                port_manager: Arc::new(Mutex::new(PortManager::new(false))),
-                browser_handler: Arc::new(BrowserHandler::new()),
-                proxy_cmd_tx: mpsc::channel(16).0,
-                start_time: std::time::Instant::now(),
-                is_orbstack: false,
-                daemon_started_at: 0,
-                shutdown_tx: stx,
-                auth_token: "test-token".to_string(),
-                control_port: ctrl_port,
-            };
+            let (ctx, srx) = test_management_context(ctrl_port);
             async move {
                 let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
             }

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nix.workspace = true
+cella-daemon.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

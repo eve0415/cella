@@ -49,11 +49,7 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = if let Some(ref wf) = self.workspace_folder {
-            wf.canonicalize().unwrap_or_else(|_| wf.clone())
-        } else {
-            std::env::current_dir()?
-        };
+        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         // 1. Resolve config
         info!("Resolving devcontainer config...");
@@ -67,10 +63,7 @@ impl BuildArgs {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
-        let client = match &self.docker_host {
-            Some(host) => DockerClient::connect_with_host(host)?,
-            None => DockerClient::connect()?,
-        };
+        let client = super::connect_docker(self.docker_host.as_deref())?;
         client.ping().await?;
 
         // Docker Compose: build all services + feature-enriched primary image

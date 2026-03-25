@@ -99,28 +99,7 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn init_repo(path: &Path) {
-        Command::new("git")
-            .args(["init"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(path)
-            .output()
-            .unwrap();
-    }
+    use crate::test_utils::init_repo;
 
     #[test]
     fn discover_from_root() {

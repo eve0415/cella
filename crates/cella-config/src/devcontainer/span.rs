@@ -47,16 +47,7 @@ impl SourceText {
     /// e.g., `["build", "dockerfile"]`.
     pub fn find_key_span(&self, path: &[&str]) -> Option<Range> {
         let bytes = self.cleaned.as_bytes();
-        let mut pos = 0;
-
-        for (i, &segment) in path.iter().enumerate() {
-            pos = find_key_in_object(bytes, pos, segment)?;
-            if i < path.len() - 1 {
-                // Advance past this key's value into the child object
-                pos = skip_past_colon(bytes, pos)?;
-                pos = skip_whitespace(bytes, pos);
-            }
-        }
+        let pos = navigate_to_key(bytes, path)?;
 
         // pos points to the opening quote of the key
         let key_start = pos;
@@ -70,19 +61,10 @@ impl SourceText {
     /// Find the byte span of the value at the given JSON pointer path.
     pub fn find_value_span(&self, path: &[&str]) -> Option<Range> {
         let bytes = self.cleaned.as_bytes();
-        let mut pos = 0;
-
-        for (i, &segment) in path.iter().enumerate() {
-            pos = find_key_in_object(bytes, pos, segment)?;
-            if i < path.len() - 1 {
-                // Advance past this key's value into the child object
-                pos = skip_past_colon(bytes, pos)?;
-                pos = skip_whitespace(bytes, pos);
-            }
-        }
+        let pos = navigate_to_key(bytes, path)?;
 
         // Skip past the last key and colon to find the value
-        pos = skip_past_colon(bytes, pos)?;
+        let pos = skip_past_colon(bytes, pos)?;
         let value_start = skip_whitespace(bytes, pos);
         let value_end = find_value_end(bytes, value_start)?;
 
@@ -96,6 +78,19 @@ impl SourceText {
     pub fn as_named_source(&self) -> miette::NamedSource<String> {
         miette::NamedSource::new(&self.name, self.original.clone())
     }
+}
+
+/// Walk a JSON pointer path to find the position of the final key.
+fn navigate_to_key(bytes: &[u8], path: &[&str]) -> Option<usize> {
+    let mut pos = 0;
+    for (i, &segment) in path.iter().enumerate() {
+        pos = find_key_in_object(bytes, pos, segment)?;
+        if i < path.len() - 1 {
+            pos = skip_past_colon(bytes, pos)?;
+            pos = skip_whitespace(bytes, pos);
+        }
+    }
+    Some(pos)
 }
 
 /// Forward-scan to find a key in an object starting from `pos`.

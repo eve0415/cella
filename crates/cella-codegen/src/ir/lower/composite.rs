@@ -3,6 +3,19 @@ use crate::ir::naming::{ref_to_def_name, to_rust_field_name, to_rust_type_name};
 use crate::ir::{EnumRepr, IrEnum, IrField, IrStruct, IrType, IrTypeRef, IrVariant};
 use crate::schema::SchemaNode;
 
+/// If the branch is a `$ref`, produce a variant named after the referenced definition.
+fn try_ref_variant(branch: &SchemaNode) -> Option<IrVariant> {
+    let ref_path = branch.r#ref.as_ref()?;
+    let def_name = ref_to_def_name(ref_path)?;
+    let type_name = to_rust_type_name(def_name);
+    Some(IrVariant {
+        name: type_name.clone(),
+        doc: branch.description.clone(),
+        json_value: None,
+        ty: Some(IrTypeRef::Named(type_name)),
+    })
+}
+
 impl Lowerer {
     // ── oneOf ────────────────────────────────────────────────────────────
 
@@ -29,16 +42,8 @@ impl Lowerer {
         branch: &SchemaNode,
     ) -> IrVariant {
         // If it's a $ref, use the definition name
-        if let Some(ref_path) = &branch.r#ref
-            && let Some(def_name) = ref_to_def_name(ref_path)
-        {
-            let type_name = to_rust_type_name(def_name);
-            return IrVariant {
-                name: type_name.clone(),
-                doc: branch.description.clone(),
-                json_value: None,
-                ty: Some(IrTypeRef::Named(type_name)),
-            };
+        if let Some(variant) = try_ref_variant(branch) {
+            return variant;
         }
 
         // Use lower_type_ref which handles simple types (int, string, etc.)
@@ -122,16 +127,8 @@ impl Lowerer {
             .iter()
             .enumerate()
             .map(|(i, branch)| {
-                if let Some(ref_path) = &branch.r#ref
-                    && let Some(def_name) = ref_to_def_name(ref_path)
-                {
-                    let type_name = to_rust_type_name(def_name);
-                    return IrVariant {
-                        name: type_name.clone(),
-                        doc: branch.description.clone(),
-                        json_value: None,
-                        ty: Some(IrTypeRef::Named(type_name)),
-                    };
+                if let Some(variant) = try_ref_variant(branch) {
+                    return variant;
                 }
                 let inner_ty = self.lower_type_ref(branch, &format!("{name}Variant{i}"));
                 IrVariant {

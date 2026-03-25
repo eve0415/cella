@@ -9,12 +9,12 @@ use tracing::{debug, info, warn};
 
 use crate::CellaDaemonError;
 use crate::browser::BrowserHandler;
-use crate::control_server::current_time_secs;
 use crate::health::run_health_monitor;
 use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
 use crate::proxy::run_proxy_coordinator;
+use crate::shared::{cleanup_files, current_time_secs, read_pid_file, set_socket_permissions};
 
 /// Write the PID file and ensure the parent directory exists.
 fn write_pid_and_ensure_dir(socket_path: &Path, pid_path: &Path) -> Result<u32, CellaDaemonError> {
@@ -149,7 +149,7 @@ pub async fn run_daemon(
         let ctrl = control_socket_path.to_path_buf();
         let ctrl_file = control_file_path;
         move || {
-            cleanup(&pid, &sock, &port, &ctrl);
+            cleanup_files(&[&pid, &sock, &port, &ctrl]);
             let _ = std::fs::remove_file(&ctrl_file);
         }
     });
@@ -185,25 +185,13 @@ fn generate_auth_token() -> String {
 async fn bind_control_tcp(
     control_socket_path: &Path,
 ) -> Result<tokio::net::TcpListener, CellaDaemonError> {
-    use std::net::SocketAddr;
-
     let control_file = control_socket_path.with_file_name("daemon.control");
     let preferred_port = std::fs::read_to_string(&control_file)
         .ok()
         .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u16>().ok()))
         .unwrap_or(0);
 
-    if preferred_port != 0 {
-        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        if let Ok(l) = tokio::net::TcpListener::bind(addr).await {
-            debug!("Reclaimed control TCP port {preferred_port}");
-            return Ok(l);
-        }
-        warn!("Cannot reclaim control TCP port {preferred_port}, binding new port");
-    }
-
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    tokio::net::TcpListener::bind(addr)
+    crate::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("failed to bind control TCP: {e}"),
@@ -223,12 +211,7 @@ async fn run_legacy_credential_server(
         message: format!("failed to bind {}: {e}", socket_path.display()),
     })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(socket_path, perms);
-    }
+    set_socket_permissions(socket_path);
 
     info!(
         "Legacy credential server listening on {}",
@@ -255,7 +238,7 @@ async fn handle_legacy_stream(
     mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 ) -> Result<(), CellaDaemonError> {
     use crate::credential::{
-        CredentialResponse, format_response, invoke_git_credential, parse_request,
+        CredentialResponse, format_credential_fields, invoke_git_credential, parse_request,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -298,7 +281,7 @@ async fn handle_legacy_stream(
             let response = CredentialResponse {
                 fields: response_fields,
             };
-            let output = format_response(&response);
+            let output = format_credential_fields(&response.fields);
             stream
                 .write_all(output.as_bytes())
                 .await
@@ -322,25 +305,12 @@ async fn handle_legacy_stream(
 
 /// Bind a legacy TCP listener, attempting to reclaim a previously used port.
 async fn bind_legacy_tcp(port_path: &Path) -> Result<tokio::net::TcpListener, CellaDaemonError> {
-    use std::net::SocketAddr;
-    use tokio::net::TcpListener;
-
     let preferred_port = std::fs::read_to_string(port_path)
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(0);
 
-    if preferred_port != 0 {
-        let addr: SocketAddr = ([127, 0, 0, 1], preferred_port).into();
-        if let Ok(l) = TcpListener::bind(addr).await {
-            debug!("Reusing previous TCP port {preferred_port}");
-            return Ok(l);
-        }
-        warn!("Cannot reclaim TCP port {preferred_port}, binding new port");
-    }
-
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    TcpListener::bind(addr)
+    crate::shared::bind_tcp_reclaim(preferred_port)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("failed to bind TCP: {e}"),
@@ -395,19 +365,7 @@ async fn run_legacy_tcp_server(
 
 /// Check if the daemon is already running.
 pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
-    let Some(pid) = read_pid_file(pid_path) else {
-        return false;
-    };
-
-    let alive = is_process_alive(pid);
-    if !alive {
-        debug!("Stale PID file found (PID {pid}), cleaning up");
-        let _ = std::fs::remove_file(pid_path);
-        let _ = std::fs::remove_file(socket_path);
-        return false;
-    }
-
-    socket_path.exists()
+    crate::shared::is_daemon_running(pid_path, socket_path)
 }
 
 /// Start the daemon as a detached background process.
@@ -421,30 +379,21 @@ pub fn start_daemon_background(
     port_path: &Path,
     control_socket_path: &Path,
 ) -> Result<(), CellaDaemonError> {
-    let exe = std::env::current_exe().map_err(|e| CellaDaemonError::PidFile {
-        message: format!("failed to get current exe: {e}"),
+    let args = [
+        "daemon",
+        "start",
+        "--socket",
+        &socket_path.to_string_lossy(),
+        "--pid-file",
+        &pid_path.to_string_lossy(),
+        "--port-file",
+        &port_path.to_string_lossy(),
+        "--control-socket",
+        &control_socket_path.to_string_lossy(),
+    ];
+    crate::shared::start_background_process(&args).map_err(|e| CellaDaemonError::PidFile {
+        message: format!("failed to spawn daemon: {e}"),
     })?;
-
-    std::process::Command::new(exe)
-        .args([
-            "daemon",
-            "start",
-            "--socket",
-            &socket_path.to_string_lossy(),
-            "--pid-file",
-            &pid_path.to_string_lossy(),
-            "--port-file",
-            &port_path.to_string_lossy(),
-            "--control-socket",
-            &control_socket_path.to_string_lossy(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| CellaDaemonError::PidFile {
-            message: format!("failed to spawn daemon: {e}"),
-        })?;
 
     info!("Cella daemon started in background");
     Ok(())
@@ -500,62 +449,14 @@ pub fn stop_daemon(
             .status();
     }
 
-    cleanup(pid_path, socket_path, port_path, control_socket_path);
+    cleanup_files(&[pid_path, socket_path, port_path, control_socket_path]);
     info!("Cella daemon stopped");
     Ok(())
-}
-
-fn read_pid_file(pid_path: &Path) -> Option<u32> {
-    let content = std::fs::read_to_string(pid_path).ok()?;
-    content.trim().parse().ok()
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::kill;
-        use nix::unistd::Pid;
-
-        // Signal 0 checks process existence without sending a signal.
-        // EPERM means the process exists but we lack permission — still alive.
-        let Ok(pid) = i32::try_from(pid) else {
-            return false;
-        };
-        kill(Pid::from_raw(pid), None).is_ok()
-            || matches!(nix::errno::Errno::last(), nix::errno::Errno::EPERM)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-fn cleanup(pid_path: &Path, socket_path: &Path, port_path: &Path, control_socket_path: &Path) {
-    let _ = std::fs::remove_file(pid_path);
-    let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file(port_path);
-    let _ = std::fs::remove_file(control_socket_path);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn read_pid_file_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_path = dir.path().join("test.pid");
-        std::fs::write(&pid_path, "12345").unwrap();
-        assert_eq!(read_pid_file(&pid_path), Some(12345));
-    }
-
-    #[test]
-    fn read_pid_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_pid_file(&dir.path().join("nope.pid")), None);
-    }
 
     #[test]
     fn daemon_not_running_without_pid() {
