@@ -84,7 +84,9 @@ fn create_tar_archive(files: &[FileToUpload]) -> Result<Vec<u8>, CellaDockerErro
         // for paths exceeding standard tar header field sizes)
         for dir in &dirs {
             let dir_path = dir.strip_prefix('/').unwrap_or(dir);
-            if dir_path.is_empty() {
+            if dir_path.is_empty() || !dir_path.contains('/') {
+                // Skip top-level dirs (/tmp, /home, /etc, ...) — they always
+                // exist and may have non-default permissions (e.g. /tmp is 1777).
                 continue;
             }
             let mut header = tar::Header::new_gnu();
@@ -170,6 +172,66 @@ mod tests {
                 .is_some_and(|p| p.to_string_lossy().contains("file.json"))
         });
         assert!(found, "Long path file should be present in archive");
+    }
+
+    #[test]
+    fn top_level_dir_entries_skipped() {
+        // Files in top-level directories like /tmp should NOT produce a directory
+        // entry for the top-level dir, because it already exists in the container
+        // and may have non-default permissions (e.g. /tmp is 1777).
+        let files = vec![FileToUpload {
+            path: "/tmp/.cella-probed-env.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o644,
+        }];
+
+        let tar_bytes = create_tar_archive(&files).unwrap();
+        let mut archive = tar::Archive::new(&tar_bytes[..]);
+
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        // Should contain the file but NOT a "tmp/" directory entry
+        assert!(
+            entries.iter().any(|p| p.contains("cella-probed-env")),
+            "File should be in archive"
+        );
+        assert!(
+            !entries.iter().any(|p| p == "tmp" || p == "tmp/"),
+            "Top-level tmp/ dir entry should be skipped, got: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn nested_dir_entries_created() {
+        // Files in nested directories SHOULD produce directory entries for the
+        // non-top-level parents.
+        let files = vec![FileToUpload {
+            path: "/home/node/.claude/config.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o644,
+        }];
+
+        let tar_bytes = create_tar_archive(&files).unwrap();
+        let mut archive = tar::Archive::new(&tar_bytes[..]);
+
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            entries
+                .iter()
+                .any(|p| p == "home/node/.claude" || p == "home/node/.claude/"),
+            "Nested dir entry should be created, got: {entries:?}"
+        );
     }
 
     #[test]
