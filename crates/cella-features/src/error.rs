@@ -34,6 +34,14 @@ pub enum FeatureError {
     #[error("feature build failed for {feature_id}: {message}")]
     BuildFailed { feature_id: String, message: String },
 
+    /// Downloaded blob digest does not match the OCI manifest.
+    #[error("digest mismatch for {feature_id}: expected {expected}, got {actual}")]
+    DigestMismatch {
+        feature_id: String,
+        expected: String,
+        actual: String,
+    },
+
     /// HTTP fetch failed.
     #[error("failed to fetch {url}: {message}")]
     FetchFailed { url: String, message: String },

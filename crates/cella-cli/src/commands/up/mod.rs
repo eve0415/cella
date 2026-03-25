@@ -20,6 +20,7 @@ use super::image::ensure_image;
 
 /// Start a dev container for the current workspace.
 #[derive(Args)]
+#[allow(clippy::struct_excessive_bools)] // CLI arg structs naturally accumulate boolean flags
 pub struct UpArgs {
     /// Rebuild the container image before starting.
     #[arg(long)]
@@ -52,6 +53,10 @@ pub struct UpArgs {
     /// Strictness level for validation ("host-requirements" to fail on unmet requirements).
     #[arg(long)]
     strict: Vec<String>,
+
+    /// Skip SHA256 checksum verification for agent binary download.
+    #[arg(long)]
+    skip_checksum: bool,
 }
 
 /// Output format for container commands.
@@ -79,6 +84,7 @@ pub struct UpContext {
     pub(crate) output: OutputFormat,
     pub(crate) remove_container: bool,
     pub(crate) build_no_cache: bool,
+    pub(crate) skip_checksum: bool,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
 }
@@ -141,6 +147,7 @@ impl UpContext {
             output: args.output.clone(),
             remove_container,
             build_no_cache: args.build_no_cache,
+            skip_checksum: args.skip_checksum,
             extra_labels: std::collections::HashMap::new(),
         })
     }
@@ -200,6 +207,7 @@ impl UpContext {
             output,
             remove_container: false,
             build_no_cache: false,
+            skip_checksum: false,
             extra_labels,
         })
     }
@@ -664,7 +672,7 @@ impl UpContext {
         remote_user: &str,
         settings: &cella_config::Settings,
         agent_arch: &str,
-    ) {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Forwarding mounts
         for m in &env_fwd.mounts {
             create_opts.mounts.push(MountConfig {
@@ -741,10 +749,18 @@ impl UpContext {
 
         // Agent volume mount and env vars
         let agent_step = self.progress.step("Populating agent volume...");
-        match cella_docker::volume::ensure_agent_volume_populated(self.client.inner(), agent_arch)
-            .await
+        match cella_docker::volume::ensure_agent_volume_populated(
+            self.client.inner(),
+            agent_arch,
+            self.skip_checksum,
+        )
+        .await
         {
             Ok(()) => agent_step.finish(),
+            Err(e @ CellaDockerError::AgentChecksumMismatch { .. }) => {
+                agent_step.fail("checksum mismatch");
+                return Err(e.into());
+            }
             Err(e) => {
                 agent_step.fail("failed");
                 warn!("Failed to populate agent volume: {e}");
@@ -768,6 +784,8 @@ impl UpContext {
             target: vol_target.to_string(),
             consistency: None,
         });
+
+        Ok(())
     }
 
     /// Start the container, connect networks, and register with the daemon.
@@ -1138,7 +1156,7 @@ impl UpContext {
             &settings,
             &agent_arch,
         )
-        .await;
+        .await?;
 
         // Create and start container
         let container_id = if self.progress.is_verbose() {

@@ -138,8 +138,12 @@ async fn prepare_and_start(
 
     ctx.progress
         .run_step("Preparing agent volume...", async {
-            cella_docker::volume::ensure_agent_volume_populated(ctx.client.inner(), &agent_arch)
-                .await
+            cella_docker::volume::ensure_agent_volume_populated(
+                ctx.client.inner(),
+                &agent_arch,
+                ctx.skip_checksum,
+            )
+            .await
         })
         .await?;
 

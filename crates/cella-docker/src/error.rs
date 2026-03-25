@@ -55,6 +55,10 @@ pub enum CellaDockerError {
     #[error("agent volume error: {message}")]
     AgentVolume { message: String },
 
+    /// Agent binary checksum verification failed.
+    #[error("agent binary checksum mismatch: expected {expected}, got {actual}")]
+    AgentChecksumMismatch { expected: String, actual: String },
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

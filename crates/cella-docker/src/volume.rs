@@ -11,6 +11,10 @@ use bollard::query_parameters::{
     StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::StreamExt;
+#[cfg(any(not(debug_assertions), test))]
+use sha2::{Digest, Sha256};
+#[cfg(not(debug_assertions))]
+use tracing::warn;
 use tracing::{debug, info};
 
 use crate::CellaDockerError;
@@ -196,6 +200,7 @@ pub async fn remove_agent_volume(docker: &Docker) -> Result<(), CellaDockerError
 pub async fn ensure_agent_volume_populated(
     docker: &Docker,
     arch: &str,
+    skip_checksum: bool,
 ) -> Result<(), CellaDockerError> {
     ensure_agent_volume(docker).await?;
 
@@ -208,7 +213,7 @@ pub async fn ensure_agent_volume_populated(
     }
 
     info!("Populating agent volume with v{version}/{arch}...");
-    populate_volume(docker, version, arch, &expected_marker).await?;
+    populate_volume(docker, version, arch, &expected_marker, skip_checksum).await?;
     info!("Agent volume populated successfully");
     Ok(())
 }
@@ -235,8 +240,9 @@ async fn populate_volume(
     version: &str,
     arch: &str,
     expected_marker: &str,
+    skip_checksum: bool,
 ) -> Result<(), CellaDockerError> {
-    let agent_bytes = get_agent_binary_bytes(docker, arch).await?;
+    let agent_bytes = get_agent_binary_bytes(docker, arch, skip_checksum).await?;
     let browser_script = browser_helper_script(version, arch);
 
     upload_to_volume(
@@ -379,10 +385,14 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
 ///
 /// Release builds:
 /// 1. Download from GitHub releases
-async fn get_agent_binary_bytes(docker: &Docker, arch: &str) -> Result<Vec<u8>, CellaDockerError> {
+async fn get_agent_binary_bytes(
+    docker: &Docker,
+    arch: &str,
+    skip_checksum: bool,
+) -> Result<Vec<u8>, CellaDockerError> {
     #[cfg(debug_assertions)]
     {
-        let _ = arch; // arch is only used in release builds (download URL)
+        let _ = (arch, skip_checksum); // only used in release builds
 
         // Check for CELLA_AGENT_PATH override (fastest dev iteration)
         if let Some(path) = dev_agent_override() {
@@ -413,17 +423,86 @@ async fn get_agent_binary_bytes(docker: &Docker, arch: &str) -> Result<Vec<u8>, 
     #[cfg(not(debug_assertions))]
     {
         let _ = docker; // suppress unused warning in release
-        download_agent_from_release(arch).await
+        download_agent_from_release(arch, skip_checksum).await
     }
+}
+
+/// Verify that a byte slice matches an expected SHA-256 hex digest.
+#[cfg(any(not(debug_assertions), test))]
+fn verify_agent_checksum(bytes: &[u8], expected: &str) -> Result<(), CellaDockerError> {
+    let actual = hex::encode(Sha256::digest(bytes));
+    if actual != expected {
+        return Err(CellaDockerError::AgentChecksumMismatch {
+            expected: expected.to_owned(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Fetch the `SHA256SUMS` file from the GitHub release and extract the expected
+/// hash for the given artifact.
+#[cfg(not(debug_assertions))]
+async fn fetch_expected_checksum(
+    version: &str,
+    artifact_name: &str,
+) -> Result<String, CellaDockerError> {
+    let url = format!("https://github.com/eve0415/cella/releases/download/v{version}/SHA256SUMS");
+    debug!("Fetching SHA256SUMS from {url}");
+
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to fetch SHA256SUMS from {url}: {e}"),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(CellaDockerError::AgentVolume {
+            message: format!(
+                "SHA256SUMS download failed: HTTP {} from {url}",
+                response.status()
+            ),
+        });
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("failed to read SHA256SUMS response: {e}"),
+        })?;
+
+    parse_sha256sums(&body, artifact_name)
+}
+
+/// Parse a `SHA256SUMS` file and return the hash for the given artifact name.
+#[cfg(any(not(debug_assertions), test))]
+fn parse_sha256sums(contents: &str, artifact_name: &str) -> Result<String, CellaDockerError> {
+    for line in contents.lines() {
+        // Format: "<hex_hash>  <filename>" (two spaces) or "<hex_hash> <filename>"
+        let Some((hash, name)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if name.trim() == artifact_name {
+            return Ok(hash.to_owned());
+        }
+    }
+    Err(CellaDockerError::AgentVolume {
+        message: format!("artifact '{artifact_name}' not found in SHA256SUMS"),
+    })
 }
 
 /// Download the agent binary from the matching GitHub release.
 #[cfg(not(debug_assertions))]
-async fn download_agent_from_release(arch: &str) -> Result<Vec<u8>, CellaDockerError> {
+async fn download_agent_from_release(
+    arch: &str,
+    skip_checksum: bool,
+) -> Result<Vec<u8>, CellaDockerError> {
     let version = env!("CARGO_PKG_VERSION");
+    let artifact_name = format!("cella-agent-{arch}");
     let url =
-        format!("https://github.com/eve0415/cella/releases/download/v{version}/cella-agent-{arch}");
-    info!("Downloading cella-agent-{arch} v{version} from GitHub releases...");
+        format!("https://github.com/eve0415/cella/releases/download/v{version}/{artifact_name}");
+    info!("Downloading {artifact_name} v{version} from GitHub releases...");
 
     let response = reqwest::get(&url)
         .await
@@ -447,7 +526,16 @@ async fn download_agent_from_release(arch: &str) -> Result<Vec<u8>, CellaDockerE
             message: format!("failed to read agent binary response: {e}"),
         })?;
 
-    info!("Downloaded cella-agent-{arch} ({} bytes)", bytes.len());
+    info!("Downloaded {artifact_name} ({} bytes)", bytes.len());
+
+    if skip_checksum {
+        warn!("Skipping SHA256 checksum verification for {artifact_name} (--skip-checksum)");
+    } else {
+        let expected = fetch_expected_checksum(version, &artifact_name).await?;
+        verify_agent_checksum(&bytes, &expected)?;
+        info!("SHA256 checksum verified for {artifact_name}");
+    }
+
     Ok(bytes.to_vec())
 }
 
@@ -978,6 +1066,38 @@ mod tests {
         }
 
         let result = extract_file_from_tar(&buf, "missing");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_checksum_match_passes() {
+        let data = b"hello world";
+        let expected = hex::encode(Sha256::digest(data));
+        assert!(verify_agent_checksum(data, &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_mismatch_fails() {
+        let data = b"hello world";
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = verify_agent_checksum(data, wrong_hash);
+        assert!(matches!(
+            result,
+            Err(CellaDockerError::AgentChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_sha256sums_finds_artifact() {
+        let contents = "abc123  cella-v0.1.0-x86_64-unknown-linux-musl.tar.gz\ndef456  cella-agent-x86_64\n789abc  cella-agent-aarch64\n";
+        let result = parse_sha256sums(contents, "cella-agent-x86_64").unwrap();
+        assert_eq!(result, "def456");
+    }
+
+    #[test]
+    fn parse_sha256sums_missing_artifact() {
+        let contents = "abc123  cella-agent-x86_64\n";
+        let result = parse_sha256sums(contents, "cella-agent-aarch64");
         assert!(result.is_err());
     }
 }

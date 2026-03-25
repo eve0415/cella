@@ -13,6 +13,7 @@ use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
 use oci_distribution::secrets::RegistryAuth;
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::auth::resolve_credentials;
@@ -100,6 +101,24 @@ fn find_feature_layer<'a>(
         })
 }
 
+/// Verify that a blob matches its expected OCI digest (e.g. `sha256:<hex>`).
+fn verify_blob_digest(
+    blob: &[u8],
+    expected_digest: &str,
+    repository: &str,
+) -> Result<(), FeatureError> {
+    let actual_digest = format!("sha256:{}", hex::encode(Sha256::digest(blob)));
+    if actual_digest != expected_digest {
+        return Err(FeatureError::DigestMismatch {
+            feature_id: repository.to_owned(),
+            expected: expected_digest.to_owned(),
+            actual: actual_digest,
+        });
+    }
+    debug!("blob digest verified: {expected_digest}");
+    Ok(())
+}
+
 /// Extract a layer blob to a staging directory and atomically commit to the cache.
 fn extract_and_commit(
     blob: &[u8],
@@ -164,7 +183,7 @@ impl OciFetcher {
         Ok((manifest, digest))
     }
 
-    /// Download a single layer blob from the registry.
+    /// Download a single layer blob from the registry and verify its digest.
     async fn pull_layer_blob(
         &self,
         oci_ref: &Reference,
@@ -185,6 +204,10 @@ impl OciFetcher {
             blob.len(),
             layer.media_type
         );
+
+        // Verify blob integrity against the manifest digest.
+        verify_blob_digest(&blob, &layer.digest, oci_ref.repository())?;
+
         Ok(blob)
     }
 }
@@ -493,6 +516,25 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&extracted).unwrap(),
             "gzipped-content"
+        );
+    }
+
+    #[test]
+    fn verify_blob_digest_match_passes() {
+        let data = b"test blob data";
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
+        assert!(verify_blob_digest(data, &digest, "test/repo").is_ok());
+    }
+
+    #[test]
+    fn verify_blob_digest_mismatch_fails() {
+        let data = b"test blob data";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let result = verify_blob_digest(data, wrong_digest, "test/repo");
+        assert!(
+            matches!(result, Err(FeatureError::DigestMismatch { .. })),
+            "expected DigestMismatch, got {result:?}",
         );
     }
 
