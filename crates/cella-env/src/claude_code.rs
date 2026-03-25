@@ -26,6 +26,9 @@ const WALK_SKIP_DIRS: &[&str] = &["cache"];
 /// Text file extensions that receive path rewriting.
 const REWRITE_EXTENSIONS: &[&str] = &["json", "jsonl", "md", "sh", "toml", "yml", "yaml", "txt"];
 
+/// File extensions treated as executable in the heuristic fallback.
+const EXECUTABLE_EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "py", "rb", "pl"];
+
 /// Container home path for a given user.
 pub fn container_home(remote_user: &str) -> String {
     if remote_user == "root" {
@@ -237,6 +240,77 @@ struct Collector<'c> {
     uploads: &'c mut Vec<FileUpload>,
 }
 
+/// Check if a file should be treated as sensitive (capped at 0o600).
+///
+/// Matches hidden files with `.json` extension (e.g., `.credentials.json`).
+fn is_sensitive_file(relative_path: &str) -> bool {
+    relative_path.starts_with('.')
+        && relative_path
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+/// Determine file mode from extension or shebang when host metadata is unavailable.
+fn heuristic_file_mode(content: &[u8], relative_path: &str) -> u32 {
+    if let Some(ext) = relative_path.rsplit('.').next()
+        && EXECUTABLE_EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext))
+    {
+        return 0o755;
+    }
+
+    // Check for shebang only in extensionless files.
+    if !relative_path.contains('.') && content.starts_with(b"#!") {
+        return 0o755;
+    }
+
+    0o644
+}
+
+/// Resolve the file mode for a host file being uploaded to the container.
+///
+/// Priority:
+/// 1. Sensitive files (hidden + `.json`) are capped at 0o600.
+/// 2. On Unix, reads the host file's actual permission bits.
+/// 3. Falls back to extension/shebang heuristics when metadata is unavailable.
+fn resolve_file_mode(host_path: &Path, content: &[u8], relative_path: &str) -> u32 {
+    if is_sensitive_file(relative_path) {
+        tracing::debug!(
+            path = relative_path,
+            mode = "0o600",
+            source = "sensitive-cap",
+            "Resolved file mode"
+        );
+        return 0o600;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = host_path.metadata() {
+            let host_mode = metadata.permissions().mode() & 0o777;
+            tracing::debug!(
+                path = relative_path,
+                mode = format_args!("{host_mode:#o}").to_string(),
+                source = "host",
+                "Resolved file mode"
+            );
+            return host_mode;
+        }
+    }
+
+    let mode = heuristic_file_mode(content, relative_path);
+    tracing::debug!(
+        path = relative_path,
+        mode = format_args!("{mode:#o}").to_string(),
+        source = "heuristic",
+        "Resolved file mode"
+    );
+    mode
+}
+
 impl Collector<'_> {
     // -- public collection methods ------------------------------------------
 
@@ -246,12 +320,7 @@ impl Collector<'_> {
         let Ok(content) = std::fs::read(&host_path) else {
             return;
         };
-        let is_sensitive = relative_path
-            .rsplit('.')
-            .next()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-            && relative_path.starts_with('.');
-        let mode = if is_sensitive { 0o600 } else { 0o644 };
+        let mode = resolve_file_mode(&host_path, &content, relative_path);
         self.push_file(relative_path, &content, mode);
     }
 
@@ -306,15 +375,7 @@ impl Collector<'_> {
             let Ok(content) = std::fs::read(&path) else {
                 continue;
             };
-            let mode = if name
-                .rsplit('.')
-                .next()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
-            {
-                0o755
-            } else {
-                0o644
-            };
+            let mode = resolve_file_mode(&path, &content, name);
             self.push_file(name, &content, mode);
         }
     }
@@ -364,7 +425,8 @@ impl Collector<'_> {
             let Ok(content) = std::fs::read(&entry) else {
                 continue;
             };
-            self.push_file(&relative, &content, 0o644);
+            let mode = resolve_file_mode(&entry, &content, &relative);
+            self.push_file(&relative, &content, mode);
         }
     }
 
@@ -402,7 +464,8 @@ impl Collector<'_> {
                 let Ok(content) = std::fs::read(&path) else {
                     continue;
                 };
-                self.push_file(&relative, &content, 0o644);
+                let mode = resolve_file_mode(&path, &content, &relative);
+                self.push_file(&relative, &content, mode);
             }
         }
     }
@@ -595,5 +658,129 @@ mod tests {
         let content: &[u8] = &[0xFF, 0xFE, 0x00, 0x01];
         let result = maybe_rewrite(content, "test.json", &rewrites);
         assert_eq!(result, content);
+    }
+
+    // --- is_sensitive_file ---
+
+    #[test]
+    fn sensitive_hidden_json() {
+        assert!(is_sensitive_file(".credentials.json"));
+    }
+
+    #[test]
+    fn sensitive_not_hidden() {
+        assert!(!is_sensitive_file("settings.json"));
+    }
+
+    #[test]
+    fn sensitive_not_json() {
+        assert!(!is_sensitive_file(".bashrc"));
+    }
+
+    // --- heuristic_file_mode ---
+
+    #[test]
+    fn heuristic_sh_extension() {
+        assert_eq!(heuristic_file_mode(b"echo hi", "hook.sh"), 0o755);
+    }
+
+    #[test]
+    fn heuristic_bash_extension() {
+        assert_eq!(heuristic_file_mode(b"echo hi", "hook.bash"), 0o755);
+    }
+
+    #[test]
+    fn heuristic_py_extension() {
+        assert_eq!(heuristic_file_mode(b"print('hi')", "script.py"), 0o755);
+    }
+
+    #[test]
+    fn heuristic_json_not_executable() {
+        assert_eq!(heuristic_file_mode(b"{}", "config.json"), 0o644);
+    }
+
+    #[test]
+    fn heuristic_shebang_no_extension() {
+        assert_eq!(
+            heuristic_file_mode(b"#!/bin/bash\necho hi", "myscript"),
+            0o755
+        );
+    }
+
+    #[test]
+    fn heuristic_no_shebang_no_extension() {
+        assert_eq!(heuristic_file_mode(b"just text", "readme"), 0o644);
+    }
+
+    #[test]
+    fn heuristic_shebang_with_unknown_extension() {
+        // File has .txt extension — shebang check skipped for files with extensions.
+        assert_eq!(
+            heuristic_file_mode(b"#!/bin/bash\necho hi", "notes.txt"),
+            0o644
+        );
+    }
+
+    // --- resolve_file_mode ---
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mode_reads_host_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_script");
+        std::fs::write(&file_path, b"#!/bin/sh\necho hi").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let content = std::fs::read(&file_path).unwrap();
+        let mode = resolve_file_mode(&file_path, &content, "test_script");
+        assert_eq!(mode, 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mode_sensitive_overrides_host() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join(".credentials.json");
+        std::fs::write(&file_path, b"{}").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let content = std::fs::read(&file_path).unwrap();
+        let mode = resolve_file_mode(&file_path, &content, ".credentials.json");
+        assert_eq!(
+            mode, 0o600,
+            "Sensitive files must be capped at 0o600 regardless of host mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mode_preserves_non_standard_triple() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("deploy.sh");
+        std::fs::write(&file_path, b"#!/bin/sh").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let content = std::fs::read(&file_path).unwrap();
+        let mode = resolve_file_mode(&file_path, &content, "deploy.sh");
+        assert_eq!(
+            mode, 0o700,
+            "Full mode triple should be preserved, not normalized to 0o755"
+        );
+    }
+
+    #[test]
+    fn resolve_mode_falls_back_to_heuristic() {
+        let nonexistent = Path::new("/tmp/does_not_exist_cella_test_xyz");
+        let mode = resolve_file_mode(nonexistent, b"#!/usr/bin/env python3", "myscript");
+        assert_eq!(
+            mode, 0o755,
+            "Should fall back to shebang heuristic when metadata unavailable"
+        );
     }
 }
