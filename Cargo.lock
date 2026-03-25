@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-port",
  "serde_json",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-compose",
  "cella-config",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "heck",
  "indexmap",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "hex",
  "insta",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-codegen",
  "hex",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "cella-credential-proxy"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-daemon",
  "tempfile",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-port",
  "nix",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bollard",
  "cella-features",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-config",
  "cella-daemon",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cella-config",
  "glob",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
  "bollard",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "insta",
  "tempfile",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
