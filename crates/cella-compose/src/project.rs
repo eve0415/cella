@@ -203,8 +203,13 @@ fn workspace_hash(workspace_root: &Path) -> String {
 }
 
 /// Sanitize a string for Docker project name compatibility.
+///
+/// Lowercases and replaces invalid characters, then collapses consecutive
+/// separator chars (`[._-]`) into a single dash. This ensures the result
+/// is valid as a Docker image repository name (which must be lowercase).
 fn sanitize_name(s: &str) -> String {
     let sanitized: String = s
+        .to_ascii_lowercase()
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
@@ -215,17 +220,21 @@ fn sanitize_name(s: &str) -> String {
         })
         .collect();
 
+    // Collapse consecutive separator chars ([._-]+) into a single dash.
+    // Docker path-component separators are [._] | '__' | '-'+, but mixed
+    // sequences like "._" or "_-" are invalid. Using '-' is always safe.
     let mut result = String::with_capacity(sanitized.len());
-    let mut prev_dash = false;
+    let mut prev_sep = false;
     for c in sanitized.chars() {
-        if c == '-' {
-            if !prev_dash {
-                result.push(c);
+        let is_sep = c == '-' || c == '_' || c == '.';
+        if is_sep {
+            if !prev_sep {
+                result.push('-');
             }
-            prev_dash = true;
+            prev_sep = true;
         } else {
             result.push(c);
-            prev_dash = false;
+            prev_sep = false;
         }
     }
 
@@ -290,6 +299,18 @@ mod tests {
     #[test]
     fn sanitize_collapses_dashes() {
         assert_eq!(sanitize_name("a---b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_lowercases() {
+        assert_eq!(sanitize_name("ActivityManager"), "activitymanager");
+    }
+
+    #[test]
+    fn project_name_always_lowercase() {
+        let path = PathBuf::from("/tmp/MyProject");
+        let name = compose_project_name(&path, Some("MyApp"));
+        assert_eq!(name, name.to_lowercase());
     }
 
     #[test]
