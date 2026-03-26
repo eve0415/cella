@@ -24,18 +24,46 @@ pub struct DockerClient {
 }
 
 impl DockerClient {
-    /// Connect using auto-detect (`DOCKER_HOST` env var / platform socket).
+    /// Connect using auto-detect with fallback discovery.
+    ///
+    /// Strategy:
+    /// 1. Try bollard defaults (`DOCKER_HOST` env var / `/var/run/docker.sock`)
+    /// 2. On failure, discover alternative sockets (docker context, known paths)
+    /// 3. If all fail, return a detailed error listing everything tried
     ///
     /// # Errors
     ///
-    /// Returns `CellaDockerError::RuntimeNotFound` if connection fails.
+    /// Returns `CellaDockerError::RuntimeNotFound` if no reachable socket is found.
     pub fn connect() -> Result<Self, CellaDockerError> {
-        let docker = Docker::connect_with_local_defaults().map_err(|e| {
-            CellaDockerError::RuntimeNotFound {
-                message: format!("failed to connect to Docker: {e}"),
+        // Fast path: bollard defaults (DOCKER_HOST or /var/run/docker.sock)
+        match Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                debug!("Connected to Docker via default socket");
+                return Ok(Self { inner: docker });
             }
-        })?;
-        Ok(Self { inner: docker })
+            Err(e) => {
+                debug!("Default Docker connection failed: {e}, trying alternative sockets");
+            }
+        }
+
+        // Fallback: discover alternative sockets
+        if let Some(discovered) = crate::discovery::discover_socket() {
+            let path_str = discovered.path.to_string_lossy().to_string();
+            let docker = Docker::connect_with_socket(&path_str, 120, bollard::API_DEFAULT_VERSION)
+                .map_err(|e| CellaDockerError::RuntimeNotFound {
+                    message: format!(
+                        "found socket at {path_str} (via {}) but failed to connect: {e}",
+                        discovered.method,
+                    ),
+                })?;
+            tracing::info!("Connected to Docker via discovered socket: {path_str}");
+            return Ok(Self { inner: docker });
+        }
+
+        // All methods failed
+        Err(CellaDockerError::RuntimeNotFound {
+            message: crate::discovery::discovery_failure_message(),
+        })
     }
 
     /// Connect with an explicit docker host URL.

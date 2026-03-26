@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config_map;
 pub mod container;
+pub mod discovery;
 mod docker_api_impl;
 mod error;
 pub mod exec;

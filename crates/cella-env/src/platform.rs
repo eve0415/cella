@@ -12,6 +12,10 @@ pub enum DockerRuntime {
     LinuxNative,
     /// Colima (macOS) — direct socket bind-mount works.
     Colima,
+    /// Podman — VM-based on macOS (Podman Machine), native on Linux.
+    Podman,
+    /// Rancher Desktop — VM-based (Lima) on macOS/Linux.
+    RancherDesktop,
     /// Unknown runtime — try direct bind-mount with warning.
     Unknown,
 }
@@ -25,6 +29,8 @@ impl DockerRuntime {
             Self::OrbStack => "orbstack",
             Self::LinuxNative => "linux-native",
             Self::Colima => "colima",
+            Self::Podman => "podman",
+            Self::RancherDesktop => "rancher-desktop",
             Self::Unknown => "unknown",
         }
     }
@@ -46,6 +52,12 @@ pub fn detect_runtime() -> DockerRuntime {
         if host.contains("colima") {
             return DockerRuntime::Colima;
         }
+        if host.contains("podman") {
+            return DockerRuntime::Podman;
+        }
+        if host.contains(".rd/") || host.contains("rancher") {
+            return DockerRuntime::RancherDesktop;
+        }
         if host.contains("docker.raw.sock") || host.contains("docker-desktop") {
             return DockerRuntime::DockerDesktop;
         }
@@ -60,6 +72,12 @@ pub fn detect_runtime() -> DockerRuntime {
         if ctx_lower.contains("colima") {
             return DockerRuntime::Colima;
         }
+        if ctx_lower.contains("podman") {
+            return DockerRuntime::Podman;
+        }
+        if ctx_lower.contains("rancher") {
+            return DockerRuntime::RancherDesktop;
+        }
         if ctx_lower.contains("desktop") {
             return DockerRuntime::DockerDesktop;
         }
@@ -71,10 +89,17 @@ pub fn detect_runtime() -> DockerRuntime {
     }
 
     // 4. Platform-based fallback
-    match std::env::consts::OS {
-        "linux" => DockerRuntime::LinuxNative,
-        _ => DockerRuntime::Unknown,
+    if std::env::consts::OS == "linux" {
+        // Check for rootless Podman socket before assuming native Docker
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+            && std::path::Path::new(&format!("{xdg}/podman/podman.sock")).exists()
+        {
+            return DockerRuntime::Podman;
+        }
+        return DockerRuntime::LinuxNative;
     }
+
+    DockerRuntime::Unknown
 }
 
 /// Query `docker context inspect` to determine the active runtime.
@@ -102,6 +127,12 @@ fn detect_from_docker_context() -> Option<DockerRuntime> {
     }
     if endpoint.contains("colima") {
         return Some(DockerRuntime::Colima);
+    }
+    if endpoint.contains("podman") {
+        return Some(DockerRuntime::Podman);
+    }
+    if endpoint.contains(".rd/") || endpoint.contains("rancher") {
+        return Some(DockerRuntime::RancherDesktop);
     }
     if endpoint.contains("docker.raw.sock") || endpoint.contains("docker-desktop") {
         return Some(DockerRuntime::DockerDesktop);
@@ -132,6 +163,8 @@ mod tests {
         assert_eq!(DockerRuntime::OrbStack.as_label(), "orbstack");
         assert_eq!(DockerRuntime::LinuxNative.as_label(), "linux-native");
         assert_eq!(DockerRuntime::Colima.as_label(), "colima");
+        assert_eq!(DockerRuntime::Podman.as_label(), "podman");
+        assert_eq!(DockerRuntime::RancherDesktop.as_label(), "rancher-desktop");
         assert_eq!(DockerRuntime::Unknown.as_label(), "unknown");
     }
 
@@ -142,6 +175,8 @@ mod tests {
             DockerRuntime::OrbStack,
             DockerRuntime::LinuxNative,
             DockerRuntime::Colima,
+            DockerRuntime::Podman,
+            DockerRuntime::RancherDesktop,
             DockerRuntime::Unknown,
         ] {
             assert_eq!(format!("{runtime}"), runtime.as_label());

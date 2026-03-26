@@ -365,6 +365,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures-util",
+ "glob",
  "hex",
  "reqwest 0.13.2",
  "serde_json",

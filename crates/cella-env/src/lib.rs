@@ -206,11 +206,20 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
 }
 
 /// Whether a runtime needs TCP-based credential proxy instead of socket bind-mount.
+///
+/// VM-based runtimes (where the host socket is not directly reachable from inside
+/// containers) use TCP via `host.docker.internal`. Direct runtimes use socket
+/// bind-mount.
 const fn needs_tcp_credential_proxy(runtime: &DockerRuntime) -> bool {
-    matches!(
-        runtime,
-        DockerRuntime::OrbStack | DockerRuntime::Colima | DockerRuntime::Unknown
-    )
+    match runtime {
+        DockerRuntime::OrbStack
+        | DockerRuntime::Colima
+        | DockerRuntime::RancherDesktop
+        | DockerRuntime::Unknown => true,
+        // Podman Machine on macOS runs a VM; rootless Podman on Linux is direct.
+        DockerRuntime::Podman => cfg!(target_os = "macos"),
+        DockerRuntime::DockerDesktop | DockerRuntime::LinuxNative => false,
+    }
 }
 
 /// Git config command to set the credential helper.

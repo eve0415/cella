@@ -122,7 +122,7 @@ async fn check_compose() -> CheckResult {
     }
 }
 
-/// Check Docker socket accessibility (Linux/macOS only, skip for TCP hosts).
+/// Check Docker socket accessibility, including alternative runtime paths.
 fn check_socket_accessible() -> Option<CheckResult> {
     // If DOCKER_HOST is TCP, socket check is not applicable
     if let Ok(host) = std::env::var("DOCKER_HOST") {
@@ -137,7 +137,35 @@ fn check_socket_accessible() -> Option<CheckResult> {
     }
 
     // Default socket path
-    Some(check_path_accessible("/var/run/docker.sock"))
+    if std::fs::metadata("/var/run/docker.sock").is_ok() {
+        return Some(check_path_accessible("/var/run/docker.sock"));
+    }
+
+    // Try alternative runtime discovery
+    if let Some(discovered) = cella_docker::discovery::discover_socket() {
+        return Some(CheckResult {
+            name: "socket accessible".into(),
+            severity: Severity::Pass,
+            detail: format!(
+                "{} (discovered via {})",
+                discovered.path.display(),
+                discovered.method,
+            ),
+            fix_hint: None,
+        });
+    }
+
+    // No socket found anywhere
+    Some(CheckResult {
+        name: "socket accessible".into(),
+        severity: Severity::Error,
+        detail: "no Docker socket found".into(),
+        fix_hint: Some(
+            "Set DOCKER_HOST or ensure your container runtime is running \
+             (Docker Desktop, Colima, Podman, Rancher Desktop)"
+                .into(),
+        ),
+    })
 }
 
 fn check_path_accessible(path: &str) -> CheckResult {

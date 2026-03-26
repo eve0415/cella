@@ -10,6 +10,7 @@ reqwest.workspace = true
 cella-port.workspace = true
 crossterm.workspace = true
 cella-features.workspace = true
+glob.workspace = true
 tar.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

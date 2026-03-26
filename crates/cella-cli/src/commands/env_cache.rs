@@ -123,7 +123,10 @@ pub async fn ensure_ssh_auth_sock(
     }
 
     let runtime = cella_env::platform::detect_runtime();
-    let socket_path = if matches!(runtime, DockerRuntime::DockerDesktop) {
+    let socket_path = if matches!(
+        runtime,
+        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack
+    ) {
         "/run/host-services/ssh-auth.sock"
     } else {
         "/tmp/cella-ssh-agent.sock"
