@@ -114,12 +114,17 @@ impl ExecArgs {
             }
         }
 
+        // Wrap command in a login shell so that shell profiles are sourced
+        // and the full PATH (including ~/.local/bin etc.) is available.
+        let shell = super::shell_detect::detect_shell(&client, &container.id, &user).await;
+        let cmd = super::shell_detect::wrap_in_login_shell(&shell, &self.command);
+
         if self.detach {
             let exec_id = client
                 .exec_detached(
                     &container.id,
                     &ExecOptions {
-                        cmd: self.command,
+                        cmd,
                         user: Some(user),
                         env: Some(env),
                         working_dir,
@@ -133,7 +138,7 @@ impl ExecArgs {
                 .exec_interactive(
                     &container.id,
                     &InteractiveExecOptions {
-                        cmd: self.command,
+                        cmd,
                         user: Some(user),
                         env: Some(env),
                         working_dir,

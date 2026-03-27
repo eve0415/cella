@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use cella_docker::{ContainerTarget, DockerClient, ExecOptions, InteractiveExecOptions};
+use cella_docker::{ContainerTarget, InteractiveExecOptions};
 
 /// Open a shell inside the running dev container.
 #[derive(Args)]
@@ -70,7 +70,7 @@ impl ShellArgs {
         let shell = if let Some(s) = self.shell {
             s
         } else {
-            detect_shell(&client, &container.id, &user).await
+            super::shell_detect::detect_shell(&client, &container.id, &user).await
         };
 
         debug!("Using shell: {shell}");
@@ -109,119 +109,4 @@ impl ShellArgs {
 
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
-}
-
-/// Detect the best available shell in the container.
-///
-/// Tries, in order:
-/// 1. `$SHELL` environment variable
-/// 2. `/etc/passwd` entry for the user
-/// 3. Probing `/bin/zsh`, `/bin/bash`, `/bin/sh`
-async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> String {
-    if let Some(shell) = detect_shell_from_env(client, container_id, user).await {
-        return shell;
-    }
-    if let Some(shell) = detect_shell_from_passwd(client, container_id, user).await {
-        return shell;
-    }
-    if let Some(shell) = detect_shell_by_probing(client, container_id, user).await {
-        return shell;
-    }
-
-    warn!("Could not detect shell, falling back to /bin/sh");
-    "/bin/sh".to_string()
-}
-
-/// Try to detect the shell from the `$SHELL` environment variable.
-async fn detect_shell_from_env(
-    client: &DockerClient,
-    container_id: &str,
-    user: &str,
-) -> Option<String> {
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "echo $SHELL".to_string(),
-                ],
-                user: Some(user.to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .ok()?;
-
-    let shell = result.stdout.trim().to_string();
-    if !shell.is_empty() && shell != "$SHELL" {
-        debug!("Detected shell from $SHELL: {shell}");
-        return Some(shell);
-    }
-    None
-}
-
-/// Try to detect the shell from `/etc/passwd`.
-async fn detect_shell_from_passwd(
-    client: &DockerClient,
-    container_id: &str,
-    user: &str,
-) -> Option<String> {
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("getent passwd {user} 2>/dev/null || grep '^{user}:' /etc/passwd"),
-                ],
-                user: Some(user.to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .ok()?;
-
-    let output = result.stdout.trim().to_string();
-    let shell = output.split(':').nth(6)?.trim();
-    if !shell.is_empty() {
-        debug!("Detected shell from passwd: {shell}");
-        return Some(shell.to_string());
-    }
-    None
-}
-
-/// Probe common shell paths to find one that exists.
-async fn detect_shell_by_probing(
-    client: &DockerClient,
-    container_id: &str,
-    user: &str,
-) -> Option<String> {
-    for candidate in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
-        if let Ok(result) = client
-            .exec_command(
-                container_id,
-                &ExecOptions {
-                    cmd: vec![
-                        "test".to_string(),
-                        "-x".to_string(),
-                        (*candidate).to_string(),
-                    ],
-                    user: Some(user.to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await
-            && result.exit_code == 0
-        {
-            debug!("Detected shell by probing: {candidate}");
-            return Some((*candidate).to_string());
-        }
-    }
-    None
 }

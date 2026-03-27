@@ -331,6 +331,10 @@ impl UpContext {
             )
             .await;
 
+        // Detect user's shell for probing (use their actual shell, not /bin/sh)
+        let shell =
+            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = self
@@ -342,87 +346,50 @@ impl UpContext {
                     container_id,
                     remote_user,
                     self.probe_type(),
+                    &shell,
                 ),
             )
             .await;
 
-        // Sequential prerequisites
+        // Sequential prerequisites + tool installation
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
             create_claude_home_symlink(&self.client, container_id, remote_user).await;
             setup_plugin_manifests(&self.client, container_id, remote_user).await;
         }
 
-        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
-        let node_available = if needs_npm {
-            ensure_node_available(&self.client, container_id, probed_env.as_ref()).await
-        } else {
-            false
-        };
-
         let any_tool = settings.tools.claude_code.enabled
             || settings.tools.codex.enabled
             || settings.tools.gemini.enabled;
+        self.install_tools(container_id, remote_user, &settings, probed_env.as_ref())
+            .await;
 
-        if any_tool {
-            let phase = self.progress.phase("Installing tools...");
-
-            let claude_branch = async {
-                if settings.tools.claude_code.enabled {
-                    let step = phase.step("Claude Code");
-                    install_claude_code(
+        // Re-probe after tool installation to capture PATH changes
+        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
+        let final_probed = if any_tool {
+            self.progress
+                .run_step(
+                    "Updating environment cache...",
+                    super::env_cache::probe_and_cache_user_env(
                         &self.client,
                         container_id,
                         remote_user,
-                        &settings.tools.claude_code,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-            };
+                        self.probe_type(),
+                        &shell,
+                    ),
+                )
+                .await
+                .or(probed_env)
+        } else {
+            probed_env
+        };
 
-            let npm_branch = async {
-                if needs_npm && !node_available {
-                    warn!("Skipping npm tool installs: Node.js/npm not available");
-                    return;
-                }
-                if settings.tools.codex.enabled {
-                    let step = phase.step("Codex");
-                    install_codex(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.codex,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-                if settings.tools.gemini.enabled {
-                    let step = phase.step("Gemini CLI");
-                    install_gemini(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.gemini,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-            };
-
-            tokio::join!(claude_branch, npm_branch);
-            phase.finish();
-        }
-
-        let lifecycle_env = probed_env.as_ref().map_or_else(
+        let lifecycle_env = final_probed.as_ref().map_or_else(
             || self.remote_env.clone(),
             |probed| cella_env::user_env_probe::merge_env(probed, &self.remote_env),
         );
 
-        (probed_env, lifecycle_env)
+        (final_probed, lifecycle_env)
     }
 
     /// Handle an already-running container (no rebuild requested, no `--build-no-cache`).
@@ -892,6 +859,10 @@ impl UpContext {
             .await;
         }
 
+        // Detect user's shell for probing (use their actual shell, not /bin/sh)
+        let shell =
+            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = self
@@ -903,13 +874,14 @@ impl UpContext {
                     container_id,
                     remote_user,
                     self.probe_type(),
+                    &shell,
                 ),
             )
             .await;
 
         // Fix /tmp permissions (must be world-writable with sticky bit).
-        // upload_files (used by write_env_cache above) can reset /tmp to 755
-        // via tar directory entries; some base images may also lack the sticky bit.
+        // upload_files can reset /tmp to 755 via tar directory entries;
+        // some base images may also lack the sticky bit.
         let _ = self
             .client
             .exec_command(
@@ -934,15 +906,38 @@ impl UpContext {
         }
 
         // Install AI coding tools
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
         self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
             .await;
 
-        let lifecycle_env = probed_env.as_ref().map_or_else(
+        // Re-probe after tool installation to capture PATH changes
+        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
+        let final_probed = if any_tool {
+            self.progress
+                .run_step(
+                    "Updating environment cache...",
+                    super::env_cache::probe_and_cache_user_env(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        self.probe_type(),
+                        &shell,
+                    ),
+                )
+                .await
+                .or(probed_env)
+        } else {
+            probed_env
+        };
+
+        let lifecycle_env = final_probed.as_ref().map_or_else(
             || remote_env.to_vec(),
             |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
         );
 
-        (probed_env, lifecycle_env)
+        (final_probed, lifecycle_env)
     }
 
     /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
