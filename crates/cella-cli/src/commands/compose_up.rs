@@ -107,22 +107,16 @@ async fn prepare_and_start(
     project: &ComposeProject,
 ) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
 {
-    // 5. Build feature-enriched image if features are configured
-    let (image_override, resolved_features) = if has_features(config) {
-        let (img_name, rf, _details) = super::image::ensure_image(
-            &ctx.client,
-            config,
-            &ctx.resolved.workspace_root,
-            ctx.config_name(),
-            &ctx.resolved.config_path,
-            ctx.build_no_cache,
-            &ctx.progress,
-        )
-        .await?;
-        (Some(img_name), rf)
-    } else {
-        (None, None)
-    };
+    // 5. Resolve features via combined-Dockerfile approach (if features configured)
+    let features_build = super::compose_features::resolve_compose_features(
+        &ctx.client,
+        config,
+        &ctx.resolved.config_path,
+        project,
+        ctx.build_no_cache,
+        &ctx.progress,
+    )
+    .await?;
 
     // 6. Ensure daemon is running and get daemon env vars
     super::ensure_credential_proxy();
@@ -168,12 +162,21 @@ async fn prepare_and_start(
     // 11. Generate and write override YAML
     let override_config = OverrideConfig {
         primary_service: project.primary_service.clone(),
-        image_override,
+        image_override: features_build
+            .as_ref()
+            .and_then(|b| b.image_name_override.clone()),
         override_command: project.override_command,
         agent_volume_name: agent_vol_name.to_string(),
         agent_volume_target: agent_vol_target.to_string(),
         extra_env,
         extra_labels: labels,
+        build_dockerfile: features_build
+            .as_ref()
+            .map(|b| b.combined_dockerfile.clone()),
+        build_target: features_build.as_ref().map(|b| b.build_target.clone()),
+        build_context: features_build
+            .as_ref()
+            .and_then(|b| b.build_context.clone()),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -182,9 +185,9 @@ async fn prepare_and_start(
         project.override_file.display()
     );
 
-    // 12. Run docker compose build if --build-no-cache
+    // 12. Run docker compose build (always when features present, or if --build-no-cache)
     let compose_cmd = ComposeCommand::new(project);
-    if ctx.build_no_cache {
+    if features_build.is_some() || ctx.build_no_cache {
         ctx.progress
             .run_step("Building compose services...", compose_cmd.build(None))
             .await?;
@@ -197,6 +200,7 @@ async fn prepare_and_start(
         })
         .await?;
 
+    let resolved_features = features_build.map(|b| b.resolved_features);
     Ok((remote_user, resolved_features, agent_arch))
 }
 
@@ -326,13 +330,6 @@ async fn handle_compose_running(
     );
 
     Ok(())
-}
-
-/// Check if the config references any devcontainer features.
-fn has_features(config: &serde_json::Value) -> bool {
-    config
-        .get("features")
-        .is_some_and(|v| v.is_object() && !v.as_object().unwrap().is_empty())
 }
 
 /// Build cella labels for the compose override file.

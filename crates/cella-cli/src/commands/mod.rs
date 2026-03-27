@@ -1,5 +1,6 @@
 mod branch;
 mod build;
+pub mod compose_features;
 mod compose_up;
 mod config;
 mod credential;

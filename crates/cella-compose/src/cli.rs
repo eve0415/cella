@@ -7,8 +7,41 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
+use serde::Deserialize;
+
+use crate::config::ResolvedComposeConfig;
 use crate::error::CellaComposeError;
 use crate::project::ComposeProject;
+
+/// A service status entry from `docker compose ps --format json`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ComposeServiceStatus {
+    /// Service name.
+    pub service: String,
+    /// Container name.
+    pub name: String,
+    /// Container state (e.g., "running", "exited").
+    pub state: String,
+    /// Published ports (e.g., `"0.0.0.0:3000->3000/tcp"`).
+    #[serde(default)]
+    pub publishers: Vec<ComposePortPublisher>,
+}
+
+/// A published port from compose ps output.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ComposePortPublisher {
+    /// Target port inside the container.
+    pub target_port: u16,
+    /// Published port on the host.
+    pub published_port: u16,
+    /// Protocol (tcp/udp).
+    pub protocol: String,
+    /// URL/address the port is published on.
+    #[serde(rename = "URL", default)]
+    pub url: String,
+}
 
 /// Wrapper around the `docker compose` CLI.
 ///
@@ -155,6 +188,94 @@ impl ComposeCommand {
             });
         }
         Ok(())
+    }
+
+    /// Run `docker compose config --format json` and parse the resolved output.
+    ///
+    /// This resolves all variable interpolation, extends, profiles, and file
+    /// merging, returning the fully expanded compose configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `docker compose` CLI is not found, the command
+    /// fails, or the JSON output cannot be parsed.
+    pub async fn config(&self) -> Result<ResolvedComposeConfig, CellaComposeError> {
+        let mut cmd = self.base_command();
+        cmd.arg("config").arg("--format").arg("json");
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        debug!("Running: docker compose config --format json");
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| CellaComposeError::CliNotFound {
+                message: format!("failed to execute docker compose: {e}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(CellaComposeError::ComposeFailed {
+                exit_code: output.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str(&stdout).map_err(|e| CellaComposeError::ConfigParseFailed {
+            message: format!("failed to parse compose config JSON: {e}"),
+        })
+    }
+
+    /// Run `docker compose ps --format json` and return parsed service statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI is not found or the command fails.
+    pub async fn ps_json(&self) -> Result<Vec<ComposeServiceStatus>, CellaComposeError> {
+        let mut cmd = self.base_command();
+        cmd.arg("ps").arg("--format").arg("json");
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        debug!("Running: docker compose ps --format json");
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| CellaComposeError::CliNotFound {
+                message: format!("failed to execute docker compose: {e}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(CellaComposeError::ComposeFailed {
+                exit_code: output.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // docker compose ps --format json may output one JSON object per line
+        // (NDJSON) or a JSON array depending on compose version.
+        let trimmed = stdout.trim();
+        if trimmed.starts_with('[') {
+            serde_json::from_str(trimmed).map_err(|e| CellaComposeError::ConfigParseFailed {
+                message: format!("failed to parse compose ps JSON: {e}"),
+            })
+        } else {
+            // NDJSON: one JSON object per line
+            trimmed
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str(line).map_err(|e| CellaComposeError::ConfigParseFailed {
+                        message: format!("failed to parse compose ps JSON line: {e}"),
+                    })
+                })
+                .collect()
+        }
     }
 
     /// Execute a command and stream stderr to the terminal, capturing it for errors.

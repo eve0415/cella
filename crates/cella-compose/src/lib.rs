@@ -8,14 +8,21 @@
 //! - Computing multi-file change detection hashes
 
 pub mod cli;
+pub mod config;
 pub mod discovery;
+pub mod dockerfile;
 pub mod error;
 pub mod hash;
 pub mod override_file;
 pub mod parse;
 pub mod project;
 
-pub use cli::ComposeCommand;
+pub use cli::{ComposeCommand, ComposeServiceStatus};
+pub use config::{ResolvedComposeConfig, ServiceBuildInfo, extract_service_build_info};
+pub use dockerfile::{
+    AUTO_STAGE_NAME, FEATURES_TARGET_STAGE, ensure_stage_named, generate_combined_dockerfile,
+    synthetic_dockerfile,
+};
 pub use error::CellaComposeError;
 pub use override_file::OverrideConfig;
 pub use project::{ComposeProject, ShutdownAction};

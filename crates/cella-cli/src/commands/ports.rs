@@ -70,6 +70,17 @@ async fn print_docker_ports(all: bool) -> Result<(), Box<dyn std::error::Error>>
     let client = cella_docker::DockerClient::connect()?;
     let containers = client.list_cella_containers(true).await?;
 
+    // Check if any container is compose-managed and try compose ps
+    if let Some(compose_container) = containers
+        .iter()
+        .find(|c| cella_compose::discovery::is_compose_container(&c.labels))
+        && let Some(project_name) =
+            cella_compose::discovery::compose_project_from_labels(&compose_container.labels)
+        && try_print_compose_ports(project_name).await
+    {
+        return Ok(());
+    }
+
     let has_ports = containers.iter().any(|c| !c.ports.is_empty());
 
     if containers.is_empty() || !has_ports {
@@ -87,6 +98,64 @@ async fn print_docker_ports(all: bool) -> Result<(), Box<dyn std::error::Error>>
     }
 
     Ok(())
+}
+
+/// Try to print compose service ports via `docker compose ps --format json`.
+///
+/// Returns `true` if ports were printed, `false` to fall back to generic listing.
+async fn try_print_compose_ports(project_name: &str) -> bool {
+    use crate::table::{Column, Table};
+
+    let cmd = cella_compose::ComposeCommand::from_project_name(project_name);
+    let statuses = match cmd.ps_json().await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("docker compose ps failed, falling back: {e}");
+            return false;
+        }
+    };
+
+    let has_ports = statuses
+        .iter()
+        .any(|s| !s.publishers.is_empty() && s.state == "running");
+
+    if !has_ports {
+        return false;
+    }
+
+    let mut table = Table::new(vec![
+        Column::shrinkable("SERVICE"),
+        Column::fixed("PORT"),
+        Column::fixed("HOST PORT"),
+        Column::fixed("PROTOCOL"),
+        Column::fixed("URL"),
+    ]);
+
+    for svc in &statuses {
+        if svc.state != "running" {
+            continue;
+        }
+        for pub_port in &svc.publishers {
+            if pub_port.published_port == 0 {
+                continue;
+            }
+            let url = if pub_port.url.is_empty() || pub_port.url == "0.0.0.0" {
+                format!("localhost:{}", pub_port.published_port)
+            } else {
+                format!("{}:{}", pub_port.url, pub_port.published_port)
+            };
+            table.add_row(vec![
+                svc.service.clone(),
+                pub_port.target_port.to_string(),
+                pub_port.published_port.to_string(),
+                pub_port.protocol.clone(),
+                url,
+            ]);
+        }
+    }
+
+    table.eprint();
+    true
 }
 
 fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack: bool) {

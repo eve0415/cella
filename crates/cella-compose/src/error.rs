@@ -48,6 +48,27 @@ pub enum CellaComposeError {
         field: String,
     },
 
+    /// Failed to parse `docker compose config` output.
+    #[error("docker compose config parse failed: {message}")]
+    ConfigParseFailed {
+        /// Details about what went wrong.
+        message: String,
+    },
+
+    /// Service has neither `build` nor `image` defined.
+    #[error("service '{service}' has neither 'build' nor 'image' in compose config")]
+    ServiceHasNoBuildOrImage {
+        /// The service name.
+        service: String,
+    },
+
+    /// Dockerfile parsing error.
+    #[error("dockerfile error: {message}")]
+    DockerfileParse {
+        /// Details about what went wrong.
+        message: String,
+    },
+
     /// I/O error (reading compose files, writing override files).
     #[error(transparent)]
     Io(#[from] std::io::Error),

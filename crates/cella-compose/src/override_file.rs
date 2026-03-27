@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::CellaComposeError;
 
@@ -26,6 +26,12 @@ pub struct OverrideConfig {
     pub extra_env: Vec<String>,
     /// Extra labels for the primary service container.
     pub extra_labels: BTreeMap<String, String>,
+    /// Override `build.dockerfile` for combined Dockerfile (compose + features).
+    pub build_dockerfile: Option<PathBuf>,
+    /// Override `build.target` for the features target stage.
+    pub build_target: Option<String>,
+    /// Override `build.context` for image-only services that need a synthetic build.
+    pub build_context: Option<PathBuf>,
 }
 
 /// Generate the override compose YAML as a string.
@@ -40,9 +46,21 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     yaml.push_str("services:\n");
     let _ = writeln!(yaml, "  {}:", config.primary_service);
 
-    // Image override (from feature-enriched build)
+    // Image override (for image-only services with features, to avoid retagging original)
     if let Some(ref image) = config.image_override {
         let _ = writeln!(yaml, "    image: \"{image}\"");
+    }
+
+    // Build override (combined Dockerfile for compose + features)
+    if let Some(ref dockerfile) = config.build_dockerfile {
+        yaml.push_str("    build:\n");
+        let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
+        if let Some(ref target) = config.build_target {
+            let _ = writeln!(yaml, "      target: \"{target}\"");
+        }
+        if let Some(ref context) = config.build_context {
+            let _ = writeln!(yaml, "      context: \"{}\"", context.display());
+        }
     }
 
     // Command override (only if explicitly enabled; compose default is false)
@@ -118,6 +136,9 @@ mod tests {
             agent_volume_target: "/cella".to_string(),
             extra_env: Vec::new(),
             extra_labels: BTreeMap::new(),
+            build_dockerfile: None,
+            build_target: None,
+            build_context: None,
         }
     }
 
@@ -218,6 +239,37 @@ mod tests {
           cella-agent:
             external: true
         "#);
+    }
+
+    #[test]
+    fn with_build_override() {
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from(
+            "/home/user/.cella/compose/proj/Dockerfile.combined",
+        ));
+        config.build_target = Some("dev_containers_target_stage".to_string());
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("build:"));
+        assert!(yaml.contains("dockerfile:"));
+        assert!(yaml.contains("Dockerfile.combined"));
+        assert!(yaml.contains("target: \"dev_containers_target_stage\""));
+        // No context override for build-based services
+        assert!(!yaml.contains("context:"));
+    }
+
+    #[test]
+    fn with_build_override_and_context() {
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from("/tmp/Dockerfile.combined"));
+        config.build_target = Some("dev_containers_target_stage".to_string());
+        config.build_context = Some(PathBuf::from("/tmp/features-context"));
+        config.image_override = Some("cella-img-app-features".to_string());
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("image: \"cella-img-app-features\""));
+        assert!(yaml.contains("build:"));
+        assert!(yaml.contains("dockerfile:"));
+        assert!(yaml.contains("target:"));
+        assert!(yaml.contains("context: \"/tmp/features-context\""));
     }
 
     #[test]
