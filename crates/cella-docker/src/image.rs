@@ -90,6 +90,7 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push("buildx".to_string());
     }
     args.push("build".to_string());
+    args.push("--progress=plain".to_string());
 
     if use_buildx {
         args.push("--load".to_string());
@@ -134,7 +135,13 @@ fn spawn_line_reader(
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = tx.send(line);
+            // Split on \r to handle carriage-return progress updates
+            // (BuildKit, apt-get, wget). Each segment becomes its own line.
+            for segment in line.split('\r') {
+                if !segment.is_empty() {
+                    let _ = tx.send(segment.to_string());
+                }
+            }
         }
     });
 }
@@ -200,6 +207,7 @@ impl DockerClient {
 
         if !use_buildx {
             cmd.env("DOCKER_BUILDKIT", "1");
+            cmd.env("BUILDKIT_PROGRESS", "plain");
         }
 
         let mut child = cmd
@@ -346,6 +354,7 @@ mod tests {
             args,
             vec![
                 "build",
+                "--progress=plain",
                 "-t",
                 "myimage:latest",
                 "-f",
@@ -361,7 +370,8 @@ mod tests {
         let args = build_command_args(&opts, true);
         assert_eq!(args[0], "buildx");
         assert_eq!(args[1], "build");
-        assert_eq!(args[2], "--load");
+        assert_eq!(args[2], "--progress=plain");
+        assert_eq!(args[3], "--load");
     }
 
     #[test]
