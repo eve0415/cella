@@ -1641,16 +1641,6 @@ fn add_tool_config_mounts(
                 });
             }
         }
-
-        // Inject CELLA_HOST_HOME for cella-agent plugin sync
-        if let Some(host_home) = cella_env::claude_code::host_home() {
-            if create_opts.env.is_empty() {
-                // env will be populated by the caller; just push the var
-            }
-            create_opts
-                .env
-                .push(format!("CELLA_HOST_HOME={}", host_home.display()));
-        }
     }
 
     // Codex: ~/.codex
@@ -1862,21 +1852,27 @@ async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, r
 /// Creates symlinks for plugin content (cache/, data/, marketplaces/) pointing
 /// to the hidden host mount at `/tmp/.cella/host-plugins/`, and copies
 /// `installed_plugins.json` and `known_marketplaces.json` with path rewriting.
+///
+/// Uses regex-based sed to match ANY home path + `/.claude` (Linux, macOS, root)
+/// and replace with the container user's path. This handles files written by
+/// previous containers with different users (e.g. `/home/node/.claude` →
+/// `/home/vscode/.claude`).
 async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
-    let Some(host_home) = cella_env::claude_code::host_home() else {
-        return;
-    };
     let container_home = cella_env::claude_code::container_home(remote_user);
-
-    let host_home_str = host_home.to_string_lossy();
-    if *host_home_str == container_home {
-        return;
-    }
-
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins = "/tmp/.cella/host-plugins";
-    let old_prefix = format!("{host_home_str}/.claude");
-    let new_prefix = format!("{container_home}/.claude");
+    let target_claude = format!("{container_home}/.claude");
+
+    // Regex sed: rewrite /home/USER/.claude, /Users/USER/.claude, /root/.claude
+    // to the container user's path. Handles any previous writer.
+    let sed_expr = format!(
+        concat!(
+            "s|/home/[^/\"]*/.claude|{t}|g; ",
+            "s|/Users/[^/\"]*/.claude|{t}|g; ",
+            "s|/root/.claude|{t}|g",
+        ),
+        t = target_claude,
+    );
 
     // Symlink all items except the 2 manifest JSONs (which get copied + rewritten)
     let script = format!(
@@ -1888,15 +1884,14 @@ async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remot
             "  case \"$name\" in ",
             "    .|..) continue ;; ",
             "    installed_plugins.json|known_marketplaces.json) ",
-            "      [ -f \"$item\" ] && sed 's|{old}|{new}|g' \"$item\" > \"{dir}/$name\" ;; ",
+            "      [ -f \"$item\" ] && sed -E '{sed}' \"$item\" > \"{dir}/$name\" ;; ",
             "    *) ln -sfn \"$item\" \"{dir}/$name\" ;; ",
             "  esac; ",
             "done",
         ),
         host = host_plugins,
         dir = plugins_dir,
-        old = old_prefix,
-        new = new_prefix,
+        sed = sed_expr,
     );
 
     let _ = client

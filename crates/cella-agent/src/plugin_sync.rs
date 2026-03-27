@@ -21,18 +21,46 @@ const SYNC_FILES: &[&str] = &["installed_plugins.json", "known_marketplaces.json
 /// Host-side plugins directory (bind-mounted at this path inside the container).
 const HOST_PLUGINS_DIR: &str = "/tmp/.cella/host-plugins";
 
+/// Detect the original home path from a host JSON file by finding `/.claude/`
+/// path references. Returns the home portion (e.g., `/home/node`).
+fn detect_home_from_json(content: &str) -> Option<String> {
+    // Look for patterns like "/home/USER/.claude/" or "/Users/USER/.claude/"
+    // or "/root/.claude/" in JSON string values
+    for line in content.lines() {
+        // Find /.claude/ and extract the home prefix
+        if let Some(idx) = line.find("/.claude/") {
+            // Walk backwards to find the start of the path (after a quote)
+            let prefix = &line[..idx];
+            if let Some(quote_idx) = prefix.rfind('"') {
+                let home = &prefix[quote_idx + 1..];
+                if home.starts_with('/') {
+                    return Some(home.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Run the plugin manifest sync watcher.
 ///
 /// Watches the container's plugin manifest files and reverse-rewrites paths
-/// back to the host on every change. Runs until the channel closes (container
-/// shutdown).
-pub async fn run(container_home: String, host_home: String) {
+/// back to the host on every change. Detects the original host home path from
+/// the host's JSON files at startup.
+pub async fn run(container_home: String) {
     let plugins_dir = format!("{container_home}/.claude/plugins");
 
     if !Path::new(&plugins_dir).exists() || !Path::new(HOST_PLUGINS_DIR).exists() {
         tracing::debug!("Plugin sync: paths not ready, skipping");
         return;
     }
+
+    // Detect the original home path from host JSON files
+    let host_home = detect_host_home().await;
+    let Some(host_home) = host_home else {
+        tracing::debug!("Plugin sync: could not detect host home path, skipping");
+        return;
+    };
 
     let (tx, mut rx) = mpsc::channel::<()>(16);
 
@@ -41,12 +69,12 @@ pub async fn run(container_home: String, host_home: String) {
         if let Ok(event) = res
             && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
         {
-            let dominated = event.paths.iter().any(|p| {
+            let is_sync_file = event.paths.iter().any(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|name| SYNC_FILES.contains(&name))
             });
-            if dominated {
+            if is_sync_file {
                 let _ = tx.blocking_send(());
             }
         }
@@ -63,13 +91,12 @@ pub async fn run(container_home: String, host_home: String) {
         return;
     }
 
-    tracing::debug!("Plugin sync: watching {watch_dir}");
+    tracing::debug!("Plugin sync: watching {watch_dir}, host home: {host_home}");
 
     let from_prefix = format!("{container_home}/.claude");
     let to_prefix = format!("{host_home}/.claude");
 
     loop {
-        // Wait for an event
         if rx.recv().await.is_none() {
             break;
         }
@@ -95,5 +122,50 @@ pub async fn run(container_home: String, host_home: String) {
                 tracing::debug!("Plugin sync: synced {file} back to host");
             }
         }
+    }
+}
+
+/// Detect the original host home path from any host JSON in the hidden mount.
+async fn detect_host_home() -> Option<String> {
+    for &file in SYNC_FILES {
+        let path = PathBuf::from(HOST_PLUGINS_DIR).join(file);
+        if let Ok(content) = tokio::fs::read_to_string(&path).await
+            && let Some(home) = detect_home_from_json(&content)
+        {
+            return Some(home);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_home_linux() {
+        let json = r#"{"installPath": "/home/node/.claude/plugins/cache/foo"}"#;
+        assert_eq!(detect_home_from_json(json), Some("/home/node".to_string()));
+    }
+
+    #[test]
+    fn detect_home_macos() {
+        let json = r#"{"path": "/Users/alice/.claude/plugins"}"#;
+        assert_eq!(
+            detect_home_from_json(json),
+            Some("/Users/alice".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_home_root() {
+        let json = r#"{"installLocation": "/root/.claude/plugins/marketplaces/foo"}"#;
+        assert_eq!(detect_home_from_json(json), Some("/root".to_string()));
+    }
+
+    #[test]
+    fn detect_home_no_match() {
+        let json = r#"{"name": "no paths here"}"#;
+        assert_eq!(detect_home_from_json(json), None);
     }
 }
