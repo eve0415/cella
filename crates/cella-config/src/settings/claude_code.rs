@@ -25,14 +25,6 @@ pub struct ClaudeCode {
     /// Version to install: `"latest"`, `"stable"`, or pinned e.g. `"1.0.58"`.
     #[serde(default = "default_latest")]
     pub version: String,
-
-    /// Glob patterns for additional files/dirs to exclude from the default copy set.
-    #[serde(default)]
-    pub exclude: Vec<String>,
-
-    /// Glob patterns for additional files/dirs to include beyond the default copy set.
-    #[serde(default)]
-    pub include: Vec<String>,
 }
 
 impl Default for ClaudeCode {
@@ -41,8 +33,6 @@ impl Default for ClaudeCode {
             enabled: true,
             forward_config: true,
             version: "latest".to_string(),
-            exclude: Vec::new(),
-            include: Vec::new(),
         }
     }
 }
@@ -57,8 +47,6 @@ mod tests {
         assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
-        assert!(settings.exclude.is_empty());
-        assert!(settings.include.is_empty());
     }
 
     #[test]
@@ -87,19 +75,6 @@ mod tests {
     fn deserialize_stable_version() {
         let settings: ClaudeCode = toml::from_str("version = \"stable\"").unwrap();
         assert_eq!(settings.version, "stable");
-    }
-
-    #[test]
-    fn deserialize_glob_patterns() {
-        let settings: ClaudeCode = toml::from_str(
-            r#"
-exclude = ["plans/**", "sessions/**"]
-include = ["backups/important/**"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(settings.exclude, vec!["plans/**", "sessions/**"]);
-        assert_eq!(settings.include, vec!["backups/important/**"]);
     }
 
     #[test]

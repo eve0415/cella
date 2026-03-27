@@ -349,7 +349,7 @@ impl UpContext {
         // Sequential prerequisites
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
-            resync_claude_auth(&self.client, container_id, remote_user).await;
+            create_claude_home_symlink(&self.client, container_id, remote_user).await;
         }
 
         let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
@@ -667,6 +667,8 @@ impl UpContext {
     }
 
     /// Merge forwarding mounts, env vars, daemon env, and agent volume into create options.
+    ///
+    /// Tool config mounts (Claude Code, Codex, Gemini) are added via [`add_tool_config_mounts`].
     async fn apply_env_and_mounts(
         &self,
         create_opts: &mut cella_docker::CreateContainerOptions,
@@ -686,47 +688,7 @@ impl UpContext {
             });
         }
 
-        // Auto-mount ~/.claude.json if Claude Code config forwarding is enabled
-        if settings.tools.claude_code.forward_config
-            && let Some(host_path) = cella_env::claude_code::host_claude_json_path()
-        {
-            let target = format!(
-                "{}/.claude.json",
-                cella_env::claude_code::container_home(remote_user),
-            );
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target,
-                consistency: None,
-            });
-        }
-
-        // Auto-mount ~/.codex if Codex config forwarding is enabled
-        if settings.tools.codex.forward_config
-            && let Some(host_path) = cella_env::codex::host_codex_dir()
-        {
-            let target = cella_env::codex::container_codex_dir(remote_user);
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target,
-                consistency: None,
-            });
-        }
-
-        // Auto-mount ~/.gemini if Gemini config forwarding is enabled
-        if settings.tools.gemini.forward_config
-            && let Some(host_path) = cella_env::gemini::host_gemini_dir()
-        {
-            let target = cella_env::gemini::container_gemini_dir(remote_user);
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target,
-                consistency: None,
-            });
-        }
+        add_tool_config_mounts(create_opts, settings, remote_user);
 
         // Forwarding env vars
         if !env_fwd.env.is_empty() {
@@ -964,7 +926,12 @@ impl UpContext {
             )
             .await;
 
-        // Forward config and install AI coding tools
+        // Create home path symlink for Claude Code plugin resolution
+        if settings.tools.claude_code.forward_config {
+            create_claude_home_symlink(&self.client, container_id, remote_user).await;
+        }
+
+        // Install AI coding tools
         self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
             .await;
 
@@ -987,22 +954,6 @@ impl UpContext {
         settings: &cella_config::Settings,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
-        // Sequential prerequisite: forward Claude Code config before install
-        if settings.tools.claude_code.forward_config {
-            self.progress
-                .run_step(
-                    "Forwarding Claude Code config...",
-                    seed_claude_config(
-                        &self.client,
-                        container_id,
-                        &self.resolved.workspace_root,
-                        remote_user,
-                        &settings.tools.claude_code,
-                    ),
-                )
-                .await;
-        }
-
         // Sequential prerequisite: ensure Node.js/npm once for all npm tools
         let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
         let node_available = if needs_npm {
@@ -1640,6 +1591,66 @@ async fn apply_git_config(
     }
 }
 
+// ── Tool config mounts ─────────────────────────────────────────────────────
+
+/// Add bind mounts for AI tool config directories (Claude Code, Codex, Gemini).
+fn add_tool_config_mounts(
+    create_opts: &mut cella_docker::CreateContainerOptions,
+    settings: &cella_config::Settings,
+    remote_user: &str,
+) {
+    // Claude Code: ~/.claude.json (single file) and ~/.claude/ (directory)
+    if settings.tools.claude_code.forward_config {
+        if let Some(host_path) = cella_env::claude_code::host_claude_json_path() {
+            let target = format!(
+                "{}/.claude.json",
+                cella_env::claude_code::container_home(remote_user),
+            );
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+        if let Some(host_path) = cella_env::claude_code::host_claude_dir() {
+            let target = cella_env::claude_code::claude_dir_for_user(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+    }
+
+    // Codex: ~/.codex
+    if settings.tools.codex.forward_config
+        && let Some(host_path) = cella_env::codex::host_codex_dir()
+    {
+        let target = cella_env::codex::container_codex_dir(remote_user);
+        create_opts.mounts.push(MountConfig {
+            mount_type: "bind".to_string(),
+            source: host_path.to_string_lossy().to_string(),
+            target,
+            consistency: None,
+        });
+    }
+
+    // Gemini: ~/.gemini
+    if settings.tools.gemini.forward_config
+        && let Some(host_path) = cella_env::gemini::host_gemini_dir()
+    {
+        let target = cella_env::gemini::container_gemini_dir(remote_user);
+        create_opts.mounts.push(MountConfig {
+            mount_type: "bind".to_string(),
+            source: host_path.to_string_lossy().to_string(),
+            target,
+            consistency: None,
+        });
+    }
+}
+
 // ── Shared container-operation helpers ──────────────────────────────────────
 
 /// Create a directory inside the container with the given mode (as root).
@@ -1692,7 +1703,7 @@ async fn chown_in_container(
 }
 
 /// Create a directory, upload files, and fix ownership -- the shared pattern
-/// used by both `seed_gh_credentials` and `seed_claude_config`.
+/// used by `seed_gh_credentials`.
 ///
 /// Returns `true` on success, `false` on any step failure.
 async fn upload_to_container(
@@ -1711,7 +1722,6 @@ async fn upload_to_container(
     let docker_files = convert_uploads(uploads);
     if let Err(e) = client.upload_files(container_id, &docker_files).await {
         warn!("Failed to upload {context_label} files: {e}");
-        // For Claude config we still chown even on upload failure, so always chown.
     }
 
     chown_in_container(client, container_id, remote_user, dir).await;
@@ -1784,64 +1794,38 @@ async fn config_exists_in_container(
         .is_ok_and(|r| r.exit_code == 0)
 }
 
-/// Seed Claude Code config files into a container (first create).
+/// Create a symlink from the host's `.claude` path to the container's so that
+/// hardcoded paths in plugin manifests (`installed_plugins.json`, `known_marketplaces.json`)
+/// resolve transparently.
 ///
-/// Copies `~/.claude/` from host with path rewriting, then fixes ownership.
-/// Skips silently if `~/.claude/` doesn't exist on host or config already
-/// exists in the container.
-async fn seed_claude_config(
-    client: &DockerClient,
-    container_id: &str,
-    workspace_root: &std::path::Path,
-    remote_user: &str,
-    settings: &cella_config::ClaudeCode,
-) {
-    let claude_dir = cella_env::claude_code::claude_dir_for_user(remote_user);
+/// Example: host home `/home/node`, container home `/home/vscode`:
+///   `/home/node/.claude` → `/home/vscode/.claude`
+async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let Some(host_home) = cella_env::claude_code::host_home() else {
+        return;
+    };
+    let container_home = cella_env::claude_code::container_home(remote_user);
 
-    if config_exists_in_container(
-        client,
-        container_id,
-        remote_user,
-        &cella_env::claude_code::claude_config_exists_command(&claude_dir),
-    )
-    .await
-    {
-        debug!("Claude config already present in container, skipping seed");
+    let host_home_str = host_home.to_string_lossy();
+    if *host_home_str == container_home {
         return;
     }
 
-    let Some(uploads) =
-        cella_env::claude_code::prepare_claude_config(remote_user, workspace_root, settings)
-    else {
-        return;
-    };
+    let claude_target = format!("{container_home}/.claude");
+    let claude_link = format!("{host_home_str}/.claude");
+    let cmd = format!("mkdir -p {host_home_str} && ln -sfn {claude_target} {claude_link}");
 
-    upload_to_container(
-        client,
-        container_id,
-        remote_user,
-        &claude_dir,
-        &uploads,
-        "Claude config",
-    )
-    .await;
-
-    debug!("Seeded Claude Code config into container");
-}
-
-/// Re-sync Claude Code auth credentials on container restart.
-///
-/// Only re-uploads `.credentials.json` — does not overwrite other config.
-async fn resync_claude_auth(client: &DockerClient, container_id: &str, remote_user: &str) {
-    let Some(uploads) = cella_env::claude_code::prepare_claude_auth_resync(remote_user) else {
-        return;
-    };
-
-    let docker_files = convert_uploads(&uploads);
-
-    if let Err(e) = client.upload_files(container_id, &docker_files).await {
-        debug!("Failed to re-sync Claude auth: {e}");
-    }
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".into(), "-c".into(), cmd],
+                user: Some("root".into()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
 }
 
 /// Check if Claude Code is already installed at the desired version.

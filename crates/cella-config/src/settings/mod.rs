@@ -200,13 +200,11 @@ version = "0.5.0"
 enabled = false
 forward_config = false
 version = "1.0.58"
-exclude = ["plans/**"]
 "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.tools.claude_code.enabled);
         assert!(!settings.tools.claude_code.forward_config);
         assert_eq!(settings.tools.claude_code.version, "1.0.58");
-        assert_eq!(settings.tools.claude_code.exclude, vec!["plans/**"]);
         // credentials and other tools should still be default
         assert!(settings.credentials.gh);
         assert!(settings.tools.codex.enabled);

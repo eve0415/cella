@@ -395,11 +395,7 @@ dependencies = [
 name = "cella-env"
 version = "0.0.6"
 dependencies = [
- "cella-config",
- "glob",
- "regex",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

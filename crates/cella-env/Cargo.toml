@@ -5,16 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-glob.workspace = true
-regex.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-cella-config.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
