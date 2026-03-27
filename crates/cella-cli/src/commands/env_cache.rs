@@ -5,8 +5,14 @@ use tracing::debug;
 use cella_docker::{DockerClient, ExecOptions};
 use cella_env::platform::DockerRuntime;
 
-/// Path inside the container where probed environment is cached.
-const PROBED_ENV_CACHE_PATH: &str = "/tmp/.cella-probed-env.json";
+/// Compute the per-user cache path for the probed environment.
+///
+/// Stores under `$HOME/.cella/probed-env.json` so it survives container
+/// restarts (unlike `/tmp` which can be cleared).
+fn cache_path(user: &str) -> String {
+    let home = cella_env::claude_code::container_home(user);
+    format!("{home}/.cella/probed-env.json")
+}
 
 /// Read the cached probed environment from a running container.
 ///
@@ -17,11 +23,12 @@ pub async fn read_probed_env_cache(
     container_id: &str,
     user: &str,
 ) -> Option<HashMap<String, String>> {
+    let path = cache_path(user);
     let result = client
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec!["cat".to_string(), PROBED_ENV_CACHE_PATH.to_string()],
+                cmd: vec!["cat".to_string(), path],
                 user: Some(user.to_string()),
                 env: None,
                 working_dir: None,
@@ -48,9 +55,10 @@ pub async fn probe_and_cache_user_env(
     container_id: &str,
     user: &str,
     probe_type: &str,
+    shell: &str,
 ) -> Option<HashMap<String, String>> {
-    let env = run_env_probe(client, container_id, user, probe_type).await?;
-    write_env_cache(client, container_id, &env).await;
+    let env = run_env_probe(client, container_id, user, probe_type, shell).await?;
+    write_env_cache(client, container_id, user, &env).await;
     Some(env)
 }
 
@@ -60,10 +68,11 @@ async fn run_env_probe(
     container_id: &str,
     user: &str,
     probe_type: &str,
+    shell: &str,
 ) -> Option<HashMap<String, String>> {
-    let probe_cmd = cella_env::user_env_probe::probe_command(probe_type, "/bin/sh")?;
+    let probe_cmd = cella_env::user_env_probe::probe_command(probe_type, shell)?;
 
-    debug!("Running userEnvProbe ({probe_type}): {probe_cmd:?}");
+    debug!("Running userEnvProbe ({probe_type}) with {shell}: {probe_cmd:?}");
 
     let result = client
         .exec_command(
@@ -92,12 +101,37 @@ async fn run_env_probe(
 }
 
 /// Write the probed environment to a cache file inside the container.
-async fn write_env_cache(client: &DockerClient, container_id: &str, env: &HashMap<String, String>) {
+///
+/// Creates the `~/.cella/` directory if it doesn't exist.
+async fn write_env_cache(
+    client: &DockerClient,
+    container_id: &str,
+    user: &str,
+    env: &HashMap<String, String>,
+) {
     let Some(json) = serde_json::to_string(env).ok() else {
         return;
     };
+
+    let path = cache_path(user);
+
+    // Ensure the parent directory exists
+    let home = cella_env::claude_code::container_home(user);
+    let dir_path = format!("{home}/.cella");
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["mkdir".to_string(), "-p".to_string(), dir_path],
+                user: Some(user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
     let cache_file = cella_docker::FileToUpload {
-        path: PROBED_ENV_CACHE_PATH.to_string(),
+        path,
         content: json.into_bytes(),
         mode: 0o644,
     };

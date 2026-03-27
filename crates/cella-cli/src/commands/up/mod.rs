@@ -331,6 +331,10 @@ impl UpContext {
             )
             .await;
 
+        // Detect user's shell for probing (use their actual shell, not /bin/sh)
+        let shell =
+            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = self
@@ -342,86 +346,50 @@ impl UpContext {
                     container_id,
                     remote_user,
                     self.probe_type(),
+                    &shell,
                 ),
             )
             .await;
 
-        // Sequential prerequisites
+        // Sequential prerequisites + tool installation
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
             create_claude_home_symlink(&self.client, container_id, remote_user).await;
+            setup_plugin_manifests(&self.client, container_id, remote_user).await;
         }
-
-        let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
-        let node_available = if needs_npm {
-            ensure_node_available(&self.client, container_id, probed_env.as_ref()).await
-        } else {
-            false
-        };
 
         let any_tool = settings.tools.claude_code.enabled
             || settings.tools.codex.enabled
             || settings.tools.gemini.enabled;
+        self.install_tools(container_id, remote_user, &settings, probed_env.as_ref())
+            .await;
 
-        if any_tool {
-            let phase = self.progress.phase("Installing tools...");
-
-            let claude_branch = async {
-                if settings.tools.claude_code.enabled {
-                    let step = phase.step("Claude Code");
-                    install_claude_code(
+        // Re-probe after tool installation to capture PATH changes
+        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
+        let final_probed = if any_tool {
+            self.progress
+                .run_step(
+                    "Updating environment cache...",
+                    super::env_cache::probe_and_cache_user_env(
                         &self.client,
                         container_id,
                         remote_user,
-                        &settings.tools.claude_code,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-            };
+                        self.probe_type(),
+                        &shell,
+                    ),
+                )
+                .await
+                .or(probed_env)
+        } else {
+            probed_env
+        };
 
-            let npm_branch = async {
-                if needs_npm && !node_available {
-                    warn!("Skipping npm tool installs: Node.js/npm not available");
-                    return;
-                }
-                if settings.tools.codex.enabled {
-                    let step = phase.step("Codex");
-                    install_codex(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.codex,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-                if settings.tools.gemini.enabled {
-                    let step = phase.step("Gemini CLI");
-                    install_gemini(
-                        &self.client,
-                        container_id,
-                        remote_user,
-                        &settings.tools.gemini,
-                        probed_env.as_ref(),
-                    )
-                    .await;
-                    step.finish();
-                }
-            };
-
-            tokio::join!(claude_branch, npm_branch);
-            phase.finish();
-        }
-
-        let lifecycle_env = probed_env.as_ref().map_or_else(
+        let lifecycle_env = final_probed.as_ref().map_or_else(
             || self.remote_env.clone(),
             |probed| cella_env::user_env_probe::merge_env(probed, &self.remote_env),
         );
 
-        (probed_env, lifecycle_env)
+        (final_probed, lifecycle_env)
     }
 
     /// Handle an already-running container (no rebuild requested, no `--build-no-cache`).
@@ -891,6 +859,10 @@ impl UpContext {
             .await;
         }
 
+        // Detect user's shell for probing (use their actual shell, not /bin/sh)
+        let shell =
+            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
         let probed_env = self
@@ -902,13 +874,14 @@ impl UpContext {
                     container_id,
                     remote_user,
                     self.probe_type(),
+                    &shell,
                 ),
             )
             .await;
 
         // Fix /tmp permissions (must be world-writable with sticky bit).
-        // upload_files (used by write_env_cache above) can reset /tmp to 755
-        // via tar directory entries; some base images may also lack the sticky bit.
+        // upload_files can reset /tmp to 755 via tar directory entries;
+        // some base images may also lack the sticky bit.
         let _ = self
             .client
             .exec_command(
@@ -926,21 +899,45 @@ impl UpContext {
             )
             .await;
 
-        // Create home path symlink for Claude Code plugin resolution
+        // Create home path symlink and populate plugin manifests
         if settings.tools.claude_code.forward_config {
             create_claude_home_symlink(&self.client, container_id, remote_user).await;
+            setup_plugin_manifests(&self.client, container_id, remote_user).await;
         }
 
         // Install AI coding tools
+        let any_tool = settings.tools.claude_code.enabled
+            || settings.tools.codex.enabled
+            || settings.tools.gemini.enabled;
         self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
             .await;
 
-        let lifecycle_env = probed_env.as_ref().map_or_else(
+        // Re-probe after tool installation to capture PATH changes
+        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
+        let final_probed = if any_tool {
+            self.progress
+                .run_step(
+                    "Updating environment cache...",
+                    super::env_cache::probe_and_cache_user_env(
+                        &self.client,
+                        container_id,
+                        remote_user,
+                        self.probe_type(),
+                        &shell,
+                    ),
+                )
+                .await
+                .or(probed_env)
+        } else {
+            probed_env
+        };
+
+        let lifecycle_env = final_probed.as_ref().map_or_else(
             || remote_env.to_vec(),
             |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
         );
 
-        (probed_env, lifecycle_env)
+        (final_probed, lifecycle_env)
     }
 
     /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
@@ -1618,9 +1615,26 @@ fn add_tool_config_mounts(
             create_opts.mounts.push(MountConfig {
                 mount_type: "bind".to_string(),
                 source: host_path.to_string_lossy().to_string(),
-                target,
+                target: target.clone(),
                 consistency: None,
             });
+
+            // Hidden mount for host plugins (backward sync access)
+            if let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() {
+                create_opts.mounts.push(MountConfig {
+                    mount_type: "bind".to_string(),
+                    source: host_plugins.to_string_lossy().to_string(),
+                    target: "/tmp/.cella/host-plugins".to_string(),
+                    consistency: None,
+                });
+                // tmpfs shadows the parent bind mount's plugins/ subdirectory
+                create_opts.mounts.push(MountConfig {
+                    mount_type: "tmpfs".to_string(),
+                    source: String::new(),
+                    target: format!("{target}/plugins"),
+                    consistency: None,
+                });
+            }
         }
     }
 
@@ -1826,6 +1840,68 @@ async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, r
             },
         )
         .await;
+}
+
+/// Populate the tmpfs-backed `~/.claude/plugins/` directory.
+///
+/// Creates symlinks for plugin content (cache/, data/, marketplaces/) pointing
+/// to the hidden host mount at `/tmp/.cella/host-plugins/`, and copies
+/// `installed_plugins.json` and `known_marketplaces.json` with path rewriting.
+///
+/// Uses regex-based sed to match ANY home path + `/.claude` (Linux, macOS, root)
+/// and replace with the container user's path. This handles files written by
+/// previous containers with different users (e.g. `/home/node/.claude` →
+/// `/home/vscode/.claude`).
+async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let container_home = cella_env::claude_code::container_home(remote_user);
+    let plugins_dir = format!("{container_home}/.claude/plugins");
+    let host_plugins = "/tmp/.cella/host-plugins";
+    let target_claude = format!("{container_home}/.claude");
+
+    // Regex sed: rewrite /home/USER/.claude, /Users/USER/.claude, /root/.claude
+    // to the container user's path. Handles any previous writer.
+    let sed_expr = format!(
+        concat!(
+            "s|/home/[^/\"]*/.claude|{t}|g; ",
+            "s|/Users/[^/\"]*/.claude|{t}|g; ",
+            "s|/root/.claude|{t}|g",
+        ),
+        t = target_claude,
+    );
+
+    // Symlink all items except the 2 manifest JSONs (which get copied + rewritten)
+    let script = format!(
+        concat!(
+            "[ -d \"{host}\" ] || exit 0; ",
+            "for item in \"{host}\"/* \"{host}\"/.*; do ",
+            "  [ -e \"$item\" ] || continue; ",
+            "  name=$(basename \"$item\"); ",
+            "  case \"$name\" in ",
+            "    .|..) continue ;; ",
+            "    installed_plugins.json|known_marketplaces.json) ",
+            "      [ -f \"$item\" ] && sed -E '{sed}' \"$item\" > \"{dir}/$name\" ;; ",
+            "    *) ln -sfn \"$item\" \"{dir}/$name\" ;; ",
+            "  esac; ",
+            "done",
+        ),
+        host = host_plugins,
+        dir = plugins_dir,
+        sed = sed_expr,
+    );
+
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".into(), "-c".into(), script],
+                user: Some("root".into()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    chown_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
 /// Check if Claude Code is already installed at the desired version.

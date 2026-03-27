@@ -19,6 +19,7 @@ mod ports;
 mod prune;
 mod read_configuration;
 mod shell;
+pub mod shell_detect;
 
 mod switch;
 mod template;
