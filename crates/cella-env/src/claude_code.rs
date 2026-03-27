@@ -34,11 +34,28 @@ pub fn host_claude_json_path() -> Option<PathBuf> {
     if path.is_file() { Some(path) } else { None }
 }
 
+/// Host-side `~/.claude/plugins` directory path (if it exists).
+pub fn host_plugins_dir() -> Option<PathBuf> {
+    let dir = host_claude_dir()?.join("plugins");
+    if dir.is_dir() { Some(dir) } else { None }
+}
+
 /// Host home directory derived from the host `.claude` directory path.
 ///
 /// Returns `None` if `~/.claude/` doesn't exist on the host.
 pub fn host_home() -> Option<PathBuf> {
     host_claude_dir().and_then(|d| d.parent().map(PathBuf::from))
+}
+
+/// Replace home-path prefix in file content.
+///
+/// Performs a simple string replacement of `{from_home}/.claude` with
+/// `{to_home}/.claude` for rewriting plugin manifest paths.
+pub fn rewrite_claude_home(content: &str, from_home: &str, to_home: &str) -> String {
+    content.replace(
+        &format!("{from_home}/.claude"),
+        &format!("{to_home}/.claude"),
+    )
 }
 
 /// Get the host home directory.
@@ -85,5 +102,36 @@ mod tests {
             let home = host_home().expect("host_home should return Some when host_claude_dir does");
             assert_eq!(home, claude_dir.parent().unwrap());
         }
+    }
+
+    #[test]
+    fn rewrite_claude_home_replaces_paths() {
+        let content = r#"{"installPath": "/home/node/.claude/plugins/cache/foo"}"#;
+        let result = rewrite_claude_home(content, "/home/node", "/home/vscode");
+        assert_eq!(
+            result,
+            r#"{"installPath": "/home/vscode/.claude/plugins/cache/foo"}"#
+        );
+    }
+
+    #[test]
+    fn rewrite_claude_home_multiple_occurrences() {
+        let content = "/home/node/.claude/a /home/node/.claude/b";
+        let result = rewrite_claude_home(content, "/home/node", "/home/vscode");
+        assert_eq!(result, "/home/vscode/.claude/a /home/vscode/.claude/b");
+    }
+
+    #[test]
+    fn rewrite_claude_home_noop_when_same() {
+        let content = "/home/vscode/.claude/plugins";
+        let result = rewrite_claude_home(content, "/home/vscode", "/home/vscode");
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn rewrite_claude_home_macos_to_linux() {
+        let content = r#"{"path": "/Users/alice/.claude/plugins"}"#;
+        let result = rewrite_claude_home(content, "/Users/alice", "/home/vscode");
+        assert_eq!(result, r#"{"path": "/home/vscode/.claude/plugins"}"#);
     }
 }

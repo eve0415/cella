@@ -9,6 +9,7 @@
 mod browser;
 mod control;
 mod credential;
+mod plugin_sync;
 mod port_proxy;
 mod port_watcher;
 mod reconnecting_client;
@@ -160,6 +161,13 @@ async fn run_daemon(poll_interval_ms: u64) {
     let watcher_handle = tokio::spawn(async move {
         port_watcher::run(poll_interval, ctrl, pd, pm).await;
     });
+
+    // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
+    let container_home = std::env::var("HOME").unwrap_or_default();
+    let host_home = std::env::var("CELLA_HOST_HOME").unwrap_or_default();
+    if !host_home.is_empty() && host_home != container_home {
+        tokio::spawn(plugin_sync::run(container_home, host_home));
+    }
 
     // Spawn health reporter
     let ctrl = control.clone();

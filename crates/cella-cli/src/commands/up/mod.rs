@@ -350,6 +350,7 @@ impl UpContext {
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
             create_claude_home_symlink(&self.client, container_id, remote_user).await;
+            setup_plugin_manifests(&self.client, container_id, remote_user).await;
         }
 
         let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
@@ -926,9 +927,10 @@ impl UpContext {
             )
             .await;
 
-        // Create home path symlink for Claude Code plugin resolution
+        // Create home path symlink and populate plugin manifests
         if settings.tools.claude_code.forward_config {
             create_claude_home_symlink(&self.client, container_id, remote_user).await;
+            setup_plugin_manifests(&self.client, container_id, remote_user).await;
         }
 
         // Install AI coding tools
@@ -1618,9 +1620,36 @@ fn add_tool_config_mounts(
             create_opts.mounts.push(MountConfig {
                 mount_type: "bind".to_string(),
                 source: host_path.to_string_lossy().to_string(),
-                target,
+                target: target.clone(),
                 consistency: None,
             });
+
+            // Hidden mount for host plugins (backward sync access)
+            if let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() {
+                create_opts.mounts.push(MountConfig {
+                    mount_type: "bind".to_string(),
+                    source: host_plugins.to_string_lossy().to_string(),
+                    target: "/tmp/.cella/host-plugins".to_string(),
+                    consistency: None,
+                });
+                // tmpfs shadows the parent bind mount's plugins/ subdirectory
+                create_opts.mounts.push(MountConfig {
+                    mount_type: "tmpfs".to_string(),
+                    source: String::new(),
+                    target: format!("{target}/plugins"),
+                    consistency: None,
+                });
+            }
+        }
+
+        // Inject CELLA_HOST_HOME for cella-agent plugin sync
+        if let Some(host_home) = cella_env::claude_code::host_home() {
+            if create_opts.env.is_empty() {
+                // env will be populated by the caller; just push the var
+            }
+            create_opts
+                .env
+                .push(format!("CELLA_HOST_HOME={}", host_home.display()));
         }
     }
 
@@ -1826,6 +1855,63 @@ async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, r
             },
         )
         .await;
+}
+
+/// Populate the tmpfs-backed `~/.claude/plugins/` directory.
+///
+/// Creates symlinks for plugin content (cache/, data/, marketplaces/) pointing
+/// to the hidden host mount at `/tmp/.cella/host-plugins/`, and copies
+/// `installed_plugins.json` and `known_marketplaces.json` with path rewriting.
+async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let Some(host_home) = cella_env::claude_code::host_home() else {
+        return;
+    };
+    let container_home = cella_env::claude_code::container_home(remote_user);
+
+    let host_home_str = host_home.to_string_lossy();
+    if *host_home_str == container_home {
+        return;
+    }
+
+    let plugins_dir = format!("{container_home}/.claude/plugins");
+    let host_plugins = "/tmp/.cella/host-plugins";
+    let old_prefix = format!("{host_home_str}/.claude");
+    let new_prefix = format!("{container_home}/.claude");
+
+    // Symlink all items except the 2 manifest JSONs (which get copied + rewritten)
+    let script = format!(
+        concat!(
+            "[ -d \"{host}\" ] || exit 0; ",
+            "for item in \"{host}\"/* \"{host}\"/.*; do ",
+            "  [ -e \"$item\" ] || continue; ",
+            "  name=$(basename \"$item\"); ",
+            "  case \"$name\" in ",
+            "    .|..) continue ;; ",
+            "    installed_plugins.json|known_marketplaces.json) ",
+            "      [ -f \"$item\" ] && sed 's|{old}|{new}|g' \"$item\" > \"{dir}/$name\" ;; ",
+            "    *) ln -sfn \"$item\" \"{dir}/$name\" ;; ",
+            "  esac; ",
+            "done",
+        ),
+        host = host_plugins,
+        dir = plugins_dir,
+        old = old_prefix,
+        new = new_prefix,
+    );
+
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".into(), "-c".into(), script],
+                user: Some("root".into()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    chown_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
 /// Check if Claude Code is already installed at the desired version.
