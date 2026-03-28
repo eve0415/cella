@@ -79,47 +79,6 @@ jobs:
       - name: Validate snapshots
         run: cargo insta test --workspace --check --unreferenced=reject
 
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-24.04-arm
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Generate coverage
-        run: cargo llvm-cov --workspace > coverage-report.txt
-
-      - name: Build coverage comment
-        id: coverage
-        run: |
-          {
-            echo 'comment<<EOF'
-            echo '## Coverage Report'
-            echo ''
-            echo '```'
-            grep -E '^(Filename|-|TOTAL)' coverage-report.txt
-            echo '```'
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Post coverage comment
-        uses: marocchino/sticky-pull-request-comment@70d2764d1a7d5d9560b100cbea0077fc8f633987 # v3.0.2
-        with:
-          header: coverage
-          message: ${{ steps.coverage.outputs.comment }}
-
   integration-test:
     name: Integration Test
     runs-on: ubuntu-24.04-arm
@@ -143,34 +102,39 @@ jobs:
       - name: Log in to ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Run unit tests with coverage
+        run: cargo llvm-cov --no-report --workspace
+
       - name: Run integration tests with coverage
         run: >
-          cargo llvm-cov
+          cargo llvm-cov --no-report
           -p cella-features
           -p cella-daemon
           -p cella-credential-proxy
           --features integration-tests
-          > integration-coverage-report.txt
 
-      - name: Build integration coverage comment
+      - name: Generate combined coverage report
+        run: cargo llvm-cov report > coverage-report.txt
+
+      - name: Build coverage comment
         if: github.event_name == 'pull_request'
         id: coverage
         run: |
           {
             echo 'comment<<EOF'
-            echo '## Integration Test Coverage'
+            echo '## Coverage Report'
             echo ''
             echo '```'
-            grep -E '^(Filename|-|TOTAL)' integration-coverage-report.txt
+            grep -E '^(Filename|-|TOTAL)' coverage-report.txt
             echo '```'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Post integration coverage comment
+      - name: Post coverage comment
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@70d2764d1a7d5d9560b100cbea0077fc8f633987 # v3.0.2
         with:
-          header: integration-coverage
+          header: coverage
           message: ${{ steps.coverage.outputs.comment }}
 
   cross-compile:
