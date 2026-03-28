@@ -1624,7 +1624,7 @@ async fn apply_git_config(
 
 // ── Tool config mounts ─────────────────────────────────────────────────────
 
-/// Add bind mounts for AI tool config directories (Claude Code, Codex, Gemini).
+/// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
 fn add_tool_config_mounts(
     create_opts: &mut cella_docker::CreateContainerOptions,
     settings: &cella_config::Settings,
@@ -1696,6 +1696,46 @@ fn add_tool_config_mounts(
             target,
             consistency: None,
         });
+    }
+
+    // Nvim: ~/.config/nvim
+    if settings.tools.nvim.forward_config
+        && let Some(host_path) =
+            cella_env::nvim::host_nvim_config_dir(settings.tools.nvim.config_path.as_deref())
+    {
+        let target = cella_env::nvim::container_nvim_config_dir(remote_user);
+        create_opts.mounts.push(MountConfig {
+            mount_type: "bind".to_string(),
+            source: host_path.to_string_lossy().to_string(),
+            target,
+            consistency: None,
+        });
+    }
+
+    // Tmux: ~/.tmux.conf (file) and/or ~/.config/tmux/ (directory)
+    if settings.tools.tmux.forward_config {
+        if let Some(host_path) =
+            cella_env::tmux::host_tmux_conf(settings.tools.tmux.config_path.as_deref())
+        {
+            let target = cella_env::tmux::container_tmux_conf(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
+        if let Some(host_path) =
+            cella_env::tmux::host_tmux_config_dir(settings.tools.tmux.config_path.as_deref())
+        {
+            let target = cella_env::tmux::container_tmux_config_dir(remote_user);
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target,
+                consistency: None,
+            });
+        }
     }
 }
 

@@ -11,9 +11,11 @@ pub mod gemini;
 pub mod gh_credential;
 pub mod git_config;
 pub mod git_credential;
+pub mod nvim;
 pub mod platform;
 pub mod ssh_agent;
 pub mod ssh_config;
+pub mod tmux;
 pub mod user_env_probe;
 
 pub use error::CellaEnvError;

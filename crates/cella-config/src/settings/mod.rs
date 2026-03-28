@@ -2,6 +2,8 @@ mod claude_code;
 mod codex;
 mod credentials;
 mod gemini;
+mod nvim;
+mod tmux;
 
 use std::path::Path;
 
@@ -12,6 +14,8 @@ pub use claude_code::ClaudeCode;
 pub use codex::Codex;
 pub use credentials::Credentials;
 pub use gemini::Gemini;
+pub use nvim::Nvim;
+pub use tmux::Tmux;
 
 /// Tool installation and forwarding settings.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -27,6 +31,14 @@ pub struct Tools {
     /// Google Gemini CLI settings.
     #[serde(default)]
     pub gemini: Gemini,
+
+    /// Neovim settings.
+    #[serde(default)]
+    pub nvim: Nvim,
+
+    /// Tmux settings.
+    #[serde(default)]
+    pub tmux: Tmux,
 }
 
 /// Cella's own settings, loaded from TOML config files.
@@ -102,6 +114,8 @@ impl Settings {
                     claude_code: pt_claude,
                     codex: pt_codex,
                     gemini: pt_gemini,
+                    nvim: pt_nvim,
+                    tmux: pt_tmux,
                 } = pt;
                 Self {
                     credentials: pc,
@@ -109,6 +123,8 @@ impl Settings {
                         claude_code: pt_claude,
                         codex: pt_codex,
                         gemini: pt_gemini,
+                        nvim: pt_nvim,
+                        tmux: pt_tmux,
                     },
                 }
             }
@@ -134,6 +150,11 @@ mod tests {
         assert!(settings.tools.gemini.enabled);
         assert!(settings.tools.gemini.forward_config);
         assert_eq!(settings.tools.gemini.version, "latest");
+        assert!(settings.tools.nvim.forward_config);
+        assert_eq!(settings.tools.nvim.version, "stable");
+        assert!(settings.tools.nvim.config_path.is_none());
+        assert!(settings.tools.tmux.forward_config);
+        assert!(settings.tools.tmux.config_path.is_none());
     }
 
     #[test]
@@ -182,6 +203,15 @@ version = "0.1.2"
 [tools.gemini]
 enabled = false
 version = "0.5.0"
+
+[tools.nvim]
+forward_config = false
+version = "0.10.3"
+config_path = "~/dotfiles/nvim"
+
+[tools.tmux]
+forward_config = false
+config_path = "~/dotfiles/.tmux.conf"
 "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.credentials.gh);
@@ -191,6 +221,17 @@ version = "0.5.0"
         assert_eq!(settings.tools.codex.version, "0.1.2");
         assert!(!settings.tools.gemini.enabled);
         assert_eq!(settings.tools.gemini.version, "0.5.0");
+        assert!(!settings.tools.nvim.forward_config);
+        assert_eq!(settings.tools.nvim.version, "0.10.3");
+        assert_eq!(
+            settings.tools.nvim.config_path.as_deref(),
+            Some("~/dotfiles/nvim")
+        );
+        assert!(!settings.tools.tmux.forward_config);
+        assert_eq!(
+            settings.tools.tmux.config_path.as_deref(),
+            Some("~/dotfiles/.tmux.conf")
+        );
     }
 
     #[test]

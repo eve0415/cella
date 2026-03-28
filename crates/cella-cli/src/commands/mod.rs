@@ -21,6 +21,7 @@ mod prune;
 mod read_configuration;
 mod shell;
 pub mod shell_detect;
+mod tmux;
 
 mod switch;
 mod template;
@@ -72,8 +73,10 @@ pub enum Command {
     Init(init::InitArgs),
     /// Open VS Code connected to the dev container.
     Code(code::CodeArgs),
-    /// Open neovim connected to the dev container.
+    /// Open neovim inside the dev container.
     Nvim(nvim::NvimArgs),
+    /// Open a persistent tmux session inside the dev container.
+    Tmux(tmux::TmuxArgs),
     /// View port forwarding status for dev containers.
     Ports(ports::PortsArgs),
     /// Manage credential forwarding for dev containers.
@@ -95,6 +98,8 @@ impl Command {
         match self {
             Self::Up(args) => args.is_text_output(),
             Self::Code(args) => args.is_text_output(),
+            Self::Nvim(args) => args.is_text_output(),
+            Self::Tmux(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
             Self::ReadConfiguration(_) => false,
@@ -107,6 +112,8 @@ impl Command {
         let verbose = match self {
             Self::Up(args) => args.verbose.verbose,
             Self::Code(args) => args.up.verbose.verbose,
+            Self::Nvim(args) => args.up.verbose.verbose,
+            Self::Tmux(args) => args.up.verbose.verbose,
             Self::Build(args) => args.verbose.verbose,
             Self::Branch(args) => args.verbose.verbose,
             Self::Down(args) => args.verbose.verbose,
@@ -144,7 +151,8 @@ impl Command {
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Init(args) => args.execute(),
-            Self::Nvim(args) => args.execute(),
+            Self::Nvim(args) => args.execute(progress).await,
+            Self::Tmux(args) => args.execute(progress).await,
             Self::Credential(args) => args.execute().await,
             Self::CredentialProxy(args) => args.execute().await,
             Self::Ports(args) => args.execute().await,
