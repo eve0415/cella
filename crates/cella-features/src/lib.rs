@@ -10,6 +10,9 @@ pub mod ordering;
 pub mod reference;
 pub mod types;
 
+#[cfg(test)]
+mod test_utils;
+
 pub use cache::FeatureCache;
 pub use dockerfile::{
     generate_builtin_env, generate_dockerfile, generate_entrypoint_script, generate_feature_env,
@@ -622,17 +625,7 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "integration-tests")]
-    fn test_platform() -> Platform {
-        let architecture = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            other => other,
-        };
-        Platform {
-            os: "linux".to_string(),
-            architecture: architecture.to_string(),
-        }
-    }
+    use crate::test_utils::test_platform;
 
     // -----------------------------------------------------------------------
     // generate_metadata_label
