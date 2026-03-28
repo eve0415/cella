@@ -79,13 +79,14 @@ jobs:
       - name: Validate snapshots
         run: cargo insta test --workspace --check --unreferenced=reject
 
-  coverage:
-    name: Coverage
+  integration-test:
+    name: Integration Test
     runs-on: ubuntu-24.04-arm
-    if: github.event_name == 'pull_request'
     permissions:
       contents: read
+      packages: read
       pull-requests: write
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -98,10 +99,25 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate coverage
-        run: cargo llvm-cov --workspace > coverage-report.txt
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Run unit tests with coverage
+        run: cargo llvm-cov --no-report --workspace
+
+      - name: Run integration tests with coverage
+        run: >
+          cargo llvm-cov --no-report
+          -p cella-features
+          -p cella-daemon
+          -p cella-credential-proxy
+          --features integration-tests
+
+      - name: Generate combined coverage report
+        run: cargo llvm-cov report > coverage-report.txt
 
       - name: Build coverage comment
+        if: github.event_name == 'pull_request'
         id: coverage
         run: |
           {
@@ -115,6 +131,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post coverage comment
+        if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@70d2764d1a7d5d9560b100cbea0077fc8f633987 # v3.0.2
         with:
           header: coverage

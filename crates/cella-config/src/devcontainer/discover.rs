@@ -243,19 +243,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let custom_path = tmp.path().join("custom").join("my-devcontainer.json");
         create_file(&custom_path);
-        let resolved =
-            crate::resolve::config(tmp.path(), Some(&custom_path)).unwrap();
+        let resolved = crate::resolve::config(tmp.path(), Some(&custom_path)).unwrap();
         assert_eq!(resolved.config_path, custom_path);
     }
 
     #[test]
     fn spec_no_parent_traversal() {
         let tmp = TempDir::new().unwrap();
-        create_file(
-            &tmp.path()
-                .join(".devcontainer")
-                .join("devcontainer.json"),
-        );
+        create_file(&tmp.path().join(".devcontainer").join("devcontainer.json"));
         let subdir = tmp.path().join("subproject");
         std::fs::create_dir_all(&subdir).unwrap();
         let result = config(&subdir);

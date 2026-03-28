@@ -387,7 +387,11 @@ mod tests {
         let mut sorted = cap_strs.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(cap_strs.len(), sorted.len(), "capAdd should have no duplicates");
+        assert_eq!(
+            cap_strs.len(),
+            sorted.len(),
+            "capAdd should have no duplicates"
+        );
     }
 
     #[test]
@@ -405,7 +409,11 @@ mod tests {
         let mut sorted = opt_strs.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(opt_strs.len(), sorted.len(), "securityOpt should have no duplicates");
+        assert_eq!(
+            opt_strs.len(),
+            sorted.len(),
+            "securityOpt should have no duplicates"
+        );
     }
 
     #[test]
@@ -424,7 +432,11 @@ mod tests {
         let mut sorted = port_nums.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(port_nums.len(), sorted.len(), "forwardPorts should have no duplicates");
+        assert_eq!(
+            port_nums.len(),
+            sorted.len(),
+            "forwardPorts should have no duplicates"
+        );
     }
 
     #[test]
@@ -523,7 +535,8 @@ mod tests {
     #[test]
     fn spec_ports_attributes_per_port_last_wins() {
         let mut base = json!({"portsAttributes": {"3000": {"label": "app"}}});
-        let overlay = json!({"portsAttributes": {"3000": {"label": "frontend"}, "8080": {"label": "api"}}});
+        let overlay =
+            json!({"portsAttributes": {"3000": {"label": "frontend"}, "8080": {"label": "api"}}});
         layers(&mut base, &overlay);
         assert_eq!(base["portsAttributes"]["3000"]["label"], "frontend");
         assert_eq!(base["portsAttributes"]["8080"]["label"], "api");
@@ -534,7 +547,10 @@ mod tests {
         let mut base = json!({"hostRequirements": {"cpus": 2, "memory": "4gb"}});
         let overlay = json!({"hostRequirements": {"cpus": 4, "memory": "2gb"}});
         layers(&mut base, &overlay);
-        assert_eq!(base["hostRequirements"]["cpus"], 4, "cpus should use max value");
+        assert_eq!(
+            base["hostRequirements"]["cpus"], 4,
+            "cpus should use max value"
+        );
         assert_eq!(
             base["hostRequirements"]["memory"], "4gb",
             "memory should use max value (4gb > 2gb)"
@@ -544,9 +560,13 @@ mod tests {
     #[test]
     fn spec_customizations_deep_merge() {
         let mut base = json!({"customizations": {"vscode": {"extensions": ["ext1"]}}});
-        let overlay = json!({"customizations": {"vscode": {"settings": {}}, "cella": {"key": "val"}}});
+        let overlay =
+            json!({"customizations": {"vscode": {"settings": {}}, "cella": {"key": "val"}}});
         layers(&mut base, &overlay);
-        assert_eq!(base["customizations"]["vscode"]["extensions"], json!(["ext1"]));
+        assert_eq!(
+            base["customizations"]["vscode"]["extensions"],
+            json!(["ext1"])
+        );
         assert_eq!(base["customizations"]["vscode"]["settings"], json!({}));
         assert_eq!(base["customizations"]["cella"]["key"], "val");
     }

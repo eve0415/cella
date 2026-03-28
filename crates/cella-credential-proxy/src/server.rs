@@ -198,7 +198,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TCP port binding"]
     async fn tcp_server_reuses_port() {
         let dir = tempfile::tempdir().unwrap();
         let port_path = dir.path().join("test.port");

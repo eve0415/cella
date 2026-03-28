@@ -10,6 +10,9 @@ pub mod ordering;
 pub mod reference;
 pub mod types;
 
+#[cfg(test)]
+mod test_utils;
+
 pub use cache::FeatureCache;
 pub use dockerfile::{
     generate_builtin_env, generate_dockerfile, generate_entrypoint_script, generate_feature_env,
@@ -621,6 +624,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "integration-tests")]
+    use crate::test_utils::test_platform;
+
     // -----------------------------------------------------------------------
     // generate_metadata_label
     // -----------------------------------------------------------------------
@@ -1085,7 +1091,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires Docker and network access"]
+    #[cfg(feature = "integration-tests")]
     async fn e2e_resolve_node_feature() {
         let config = json!({
             "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
@@ -1100,10 +1106,7 @@ mod tests {
         let config_path = tmp.path().join("devcontainer.json");
         std::fs::write(&config_path, config.to_string()).unwrap();
 
-        let platform = Platform {
-            os: "linux".to_string(),
-            architecture: "amd64".to_string(),
-        };
+        let platform = test_platform();
         let cache = FeatureCache::new();
 
         let result = resolve_features(
