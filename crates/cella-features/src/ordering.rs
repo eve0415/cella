@@ -610,7 +610,13 @@ mod tests {
     fn option_key_to_env_var(key: &str) -> String {
         let mut result: String = key
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let first_valid = result
             .chars()

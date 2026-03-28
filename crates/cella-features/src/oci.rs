@@ -364,6 +364,19 @@ fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::
 mod tests {
     use super::*;
 
+    #[cfg(feature = "integration-tests")]
+    fn test_platform() -> Platform {
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        Platform {
+            os: "linux".to_string(),
+            architecture: architecture.to_string(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests
     // -----------------------------------------------------------------------
@@ -543,7 +556,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires network access to ghcr.io"]
+    #[cfg(feature = "integration-tests")]
     async fn fetch_node_feature_from_ghcr() {
         let fetcher = OciFetcher::new();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -555,10 +568,7 @@ mod tests {
             tag: "1".to_owned(),
         };
 
-        let platform = Platform {
-            os: "linux".to_owned(),
-            architecture: "amd64".to_owned(),
-        };
+        let platform = test_platform();
 
         let path = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
 
@@ -580,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network access to ghcr.io"]
+    #[cfg(feature = "integration-tests")]
     async fn fetch_github_cli_feature_from_ghcr() {
         let fetcher = OciFetcher::new();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -592,10 +602,7 @@ mod tests {
             tag: "1".to_owned(),
         };
 
-        let platform = Platform {
-            os: "linux".to_owned(),
-            architecture: "amd64".to_owned(),
-        };
+        let platform = test_platform();
 
         let path = fetcher.fetch(&reference, &platform, &cache).await.unwrap();
 

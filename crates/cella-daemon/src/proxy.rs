@@ -151,7 +151,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires TCP port binding"]
     async fn proxy_starts_and_stops() {
         let target = ProxyTarget::DirectIp {
             ip: "127.0.0.1".to_string(),

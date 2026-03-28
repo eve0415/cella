@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Docker"]
+    #[cfg(feature = "integration-tests")]
     fn running_container_count_with_no_containers() {
         let count = running_cella_container_count();
         assert_eq!(count, 0);

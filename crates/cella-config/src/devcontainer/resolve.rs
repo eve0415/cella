@@ -317,9 +317,7 @@ mod tests {
                 let quotient = current / 32;
                 remainder = current % 32;
                 if !new_digits.is_empty() || quotient > 0 {
-                    new_digits.push(
-                        u8::try_from(quotient).expect("quotient fits in u8"),
-                    );
+                    new_digits.push(u8::try_from(quotient).expect("quotient fits in u8"));
                 }
             }
             let r = u8::try_from(remainder).expect("remainder fits in u8");
@@ -334,9 +332,7 @@ mod tests {
         }
     }
 
-    fn spec_devcontainer_id(
-        labels: &std::collections::BTreeMap<String, String>,
-    ) -> String {
+    fn spec_devcontainer_id(labels: &std::collections::BTreeMap<String, String>) -> String {
         let json = serde_json::to_string(labels).expect("serialize");
         let hash = Sha256::digest(json.as_bytes());
         let num = bytes_to_bigint(&hash);
@@ -373,10 +369,7 @@ mod tests {
             "devcontainer.local_folder".to_string(),
             "/home/user/project".to_string(),
         );
-        assert_eq!(
-            spec_devcontainer_id(&labels),
-            spec_devcontainer_id(&labels)
-        );
+        assert_eq!(spec_devcontainer_id(&labels), spec_devcontainer_id(&labels));
     }
 
     #[test]

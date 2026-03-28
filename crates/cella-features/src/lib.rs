@@ -621,6 +621,19 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "integration-tests")]
+    fn test_platform() -> Platform {
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        Platform {
+            os: "linux".to_string(),
+            architecture: architecture.to_string(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // generate_metadata_label
     // -----------------------------------------------------------------------
@@ -1085,7 +1098,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires Docker and network access"]
+    #[cfg(feature = "integration-tests")]
     async fn e2e_resolve_node_feature() {
         let config = json!({
             "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
@@ -1100,10 +1113,7 @@ mod tests {
         let config_path = tmp.path().join("devcontainer.json");
         std::fs::write(&config_path, config.to_string()).unwrap();
 
-        let platform = Platform {
-            os: "linux".to_string(),
-            architecture: "amd64".to_string(),
-        };
+        let platform = test_platform();
         let cache = FeatureCache::new();
 
         let result = resolve_features(

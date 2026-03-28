@@ -16,5 +16,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[features]
+integration-tests = []
+
 [lints]
 workspace = true
