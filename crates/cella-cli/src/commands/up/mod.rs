@@ -27,39 +27,39 @@ pub struct UpArgs {
 
     /// Rebuild the container image before starting.
     #[arg(long)]
-    rebuild: bool,
+    pub(crate) rebuild: bool,
 
     /// Do not use cache when building the image.
     #[arg(long)]
-    build_no_cache: bool,
+    pub(crate) build_no_cache: bool,
 
     /// Remove existing container before starting.
     #[arg(long)]
-    remove_existing_container: bool,
+    pub(crate) remove_existing_container: bool,
 
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
-    workspace_folder: Option<PathBuf>,
+    pub(crate) workspace_folder: Option<PathBuf>,
 
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
-    docker_host: Option<String>,
+    pub(crate) docker_host: Option<String>,
 
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
-    file: Option<PathBuf>,
+    pub(crate) file: Option<PathBuf>,
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
-    output: OutputFormat,
+    pub(crate) output: OutputFormat,
 
     /// Strictness level for validation ("host-requirements" to fail on unmet requirements).
     #[arg(long)]
-    strict: Vec<String>,
+    pub(crate) strict: Vec<String>,
 
     /// Skip SHA256 checksum verification for agent binary download.
     #[arg(long)]
-    skip_checksum: bool,
+    pub(crate) skip_checksum: bool,
 }
 
 /// Output format for container commands.
@@ -101,7 +101,7 @@ struct ImageConfig {
 }
 
 impl UpContext {
-    async fn new(
+    pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -397,7 +397,7 @@ impl UpContext {
         &self,
         container: &ContainerInfo,
         remote_user: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<UpResult, Box<dyn std::error::Error>> {
         super::ensure_cella_daemon().await;
 
         // Check for previous background lifecycle failure
@@ -450,26 +450,24 @@ impl UpContext {
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
-        output_result(
-            &self.output,
-            "running",
-            &container.id,
-            remote_user,
-            self.workspace_folder_str(),
-        );
-        Ok(())
+        Ok(UpResult {
+            container_id: container.id.clone(),
+            remote_user: remote_user.to_string(),
+            outcome: "running".to_string(),
+            workspace_folder: self.workspace_folder_str().to_string(),
+        })
     }
 
     /// Handle a stopped container: try to restart it.
     ///
-    /// Returns `Ok(true)` if the container was successfully restarted (caller should return),
-    /// `Ok(false)` if restart failed and the container was removed (caller should fall through
-    /// to the create path).
+    /// Returns `Ok(Some(result))` if the container was successfully restarted,
+    /// `Ok(None)` if restart failed and the container was removed (caller should
+    /// fall through to the create path).
     async fn handle_stopped(
         &self,
         container: &ContainerInfo,
         remote_user: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<Option<UpResult>, Box<dyn std::error::Error>> {
         super::ensure_cella_daemon().await;
 
         // Warn if config has changed
@@ -523,14 +521,12 @@ impl UpContext {
                     run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
                 }
 
-                output_result(
-                    &self.output,
-                    "started",
-                    &container.id,
-                    remote_user,
-                    self.workspace_folder_str(),
-                );
-                Ok(true)
+                Ok(Some(UpResult {
+                    container_id: container.id.clone(),
+                    remote_user: remote_user.to_string(),
+                    outcome: "started".to_string(),
+                    workspace_folder: self.workspace_folder_str().to_string(),
+                }))
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
@@ -539,7 +535,7 @@ impl UpContext {
                 self.progress.hint("Recreating container...");
                 let _ = self.client.remove_container(&container.id, false).await;
                 // Fall through to creation path
-                Ok(false)
+                Ok(None)
             }
         }
     }
@@ -1181,14 +1177,6 @@ impl UpContext {
         )
         .await;
 
-        output_result(
-            &self.output,
-            "created",
-            &container_id,
-            &remote_user,
-            self.workspace_folder_str(),
-        );
-
         Ok(CreateResult {
             container_id: container_id.clone(),
             remote_user: remote_user.clone(),
@@ -1202,30 +1190,40 @@ pub struct CreateResult {
     pub remote_user: String,
 }
 
-impl UpArgs {
-    pub async fn execute(
-        self,
-        progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = UpContext::new(&self, progress).await?;
+/// Result of ensuring a container is up and ready.
+pub struct UpResult {
+    pub container_id: String,
+    pub remote_user: String,
+    pub outcome: String,
+    pub workspace_folder: String,
+}
 
+impl UpContext {
+    /// Ensure a container is up and ready, returning the result without printing output.
+    ///
+    /// This is the core logic shared by `cella up` and `cella code`.
+    /// It handles existing containers (running, stopped) and creates new ones as needed.
+    pub async fn ensure_up(
+        &self,
+        build_no_cache: bool,
+        strict: &[String],
+    ) -> Result<UpResult, Box<dyn std::error::Error>> {
         // Validate hostRequirements
-        if ctx.config().get("hostRequirements").is_some() {
+        if self.config().get("hostRequirements").is_some() {
             let result = cella_doctor::host_requirements::validate(
-                ctx.config(),
-                &ctx.resolved.workspace_root,
+                self.config(),
+                &self.resolved.workspace_root,
             );
             for check in &result.checks {
                 if !check.met {
-                    ctx.progress.warn(&format!(
+                    self.progress.warn(&format!(
                         "Host does not meet requirement: {} (need {}, have {})",
                         check.name, check.required, check.actual
                     ));
                 }
             }
             if !result.all_met
-                && self
-                    .strict
+                && strict
                     .iter()
                     .any(|s| s == "host-requirements" || s == "all")
             {
@@ -1234,50 +1232,86 @@ impl UpArgs {
         }
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
-        if ctx.config().get("dockerComposeFile").is_some() {
-            return super::compose_up::compose_up(ctx).await;
+        if self.config().get("dockerComposeFile").is_some() {
+            // Compose flow still uses the old path with its own output_result calls.
+            // For now, compose + code is not supported via ensure_up; callers should
+            // use compose_up directly.
+            return Err(
+                "Docker Compose projects are not yet supported with `cella code`. \
+                 Use `cella up` first, then `cella code`."
+                    .into(),
+            );
         }
 
-        let existing = ctx
+        let existing = self
             .client
-            .find_container(&ctx.resolved.workspace_root)
+            .find_container(&self.resolved.workspace_root)
             .await?;
 
         if let Some(container) = existing {
-            let remote_user = ctx.resolve_remote_user_from_container(&container).await;
+            let remote_user = self.resolve_remote_user_from_container(&container).await;
 
-            match (&container.state, ctx.remove_container) {
-                (ContainerState::Running, false) if !ctx.build_no_cache => {
-                    return ctx.handle_running(&container, &remote_user).await;
+            match (&container.state, self.remove_container) {
+                (ContainerState::Running, false) if !build_no_cache => {
+                    return self.handle_running(&container, &remote_user).await;
                 }
                 (ContainerState::Stopped, false) => {
-                    if ctx.handle_stopped(&container, &remote_user).await? {
-                        return Ok(());
+                    if let Some(result) = self.handle_stopped(&container, &remote_user).await? {
+                        return Ok(result);
                     }
                     // Fall through to create_and_start
                 }
                 (ContainerState::Running, false) => {
                     // build_no_cache=true with running container: stop, remove, rebuild
-                    ctx.remove_existing(&container, "--build-no-cache").await?;
+                    self.remove_existing(&container, "--build-no-cache").await?;
                 }
                 (ContainerState::Running, true) => {
-                    ctx.remove_existing(&container, "rebuild").await?;
+                    self.remove_existing(&container, "rebuild").await?;
                 }
                 (_, true) => {
                     // Rebuild: stop if running, then remove
                     if container.state == ContainerState::Running {
-                        ctx.client.stop_container(&container.id).await?;
+                        self.client.stop_container(&container.id).await?;
                     }
-                    ctx.client.remove_container(&container.id, false).await?;
+                    self.client.remove_container(&container.id, false).await?;
                 }
                 (_, false) => {
                     // Created but never started, or other state — remove and recreate
-                    ctx.client.remove_container(&container.id, false).await?;
+                    self.client.remove_container(&container.id, false).await?;
                 }
             }
         }
 
-        ctx.create_and_start(self.build_no_cache).await?;
+        let create_result = self.create_and_start(build_no_cache).await?;
+        Ok(UpResult {
+            container_id: create_result.container_id,
+            remote_user: create_result.remote_user,
+            outcome: "created".to_string(),
+            workspace_folder: self.workspace_folder_str().to_string(),
+        })
+    }
+}
+
+impl UpArgs {
+    pub async fn execute(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = UpContext::new(&self, progress).await?;
+
+        // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
+        if ctx.config().get("dockerComposeFile").is_some() {
+            return super::compose_up::compose_up(ctx).await;
+        }
+
+        let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
+        output_result(
+            &ctx.output,
+            &result.outcome,
+            &result.container_id,
+            &result.remote_user,
+            &result.workspace_folder,
+        );
         Ok(())
     }
 }

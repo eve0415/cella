@@ -1,5 +1,6 @@
 mod branch;
 mod build;
+mod code;
 pub mod compose_features;
 mod compose_up;
 mod config;
@@ -69,6 +70,8 @@ pub enum Command {
     Template(template::TemplateArgs),
     /// Initialize cella in the current repository.
     Init(init::InitArgs),
+    /// Open VS Code connected to the dev container.
+    Code(code::CodeArgs),
     /// Open neovim connected to the dev container.
     Nvim(nvim::NvimArgs),
     /// View port forwarding status for dev containers.
@@ -91,6 +94,7 @@ impl Command {
     pub const fn is_text_output(&self) -> bool {
         match self {
             Self::Up(args) => args.is_text_output(),
+            Self::Code(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
             Self::ReadConfiguration(_) => false,
@@ -102,6 +106,7 @@ impl Command {
     pub const fn verbosity(&self) -> Verbosity {
         let verbose = match self {
             Self::Up(args) => args.verbose.verbose,
+            Self::Code(args) => args.up.verbose.verbose,
             Self::Build(args) => args.verbose.verbose,
             Self::Branch(args) => args.verbose.verbose,
             Self::Down(args) => args.verbose.verbose,
@@ -123,6 +128,7 @@ impl Command {
     pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Up(args) => args.execute(progress).await,
+            Self::Code(args) => args.execute(progress).await,
             Self::Down(args) => args.execute().await,
             Self::Shell(args) => args.execute().await,
             Self::Exec(args) => args.execute().await,
