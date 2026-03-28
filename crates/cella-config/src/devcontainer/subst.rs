@@ -111,13 +111,19 @@ impl SubstitutionContext {
             }
             "containerEnv" => {
                 // Container not running at resolve time — use default or empty
-                let _ = parts.next(); // advance past var name to reach default
+                parts.next(); // advance past var name to reach default
                 let default = parts.next().unwrap_or("");
                 default.to_string()
             }
             "localWorkspaceFolder" => self.local_workspace_folder.clone(),
             "containerWorkspaceFolder" => self.container_workspace_folder.clone(),
             "localWorkspaceFolderBasename" => self.local_workspace_folder_basename.clone(),
+            "containerWorkspaceFolderBasename" => {
+                // Extract the last path component from the container workspace folder
+                Path::new(&self.container_workspace_folder)
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().to_string())
+            }
             "devcontainerId" => self.devcontainer_id.clone(),
             _ => format!("${{{expr}}}"),
         }
@@ -212,10 +218,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::literal_string_with_formatting_args)] // devcontainer ${} syntax, not Rust format args
     fn multiple_variables_in_one_string() {
         let ctx = test_ctx();
-        let input = "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json";
+        let input = concat!(
+            "source=${localEnv:HOME}",
+            "/.claude.json,target=/home/vscode/.claude.json"
+        );
         assert_eq!(
             ctx.substitute_str(input),
             "source=/home/testuser/.claude.json,target=/home/vscode/.claude.json"
@@ -241,12 +249,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::literal_string_with_formatting_args)] // devcontainer ${} syntax, not Rust format args
     fn substitute_value_walks_json() {
         let ctx = test_ctx();
-        let mount_entry = "source=${localEnv:HOME}/.config,target=/home/user/.config";
-        let workspace_var = "${containerWorkspaceFolder}";
-        let env_var = "${localEnv:HOME}";
+        let mount_entry = concat!(
+            "source=${localEnv:HOME}",
+            "/.config,target=/home/user/.config"
+        );
+        let workspace_var = concat!("${containerWorkspaceFolder", "}");
+        let env_var = concat!("${localEnv:HOME", "}");
         let mut value = serde_json::json!({
             "mounts": [
                 mount_entry,
@@ -326,5 +336,150 @@ mod tests {
         assert_eq!(ctx.container_workspace_folder, "/custom/path");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // --- Spec compliance tests ---
+    // Reference: https://containers.dev/implementors/json_reference/#variables-in-devcontainerjson
+
+    fn spec_ctx_with_env(env: HashMap<String, String>) -> SubstitutionContext {
+        let tmp = std::env::temp_dir().join("spec_test_ws");
+        std::fs::create_dir_all(&tmp).ok();
+        SubstitutionContext::new(
+            &tmp,
+            Some("/workspaces/myproject"),
+            "test-devcontainer-id-52chars00000000000000000000000",
+            env,
+        )
+    }
+
+    fn spec_default_ctx() -> SubstitutionContext {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
+        env.insert("EMPTY".to_string(), String::new());
+        spec_ctx_with_env(env)
+    }
+
+    #[test]
+    fn spec_local_env_resolves_to_host_var() {
+        let ctx = spec_default_ctx();
+        assert_eq!(ctx.substitute_str("${localEnv:HOME}"), "/home/user");
+    }
+
+    #[test]
+    fn spec_local_env_missing_resolves_to_empty() {
+        let ctx = spec_default_ctx();
+        assert_eq!(ctx.substitute_str("${localEnv:NONEXISTENT}"), "");
+    }
+
+    #[test]
+    fn spec_local_env_uses_default_when_missing() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${localEnv:NONEXISTENT:fallback}"),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn spec_local_env_ignores_default_when_present() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${localEnv:HOME:fallback}"),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn spec_local_env_empty_value_is_not_default() {
+        let ctx = spec_default_ctx();
+        assert_eq!(ctx.substitute_str("${localEnv:EMPTY:fallback}"), "");
+    }
+
+    #[test]
+    fn spec_local_env_default_with_colons() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${localEnv:NONEXISTENT:/usr/bin:/usr/local/bin}"),
+            "/usr/bin:/usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn spec_container_env_resolves_to_empty_at_config_time() {
+        let ctx = spec_default_ctx();
+        assert_eq!(ctx.substitute_str("${containerEnv:PATH}"), "");
+    }
+
+    #[test]
+    fn spec_container_env_uses_default_at_config_time() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:SHELL:/bin/bash}"),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn spec_local_workspace_folder_resolves() {
+        let ctx = spec_default_ctx();
+        let result = ctx.substitute_str("${localWorkspaceFolder}");
+        assert!(!result.is_empty());
+        assert!(!result.contains("${"));
+    }
+
+    #[test]
+    fn spec_container_workspace_folder_resolves() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${containerWorkspaceFolder}"),
+            "/workspaces/myproject"
+        );
+    }
+
+    #[test]
+    fn spec_local_workspace_folder_basename_resolves() {
+        let ctx = spec_default_ctx();
+        let result = ctx.substitute_str("${localWorkspaceFolderBasename}");
+        assert!(!result.is_empty());
+        assert!(!result.contains('/'));
+    }
+
+    #[test]
+    fn spec_container_workspace_folder_basename_resolves() {
+        let ctx = spec_default_ctx();
+        assert_eq!(
+            ctx.substitute_str("${containerWorkspaceFolderBasename}"),
+            "myproject"
+        );
+    }
+
+    #[test]
+    fn spec_devcontainer_id_resolves() {
+        let ctx = spec_default_ctx();
+        let result = ctx.substitute_str("${devcontainerId}");
+        assert!(!result.is_empty());
+        assert!(!result.contains("${"));
+    }
+
+    #[test]
+    fn spec_multiple_variables_in_one_string() {
+        let ctx = spec_default_ctx();
+        let input = concat!(
+            "source=${localEnv:HOME}/.config,",
+            "target=${containerWorkspaceFolder}/.config"
+        );
+        let result = ctx.substitute_str(input);
+        assert_eq!(
+            result,
+            "source=/home/user/.config,target=/workspaces/myproject/.config"
+        );
+    }
+
+    #[test]
+    fn spec_container_env_substitution_works_syntactically() {
+        let ctx = spec_default_ctx();
+        let result = ctx.substitute_str("${containerEnv:SOME_VAR:default_value}");
+        assert_eq!(result, "default_value");
     }
 }

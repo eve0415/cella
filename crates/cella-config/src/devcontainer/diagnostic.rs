@@ -1,5 +1,4 @@
 //! Maps validation errors to developer-friendly diagnostics with source spans.
-#![allow(unused_assignments)]
 
 use std::fmt::Write;
 
@@ -28,7 +27,6 @@ pub struct Diagnostic {
 /// A renderable diagnostic with source context, implementing `miette::Diagnostic`.
 #[derive(Debug, Error, miette::Diagnostic)]
 #[error("{message}")]
-#[allow(unused_assignments, clippy::missing_const_for_fn)]
 pub struct Renderable {
     message: String,
 

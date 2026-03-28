@@ -132,18 +132,18 @@ pub async fn ensure_image(
     }
 
     // Resolve and build features layer
-    let (features_image, resolved) = resolve_and_build_features(
+    let input = FeaturesBuildInput {
         client,
         config,
         config_path,
         workspace_root,
         config_name,
-        &base_image_tag,
-        &base_image_details,
+        base_image_tag: &base_image_tag,
+        base_image_details: &base_image_details,
         no_cache,
         progress,
-    )
-    .await?;
+    };
+    let (features_image, resolved) = resolve_and_build_features(&input).await?;
 
     Ok((features_image, Some(resolved), base_image_details))
 }
@@ -190,47 +190,51 @@ async fn resolve_base_image(
     }
 }
 
-/// Resolve features and build the features layer image.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_and_build_features(
-    client: &DockerClient,
-    config: &serde_json::Value,
-    config_path: &Path,
-    workspace_root: &Path,
-    config_name: Option<&str>,
-    base_image_tag: &str,
-    base_image_details: &ImageDetails,
+/// Inputs for resolving and building the features layer image.
+struct FeaturesBuildInput<'a> {
+    client: &'a DockerClient,
+    config: &'a serde_json::Value,
+    config_path: &'a Path,
+    workspace_root: &'a Path,
+    config_name: Option<&'a str>,
+    base_image_tag: &'a str,
+    base_image_details: &'a ImageDetails,
     no_cache: bool,
-    progress: &Progress,
+    progress: &'a Progress,
+}
+
+/// Resolve features and build the features layer image.
+async fn resolve_and_build_features(
+    input: &FeaturesBuildInput<'_>,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
     info!("Resolving devcontainer features...");
-    let platform = cella_features::oci::detect_platform(client.inner())
+    let platform = cella_features::oci::detect_platform(input.client.inner())
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
     let cache = cella_features::FeatureCache::new();
 
     let resolved = cella_features::resolve_features(
-        config,
-        config_path,
+        input.config,
+        input.config_path,
         &platform,
         &cache,
-        base_image_tag,
-        &base_image_details.user,
-        base_image_details.metadata.as_deref(),
+        input.base_image_tag,
+        &input.base_image_details.user,
+        input.base_image_details.metadata.as_deref(),
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;
 
     let ctx = FeaturesLayerContext {
-        client,
-        config,
-        workspace_root,
-        config_name,
+        client: input.client,
+        config: input.config,
+        workspace_root: input.workspace_root,
+        config_name: input.config_name,
         resolved: &resolved,
-        base_image: base_image_tag,
-        image_user: &base_image_details.user,
-        no_cache,
-        progress,
+        base_image: input.base_image_tag,
+        image_user: &input.base_image_details.user,
+        no_cache: input.no_cache,
+        progress: input.progress,
     };
     let features_image = build_features_layer(&ctx).await?;
 

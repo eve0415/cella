@@ -369,4 +369,115 @@ mod tests {
         assert_eq!(lines[0], "      content");
         assert_eq!(lines[1], "      another");
     }
+
+    // --- Spec compliance tests ---
+    // Reference: https://containers.dev/implementors/spec/#lifecycle-scripts
+
+    #[test]
+    fn spec_string_command_wrapped_in_sh() {
+        let value = json!("echo hello && echo world");
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert_eq!(cmds[0][0], "sh");
+                assert_eq!(cmds[0][1], "-c");
+                assert_eq!(cmds[0][2], "echo hello && echo world");
+            }
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn spec_array_command_executed_directly() {
+        let value = json!(["echo", "hello", "world"]);
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert_eq!(cmds[0], vec!["echo", "hello", "world"]);
+            }
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn spec_object_command_is_parallel() {
+        let value = json!({"setup": "npm install", "db": ["mysql", "-u", "root"]});
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Parallel(cmds) => {
+                assert_eq!(cmds.len(), 2);
+                let setup = cmds.iter().find(|(n, _)| n == "setup").unwrap();
+                assert_eq!(setup.1, vec!["sh", "-c", "npm install"]);
+                let db = cmds.iter().find(|(n, _)| n == "db").unwrap();
+                assert_eq!(db.1, vec!["mysql", "-u", "root"]);
+            }
+            ParsedLifecycle::Sequential(_) => panic!("expected Parallel"),
+        }
+    }
+
+    #[test]
+    fn spec_object_string_values_wrapped_in_sh() {
+        let value = json!({"server": "npm start", "client": "npm run dev"});
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Parallel(cmds) => {
+                for (_, cmd) in &cmds {
+                    assert_eq!(cmd[0], "sh");
+                    assert_eq!(cmd[1], "-c");
+                }
+            }
+            ParsedLifecycle::Sequential(_) => panic!("expected Parallel"),
+        }
+    }
+
+    #[test]
+    fn spec_empty_string_is_valid_command() {
+        let value = json!("");
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert_eq!(cmds[0], vec!["sh", "-c", ""]);
+            }
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn spec_empty_object_no_parallel_commands() {
+        let value = json!({});
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Parallel(cmds) => assert!(cmds.is_empty()),
+            ParsedLifecycle::Sequential(_) => panic!("expected Parallel"),
+        }
+    }
+
+    #[test]
+    fn spec_lifecycle_phase_order() {
+        let phases = [
+            "initializeCommand",
+            "onCreateCommand",
+            "updateContentCommand",
+            "postCreateCommand",
+            "postStartCommand",
+            "postAttachCommand",
+        ];
+        for i in 0..phases.len() - 1 {
+            assert!(
+                phases.iter().position(|p| *p == phases[i]).unwrap()
+                    < phases.iter().position(|p| *p == phases[i + 1]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn spec_resume_only_post_start_and_attach() {
+        let resume_phases = ["postStartCommand", "postAttachCommand"];
+        let creation_only = [
+            "initializeCommand",
+            "onCreateCommand",
+            "updateContentCommand",
+            "postCreateCommand",
+        ];
+        for phase in &creation_only {
+            assert!(!resume_phases.contains(phase));
+        }
+    }
 }

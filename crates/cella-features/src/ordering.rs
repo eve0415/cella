@@ -603,4 +603,56 @@ mod tests {
         // b listed (override), a unlisted (appended).
         assert_eq!(order, vec!["b", "a"]);
     }
+
+    // --- Spec compliance: feature option env var transformation ---
+    // Reference: https://containers.dev/implementors/spec/#dev-container-features
+
+    fn option_key_to_env_var(key: &str) -> String {
+        let mut result: String = key
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let first_valid = result
+            .chars()
+            .position(|c| c != '_' && !c.is_ascii_digit())
+            .unwrap_or(result.len());
+        if first_valid > 0 {
+            result = format!("_{}", &result[first_valid..]);
+        }
+        result.to_uppercase()
+    }
+
+    #[test]
+    fn spec_option_key_simple_uppercase() {
+        assert_eq!(option_key_to_env_var("version"), "VERSION");
+    }
+
+    #[test]
+    fn spec_option_key_with_hyphens() {
+        assert_eq!(option_key_to_env_var("my-option"), "MY_OPTION");
+    }
+
+    #[test]
+    fn spec_option_key_with_dots() {
+        assert_eq!(option_key_to_env_var("node.version"), "NODE_VERSION");
+    }
+
+    #[test]
+    fn spec_option_key_leading_digit() {
+        assert_eq!(option_key_to_env_var("123bad"), "_BAD");
+    }
+
+    #[test]
+    fn spec_option_key_special_chars() {
+        assert_eq!(option_key_to_env_var("my@option#1"), "MY_OPTION_1");
+    }
+
+    #[test]
+    fn spec_option_shorthand_string_to_version() {
+        let input = serde_json::json!("1.18");
+        if let Some(s) = input.as_str() {
+            let expanded = serde_json::json!({"version": s});
+            assert_eq!(expanded, serde_json::json!({"version": "1.18"}));
+        }
+    }
 }

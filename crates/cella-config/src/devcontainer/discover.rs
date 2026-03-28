@@ -224,4 +224,41 @@ mod tests {
         let err = config(tmp.path()).unwrap_err();
         assert!(matches!(err, Error::NotFound));
     }
+
+    // --- Spec compliance tests ---
+    // Reference: https://containers.dev/implementors/spec/#devcontainerjson
+
+    #[test]
+    fn spec_primary_takes_priority_over_root_level() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join(".devcontainer").join("devcontainer.json");
+        create_file(&primary);
+        create_file(&tmp.path().join(".devcontainer.json"));
+        let result = config(tmp.path()).unwrap();
+        assert_eq!(result, primary);
+    }
+
+    #[test]
+    fn spec_config_path_override_skips_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let custom_path = tmp.path().join("custom").join("my-devcontainer.json");
+        create_file(&custom_path);
+        let resolved =
+            crate::resolve::config(tmp.path(), Some(&custom_path)).unwrap();
+        assert_eq!(resolved.config_path, custom_path);
+    }
+
+    #[test]
+    fn spec_no_parent_traversal() {
+        let tmp = TempDir::new().unwrap();
+        create_file(
+            &tmp.path()
+                .join(".devcontainer")
+                .join("devcontainer.json"),
+        );
+        let subdir = tmp.path().join("subproject");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let result = config(&subdir);
+        assert!(result.is_err(), "should not traverse parent directories");
+    }
 }

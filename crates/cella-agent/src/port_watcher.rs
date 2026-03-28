@@ -153,7 +153,6 @@ async fn send_port_open_and_record(
 /// and read the port mapping response.
 ///
 /// Returns `true` if the listener was successfully reported and should be tracked.
-#[allow(clippy::significant_drop_tightening)]
 async fn handle_new_listener(
     listener: &DetectedListener,
     control: &Mutex<ReconnectingClient>,
