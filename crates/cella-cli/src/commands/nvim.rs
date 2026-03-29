@@ -21,7 +21,7 @@ pub struct NvimArgs {
 
     /// Additional arguments passed to nvim (after `--`).
     #[arg(last = true)]
-    pub nvim_args: Vec<String>,
+    pub extra_args: Vec<String>,
 }
 
 impl NvimArgs {
@@ -105,7 +105,7 @@ impl NvimArgs {
 
         // 6. Build command
         let mut cmd = vec!["nvim".to_string()];
-        cmd.extend(self.nvim_args);
+        cmd.extend(self.extra_args);
 
         let working_dir = container.labels.get("dev.cella.workspace_folder").cloned();
 
@@ -229,11 +229,7 @@ async fn install_nvim(
     let settings = cella_config::Settings::load(&std::env::current_dir().unwrap_or_default());
     let version = &settings.tools.nvim.version;
 
-    let version_tag = match version.as_str() {
-        "stable" => "stable",
-        "nightly" => "nightly",
-        v => v,
-    };
+    let version_tag = version.as_str();
 
     // Build download URL based on arch
     let (url, extract_cmd) = match arch.as_str() {
