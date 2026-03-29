@@ -37,6 +37,9 @@ pub enum CliCommand {
     TaskStop {
         branch: String,
     },
+    Switch {
+        branch: String,
+    },
     Help,
     Unsupported {
         command: String,
@@ -87,6 +90,13 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             CliCommand::Prune { dry_run }
         }
         Some("task") => parse_task_subcommand(args),
+        Some("switch") => {
+            let branch = match args.get(2) {
+                Some(b) if !b.starts_with('-') => b.clone(),
+                _ => return CliCommand::Help,
+            };
+            CliCommand::Switch { branch }
+        }
         Some("--help" | "-h") | None => CliCommand::Help,
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
@@ -175,6 +185,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> 
         CliCommand::TaskLogs { branch } => run_task_logs(&branch).await,
         CliCommand::TaskWait { branch } => run_task_wait(&branch).await,
         CliCommand::TaskStop { branch } => run_task_stop(&branch).await,
+        CliCommand::Switch { branch } => run_switch(&branch).await,
     }
 }
 
@@ -189,6 +200,7 @@ Commands:
   branch <name> [--base ref]     Create a worktree-backed branch with its own container
   list                           List worktree branches and their containers
   exec <branch> -- <cmd...>      Run a command in another branch's container
+  switch <branch>                Open a shell in another branch's container
   prune [--dry-run]              Remove merged worktrees and their containers
   task run <branch> -- <cmd...>  Run a background task in a branch's container
   task list                      List active background tasks
@@ -212,6 +224,7 @@ Available commands inside containers:
   cella branch <name>          Create a worktree-backed branch
   cella list                   List worktree branches
   cella exec <branch> -- cmd   Run command in another branch's container
+  cella switch <branch>        Shell into another branch's container
   cella prune                  Remove merged worktrees
 
 Run `cella --help` on the host for all commands."
@@ -502,6 +515,34 @@ async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
             DaemonMessage::OperationOutput { data, .. } => eprint!("{data}"),
             DaemonMessage::TaskStopResult { .. } => {
                 eprintln!("Task '{branch}' stopped.");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::SwitchRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        match resp {
+            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stderr => eprint!("{data}"),
+            },
+            DaemonMessage::SwitchResult { exit_code, .. } => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
                 return Ok(());
             }
             _ => {}

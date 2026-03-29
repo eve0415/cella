@@ -298,6 +298,7 @@ async fn handle_agent_connection(
                 | AgentMessage::TaskLogsRequest { .. }
                 | AgentMessage::TaskWaitRequest { .. }
                 | AgentMessage::TaskStopRequest { .. }
+                | AgentMessage::SwitchRequest { .. }
         ) {
             handle_worktree_message(
                 msg,
@@ -511,7 +512,8 @@ pub(crate) async fn handle_agent_message(
         | AgentMessage::TaskListRequest { .. }
         | AgentMessage::TaskLogsRequest { .. }
         | AgentMessage::TaskWaitRequest { .. }
-        | AgentMessage::TaskStopRequest { .. } => {
+        | AgentMessage::TaskStopRequest { .. }
+        | AgentMessage::SwitchRequest { .. } => {
             unreachable!("worktree/exec/task messages intercepted before handle_agent_message")
         }
     }
@@ -640,6 +642,9 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         }
         AgentMessage::TaskStopRequest { request_id, branch } => {
             handle_task_stop(&request_id, &branch, task_mgr, writer).await?;
+        }
+        AgentMessage::SwitchRequest { request_id, branch } => {
+            handle_switch_request(&request_id, &branch, writer).await?;
         }
         _ => {}
     }
@@ -1373,6 +1378,89 @@ async fn handle_task_stop<W: AsyncWriteExt + Unpin>(
         writer,
         &DaemonMessage::TaskStopResult {
             request_id: request_id.to_string(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle a `SwitchRequest`: run default shell in the target branch's container.
+///
+/// This is a non-interactive exec — suitable for AI agents. For interactive
+/// use, users should run `cella shell <branch>` from the host terminal.
+async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let container_name = find_container_for_branch(branch).await;
+    let Some(container_name) = container_name else {
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: cella_port::protocol::OutputStream::Stderr,
+                data: format!("No running container found for branch '{branch}'\n"),
+            },
+        )
+        .await?;
+        send_message(
+            writer,
+            &DaemonMessage::SwitchResult {
+                request_id: request_id.to_string(),
+                exit_code: 1,
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+
+    info!("Handling SwitchRequest: branch={branch} container={container_name}");
+
+    // Run default shell in the target container.
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args([
+        "exec",
+        &container_name,
+        "sh",
+        "-c",
+        "echo \"Connected to ${HOSTNAME:-$container_name}\"; exec $SHELL -l 2>/dev/null || exec sh",
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            send_message(
+                writer,
+                &DaemonMessage::OperationOutput {
+                    request_id: request_id.to_string(),
+                    stream: cella_port::protocol::OutputStream::Stderr,
+                    data: format!("Failed to exec shell: {e}\n"),
+                },
+            )
+            .await?;
+            send_message(
+                writer,
+                &DaemonMessage::SwitchResult {
+                    request_id: request_id.to_string(),
+                    exit_code: 1,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (status, _, _) = stream_child_output(&mut child, request_id, writer).await?;
+
+    send_message(
+        writer,
+        &DaemonMessage::SwitchResult {
+            request_id: request_id.to_string(),
+            exit_code: status.code().unwrap_or(1),
         },
     )
     .await?;

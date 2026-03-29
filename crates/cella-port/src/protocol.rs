@@ -112,6 +112,8 @@ pub enum AgentMessage {
     TaskWaitRequest { request_id: String, branch: String },
     /// Stop a running background task.
     TaskStopRequest { request_id: String, branch: String },
+    /// Switch to another branch's container (run default shell).
+    SwitchRequest { request_id: String, branch: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +283,8 @@ pub enum DaemonMessage {
     TaskWaitResult { request_id: String, exit_code: i32 },
     /// Background task stopped.
     TaskStopResult { request_id: String },
+    /// Result of a switch (shell exec in target container).
+    SwitchResult { request_id: String, exit_code: i32 },
 }
 
 /// Transport protocol for a port.
