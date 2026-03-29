@@ -4,6 +4,7 @@
 //! the CLI (`cella`) and daemon (`cella-daemon`) can call the same Rust
 //! functions instead of the daemon shelling out to CLI subprocesses.
 
+pub mod branch;
 pub mod config;
 pub mod docker_helpers;
 pub mod error;
