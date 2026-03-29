@@ -134,6 +134,8 @@ struct HandshakeResult {
     container_id: String,
     container_ip: Option<String>,
     agent_state: Arc<AgentConnectionState>,
+    /// Host-side workspace path from container labels.
+    workspace_path: Option<String>,
 }
 
 /// Perform the hello handshake: read `AgentHello`, validate, look up container.
@@ -206,15 +208,17 @@ where
         );
     }
 
-    // Send DaemonHello success
-    // TODO(phase-1): look up container labels from Docker to populate workspace metadata
+    // Send DaemonHello success with workspace metadata from container labels.
+    let labels = lookup_container_labels(&container_id).await;
     let hello = DaemonHello {
         protocol_version: PROTOCOL_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         error: None,
-        workspace_path: None,
-        parent_repo: None,
-        is_worktree: false,
+        workspace_path: labels.get("dev.cella.workspace_path").cloned(),
+        parent_repo: labels.get("dev.cella.parent_repo").cloned(),
+        is_worktree: labels
+            .get("dev.cella.worktree")
+            .is_some_and(|v| v == "true"),
     };
     let mut json = serde_json::to_string(&hello).map_err(|e| CellaDaemonError::Protocol {
         message: format!("hello serialize error: {e}"),
@@ -230,11 +234,14 @@ where
         message: format!("hello flush error: {e}"),
     })?;
 
+    let workspace_path = hello.workspace_path.clone();
+
     Ok(Some(HandshakeResult {
         container_name,
         container_id,
         container_ip,
         agent_state,
+        workspace_path,
     }))
 }
 
@@ -281,7 +288,7 @@ async fn handle_agent_connection(
         // Handle them directly before falling through to the single-response handler.
         match &msg {
             AgentMessage::BranchRequest { .. } | AgentMessage::ListRequest { .. } => {
-                handle_worktree_message(msg, &hs.container_name, &mut writer).await?;
+                handle_worktree_message(msg, hs.workspace_path.as_deref(), &mut writer).await?;
                 continue;
             }
             _ => {}
@@ -509,13 +516,45 @@ async fn send_message<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
+// Docker label lookup
+// ---------------------------------------------------------------------------
+
+/// Look up container labels via `docker inspect`.
+///
+/// Returns an empty map on any failure (Docker not running, container not found, etc.)
+/// so callers can proceed with defaults.
+async fn lookup_container_labels(container_id: &str) -> HashMap<String, String> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            container_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<HashMap<String, String>>(stdout.trim()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Worktree operation handlers
 // ---------------------------------------------------------------------------
 
 /// Handle worktree messages that need writer access for multi-message responses.
 async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
     msg: AgentMessage,
-    _container_name: &str,
+    workspace_path: Option<&str>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     match msg {
@@ -524,10 +563,17 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             branch,
             base,
         } => {
-            handle_branch_request(&request_id, &branch, base.as_deref(), writer).await?;
+            handle_branch_request(
+                &request_id,
+                &branch,
+                base.as_deref(),
+                workspace_path,
+                writer,
+            )
+            .await?;
         }
         AgentMessage::ListRequest { request_id } => {
-            handle_list_request(&request_id, writer).await?;
+            handle_list_request(&request_id, workspace_path, writer).await?;
         }
         _ => {}
     }
@@ -541,9 +587,10 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     base: Option<&str>,
+    workspace_path: Option<&str>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    use cella_port::protocol::{OutputStream, WorktreeOperationResult};
+    use cella_port::protocol::WorktreeOperationResult;
     use tokio::process::Command;
 
     // Find the cella binary (same binary as the daemon was started from,
@@ -581,64 +628,47 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
     }
+    if let Some(ws) = workspace_path {
+        cmd.current_dir(ws);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    // Spawn and wait
-    let output = match cmd.output().await {
-        Ok(o) => o,
+    // Spawn child process with piped stdout/stderr for live streaming.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
-            let result = DaemonMessage::BranchResult {
-                request_id: request_id.to_string(),
-                result: WorktreeOperationResult::Error {
-                    message: format!("failed to spawn cella branch: {e}"),
+            send_message(
+                writer,
+                &DaemonMessage::BranchResult {
+                    request_id: request_id.to_string(),
+                    result: WorktreeOperationResult::Error {
+                        message: format!("failed to spawn cella branch: {e}"),
+                    },
                 },
-            };
-            send_message(writer, &result).await?;
+            )
+            .await?;
             return Ok(());
         }
     };
 
-    // Stream captured output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.is_empty() {
-        send_message(
-            writer,
-            &DaemonMessage::OperationOutput {
-                request_id: request_id.to_string(),
-                stream: OutputStream::Stdout,
-                data: stdout.to_string(),
-            },
-        )
-        .await?;
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        send_message(
-            writer,
-            &DaemonMessage::OperationOutput {
-                request_id: request_id.to_string(),
-                stream: OutputStream::Stderr,
-                data: stderr.to_string(),
-            },
-        )
-        .await?;
-    }
+    let (status, last_stdout_line, stderr_collected) =
+        stream_child_output(&mut child, request_id, writer).await?;
 
-    // Send final result
-    let result = if output.status.success() {
-        // Try to parse JSON output from `cella branch --output json`
-        // for container_name and worktree_path. Fall back to generic success.
-        parse_branch_json_output(&stdout).unwrap_or_else(|| WorktreeOperationResult::Success {
-            container_name: String::new(),
-            worktree_path: String::new(),
+    // Send final result.
+    let result = if status.success() {
+        parse_branch_json_output(&last_stdout_line).unwrap_or_else(|| {
+            WorktreeOperationResult::Success {
+                container_name: String::new(),
+                worktree_path: String::new(),
+            }
         })
     } else {
         WorktreeOperationResult::Error {
-            message: if stderr.is_empty() {
-                format!("cella branch exited with code {}", output.status)
+            message: if stderr_collected.is_empty() {
+                format!("cella branch exited with code {status}")
             } else {
-                stderr.trim().to_string()
+                stderr_collected.trim().to_string()
             },
         }
     };
@@ -653,6 +683,69 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     .await?;
 
     Ok(())
+}
+
+/// Stream a child process's stdout and stderr line-by-line as `OperationOutput` messages.
+///
+/// Returns the exit status, last stdout line (for JSON parsing), and collected stderr.
+async fn stream_child_output<W: AsyncWriteExt + Unpin>(
+    child: &mut tokio::process::Child,
+    request_id: &str,
+    writer: &mut W,
+) -> Result<(std::process::ExitStatus, String, String), CellaDaemonError> {
+    use cella_port::protocol::OutputStream;
+
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+    let mut last_stdout_line = String::new();
+
+    let mut stdout_reader = child_stdout.map(|s| BufReader::new(s).lines());
+    let mut stderr_reader = child_stderr.map(|s| BufReader::new(s).lines());
+    let mut stdout_done = stdout_reader.is_none();
+    let mut stderr_done = stderr_reader.is_none();
+    let mut stderr_collected = String::new();
+
+    while !stdout_done || !stderr_done {
+        tokio::select! {
+            line = async {
+                if let Some(ref mut r) = stdout_reader { r.next_line().await } else { Ok(None) }
+            }, if !stdout_done => {
+                match line {
+                    Ok(Some(text)) => {
+                        last_stdout_line.clone_from(&text);
+                        send_message(writer, &DaemonMessage::OperationOutput {
+                            request_id: request_id.to_string(),
+                            stream: OutputStream::Stdout,
+                            data: format!("{text}\n"),
+                        }).await?;
+                    }
+                    _ => stdout_done = true,
+                }
+            }
+            line = async {
+                if let Some(ref mut r) = stderr_reader { r.next_line().await } else { Ok(None) }
+            }, if !stderr_done => {
+                match line {
+                    Ok(Some(text)) => {
+                        stderr_collected.push_str(&text);
+                        stderr_collected.push('\n');
+                        send_message(writer, &DaemonMessage::OperationOutput {
+                            request_id: request_id.to_string(),
+                            stream: OutputStream::Stderr,
+                            data: format!("{text}\n"),
+                        }).await?;
+                    }
+                    _ => stderr_done = true,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| CellaDaemonError::Protocol {
+        message: format!("failed to wait for child process: {e}"),
+    })?;
+
+    Ok((status, last_stdout_line, stderr_collected))
 }
 
 /// Try to parse the JSON output from `cella branch --output json`.
@@ -687,19 +780,28 @@ fn parse_branch_json_output(stdout: &str) -> Option<cella_port::protocol::Worktr
 /// Handle a `ListRequest` using direct git + container queries.
 async fn handle_list_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
+    workspace_path: Option<&str>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // Find git repositories from registered containers.
-    // For now, run `git worktree list --porcelain` in the CWD or a known repo.
-    // This is a simplification — the proper version would discover the repo
-    // from the requesting container's workspace_path label.
-    let worktrees = match list_worktrees_from_cwd() {
+    let mut worktrees = match list_worktrees(workspace_path) {
         Ok(wts) => wts,
         Err(e) => {
             warn!("Failed to list worktrees: {e}");
             vec![]
         }
     };
+
+    // Enrich with container status from Docker
+    let containers = list_cella_containers().await;
+    for wt in &mut worktrees {
+        if let Some(c) = containers
+            .iter()
+            .find(|c| c.workspace_path.as_deref() == Some(&*wt.worktree_path))
+        {
+            wt.container_name = Some(c.name.clone());
+            wt.container_state = Some(c.state.clone());
+        }
+    }
 
     send_message(
         writer,
@@ -713,10 +815,17 @@ async fn handle_list_request<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// List worktrees by running `git worktree list --porcelain` from CWD.
-fn list_worktrees_from_cwd() -> Result<Vec<cella_port::protocol::WorktreeEntry>, String> {
-    let output = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
+/// List worktrees by running `git worktree list --porcelain`.
+fn list_worktrees(
+    workspace_path: Option<&str>,
+) -> Result<Vec<cella_port::protocol::WorktreeEntry>, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["worktree", "list", "--porcelain"]);
+    if let Some(ws) = workspace_path {
+        cmd.current_dir(ws);
+    }
+
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
 
@@ -725,13 +834,18 @@ fn list_worktrees_from_cwd() -> Result<Vec<cella_port::protocol::WorktreeEntry>,
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_worktree_porcelain(&stdout))
+}
+
+/// Parse `git worktree list --porcelain` output.
+fn parse_worktree_porcelain(output: &str) -> Vec<cella_port::protocol::WorktreeEntry> {
     let mut entries = Vec::new();
     let mut path: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut is_first = true;
     let mut is_bare = false;
 
-    for line in stdout.lines() {
+    for line in output.lines() {
         if line.is_empty() {
             if let Some(p) = path.take() {
                 entries.push(cella_port::protocol::WorktreeEntry {
@@ -766,7 +880,59 @@ fn list_worktrees_from_cwd() -> Result<Vec<cella_port::protocol::WorktreeEntry>,
         });
     }
 
-    Ok(entries)
+    entries
+}
+
+/// Minimal container info from `docker ps`.
+struct CellaContainer {
+    name: String,
+    state: String,
+    workspace_path: Option<String>,
+}
+
+/// List all cella-managed containers with their workspace paths.
+async fn list_cella_containers() -> Vec<CellaContainer> {
+    // Use docker ps with label filter and Go template for structured output
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=dev.cella.tool=cella",
+            "--format",
+            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return vec![];
+    };
+    if !output.status.success() {
+        return vec![];
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let name = parts.next()?.to_string();
+            let state = parts.next()?.to_string();
+            let ws = parts
+                .next()
+                .map(ToString::to_string)
+                .filter(|s| !s.is_empty());
+            Some(CellaContainer {
+                name,
+                state,
+                workspace_path: ws,
+            })
+        })
+        .collect()
 }
 
 /// Extract the port number from a URL like `http://localhost:3000/path`.
