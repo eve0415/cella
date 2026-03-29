@@ -296,6 +296,7 @@ dependencies = [
  "cella-env",
  "cella-features",
  "cella-git",
+ "cella-orchestrator",
  "cella-port",
  "chrono",
  "clap",
@@ -471,6 +472,21 @@ dependencies = [
  "insta",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "cella-orchestrator"
+version = "0.0.9"
+dependencies = [
+ "cella-docker",
+ "cella-features",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

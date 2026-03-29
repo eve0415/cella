@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod error;
+pub mod image;
 pub mod progress;
 pub mod result;
 
