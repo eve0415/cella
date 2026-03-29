@@ -9,6 +9,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Format an elapsed duration for display in progress output.
+///
+/// Returns an empty string for durations under 100ms (too fast to matter),
+/// otherwise `" (1.2s)"` style.
+pub fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_millis() >= 100 {
+        format!(" ({:.1}s)", elapsed.as_secs_f64())
+    } else {
+        String::new()
+    }
+}
+
 /// A single progress event emitted by orchestrator operations.
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
