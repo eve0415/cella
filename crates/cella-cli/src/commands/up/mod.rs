@@ -844,6 +844,9 @@ impl UpContext {
             )
             .await;
 
+        // Add /cella/bin to PATH in shell profiles so `cella` CLI is discoverable.
+        inject_cella_path(&self.client, container_id, remote_user).await;
+
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
             seed_gh_credentials(
@@ -1539,6 +1542,45 @@ pub async fn inject_post_start(
         remote_user,
     )
     .await;
+}
+
+/// Add `/cella/bin` to PATH in the container's shell profile.
+///
+/// This makes the `cella` CLI (symlinked to the agent binary) discoverable
+/// by users and AI agents running inside the container.
+async fn inject_cella_path(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let snippet = r#"
+# cella CLI (in-container worktree commands)
+if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then
+    export PATH="/cella/bin:$PATH"
+fi
+"#;
+    // Determine home directory
+    let home = if remote_user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{remote_user}")
+    };
+
+    for profile in &[".bashrc", ".zshrc", ".profile"] {
+        let path = format!("{home}/{profile}");
+        let cmd = format!(
+            "if [ -f '{path}' ] && ! grep -q '/cella/bin' '{path}'; then printf '%s\\n' '{snippet_escaped}' >> '{path}'; fi",
+            path = path,
+            snippet_escaped = snippet.replace('\'', "'\\''"),
+        );
+        let _ = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
+                    user: Some("root".to_string()),
+                    working_dir: None,
+                    env: None,
+                },
+            )
+            .await;
+    }
 }
 
 /// Upload SSH config files to the container's `.ssh` directory.

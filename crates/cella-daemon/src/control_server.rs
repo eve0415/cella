@@ -118,6 +118,9 @@ async fn send_reject<W: AsyncWriteExt + Unpin>(writer: &mut W, error: String) {
         protocol_version: PROTOCOL_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         error: Some(error),
+        workspace_path: None,
+        parent_repo: None,
+        is_worktree: false,
     };
     let mut json = serde_json::to_string(&reject).unwrap_or_default();
     json.push('\n');
@@ -204,10 +207,14 @@ where
     }
 
     // Send DaemonHello success
+    // TODO(phase-1): look up container labels from Docker to populate workspace metadata
     let hello = DaemonHello {
         protocol_version: PROTOCOL_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         error: None,
+        workspace_path: None,
+        parent_repo: None,
+        is_worktree: false,
     };
     let mut json = serde_json::to_string(&hello).map_err(|e| CellaDaemonError::Protocol {
         message: format!("hello serialize error: {e}"),
@@ -473,6 +480,27 @@ pub(crate) async fn handle_agent_message(
         } => {
             debug!("Agent health: uptime={uptime_secs}s ports={ports_detected}");
             None
+        }
+
+        // Worktree operations — Phase 1 stubs that return errors.
+        // Full implementation will spawn cella CLI subprocess or call orchestrator.
+        AgentMessage::BranchRequest {
+            request_id, branch, ..
+        } => {
+            warn!("BranchRequest for '{branch}' — not yet implemented in daemon");
+            Some(DaemonMessage::BranchResult {
+                request_id,
+                result: cella_port::protocol::WorktreeOperationResult::Error {
+                    message: "worktree branch creation not yet implemented in daemon".to_string(),
+                },
+            })
+        }
+        AgentMessage::ListRequest { request_id } => {
+            warn!("ListRequest — not yet implemented in daemon");
+            Some(DaemonMessage::ListResult {
+                request_id,
+                worktrees: vec![],
+            })
         }
     }
 }

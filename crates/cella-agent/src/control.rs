@@ -16,6 +16,8 @@ pub struct ControlClient {
 impl ControlClient {
     /// Connect to the host daemon via TCP.
     ///
+    /// Returns the client and the `DaemonHello` received during handshake.
+    ///
     /// # Errors
     ///
     /// Returns error if connection or handshake fails.
@@ -23,7 +25,7 @@ impl ControlClient {
         addr: &str,
         container_name: &str,
         auth_token: &str,
-    ) -> Result<Self, CellaPortError> {
+    ) -> Result<(Self, DaemonHello), CellaPortError> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| CellaPortError::ControlSocket {
@@ -81,7 +83,7 @@ impl ControlClient {
             });
         }
 
-        Ok(client)
+        Ok((client, daemon_hello))
     }
 
     /// Send a message to the daemon (newline-delimited JSON).
