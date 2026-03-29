@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cella-backend",
     "crates/cella-cli",
     "crates/cella-codegen",
     "crates/cella-compose",
@@ -108,6 +109,7 @@ tempfile = "3.27.0"
 insta = { version = "1.46.3", features = ["json", "yaml", "redactions"] }
 
 # Internal crates
+cella-backend = { path = "crates/cella-backend" }
 cella-agent = { path = "crates/cella-agent" }
 cella-codegen = { path = "crates/cella-codegen" }
 cella-compose = { path = "crates/cella-compose" }

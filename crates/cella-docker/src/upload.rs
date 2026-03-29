@@ -5,18 +5,10 @@ use std::path::Path;
 use bollard::query_parameters::UploadToContainerOptions;
 use tracing::debug;
 
+pub use cella_backend::FileToUpload;
+
 use crate::CellaDockerError;
 use crate::client::DockerClient;
-
-/// A file to upload into a container.
-pub struct FileToUpload {
-    /// Absolute path inside the container.
-    pub path: String,
-    /// File content.
-    pub content: Vec<u8>,
-    /// File permissions (octal, e.g., 0o600).
-    pub mode: u32,
-}
 
 impl DockerClient {
     /// Upload files into a running container via tar archive.

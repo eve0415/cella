@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+pub use cella_backend::{ExecOptions, ExecResult, InteractiveExecOptions};
+
 use crate::CellaDockerError;
 use crate::client::DockerClient;
 
@@ -19,30 +21,6 @@ type OutputStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors:
 
 /// Pinned async writer for container stdin.
 type InputStream = Pin<Box<dyn AsyncWrite + Send>>;
-
-/// Options for executing a command in a container (capture mode).
-pub struct ExecOptions {
-    pub cmd: Vec<String>,
-    pub user: Option<String>,
-    pub env: Option<Vec<String>>,
-    pub working_dir: Option<String>,
-}
-
-/// Result of a command execution.
-pub struct ExecResult {
-    pub exit_code: i64,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// Options for interactive command execution.
-pub struct InteractiveExecOptions {
-    pub cmd: Vec<String>,
-    pub user: Option<String>,
-    pub env: Option<Vec<String>>,
-    pub working_dir: Option<String>,
-    pub tty: bool,
-}
 
 /// Guard that restores terminal raw mode on drop.
 struct RawModeGuard;

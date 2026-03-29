@@ -1,7 +1,5 @@
 //! Image pull and Dockerfile build operations.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
 
@@ -9,19 +7,10 @@ use bollard::query_parameters::CreateImageOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
+pub use cella_backend::{BuildOptions, ImageDetails};
+
 use crate::CellaDockerError;
 use crate::client::DockerClient;
-
-/// Image inspection results from a single Docker API call.
-#[derive(Debug, Clone)]
-pub struct ImageDetails {
-    /// Normalized USER (user portion only, defaults to `"root"`).
-    pub user: String,
-    /// `KEY=value` environment entries from the image config.
-    pub env: Vec<String>,
-    /// Raw JSON from the `devcontainer.metadata` label, if present.
-    pub metadata: Option<String>,
-}
 
 /// Extract the user/uid portion from a Docker USER value.
 ///
@@ -34,17 +23,6 @@ pub(crate) fn normalize_user(raw: &str) -> String {
     } else {
         user.to_string()
     }
-}
-
-/// Options for building a Docker image from a Dockerfile.
-pub struct BuildOptions {
-    pub image_name: String,
-    pub context_path: PathBuf,
-    pub dockerfile: String,
-    pub args: HashMap<String, String>,
-    pub target: Option<String>,
-    pub cache_from: Vec<String>,
-    pub options: Vec<String>,
 }
 
 /// Locate the docker binary, caching the result.
@@ -332,6 +310,9 @@ impl DockerClient {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
     use super::*;
 
     fn basic_opts() -> BuildOptions {

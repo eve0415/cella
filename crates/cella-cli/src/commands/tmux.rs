@@ -28,7 +28,7 @@ pub struct TmuxArgs {
 
     /// Additional arguments passed to tmux (after `--`).
     #[arg(last = true)]
-    pub tmux_args: Vec<String>,
+    pub extra_args: Vec<String>,
 }
 
 impl TmuxArgs {
@@ -131,7 +131,7 @@ impl TmuxArgs {
         }
 
         // 9. Build command
-        let cmd = if self.tmux_args.is_empty() {
+        let cmd = if self.extra_args.is_empty() {
             // Default: attach-or-create named session
             vec![
                 "tmux".to_string(),
@@ -142,7 +142,7 @@ impl TmuxArgs {
         } else {
             // User-provided args: pass through
             let mut c = vec!["tmux".to_string()];
-            c.extend(self.tmux_args);
+            c.extend(self.extra_args);
             c
         };
 

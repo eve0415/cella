@@ -138,9 +138,10 @@ impl CodeArgs {
 /// Each ASCII byte of the container ID is converted to its two-character hex
 /// representation. For example, `"a"` (0x61) becomes `"61"`.
 fn hex_encode_container_id(id: &str) -> String {
+    use std::fmt::Write;
     let mut encoded = String::with_capacity(id.len() * 2);
     for byte in id.bytes() {
-        encoded.push_str(&format!("{byte:02x}"));
+        let _ = write!(encoded, "{byte:02x}");
     }
     encoded
 }
@@ -202,7 +203,7 @@ fn which_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// Platform-specific help text when an editor binary is not found.
 fn editor_not_found_help(name: &str) -> String {
-    let base = match name {
+    match name {
         "code" | "code-insiders" => {
             if cfg!(target_os = "macos") {
                 format!(
@@ -218,8 +219,7 @@ fn editor_not_found_help(name: &str) -> String {
             "To fix:\n  Install Cursor from https://cursor.com and add it to your PATH".to_string()
         }
         _ => format!("Ensure `{name}` is installed and available in your PATH"),
-    };
-    base
+    }
 }
 
 /// Help text when editor launch fails (binary exists but spawn fails).
@@ -303,13 +303,13 @@ async fn poll_vscode_server(
             )
             .await;
 
-        if let Ok(result) = check_result {
-            if result.exit_code == 0 {
-                let elapsed = start.elapsed().as_secs_f32();
-                step.finish();
-                debug!("VS Code Server detected after {elapsed:.1}s");
-                return true;
-            }
+        if let Ok(result) = check_result
+            && result.exit_code == 0
+        {
+            let elapsed = start.elapsed().as_secs_f32();
+            step.finish();
+            debug!("VS Code Server detected after {elapsed:.1}s");
+            return true;
         }
 
         if start.elapsed() > timeout {

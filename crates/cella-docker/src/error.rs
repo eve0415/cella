@@ -63,3 +63,40 @@ pub enum CellaDockerError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+impl From<CellaDockerError> for cella_backend::BackendError {
+    fn from(e: CellaDockerError) -> Self {
+        match e {
+            CellaDockerError::RuntimeNotFound { message } => Self::ConnectionFailed { message },
+            CellaDockerError::DockerApi(e) => Self::Runtime(Box::new(e)),
+            CellaDockerError::ImageNotFound { image } => Self::ImageNotFound { image },
+            CellaDockerError::DockerCliNotFound { message } => Self::CliNotFound { message },
+            CellaDockerError::BuildFailed { message } => Self::ImageBuildFailed { message },
+            CellaDockerError::ContainerNotFound { workspace } => Self::ContainerNotFound {
+                identifier: workspace,
+            },
+            CellaDockerError::ContainerNotRunning { hint } => Self::ContainerNotRunning { hint },
+            CellaDockerError::ExecFailed { command, exit_code } => {
+                Self::ExecFailed { command, exit_code }
+            }
+            CellaDockerError::LifecycleFailed { phase, message } => {
+                Self::LifecycleFailed { phase, message }
+            }
+            CellaDockerError::HostCommandFailed { command, source } => {
+                Self::HostCommandFailed { command, source }
+            }
+            CellaDockerError::ContainerExitedImmediately {
+                exit_code,
+                logs_tail,
+            } => Self::ContainerExitedImmediately {
+                exit_code,
+                logs_tail,
+            },
+            CellaDockerError::AgentVolume { message } => Self::AgentVolume { message },
+            CellaDockerError::AgentChecksumMismatch { expected, actual } => {
+                Self::AgentChecksumMismatch { expected, actual }
+            }
+            CellaDockerError::Io(e) => Self::Io(e),
+        }
+    }
+}
