@@ -89,6 +89,7 @@ pub(crate) async fn run_management_server(
             browser_handler: ctx.browser_handler.clone(),
             container_handles: container_handles.clone(),
             proxy_cmd_tx: ctx.proxy_cmd_tx.clone(),
+            task_manager: crate::task_manager::new_shared(),
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(

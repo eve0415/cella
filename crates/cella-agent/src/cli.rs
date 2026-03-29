@@ -22,6 +22,21 @@ pub enum CliCommand {
     Prune {
         dry_run: bool,
     },
+    TaskRun {
+        branch: String,
+        command: Vec<String>,
+        base: Option<String>,
+    },
+    TaskList,
+    TaskLogs {
+        branch: String,
+    },
+    TaskWait {
+        branch: String,
+    },
+    TaskStop {
+        branch: String,
+    },
     Help,
     Unsupported {
         command: String,
@@ -71,10 +86,68 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             let dry_run = args.iter().any(|a| a == "--dry-run");
             CliCommand::Prune { dry_run }
         }
+        Some("task") => parse_task_subcommand(args),
         Some("--help" | "-h") | None => CliCommand::Help,
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
         },
+    }
+}
+
+fn parse_task_subcommand(args: &[String]) -> CliCommand {
+    let sub = args.get(2).map(String::as_str);
+    match sub {
+        Some("run") => {
+            let branch = match args.get(3) {
+                Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
+                _ => return CliCommand::Help,
+            };
+            let sep = args.iter().position(|a| a == "--");
+            let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
+            if command.is_empty() {
+                return CliCommand::Help;
+            }
+            // Check for --base before the separator
+            let mut base = None;
+            let end = sep.unwrap_or(args.len());
+            let mut i = 4;
+            while i < end {
+                if args[i] == "--base" {
+                    base = args.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            CliCommand::TaskRun {
+                branch,
+                command,
+                base,
+            }
+        }
+        Some("list" | "ls") => CliCommand::TaskList,
+        Some("logs") => {
+            let branch = match args.get(3) {
+                Some(b) => b.clone(),
+                None => return CliCommand::Help,
+            };
+            CliCommand::TaskLogs { branch }
+        }
+        Some("wait") => {
+            let branch = match args.get(3) {
+                Some(b) => b.clone(),
+                None => return CliCommand::Help,
+            };
+            CliCommand::TaskWait { branch }
+        }
+        Some("stop") => {
+            let branch = match args.get(3) {
+                Some(b) => b.clone(),
+                None => return CliCommand::Help,
+            };
+            CliCommand::TaskStop { branch }
+        }
+        _ => CliCommand::Help,
     }
 }
 
@@ -93,6 +166,15 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> 
         CliCommand::List => run_list().await,
         CliCommand::Exec { branch, command } => run_exec(&branch, &command).await,
         CliCommand::Prune { dry_run } => run_prune(dry_run).await,
+        CliCommand::TaskRun {
+            branch,
+            command,
+            base,
+        } => run_task_run(&branch, &command, base.as_deref()).await,
+        CliCommand::TaskList => run_task_list().await,
+        CliCommand::TaskLogs { branch } => run_task_logs(&branch).await,
+        CliCommand::TaskWait { branch } => run_task_wait(&branch).await,
+        CliCommand::TaskStop { branch } => run_task_stop(&branch).await,
     }
 }
 
@@ -108,6 +190,11 @@ Commands:
   list                           List worktree branches and their containers
   exec <branch> -- <cmd...>      Run a command in another branch's container
   prune [--dry-run]              Remove merged worktrees and their containers
+  task run <branch> -- <cmd...>  Run a background task in a branch's container
+  task list                      List active background tasks
+  task logs <branch>             Show output from a background task
+  task wait <branch>             Wait for a background task to complete
+  task stop <branch>             Stop a running background task
 
 Options:
   --help, -h                     Show this help message
@@ -273,6 +360,148 @@ async fn run_prune(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     std::process::exit(1);
                 }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_task_run(
+    branch: &str,
+    command: &[String],
+    base: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::TaskRunRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+        command: command.to_vec(),
+        base: base.map(String::from),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        match resp {
+            DaemonMessage::OperationProgress { message, .. } => {
+                eprintln!("{message}");
+            }
+            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stderr => eprint!("{data}"),
+            },
+            DaemonMessage::TaskRunResult {
+                task_id,
+                container_name,
+                ..
+            } => {
+                if task_id.is_empty() {
+                    return Err("Failed to start task".into());
+                }
+                eprintln!("Task '{task_id}' started in container {container_name}");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::TaskListRequest {
+        request_id: id.clone(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        if let DaemonMessage::TaskListResult { tasks, .. } = resp {
+            if tasks.is_empty() {
+                eprintln!("No active tasks.");
+            } else {
+                const HEADER: &str = "BRANCH               STATUS     TIME     COMMAND";
+                println!("{HEADER}");
+                for t in &tasks {
+                    let status = format!("{:?}", t.status).to_lowercase();
+                    let time = format!("{}s", t.elapsed_secs);
+                    let cmd = t.command.join(" ");
+                    println!("{:<20} {:<10} {:<8} {cmd}", t.branch, status, time);
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+async fn run_task_logs(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::TaskLogsRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        if let DaemonMessage::TaskLogsData { data, done, .. } = resp {
+            if !data.is_empty() {
+                print!("{data}");
+            }
+            if done {
+                return Ok(());
+            }
+            // For non-done tasks, return after first chunk (no live tailing yet).
+            return Ok(());
+        }
+    }
+}
+
+async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::TaskWaitRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        if let DaemonMessage::TaskWaitResult { exit_code, .. } = resp {
+            if exit_code != 0 {
+                eprintln!("Task '{branch}' exited with code {exit_code}");
+                std::process::exit(exit_code);
+            }
+            eprintln!("Task '{branch}' completed successfully.");
+            return Ok(());
+        }
+    }
+}
+
+async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::TaskStopRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        match resp {
+            DaemonMessage::OperationOutput { data, .. } => eprint!("{data}"),
+            DaemonMessage::TaskStopResult { .. } => {
+                eprintln!("Task '{branch}' stopped.");
                 return Ok(());
             }
             _ => {}

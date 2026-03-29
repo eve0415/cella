@@ -29,6 +29,7 @@ pub(crate) struct ControlContext {
     pub browser_handler: Arc<BrowserHandler>,
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
+    pub task_manager: crate::task_manager::SharedTaskManager,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -298,7 +299,13 @@ async fn handle_agent_connection(
                 | AgentMessage::TaskWaitRequest { .. }
                 | AgentMessage::TaskStopRequest { .. }
         ) {
-            handle_worktree_message(msg, hs.workspace_path.as_deref(), &mut writer).await?;
+            handle_worktree_message(
+                msg,
+                hs.workspace_path.as_deref(),
+                &ctx.task_manager,
+                &mut writer,
+            )
+            .await?;
             continue;
         }
 
@@ -571,6 +578,7 @@ async fn lookup_container_labels(container_id: &str) -> HashMap<String, String> 
 async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
     msg: AgentMessage,
     workspace_path: Option<&str>,
+    task_mgr: &crate::task_manager::SharedTaskManager,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     match msg {
@@ -604,21 +612,34 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         } => {
             handle_prune_request(&request_id, dry_run, workspace_path, writer).await?;
         }
-        AgentMessage::TaskRunRequest { request_id, .. }
-        | AgentMessage::TaskListRequest { request_id, .. }
-        | AgentMessage::TaskLogsRequest { request_id, .. }
-        | AgentMessage::TaskWaitRequest { request_id, .. }
-        | AgentMessage::TaskStopRequest { request_id, .. } => {
-            // Task commands are Phase 2.5 — return not-implemented for now.
-            send_message(
+        AgentMessage::TaskRunRequest {
+            request_id,
+            branch,
+            command,
+            base,
+        } => {
+            handle_task_run(
+                &request_id,
+                &branch,
+                &command,
+                base.as_deref(),
+                workspace_path,
+                task_mgr,
                 writer,
-                &DaemonMessage::OperationProgress {
-                    request_id: request_id.clone(),
-                    step: "error".to_string(),
-                    message: "task commands not yet implemented".to_string(),
-                },
             )
             .await?;
+        }
+        AgentMessage::TaskListRequest { request_id } => {
+            handle_task_list(&request_id, task_mgr, writer).await?;
+        }
+        AgentMessage::TaskLogsRequest { request_id, branch } => {
+            handle_task_logs(&request_id, &branch, task_mgr, writer).await?;
+        }
+        AgentMessage::TaskWaitRequest { request_id, branch } => {
+            handle_task_wait(&request_id, &branch, task_mgr, writer).await?;
+        }
+        AgentMessage::TaskStopRequest { request_id, branch } => {
+            handle_task_stop(&request_id, &branch, task_mgr, writer).await?;
         }
         _ => {}
     }
@@ -1100,6 +1121,258 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
             request_id: request_id.to_string(),
             pruned: vec![], // TODO: parse pruned branches from output
             errors,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Task command handlers
+// ---------------------------------------------------------------------------
+
+/// Handle `TaskRunRequest`: create branch (if needed) + run background command.
+async fn handle_task_run<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    command: &[String],
+    base: Option<&str>,
+    workspace_path: Option<&str>,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // First, ensure the branch container exists (create if needed).
+    // Check if container already exists for this branch.
+    let container = find_container_for_branch(branch).await;
+    let container_name = if let Some(name) = container {
+        name
+    } else {
+        // Create branch + container via cella branch subprocess.
+        send_message(
+            writer,
+            &DaemonMessage::OperationProgress {
+                request_id: request_id.to_string(),
+                step: "creating_branch".to_string(),
+                message: format!("Creating branch '{branch}' and container..."),
+            },
+        )
+        .await?;
+
+        let cella_bin = find_cella_binary();
+        let mut cmd = tokio::process::Command::new(&cella_bin);
+        cmd.arg("branch").arg(branch).arg("--output").arg("json");
+        if let Some(b) = base {
+            cmd.arg("--base").arg(b);
+        }
+        if let Some(ws) = workspace_path {
+            cmd.current_dir(ws);
+        }
+        let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
+            message: format!("failed to create branch: {e}"),
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            send_message(
+                writer,
+                &DaemonMessage::OperationOutput {
+                    request_id: request_id.to_string(),
+                    stream: cella_port::protocol::OutputStream::Stderr,
+                    data: stderr.to_string(),
+                },
+            )
+            .await?;
+            send_message(
+                writer,
+                &DaemonMessage::TaskRunResult {
+                    request_id: request_id.to_string(),
+                    task_id: String::new(),
+                    container_name: String::new(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Find the newly created container.
+        find_container_for_branch(branch).await.unwrap_or_default()
+    };
+
+    if container_name.is_empty() {
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: cella_port::protocol::OutputStream::Stderr,
+                data: format!("No container found for branch '{branch}' after creation\n"),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Start the background task.
+    let task_id = {
+        let mut mgr = task_mgr.lock().await;
+        match mgr.start_task(branch, container_name.clone(), command.to_vec()) {
+            Ok(id) => id,
+            Err(e) => {
+                send_message(
+                    writer,
+                    &DaemonMessage::OperationOutput {
+                        request_id: request_id.to_string(),
+                        stream: cella_port::protocol::OutputStream::Stderr,
+                        data: format!("{e}\n"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::TaskRunResult {
+            request_id: request_id.to_string(),
+            task_id,
+            container_name,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `TaskListRequest`: list active tasks.
+async fn handle_task_list<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let tasks = {
+        let infos = task_mgr.lock().await.list_tasks().await;
+        infos
+            .into_iter()
+            .map(|t| cella_port::protocol::TaskEntry {
+                task_id: t.task_id,
+                branch: t.branch,
+                container_name: t.container_name,
+                status: if t.is_done {
+                    if t.exit_code == Some(0) {
+                        cella_port::protocol::TaskStatus::Done
+                    } else {
+                        cella_port::protocol::TaskStatus::Failed
+                    }
+                } else {
+                    cella_port::protocol::TaskStatus::Running
+                },
+                command: t.command,
+                elapsed_secs: t.elapsed_secs,
+            })
+            .collect()
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::TaskListResult {
+            request_id: request_id.to_string(),
+            tasks,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `TaskLogsRequest`: return captured output for a task.
+async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let output = task_mgr
+        .lock()
+        .await
+        .get_output(branch)
+        .await
+        .unwrap_or_default();
+    let is_done = task_mgr
+        .lock()
+        .await
+        .list_tasks()
+        .await
+        .iter()
+        .any(|t| t.branch == branch && t.is_done);
+
+    send_message(
+        writer,
+        &DaemonMessage::TaskLogsData {
+            request_id: request_id.to_string(),
+            data: output,
+            done: is_done,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `TaskWaitRequest`: block until task completes.
+async fn handle_task_wait<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // We need to drop the lock while waiting, so clone what we need.
+    let exit_code = {
+        let mgr = task_mgr.lock().await;
+        mgr.wait_for(branch).await
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::TaskWaitResult {
+            request_id: request_id.to_string(),
+            exit_code: exit_code.unwrap_or(1),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `TaskStopRequest`: abort a running task.
+async fn handle_task_stop<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let stopped = {
+        let mut mgr = task_mgr.lock().await;
+        mgr.stop_task(branch).await
+    };
+
+    if !stopped {
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: cella_port::protocol::OutputStream::Stderr,
+                data: format!("No running task found for branch '{branch}'\n"),
+            },
+        )
+        .await?;
+    }
+
+    send_message(
+        writer,
+        &DaemonMessage::TaskStopResult {
+            request_id: request_id.to_string(),
         },
     )
     .await?;
