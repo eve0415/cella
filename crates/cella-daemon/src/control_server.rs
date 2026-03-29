@@ -277,6 +277,16 @@ async fn handle_agent_connection(
                 message: format!("invalid agent message: {e}"),
             })?;
 
+        // Worktree operations need writer access for multi-message responses.
+        // Handle them directly before falling through to the single-response handler.
+        match &msg {
+            AgentMessage::BranchRequest { .. } | AgentMessage::ListRequest { .. } => {
+                handle_worktree_message(msg, &hs.container_name, &mut writer).await?;
+                continue;
+            }
+            _ => {}
+        }
+
         let handler_ctx = AgentHandlerContext {
             port_manager: &ctx.port_manager,
             browser_handler: &ctx.browser_handler,
@@ -287,20 +297,7 @@ async fn handle_agent_connection(
         let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
 
         if let Some(resp) = response {
-            let mut json =
-                serde_json::to_string(&resp).map_err(|e| CellaDaemonError::Protocol {
-                    message: format!("serialize error: {e}"),
-                })?;
-            json.push('\n');
-            writer
-                .write_all(json.as_bytes())
-                .await
-                .map_err(|e| CellaDaemonError::Socket {
-                    message: format!("write error: {e}"),
-                })?;
-            writer.flush().await.map_err(|e| CellaDaemonError::Socket {
-                message: format!("flush error: {e}"),
-            })?;
+            send_message(&mut writer, &resp).await?;
         }
     }
 
@@ -482,27 +479,294 @@ pub(crate) async fn handle_agent_message(
             None
         }
 
-        // Worktree operations — Phase 1 stubs that return errors.
-        // Full implementation will spawn cella CLI subprocess or call orchestrator.
-        AgentMessage::BranchRequest {
-            request_id, branch, ..
-        } => {
-            warn!("BranchRequest for '{branch}' — not yet implemented in daemon");
-            Some(DaemonMessage::BranchResult {
-                request_id,
-                result: cella_port::protocol::WorktreeOperationResult::Error {
-                    message: "worktree branch creation not yet implemented in daemon".to_string(),
-                },
-            })
-        }
-        AgentMessage::ListRequest { request_id } => {
-            warn!("ListRequest — not yet implemented in daemon");
-            Some(DaemonMessage::ListResult {
-                request_id,
-                worktrees: vec![],
-            })
+        // Worktree operations are handled in the message loop via
+        // handle_worktree_message() which has writer access for streaming.
+        AgentMessage::BranchRequest { .. } | AgentMessage::ListRequest { .. } => {
+            unreachable!("worktree messages intercepted before handle_agent_message")
         }
     }
+}
+
+/// Send a single `DaemonMessage` on the writer.
+async fn send_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &DaemonMessage,
+) -> Result<(), CellaDaemonError> {
+    let mut json = serde_json::to_string(msg).map_err(|e| CellaDaemonError::Protocol {
+        message: format!("serialize error: {e}"),
+    })?;
+    json.push('\n');
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("write error: {e}"),
+        })?;
+    writer.flush().await.map_err(|e| CellaDaemonError::Socket {
+        message: format!("flush error: {e}"),
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Worktree operation handlers
+// ---------------------------------------------------------------------------
+
+/// Handle worktree messages that need writer access for multi-message responses.
+async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
+    msg: AgentMessage,
+    _container_name: &str,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    match msg {
+        AgentMessage::BranchRequest {
+            request_id,
+            branch,
+            base,
+        } => {
+            handle_branch_request(&request_id, &branch, base.as_deref(), writer).await?;
+        }
+        AgentMessage::ListRequest { request_id } => {
+            handle_list_request(&request_id, writer).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle a `BranchRequest` by spawning `cella branch` as a subprocess.
+///
+/// Streams progress and output back to the agent, then sends the final result.
+async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    base: Option<&str>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    use cella_port::protocol::{OutputStream, WorktreeOperationResult};
+    use tokio::process::Command;
+
+    // Find the cella binary (same binary as the daemon was started from,
+    // or fall back to PATH lookup).
+    let cella_bin = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            // The daemon is started by the CLI, so the CLI binary is typically
+            // a sibling or the same binary. Look for "cella" next to it.
+            let dir = exe.parent()?;
+            let cella = dir.join("cella");
+            if cella.exists() { Some(cella) } else { None }
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("cella"));
+
+    info!(
+        "Handling BranchRequest: branch={branch} base={base:?} via {}",
+        cella_bin.display()
+    );
+
+    // Send initial progress
+    send_message(
+        writer,
+        &DaemonMessage::OperationProgress {
+            request_id: request_id.to_string(),
+            step: "starting".to_string(),
+            message: format!("Creating worktree branch '{branch}'..."),
+        },
+    )
+    .await?;
+
+    // Build command
+    let mut cmd = Command::new(&cella_bin);
+    cmd.arg("branch").arg(branch).arg("--output").arg("json");
+    if let Some(b) = base {
+        cmd.arg("--base").arg(b);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    // Spawn and wait
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            let result = DaemonMessage::BranchResult {
+                request_id: request_id.to_string(),
+                result: WorktreeOperationResult::Error {
+                    message: format!("failed to spawn cella branch: {e}"),
+                },
+            };
+            send_message(writer, &result).await?;
+            return Ok(());
+        }
+    };
+
+    // Stream captured output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: OutputStream::Stdout,
+                data: stdout.to_string(),
+            },
+        )
+        .await?;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: OutputStream::Stderr,
+                data: stderr.to_string(),
+            },
+        )
+        .await?;
+    }
+
+    // Send final result
+    let result = if output.status.success() {
+        // Try to parse JSON output from `cella branch --output json`
+        // for container_name and worktree_path. Fall back to generic success.
+        parse_branch_json_output(&stdout).unwrap_or_else(|| WorktreeOperationResult::Success {
+            container_name: String::new(),
+            worktree_path: String::new(),
+        })
+    } else {
+        WorktreeOperationResult::Error {
+            message: if stderr.is_empty() {
+                format!("cella branch exited with code {}", output.status)
+            } else {
+                stderr.trim().to_string()
+            },
+        }
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::BranchResult {
+            request_id: request_id.to_string(),
+            result,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Try to parse the JSON output from `cella branch --output json`.
+fn parse_branch_json_output(stdout: &str) -> Option<cella_port::protocol::WorktreeOperationResult> {
+    // The JSON output may contain multiple lines; find the last JSON object
+    // which should be the final result.
+    for line in stdout.lines().rev() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            let container_name = v
+                .get("containerId")
+                .or_else(|| v.get("containerName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let worktree_path = v
+                .get("workspaceFolder")
+                .or_else(|| v.get("remoteWorkspaceFolder"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if v.get("outcome").is_some() || v.get("containerId").is_some() {
+                return Some(cella_port::protocol::WorktreeOperationResult::Success {
+                    container_name,
+                    worktree_path,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Handle a `ListRequest` using direct git + container queries.
+async fn handle_list_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // Find git repositories from registered containers.
+    // For now, run `git worktree list --porcelain` in the CWD or a known repo.
+    // This is a simplification — the proper version would discover the repo
+    // from the requesting container's workspace_path label.
+    let worktrees = match list_worktrees_from_cwd() {
+        Ok(wts) => wts,
+        Err(e) => {
+            warn!("Failed to list worktrees: {e}");
+            vec![]
+        }
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::ListResult {
+            request_id: request_id.to_string(),
+            worktrees,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// List worktrees by running `git worktree list --porcelain` from CWD.
+fn list_worktrees_from_cwd() -> Result<Vec<cella_port::protocol::WorktreeEntry>, String> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut is_first = true;
+    let mut is_bare = false;
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            if let Some(p) = path.take() {
+                entries.push(cella_port::protocol::WorktreeEntry {
+                    branch: branch.take(),
+                    worktree_path: p,
+                    is_main: is_first && !is_bare,
+                    container_name: None,
+                    container_state: None,
+                });
+                is_first = false;
+                is_bare = false;
+            }
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            let short = b.strip_prefix("refs/heads/").unwrap_or(b);
+            branch = Some(short.to_string());
+        } else if line == "bare" {
+            is_bare = true;
+        }
+    }
+    // Handle last entry without trailing blank line
+    if let Some(p) = path {
+        entries.push(cella_port::protocol::WorktreeEntry {
+            branch: branch.take(),
+            worktree_path: p,
+            is_main: is_first && !is_bare,
+            container_name: None,
+            container_state: None,
+        });
+    }
+
+    Ok(entries)
 }
 
 /// Extract the port number from a URL like `http://localhost:3000/path`.
