@@ -10,6 +10,7 @@ pub mod error;
 pub mod image;
 pub mod lifecycle;
 pub mod progress;
+pub mod prune;
 pub mod result;
 
 pub use config::{BranchConfig, ImageStrategy, PruneConfig, UpConfig};
