@@ -34,10 +34,7 @@ pub fn resolve_backend(
 ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
     match choice {
         Some(BackendChoice::Docker) => connect_docker_backend(docker_host),
-        Some(BackendChoice::AppleContainer) => Err(
-            "Apple Container backend is not yet available. It will be added in a future release."
-                .into(),
-        ),
+        Some(BackendChoice::AppleContainer) => connect_apple_container_backend(),
         None => auto_detect(docker_host),
     }
 }
@@ -50,10 +47,13 @@ fn auto_detect(
         return Ok(client);
     }
 
-    // Apple Container will be added here as lowest priority fallback
+    // Apple Container is lowest priority fallback
+    if let Ok(client) = connect_apple_container_backend() {
+        return Ok(client);
+    }
 
     Err(
-        "No container backend available. Install Docker or another supported container runtime."
+        "No container backend available. Install Docker or Apple Container (macOS 26+, Apple Silicon)."
             .into(),
     )
 }
@@ -65,4 +65,17 @@ fn connect_docker_backend(
         DockerClient::connect_with_host(host)
     })?;
     Ok(Box::new(client))
+}
+
+fn connect_apple_container_backend() -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>>
+{
+    let cli = cella_container::discovery::discover()
+        .ok_or("Apple Container CLI not found. Install from https://github.com/apple/container")?;
+
+    eprintln!(
+        "warning: Apple Container backend is experimental. \
+         Report issues at https://github.com/eve0415/cella/issues"
+    );
+
+    Ok(Box::new(cella_container::AppleContainerBackend::new(cli)))
 }

@@ -282,6 +282,7 @@ dependencies = [
  "cella-backend",
  "cella-compose",
  "cella-config",
+ "cella-container",
  "cella-credential-proxy",
  "cella-daemon",
  "cella-docker",
@@ -348,6 +349,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "cella-container"
+version = "0.0.8"
+dependencies = [
+ "cella-backend",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
