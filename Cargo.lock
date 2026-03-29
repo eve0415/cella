@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-port",
  "notify",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "cella-backend"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "chrono",
  "hex",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "heck",
  "indexmap",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "hex",
  "insta",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-codegen",
  "hex",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "cella-container"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-backend",
  "serde",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "cella-credential-proxy"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-daemon",
  "tempfile",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-port",
  "nix",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "bollard",
  "cella-backend",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cella-config",
  "cella-daemon",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "base64 0.22.1",
  "bollard",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "insta",
  "tempfile",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "serde",
  "serde_json",
