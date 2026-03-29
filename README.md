@@ -65,6 +65,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `waitFor` | Return after specified lifecycle phase | No |
 | Config validation | Source-positioned diagnostics | Basic |
 | Docker Compose | Yes | Yes |
+| Container backends | Docker, Apple Container (experimental) | Docker, Podman |
 | Podman | Not yet | Yes |
 | Editor requirement | None (any terminal) | VS Code for full feature set |
 
@@ -113,6 +114,12 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] BROWSER interception (OAuth callbacks)
 - [x] OrbStack-aware port handling
 
+### Editor & Terminal Integration
+
+- [x] `cella code` — open VS Code connected to the container
+- [x] `cella nvim` — open Neovim connected to the container
+- [x] `cella tmux` — open tmux session inside the container
+
 ### Runtime Support
 
 - [x] Docker Engine
@@ -120,11 +127,12 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [ ] Podman
 - [ ] Colima / Lima
 
+### Experimental Backends
+
+- [x] Apple Container (macOS 26+, Apple Silicon only — pre-1.0 CLI, no Compose support)
+
 ### Planned
 
-- [ ] AI agent launching (`cella branch --agent`)
-- [ ] tmux integration
-- [ ] Neovim integration
 - [ ] Templates & global config
 - [ ] Project initialization (`cella init`)
 
@@ -166,15 +174,17 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `cella ports` | View port forwarding status |
 | `cella credential` | Manage credential forwarding |
 
-### Editor Integration
+### Editor & Terminal Integration
 
 | Command | Description |
 |---------|-------------|
+| `cella code` | Open VS Code connected to the container |
 | `cella nvim` | Open Neovim connected to the container |
+| `cella tmux` | Open a tmux session inside the container |
 
 ## Architecture
 
-cella is a Rust workspace with 13 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 15 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -183,15 +193,22 @@ cella is a Rust workspace with 13 focused crates. The CLI delegates all business
 ├──────────┬──────────┬─────────┬─────────┬────────┬──────────┤
 │cella-    │cella-    │cella-git│cella-env│cella-  │cella-    │
 │docker    │compose   │(worktree│(env     │daemon  │doctor    │
-│(container│(compose  │ mgmt)   │ fwding) │(host   │(health   │
-│ runtime) │ orchestr)│         │         │ daemon)│ checks)  │
+│(Docker   │(compose  │ mgmt)   │ fwding) │(host   │(health   │
+│ backend) │ orchestr)│         │         │ daemon)│ checks)  │
+├──────────┤          │         │         │        │          │
+│cella-    │          │         │         │        │          │
+│container │          │         │         │        │          │
+│(Apple    │          │         │         │        │          │
+│ backend) │          │         │         │        │          │
 ├──────────┴──────┬───┴─────────┴─────────┴────────┴──────────┤
 │  cella-agent    │  cella-config    cella-features            │
 │  (in-container  │  (devcontainer   (OCI feature              │
 │   agent)        │   parsing)       resolution)               │
 ├─────────────────┼────────────────────────────────────────────┤
-│  cella-port     │  cella-codegen   cella-credential-proxy    │
-│  (IPC protocol) │  (schema codegen)(legacy credential proxy) │
+│  cella-backend  │  cella-codegen   cella-credential-proxy    │
+│  (backend trait)│  (schema codegen)(credential proxy)        │
+│  cella-port     │                                            │
+│  (IPC protocol) │                                            │
 └─────────────────┴────────────────────────────────────────────┘
 ```
 

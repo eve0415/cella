@@ -6,7 +6,7 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-env detects the host environment (SSH agent, git config, credential proxies, AI agent tools) and produces the mounts, environment variables, and post-start commands needed to forward that environment into a dev container. It is the single entry point for all environment setup during `cella up`.
+cella-env detects the host environment (SSH agent, git config, credential proxies, AI agent tools, editor/terminal tool configs) and produces the mounts, environment variables, and post-start commands needed to forward that environment into a dev container. It is the single entry point for all environment setup during `cella up`.
 
 The crate is designed to never fail. Each forwarding feature (SSH agent, git config, credentials) is independently detected and configured. If any feature's detection fails, it logs a warning and is skipped — the container still starts. This follows the principle that `cella up` should always succeed even if some environment forwarding isn't available.
 
@@ -52,6 +52,8 @@ This is the main entry point. It detects the runtime, probes the host environmen
 | `claude_code` | Claude Code config detection, path rewriting, and container injection |
 | `codex` | OpenAI Codex CLI host detection and container path helpers |
 | `gemini` | Google Gemini CLI host detection and container path helpers |
+| `nvim` | Neovim config directory detection and mount preparation |
+| `tmux` | tmux config detection, mount preparation, and install command generation |
 
 ## Crate Dependencies
 

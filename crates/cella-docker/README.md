@@ -6,7 +6,7 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-docker provides all container operations: creating, starting, stopping, and removing containers, building images, executing commands, uploading files, managing volumes and networks, and running lifecycle commands. It wraps the [bollard](https://docs.rs/bollard) Docker API client behind a `DockerApi` trait, enabling testability and future support for alternative runtimes (Podman, etc.).
+cella-docker provides all Docker container operations: creating, starting, stopping, and removing containers, building images, executing commands, uploading files, managing volumes and networks, and running lifecycle commands. It implements `ContainerBackend` (from [cella-backend](../cella-backend)) using the [bollard](https://docs.rs/bollard) Docker API client. Internally, the `DockerApi` trait wraps bollard for testability.
 
 The crate auto-detects the Docker socket location and connects to whatever Docker-compatible runtime is available (Docker Engine, OrbStack, Colima). Container naming, labeling, and image naming follow consistent conventions that allow cella to track and manage its containers.
 
@@ -27,15 +27,9 @@ Implements the container lifecycle portions of the [Dev Container specification]
 
 ### Key Types
 
-- `DockerApi` — trait abstracting all Docker operations (the extension point for new runtimes)
-- `DockerClient` — bollard-backed implementation of `DockerApi`
-- `ContainerInfo` — full container state including mounts, ports, labels
-- `ContainerState` — lifecycle state tracking (created, running, stopped, etc.)
-- `CreateContainerOptions` — container creation parameters
-- `MountConfig` — mount specification (bind, volume, tmpfs)
-- `ExecOptions` / `InteractiveExecOptions` — command execution configuration
-- `ExecResult` — execution output with exit code
-- `BuildOptions` — image build parameters
+- `DockerApi` — internal trait wrapping bollard Docker operations (not the extension point for new runtimes — see `ContainerBackend` in [cella-backend](../cella-backend))
+- `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend` and `ComposeBackend`
+- `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend) and re-exported here
 - `ParsedLifecycle` — parsed lifecycle command (string, array, or map form)
 - `ContainerTarget` — resolved container identifier
 - `FileToUpload` — file content for upload into containers
@@ -64,7 +58,7 @@ Implements the container lifecycle portions of the [Dev Container specification]
 
 ## Crate Dependencies
 
-**Depends on:** [cella-port](../cella-port), [cella-features](../cella-features)
+**Depends on:** [cella-backend](../cella-backend), [cella-port](../cella-port), [cella-features](../cella-features)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-compose](../cella-compose), [cella-doctor](../cella-doctor)
 
@@ -82,10 +76,7 @@ cargo test -p cella-docker -- --ignored
 
 ## Development
 
-The `DockerApi` trait is the primary abstraction boundary. To add support for a new container runtime (e.g., Podman):
-1. Implement the `DockerApi` trait for the new runtime
-2. Add runtime detection in the client module
-3. The rest of cella will work through the trait without changes
+To add support for a new container runtime (e.g., Podman), implement `ContainerBackend` from [cella-backend](../cella-backend) in a new crate — see that crate's README for the full guide. `DockerApi` is an internal abstraction within this crate for wrapping bollard, not the extension point for new runtimes.
 
 The `lifecycle` module handles the three forms of lifecycle commands in the spec: string (`"npm install"`), array (`["npm", "install"]`), and map (`{"vscode": "npm install"}`). When adding lifecycle support, ensure all three forms are handled.
 

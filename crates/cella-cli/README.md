@@ -28,12 +28,20 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `config` | View and manage cella configuration |
 | `template` | Manage dev container templates |
 | `init` | Initialize cella in the current repository |
-| `nvim` | Open neovim connected to the dev container |
+| `code` | Open VS Code connected to the dev container |
+| `nvim` | Open Neovim connected to the dev container |
+| `tmux` | Open a tmux session inside the dev container |
 | `ports` | View port forwarding status for dev containers |
 | `credential` | Manage credential forwarding for dev containers |
 | `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
 
 Hidden internal commands: `daemon`, `credential-proxy`.
+
+### Global Flags
+
+| Flag | Description |
+|------|-------------|
+| `--backend <name>` | Container backend to use (`docker` or `apple-container`). Defaults to auto-detection. |
 
 ## Architecture
 
@@ -63,19 +71,22 @@ Hidden internal commands: `daemon`, `credential-proxy`.
 | `commands/read_configuration.rs` | Resolved devcontainer config output (JSON, compatible with devcontainer CLI) |
 | `commands/template.rs` | Template management |
 | `commands/init.rs` | Repository initialization |
+| `commands/code.rs` | VS Code container connection (attached-container URI, auto-up, fork support) |
 | `commands/nvim.rs` | Neovim container connection |
+| `commands/tmux.rs` | tmux session management (attach-or-create, config forwarding) |
 | `commands/ports.rs` | Port forwarding status |
 | `commands/credential.rs` | Credential forwarding management |
 | `commands/daemon.rs` | Daemon lifecycle management (hidden) |
 | `commands/credential_proxy.rs` | Legacy credential proxy management (hidden) |
 | `commands/env_cache.rs` | Environment cache management (internal helper) |
 | `commands/image.rs` | Image inspection (internal helper) |
+| `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
 
 Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-config](../cella-config), [cella-docker](../cella-docker), [cella-compose](../cella-compose), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-port](../cella-port), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-credential-proxy](../cella-credential-proxy)
+**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-compose](../cella-compose), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-port](../cella-port), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-credential-proxy](../cella-credential-proxy)
 
 **Depended on by:** none (top of the dependency tree)
 
