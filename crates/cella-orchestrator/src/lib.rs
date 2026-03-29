@@ -5,6 +5,7 @@
 //! functions instead of the daemon shelling out to CLI subprocesses.
 
 pub mod config;
+pub mod docker_helpers;
 pub mod error;
 pub mod image;
 pub mod lifecycle;

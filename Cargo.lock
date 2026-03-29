@@ -479,8 +479,10 @@ dependencies = [
 name = "cella-orchestrator"
 version = "0.0.9"
 dependencies = [
+ "cella-backend",
  "cella-docker",
  "cella-features",
+ "cella-git",
  "hex",
  "serde_json",
  "sha2 0.11.0",

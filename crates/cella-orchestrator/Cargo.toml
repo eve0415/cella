@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-backend.workspace = true
 cella-docker.workspace = true
 cella-features.workspace = true
 cella-git.workspace = true
