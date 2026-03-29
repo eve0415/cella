@@ -30,6 +30,9 @@ pub(crate) struct ControlContext {
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
     pub task_manager: crate::task_manager::SharedTaskManager,
+    /// Host-native cella binary, resolved and snapshotted at daemon startup so
+    /// that in-container `cargo build` cannot clobber it via the bind mount.
+    pub cella_bin: std::path::PathBuf,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -302,8 +305,11 @@ async fn handle_agent_connection(
         ) {
             handle_worktree_message(
                 msg,
-                hs.workspace_path.as_deref(),
-                &ctx.task_manager,
+                WorktreeHandlerCtx {
+                    workspace_path: hs.workspace_path.as_deref(),
+                    cella_bin: &ctx.cella_bin,
+                    task_mgr: &ctx.task_manager,
+                },
                 &mut writer,
             )
             .await?;
@@ -576,11 +582,17 @@ async fn lookup_container_labels(container_id: &str) -> HashMap<String, String> 
 // Worktree operation handlers
 // ---------------------------------------------------------------------------
 
+/// Shared context for worktree operation handlers.
+struct WorktreeHandlerCtx<'a> {
+    workspace_path: Option<&'a str>,
+    cella_bin: &'a std::path::Path,
+    task_mgr: &'a crate::task_manager::SharedTaskManager,
+}
+
 /// Handle worktree/exec/task messages that need writer access for multi-message responses.
 async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
     msg: AgentMessage,
-    workspace_path: Option<&str>,
-    task_mgr: &crate::task_manager::SharedTaskManager,
+    wt: WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     match msg {
@@ -593,13 +605,14 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
                 &request_id,
                 &branch,
                 base.as_deref(),
-                workspace_path,
+                wt.workspace_path,
+                wt.cella_bin,
                 writer,
             )
             .await?;
         }
         AgentMessage::ListRequest { request_id } => {
-            handle_list_request(&request_id, workspace_path, writer).await?;
+            handle_list_request(&request_id, wt.workspace_path, writer).await?;
         }
         AgentMessage::ExecRequest {
             request_id,
@@ -612,7 +625,8 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             dry_run,
         } => {
-            handle_prune_request(&request_id, dry_run, workspace_path, writer).await?;
+            handle_prune_request(&request_id, dry_run, wt.workspace_path, wt.cella_bin, writer)
+                .await?;
         }
         AgentMessage::TaskRunRequest {
             request_id,
@@ -620,28 +634,20 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             command,
             base,
         } => {
-            handle_task_run(
-                &request_id,
-                &branch,
-                &command,
-                base.as_deref(),
-                workspace_path,
-                task_mgr,
-                writer,
-            )
-            .await?;
+            handle_task_run(&request_id, &branch, &command, base.as_deref(), &wt, writer)
+                .await?;
         }
         AgentMessage::TaskListRequest { request_id } => {
-            handle_task_list(&request_id, task_mgr, writer).await?;
+            handle_task_list(&request_id, wt.task_mgr, writer).await?;
         }
         AgentMessage::TaskLogsRequest { request_id, branch } => {
-            handle_task_logs(&request_id, &branch, task_mgr, writer).await?;
+            handle_task_logs(&request_id, &branch, wt.task_mgr, writer).await?;
         }
         AgentMessage::TaskWaitRequest { request_id, branch } => {
-            handle_task_wait(&request_id, &branch, task_mgr, writer).await?;
+            handle_task_wait(&request_id, &branch, wt.task_mgr, writer).await?;
         }
         AgentMessage::TaskStopRequest { request_id, branch } => {
-            handle_task_stop(&request_id, &branch, task_mgr, writer).await?;
+            handle_task_stop(&request_id, &branch, wt.task_mgr, writer).await?;
         }
         AgentMessage::SwitchRequest { request_id, branch } => {
             handle_switch_request(&request_id, &branch, writer).await?;
@@ -659,12 +665,11 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     branch: &str,
     base: Option<&str>,
     workspace_path: Option<&str>,
+    cella_bin: &std::path::Path,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     use cella_port::protocol::WorktreeOperationResult;
     use tokio::process::Command;
-
-    let cella_bin = find_cella_binary();
 
     info!(
         "Handling BranchRequest: branch={branch} base={base:?} via {}",
@@ -683,7 +688,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     .await?;
 
     // Build command
-    let mut cmd = Command::new(&cella_bin);
+    let mut cmd = Command::new(cella_bin);
     cmd.arg("branch").arg(branch).arg("--output").arg("json");
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
@@ -1081,11 +1086,11 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     dry_run: bool,
     workspace_path: Option<&str>,
+    cella_bin: &std::path::Path,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    let cella_bin = find_cella_binary();
 
-    let mut cmd = tokio::process::Command::new(&cella_bin);
+    let mut cmd = tokio::process::Command::new(cella_bin);
     cmd.arg("prune").arg("--force"); // Skip interactive prompt
     if dry_run {
         cmd.arg("--dry-run");
@@ -1143,8 +1148,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
     branch: &str,
     command: &[String],
     base: Option<&str>,
-    workspace_path: Option<&str>,
-    task_mgr: &crate::task_manager::SharedTaskManager,
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     // First, ensure the branch container exists (create if needed).
@@ -1164,13 +1168,12 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
         )
         .await?;
 
-        let cella_bin = find_cella_binary();
-        let mut cmd = tokio::process::Command::new(&cella_bin);
+        let mut cmd = tokio::process::Command::new(wt.cella_bin);
         cmd.arg("branch").arg(branch).arg("--output").arg("json");
         if let Some(b) = base {
             cmd.arg("--base").arg(b);
         }
-        if let Some(ws) = workspace_path {
+        if let Some(ws) = wt.workspace_path {
             cmd.current_dir(ws);
         }
         let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
@@ -1219,7 +1222,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
 
     // Start the background task.
     let task_id = {
-        let mut mgr = task_mgr.lock().await;
+        let mut mgr = wt.task_mgr.lock().await;
         match mgr.start_task(branch, container_name.clone(), command.to_vec()) {
             Ok(id) => id,
             Err(e) => {
@@ -1469,15 +1472,92 @@ async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
 }
 
 /// Find the cella binary path (sibling to current exe or PATH fallback).
-fn find_cella_binary() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let dir = exe.parent()?;
-            let cella = dir.join("cella");
-            if cella.exists() { Some(cella) } else { None }
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("cella"))
+/// Resolve the host-native cella binary and snapshot it to a stable path.
+///
+/// During development, `cargo build` inside the container overwrites
+/// `target/debug/cella` (the host macOS binary) with a Linux ELF via the
+/// bind mount. By copying the binary to a daemon-managed location at startup,
+/// we guarantee the daemon always has a working host-native binary.
+///
+/// Resolution order:
+/// 1. `CELLA_HOST_BIN` env var (explicit override for development)
+/// 2. Adjacent to the daemon exe (`target/debug/cella` next to `cella-daemon`)
+/// 3. PATH lookup (installed `cella`)
+pub(crate) fn resolve_cella_binary() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    // 1. Explicit override
+    if let Ok(bin) = std::env::var("CELLA_HOST_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.is_file() {
+            return snapshot_binary(&p).unwrap_or(p);
+        }
+        warn!("CELLA_HOST_BIN={bin} does not exist, falling through");
+    }
+
+    // 2. Adjacent to daemon exe
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cella = dir.join("cella");
+        if cella.is_file() {
+            return snapshot_binary(&cella).unwrap_or(cella);
+        }
+    }
+
+    // 3. PATH lookup
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("cella")
+        .output()
+        && output.status.success()
+    {
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        if path.is_file() {
+            return snapshot_binary(&path).unwrap_or(path);
+        }
+    }
+
+    warn!("Could not resolve host cella binary — worktree operations will fail");
+    PathBuf::from("cella")
+}
+
+/// Copy the binary to a daemon-managed stable path so bind-mount overwrites
+/// from in-container builds don't affect the running daemon.
+fn snapshot_binary(source: &std::path::Path) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let snap_dir = std::path::PathBuf::from(home).join(".cella").join("bin");
+
+    if std::fs::create_dir_all(&snap_dir).is_err() {
+        return None;
+    }
+
+    let dest = snap_dir.join("cella");
+
+    // Only copy if source is newer or snapshot doesn't exist yet.
+    let needs_copy = match (std::fs::metadata(source), std::fs::metadata(&dest)) {
+        (Ok(src_meta), Ok(dst_meta)) => {
+            src_meta.modified().ok() > dst_meta.modified().ok()
+                || src_meta.len() != dst_meta.len()
+        }
+        (Ok(_), Err(_)) => true,
+        _ => return None,
+    };
+
+    if needs_copy {
+        if let Err(e) = std::fs::copy(source, &dest) {
+            warn!("Failed to snapshot cella binary: {e}");
+            return None;
+        }
+        // Ensure executable permission
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        }
+        info!("Snapshotted cella binary to {}", dest.display());
+    }
+
+    Some(dest)
 }
 
 /// Find a running container for a given branch name via Docker labels.
