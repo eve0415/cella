@@ -71,7 +71,7 @@ miette = { version = "7.6.0", features = ["fancy"] }
 bollard = "0.20.2"
 
 # Hashing
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 hex = "0.4.3"
 
 # Stream processing
@@ -100,14 +100,14 @@ regex = "1.12.3"
 glob = "0.3.3"
 
 # File watching
-notify = "8.0.0"
+notify = "8.2.0"
 
 # Process inspection
 nix = { version = "0.31.2", default-features = false, features = ["signal"] }
 
 # Testing
 tempfile = "3.27.0"
-insta = { version = "1.46.3", features = ["json", "yaml", "redactions"] }
+insta = { version = "1.47.0", features = ["json", "yaml", "redactions"] }
 
 # Internal crates
 cella-backend = { path = "crates/cella-backend" }
