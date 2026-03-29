@@ -3,91 +3,13 @@
 //! Maps `docker create` CLI flags to bollard `HostConfig` and container body
 //! fields. Unrecognized flags are collected for warning emission.
 
-use std::collections::HashMap;
-
 use tracing::warn;
 
-/// GPU specification from `--gpus`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GpuSpec {
-    All,
-    Count(i64),
-    DeviceIds(Vec<String>),
-}
+pub use cella_backend::{DeviceSpec, GpuRequest, RunArgsOverrides, UlimitSpec};
 
-/// A device specification from `--device`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceSpec {
-    pub path_on_host: String,
-    pub path_in_container: String,
-    pub cgroup_permissions: String,
-}
-
-/// A ulimit specification from `--ulimit`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UlimitSpec {
-    pub name: String,
-    pub soft: i64,
-    pub hard: i64,
-}
-
-/// Parsed overrides from `runArgs` (docker create flags).
-///
-/// Each field maps to the corresponding bollard `HostConfig` or container body
-/// field. `None`/empty means the flag was not specified (don't override).
-#[derive(Debug, Clone, Default)]
-pub struct RunArgsOverrides {
-    // Networking
-    pub network_mode: Option<String>,
-    pub hostname: Option<String>,
-    pub dns: Vec<String>,
-    pub dns_search: Vec<String>,
-    pub extra_hosts: Vec<String>,
-    pub mac_address: Option<String>,
-
-    // Resources
-    pub memory: Option<i64>,
-    pub memory_swap: Option<i64>,
-    pub memory_reservation: Option<i64>,
-    pub nano_cpus: Option<i64>,
-    pub cpu_shares: Option<i64>,
-    pub cpu_period: Option<i64>,
-    pub cpu_quota: Option<i64>,
-    pub cpuset_cpus: Option<String>,
-    pub cpuset_mems: Option<String>,
-    pub shm_size: Option<i64>,
-    pub pids_limit: Option<i64>,
-
-    // Security
-    pub security_opt: Vec<String>,
-    pub userns_mode: Option<String>,
-    pub cgroup_parent: Option<String>,
-    pub cgroupns_mode: Option<String>,
-
-    // Devices
-    pub devices: Vec<DeviceSpec>,
-    pub device_cgroup_rules: Vec<String>,
-    pub gpus: Option<GpuSpec>,
-
-    // Other
-    pub ulimits: Vec<UlimitSpec>,
-    pub sysctls: HashMap<String, String>,
-    pub tmpfs: HashMap<String, String>,
-    pub labels: HashMap<String, String>,
-    pub pid_mode: Option<String>,
-    pub ipc_mode: Option<String>,
-    pub uts_mode: Option<String>,
-    pub runtime: Option<String>,
-    pub storage_opt: HashMap<String, String>,
-    pub log_driver: Option<String>,
-    pub log_opt: HashMap<String, String>,
-    pub restart_policy: Option<String>,
-    pub init: Option<bool>,
-    pub privileged: Option<bool>,
-
-    /// Flags not recognized by the parser (emitted as warnings).
-    pub unrecognized: Vec<String>,
-}
+/// Type alias for backward compatibility — `GpuSpec` was renamed to `GpuRequest` in
+/// `cella-backend`.
+pub type GpuSpec = GpuRequest;
 
 /// Parse `runArgs` from devcontainer.json into overrides.
 ///
@@ -479,29 +401,29 @@ pub fn parse_byte_size(s: &str) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
-/// Parse `--gpus` value into a `GpuSpec`.
-fn parse_gpu_spec(s: &str) -> GpuSpec {
+/// Parse `--gpus` value into a `GpuRequest`.
+fn parse_gpu_spec(s: &str) -> GpuRequest {
     let s = s.trim();
     if s == "all" {
-        return GpuSpec::All;
+        return GpuRequest::All;
     }
     if let Ok(n) = s.parse::<i64>() {
-        return GpuSpec::Count(n);
+        return GpuRequest::Count(n);
     }
     // Handle device=0,1 or count=N
     for part in s.split(',') {
         let part = part.trim();
         if let Some(ids) = part.strip_prefix("device=") {
-            return GpuSpec::DeviceIds(ids.split(',').map(|s| s.trim().to_string()).collect());
+            return GpuRequest::DeviceIds(ids.split(',').map(|s| s.trim().to_string()).collect());
         }
         if let Some(count) = part.strip_prefix("count=")
             && let Ok(n) = count.trim().parse::<i64>()
         {
-            return GpuSpec::Count(n);
+            return GpuRequest::Count(n);
         }
     }
     // Fallback: treat as "all" for unrecognized GPU specs
-    GpuSpec::All
+    GpuRequest::All
 }
 
 /// Parse `--device` value: `/dev/foo:/dev/bar:rwm` or `/dev/foo`.

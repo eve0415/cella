@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use bollard::models::PortBinding;
+use cella_backend::PortForward;
 use cella_port::protocol::{OnAutoForward, PortAttributes, PortPattern};
 
-pub(super) fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, Vec<PortBinding>> {
+pub(super) fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, Vec<PortForward>> {
     let Some(ports) = config.get("forwardPorts").and_then(|v| v.as_array()) else {
         return HashMap::new();
     };
@@ -29,7 +29,7 @@ pub(super) fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, V
 
         bindings.insert(
             container_port,
-            vec![PortBinding {
+            vec![PortForward {
                 host_ip: Some("0.0.0.0".to_string()),
                 host_port: Some(host_port),
             }],

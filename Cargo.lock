@@ -263,9 +263,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-backend"
+version = "0.0.8"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cella-cli"
 version = "0.0.8"
 dependencies = [
+ "cella-backend",
  "cella-compose",
  "cella-config",
  "cella-credential-proxy",
@@ -367,6 +381,7 @@ name = "cella-docker"
 version = "0.0.8"
 dependencies = [
  "bollard",
+ "cella-backend",
  "cella-features",
  "cella-port",
  "chrono",

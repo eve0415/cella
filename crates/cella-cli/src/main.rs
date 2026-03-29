@@ -1,3 +1,4 @@
+pub mod backend;
 mod commands;
 pub mod progress;
 mod table;
@@ -16,6 +17,10 @@ struct Cli {
     /// Print version.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
+
+    /// Container backend to use (auto-detected if not specified).
+    #[arg(long, global = true, value_enum)]
+    backend: Option<backend::BackendChoice>,
 
     #[command(subcommand)]
     command: commands::Command,

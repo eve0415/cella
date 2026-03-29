@@ -14,19 +14,22 @@ pub mod uid;
 pub mod upload;
 pub mod volume;
 
-pub use client::{DockerApi, DockerClient};
-pub use config_map::{CreateContainerOptions, MountConfig};
-pub use container::{ContainerInfo, ContainerState, MountInfo, PortBinding};
+pub use client::DockerClient;
+pub use config_map::to_bollard_config;
 pub use error::CellaDockerError;
-pub use exec::{ExecOptions, ExecResult, InteractiveExecOptions};
-pub use image::{BuildOptions, ImageDetails};
 pub use lifecycle::{
     LifecycleContext, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,
 };
-pub use names::{
+pub use resolve::ContainerTarget;
+pub use uid::update_remote_user_uid;
+
+// Re-export types from cella-backend for backward compatibility.
+pub use cella_backend::names::{
     compose_labels, compose_project_name, container_labels, container_name, image_name,
     image_name_with_features, worktree_labels,
 };
-pub use resolve::ContainerTarget;
-pub use uid::update_remote_user_uid;
-pub use upload::FileToUpload;
+pub use cella_backend::{
+    BackendError, BackendKind, BoxFuture, BuildOptions, ComposeBackend, ContainerBackend,
+    ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
+    ImageDetails, InteractiveExecOptions, MountConfig, MountInfo, PortBinding,
+};

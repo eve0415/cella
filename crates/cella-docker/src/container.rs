@@ -11,75 +11,24 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
+pub use cella_backend::{BackendKind, ContainerInfo, ContainerState, MountInfo, PortBinding};
+
 use crate::CellaDockerError;
 use crate::client::DockerClient;
+use crate::config_map::to_bollard_config;
 use crate::image::normalize_user;
 
-/// Container state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContainerState {
-    Running,
-    Stopped,
-    Created,
-    Removing,
-    Other(String),
-}
-
-impl ContainerState {
-    pub(crate) fn from_bollard(status: ContainerStateStatusEnum) -> Self {
-        match status {
-            ContainerStateStatusEnum::RUNNING => Self::Running,
-            ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD => Self::Stopped,
-            ContainerStateStatusEnum::CREATED => Self::Created,
-            ContainerStateStatusEnum::REMOVING => Self::Removing,
-            other => Self::Other(format!("{other:?}")),
+/// Convert a bollard `ContainerStateStatusEnum` to a `ContainerState`.
+pub(crate) fn container_state_from_bollard(status: ContainerStateStatusEnum) -> ContainerState {
+    match status {
+        ContainerStateStatusEnum::RUNNING => ContainerState::Running,
+        ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD => {
+            ContainerState::Stopped
         }
+        ContainerStateStatusEnum::CREATED => ContainerState::Created,
+        ContainerStateStatusEnum::REMOVING => ContainerState::Removing,
+        other => ContainerState::Other(format!("{other:?}")),
     }
-
-    pub(crate) fn from_str(s: &str) -> Self {
-        match s {
-            "running" => Self::Running,
-            "exited" | "dead" => Self::Stopped,
-            "created" => Self::Created,
-            "removing" => Self::Removing,
-            other => Self::Other(other.to_string()),
-        }
-    }
-}
-
-/// A port binding exposed by the container.
-#[derive(Debug, Clone)]
-pub struct PortBinding {
-    pub container_port: u16,
-    pub host_port: Option<u16>,
-    pub protocol: String,
-}
-
-/// A bind mount or volume attached to the container.
-#[derive(Debug, Clone)]
-pub struct MountInfo {
-    pub mount_type: String,
-    pub source: String,
-    pub destination: String,
-}
-
-/// Information about a container.
-#[derive(Debug, Clone)]
-pub struct ContainerInfo {
-    pub id: String,
-    pub name: String,
-    pub state: ContainerState,
-    pub exit_code: Option<i64>,
-    pub labels: HashMap<String, String>,
-    pub config_hash: Option<String>,
-    pub ports: Vec<PortBinding>,
-    pub created_at: Option<String>,
-    /// The USER from the container's config (only populated via inspect, not list).
-    pub container_user: Option<String>,
-    /// The image used to create the container.
-    pub image: Option<String>,
-    /// Bind mounts and volumes (only populated via inspect, not list).
-    pub mounts: Vec<MountInfo>,
 }
 
 /// Convert a bollard `ContainerSummary` into a `ContainerInfo`.
@@ -93,7 +42,7 @@ pub(crate) fn container_info_from_summary(
     let config_hash = labels.get("dev.cella.config_hash").cloned();
     let state = summary.state.as_ref().map_or_else(
         || ContainerState::Other("unknown".to_string()),
-        |s| ContainerState::from_str(s.as_ref()),
+        |s| ContainerState::parse(s.as_ref()),
     );
 
     let ports = summary
@@ -130,6 +79,7 @@ pub(crate) fn container_info_from_summary(
         container_user: None,
         image: summary.image,
         mounts: Vec::new(),
+        backend: BackendKind::Docker,
     }
 }
 
@@ -173,7 +123,7 @@ impl DockerClient {
     /// Returns `CellaDockerError::DockerApi` on API errors.
     pub async fn create_container(
         &self,
-        opts: &super::config_map::CreateContainerOptions,
+        opts: &cella_backend::CreateContainerOptions,
     ) -> Result<String, CellaDockerError> {
         info!("Creating container: {}", opts.name);
 
@@ -182,7 +132,7 @@ impl DockerClient {
             ..Default::default()
         };
 
-        let config = opts.to_bollard_config();
+        let config = to_bollard_config(opts);
         let response = self
             .inner()
             .create_container(Some(bollard_opts), config)
@@ -255,7 +205,7 @@ impl DockerClient {
         let container_state = inspect.state.as_ref();
         let state = container_state.and_then(|s| s.status).map_or_else(
             || ContainerState::Other("unknown".to_string()),
-            ContainerState::from_bollard,
+            container_state_from_bollard,
         );
         let exit_code = container_state.and_then(|s| s.exit_code);
 
@@ -332,6 +282,7 @@ impl DockerClient {
             container_user,
             image,
             mounts,
+            backend: BackendKind::Docker,
         })
     }
 
@@ -469,59 +420,56 @@ mod tests {
     use bollard::models::{
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
+    use cella_backend::ContainerBackend;
 
     use super::*;
-    use crate::client::DockerApi;
     use crate::client::mock::{MockCall, MockDockerClient};
 
     // -----------------------------------------------------------------------
-    // ContainerState::from_str tests
+    // ContainerState::parse tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn from_str_running() {
-        assert_eq!(ContainerState::from_str("running"), ContainerState::Running);
+        assert_eq!(ContainerState::parse("running"), ContainerState::Running);
     }
 
     #[test]
     fn from_str_exited() {
-        assert_eq!(ContainerState::from_str("exited"), ContainerState::Stopped);
+        assert_eq!(ContainerState::parse("exited"), ContainerState::Stopped);
     }
 
     #[test]
     fn from_str_dead() {
-        assert_eq!(ContainerState::from_str("dead"), ContainerState::Stopped);
+        assert_eq!(ContainerState::parse("dead"), ContainerState::Stopped);
     }
 
     #[test]
     fn from_str_created() {
-        assert_eq!(ContainerState::from_str("created"), ContainerState::Created);
+        assert_eq!(ContainerState::parse("created"), ContainerState::Created);
     }
 
     #[test]
     fn from_str_removing() {
-        assert_eq!(
-            ContainerState::from_str("removing"),
-            ContainerState::Removing
-        );
+        assert_eq!(ContainerState::parse("removing"), ContainerState::Removing);
     }
 
     #[test]
     fn from_str_unknown() {
         assert_eq!(
-            ContainerState::from_str("unknown_state"),
+            ContainerState::parse("unknown_state"),
             ContainerState::Other("unknown_state".to_string())
         );
     }
 
     // -----------------------------------------------------------------------
-    // ContainerState::from_bollard tests
+    // container_state_from_bollard tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn from_bollard_running() {
         assert_eq!(
-            ContainerState::from_bollard(ContainerStateStatusEnum::RUNNING),
+            container_state_from_bollard(ContainerStateStatusEnum::RUNNING),
             ContainerState::Running
         );
     }
@@ -529,7 +477,7 @@ mod tests {
     #[test]
     fn from_bollard_exited() {
         assert_eq!(
-            ContainerState::from_bollard(ContainerStateStatusEnum::EXITED),
+            container_state_from_bollard(ContainerStateStatusEnum::EXITED),
             ContainerState::Stopped
         );
     }
@@ -537,7 +485,7 @@ mod tests {
     #[test]
     fn from_bollard_dead() {
         assert_eq!(
-            ContainerState::from_bollard(ContainerStateStatusEnum::DEAD),
+            container_state_from_bollard(ContainerStateStatusEnum::DEAD),
             ContainerState::Stopped
         );
     }
@@ -545,7 +493,7 @@ mod tests {
     #[test]
     fn from_bollard_created() {
         assert_eq!(
-            ContainerState::from_bollard(ContainerStateStatusEnum::CREATED),
+            container_state_from_bollard(ContainerStateStatusEnum::CREATED),
             ContainerState::Created
         );
     }
@@ -553,7 +501,7 @@ mod tests {
     #[test]
     fn from_bollard_removing() {
         assert_eq!(
-            ContainerState::from_bollard(ContainerStateStatusEnum::REMOVING),
+            container_state_from_bollard(ContainerStateStatusEnum::REMOVING),
             ContainerState::Removing
         );
     }
@@ -803,6 +751,7 @@ mod tests {
             container_user: None,
             image: None,
             mounts: Vec::new(),
+            backend: BackendKind::Docker,
         }
     }
 
@@ -938,12 +887,12 @@ mod tests {
         mock.start_container_responses
             .lock()
             .unwrap()
-            .push_back(Err(CellaDockerError::DockerApi(
+            .push_back(Err(cella_backend::BackendError::Runtime(Box::new(
                 bollard::errors::Error::DockerResponseServerError {
                     status_code: 500,
                     message: "bind mount source does not exist".to_string(),
                 },
-            )));
+            ))));
         let result = mock.start_container("test-id").await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());

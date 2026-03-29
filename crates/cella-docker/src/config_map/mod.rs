@@ -9,47 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use bollard::models::{
-    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, Mount, MountTypeEnum,
-    PortBinding, PortMap, ResourcesUlimits, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, Mount, MountTypeEnum, PortMap,
+    ResourcesUlimits, RestartPolicy, RestartPolicyNameEnum,
 };
+pub use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
 use mounts::{map_additional_mounts, map_workspace_mount, parse_mount_string};
 use ports::map_port_bindings;
-use run_args::{GpuSpec, RunArgsOverrides};
-
-/// Options for creating a container (pre-mapped from devcontainer.json).
-#[derive(Debug, Clone)]
-pub struct CreateContainerOptions {
-    pub name: String,
-    pub image: String,
-    pub labels: HashMap<String, String>,
-    pub env: Vec<String>,
-    pub remote_env: Vec<String>,
-    pub user: Option<String>,
-    pub workspace_folder: String,
-    pub workspace_mount: Option<MountConfig>,
-    pub mounts: Vec<MountConfig>,
-    pub port_bindings: HashMap<String, Vec<PortBinding>>,
-    pub entrypoint: Option<Vec<String>>,
-    pub cmd: Option<Vec<String>>,
-    pub cap_add: Vec<String>,
-    pub security_opt: Vec<String>,
-    pub privileged: bool,
-    pub run_args_overrides: Option<RunArgsOverrides>,
-    /// GPU device request from `hostRequirements.gpu` (lower precedence than runArgs `--gpus`).
-    pub gpu_device_request: Option<DeviceRequest>,
-}
-
-/// A mount configuration (abstracted from Docker's Mount type).
-#[derive(Debug, Clone)]
-pub struct MountConfig {
-    pub mount_type: String,
-    pub source: String,
-    pub target: String,
-    pub consistency: Option<String>,
-}
 
 /// Merged overrides applied during `to_bollard_config`.
 struct MergedOverrides {
@@ -60,134 +28,145 @@ struct MergedOverrides {
     privileged: bool,
 }
 
-impl CreateContainerOptions {
-    /// Convert to bollard `ContainerCreateBody` for container creation.
-    pub fn to_bollard_config(&self) -> ContainerCreateBody {
-        let (exposed_ports, port_bindings) = self.build_port_mappings();
-        let mounts = self.build_deduped_mounts();
-        let mut host_config = build_host_config(mounts, port_bindings);
-        let merged = self.apply_overrides(&mut host_config);
+/// Convert `CreateContainerOptions` (from `cella-backend`) to a bollard
+/// `ContainerCreateBody`.
+///
+/// This is a free function because `CreateContainerOptions` is defined in
+/// `cella-backend` and we cannot add inherent methods from another crate.
+pub fn to_bollard_config(opts: &CreateContainerOptions) -> ContainerCreateBody {
+    let (exposed_ports, port_bindings) = build_port_mappings(opts);
+    let mounts = build_deduped_mounts(opts);
+    let mut host_config = build_host_config(mounts, port_bindings);
+    let merged = apply_overrides(opts, &mut host_config);
 
-        host_config.cap_add = if merged.cap_add.is_empty() {
+    host_config.cap_add = if merged.cap_add.is_empty() {
+        None
+    } else {
+        Some(merged.cap_add)
+    };
+    host_config.security_opt = if merged.security_opt.is_empty() {
+        None
+    } else {
+        Some(merged.security_opt)
+    };
+    host_config.privileged = Some(merged.privileged);
+
+    ContainerCreateBody {
+        image: Some(opts.image.clone()),
+        labels: Some(merged.labels),
+        env: if opts.env.is_empty() {
             None
         } else {
-            Some(merged.cap_add)
-        };
-        host_config.security_opt = if merged.security_opt.is_empty() {
+            Some(opts.env.clone())
+        },
+        user: opts.user.clone(),
+        hostname: merged.hostname,
+        working_dir: Some(opts.workspace_folder.clone()),
+        entrypoint: opts.entrypoint.clone(),
+        cmd: opts.cmd.clone(),
+        exposed_ports: if exposed_ports.is_empty() {
             None
         } else {
-            Some(merged.security_opt)
+            Some(exposed_ports)
+        },
+        host_config: Some(host_config),
+        ..Default::default()
+    }
+}
+
+/// Build exposed ports and port bindings, converting `PortForward` to
+/// bollard `PortBinding`.
+fn build_port_mappings(opts: &CreateContainerOptions) -> (Vec<String>, PortMap) {
+    let mut exposed_ports: Vec<String> = Vec::new();
+    let mut port_bindings: PortMap = HashMap::new();
+
+    for (container_port, bindings) in &opts.port_bindings {
+        let port_key = if container_port.contains('/') {
+            container_port.clone()
+        } else {
+            format!("{container_port}/tcp")
         };
-        host_config.privileged = Some(merged.privileged);
+        exposed_ports.push(port_key.clone());
 
-        ContainerCreateBody {
-            image: Some(self.image.clone()),
-            labels: Some(merged.labels),
-            env: if self.env.is_empty() {
-                None
-            } else {
-                Some(self.env.clone())
-            },
-            user: self.user.clone(),
-            hostname: merged.hostname,
-            working_dir: Some(self.workspace_folder.clone()),
-            entrypoint: self.entrypoint.clone(),
-            cmd: self.cmd.clone(),
-            exposed_ports: if exposed_ports.is_empty() {
-                None
-            } else {
-                Some(exposed_ports)
-            },
-            host_config: Some(host_config),
-            ..Default::default()
-        }
+        let bollard_bindings: Vec<bollard::models::PortBinding> = bindings
+            .iter()
+            .map(|pf| bollard::models::PortBinding {
+                host_ip: pf.host_ip.clone(),
+                host_port: pf.host_port.clone(),
+            })
+            .collect();
+        port_bindings.insert(port_key, Some(bollard_bindings));
     }
 
-    /// Build exposed ports and port bindings from `self.port_bindings`.
-    fn build_port_mappings(&self) -> (Vec<String>, PortMap) {
-        let mut exposed_ports: Vec<String> = Vec::new();
-        let mut port_bindings: PortMap = HashMap::new();
+    (exposed_ports, port_bindings)
+}
 
-        for (container_port, bindings) in &self.port_bindings {
-            let port_key = if container_port.contains('/') {
-                container_port.clone()
-            } else {
-                format!("{container_port}/tcp")
-            };
-            exposed_ports.push(port_key.clone());
-            port_bindings.insert(port_key, Some(bindings.clone()));
-        }
-
-        (exposed_ports, port_bindings)
+/// Build deduplicated mount list (last occurrence wins per target path).
+fn build_deduped_mounts(opts: &CreateContainerOptions) -> Vec<Mount> {
+    let mut mounts: Vec<Mount> = Vec::new();
+    if let Some(ws_mount) = &opts.workspace_mount {
+        mounts.push(to_bollard_mount(ws_mount));
+    }
+    for m in &opts.mounts {
+        mounts.push(to_bollard_mount(m));
     }
 
-    /// Build deduplicated mount list (last occurrence wins per target path).
-    fn build_deduped_mounts(&self) -> Vec<Mount> {
-        let mut mounts: Vec<Mount> = Vec::new();
-        if let Some(ws_mount) = &self.workspace_mount {
-            mounts.push(to_bollard_mount(ws_mount));
+    let mut seen = HashSet::new();
+    mounts.reverse();
+    mounts.retain(|m| m.target.as_ref().is_none_or(|t| seen.insert(t.clone())));
+    mounts.reverse();
+    mounts
+}
+
+/// Apply `run_args` overrides and GPU device requests to host config.
+fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) -> MergedOverrides {
+    let mut extra_hosts = vec!["host.docker.internal:host-gateway".to_string()];
+    let mut security_opt = opts.security_opt.clone();
+    let mut privileged = opts.privileged;
+    let cap_add = opts.cap_add.clone();
+    let mut labels = opts.labels.clone();
+    let mut hostname = None;
+
+    if let Some(ref ra) = opts.run_args_overrides {
+        apply_run_args_to_host_config(host_config, ra);
+        extra_hosts.extend(ra.extra_hosts.clone());
+        security_opt.extend(ra.security_opt.clone());
+        if let Some(p) = ra.privileged {
+            privileged = p || privileged;
         }
-        for m in &self.mounts {
-            mounts.push(to_bollard_mount(m));
+        for (k, v) in &ra.labels {
+            labels.insert(k.clone(), v.clone());
         }
+        hostname.clone_from(&ra.hostname);
+        let _ = &ra.mac_address;
 
-        let mut seen = HashSet::new();
-        mounts.reverse();
-        mounts.retain(|m| m.target.as_ref().is_none_or(|t| seen.insert(t.clone())));
-        mounts.reverse();
-        mounts
-    }
-
-    /// Apply `run_args` overrides and GPU device requests to host config.
-    fn apply_overrides(&self, host_config: &mut HostConfig) -> MergedOverrides {
-        let mut extra_hosts = vec!["host.docker.internal:host-gateway".to_string()];
-        let mut security_opt = self.security_opt.clone();
-        let mut privileged = self.privileged;
-        let cap_add = self.cap_add.clone();
-        let mut labels = self.labels.clone();
-        let mut hostname = None;
-
-        if let Some(ref ra) = self.run_args_overrides {
-            apply_run_args_to_host_config(host_config, ra);
-            extra_hosts.extend(ra.extra_hosts.clone());
-            security_opt.extend(ra.security_opt.clone());
-            if let Some(p) = ra.privileged {
-                privileged = p || privileged;
-            }
-            for (k, v) in &ra.labels {
-                labels.insert(k.clone(), v.clone());
-            }
-            hostname.clone_from(&ra.hostname);
-            let _ = &ra.mac_address;
-
-            if let Some(ref gpu) = ra.gpus {
-                host_config
-                    .device_requests
-                    .get_or_insert_with(Vec::new)
-                    .push(gpu_spec_to_device_request(gpu));
-            }
-        }
-
-        let has_run_args_gpu = self
-            .run_args_overrides
-            .as_ref()
-            .is_some_and(|ra| ra.gpus.is_some());
-        if !has_run_args_gpu && let Some(ref dr) = self.gpu_device_request {
+        if let Some(ref gpu) = ra.gpus {
             host_config
                 .device_requests
                 .get_or_insert_with(Vec::new)
-                .push(dr.clone());
+                .push(gpu_request_to_device_request(gpu));
         }
+    }
 
-        host_config.extra_hosts = Some(extra_hosts);
+    let has_run_args_gpu = opts
+        .run_args_overrides
+        .as_ref()
+        .is_some_and(|ra| ra.gpus.is_some());
+    if !has_run_args_gpu && let Some(ref gpu) = opts.gpu_request {
+        host_config
+            .device_requests
+            .get_or_insert_with(Vec::new)
+            .push(gpu_request_to_device_request(gpu));
+    }
 
-        MergedOverrides {
-            labels,
-            hostname,
-            cap_add,
-            security_opt,
-            privileged,
-        }
+    host_config.extra_hosts = Some(extra_hosts);
+
+    MergedOverrides {
+        labels,
+        hostname,
+        cap_add,
+        security_opt,
+        privileged,
     }
 }
 
@@ -377,21 +356,21 @@ fn apply_misc_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
     }
 }
 
-/// Convert a `GpuSpec` to a bollard `DeviceRequest`.
-fn gpu_spec_to_device_request(gpu: &GpuSpec) -> DeviceRequest {
+/// Convert a `GpuRequest` to a bollard `DeviceRequest`.
+fn gpu_request_to_device_request(gpu: &GpuRequest) -> DeviceRequest {
     let capabilities = Some(vec![vec!["gpu".to_string()]]);
     match gpu {
-        GpuSpec::All => DeviceRequest {
+        GpuRequest::All => DeviceRequest {
             count: Some(-1),
             capabilities,
             ..Default::default()
         },
-        GpuSpec::Count(n) => DeviceRequest {
+        GpuRequest::Count(n) => DeviceRequest {
             count: Some(*n),
             capabilities,
             ..Default::default()
         },
-        GpuSpec::DeviceIds(ids) => DeviceRequest {
+        GpuRequest::DeviceIds(ids) => DeviceRequest {
             device_ids: Some(ids.clone()),
             capabilities,
             ..Default::default()
@@ -474,7 +453,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .unwrap_or(false)
         || feature_config.is_some_and(|fc| fc.privileged);
 
-    let gpu_device_request = map_gpu_device_request(config);
+    let gpu_request = map_gpu_device_request(config);
     let run_args_overrides = parse_run_args_from_config(config);
 
     CreateContainerOptions {
@@ -494,7 +473,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         security_opt,
         privileged,
         run_args_overrides,
-        gpu_device_request,
+        gpu_request,
     }
 }
 
@@ -590,25 +569,22 @@ fn build_entrypoint_cmd(
     )
 }
 
-/// Map `hostRequirements.gpu` to a `DeviceRequest` (runArgs `--gpus` takes precedence).
-fn map_gpu_device_request(config: &serde_json::Value) -> Option<DeviceRequest> {
+/// Map `hostRequirements.gpu` to a `GpuRequest` (runArgs `--gpus` takes precedence).
+fn map_gpu_device_request(config: &serde_json::Value) -> Option<GpuRequest> {
     config
         .get("hostRequirements")
         .and_then(|h| h.get("gpu"))
-        .and_then(|gpu| {
-            let spec = match gpu {
-                serde_json::Value::Bool(true) => Some(GpuSpec::All),
-                serde_json::Value::String(s) if s == "optional" => Some(GpuSpec::All),
-                serde_json::Value::Object(obj) => {
-                    let count = obj
-                        .get("cores")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(-1);
-                    Some(GpuSpec::Count(count))
-                }
-                _ => None,
-            };
-            spec.map(|s| gpu_spec_to_device_request(&s))
+        .and_then(|gpu| match gpu {
+            serde_json::Value::Bool(true) => Some(GpuRequest::All),
+            serde_json::Value::String(s) if s == "optional" => Some(GpuRequest::All),
+            serde_json::Value::Object(obj) => {
+                let count = obj
+                    .get("cores")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
+                Some(GpuRequest::Count(count))
+            }
+            _ => None,
         })
 }
 
@@ -950,10 +926,10 @@ mod tests {
             security_opt: Vec::new(),
             privileged: false,
             run_args_overrides: None,
-            gpu_device_request: None,
+            gpu_request: None,
         };
 
-        let bollard_config = opts.to_bollard_config();
+        let bollard_config = to_bollard_config(&opts);
         let mounts = bollard_config.host_config.unwrap().mounts.unwrap();
 
         assert_eq!(mounts.len(), 1);
@@ -990,10 +966,10 @@ mod tests {
             security_opt: Vec::new(),
             privileged: false,
             run_args_overrides: None,
-            gpu_device_request: None,
+            gpu_request: None,
         };
 
-        let bollard_config = opts.to_bollard_config();
+        let bollard_config = to_bollard_config(&opts);
         let mounts = bollard_config.host_config.unwrap().mounts.unwrap();
 
         // Last occurrence wins — user mount overrides workspace mount
@@ -1040,9 +1016,9 @@ mod tests {
             security_opt: Vec::new(),
             privileged: false,
             run_args_overrides: None,
-            gpu_device_request: None,
+            gpu_request: None,
         };
-        let bollard_config = opts.to_bollard_config();
+        let bollard_config = to_bollard_config(&opts);
         let extra_hosts = bollard_config.host_config.unwrap().extra_hosts.unwrap();
         assert!(extra_hosts.contains(&"host.docker.internal:host-gateway".to_string()));
     }
