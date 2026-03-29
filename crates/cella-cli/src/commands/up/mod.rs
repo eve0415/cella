@@ -1338,28 +1338,13 @@ pub fn resolve_remote_user(
         .to_string()
 }
 
-/// Build lifecycle entries for a phase from the metadata label, falling back to
-/// the config value if no metadata is available.
+/// Build lifecycle entries for a phase — delegates to orchestrator.
 fn lifecycle_entries_for_phase(
     metadata: Option<&str>,
     config: &serde_json::Value,
     phase: &str,
 ) -> Vec<cella_features::LifecycleEntry> {
-    metadata.map_or_else(
-        || {
-            config
-                .get(phase)
-                .filter(|v| !v.is_null())
-                .map(|cmd| {
-                    vec![cella_features::LifecycleEntry {
-                        origin: "devcontainer.json".into(),
-                        command: cmd.clone(),
-                    }]
-                })
-                .unwrap_or_default()
-        },
-        |meta_json| cella_features::lifecycle_from_metadata_label(meta_json, phase),
-    )
+    cella_orchestrator::lifecycle::lifecycle_entries_for_phase(metadata, config, phase)
 }
 
 /// Convert `cella_env::FileUpload` items to `cella_docker::File`.
