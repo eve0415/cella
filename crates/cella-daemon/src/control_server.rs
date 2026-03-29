@@ -284,14 +284,22 @@ async fn handle_agent_connection(
                 message: format!("invalid agent message: {e}"),
             })?;
 
-        // Worktree operations need writer access for multi-message responses.
+        // Worktree/exec/task operations need writer access for multi-message responses.
         // Handle them directly before falling through to the single-response handler.
-        match &msg {
-            AgentMessage::BranchRequest { .. } | AgentMessage::ListRequest { .. } => {
-                handle_worktree_message(msg, hs.workspace_path.as_deref(), &mut writer).await?;
-                continue;
-            }
-            _ => {}
+        if matches!(
+            &msg,
+            AgentMessage::BranchRequest { .. }
+                | AgentMessage::ListRequest { .. }
+                | AgentMessage::ExecRequest { .. }
+                | AgentMessage::PruneRequest { .. }
+                | AgentMessage::TaskRunRequest { .. }
+                | AgentMessage::TaskListRequest { .. }
+                | AgentMessage::TaskLogsRequest { .. }
+                | AgentMessage::TaskWaitRequest { .. }
+                | AgentMessage::TaskStopRequest { .. }
+        ) {
+            handle_worktree_message(msg, hs.workspace_path.as_deref(), &mut writer).await?;
+            continue;
         }
 
         let handler_ctx = AgentHandlerContext {
@@ -486,10 +494,18 @@ pub(crate) async fn handle_agent_message(
             None
         }
 
-        // Worktree operations are handled in the message loop via
+        // Worktree/exec/task operations are handled in the message loop via
         // handle_worktree_message() which has writer access for streaming.
-        AgentMessage::BranchRequest { .. } | AgentMessage::ListRequest { .. } => {
-            unreachable!("worktree messages intercepted before handle_agent_message")
+        AgentMessage::BranchRequest { .. }
+        | AgentMessage::ListRequest { .. }
+        | AgentMessage::ExecRequest { .. }
+        | AgentMessage::PruneRequest { .. }
+        | AgentMessage::TaskRunRequest { .. }
+        | AgentMessage::TaskListRequest { .. }
+        | AgentMessage::TaskLogsRequest { .. }
+        | AgentMessage::TaskWaitRequest { .. }
+        | AgentMessage::TaskStopRequest { .. } => {
+            unreachable!("worktree/exec/task messages intercepted before handle_agent_message")
         }
     }
 }
@@ -551,7 +567,7 @@ async fn lookup_container_labels(container_id: &str) -> HashMap<String, String> 
 // Worktree operation handlers
 // ---------------------------------------------------------------------------
 
-/// Handle worktree messages that need writer access for multi-message responses.
+/// Handle worktree/exec/task messages that need writer access for multi-message responses.
 async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
     msg: AgentMessage,
     workspace_path: Option<&str>,
@@ -575,6 +591,35 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         AgentMessage::ListRequest { request_id } => {
             handle_list_request(&request_id, workspace_path, writer).await?;
         }
+        AgentMessage::ExecRequest {
+            request_id,
+            branch,
+            command,
+        } => {
+            handle_exec_request(&request_id, &branch, &command, writer).await?;
+        }
+        AgentMessage::PruneRequest {
+            request_id,
+            dry_run,
+        } => {
+            handle_prune_request(&request_id, dry_run, workspace_path, writer).await?;
+        }
+        AgentMessage::TaskRunRequest { request_id, .. }
+        | AgentMessage::TaskListRequest { request_id, .. }
+        | AgentMessage::TaskLogsRequest { request_id, .. }
+        | AgentMessage::TaskWaitRequest { request_id, .. }
+        | AgentMessage::TaskStopRequest { request_id, .. } => {
+            // Task commands are Phase 2.5 — return not-implemented for now.
+            send_message(
+                writer,
+                &DaemonMessage::OperationProgress {
+                    request_id: request_id.clone(),
+                    step: "error".to_string(),
+                    message: "task commands not yet implemented".to_string(),
+                },
+            )
+            .await?;
+        }
         _ => {}
     }
     Ok(())
@@ -593,18 +638,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     use cella_port::protocol::WorktreeOperationResult;
     use tokio::process::Command;
 
-    // Find the cella binary (same binary as the daemon was started from,
-    // or fall back to PATH lookup).
-    let cella_bin = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            // The daemon is started by the CLI, so the CLI binary is typically
-            // a sibling or the same binary. Look for "cella" next to it.
-            let dir = exe.parent()?;
-            let cella = dir.join("cella");
-            if cella.exists() { Some(cella) } else { None }
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("cella"));
+    let cella_bin = find_cella_binary();
 
     info!(
         "Handling BranchRequest: branch={branch} base={base:?} via {}",
@@ -933,6 +967,182 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
             })
         })
         .collect()
+}
+
+/// Handle an `ExecRequest` by finding the branch's container and running docker exec.
+async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    command: &[String],
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    use cella_port::protocol::OutputStream;
+
+    // Find the container for this branch via docker ps with label filter.
+    let container_name = find_container_for_branch(branch).await;
+    let Some(container_name) = container_name else {
+        send_message(
+            writer,
+            &DaemonMessage::ExecResult {
+                request_id: request_id.to_string(),
+                exit_code: 1,
+            },
+        )
+        .await?;
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: OutputStream::Stderr,
+                data: format!("No running container found for branch '{branch}'\n"),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+
+    info!("Handling ExecRequest: branch={branch} container={container_name}");
+
+    // Build docker exec command.
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.arg("exec").arg(&container_name);
+    for arg in command {
+        cmd.arg(arg);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            send_message(
+                writer,
+                &DaemonMessage::OperationOutput {
+                    request_id: request_id.to_string(),
+                    stream: OutputStream::Stderr,
+                    data: format!("failed to spawn docker exec: {e}\n"),
+                },
+            )
+            .await?;
+            send_message(
+                writer,
+                &DaemonMessage::ExecResult {
+                    request_id: request_id.to_string(),
+                    exit_code: 1,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (status, _, _) = stream_child_output(&mut child, request_id, writer).await?;
+
+    send_message(
+        writer,
+        &DaemonMessage::ExecResult {
+            request_id: request_id.to_string(),
+            exit_code: status.code().unwrap_or(1),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle a `PruneRequest` by spawning `cella prune` as a subprocess.
+async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    dry_run: bool,
+    workspace_path: Option<&str>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let cella_bin = find_cella_binary();
+
+    let mut cmd = tokio::process::Command::new(&cella_bin);
+    cmd.arg("prune").arg("--force"); // Skip interactive prompt
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    if let Some(ws) = workspace_path {
+        cmd.current_dir(ws);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            send_message(
+                writer,
+                &DaemonMessage::PruneResult {
+                    request_id: request_id.to_string(),
+                    pruned: vec![],
+                    errors: vec![format!("failed to spawn cella prune: {e}")],
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (status, _stdout, stderr) = stream_child_output(&mut child, request_id, writer).await?;
+
+    let errors = if status.success() {
+        vec![]
+    } else {
+        vec![stderr.trim().to_string()]
+    };
+
+    send_message(
+        writer,
+        &DaemonMessage::PruneResult {
+            request_id: request_id.to_string(),
+            pruned: vec![], // TODO: parse pruned branches from output
+            errors,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Find the cella binary path (sibling to current exe or PATH fallback).
+fn find_cella_binary() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let dir = exe.parent()?;
+            let cella = dir.join("cella");
+            if cella.exists() { Some(cella) } else { None }
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("cella"))
+}
+
+/// Find a running container for a given branch name via Docker labels.
+async fn find_container_for_branch(branch: &str) -> Option<String> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!("label=dev.cella.branch={branch}"),
+            "--filter",
+            "label=dev.cella.worktree=true",
+            "--format",
+            "{{.Names}}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().next().map(ToString::to_string)
 }
 
 /// Extract the port number from a URL like `http://localhost:3000/path`.

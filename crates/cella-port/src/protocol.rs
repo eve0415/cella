@@ -82,6 +82,36 @@ pub enum AgentMessage {
     },
     /// Request to list worktree branches and their container status.
     ListRequest { request_id: String },
+    /// Execute a command in another branch's container.
+    ExecRequest {
+        request_id: String,
+        /// Branch name whose container to exec in.
+        branch: String,
+        /// Command to execute.
+        command: Vec<String>,
+    },
+    /// Remove merged worktrees and their containers.
+    PruneRequest {
+        request_id: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Create a branch and run a background command in its container.
+    TaskRunRequest {
+        request_id: String,
+        branch: String,
+        command: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+    },
+    /// List active background tasks.
+    TaskListRequest { request_id: String },
+    /// Stream output from a background task.
+    TaskLogsRequest { request_id: String, branch: String },
+    /// Block until a background task completes.
+    TaskWaitRequest { request_id: String, branch: String },
+    /// Stop a running background task.
+    TaskStopRequest { request_id: String, branch: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +252,35 @@ pub enum DaemonMessage {
         request_id: String,
         worktrees: Vec<WorktreeEntry>,
     },
+    /// Result of an exec request (exit code after command completes).
+    ExecResult { request_id: String, exit_code: i32 },
+    /// Result of a prune request.
+    PruneResult {
+        request_id: String,
+        pruned: Vec<String>,
+        errors: Vec<String>,
+    },
+    /// A background task was started.
+    TaskRunResult {
+        request_id: String,
+        task_id: String,
+        container_name: String,
+    },
+    /// List of active background tasks.
+    TaskListResult {
+        request_id: String,
+        tasks: Vec<TaskEntry>,
+    },
+    /// Background task output chunk (streaming).
+    TaskLogsData {
+        request_id: String,
+        data: String,
+        done: bool,
+    },
+    /// Background task completed.
+    TaskWaitResult { request_id: String, exit_code: i32 },
+    /// Background task stopped.
+    TaskStopResult { request_id: String },
 }
 
 /// Transport protocol for a port.
@@ -346,6 +405,32 @@ pub enum WorktreeOperationResult {
     Error {
         message: String,
     },
+}
+
+/// A background task entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEntry {
+    /// Task identifier (typically the branch name).
+    pub task_id: String,
+    /// Branch this task is running in.
+    pub branch: String,
+    /// Container running the task.
+    pub container_name: String,
+    /// Task status.
+    pub status: TaskStatus,
+    /// Command being run.
+    pub command: Vec<String>,
+    /// Seconds since the task started.
+    pub elapsed_secs: u64,
+}
+
+/// Status of a background task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Done,
+    Failed,
 }
 
 /// A worktree entry for list responses.
@@ -900,5 +985,115 @@ mod tests {
         assert!(
             matches!(decoded, DaemonMessage::ListResult { worktrees, .. } if worktrees.len() == 2)
         );
+    }
+
+    // -- Phase 2 protocol tests --------------------------------------------
+
+    #[test]
+    fn roundtrip_exec_request() {
+        let msg = AgentMessage::ExecRequest {
+            request_id: "ex-1".to_string(),
+            branch: "feat/auth".to_string(),
+            command: vec!["cargo".to_string(), "test".to_string()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"exec_request\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::ExecRequest { branch, .. } if branch == "feat/auth"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_exec_result() {
+        let msg = DaemonMessage::ExecResult {
+            request_id: "ex-1".to_string(),
+            exit_code: 0,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::ExecResult { exit_code: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_prune_request() {
+        let msg = AgentMessage::PruneRequest {
+            request_id: "pr-1".to_string(),
+            dry_run: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::PruneRequest { dry_run: true, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_prune_result() {
+        let msg = DaemonMessage::PruneResult {
+            request_id: "pr-1".to_string(),
+            pruned: vec!["feat/old".to_string()],
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, DaemonMessage::PruneResult { pruned, errors, .. }
+                if pruned.len() == 1 && errors.is_empty())
+        );
+    }
+
+    #[test]
+    fn roundtrip_task_run_request() {
+        let msg = AgentMessage::TaskRunRequest {
+            request_id: "tr-1".to_string(),
+            branch: "feat/auth".to_string(),
+            command: vec!["claude".to_string(), "-p".to_string(), "test".to_string()],
+            base: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"task_run_request\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::TaskRunRequest { branch, .. } if branch == "feat/auth"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_task_list_result() {
+        let msg = DaemonMessage::TaskListResult {
+            request_id: "tl-1".to_string(),
+            tasks: vec![TaskEntry {
+                task_id: "feat-auth".to_string(),
+                branch: "feat/auth".to_string(),
+                container_name: "cella-proj-feat-auth".to_string(),
+                status: TaskStatus::Running,
+                command: vec!["claude".to_string()],
+                elapsed_secs: 120,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, DaemonMessage::TaskListResult { tasks, .. } if tasks.len() == 1));
+    }
+
+    #[test]
+    fn roundtrip_task_wait_result() {
+        let msg = DaemonMessage::TaskWaitResult {
+            request_id: "tw-1".to_string(),
+            exit_code: 0,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::TaskWaitResult { exit_code: 0, .. }
+        ));
     }
 }

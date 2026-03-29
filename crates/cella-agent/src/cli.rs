@@ -10,10 +10,22 @@ use crate::control::ControlClient;
 
 /// In-container CLI commands.
 pub enum CliCommand {
-    Branch { name: String, base: Option<String> },
+    Branch {
+        name: String,
+        base: Option<String>,
+    },
     List,
+    Exec {
+        branch: String,
+        command: Vec<String>,
+    },
+    Prune {
+        dry_run: bool,
+    },
     Help,
-    Unsupported { command: String },
+    Unsupported {
+        command: String,
+    },
 }
 
 /// Parse CLI arguments for in-container mode.
@@ -41,17 +53,28 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             CliCommand::Branch { name, base }
         }
         Some("list" | "ls") => CliCommand::List,
-        Some("--help" | "-h") | None => CliCommand::Help,
-        Some(cmd) => {
-            let supported = ["branch", "list", "ls"];
-            if supported.contains(&cmd) {
-                CliCommand::Help
-            } else {
-                CliCommand::Unsupported {
-                    command: cmd.to_string(),
-                }
+        Some("exec") => {
+            // Parse: cella exec <branch> -- <cmd...>
+            let branch = match args.get(2) {
+                Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
+                _ => return CliCommand::Help,
+            };
+            // Find "--" separator
+            let sep = args.iter().position(|a| a == "--");
+            let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
+            if command.is_empty() {
+                return CliCommand::Help;
             }
+            CliCommand::Exec { branch, command }
         }
+        Some("prune") => {
+            let dry_run = args.iter().any(|a| a == "--dry-run");
+            CliCommand::Prune { dry_run }
+        }
+        Some("--help" | "-h") | None => CliCommand::Help,
+        Some(cmd) => CliCommand::Unsupported {
+            command: cmd.to_string(),
+        },
     }
 }
 
@@ -68,6 +91,8 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> 
         }
         CliCommand::Branch { name, base } => run_branch(&name, base.as_deref()).await,
         CliCommand::List => run_list().await,
+        CliCommand::Exec { branch, command } => run_exec(&branch, &command).await,
+        CliCommand::Prune { dry_run } => run_prune(dry_run).await,
     }
 }
 
@@ -79,11 +104,13 @@ cella — dev container worktree management (in-container)
 Usage: cella <command> [options]
 
 Commands:
-  branch <name> [--base ref]   Create a worktree-backed branch with its own container
-  list                         List worktree branches and their containers
+  branch <name> [--base ref]     Create a worktree-backed branch with its own container
+  list                           List worktree branches and their containers
+  exec <branch> -- <cmd...>      Run a command in another branch's container
+  prune [--dry-run]              Remove merged worktrees and their containers
 
 Options:
-  --help, -h                   Show this help message
+  --help, -h                     Show this help message
 
 Run `cella --help` on the host for all commands."
     );
@@ -95,8 +122,10 @@ fn print_unsupported(command: &str) {
 Error: `cella {command}` is not available inside a dev container.
 
 Available commands inside containers:
-  cella branch <name>   Create a worktree-backed branch
-  cella list            List worktree branches
+  cella branch <name>          Create a worktree-backed branch
+  cella list                   List worktree branches
+  cella exec <branch> -- cmd   Run command in another branch's container
+  cella prune                  Remove merged worktrees
 
 Run `cella --help` on the host for all commands."
     );
@@ -185,6 +214,69 @@ async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         // Ignore unrelated messages (Ack, PortMapping, etc.)
+    }
+}
+
+async fn run_exec(branch: &str, command: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::ExecRequest {
+        request_id: id.clone(),
+        branch: branch.to_string(),
+        command: command.to_vec(),
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        match resp {
+            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stderr => eprint!("{data}"),
+            },
+            DaemonMessage::ExecResult { exit_code, .. } => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_prune(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect_daemon().await?;
+
+    let id = request_id();
+    let msg = AgentMessage::PruneRequest {
+        request_id: id.clone(),
+        dry_run,
+    };
+    client.send(&msg).await?;
+
+    loop {
+        let resp = client.recv().await?;
+        match resp {
+            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stderr => eprint!("{data}"),
+            },
+            DaemonMessage::PruneResult { pruned, errors, .. } => {
+                if !pruned.is_empty() {
+                    eprintln!("Pruned {} worktree(s).", pruned.len());
+                }
+                if !errors.is_empty() {
+                    for e in &errors {
+                        eprintln!("Error: {e}");
+                    }
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -277,5 +369,49 @@ mod tests {
         let args = vec!["cella".to_string(), "branch".to_string()];
         let cmd = parse_cli_args(&args);
         assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_exec_command() {
+        let args = vec![
+            "cella".to_string(),
+            "exec".to_string(),
+            "feat/auth".to_string(),
+            "--".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ];
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Exec { branch, command }
+                if branch == "feat/auth" && command == ["cargo", "test"]));
+    }
+
+    #[test]
+    fn parse_exec_missing_separator_shows_help() {
+        let args = vec![
+            "cella".to_string(),
+            "exec".to_string(),
+            "feat/auth".to_string(),
+        ];
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_prune() {
+        let args = vec!["cella".to_string(), "prune".to_string()];
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Prune { dry_run: false }));
+    }
+
+    #[test]
+    fn parse_prune_dry_run() {
+        let args = vec![
+            "cella".to_string(),
+            "prune".to_string(),
+            "--dry-run".to_string(),
+        ];
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Prune { dry_run: true }));
     }
 }
