@@ -14,6 +14,7 @@ pub mod image;
 mod init;
 mod list;
 mod logs;
+mod network;
 mod nvim;
 mod ports;
 mod prune;
@@ -76,6 +77,8 @@ pub enum Command {
     Nvim(nvim::NvimArgs),
     /// Open a persistent tmux session inside the dev container.
     Tmux(tmux::TmuxArgs),
+    /// Inspect network proxy and blocking configuration.
+    Network(network::NetworkArgs),
     /// View port forwarding status for dev containers.
     Ports(ports::PortsArgs),
     /// Manage credential forwarding for dev containers.
@@ -150,6 +153,7 @@ impl Command {
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
             Self::Credential(args) => args.execute().await,
+            Self::Network(args) => args.execute(),
             Self::Ports(args) => args.execute().await,
             Self::Daemon(args) => args.execute().await,
         }

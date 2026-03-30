@@ -337,6 +337,7 @@ dependencies = [
  "cella-env",
  "cella-features",
  "cella-git",
+ "cella-network",
  "cella-orchestrator",
  "cella-port",
  "chrono",
