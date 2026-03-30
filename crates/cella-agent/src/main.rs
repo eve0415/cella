@@ -197,8 +197,9 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let poll_interval = Duration::from_millis(poll_interval_ms);
     let connect_timeout = Duration::from_secs(30);
 
-    // Start forward proxy if config is provided.
-    if let Some(ref json) = proxy_config_json {
+    // Start forward proxy if config is provided (via CLI arg or env var).
+    let proxy_json = proxy_config_json.or_else(|| std::env::var("CELLA_PROXY_CONFIG").ok());
+    if let Some(ref json) = proxy_json {
         match proxy_config::AgentProxyConfig::from_json(json) {
             Ok(config) => {
                 let config = std::sync::Arc::new(config);

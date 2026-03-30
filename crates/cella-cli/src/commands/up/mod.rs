@@ -1056,7 +1056,21 @@ impl UpContext {
             resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
 
         super::ensure_cella_daemon().await;
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+
+        // Build network proxy forwarding config from settings.
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
+        let net_config = settings.network.to_network_config();
+        let has_rules = net_config.has_rules();
+        let proxy_fwd = cella_env::ProxyForwardingConfig {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: has_rules,
+            full_config: if has_rules {
+                Some(net_config)
+            } else {
+                None
+            },
+        };
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
 
         let labels = self.build_labels(
             resolved_features,

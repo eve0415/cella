@@ -3,7 +3,7 @@
 //! Detects host proxy env vars and builds the env var set for injection
 //! into containers, respecting cella network config overrides.
 
-use cella_network::config::ProxyConfig;
+use cella_network::config::{NetworkConfig, ProxyConfig};
 use cella_network::proxy_env::ProxyEnvVars;
 
 use crate::{EnvForwarding, ForwardEnv};
@@ -42,4 +42,43 @@ pub fn apply_proxy_env(
     for (key, value) in pairs {
         fwd.env.push(ForwardEnv { key, value });
     }
+}
+
+/// Build the JSON config string for the cella-agent forward proxy.
+///
+/// This is set as `CELLA_PROXY_CONFIG` env var in the container so
+/// the agent can start its forward proxy with the right rules.
+pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
+    let proxy_env = ProxyEnvVars::detect(&config.proxy);
+    let upstream = proxy_env.and_then(|p| p.http_proxy.or(p.https_proxy));
+
+    let rules: Vec<serde_json::Value> = config
+        .rules
+        .iter()
+        .map(|r| {
+            let mut rule = serde_json::json!({
+                "domain": r.domain,
+                "action": match r.action {
+                    cella_network::RuleAction::Block => "block",
+                    cella_network::RuleAction::Allow => "allow",
+                },
+            });
+            if !r.paths.is_empty() {
+                rule["paths"] = serde_json::json!(r.paths);
+            }
+            rule
+        })
+        .collect();
+
+    let json = serde_json::json!({
+        "listen_port": config.proxy.proxy_port,
+        "mode": match config.mode {
+            cella_network::NetworkMode::Denylist => "denylist",
+            cella_network::NetworkMode::Allowlist => "allowlist",
+        },
+        "rules": rules,
+        "upstream_proxy": upstream,
+    });
+
+    json.to_string()
 }

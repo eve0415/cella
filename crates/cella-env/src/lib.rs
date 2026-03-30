@@ -150,6 +150,8 @@ pub struct ProxyForwardingConfig {
     /// Whether blocking rules are active (determines if proxy env vars
     /// point to cella-agent proxy or directly to upstream).
     pub has_blocking_rules: bool,
+    /// Full network config (needed to build agent proxy config JSON).
+    pub full_config: Option<cella_network::config::NetworkConfig>,
 }
 
 /// Prepare environment forwarding for a container.
@@ -176,6 +178,18 @@ pub fn prepare_env_forwarding(
 
     if let Some(net_config) = network {
         proxy::apply_proxy_env(&mut fwd, &net_config.proxy, net_config.has_blocking_rules);
+
+        // If blocking rules are active, pass the proxy config to cella-agent
+        // via env var so it can start the forward proxy.
+        if net_config.has_blocking_rules
+            && let Some(ref net_full) = net_config.full_config
+        {
+            let json = proxy::build_agent_proxy_config_json(net_full);
+            fwd.env.push(ForwardEnv {
+                key: "CELLA_PROXY_CONFIG".to_string(),
+                value: json,
+            });
+        }
     }
 
     fwd
