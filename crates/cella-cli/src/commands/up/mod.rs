@@ -60,6 +60,10 @@ pub struct UpArgs {
     /// Skip SHA256 checksum verification for agent binary download.
     #[arg(long)]
     pub(crate) skip_checksum: bool,
+
+    /// Target a worktree branch's container by branch name.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
 }
 
 /// Output format for container commands.
@@ -1311,10 +1315,57 @@ impl UpContext {
 }
 
 impl UpArgs {
+    /// Handle `--branch`: start/restart a worktree branch's container.
+    async fn execute_branch(
+        &self,
+        branch_name: &str,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = std::env::current_dir()?;
+        let repo_info = cella_git::discover(&cwd)?;
+        let worktrees = cella_git::list(&repo_info.root)?;
+        let wt = worktrees
+            .iter()
+            .find(|wt| wt.branch.as_deref() == Some(branch_name))
+            .ok_or_else(|| {
+                format!(
+                    "No worktree for branch '{branch_name}'. \
+                     Use `cella branch {branch_name}` to create one."
+                )
+            })?;
+
+        let extra_labels = cella_docker::worktree_labels(branch_name, &repo_info.root);
+        let mut ctx = UpContext::for_workspace(
+            &wt.path,
+            self.docker_host.as_deref(),
+            extra_labels,
+            progress,
+            self.output.clone(),
+        )
+        .await?;
+        ctx.remove_container = self.rebuild || self.remove_existing_container;
+        ctx.build_no_cache = self.build_no_cache;
+        ctx.skip_checksum = self.skip_checksum;
+
+        let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
+        output_result(
+            &ctx.output,
+            &result.outcome,
+            &result.container_id,
+            &result.remote_user,
+            &result.workspace_folder,
+        );
+        Ok(())
+    }
+
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref branch_name) = self.branch {
+            return self.execute_branch(branch_name, progress).await;
+        }
+
         let ctx = UpContext::new(&self, progress).await?;
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
