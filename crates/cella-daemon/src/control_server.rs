@@ -1217,6 +1217,15 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
             },
         )
         .await?;
+        send_message(
+            writer,
+            &DaemonMessage::TaskRunResult {
+                request_id: request_id.to_string(),
+                task_id: String::new(),
+                container_name: String::new(),
+            },
+        )
+        .await?;
         return Ok(());
     }
 
