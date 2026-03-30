@@ -301,9 +301,11 @@ dependencies = [
 name = "cella-agent"
 version = "0.0.9"
 dependencies = [
+ "cella-network",
  "cella-port",
  "nix 0.31.2",
  "notify",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

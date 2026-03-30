@@ -9,9 +9,11 @@ name = "cella-agent"
 path = "src/main.rs"
 
 [dependencies]
+cella-network.workspace = true
 cella-port.workspace = true
 nix.workspace = true
 notify.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

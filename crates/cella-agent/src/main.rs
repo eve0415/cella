@@ -16,9 +16,11 @@ mod browser;
 mod cli;
 mod control;
 mod credential;
+mod forward_proxy;
 mod plugin_sync;
 mod port_proxy;
 mod port_watcher;
+mod proxy_config;
 mod reconnecting_client;
 
 use std::time::Duration;
@@ -32,7 +34,10 @@ struct AgentArgs {
 
 enum AgentCommand {
     /// Run the agent daemon (port watching + credential helper).
-    Daemon { poll_interval_ms: u64 },
+    Daemon {
+        poll_interval_ms: u64,
+        proxy_config_json: Option<String>,
+    },
     /// Open a URL in the host browser.
     BrowserOpen { url: String },
     /// Handle a git credential request.
@@ -51,6 +56,7 @@ fn parse_args() -> Result<AgentArgs, String> {
     match args[1].as_str() {
         "daemon" => {
             let mut poll_interval_ms = 1000u64;
+            let mut proxy_config_json = None;
 
             let mut i = 2;
             while i < args.len() {
@@ -63,13 +69,24 @@ fn parse_args() -> Result<AgentArgs, String> {
                             .parse()
                             .map_err(|_| "invalid --poll-interval value")?;
                     }
+                    "--proxy-config" => {
+                        i += 1;
+                        proxy_config_json = Some(
+                            args.get(i)
+                                .ok_or("missing --proxy-config value")?
+                                .clone(),
+                        );
+                    }
                     other => return Err(format!("unknown flag: {other}")),
                 }
                 i += 1;
             }
 
             Ok(AgentArgs {
-                command: AgentCommand::Daemon { poll_interval_ms },
+                command: AgentCommand::Daemon {
+                    poll_interval_ms,
+                    proxy_config_json,
+                },
             })
         }
         "browser-open" => {
@@ -154,9 +171,12 @@ async fn main() {
     };
 
     match args.command {
-        AgentCommand::Daemon { poll_interval_ms } => {
+        AgentCommand::Daemon {
+            poll_interval_ms,
+            proxy_config_json,
+        } => {
             info!("cella-agent daemon starting (poll interval: {poll_interval_ms}ms)");
-            run_daemon(poll_interval_ms).await;
+            run_daemon(poll_interval_ms, proxy_config_json).await;
         }
         AgentCommand::BrowserOpen { url } => {
             if let Err(e) = browser::send_browser_open(&url).await {
@@ -173,9 +193,29 @@ async fn main() {
     }
 }
 
-async fn run_daemon(poll_interval_ms: u64) {
+async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let poll_interval = Duration::from_millis(poll_interval_ms);
     let connect_timeout = Duration::from_secs(30);
+
+    // Start forward proxy if config is provided.
+    if let Some(ref json) = proxy_config_json {
+        match proxy_config::AgentProxyConfig::from_json(json) {
+            Ok(config) => {
+                let config = std::sync::Arc::new(config);
+                match forward_proxy::start_forward_proxy(config).await {
+                    Ok(_handle) => {
+                        info!("Forward proxy started");
+                    }
+                    Err(e) => {
+                        error!("Failed to start forward proxy: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Invalid proxy config: {e}");
+            }
+        }
+    }
 
     // Read connection info from env vars
     let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") else {
