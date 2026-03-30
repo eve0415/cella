@@ -134,7 +134,12 @@ pub enum AgentMessage {
     /// List active background tasks.
     TaskListRequest { request_id: String },
     /// Stream output from a background task.
-    TaskLogsRequest { request_id: String, branch: String },
+    TaskLogsRequest {
+        request_id: String,
+        branch: String,
+        #[serde(default)]
+        follow: bool,
+    },
     /// Block until a background task completes.
     TaskWaitRequest { request_id: String, branch: String },
     /// Stop a running background task.
@@ -292,9 +297,8 @@ pub enum DaemonMessage {
     /// Result of a down (stop/remove) request.
     DownResult {
         request_id: String,
-        /// "stopped" or "removed".
-        outcome: String,
-        container_name: String,
+        #[serde(flatten)]
+        result: DownOperationResult,
     },
     /// Result of an up (start/restart) request.
     UpResult {
@@ -305,8 +309,8 @@ pub enum DaemonMessage {
     /// A background task was started.
     TaskRunResult {
         request_id: String,
-        task_id: String,
-        container_name: String,
+        #[serde(flatten)]
+        result: TaskRunOperationResult,
     },
     /// List of active background tasks.
     TaskListResult {
@@ -447,6 +451,40 @@ pub enum WorktreeOperationResult {
         container_name: String,
         /// Host-side path to the worktree directory.
         worktree_path: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Outcome of a container stop/remove operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownOutcome {
+    Stopped,
+    Removed,
+}
+
+/// Result of a down (stop/remove) operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DownOperationResult {
+    Success {
+        outcome: DownOutcome,
+        container_name: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Result of a task run operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TaskRunOperationResult {
+    Success {
+        task_id: String,
+        container_name: String,
     },
     Error {
         message: String,
@@ -1143,14 +1181,22 @@ mod tests {
     fn roundtrip_down_result() {
         let msg = DaemonMessage::DownResult {
             request_id: "dn-1".to_string(),
-            outcome: "stopped".to_string(),
-            container_name: "cella-proj-feat-auth".to_string(),
+            result: DownOperationResult::Success {
+                outcome: DownOutcome::Stopped,
+                container_name: "cella-proj-feat-auth".to_string(),
+            },
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            DaemonMessage::DownResult { outcome, .. } if outcome == "stopped"
+            DaemonMessage::DownResult {
+                result: DownOperationResult::Success {
+                    outcome: DownOutcome::Stopped,
+                    ..
+                },
+                ..
+            }
         ));
     }
 
