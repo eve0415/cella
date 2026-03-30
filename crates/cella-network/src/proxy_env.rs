@@ -118,6 +118,27 @@ impl ProxyEnvVars {
         entries.join(",")
     }
 
+    /// Build args to inject into Docker builds for proxy support.
+    ///
+    /// Docker automatically recognizes `HTTP_PROXY`, `HTTPS_PROXY`, and
+    /// `NO_PROXY` as build args without requiring explicit `ARG` declarations.
+    pub fn to_build_args(&self) -> Vec<(String, String)> {
+        let mut args = Vec::new();
+        if let Some(ref url) = self.http_proxy {
+            args.push(("HTTP_PROXY".to_string(), url.clone()));
+            args.push(("http_proxy".to_string(), url.clone()));
+        }
+        if let Some(ref url) = self.https_proxy {
+            args.push(("HTTPS_PROXY".to_string(), url.clone()));
+            args.push(("https_proxy".to_string(), url.clone()));
+        }
+        if let Some(ref np) = self.no_proxy {
+            args.push(("NO_PROXY".to_string(), np.clone()));
+            args.push(("no_proxy".to_string(), np.clone()));
+        }
+        args
+    }
+
     /// Build the env var pairs for the cella-agent proxy.
     ///
     /// When blocking rules are active, proxy env vars point to the local
