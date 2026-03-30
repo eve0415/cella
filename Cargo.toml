@@ -100,6 +100,10 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 regex = "1.12.3"
 glob = "0.3.3"
 
+# Certificate management
+rcgen = "0.14.7"
+rustls-native-certs = "0.8.3"
+
 # File watching
 notify = "8.2.0"
 

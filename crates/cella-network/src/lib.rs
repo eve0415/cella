@@ -6,6 +6,7 @@
 //! - Host proxy environment variable auto-detection
 //! - Rule merging from multiple configuration sources
 
+pub mod ca;
 pub mod config;
 pub mod merge;
 pub mod proxy_env;
