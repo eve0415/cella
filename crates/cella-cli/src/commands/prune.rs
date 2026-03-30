@@ -20,6 +20,10 @@ pub struct PruneArgs {
     #[arg(long)]
     dry_run: bool,
 
+    /// Include unmerged worktrees (not just merged ones).
+    #[arg(long)]
+    all: bool,
+
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
     docker_host: Option<String>,
@@ -62,24 +66,25 @@ impl PruneArgs {
             return Ok(());
         }
 
-        // 3. Detect default branch and find merged branches
-        let default_branch = cella_git::default_branch(repo_root)?;
-        debug!("default branch: {default_branch}");
+        let merged = if self.all {
+            Vec::new()
+        } else {
+            let default_branch = cella_git::default_branch(repo_root)?;
+            debug!("default branch: {default_branch}");
+            let merged = cella_git::merged_branches(repo_root, &default_branch)?;
+            debug!("merged branches: {merged:?}");
+            merged
+        };
 
-        let merged = cella_git::merged_branches(repo_root, &default_branch)?;
-        debug!("merged branches: {merged:?}");
-
-        // 4. Connect to Docker for container lookup
         let client = super::connect_docker(self.docker_host.as_deref())?;
 
-        // 5. Find prunable worktrees
         let mut candidates = Vec::new();
         for wt in &linked_worktrees {
             let Some(branch) = &wt.branch else {
                 continue; // Skip detached HEAD worktrees
             };
 
-            if !merged.contains(branch) {
+            if !self.all && !merged.contains(branch) {
                 continue;
             }
 
@@ -98,6 +103,8 @@ impl PruneArgs {
         if candidates.is_empty() {
             if self.is_json() {
                 print_json_result(&[], &[]);
+            } else if self.all {
+                eprintln!("Nothing to prune. No linked worktrees found.");
             } else {
                 eprintln!("Nothing to prune. No merged worktrees found.");
             }
@@ -121,12 +128,16 @@ impl PruneArgs {
             return Ok(());
         }
 
-        // 8. Confirm unless --force (skip in json mode)
         if !self.force && !self.is_json() {
+            let unmerged = if self.all {
+                " (including unmerged)"
+            } else {
+                ""
+            };
+            let plural = if candidates.len() == 1 { "" } else { "s" };
             eprint!(
-                "\nRemove {} worktree{} and their containers? [y/N] ",
-                candidates.len(),
-                if candidates.len() == 1 { "" } else { "s" }
+                "\nRemove {} worktree{plural}{unmerged}? [y/N] ",
+                candidates.len()
             );
             io::stderr().flush()?;
 
@@ -139,7 +150,6 @@ impl PruneArgs {
             }
         }
 
-        // 9. Prune and output results
         let (pruned_branches, errors) =
             execute_prune(&candidates, &client, repo_root, self.is_json()).await;
 
