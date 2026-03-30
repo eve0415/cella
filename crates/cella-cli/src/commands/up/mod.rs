@@ -64,6 +64,10 @@ pub struct UpArgs {
     /// Target a worktree branch's container by branch name.
     #[arg(long)]
     pub(crate) branch: Option<String>,
+
+    /// Start container without network blocking rules (proxy forwarding still active).
+    #[arg(long)]
+    pub(crate) no_network_rules: bool,
 }
 
 /// Output format for container commands.
@@ -77,6 +81,15 @@ impl UpArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Text)
     }
+}
+
+/// Whether network blocking rules are enforced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NetworkRulePolicy {
+    /// Enforce blocking rules from config.
+    Enforce,
+    /// Skip blocking rules (`--no-network-rules`).
+    Skip,
 }
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
@@ -94,6 +107,8 @@ pub struct UpContext {
     pub(crate) skip_checksum: bool,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
+    /// Network rule enforcement policy.
+    network_rules: NetworkRulePolicy,
 }
 
 /// Resolved image configuration for container creation.
@@ -156,6 +171,11 @@ impl UpContext {
             build_no_cache: args.build_no_cache,
             skip_checksum: args.skip_checksum,
             extra_labels: std::collections::HashMap::new(),
+            network_rules: if args.no_network_rules {
+                NetworkRulePolicy::Skip
+            } else {
+                NetworkRulePolicy::Enforce
+            },
         })
     }
 
@@ -216,6 +236,7 @@ impl UpContext {
             build_no_cache: false,
             skip_checksum: false,
             extra_labels,
+            network_rules: NetworkRulePolicy::Enforce,
         })
     }
 
@@ -1060,7 +1081,11 @@ impl UpContext {
         // Build network proxy forwarding config from settings.
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         let net_config = settings.network.to_network_config();
-        let has_rules = net_config.has_rules();
+        let skip_rules = self.network_rules == NetworkRulePolicy::Skip;
+        let has_rules = net_config.has_rules() && !skip_rules;
+        if skip_rules && net_config.has_rules() {
+            tracing::info!("Network blocking rules disabled via --no-network-rules");
+        }
         let proxy_fwd = cella_env::ProxyForwardingConfig {
             proxy: net_config.proxy.clone(),
             has_blocking_rules: has_rules,
@@ -1360,6 +1385,11 @@ impl UpArgs {
         ctx.remove_container = self.rebuild || self.remove_existing_container;
         ctx.build_no_cache = self.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
+        ctx.network_rules = if self.no_network_rules {
+            NetworkRulePolicy::Skip
+        } else {
+            NetworkRulePolicy::Enforce
+        };
 
         let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
         output_result(

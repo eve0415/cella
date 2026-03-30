@@ -198,7 +198,15 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let connect_timeout = Duration::from_secs(30);
 
     // Start forward proxy if config is provided (via CLI arg or env var).
-    let proxy_json = proxy_config_json.or_else(|| std::env::var("CELLA_PROXY_CONFIG").ok());
+    // CELLA_NO_NETWORK_RULES=1 disables rule enforcement at runtime.
+    let rules_disabled = std::env::var("CELLA_NO_NETWORK_RULES")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let proxy_json = if rules_disabled {
+        info!("Network rules disabled via CELLA_NO_NETWORK_RULES");
+        None
+    } else {
+        proxy_config_json.or_else(|| std::env::var("CELLA_PROXY_CONFIG").ok())
+    };
     if let Some(ref json) = proxy_json {
         match proxy_config::AgentProxyConfig::from_json(json) {
             Ok(config) => {
