@@ -675,8 +675,12 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         AgentMessage::TaskListRequest { request_id } => {
             handle_task_list(&request_id, wt.task_mgr, writer).await?;
         }
-        AgentMessage::TaskLogsRequest { request_id, branch } => {
-            handle_task_logs(&request_id, &branch, wt.task_mgr, writer).await?;
+        AgentMessage::TaskLogsRequest {
+            request_id,
+            branch,
+            follow,
+        } => {
+            handle_task_logs(&request_id, &branch, follow, wt.task_mgr, writer).await?;
         }
         AgentMessage::TaskWaitRequest { request_id, branch } => {
             handle_task_wait(&request_id, &branch, wt.task_mgr, writer).await?;
@@ -758,9 +762,10 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     // Send final result.
     let result = if status.success() {
         parse_branch_json_output(&last_stdout_line).unwrap_or_else(|| {
-            WorktreeOperationResult::Success {
-                container_name: String::new(),
-                worktree_path: String::new(),
+            WorktreeOperationResult::Error {
+                message: format!(
+                    "operation may have succeeded but output was unparseable: {last_stdout_line}"
+                ),
             }
         })
     } else {
@@ -1251,21 +1256,21 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            send_message(
-                writer,
-                &DaemonMessage::DownResult {
-                    request_id: request_id.to_string(),
-                    outcome: "error".to_string(),
-                    container_name: String::new(),
-                },
-            )
-            .await?;
+            let error_msg = format!("failed to spawn cella down: {e}");
             send_message(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
                     stream: cella_port::protocol::OutputStream::Stderr,
-                    data: format!("failed to spawn cella down: {e}\n"),
+                    data: format!("{error_msg}\n"),
+                },
+            )
+            .await?;
+            send_message(
+                writer,
+                &DaemonMessage::DownResult {
+                    request_id: request_id.to_string(),
+                    result: cella_port::protocol::DownOperationResult::Error { message: error_msg },
                 },
             )
             .await?;
@@ -1275,32 +1280,33 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
 
     let (status, last_stdout, stderr) = stream_child_output(&mut child, request_id, writer).await?;
 
-    // Parse JSON output for outcome.
-    let (outcome, container_name) = parse_down_json_output(&last_stdout);
-    let outcome = if status.success() {
-        outcome
+    let result = if status.success() {
+        parse_down_json_output(&last_stdout)
     } else {
-        // Send error details.
         if !stderr.trim().is_empty() {
             send_message(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
                     stream: cella_port::protocol::OutputStream::Stderr,
-                    data: stderr,
+                    data: stderr.clone(),
                 },
             )
             .await?;
         }
-        "error".to_string()
+        let error_msg = if stderr.trim().is_empty() {
+            format!("cella down exited with {status}")
+        } else {
+            stderr.trim().to_string()
+        };
+        cella_port::protocol::DownOperationResult::Error { message: error_msg }
     };
 
     send_message(
         writer,
         &DaemonMessage::DownResult {
             request_id: request_id.to_string(),
-            outcome,
-            container_name,
+            result,
         },
     )
     .await?;
@@ -1309,24 +1315,34 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
 }
 
 /// Parse JSON output from `cella down --output json`.
-fn parse_down_json_output(stdout: &str) -> (String, String) {
+fn parse_down_json_output(stdout: &str) -> cella_port::protocol::DownOperationResult {
+    use cella_port::protocol::{DownOperationResult, DownOutcome};
+
     let trimmed = stdout.trim();
-    serde_json::from_str::<serde_json::Value>(trimmed).map_or_else(
-        |_| (String::new(), String::new()),
-        |v| {
-            let outcome = v
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => {
+            let outcome_str = v
                 .get("outcome")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let container_id = v
+                .unwrap_or_default();
+            let outcome = match outcome_str {
+                "removed" => DownOutcome::Removed,
+                _ => DownOutcome::Stopped,
+            };
+            let container_name = v
                 .get("containerId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            (outcome, container_id)
+            DownOperationResult::Success {
+                outcome,
+                container_name,
+            }
+        }
+        Err(e) => DownOperationResult::Error {
+            message: format!("operation may have succeeded but output was unparseable: {e}"),
         },
-    )
+    }
 }
 
 /// Handle an `UpRequest` by spawning `cella up --branch` as a subprocess.
@@ -1443,6 +1459,59 @@ fn parse_up_json_output(stdout: &str) -> cella_port::protocol::WorktreeOperation
 // ---------------------------------------------------------------------------
 
 /// Handle `TaskRunRequest`: create branch (if needed) + run background command.
+/// Ensure a branch has a running container, creating one if needed.
+///
+/// Returns the container name on success, or sends an error result and returns `None`.
+async fn ensure_branch_container<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    base: Option<&str>,
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<Option<String>, CellaDaemonError> {
+    if let Some(name) = find_container_for_branch(branch).await {
+        return Ok(Some(name));
+    }
+
+    send_message(
+        writer,
+        &DaemonMessage::OperationProgress {
+            request_id: request_id.to_string(),
+            step: "creating_branch".to_string(),
+            message: format!("Creating branch '{branch}' and container..."),
+        },
+    )
+    .await?;
+
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("branch").arg(branch).arg("--output").arg("json");
+    if let Some(b) = base {
+        cmd.arg("--base").arg(b);
+    }
+    if let Some(ws) = wt.workspace_path {
+        cmd.current_dir(ws);
+    }
+    let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
+        message: format!("failed to create branch: {e}"),
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        send_message(
+            writer,
+            &DaemonMessage::OperationOutput {
+                request_id: request_id.to_string(),
+                stream: cella_port::protocol::OutputStream::Stderr,
+                data: stderr.to_string(),
+            },
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    Ok(find_container_for_branch(branch).await)
+}
+
 async fn handle_task_run<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
@@ -1451,43 +1520,17 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // First, ensure the branch container exists (create if needed).
-    // Check if container already exists for this branch.
-    let container = find_container_for_branch(branch).await;
-    let container_name = if let Some(name) = container {
-        name
-    } else {
-        // Create branch + container via cella branch subprocess.
-        send_message(
-            writer,
-            &DaemonMessage::OperationProgress {
-                request_id: request_id.to_string(),
-                step: "creating_branch".to_string(),
-                message: format!("Creating branch '{branch}' and container..."),
-            },
-        )
-        .await?;
-
-        let mut cmd = tokio::process::Command::new(wt.cella_bin);
-        cmd.arg("branch").arg(branch).arg("--output").arg("json");
-        if let Some(b) = base {
-            cmd.arg("--base").arg(b);
-        }
-        if let Some(ws) = wt.workspace_path {
-            cmd.current_dir(ws);
-        }
-        let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
-            message: format!("failed to create branch: {e}"),
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    let container_name = match ensure_branch_container(request_id, branch, base, wt, writer).await?
+    {
+        Some(name) if !name.is_empty() => name,
+        _ => {
+            let error_msg = format!("No container found for branch '{branch}' after creation");
             send_message(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
                     stream: cella_port::protocol::OutputStream::Stderr,
-                    data: stderr.to_string(),
+                    data: format!("{error_msg}\n"),
                 },
             )
             .await?;
@@ -1495,39 +1538,15 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::TaskRunResult {
                     request_id: request_id.to_string(),
-                    task_id: String::new(),
-                    container_name: String::new(),
+                    result: cella_port::protocol::TaskRunOperationResult::Error {
+                        message: error_msg,
+                    },
                 },
             )
             .await?;
             return Ok(());
         }
-
-        // Find the newly created container.
-        find_container_for_branch(branch).await.unwrap_or_default()
     };
-
-    if container_name.is_empty() {
-        send_message(
-            writer,
-            &DaemonMessage::OperationOutput {
-                request_id: request_id.to_string(),
-                stream: cella_port::protocol::OutputStream::Stderr,
-                data: format!("No container found for branch '{branch}' after creation\n"),
-            },
-        )
-        .await?;
-        send_message(
-            writer,
-            &DaemonMessage::TaskRunResult {
-                request_id: request_id.to_string(),
-                task_id: String::new(),
-                container_name: String::new(),
-            },
-        )
-        .await?;
-        return Ok(());
-    }
 
     // Start the background task.
     let task_id = {
@@ -1544,6 +1563,14 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                     },
                 )
                 .await?;
+                send_message(
+                    writer,
+                    &DaemonMessage::TaskRunResult {
+                        request_id: request_id.to_string(),
+                        result: cella_port::protocol::TaskRunOperationResult::Error { message: e },
+                    },
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -1553,8 +1580,10 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
         writer,
         &DaemonMessage::TaskRunResult {
             request_id: request_id.to_string(),
-            task_id,
-            container_name,
+            result: cella_port::protocol::TaskRunOperationResult::Success {
+                task_id,
+                container_name,
+            },
         },
     )
     .await?;
@@ -1607,32 +1636,89 @@ async fn handle_task_list<W: AsyncWriteExt + Unpin>(
 async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
+    follow: bool,
     task_mgr: &crate::task_manager::SharedTaskManager,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    let output = task_mgr
-        .lock()
-        .await
-        .get_output(branch)
-        .await
-        .unwrap_or_default();
-    let is_done = task_mgr
-        .lock()
-        .await
-        .list_tasks()
-        .await
-        .iter()
-        .any(|t| t.branch == branch && t.is_done);
+    if follow {
+        // Send existing output snapshot first.
+        let snapshot = task_mgr
+            .lock()
+            .await
+            .get_output(branch)
+            .await
+            .unwrap_or_default();
+        if !snapshot.is_empty() {
+            send_message(
+                writer,
+                &DaemonMessage::TaskLogsData {
+                    request_id: request_id.to_string(),
+                    data: snapshot,
+                    done: false,
+                },
+            )
+            .await?;
+        }
 
-    send_message(
-        writer,
-        &DaemonMessage::TaskLogsData {
-            request_id: request_id.to_string(),
-            data: output,
-            done: is_done,
-        },
-    )
-    .await?;
+        // Subscribe and stream live output.
+        let rx = task_mgr.lock().await.subscribe(branch);
+        if let Some(mut rx) = rx {
+            loop {
+                match rx.recv().await {
+                    Ok(chunk) => {
+                        send_message(
+                            writer,
+                            &DaemonMessage::TaskLogsData {
+                                request_id: request_id.to_string(),
+                                data: chunk,
+                                done: false,
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("task logs subscriber lagged by {n} messages");
+                    }
+                }
+            }
+        }
+
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: String::new(),
+                done: true,
+            },
+        )
+        .await?;
+    } else {
+        // Snapshot mode: dump available output and return.
+        let output = task_mgr
+            .lock()
+            .await
+            .get_output(branch)
+            .await
+            .unwrap_or_default();
+        let is_done = task_mgr
+            .lock()
+            .await
+            .list_tasks()
+            .await
+            .iter()
+            .any(|t| t.branch == branch && t.is_done);
+
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: output,
+                done: is_done,
+            },
+        )
+        .await?;
+    }
 
     Ok(())
 }
