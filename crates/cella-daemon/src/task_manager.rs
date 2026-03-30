@@ -35,6 +35,8 @@ struct TaskState {
     exit_code: Arc<Mutex<Option<i32>>>,
     /// Handle to abort the task.
     abort_handle: tokio::task::AbortHandle,
+    /// Broadcast channel for live output streaming.
+    output_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 /// Public task info for list responses.
@@ -75,14 +77,23 @@ impl TaskManager {
         let task_id = branch.to_string();
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let (output_tx, _) = tokio::sync::broadcast::channel(1024);
 
         let output_clone = output.clone();
         let exit_code_clone = exit_code.clone();
+        let output_tx_clone = output_tx.clone();
         let container = container_name.clone();
         let cmd = command.clone();
 
         let handle = tokio::spawn(async move {
-            run_task_process(&container, &cmd, &output_clone, &exit_code_clone).await;
+            run_task_process(
+                &container,
+                &cmd,
+                &output_clone,
+                &exit_code_clone,
+                &output_tx_clone,
+            )
+            .await;
         });
 
         let state = TaskState {
@@ -93,6 +104,7 @@ impl TaskManager {
             output,
             exit_code,
             abort_handle: handle.abort_handle(),
+            output_tx,
         };
 
         self.tasks.insert(task_id.clone(), state);
@@ -116,6 +128,20 @@ impl TaskManager {
             });
         }
         infos
+    }
+
+    /// Subscribe to live output for a task (for `--follow` mode).
+    pub fn subscribe(&self, branch: &str) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        self.tasks.get(branch).map(|s| s.output_tx.subscribe())
+    }
+
+    /// Check if a task is done.
+    pub async fn is_done(&self, branch: &str) -> bool {
+        if let Some(state) = self.tasks.get(branch) {
+            state.exit_code.lock().await.is_some()
+        } else {
+            true // no task = done
+        }
     }
 
     /// Get captured output for a task.
@@ -171,6 +197,7 @@ async fn run_task_process(
     command: &[String],
     output: &Arc<Mutex<String>>,
     exit_code: &Arc<Mutex<Option<i32>>>,
+    output_tx: &tokio::sync::broadcast::Sender<String>,
 ) {
     use tokio::io::AsyncBufReadExt;
 
@@ -187,7 +214,9 @@ async fn run_task_process(
         Err(e) => {
             warn!("Failed to spawn task process: {e}");
             *exit_code.lock().await = Some(1);
-            let _ = writeln!(output.lock().await, "Error: failed to spawn: {e}");
+            let error_line = format!("Error: failed to spawn: {e}");
+            let _ = writeln!(output.lock().await, "{error_line}");
+            let _ = output_tx.send(format!("{error_line}\n"));
             return;
         }
     };
@@ -197,25 +226,27 @@ async fn run_task_process(
     let child_stderr = child.stderr.take();
 
     let output_stdout = output.clone();
+    let tx_stdout = output_tx.clone();
     let stdout_task = tokio::spawn(async move {
         if let Some(stdout) = child_stdout {
             let mut reader = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let mut out = output_stdout.lock().await;
-                out.push_str(&line);
-                out.push('\n');
+                let formatted = format!("{line}\n");
+                output_stdout.lock().await.push_str(&formatted);
+                let _ = tx_stdout.send(formatted);
             }
         }
     });
 
     let output_stderr = output.clone();
+    let tx_stderr = output_tx.clone();
     let stderr_task = tokio::spawn(async move {
         if let Some(stderr) = child_stderr {
             let mut reader = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let mut out = output_stderr.lock().await;
-                out.push_str(&line);
-                out.push('\n');
+                let formatted = format!("{line}\n");
+                output_stderr.lock().await.push_str(&formatted);
+                let _ = tx_stderr.send(formatted);
             }
         }
     });
