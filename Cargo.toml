@@ -15,6 +15,7 @@ members = [
     "crates/cella-port",
     "crates/cella-agent",
     "crates/cella-features",
+    "crates/cella-network",
     "crates/cella-orchestrator",
 ]
 
@@ -125,6 +126,7 @@ cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
+cella-network = { path = "crates/cella-network" }
 cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-port = { path = "crates/cella-port" }
 

@@ -466,6 +466,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-network"
+version = "0.0.9"
+dependencies = [
+ "insta",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "cella-orchestrator"
 version = "0.0.9"
 dependencies = [
