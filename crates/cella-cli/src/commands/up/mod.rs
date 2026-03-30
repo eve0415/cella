@@ -706,6 +706,21 @@ impl UpContext {
         }
         create_opts.env.extend(agent_env);
 
+        // If the workspace is a linked git worktree, mount the parent repo's
+        // .git directory at the same host path so gitdir references resolve.
+        if let Some(parent_git) = cella_git::parent_git_dir(&self.resolved.workspace_root) {
+            let canonical = parent_git
+                .canonicalize()
+                .unwrap_or_else(|_| parent_git.clone());
+            let path_str = canonical.to_string_lossy().to_string();
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: path_str.clone(),
+                target: path_str,
+                consistency: None,
+            });
+        }
+
         let (vol_name, vol_target, _ro) = cella_docker::volume::agent_volume_mount();
         create_opts.mounts.push(MountConfig {
             mount_type: "volume".to_string(),
