@@ -1014,18 +1014,18 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
     let Some(container_name) = container_name else {
         send_message(
             writer,
-            &DaemonMessage::ExecResult {
+            &DaemonMessage::OperationOutput {
                 request_id: request_id.to_string(),
-                exit_code: 1,
+                stream: OutputStream::Stderr,
+                data: format!("No running container found for branch '{branch}'\n"),
             },
         )
         .await?;
         send_message(
             writer,
-            &DaemonMessage::OperationOutput {
+            &DaemonMessage::ExecResult {
                 request_id: request_id.to_string(),
-                stream: OutputStream::Stderr,
-                data: format!("No running container found for branch '{branch}'\n"),
+                exit_code: 1,
             },
         )
         .await?;
