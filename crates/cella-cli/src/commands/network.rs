@@ -45,13 +45,12 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let proxy_vars = cella_network::proxy_env::ProxyEnvVars::detect(&net_config.proxy);
-    let has_proxy = proxy_vars.as_ref().is_some_and(cella_network::ProxyEnvVars::has_proxy);
+    let has_proxy = proxy_vars
+        .as_ref()
+        .is_some_and(cella_network::ProxyEnvVars::has_proxy);
 
     if net_config.has_rules() {
-        println!(
-            "Proxy: active (localhost:{})",
-            net_config.proxy.proxy_port
-        );
+        println!("Proxy: active (localhost:{})", net_config.proxy.proxy_port);
     } else if has_proxy {
         println!("Proxy: forwarding (passthrough)");
     } else {
@@ -80,10 +79,7 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error>> {
         cella_network::NetworkMode::Denylist => "denylist",
         cella_network::NetworkMode::Allowlist => "allowlist",
     };
-    println!(
-        "Mode: {mode_str} ({} rules)",
-        net_config.rules.len()
-    );
+    println!("Mode: {mode_str} ({} rules)", net_config.rules.len());
 
     for rule in &net_config.rules {
         let action = match rule.action {
@@ -93,11 +89,7 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error>> {
         if rule.paths.is_empty() {
             println!("  {action}: {}", rule.domain);
         } else {
-            println!(
-                "  {action}: {} [{}]",
-                rule.domain,
-                rule.paths.join(", ")
-            );
+            println!("  {action}: {} [{}]", rule.domain, rule.paths.join(", "));
         }
     }
 

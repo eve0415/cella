@@ -71,11 +71,8 @@ fn parse_args() -> Result<AgentArgs, String> {
                     }
                     "--proxy-config" => {
                         i += 1;
-                        proxy_config_json = Some(
-                            args.get(i)
-                                .ok_or("missing --proxy-config value")?
-                                .clone(),
-                        );
+                        proxy_config_json =
+                            Some(args.get(i).ok_or("missing --proxy-config value")?.clone());
                     }
                     other => return Err(format!("unknown flag: {other}")),
                 }

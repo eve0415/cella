@@ -259,7 +259,10 @@ async fn resolve_and_build_features(
 ///
 /// Docker automatically recognizes `HTTP_PROXY`, `HTTPS_PROXY`, and
 /// `NO_PROXY` as predefined build args without requiring `ARG` declarations.
-pub fn inject_proxy_build_args(opts: &mut BuildOptions, proxy: &cella_network::config::ProxyConfig) {
+pub fn inject_proxy_build_args(
+    opts: &mut BuildOptions,
+    proxy: &cella_network::config::ProxyConfig,
+) {
     let Some(proxy_vars) = cella_network::proxy_env::ProxyEnvVars::detect(proxy) else {
         return;
     };

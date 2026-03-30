@@ -1090,10 +1090,7 @@ impl UpContext {
             .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
 
         // Merge: devcontainer.json is base, cella.toml overrides.
-        let merged = cella_network::merge_network_configs(
-            dc_net.as_ref(),
-            Some(&toml_net),
-        );
+        let merged = cella_network::merge_network_configs(dc_net.as_ref(), Some(&toml_net));
         let net_config = cella_network::NetworkConfig {
             mode: merged.mode,
             proxy: merged.proxy,
@@ -1108,11 +1105,7 @@ impl UpContext {
         let proxy_fwd = cella_env::ProxyForwardingConfig {
             proxy: net_config.proxy.clone(),
             has_blocking_rules: has_rules,
-            full_config: if has_rules {
-                Some(net_config)
-            } else {
-                None
-            },
+            full_config: if has_rules { Some(net_config) } else { None },
         };
         let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
 

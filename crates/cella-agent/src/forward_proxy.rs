@@ -7,7 +7,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -22,7 +22,9 @@ use crate::proxy_config::AgentProxyConfig;
 /// # Errors
 ///
 /// Returns an error if binding fails.
-pub async fn start_forward_proxy(config: Arc<AgentProxyConfig>) -> Result<JoinHandle<()>, io::Error> {
+pub async fn start_forward_proxy(
+    config: Arc<AgentProxyConfig>,
+) -> Result<JoinHandle<()>, io::Error> {
     let port = config.listen_port;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     info!("Forward proxy listening on 127.0.0.1:{port}");
@@ -91,9 +93,7 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<AgentProxyConfig>)
 async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxyConfig) {
     // Parse host:port from CONNECT target.
     let Some((host, port)) = parse_host_port(target) else {
-        let _ = client
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
+        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return;
     };
 
@@ -103,9 +103,7 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxy
         info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
         config.log_blocked(&host, "/", &verdict.reason);
         // Send 403 and close — this appears as "connection refused" to the client.
-        let _ = client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            .await;
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;
     }
 
@@ -118,9 +116,7 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxy
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await;
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return;
         }
     };
@@ -157,9 +153,7 @@ async fn handle_direct_http(
 ) {
     // Parse the URL to extract host and path.
     let Some((host, port, path)) = parse_http_url(target) else {
-        let _ = client
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
+        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return;
     };
 
@@ -168,9 +162,7 @@ async fn handle_direct_http(
     if !verdict.allowed {
         info!("BLOCKED HTTP {target} - {}", verdict.reason);
         config.log_blocked(&host, &path, &verdict.reason);
-        let _ = client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            .await;
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;
     }
 
@@ -179,9 +171,7 @@ async fn handle_direct_http(
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await;
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return;
         }
     };
@@ -215,9 +205,8 @@ async fn connect_via_upstream_proxy(
     proxy_url: &str,
 ) -> Result<TcpStream, io::Error> {
     // Parse proxy URL to get host:port.
-    let proxy_addr = parse_proxy_url(proxy_url).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "invalid upstream proxy URL")
-    })?;
+    let proxy_addr = parse_proxy_url(proxy_url)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid upstream proxy URL"))?;
 
     let mut proxy_stream = TcpStream::connect(proxy_addr.as_str()).await?;
 
@@ -233,7 +222,10 @@ async fn connect_via_upstream_proxy(
     if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("upstream proxy rejected CONNECT: {}", resp.lines().next().unwrap_or("")),
+            format!(
+                "upstream proxy rejected CONNECT: {}",
+                resp.lines().next().unwrap_or("")
+            ),
         ));
     }
 

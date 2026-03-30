@@ -14,9 +14,7 @@ const CONTAINER_CA_PATH: &str = "/usr/local/share/ca-certificates/cella-host-ca.
 ///
 /// Returns file uploads and commands to update the container's trust store.
 /// Returns `None` if no CA bundle can be detected from the host.
-pub fn prepare_ca_injection(
-    additional_ca_path: Option<&str>,
-) -> Option<CaInjection> {
+pub fn prepare_ca_injection(additional_ca_path: Option<&str>) -> Option<CaInjection> {
     let mut pem_bundle = String::new();
 
     // Detect host CA bundle.
@@ -78,8 +76,7 @@ impl CaInjection {
         post_start.git_config_commands.push(vec![
             "sh".to_string(),
             "-c".to_string(),
-            "update-ca-certificates 2>/dev/null || update-ca-trust 2>/dev/null || true"
-                .to_string(),
+            "update-ca-certificates 2>/dev/null || update-ca-trust 2>/dev/null || true".to_string(),
         ]);
     }
 }

@@ -201,11 +201,17 @@ mod tests {
         // *.prod.internal from devcontainer + api.example.com from toml
         assert_eq!(merged.rules.len(), 2);
 
-        let prod_rule = merged.rules.iter().find(|r| r.rule.domain == "*.prod.internal");
+        let prod_rule = merged
+            .rules
+            .iter()
+            .find(|r| r.rule.domain == "*.prod.internal");
         assert!(prod_rule.is_some());
         assert_eq!(prod_rule.unwrap().source, SOURCE_DEVCONTAINER);
 
-        let api_rule = merged.rules.iter().find(|r| r.rule.domain == "api.example.com");
+        let api_rule = merged
+            .rules
+            .iter()
+            .find(|r| r.rule.domain == "api.example.com");
         assert!(api_rule.is_some());
         assert_eq!(api_rule.unwrap().source, SOURCE_CELLA_TOML);
         assert_eq!(api_rule.unwrap().rule.action, RuleAction::Allow);

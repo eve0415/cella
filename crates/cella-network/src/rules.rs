@@ -62,10 +62,7 @@ impl RuleMatcher {
 
     /// Build a matcher from rules that already have source labels.
     pub fn from_labeled_rules(mode: NetworkMode, rules: &[(NetworkRule, String)]) -> Self {
-        let rules = rules
-            .iter()
-            .map(|(r, src)| compile_rule(r, src))
-            .collect();
+        let rules = rules.iter().map(|(r, src)| compile_rule(r, src)).collect();
         Self { mode, rules }
     }
 
@@ -85,9 +82,7 @@ impl RuleMatcher {
             let path_matched = if rule.path_patterns.is_empty() {
                 true
             } else {
-                rule.path_patterns
-                    .iter()
-                    .any(|pp| match_path(pp, path))
+                rule.path_patterns.iter().any(|pp| match_path(pp, path))
             };
 
             if path_matched {
@@ -211,12 +206,7 @@ fn match_segments_with_doublestar(pattern: &[PatternPart], segments: &[&str]) ->
     match_recursive(pattern, segments, 0, 0)
 }
 
-fn match_recursive(
-    pattern: &[PatternPart],
-    segments: &[&str],
-    pi: usize,
-    si: usize,
-) -> bool {
+fn match_recursive(pattern: &[PatternPart], segments: &[&str], pi: usize, si: usize) -> bool {
     // Both exhausted: match.
     if pi == pattern.len() && si == segments.len() {
         return true;

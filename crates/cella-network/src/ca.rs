@@ -180,11 +180,11 @@ fn detect_via_native_certs() -> Option<HostCaBundle> {
 /// Try to read CA bundle from well-known filesystem paths.
 fn detect_from_known_paths() -> Option<HostCaBundle> {
     let known_paths = [
-        "/etc/ssl/certs/ca-certificates.crt",                   // Debian/Ubuntu
-        "/etc/pki/tls/certs/ca-bundle.crt",                     // RHEL/CentOS
-        "/etc/ssl/ca-bundle.pem",                                // openSUSE
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",    // Fedora
-        "/etc/ssl/cert.pem",                                     // macOS / Alpine
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // Fedora
+        "/etc/ssl/cert.pem",                  // macOS / Alpine
     ];
 
     for path_str in &known_paths {
