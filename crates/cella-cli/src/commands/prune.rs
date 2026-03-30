@@ -3,6 +3,8 @@ use std::io::{self, BufRead, Write};
 use clap::Args;
 use tracing::{debug, info};
 
+use super::up::OutputFormat;
+
 /// Remove stale worktrees and their associated containers.
 ///
 /// Identifies worktrees whose branches have been fully merged into the
@@ -21,6 +23,10 @@ pub struct PruneArgs {
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
     docker_host: Option<String>,
+
+    /// Output format (text or json).
+    #[arg(long, default_value = "text")]
+    output: OutputFormat,
 }
 
 /// A worktree that is a candidate for pruning.
@@ -33,6 +39,10 @@ struct PruneCandidate {
 }
 
 impl PruneArgs {
+    const fn is_json(&self) -> bool {
+        matches!(self.output, OutputFormat::Json)
+    }
+
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
@@ -44,7 +54,11 @@ impl PruneArgs {
         let linked_worktrees: Vec<_> = worktrees.into_iter().filter(|wt| !wt.is_main).collect();
 
         if linked_worktrees.is_empty() {
-            eprintln!("No linked worktrees found.");
+            if self.is_json() {
+                print_json_result(&[], &[]);
+            } else {
+                eprintln!("No linked worktrees found.");
+            }
             return Ok(());
         }
 
@@ -82,21 +96,33 @@ impl PruneArgs {
         }
 
         if candidates.is_empty() {
-            eprintln!("Nothing to prune. No merged worktrees found.");
+            if self.is_json() {
+                print_json_result(&[], &[]);
+            } else {
+                eprintln!("Nothing to prune. No merged worktrees found.");
+            }
             return Ok(());
         }
 
-        // 6. Display candidates
-        print_candidates(&candidates);
+        // 6. Display candidates (text mode only)
+        if !self.is_json() {
+            print_candidates(&candidates);
+        }
 
         // 7. Handle dry run
         if self.dry_run {
-            eprintln!("\nDry run — no changes made.");
+            if self.is_json() {
+                let branch_names: Vec<&str> =
+                    candidates.iter().map(|c| c.branch.as_str()).collect();
+                print_json_result(&branch_names, &[]);
+            } else {
+                eprintln!("\nDry run — no changes made.");
+            }
             return Ok(());
         }
 
-        // 8. Confirm unless --force
-        if !self.force {
+        // 8. Confirm unless --force (skip in json mode)
+        if !self.force && !self.is_json() {
             eprint!(
                 "\nRemove {} worktree{} and their containers? [y/N] ",
                 candidates.len(),
@@ -113,23 +139,49 @@ impl PruneArgs {
             }
         }
 
-        // 9. Prune each candidate
-        let mut pruned = 0;
-        for candidate in &candidates {
-            // Stop and remove container
-            if let Some(ref container_id) = candidate.container_id {
-                let _ = client.stop_container(container_id).await;
-                let _ = client.remove_container(container_id, false).await;
-                info!(
-                    branch = %candidate.branch,
-                    container = candidate.container_name.as_deref().unwrap_or("-"),
-                    "removed container"
-                );
-            }
+        // 9. Prune and output results
+        let (pruned_branches, errors) =
+            execute_prune(&candidates, &client, repo_root, self.is_json()).await;
 
-            // Remove worktree
-            match cella_git::remove(repo_root, &candidate.worktree_path) {
-                Ok(()) => {
+        if self.is_json() {
+            let names: Vec<&str> = pruned_branches.iter().map(String::as_str).collect();
+            print_json_result(&names, &errors);
+        } else {
+            let count = pruned_branches.len();
+            eprintln!(
+                "\nPruned {count} worktree{}",
+                if count == 1 { "" } else { "s" }
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn execute_prune(
+    candidates: &[PruneCandidate],
+    client: &cella_docker::DockerClient,
+    repo_root: &std::path::Path,
+    json_mode: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut pruned_branches = Vec::new();
+    let mut errors = Vec::new();
+
+    for candidate in candidates {
+        // Stop and remove container
+        if let Some(ref container_id) = candidate.container_id {
+            let _ = client.stop_container(container_id).await;
+            let _ = client.remove_container(container_id, false).await;
+            info!(
+                branch = %candidate.branch,
+                container = candidate.container_name.as_deref().unwrap_or("-"),
+                "removed container"
+            );
+        }
+
+        // Remove worktree
+        match cella_git::remove(repo_root, &candidate.worktree_path) {
+            Ok(()) => {
+                if !json_mode {
                     eprintln!(
                         "  Pruned: {} ({})",
                         candidate.branch,
@@ -139,26 +191,34 @@ impl PruneArgs {
                             "no container"
                         }
                     );
-                    pruned += 1;
                 }
-                Err(e) => {
-                    eprintln!("  Failed to remove worktree for {}: {e}", candidate.branch);
+                pruned_branches.push(candidate.branch.clone());
+            }
+            Err(e) => {
+                let msg = format!("failed to remove worktree for {}: {e}", candidate.branch);
+                if !json_mode {
+                    eprintln!("  {msg}");
                 }
+                errors.push(msg);
             }
         }
-
-        // 10. Clean up stale git worktree records
-        let _ = std::process::Command::new("git")
-            .args(["worktree", "prune"])
-            .current_dir(repo_root)
-            .output();
-
-        eprintln!(
-            "\nPruned {pruned} worktree{}",
-            if pruned == 1 { "" } else { "s" }
-        );
-        Ok(())
     }
+
+    // Clean up stale git worktree records
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .output();
+
+    (pruned_branches, errors)
+}
+
+fn print_json_result(pruned: &[&str], errors: &[String]) {
+    let result = serde_json::json!({
+        "pruned": pruned,
+        "errors": errors,
+    });
+    println!("{result}");
 }
 
 fn format_candidates(candidates: &[PruneCandidate]) -> String {
