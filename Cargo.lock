@@ -387,6 +387,7 @@ name = "cella-config"
 version = "0.0.9"
 dependencies = [
  "cella-codegen",
+ "cella-network",
  "hex",
  "miette",
  "serde",
