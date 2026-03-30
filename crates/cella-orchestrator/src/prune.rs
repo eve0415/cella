@@ -24,7 +24,11 @@ pub struct PruneCandidate {
     pub container_state: Option<String>,
 }
 
-/// Find worktrees whose branches are fully merged into the default branch.
+/// Find worktrees that are candidates for pruning.
+///
+/// When `all` is false, only worktrees whose branches are fully merged into the
+/// default branch are returned. When `all` is true, all linked worktrees are
+/// returned regardless of merge status.
 ///
 /// # Errors
 ///
@@ -32,6 +36,7 @@ pub struct PruneCandidate {
 pub async fn prune_candidates(
     repo_root: &Path,
     client: &DockerClient,
+    all: bool,
 ) -> Result<Vec<PruneCandidate>, OrchestratorError> {
     let worktrees = cella_git::list(repo_root).map_err(|e| OrchestratorError::Git {
         message: format!("failed to list worktrees: {e}"),
@@ -42,20 +47,25 @@ pub async fn prune_candidates(
         return Ok(vec![]);
     }
 
-    let default_branch =
-        cella_git::default_branch(repo_root).map_err(|e| OrchestratorError::Git {
-            message: format!("failed to detect default branch: {e}"),
-        })?;
+    let merged = if all {
+        Vec::new()
+    } else {
+        let default_branch =
+            cella_git::default_branch(repo_root).map_err(|e| OrchestratorError::Git {
+                message: format!("failed to detect default branch: {e}"),
+            })?;
 
-    let merged =
-        cella_git::merged_branches(repo_root, &default_branch).map_err(|e| OrchestratorError::Git {
-            message: format!("failed to list merged branches: {e}"),
-        })?;
+        cella_git::merged_branches(repo_root, &default_branch).map_err(|e| {
+            OrchestratorError::Git {
+                message: format!("failed to list merged branches: {e}"),
+            }
+        })?
+    };
 
     let mut candidates = Vec::new();
     for wt in &linked {
         let Some(branch) = &wt.branch else { continue };
-        if !merged.contains(branch) {
+        if !all && !merged.contains(branch) {
             continue;
         }
 
