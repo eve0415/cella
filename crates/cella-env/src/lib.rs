@@ -13,6 +13,7 @@ pub mod git_config;
 pub mod nvim;
 pub mod paths;
 pub mod platform;
+pub mod proxy;
 pub mod ssh_agent;
 pub mod ssh_config;
 pub mod tmux;

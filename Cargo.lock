@@ -466,6 +466,7 @@ dependencies = [
 name = "cella-env"
 version = "0.0.9"
 dependencies = [
+ "cella-network",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
