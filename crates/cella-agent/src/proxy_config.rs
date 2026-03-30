@@ -20,6 +20,12 @@ pub struct AgentProxyConfig {
     /// Upstream proxy URL (if chaining through a corporate proxy).
     pub upstream_proxy: Option<String>,
 
+    /// PEM-encoded CA certificate for MITM TLS interception.
+    pub ca_cert_pem: Option<String>,
+
+    /// PEM-encoded CA private key for MITM TLS interception.
+    pub ca_key_pem: Option<String>,
+
     /// Log file for blocked requests.
     log_file: Mutex<Option<std::fs::File>>,
 }
@@ -60,6 +66,8 @@ impl AgentProxyConfig {
             listen_port: raw.listen_port,
             matcher,
             upstream_proxy: raw.upstream_proxy,
+            ca_cert_pem: raw.ca_cert_pem,
+            ca_key_pem: raw.ca_key_pem,
             log_file: Mutex::new(log_file),
         })
     }
@@ -98,6 +106,8 @@ struct ProxyConfigJson {
     mode: String,
     rules: Vec<RuleJson>,
     upstream_proxy: Option<String>,
+    ca_cert_pem: Option<String>,
+    ca_key_pem: Option<String>,
 }
 
 /// A rule in the JSON config.

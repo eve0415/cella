@@ -17,6 +17,7 @@ mod cli;
 mod control;
 mod credential;
 mod forward_proxy;
+mod mitm;
 mod plugin_sync;
 mod port_proxy;
 mod port_watcher;

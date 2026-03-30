@@ -107,10 +107,23 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxy
         return;
     }
 
-    // TODO: If path-level rules exist for this domain, MITM interception
-    // will be added in a follow-up commit. For now, domain-only blocking
-    // is enforced at the CONNECT stage.
+    // Check if path-level rules exist for this domain. If so, we need
+    // MITM TLS interception to inspect the URL path inside the encrypted
+    // connection.
+    if config.matcher.domain_needs_path_inspection(&host) && config.ca_cert_pem.is_some() {
+        // Send 200 first, then intercept the TLS handshake.
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        crate::mitm::intercept_tls(client, &host, port, config).await;
+        return;
+    }
 
+    // No path-level rules — just tunnel without MITM.
     // Connect to upstream (or through upstream proxy).
     let upstream = match connect_upstream(&host, port, config).await {
         Ok(s) => s,
@@ -183,6 +196,16 @@ async fn handle_direct_http(
 
     // Bidirectional copy for the rest.
     let _ = copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+/// Connect to the target, either directly or through an upstream proxy.
+/// Public for use by the MITM module.
+pub async fn connect_upstream_for_mitm(
+    host: &str,
+    port: u16,
+    config: &AgentProxyConfig,
+) -> Result<TcpStream, io::Error> {
+    connect_upstream(host, port, config).await
 }
 
 /// Connect to the target, either directly or through an upstream proxy.

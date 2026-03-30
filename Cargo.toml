@@ -102,7 +102,10 @@ glob = "0.3.3"
 
 # Certificate management
 rcgen = "0.14.7"
+rustls = { version = "0.23.27", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.3"
+rustls-pemfile = "2.2.0"
+tokio-rustls = "0.26.4"
 
 # File watching
 notify = "8.2.0"

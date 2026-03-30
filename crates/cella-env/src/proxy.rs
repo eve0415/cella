@@ -70,6 +70,23 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
         })
         .collect();
 
+    // Check if any rules require path-level inspection (MITM).
+    // If so, ensure the CA cert/key are available and include them.
+    let has_path_rules = config.rules.iter().any(|r| !r.paths.is_empty());
+    let (ca_cert_pem, ca_key_pem) = if has_path_rules {
+        match cella_network::ca::ensure_ca() {
+            Ok(ca) => (Some(ca.cert_pem), Some(ca.key_pem)),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to generate CA for MITM: {e}. Path-level blocking will be domain-only."
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let json = serde_json::json!({
         "listen_port": config.proxy.proxy_port,
         "mode": match config.mode {
@@ -78,6 +95,8 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
         },
         "rules": rules,
         "upstream_proxy": upstream,
+        "ca_cert_pem": ca_cert_pem,
+        "ca_key_pem": ca_key_pem,
     });
 
     json.to_string()
