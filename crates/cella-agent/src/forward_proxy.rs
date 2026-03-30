@@ -7,7 +7,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -49,40 +49,50 @@ pub async fn start_forward_proxy(
 
 /// Handle a single proxy connection.
 ///
-/// Reads the first line to determine if it's a CONNECT request (HTTPS)
-/// or a direct HTTP request, then dispatches accordingly.
-async fn handle_connection(mut stream: TcpStream, config: Arc<AgentProxyConfig>) {
-    // Read the request line (e.g., "CONNECT host:443 HTTP/1.1\r\n" or "GET http://... HTTP/1.1\r\n")
-    let mut buf = [0u8; 8192];
-    let n = match stream.read(&mut buf).await {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(e) => {
-            debug!("Proxy read error: {e}");
-            return;
+/// Wraps the stream in a `BufReader` to avoid consuming bytes beyond the HTTP
+/// headers (e.g., the TLS `ClientHello` for CONNECT requests).
+async fn handle_connection(stream: TcpStream, config: Arc<AgentProxyConfig>) {
+    let mut reader = BufReader::new(stream);
+
+    // Read headers line by line until \r\n\r\n.
+    let mut header_bytes = Vec::new();
+    let mut first_line = String::new();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) => {
+                debug!("Proxy read error: {e}");
+                return;
+            }
         }
-    };
+        if first_line.is_empty() {
+            first_line = line.clone();
+        }
+        header_bytes.extend_from_slice(line.as_bytes());
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
 
-    let request_bytes = &buf[..n];
-    let request_str = String::from_utf8_lossy(request_bytes);
-
-    // Parse the first line.
-    let Some(first_line) = request_str.lines().next() else {
-        return;
-    };
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let trimmed = first_line.trim_end();
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() < 2 {
-        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        let _ = reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await;
         return;
     }
 
-    let method = parts[0];
-    let target = parts[1];
+    let method = parts[0].to_string();
+    let target = parts[1].to_string();
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect(stream, target, &config).await;
+        handle_connect(reader, &target, &config).await;
     } else {
-        handle_direct_http(stream, request_bytes, method, target, &config).await;
+        handle_direct_http(reader, &header_bytes, &method, &target, &config).await;
     }
 }
 
@@ -90,52 +100,64 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<AgentProxyConfig>)
 ///
 /// CONNECT requests look like: `CONNECT host:port HTTP/1.1`
 /// We evaluate domain blocking rules before establishing the tunnel.
-async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxyConfig) {
+/// For domains with path-level rules, we defer to MITM TLS interception.
+async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: &AgentProxyConfig) {
     // Parse host:port from CONNECT target.
     let Some((host, port)) = parse_host_port(target) else {
-        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await;
         return;
     };
 
-    // Evaluate domain-level rules.
-    let verdict = config.matcher.evaluate(&host, "/");
-    if !verdict.allowed {
-        info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
-        config.log_blocked(&host, "/", &verdict.reason);
-        // Send 403 and close — this appears as "connection refused" to the client.
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
-        return;
-    }
+    let needs_path_inspection = config.matcher.domain_needs_path_inspection(&host);
+    let has_mitm = config.ca_cert_pem.is_some() && config.ca_key_pem.is_some();
 
-    // Check if path-level rules exist for this domain. If so, we need
-    // MITM TLS interception to inspect the URL path inside the encrypted
-    // connection.
-    if config.matcher.domain_needs_path_inspection(&host) && config.ca_cert_pem.is_some() {
-        // Send 200 first, then intercept the TLS handshake.
-        if client
+    if needs_path_inspection && has_mitm {
+        // Domain has path-level rules and MITM is available — allow the CONNECT
+        // and defer the actual allow/block decision to the MITM path where we
+        // can inspect request paths.
+        let mut client_tcp = client.into_inner();
+        if client_tcp
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .is_err()
         {
             return;
         }
-        crate::mitm::intercept_tls(client, &host, port, config).await;
+        crate::mitm::intercept_tls(client_tcp, &host, port, config).await;
+        return;
+    }
+
+    // No MITM available or no path-level rules — evaluate domain-level only.
+    let verdict = config.matcher.evaluate(&host, "/");
+    if !verdict.allowed {
+        info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
+        config.log_blocked(&host, "/", &verdict.reason);
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await;
         return;
     }
 
     // No path-level rules — just tunnel without MITM.
-    // Connect to upstream (or through upstream proxy).
     let upstream = match connect_upstream(&host, port, config).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            let _ = client
+                .get_mut()
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await;
             return;
         }
     };
 
-    // Send 200 Connection Established to the client.
-    if client
+    // Headers have been fully consumed by BufReader; safe to unwrap to raw TcpStream.
+    let mut client_tcp = client.into_inner();
+    if client_tcp
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .is_err()
@@ -144,13 +166,8 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxy
     }
 
     // Tunnel bidirectionally.
-    let (mut client_r, mut client_w) = client.into_split();
-    let (mut upstream_r, mut upstream_w) = upstream.into_split();
-
-    let c2u = tokio::spawn(async move { tokio::io::copy(&mut client_r, &mut upstream_w).await });
-    let u2c = tokio::spawn(async move { tokio::io::copy(&mut upstream_r, &mut client_w).await });
-
-    let _ = tokio::try_join!(c2u, u2c);
+    let mut upstream = upstream;
+    let _ = copy_bidirectional(&mut client_tcp, &mut upstream).await;
 }
 
 /// Handle direct HTTP proxy request (non-CONNECT).
@@ -158,24 +175,30 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &AgentProxy
 /// Direct requests look like: `GET http://host/path HTTP/1.1`
 /// We evaluate both domain and path blocking rules.
 async fn handle_direct_http(
-    mut client: TcpStream,
-    first_chunk: &[u8],
+    mut client: BufReader<TcpStream>,
+    header_bytes: &[u8],
     _method: &str,
     target: &str,
     config: &AgentProxyConfig,
 ) {
     // Parse the URL to extract host and path.
     let Some((host, port, path)) = parse_http_url(target) else {
-        let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await;
         return;
     };
 
-    // Evaluate rules with both domain and path.
-    let verdict = config.matcher.evaluate(&host, &path);
+    // Evaluate rules with both domain and path (strip query/fragment).
+    let verdict = config.matcher.evaluate(&host, strip_query(&path));
     if !verdict.allowed {
         info!("BLOCKED HTTP {target} - {}", verdict.reason);
         config.log_blocked(&host, &path, &verdict.reason);
-        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await;
         return;
     }
 
@@ -184,18 +207,22 @@ async fn handle_direct_http(
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to {host}:{port}: {e}");
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            let _ = client
+                .get_mut()
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await;
             return;
         }
     };
 
-    // Forward the original request to upstream.
-    if upstream.write_all(first_chunk).await.is_err() {
+    // Forward the original request headers to upstream.
+    if upstream.write_all(header_bytes).await.is_err() {
         return;
     }
 
-    // Bidirectional copy for the rest.
-    let _ = copy_bidirectional(&mut client, &mut upstream).await;
+    // Bidirectional copy for the rest (request body + response).
+    let mut client_tcp = client.into_inner();
+    let _ = copy_bidirectional(&mut client_tcp, &mut upstream).await;
 }
 
 /// Connect to the target, either directly or through an upstream proxy.
@@ -253,6 +280,15 @@ async fn connect_via_upstream_proxy(
     }
 
     Ok(proxy_stream)
+}
+
+/// Strip query string and fragment from a URL path before rule evaluation.
+pub fn strip_query(path: &str) -> &str {
+    let end = path
+        .find('?')
+        .unwrap_or(path.len())
+        .min(path.find('#').unwrap_or(path.len()));
+    &path[..end]
 }
 
 /// Parse `host:port` from a CONNECT target.
@@ -351,6 +387,16 @@ mod tests {
             parse_proxy_url("http://user:pass@proxy:3128"),
             Some("proxy:3128".to_string())
         );
+    }
+
+    #[test]
+    fn strip_query_removes_query_string() {
+        assert_eq!(strip_query("/api/v1?foo=bar"), "/api/v1");
+        assert_eq!(strip_query("/api/v1#section"), "/api/v1");
+        assert_eq!(strip_query("/api/v1?foo=bar#section"), "/api/v1");
+        assert_eq!(strip_query("/api/v1#section?foo=bar"), "/api/v1");
+        assert_eq!(strip_query("/api/v1"), "/api/v1");
+        assert_eq!(strip_query("/"), "/");
     }
 
     #[test]
