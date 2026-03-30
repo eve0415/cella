@@ -113,9 +113,32 @@ cella exec feat/logging -- cargo test
 # 5. Report results to user
 ```
 
+## Lifecycle management
+
+After tasks complete, you can manage the branch containers:
+
+```sh
+# Stop a branch's container to free resources
+cella down feat/auth
+
+# Restart a stopped branch's container
+cella up feat/auth
+
+# Stop and remove container + worktree
+cella down feat/auth --rm
+
+# Clean up all worktrees (including unmerged)
+cella prune --all
+
+# Clean up only merged worktrees
+cella prune
+```
+
 ## Important notes
 
 - Each branch gets its own container with the full dev environment
 - Tasks run independently — one failure doesn't affect others
 - The host filesystem is shared, so git operations are coordinated
-- Use `cella prune` to clean up merged branches when done
+- Use `cella down <branch>` to stop individual branches and free resources
+- Use `cella up <branch>` to restart stopped branches (e.g., after reboot)
+- Use `cella prune` to clean up merged branches, `cella prune --all` for all branches
