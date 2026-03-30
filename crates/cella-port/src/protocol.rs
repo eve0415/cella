@@ -90,11 +90,38 @@ pub enum AgentMessage {
         /// Command to execute.
         command: Vec<String>,
     },
-    /// Remove merged worktrees and their containers.
+    /// Remove worktrees and their containers.
     PruneRequest {
         request_id: String,
         #[serde(default)]
         dry_run: bool,
+        /// When true, include unmerged worktrees (not just merged ones).
+        #[serde(default)]
+        all: bool,
+    },
+    /// Stop (and optionally remove) a worktree branch's container.
+    DownRequest {
+        request_id: String,
+        /// Branch name whose container to stop.
+        branch: String,
+        /// Remove the container and worktree directory after stopping.
+        #[serde(default)]
+        rm: bool,
+        /// Remove associated volumes (only with rm).
+        #[serde(default)]
+        volumes: bool,
+        /// Force stop even when shutdownAction is "none".
+        #[serde(default)]
+        force: bool,
+    },
+    /// Start or restart a worktree branch's container.
+    UpRequest {
+        request_id: String,
+        /// Branch name whose container to start.
+        branch: String,
+        /// Rebuild the container from scratch.
+        #[serde(default)]
+        rebuild: bool,
     },
     /// Create a branch and run a background command in its container.
     TaskRunRequest {
@@ -261,6 +288,19 @@ pub enum DaemonMessage {
         request_id: String,
         pruned: Vec<String>,
         errors: Vec<String>,
+    },
+    /// Result of a down (stop/remove) request.
+    DownResult {
+        request_id: String,
+        /// "stopped" or "removed".
+        outcome: String,
+        container_name: String,
+    },
+    /// Result of an up (start/restart) request.
+    UpResult {
+        request_id: String,
+        #[serde(flatten)]
+        result: WorktreeOperationResult,
     },
     /// A background task was started.
     TaskRunResult {
@@ -1030,12 +1070,107 @@ mod tests {
         let msg = AgentMessage::PruneRequest {
             request_id: "pr-1".to_string(),
             dry_run: true,
+            all: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
             AgentMessage::PruneRequest { dry_run: true, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_prune_request_all() {
+        let msg = AgentMessage::PruneRequest {
+            request_id: "pr-2".to_string(),
+            dry_run: false,
+            all: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::PruneRequest { all: true, .. }
+        ));
+    }
+
+    #[test]
+    fn prune_request_backward_compat_missing_all() {
+        let json = r#"{"type":"prune_request","request_id":"pr-3","dry_run":false}"#;
+        let decoded: AgentMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::PruneRequest { all: false, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_down_request() {
+        let msg = AgentMessage::DownRequest {
+            request_id: "dn-1".to_string(),
+            branch: "feat/auth".to_string(),
+            rm: true,
+            volumes: false,
+            force: false,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"down_request\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::DownRequest { rm: true, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_up_request() {
+        let msg = AgentMessage::UpRequest {
+            request_id: "up-1".to_string(),
+            branch: "feat/auth".to_string(),
+            rebuild: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"up_request\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::UpRequest { rebuild: true, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_down_result() {
+        let msg = DaemonMessage::DownResult {
+            request_id: "dn-1".to_string(),
+            outcome: "stopped".to_string(),
+            container_name: "cella-proj-feat-auth".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::DownResult { outcome, .. } if outcome == "stopped"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_up_result() {
+        let msg = DaemonMessage::UpResult {
+            request_id: "up-1".to_string(),
+            result: WorktreeOperationResult::Success {
+                container_name: "cella-proj-feat-auth".to_string(),
+                worktree_path: "/home/user/proj-worktrees/feat-auth".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::UpResult {
+                result: WorktreeOperationResult::Success { .. },
+                ..
+            }
         ));
     }
 
