@@ -22,6 +22,28 @@ pub struct WorktreeInfo {
     pub is_main: bool,
 }
 
+/// If the workspace is a linked git worktree, return the parent repo's `.git`
+/// directory path.
+///
+/// Linked worktrees have a `.git` *file* (not directory) containing a `gitdir:`
+/// pointer to `<parent-repo>/.git/worktrees/<name>`. This function reads that
+/// pointer and returns the parent `.git` directory (two levels up from the
+/// pointed-to path).
+///
+/// Returns `None` if the workspace is a regular repo (`.git` is a directory or
+/// doesn't exist).
+pub fn parent_git_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let dot_git = workspace_root.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = content.strip_prefix("gitdir: ")?.trim();
+    let gitdir_path = PathBuf::from(gitdir);
+    // gitdir points to .git/worktrees/<name> — parent .git is two levels up
+    gitdir_path.parent()?.parent().map(PathBuf::from)
+}
+
 /// Compute the worktree directory path for a branch.
 ///
 /// If `worktree_root` is provided (from `cella.toml` config), the worktree
@@ -578,5 +600,47 @@ detached
             result.unwrap_err(),
             CellaGitError::BranchCheckedOut { .. }
         ));
+    }
+
+    #[test]
+    fn parent_git_dir_regular_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Regular repo has .git directory, not a file
+        assert!(parent_git_dir(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn parent_git_dir_no_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No .git at all
+        assert!(parent_git_dir(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn parent_git_dir_linked_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).unwrap();
+
+        let info = create(
+            tmp.path(),
+            "wt-test",
+            &BranchState::New,
+            Some(&wt_root),
+            None,
+        )
+        .unwrap();
+
+        let result = parent_git_dir(&info.path);
+        assert!(result.is_some());
+        // Should point to the parent repo's .git directory
+        let parent_git = result.unwrap();
+        assert_eq!(
+            parent_git.canonicalize().unwrap(),
+            tmp.path().join(".git").canonicalize().unwrap()
+        );
     }
 }

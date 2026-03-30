@@ -145,7 +145,7 @@ impl Command {
             Self::Doctor(args) => args.execute().await,
             Self::Branch(args) => args.execute(progress).await,
 
-            Self::Switch(args) => args.execute(),
+            Self::Switch(args) => args.execute().await,
             Self::Prune(args) => args.execute().await,
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),

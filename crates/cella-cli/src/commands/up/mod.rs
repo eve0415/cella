@@ -60,6 +60,10 @@ pub struct UpArgs {
     /// Skip SHA256 checksum verification for agent binary download.
     #[arg(long)]
     pub(crate) skip_checksum: bool,
+
+    /// Target a worktree branch's container by branch name.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
 }
 
 /// Output format for container commands.
@@ -706,6 +710,21 @@ impl UpContext {
         }
         create_opts.env.extend(agent_env);
 
+        // If the workspace is a linked git worktree, mount the parent repo's
+        // .git directory at the same host path so gitdir references resolve.
+        if let Some(parent_git) = cella_git::parent_git_dir(&self.resolved.workspace_root) {
+            let canonical = parent_git
+                .canonicalize()
+                .unwrap_or_else(|_| parent_git.clone());
+            let path_str = canonical.to_string_lossy().to_string();
+            create_opts.mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: path_str.clone(),
+                target: path_str,
+                consistency: None,
+            });
+        }
+
         let (vol_name, vol_target, _ro) = cella_docker::volume::agent_volume_mount();
         create_opts.mounts.push(MountConfig {
             mount_type: "volume".to_string(),
@@ -843,6 +862,9 @@ impl UpContext {
                 inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
             )
             .await;
+
+        // Add /cella/bin to PATH in shell profiles so `cella` CLI is discoverable.
+        inject_cella_path(&self.client, container_id, remote_user).await;
 
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
@@ -1293,10 +1315,57 @@ impl UpContext {
 }
 
 impl UpArgs {
+    /// Handle `--branch`: start/restart a worktree branch's container.
+    async fn execute_branch(
+        &self,
+        branch_name: &str,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = std::env::current_dir()?;
+        let repo_info = cella_git::discover(&cwd)?;
+        let worktrees = cella_git::list(&repo_info.root)?;
+        let wt = worktrees
+            .iter()
+            .find(|wt| wt.branch.as_deref() == Some(branch_name))
+            .ok_or_else(|| {
+                format!(
+                    "No worktree for branch '{branch_name}'. \
+                     Use `cella branch {branch_name}` to create one."
+                )
+            })?;
+
+        let extra_labels = cella_docker::worktree_labels(branch_name, &repo_info.root);
+        let mut ctx = UpContext::for_workspace(
+            &wt.path,
+            self.docker_host.as_deref(),
+            extra_labels,
+            progress,
+            self.output.clone(),
+        )
+        .await?;
+        ctx.remove_container = self.rebuild || self.remove_existing_container;
+        ctx.build_no_cache = self.build_no_cache;
+        ctx.skip_checksum = self.skip_checksum;
+
+        let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
+        output_result(
+            &ctx.output,
+            &result.outcome,
+            &result.container_id,
+            &result.remote_user,
+            &result.workspace_folder,
+        );
+        Ok(())
+    }
+
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref branch_name) = self.branch {
+            return self.execute_branch(branch_name, progress).await;
+        }
+
         let ctx = UpContext::new(&self, progress).await?;
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
@@ -1335,28 +1404,13 @@ pub fn resolve_remote_user(
         .to_string()
 }
 
-/// Build lifecycle entries for a phase from the metadata label, falling back to
-/// the config value if no metadata is available.
+/// Build lifecycle entries for a phase — delegates to orchestrator.
 fn lifecycle_entries_for_phase(
     metadata: Option<&str>,
     config: &serde_json::Value,
     phase: &str,
 ) -> Vec<cella_features::LifecycleEntry> {
-    metadata.map_or_else(
-        || {
-            config
-                .get(phase)
-                .filter(|v| !v.is_null())
-                .map(|cmd| {
-                    vec![cella_features::LifecycleEntry {
-                        origin: "devcontainer.json".into(),
-                        command: cmd.clone(),
-                    }]
-                })
-                .unwrap_or_default()
-        },
-        |meta_json| cella_features::lifecycle_from_metadata_label(meta_json, phase),
-    )
+    cella_orchestrator::lifecycle::lifecycle_entries_for_phase(metadata, config, phase)
 }
 
 /// Convert `cella_env::FileUpload` items to `cella_docker::File`.
@@ -1485,10 +1539,7 @@ pub fn output_result(
                 "remoteUser": remote_user,
                 "remoteWorkspaceFolder": workspace_folder,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string(&output).unwrap_or_default());
         }
     }
 }
@@ -1539,6 +1590,45 @@ pub async fn inject_post_start(
         remote_user,
     )
     .await;
+}
+
+/// Add `/cella/bin` to PATH in the container's shell profile.
+///
+/// This makes the `cella` CLI (symlinked to the agent binary) discoverable
+/// by users and AI agents running inside the container.
+async fn inject_cella_path(client: &DockerClient, container_id: &str, remote_user: &str) {
+    let snippet = r#"
+# cella CLI (in-container worktree commands)
+if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then
+    export PATH="/cella/bin:$PATH"
+fi
+"#;
+    // Determine home directory
+    let home = if remote_user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{remote_user}")
+    };
+
+    for profile in &[".bashrc", ".zshrc", ".profile"] {
+        let path = format!("{home}/{profile}");
+        let cmd = format!(
+            "if [ -f '{path}' ] && ! grep -q '/cella/bin' '{path}'; then printf '%s\\n' '{snippet_escaped}' >> '{path}'; fi",
+            path = path,
+            snippet_escaped = snippet.replace('\'', "'\\''"),
+        );
+        let _ = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
+                    user: Some("root".to_string()),
+                    working_dir: None,
+                    env: None,
+                },
+            )
+            .await;
+    }
 }
 
 /// Upload SSH config files to the container's `.ssh` directory.

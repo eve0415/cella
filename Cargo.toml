@@ -16,6 +16,7 @@ members = [
     "crates/cella-port",
     "crates/cella-agent",
     "crates/cella-features",
+    "crates/cella-orchestrator",
 ]
 
 [workspace.package]
@@ -103,7 +104,10 @@ glob = "0.3.3"
 notify = "8.2.0"
 
 # Process inspection
-nix = { version = "0.31.2", default-features = false, features = ["signal"] }
+nix = { version = "0.31.2", default-features = false, features = ["signal", "term"] }
+
+# PTY
+portable-pty = "0.9.0"
 
 # Testing
 tempfile = "3.27.0"
@@ -123,6 +127,7 @@ cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
+cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-port = { path = "crates/cella-port" }
 
 [profile.release]

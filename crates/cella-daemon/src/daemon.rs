@@ -63,8 +63,10 @@ pub async fn run_daemon(
 ) -> Result<(), CellaDaemonError> {
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
-    // Generate auth token for agent connections
-    let auth_token = generate_auth_token();
+    // Load persisted auth token (or generate + persist a new one).
+    // Persisting the token across daemon restarts ensures existing containers
+    // (which have the token baked into CELLA_DAEMON_TOKEN) can still connect.
+    let auth_token = load_or_create_auth_token(control_socket_path)?;
 
     // Bind TCP listener for agent control connections
     let control_listener = bind_control_tcp(control_socket_path).await?;
@@ -177,6 +179,48 @@ fn generate_auth_token() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Check whether a string is a valid 64-char hex auth token.
+fn is_valid_token(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Load an existing auth token from `~/.cella/daemon.token`, or generate and
+/// persist a new one.  The file survives daemon restarts so that containers
+/// created with the old token can still authenticate.
+fn load_or_create_auth_token(control_socket_path: &Path) -> Result<String, CellaDaemonError> {
+    let token_path = control_socket_path.with_file_name("daemon.token");
+
+    // Try to read an existing token.
+    if let Ok(contents) = std::fs::read_to_string(&token_path) {
+        let trimmed = contents.trim();
+        if is_valid_token(trimmed) {
+            info!("Reusing persisted auth token from {}", token_path.display());
+            return Ok(trimmed.to_string());
+        }
+        warn!(
+            "Corrupt token file at {}, regenerating",
+            token_path.display()
+        );
+    }
+
+    // Generate a fresh token and persist it.
+    let token = generate_auth_token();
+    if let Some(parent) = token_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CellaDaemonError::PidFile {
+            message: format!("failed to create directory {}: {e}", parent.display()),
+        })?;
+    }
+    std::fs::write(&token_path, &token).map_err(|e| CellaDaemonError::PidFile {
+        message: format!("failed to write token file {}: {e}", token_path.display()),
+    })?;
+    set_socket_permissions(&token_path);
+    info!(
+        "Generated new auth token, persisted to {}",
+        token_path.display()
+    );
+    Ok(token)
 }
 
 /// Bind a TCP listener for agent control connections.
@@ -465,5 +509,88 @@ mod tests {
             &dir.path().join("test.pid"),
             &dir.path().join("test.sock"),
         ));
+    }
+
+    #[test]
+    fn is_valid_token_accepts_64_hex() {
+        let token = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        assert!(is_valid_token(token));
+    }
+
+    #[test]
+    fn is_valid_token_rejects_short() {
+        assert!(!is_valid_token("abcdef1234567890"));
+    }
+
+    #[test]
+    fn is_valid_token_rejects_non_hex() {
+        let bad = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert!(!is_valid_token(bad));
+    }
+
+    #[test]
+    fn is_valid_token_rejects_empty() {
+        assert!(!is_valid_token(""));
+    }
+
+    #[test]
+    fn token_generated_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("daemon.sock");
+        let token = load_or_create_auth_token(&control).unwrap();
+        assert!(is_valid_token(&token));
+
+        let persisted = std::fs::read_to_string(dir.path().join("daemon.token")).unwrap();
+        assert_eq!(persisted, token);
+    }
+
+    #[test]
+    fn token_reused_when_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.path().join("daemon.token"), known).unwrap();
+
+        let control = dir.path().join("daemon.sock");
+        let token = load_or_create_auth_token(&control).unwrap();
+        assert_eq!(token, known);
+    }
+
+    #[test]
+    fn token_regenerated_when_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.token"), "not-a-token").unwrap();
+
+        let control = dir.path().join("daemon.sock");
+        let token = load_or_create_auth_token(&control).unwrap();
+        assert!(is_valid_token(&token));
+        assert_ne!(token, "not-a-token");
+
+        let persisted = std::fs::read_to_string(dir.path().join("daemon.token")).unwrap();
+        assert_eq!(persisted, token);
+    }
+
+    #[test]
+    fn token_regenerated_when_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.token"), "abcdef1234567890").unwrap();
+
+        let control = dir.path().join("daemon.sock");
+        let token = load_or_create_auth_token(&control).unwrap();
+        assert!(is_valid_token(&token));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("daemon.sock");
+        let _ = load_or_create_auth_token(&control).unwrap();
+
+        let perms = std::fs::metadata(dir.path().join("daemon.token"))
+            .unwrap()
+            .permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
     }
 }

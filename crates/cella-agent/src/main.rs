@@ -5,8 +5,12 @@
 //! - Proxies localhost-bound apps to 0.0.0.0 so they're reachable from outside
 //! - Handles BROWSER env var interception for opening URLs on the host
 //! - Forwards git credential requests to the host daemon
+//!
+//! When invoked as `cella` (via symlink), enters CLI mode for in-container
+//! worktree management commands that delegate to the host daemon.
 
 mod browser;
+mod cli;
 mod control;
 mod credential;
 mod plugin_sync;
@@ -81,8 +85,30 @@ fn parse_args() -> Result<AgentArgs, String> {
     }
 }
 
+/// Check if this binary was invoked as `cella` (CLI mode) vs `cella-agent`.
+fn is_cli_mode() -> bool {
+    let exe = std::env::args().next().unwrap_or_default();
+    let stem = std::path::Path::new(&exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    // Invoked as "cella" but not "cella-agent" or "cella-browser"
+    stem == "cella"
+}
+
 #[tokio::main]
 async fn main() {
+    // Check if invoked as `cella` (CLI mode via symlink)
+    if is_cli_mode() {
+        let args: Vec<String> = std::env::args().collect();
+        let command = cli::parse_cli_args(&args);
+        if let Err(e) = cli::run(command).await {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CELLA_AGENT_LOG")

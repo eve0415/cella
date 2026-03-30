@@ -12,4 +12,4 @@ pub use branch::{BranchState, is_tracking_gone, merged_branches, resolve_branch}
 pub use error::CellaGitError;
 pub use repo::{RepoInfo, default_branch, discover, is_inside_container};
 pub use sanitize::branch_to_dir_name;
-pub use worktree::{WorktreeInfo, create, list, remove, worktree_path};
+pub use worktree::{WorktreeInfo, create, list, parent_git_dir, remove, worktree_path};

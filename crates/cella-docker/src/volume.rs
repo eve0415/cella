@@ -75,6 +75,14 @@ pub fn browser_helper_path() -> String {
     format!("{AGENT_PATH_PREFIX}/bin/cella-browser")
 }
 
+/// Get the CLI symlink path inside the container.
+///
+/// This symlink points to the agent binary. When invoked via this path,
+/// the agent enters CLI mode for in-container worktree commands.
+pub fn cli_symlink_path() -> String {
+    format!("{AGENT_PATH_PREFIX}/bin/cella")
+}
+
 /// Generate the mount configuration for the agent volume.
 ///
 /// Returns a tuple of (source, target, readonly) for the volume mount.
@@ -896,6 +904,20 @@ fn build_volume_tar(
                 message: format!("tar append browser: {e}"),
             })?;
 
+        // CLI symlink: /cella/bin/cella -> agent binary
+        // When invoked as "cella", the agent enters CLI mode for in-container commands.
+        let mut header = tar::Header::new_gnu();
+        let link_target = format!("/cella/v{version}/{arch}/cella-agent");
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_link(&mut header, "cella/bin/cella", &link_target)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append cella symlink: {e}"),
+            })?;
+
         // Version marker: /cella/.version
         let marker_bytes = version_marker.as_bytes();
         let mut header = tar::Header::new_gnu();
@@ -987,6 +1009,36 @@ mod tests {
         assert!(entries.iter().any(|e| e.contains("cella-agent")));
         assert!(entries.iter().any(|e| e.contains("cella-browser")));
         assert!(entries.iter().any(|e| e.contains(".version")));
+        // CLI symlink: cella/bin/cella
+        assert!(entries.iter().any(|e| e == "cella/bin/cella"));
+    }
+
+    #[test]
+    fn cli_symlink_path_format() {
+        assert_eq!(cli_symlink_path(), "/cella/bin/cella");
+    }
+
+    #[test]
+    fn build_volume_tar_cella_symlink_points_to_agent() {
+        let agent_bytes = b"fake-binary";
+        let browser_bytes = b"#!/bin/sh";
+        let marker = "0.1.0/x86_64\n";
+
+        let tar_bytes =
+            build_volume_tar("0.1.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "cella/bin/cella" {
+                assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+                let link = entry.link_name().unwrap().unwrap();
+                assert_eq!(link.to_string_lossy(), "/cella/v0.1.0/x86_64/cella-agent");
+                return;
+            }
+        }
+        panic!("cella/bin/cella symlink not found in tar");
     }
 
     #[test]

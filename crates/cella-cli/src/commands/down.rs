@@ -33,12 +33,16 @@ pub struct DownArgs {
     workspace_folder: Option<PathBuf>,
 
     /// Target container by ID.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "branch")]
     container_id: Option<String>,
 
     /// Target container by name.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "branch")]
     container_name: Option<String>,
+
+    /// Target a worktree branch's container by branch name.
+    #[arg(long)]
+    branch: Option<String>,
 
     /// Explicit Docker host URL (overrides `DOCKER_HOST`).
     #[arg(long)]
@@ -53,6 +57,37 @@ pub struct DownArgs {
     output: OutputFormat,
 }
 
+/// Resolve a branch name to its worktree path.
+fn resolve_branch_to_path(branch_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let repo_info = cella_git::discover(&cwd)?;
+    let worktrees = cella_git::list(&repo_info.root)?;
+    let wt = worktrees
+        .iter()
+        .find(|wt| wt.branch.as_deref() == Some(branch_name))
+        .ok_or_else(|| format!("No worktree found for branch '{branch_name}'"))?;
+    Ok(wt.path.clone())
+}
+
+/// Remove the worktree directory and clean up stale git records.
+fn remove_worktree(branch_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let repo_info = cella_git::discover(&cwd)?;
+    let worktrees = cella_git::list(&repo_info.root)?;
+    if let Some(wt) = worktrees
+        .iter()
+        .find(|wt| wt.branch.as_deref() == Some(branch_name))
+    {
+        cella_git::remove(&repo_info.root, &wt.path)?;
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&repo_info.root)
+            .output();
+        info!(branch = %branch_name, "removed worktree");
+    }
+    Ok(())
+}
+
 impl DownArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Text)
@@ -61,11 +96,17 @@ impl DownArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         let client = super::connect_docker(self.docker_host.as_deref())?;
 
+        let workspace_folder = if let Some(ref branch_name) = self.branch {
+            Some(resolve_branch_to_path(branch_name)?)
+        } else {
+            self.workspace_folder
+        };
+
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
             id_label: None,
-            workspace_folder: self.workspace_folder,
+            workspace_folder,
         };
 
         let container = target.resolve(&client, false).await?;
@@ -88,10 +129,7 @@ impl DownArgs {
                             "reason": "shutdownAction is none",
                             "containerId": container.id,
                         });
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&output).unwrap_or_default()
-                        );
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
                     }
                 }
                 return Ok(());
@@ -136,6 +174,11 @@ impl DownArgs {
 
         let outcome = if self.rm {
             client.remove_container(&container.id, self.volumes).await?;
+
+            if let Some(ref branch_name) = self.branch {
+                remove_worktree(branch_name)?;
+            }
+
             "removed"
         } else {
             "stopped"
@@ -179,10 +222,7 @@ fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
                 "outcome": outcome,
                 "containerId": container_id,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string(&output).unwrap_or_default());
         }
     }
 }

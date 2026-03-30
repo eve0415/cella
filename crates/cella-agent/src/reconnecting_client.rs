@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use cella_port::CellaPortError;
-use cella_port::protocol::{AgentMessage, DaemonMessage};
+use cella_port::protocol::{AgentMessage, DaemonHello, DaemonMessage};
 use tracing::{debug, info, warn};
 
 use crate::control::ControlClient;
@@ -27,6 +27,8 @@ pub struct ReconnectingClient {
     auth_token: String,
     inner: Option<ControlClient>,
     reconnected: bool,
+    /// The `DaemonHello` received during the most recent handshake.
+    daemon_hello: Option<DaemonHello>,
 }
 
 impl ReconnectingClient {
@@ -47,7 +49,7 @@ impl ReconnectingClient {
 
         loop {
             match ControlClient::connect(addr, container_name, auth_token).await {
-                Ok(client) => {
+                Ok((client, hello)) => {
                     info!("Connected to daemon at {addr}");
                     return Self {
                         addr: addr.to_string(),
@@ -55,6 +57,7 @@ impl ReconnectingClient {
                         auth_token: auth_token.to_string(),
                         inner: Some(client),
                         reconnected: false,
+                        daemon_hello: Some(hello),
                     };
                 }
                 Err(e) => {
@@ -73,6 +76,7 @@ impl ReconnectingClient {
                     auth_token: auth_token.to_string(),
                     inner: None,
                     reconnected: false,
+                    daemon_hello: None,
                 };
             }
 
@@ -143,9 +147,10 @@ impl ReconnectingClient {
     /// Attempt a single reconnect to the daemon.
     async fn try_reconnect(&mut self) -> Result<(), CellaPortError> {
         match ControlClient::connect(&self.addr, &self.container_name, &self.auth_token).await {
-            Ok(client) => {
+            Ok((client, hello)) => {
                 info!("Reconnected to daemon at {}", self.addr);
                 self.inner = Some(client);
+                self.daemon_hello = Some(hello);
                 self.reconnected = true;
                 Ok(())
             }
@@ -180,6 +185,7 @@ mod tests {
             auth_token: "token".to_string(),
             inner: None,
             reconnected: true,
+            daemon_hello: None,
         };
 
         assert!(client.take_reconnected());
@@ -194,6 +200,7 @@ mod tests {
             auth_token: "token".to_string(),
             inner: None,
             reconnected: false,
+            daemon_hello: None,
         };
 
         let msg = AgentMessage::Health {

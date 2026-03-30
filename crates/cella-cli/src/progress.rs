@@ -454,6 +454,79 @@ pub fn format_elapsed_pub(elapsed: Duration) -> String {
     format_elapsed(elapsed)
 }
 
+// Re-export the orchestrator's channel-based progress types so callers
+// can bridge between the indicatif Progress and the orchestrator.
+pub use cella_orchestrator::progress::{
+    ProgressEvent, ProgressSender, format_elapsed as orchestrator_format_elapsed,
+};
+
+/// Create a [`ProgressSender`] and spawn a renderer task that bridges
+/// orchestrator [`ProgressEvent`]s back to this [`Progress`] instance.
+///
+/// Returns the sender (pass to orchestrator functions) and a join handle
+/// for the renderer task (abort when done).
+pub fn bridge(progress: &Progress) -> (ProgressSender, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+    let sender = ProgressSender::new(tx, progress.is_verbose());
+    let progress = progress.clone();
+    let handle = tokio::spawn(async move {
+        use std::collections::HashMap;
+        let mut steps: HashMap<u64, Step> = HashMap::new();
+        let mut phases: HashMap<u64, Phase> = HashMap::new();
+        let mut children: HashMap<u64, PhaseChild> = HashMap::new();
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                ProgressEvent::StepStarted { id, label } => {
+                    steps.insert(id, progress.step(&label));
+                }
+                ProgressEvent::StepCompleted { id, .. } => {
+                    if let Some(step) = steps.remove(&id) {
+                        step.finish();
+                    }
+                }
+                ProgressEvent::StepCompletedWith { id, message, .. } => {
+                    if let Some(step) = steps.remove(&id) {
+                        step.finish_with(&message);
+                    }
+                }
+                ProgressEvent::StepFailed { id, message } => {
+                    if let Some(step) = steps.remove(&id) {
+                        step.fail(&message);
+                    }
+                }
+                ProgressEvent::PhaseStarted { id, label } => {
+                    phases.insert(id, progress.phase(&label));
+                }
+                ProgressEvent::PhaseChildStarted {
+                    parent_id,
+                    id,
+                    label,
+                } => {
+                    if let Some(phase) = phases.get(&parent_id) {
+                        children.insert(id, phase.step(&label));
+                    }
+                }
+                ProgressEvent::PhaseChildCompleted { id, .. } => {
+                    if let Some(child) = children.remove(&id) {
+                        child.finish();
+                    }
+                }
+                ProgressEvent::PhaseCompleted { id, .. } => {
+                    if let Some(phase) = phases.remove(&id) {
+                        phase.finish();
+                    }
+                }
+                ProgressEvent::Warn { message } => progress.warn(&message),
+                ProgressEvent::Hint { message } => progress.hint(&message),
+                ProgressEvent::Output { line } => progress.println(&line),
+                ProgressEvent::Error { message } => progress.error(&message),
+            }
+        }
+    });
+    (sender, handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

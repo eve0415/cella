@@ -159,11 +159,24 @@ impl BranchArgs {
         }
 
         // Summary
-        eprintln!(
-            "Ready: {} (container: {})",
-            wt_info.path.display(),
-            ctx.container_nm,
-        );
+        match self.output {
+            OutputFormat::Text => {
+                eprintln!(
+                    "Ready: {} (container: {})",
+                    wt_info.path.display(),
+                    ctx.container_nm,
+                );
+            }
+            OutputFormat::Json => {
+                let output = serde_json::json!({
+                    "containerId": create_result.container_id,
+                    "containerName": ctx.container_nm,
+                    "worktreePath": wt_info.path.display().to_string(),
+                    "branch": self.name,
+                });
+                println!("{}", serde_json::to_string(&output).unwrap_or_default());
+            }
+        }
 
         Ok(())
     }

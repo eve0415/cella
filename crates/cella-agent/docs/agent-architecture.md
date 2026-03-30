@@ -62,8 +62,9 @@ The agent uses `ReconnectingClient` which:
 
 For listeners bound to `127.0.0.1` only:
 
-```
-0.0.0.0:PORT  ──→  127.0.0.1:PORT
+```mermaid
+graph LR
+    A["0.0.0.0:PORT"] --> B["127.0.0.1:PORT"]
 ```
 
 Runs inside the container so the service is reachable from the container's
@@ -81,11 +82,12 @@ The daemon:
 
 ## Credential Forwarding
 
-Git credential requests are intercepted by a custom `git-credential-cella`
-helper installed in the container. Requests flow:
+Git credential requests are intercepted by a custom `cella-git-credential-helper`
+binary installed in the container. Requests flow:
 
-```
-git  ──→  git-credential-cella  ──→  agent  ──→  daemon  ──→  host git credential
+```mermaid
+graph LR
+    git --> cella["cella-git-credential-helper"] --> agent --> daemon --> host["host git credential"]
 ```
 
 The agent assigns a unique ID to each request and waits for the matching

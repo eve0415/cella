@@ -49,7 +49,7 @@ pub async fn handle_credential(operation: &str) -> Result<(), CellaPortError> {
             message: "CELLA_CONTAINER_NAME not set".to_string(),
         })?;
 
-    let mut client = ControlClient::connect(&addr, &name, &token).await?;
+    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token).await?;
 
     let msg = AgentMessage::CredentialRequest {
         id: request_id.clone(),
