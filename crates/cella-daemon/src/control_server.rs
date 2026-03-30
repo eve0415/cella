@@ -1426,10 +1426,13 @@ async fn handle_task_stop<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Handle a `SwitchRequest`: run default shell in the target branch's container.
+/// Handle a `SwitchRequest`: open an interactive shell in the target container
+/// via a PTY-backed TCP stream bridge.
 ///
-/// This is a non-interactive exec — suitable for AI agents. For interactive
-/// use, users should run `cella shell <branch>` from the host terminal.
+/// The daemon allocates a PTY, spawns `docker exec -it` inside it, and opens
+/// a TCP listener on a random port. It sends `StreamReady { port }` to the
+/// agent, which connects and forwards its terminal stdin/stdout over the
+/// raw TCP connection.
 async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
@@ -1459,27 +1462,16 @@ async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
 
     info!("Handling SwitchRequest: branch={branch} container={container_name}");
 
-    // Run default shell in the target container.
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.args([
-        "exec",
-        &container_name,
-        "sh",
-        "-c",
-        "echo \"Connected to ${HOSTNAME:-$container_name}\"; exec $SHELL -l 2>/dev/null || exec sh",
-    ]);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    // Start PTY + TCP stream bridge.
+    let session = match crate::stream_bridge::start_stream_bridge(&container_name, "0.0.0.0") {
+        Ok(s) => s,
         Err(e) => {
             send_message(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
                     stream: cella_port::protocol::OutputStream::Stderr,
-                    data: format!("Failed to exec shell: {e}\n"),
+                    data: format!("Failed to start stream bridge: {e}\n"),
                 },
             )
             .await?;
@@ -1495,13 +1487,24 @@ async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    let (status, _, _) = stream_child_output(&mut child, request_id, writer).await?;
+    // Tell the agent which port to connect to.
+    send_message(
+        writer,
+        &DaemonMessage::StreamReady {
+            request_id: request_id.to_string(),
+            port: session.port,
+        },
+    )
+    .await?;
+
+    // Wait for the session to complete.
+    let exit_code = session.handle.await.unwrap_or(1);
 
     send_message(
         writer,
         &DaemonMessage::SwitchResult {
             request_id: request_id.to_string(),
-            exit_code: status.code().unwrap_or(1),
+            exit_code,
         },
     )
     .await?;

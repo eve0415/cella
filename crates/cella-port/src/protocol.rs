@@ -283,6 +283,8 @@ pub enum DaemonMessage {
     TaskWaitResult { request_id: String, exit_code: i32 },
     /// Background task stopped.
     TaskStopResult { request_id: String },
+    /// Stream channel is ready for TTY forwarding.
+    StreamReady { request_id: String, port: u16 },
     /// Result of a switch (shell exec in target container).
     SwitchResult { request_id: String, exit_code: i32 },
 }
