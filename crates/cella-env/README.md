@@ -57,7 +57,7 @@ This is the main entry point. It detects the runtime, probes the host environmen
 
 ## Crate Dependencies
 
-**Depends on:** [cella-config](../cella-config)
+**Depends on:** [cella-network](../cella-network)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 

@@ -45,7 +45,7 @@ async fn fetch_from_ghcr() {
 Run integration tests locally (requires Docker):
 
 ```sh
-cargo test -p cella-features -p cella-daemon -p cella-credential-proxy --features integration-tests
+cargo test -p cella-features -p cella-daemon --features integration-tests
 ```
 
 These tests run automatically in CI via the **Integration Test** job, which
@@ -102,4 +102,6 @@ impl ContainerRuntime for MockRuntime {
 | cella-git | Path manipulation, config parsing | Worktree operations |
 | cella-port | Port allocation logic | Port binding |
 | cella-agent | Preset resolution | Full sandbox lifecycle |
+| cella-network | Rule matching, config merging | — |
+| cella-orchestrator | — | Container lifecycle |
 | cella-cli | Argument parsing | End-to-end command tests |

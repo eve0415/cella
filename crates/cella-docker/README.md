@@ -60,7 +60,7 @@ Implements the container lifecycle portions of the [Dev Container specification]
 
 **Depends on:** [cella-backend](../cella-backend), [cella-port](../cella-port), [cella-features](../cella-features)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-compose](../cella-compose), [cella-doctor](../cella-doctor)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

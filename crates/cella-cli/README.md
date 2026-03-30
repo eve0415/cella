@@ -33,9 +33,10 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `tmux` | Open a tmux session inside the dev container |
 | `ports` | View port forwarding status for dev containers |
 | `credential` | Manage credential forwarding for dev containers |
+| `network` | Manage network proxy settings for dev containers |
 | `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
 
-Hidden internal commands: `daemon`, `credential-proxy`.
+Hidden internal commands: `daemon`.
 
 ### Global Flags
 
@@ -77,7 +78,7 @@ Hidden internal commands: `daemon`, `credential-proxy`.
 | `commands/ports.rs` | Port forwarding status |
 | `commands/credential.rs` | Credential forwarding management |
 | `commands/daemon.rs` | Daemon lifecycle management (hidden) |
-| `commands/credential_proxy.rs` | Legacy credential proxy management (hidden) |
+| `commands/network.rs` | Network proxy management |
 | `commands/env_cache.rs` | Environment cache management (internal helper) |
 | `commands/image.rs` | Image inspection (internal helper) |
 | `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
@@ -86,7 +87,7 @@ Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-compose](../cella-compose), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-port](../cella-port), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-credential-proxy](../cella-credential-proxy)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port)
 
 **Depended on by:** none (top of the dependency tree)
 

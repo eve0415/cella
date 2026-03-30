@@ -44,7 +44,7 @@ Container and image naming conventions live here so that all backends use consis
 
 **Depends on:** none (foundation crate — only `sha2`, `hex`, `chrono`, `thiserror`)
 
-**Depended on by:** [cella-docker](../cella-docker), [cella-container](../cella-container), [cella-cli](../cella-cli)
+**Depended on by:** [cella-cli](../cella-cli), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

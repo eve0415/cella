@@ -26,19 +26,21 @@ graph TD
         backend[cella-backend<br><i>backend trait</i>]
         port[cella-port<br><i>IPC protocol</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
+        network[cella-network<br><i>network proxy</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
+    agent & config & env & orchestrator --> network
 ```
 
 **Tier 1 — CLI:** cella-cli is the host binary entry point. cella-agent is the in-container binary (also serves as the `cella` CLI inside containers). Neither contains business logic.
 
 **Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, worktree orchestration, in-container agent, configuration parsing, and feature resolution.
 
-**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, and code generation.
+**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, and network proxy.
 
 ## Crate Responsibilities
 
@@ -85,6 +87,14 @@ Dev Container Features resolution. Parses feature references (OCI, local path, H
 ### cella-port
 
 Port allocation, detection, and IPC protocol. Defines the wire format for daemon-agent communication (`AgentMessage`, `DaemonMessage`), provides `/proc/net/tcp` parsing for port detection, and manages host port allocation to avoid conflicts across concurrent containers.
+
+### cella-orchestrator
+
+Container lifecycle orchestration shared by both the CLI and daemon. Extracts the common container management logic (branch creation, image builds, lifecycle execution, pruning) so that the daemon can call the same Rust functions as the CLI instead of shelling out to subprocesses.
+
+### cella-network
+
+Network proxy configuration, blocking rules, and CA certificate management. Provides glob-based domain and path matching for HTTPS interception (denylist and allowlist modes), auto-generated CA certificates for MITM proxying, host proxy environment variable detection (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`), and rule merging from multiple configuration sources (`cella.toml` and `devcontainer.json` customizations).
 
 ### cella-codegen
 

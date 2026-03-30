@@ -82,12 +82,13 @@ The daemon:
 
 ## Credential Forwarding
 
-Git credential requests are intercepted by a custom `cella-git-credential-helper`
-binary installed in the container. Requests flow:
+Git credential requests are intercepted by a `cella-credential` symlink to
+the agent binary installed in the container. When invoked as `cella-credential`,
+the agent enters credential helper mode. Requests flow:
 
 ```mermaid
 graph LR
-    git --> cella["cella-git-credential-helper"] --> agent --> daemon --> host["host git credential"]
+    git --> cella["cella-credential (symlink)"] --> agent["cella-agent"] --> daemon --> host["host git credential"]
 ```
 
 The agent assigns a unique ID to each request and waits for the matching

@@ -46,7 +46,7 @@ Implements the Docker Compose portions of the [Dev Container specification](http
 
 ## Crate Dependencies
 
-**Depends on:** [cella-docker](../cella-docker)
+**Depends on:** none
 
 **Depended on by:** [cella-cli](../cella-cli)
 

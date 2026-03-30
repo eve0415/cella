@@ -24,15 +24,37 @@ A terminal-native devcontainer CLI. Built for agents.
 
 **The official CLI has real gaps.** It requires Node.js to run (ironic for a container tool). The maintainers confirmed: SSH agent forwarding is ["part of the extension, not the CLI"](https://github.com/devcontainers/cli/issues/441). Port forwarding was left out because ["it requires NodeJS inside the container"](https://github.com/devcontainers/cli/issues/22). No `stop` or `down` command exists ([cli#386](https://github.com/devcontainers/cli/issues/386)). cella fixes all of this with a single native binary.
 
-## Quick Start
+## Installation
 
-Requires a [Rust toolchain](https://rustup.rs/) and a Docker-compatible runtime (Docker Engine, OrbStack, or similar).
+### Homebrew
 
 ```sh
-# Build from source (no published binaries yet)
-cargo build --release
-# Binary at target/release/cella
+brew install eve0415/tap/cella
+```
 
+### Install script
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/eve0415/cella/main/install.sh | sh
+```
+
+### From source
+
+Requires a [Rust toolchain](https://rustup.rs/) (1.94+).
+
+```sh
+cargo install --git https://github.com/eve0415/cella cella-cli
+```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/eve0415/cella/releases). Binaries are available for macOS (Intel, Apple Silicon) and Linux (x86_64, aarch64).
+
+## Quick Start
+
+Requires a Docker-compatible runtime (Docker Engine, OrbStack, or similar).
+
+```sh
 # Start a dev container
 cella up
 
@@ -114,6 +136,14 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] BROWSER interception (OAuth callbacks)
 - [x] OrbStack-aware port handling
 
+### Network Proxy
+
+- [x] Path-level HTTPS blocking (denylist and allowlist modes) — [guide](docs/network-proxy.md)
+- [x] Auto-generated CA certificates for HTTPS interception
+- [x] Host proxy environment forwarding (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+- [x] Glob-based domain and path matching rules
+- [x] Configuration via `cella.toml` and `devcontainer.json` customizations
+
 ### Editor & Terminal Integration
 
 - [x] `cella code` — open VS Code connected to the container
@@ -133,8 +163,11 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
-- [ ] Templates & global config
 - [ ] Project initialization (`cella init`)
+- [ ] Templates (`cella template`)
+- [ ] Global config management (`cella config show/global/dotfiles/agent`)
+- [ ] Podman backend
+- [ ] Colima / Lima support
 
 ## Commands
 
@@ -169,6 +202,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 | `cella config` | View and manage cella configuration |
 | `cella read-configuration` | Output resolved devcontainer config as JSON |
 | `cella doctor` | Check system dependencies and configuration |
+| `cella network` | Inspect network proxy and blocking configuration |
 | `cella init` | Initialize cella in the current repository |
 
 ### Port & Credential Management
@@ -214,13 +248,14 @@ graph TD
         backend[cella-backend<br><i>backend trait</i>]
         port[cella-port<br><i>IPC protocol</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
-        credproxy[cella-credential-proxy<br><i>credential proxy</i>]
+        network[cella-network<br><i>network proxy</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
+    agent & config & env & orchestrator --> network
 ```
 
 See [docs/architecture.md](docs/architecture.md) for details.

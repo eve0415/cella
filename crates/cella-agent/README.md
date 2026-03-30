@@ -45,9 +45,9 @@ cella-agent credential <operation>           # Handle git credential request (ge
 
 ## Crate Dependencies
 
-**Depends on:** [cella-port](../cella-port) (for protocol message types and port detection)
+**Depends on:** [cella-network](../cella-network), [cella-port](../cella-port)
 
-**Depended on by:** [cella-cli](../cella-cli) (the agent binary is uploaded into containers)
+**Depended on by:** none (standalone binary uploaded into containers)
 
 ## Testing
 

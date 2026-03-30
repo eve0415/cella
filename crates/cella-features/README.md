@@ -71,7 +71,7 @@ Implements the `features` property from the [Dev Container specification](https:
 
 **Depends on:** none (uses oci-distribution, reqwest, bollard, flate2, tar directly)
 
-**Depended on by:** [cella-docker](../cella-docker), [cella-cli](../cella-cli)
+**Depended on by:** [cella-cli](../cella-cli), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

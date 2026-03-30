@@ -37,7 +37,7 @@ Date: 2026-03-28
 | `templates generate-docs` | Generate docs | Not implemented | MISSING |
 
 ### Cella-Specific Commands (beyond spec, keep as-is)
-`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `ports`, `credential`, `init`, `config`, `down`, `daemon`
+`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config`, `down`, `daemon`
 
 ---
 

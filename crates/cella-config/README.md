@@ -48,9 +48,9 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 ## Crate Dependencies
 
-**Depends on:** [cella-codegen](../cella-codegen) (build-time only)
+**Depends on:** [cella-codegen](../cella-codegen) (build-time), [cella-network](../cella-network)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-env](../cella-env), [cella-doctor](../cella-doctor)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 
 ## Testing
 
