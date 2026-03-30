@@ -69,9 +69,12 @@ pub struct EnvForwarding {
 pub struct PostStartInjection {
     /// Files to upload into the container (SSH config, credential helper).
     pub file_uploads: Vec<FileUpload>,
-    /// Git config commands to execute inside the container.
+    /// Git config commands to execute inside the container as `remote_user`.
     /// Each entry is a full command (e.g., `["git", "config", "--global", "user.name", "John"]`).
     pub git_config_commands: Vec<Vec<String>>,
+    /// Commands that require root privileges (e.g., CA trust store updates).
+    /// Executed as root after file uploads.
+    pub root_commands: Vec<Vec<String>>,
 }
 
 /// Apply SSH agent forwarding to the environment.
@@ -152,6 +155,8 @@ pub struct ProxyForwardingConfig {
     pub has_blocking_rules: bool,
     /// Full network config (needed to build agent proxy config JSON).
     pub full_config: Option<cella_network::config::NetworkConfig>,
+    /// Detected container distro (for CA trust store paths).
+    pub container_distro: ca_bundle::ContainerDistro,
 }
 
 /// Prepare environment forwarding for a container.
@@ -180,22 +185,29 @@ pub fn prepare_env_forwarding(
         proxy::apply_proxy_env(&mut fwd, &net_config.proxy, net_config.has_blocking_rules);
 
         // If blocking rules are active, pass the proxy config to cella-agent
-        // via env var so it can start the forward proxy.
+        // via a file with restrictive permissions (contains CA private key).
         if net_config.has_blocking_rules
             && let Some(ref net_full) = net_config.full_config
         {
             let json = proxy::build_agent_proxy_config_json(net_full);
+            let config_path = "/tmp/.cella/proxy-config.json";
+            fwd.post_start.file_uploads.push(FileUpload {
+                container_path: config_path.to_string(),
+                content: json.into_bytes(),
+                mode: 0o600,
+            });
             fwd.env.push(ForwardEnv {
                 key: "CELLA_PROXY_CONFIG".to_string(),
-                value: json,
+                value: config_path.to_string(),
             });
         }
 
         // Inject host CA bundle into the container so TLS works behind
         // corporate proxies.
+        let distro = &net_config.container_distro;
         let additional_ca = net_config.proxy.ca_cert.as_deref();
         if let Some(ca_injection) = ca_bundle::prepare_ca_injection(additional_ca) {
-            ca_injection.apply_to(&mut fwd.post_start);
+            ca_injection.apply_to(&mut fwd.post_start, distro);
         }
 
         // If MITM CA was generated (for path-level blocking), also inject it
@@ -203,14 +215,29 @@ pub fn prepare_env_forwarding(
         if let Some(ref net_full) = net_config.full_config {
             let has_path_rules = net_full.rules.iter().any(|r| !r.paths.is_empty());
             if has_path_rules && let Ok(ca) = cella_network::ca::ensure_ca() {
+                let mitm_path = distro.ca_cert_path("cella-mitm-ca.crt");
                 let mitm_upload = FileUpload {
-                    container_path: "/usr/local/share/ca-certificates/cella-mitm-ca.crt"
-                        .to_string(),
-                    content: ca.cert_pem.into_bytes(),
+                    container_path: mitm_path,
+                    content: ca.cert_pem.clone().into_bytes(),
                     mode: 0o644,
                 };
                 fwd.post_start.file_uploads.push(mitm_upload);
-                // update-ca-certificates will be called by the host CA injection above
+
+                // For unknown distro, also upload to RHEL path.
+                if *distro == ca_bundle::ContainerDistro::Unknown {
+                    fwd.post_start.file_uploads.push(FileUpload {
+                        container_path: "/etc/pki/ca-trust/source/anchors/cella-mitm-ca.crt"
+                            .to_string(),
+                        content: ca.cert_pem.into_bytes(),
+                        mode: 0o644,
+                    });
+                }
+
+                // Always refresh trust store after MITM CA upload,
+                // even when host CA injection was None.
+                fwd.post_start
+                    .root_commands
+                    .push(distro.trust_store_update_command());
             }
         }
     }
