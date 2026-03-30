@@ -2,6 +2,7 @@ mod claude_code;
 mod codex;
 mod credentials;
 mod gemini;
+pub mod network;
 mod nvim;
 mod tmux;
 
@@ -14,6 +15,7 @@ pub use claude_code::ClaudeCode;
 pub use codex::Codex;
 pub use credentials::Credentials;
 pub use gemini::Gemini;
+pub use network::Network;
 pub use nvim::Nvim;
 pub use tmux::Tmux;
 
@@ -56,6 +58,10 @@ pub struct Settings {
     /// Tool installation and forwarding settings.
     #[serde(default)]
     pub tools: Tools,
+
+    /// Network proxy and blocking settings.
+    #[serde(default)]
+    pub network: Network,
 }
 
 impl Settings {
@@ -109,6 +115,7 @@ impl Settings {
                 let Self {
                     credentials: pc,
                     tools: pt,
+                    network: pn,
                 } = p;
                 let Tools {
                     claude_code: pt_claude,
@@ -126,6 +133,7 @@ impl Settings {
                         nvim: pt_nvim,
                         tmux: pt_tmux,
                     },
+                    network: pn,
                 }
             }
         }

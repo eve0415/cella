@@ -254,6 +254,27 @@ async fn resolve_and_build_features(
 }
 
 /// Parse build configuration from the `build` object in devcontainer.json.
+/// Inject host proxy env vars into build args so Dockerfile RUN steps
+/// work behind corporate proxies.
+///
+/// Docker automatically recognizes `HTTP_PROXY`, `HTTPS_PROXY`, and
+/// `NO_PROXY` as predefined build args without requiring `ARG` declarations.
+pub fn inject_proxy_build_args(
+    opts: &mut BuildOptions,
+    proxy: &cella_network::config::ProxyConfig,
+) {
+    let Some(proxy_vars) = cella_network::proxy_env::ProxyEnvVars::detect(proxy) else {
+        return;
+    };
+    if !proxy_vars.has_proxy() {
+        return;
+    }
+    for (key, value) in proxy_vars.to_build_args() {
+        opts.args.entry(key).or_insert(value);
+    }
+    tracing::debug!("Injected proxy build args into Docker build");
+}
+
 pub fn parse_build_options(
     build: &serde_json::Map<String, serde_json::Value>,
     img_name: &str,

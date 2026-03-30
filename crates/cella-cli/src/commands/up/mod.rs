@@ -64,6 +64,10 @@ pub struct UpArgs {
     /// Target a worktree branch's container by branch name.
     #[arg(long)]
     pub(crate) branch: Option<String>,
+
+    /// Start container without network blocking rules (proxy forwarding still active).
+    #[arg(long)]
+    pub(crate) no_network_rules: bool,
 }
 
 /// Output format for container commands.
@@ -77,6 +81,15 @@ impl UpArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Text)
     }
+}
+
+/// Whether network blocking rules are enforced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NetworkRulePolicy {
+    /// Enforce blocking rules from config.
+    Enforce,
+    /// Skip blocking rules (`--no-network-rules`).
+    Skip,
 }
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
@@ -94,6 +107,8 @@ pub struct UpContext {
     pub(crate) skip_checksum: bool,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
+    /// Network rule enforcement policy.
+    network_rules: NetworkRulePolicy,
 }
 
 /// Resolved image configuration for container creation.
@@ -156,6 +171,11 @@ impl UpContext {
             build_no_cache: args.build_no_cache,
             skip_checksum: args.skip_checksum,
             extra_labels: std::collections::HashMap::new(),
+            network_rules: if args.no_network_rules {
+                NetworkRulePolicy::Skip
+            } else {
+                NetworkRulePolicy::Enforce
+            },
         })
     }
 
@@ -216,6 +236,7 @@ impl UpContext {
             build_no_cache: false,
             skip_checksum: false,
             extra_labels,
+            network_rules: NetworkRulePolicy::Enforce,
         })
     }
 
@@ -327,7 +348,7 @@ impl UpContext {
         let config = self.config();
 
         // Re-inject env forwarding (git config + SSH files may have changed)
-        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
         self.progress
             .run_step(
                 "Configuring environment...",
@@ -1056,7 +1077,43 @@ impl UpContext {
             resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
 
         super::ensure_cella_daemon().await;
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+
+        // Build network proxy forwarding config from settings + devcontainer.json.
+        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
+        let toml_net = settings.network.to_network_config();
+        let toml_mode_override = settings.network.mode_override();
+
+        // Extract customizations.cella.network from devcontainer.json.
+        let dc_net = config
+            .get("customizations")
+            .and_then(|c| c.get("cella"))
+            .and_then(|c| c.get("network"))
+            .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
+
+        // Merge: devcontainer.json is base, cella.toml overrides (only when explicit).
+        let merged = cella_network::merge_network_configs(
+            dc_net.as_ref(),
+            Some(&toml_net),
+            toml_mode_override,
+        );
+        let net_config = cella_network::NetworkConfig {
+            mode: merged.mode,
+            proxy: merged.proxy,
+            rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
+        };
+
+        let skip_rules = self.network_rules == NetworkRulePolicy::Skip;
+        let has_rules = net_config.has_rules() && !skip_rules;
+        if skip_rules && net_config.has_rules() {
+            tracing::info!("Network blocking rules disabled via --no-network-rules");
+        }
+        let proxy_fwd = cella_env::ProxyForwardingConfig {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: has_rules,
+            full_config: if has_rules { Some(net_config) } else { None },
+            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+        };
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
 
         let labels = self.build_labels(
             resolved_features,
@@ -1346,6 +1403,11 @@ impl UpArgs {
         ctx.remove_container = self.rebuild || self.remove_existing_container;
         ctx.build_no_cache = self.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
+        ctx.network_rules = if self.no_network_rules {
+            NetworkRulePolicy::Skip
+        } else {
+            NetworkRulePolicy::Enforce
+        };
 
         let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
         output_result(
@@ -1589,6 +1651,34 @@ pub async fn inject_post_start(
         remote_user,
     )
     .await;
+
+    // Execute privileged commands (e.g., CA trust store updates) as root.
+    for cmd in &post_start.root_commands {
+        let result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: cmd.clone(),
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(r) if r.exit_code != 0 => {
+                warn!(
+                    "Root command failed (exit {}): {}",
+                    r.exit_code,
+                    r.stderr.trim()
+                );
+            }
+            Err(e) => {
+                warn!("Failed to exec root command: {e}");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Add `/cella/bin` to PATH in the container's shell profile.

@@ -19,6 +19,7 @@ cella-docker.workspace = true
 cella-orchestrator.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
+cella-network.workspace = true
 cella-git.workspace = true
 cella-port.workspace = true
 chrono.workspace = true
