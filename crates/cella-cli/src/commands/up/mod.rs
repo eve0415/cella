@@ -1539,10 +1539,7 @@ pub fn output_result(
                 "remoteUser": remote_user,
                 "remoteWorkspaceFolder": workspace_folder,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string(&output).unwrap_or_default());
         }
     }
 }

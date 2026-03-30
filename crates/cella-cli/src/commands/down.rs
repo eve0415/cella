@@ -129,10 +129,7 @@ impl DownArgs {
                             "reason": "shutdownAction is none",
                             "containerId": container.id,
                         });
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&output).unwrap_or_default()
-                        );
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
                     }
                 }
                 return Ok(());
@@ -225,10 +222,7 @@ fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
                 "outcome": outcome,
                 "containerId": container_id,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string(&output).unwrap_or_default());
         }
     }
 }
