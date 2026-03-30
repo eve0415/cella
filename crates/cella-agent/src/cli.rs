@@ -4,9 +4,31 @@
 //! it enters CLI mode instead of daemon mode. CLI commands delegate to the host
 //! daemon via the existing TCP control connection.
 
+use std::time::Duration;
+
 use cella_port::protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
+use tokio::time::timeout;
 
 use crate::control::ControlClient;
+
+/// Timeout for fast operations (list, task list, task stop).
+const TIMEOUT_FAST: Duration = Duration::from_secs(30);
+/// Timeout for medium operations (down, exec, prune, task logs/wait).
+const TIMEOUT_MEDIUM: Duration = Duration::from_secs(120);
+/// Timeout for slow operations (branch, up, task run).
+const TIMEOUT_SLOW: Duration = Duration::from_secs(600);
+
+/// Receive a message with a timeout that resets on each message in the loop.
+async fn recv_timeout(
+    client: &mut ControlClient,
+    dur: Duration,
+) -> Result<DaemonMessage, Box<dyn std::error::Error>> {
+    Ok(timeout(dur, client.recv())
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            "timed out waiting for response from daemon".into()
+        })??)
+}
 
 /// In-container CLI commands.
 pub enum CliCommand {
@@ -41,6 +63,7 @@ pub enum CliCommand {
     TaskList,
     TaskLogs {
         branch: String,
+        follow: bool,
     },
     TaskWait {
         branch: String,
@@ -73,8 +96,16 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "--base" {
-                    base = args.get(i + 1).cloned();
-                    i += 2;
+                    match args.get(i + 1) {
+                        Some(val) if !val.starts_with('-') => {
+                            base = Some(val.clone());
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!("Error: --base requires a value (e.g., --base main)");
+                            return CliCommand::Help;
+                        }
+                    }
                 } else {
                     i += 1;
                 }
@@ -158,8 +189,16 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
             let mut i = 4;
             while i < end {
                 if args[i] == "--base" {
-                    base = args.get(i + 1).cloned();
-                    i += 2;
+                    match args.get(i + 1) {
+                        Some(val) if !val.starts_with('-') => {
+                            base = Some(val.clone());
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!("Error: --base requires a value (e.g., --base main)");
+                            return CliCommand::Help;
+                        }
+                    }
                 } else {
                     i += 1;
                 }
@@ -172,23 +211,25 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
         }
         Some("list" | "ls") => CliCommand::TaskList,
         Some("logs") => {
-            let branch = match args.get(3) {
-                Some(b) => b.clone(),
-                None => return CliCommand::Help,
-            };
-            CliCommand::TaskLogs { branch }
+            // Parse: cella task logs [-f|--follow] <branch>
+            let follow = args[3..].iter().any(|a| a == "-f" || a == "--follow");
+            let branch = args[3..].iter().find(|a| !a.starts_with('-')).cloned();
+            branch.map_or(CliCommand::Help, |b| CliCommand::TaskLogs {
+                branch: b,
+                follow,
+            })
         }
         Some("wait") => {
             let branch = match args.get(3) {
-                Some(b) => b.clone(),
-                None => return CliCommand::Help,
+                Some(b) if !b.starts_with('-') => b.clone(),
+                _ => return CliCommand::Help,
             };
             CliCommand::TaskWait { branch }
         }
         Some("stop") => {
             let branch = match args.get(3) {
-                Some(b) => b.clone(),
-                None => return CliCommand::Help,
+                Some(b) if !b.starts_with('-') => b.clone(),
+                _ => return CliCommand::Help,
             };
             CliCommand::TaskStop { branch }
         }
@@ -224,7 +265,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> 
             base,
         } => run_task_run(&branch, &command, base.as_deref()).await,
         CliCommand::TaskList => run_task_list().await,
-        CliCommand::TaskLogs { branch } => run_task_logs(&branch).await,
+        CliCommand::TaskLogs { branch, follow } => run_task_logs(&branch, follow).await,
         CliCommand::TaskWait { branch } => run_task_wait(&branch).await,
         CliCommand::TaskStop { branch } => run_task_stop(&branch).await,
         CliCommand::Switch { branch } => run_switch(&branch).await,
@@ -248,7 +289,7 @@ Commands:
   prune [--all] [--dry-run]      Remove worktrees and their containers
   task run <branch> -- <cmd...>  Run a background task in a branch's container
   task list                      List active background tasks
-  task logs <branch>             Show output from a background task
+  task logs [-f] <branch>        Show output from a background task (-f to follow)
   task wait <branch>             Wait for a background task to complete
   task stop <branch>             Stop a running background task
 
@@ -312,7 +353,7 @@ async fn run_branch(name: &str, base: Option<&str>) -> Result<(), Box<dyn std::e
 
     // Read responses until we get the final BranchResult.
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_SLOW).await?;
         match resp {
             DaemonMessage::OperationProgress { step, message, .. } => {
                 eprintln!("\u{25cf} {step}: {message}");
@@ -350,7 +391,7 @@ async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::ListResult { worktrees, .. } = resp {
             if worktrees.is_empty() {
                 eprintln!("No worktree branches found.");
@@ -375,7 +416,7 @@ async fn run_exec(branch: &str, command: &[String]) -> Result<(), Box<dyn std::e
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
                 OutputStream::Stdout => print!("{data}"),
@@ -407,7 +448,7 @@ async fn check_self_target(
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(client, TIMEOUT_FAST).await?;
         if let DaemonMessage::ListResult { worktrees, .. } = resp {
             for wt in &worktrees {
                 if wt.branch.as_deref() == Some(branch)
@@ -442,7 +483,7 @@ async fn run_down(
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::OperationProgress { step, message, .. } => {
                 eprintln!("\u{25cf} {step}: {message}");
@@ -451,22 +492,26 @@ async fn run_down(
                 OutputStream::Stdout => print!("{data}"),
                 OutputStream::Stderr => eprint!("{data}"),
             },
-            DaemonMessage::DownResult {
-                outcome,
-                container_name,
-                ..
-            } => {
-                if outcome == "error" {
-                    return Err(format!("Failed to stop branch '{branch}'").into());
+            DaemonMessage::DownResult { result, .. } => match result {
+                cella_port::protocol::DownOperationResult::Success {
+                    outcome,
+                    container_name,
+                } => {
+                    let action = match outcome {
+                        cella_port::protocol::DownOutcome::Removed => "Removed",
+                        cella_port::protocol::DownOutcome::Stopped => "Stopped",
+                    };
+                    if container_name.is_empty() {
+                        eprintln!("{action} branch '{branch}'");
+                    } else {
+                        eprintln!("{action} branch '{branch}' (container: {container_name})");
+                    }
+                    return Ok(());
                 }
-                let action = if rm { "Removed" } else { "Stopped" };
-                if container_name.is_empty() {
-                    eprintln!("{action} branch '{branch}'");
-                } else {
-                    eprintln!("{action} branch '{branch}' (container: {container_name})");
+                cella_port::protocol::DownOperationResult::Error { message } => {
+                    return Err(format!("Failed to stop branch '{branch}': {message}").into());
                 }
-                return Ok(());
-            }
+            },
             _ => {}
         }
     }
@@ -484,7 +529,7 @@ async fn run_up(branch: &str, rebuild: bool) -> Result<(), Box<dyn std::error::E
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_SLOW).await?;
         match resp {
             DaemonMessage::OperationProgress { step, message, .. } => {
                 eprintln!("\u{25cf} {step}: {message}");
@@ -522,7 +567,7 @@ async fn run_prune(dry_run: bool, all: bool) -> Result<(), Box<dyn std::error::E
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
                 OutputStream::Stdout => print!("{data}"),
@@ -536,7 +581,7 @@ async fn run_prune(dry_run: bool, all: bool) -> Result<(), Box<dyn std::error::E
                     for e in &errors {
                         eprintln!("Error: {e}");
                     }
-                    std::process::exit(1);
+                    return Err("prune completed with errors".into());
                 }
                 return Ok(());
             }
@@ -562,7 +607,7 @@ async fn run_task_run(
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_SLOW).await?;
         match resp {
             DaemonMessage::OperationProgress { message, .. } => {
                 eprintln!("{message}");
@@ -571,17 +616,18 @@ async fn run_task_run(
                 OutputStream::Stdout => print!("{data}"),
                 OutputStream::Stderr => eprint!("{data}"),
             },
-            DaemonMessage::TaskRunResult {
-                task_id,
-                container_name,
-                ..
-            } => {
-                if task_id.is_empty() {
-                    return Err("Failed to start task".into());
+            DaemonMessage::TaskRunResult { result, .. } => match result {
+                cella_port::protocol::TaskRunOperationResult::Success {
+                    task_id,
+                    container_name,
+                } => {
+                    eprintln!("Task '{task_id}' started in container {container_name}");
+                    return Ok(());
                 }
-                eprintln!("Task '{task_id}' started in container {container_name}");
-                return Ok(());
-            }
+                cella_port::protocol::TaskRunOperationResult::Error { message } => {
+                    return Err(format!("Failed to start task: {message}").into());
+                }
+            },
             _ => {}
         }
     }
@@ -597,7 +643,7 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::TaskListResult { tasks, .. } = resp {
             if tasks.is_empty() {
                 eprintln!("No active tasks.");
@@ -605,7 +651,11 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
                 const HEADER: &str = "BRANCH               STATUS     TIME     COMMAND";
                 println!("{HEADER}");
                 for t in &tasks {
-                    let status = format!("{:?}", t.status).to_lowercase();
+                    let status = match t.status {
+                        cella_port::protocol::TaskStatus::Running => "running",
+                        cella_port::protocol::TaskStatus::Done => "done",
+                        cella_port::protocol::TaskStatus::Failed => "failed",
+                    };
                     let time = format!("{}s", t.elapsed_secs);
                     let cmd = t.command.join(" ");
                     println!("{:<20} {:<10} {:<8} {cmd}", t.branch, status, time);
@@ -616,18 +666,19 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_task_logs(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_task_logs(branch: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
     let msg = AgentMessage::TaskLogsRequest {
         request_id: id.clone(),
         branch: branch.to_string(),
+        follow,
     };
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         if let DaemonMessage::TaskLogsData { data, done, .. } = resp {
             if !data.is_empty() {
                 print!("{data}");
@@ -635,8 +686,6 @@ async fn run_task_logs(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
             if done {
                 return Ok(());
             }
-            // For non-done tasks, return after first chunk (no live tailing yet).
-            return Ok(());
         }
     }
 }
@@ -652,7 +701,7 @@ async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         if let DaemonMessage::TaskWaitResult { exit_code, .. } = resp {
             if exit_code != 0 {
                 eprintln!("Task '{branch}' exited with code {exit_code}");
@@ -675,7 +724,7 @@ async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
     client.send(&msg).await?;
 
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         match resp {
             DaemonMessage::OperationOutput { data, .. } => eprint!("{data}"),
             DaemonMessage::TaskStopResult { .. } => {
@@ -699,7 +748,7 @@ async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for StreamReady or error.
     let stream_port = loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::StreamReady { port, .. } => break port,
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
@@ -753,9 +802,14 @@ async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
         restore_terminal(&termios);
     }
 
-    // Wait for SwitchResult on the JSON channel.
+    // Wait for SwitchResult on the JSON channel (short timeout — daemon sends it immediately).
     loop {
-        let resp = client.recv().await?;
+        let resp = recv_timeout(&mut client, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|_| {
+                eprintln!("Warning: did not receive exit code from daemon");
+                std::process::exit(1);
+            });
         if let DaemonMessage::SwitchResult { exit_code, .. } = resp {
             if exit_code != 0 {
                 std::process::exit(exit_code);
