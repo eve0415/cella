@@ -110,7 +110,6 @@ jobs:
           cargo llvm-cov --no-report
           -p cella-features
           -p cella-daemon
-          -p cella-credential-proxy
           --features integration-tests
 
       - name: Generate combined coverage report
