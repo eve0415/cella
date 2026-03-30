@@ -13,8 +13,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Network {
     /// Blocking mode: "denylist" or "allowlist".
+    /// `None` when the user didn't set `[network].mode` in their TOML config,
+    /// so it doesn't override devcontainer.json's mode during merge.
     #[serde(default)]
-    pub mode: NetworkMode,
+    pub mode: Option<NetworkMode>,
 
     /// Proxy configuration.
     #[serde(default)]
@@ -106,13 +108,22 @@ const fn default_proxy_port() -> u16 {
 }
 
 impl Network {
+    /// The mode explicitly set by the user, if any.
+    pub fn mode_override(&self) -> Option<cella_network::NetworkMode> {
+        self.mode.map(|m| match m {
+            NetworkMode::Denylist => cella_network::NetworkMode::Denylist,
+            NetworkMode::Allowlist => cella_network::NetworkMode::Allowlist,
+        })
+    }
+
     /// Convert to `cella_network::NetworkConfig` for use by the rule engine.
+    ///
+    /// When `mode` is `None` (not explicitly set), defaults to `Denylist`.
     pub fn to_network_config(&self) -> cella_network::NetworkConfig {
         cella_network::NetworkConfig {
-            mode: match self.mode {
-                NetworkMode::Denylist => cella_network::NetworkMode::Denylist,
-                NetworkMode::Allowlist => cella_network::NetworkMode::Allowlist,
-            },
+            mode: self
+                .mode_override()
+                .unwrap_or(cella_network::NetworkMode::Denylist),
             proxy: cella_network::ProxyConfig {
                 enabled: self.proxy.enabled,
                 http: self.proxy.http.clone(),
@@ -144,7 +155,7 @@ mod tests {
     #[test]
     fn default_network_settings() {
         let network = Network::default();
-        assert_eq!(network.mode, NetworkMode::Denylist);
+        assert!(network.mode.is_none());
         assert!(network.proxy.enabled);
         assert_eq!(network.proxy.proxy_port, 18080);
         assert!(network.rules.is_empty());
@@ -169,7 +180,7 @@ paths = ["/admin/**"]
 action = "block"
 "#;
         let network: Network = toml::from_str(toml_str).unwrap();
-        assert_eq!(network.mode, NetworkMode::Denylist);
+        assert_eq!(network.mode, Some(NetworkMode::Denylist));
         assert_eq!(network.proxy.http.as_deref(), Some("http://proxy:3128"));
         assert_eq!(network.proxy.proxy_port, 19090);
         assert_eq!(network.rules.len(), 2);
@@ -180,7 +191,7 @@ action = "block"
     #[test]
     fn convert_to_network_config() {
         let network = Network {
-            mode: NetworkMode::Allowlist,
+            mode: Some(NetworkMode::Allowlist),
             proxy: ProxySettings {
                 enabled: true,
                 http: Some("http://proxy:3128".to_string()),

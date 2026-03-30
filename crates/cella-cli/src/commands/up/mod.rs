@@ -1081,6 +1081,7 @@ impl UpContext {
         // Build network proxy forwarding config from settings + devcontainer.json.
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         let toml_net = settings.network.to_network_config();
+        let toml_mode_override = settings.network.mode_override();
 
         // Extract customizations.cella.network from devcontainer.json.
         let dc_net = config
@@ -1089,8 +1090,12 @@ impl UpContext {
             .and_then(|c| c.get("network"))
             .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
 
-        // Merge: devcontainer.json is base, cella.toml overrides.
-        let merged = cella_network::merge_network_configs(dc_net.as_ref(), Some(&toml_net));
+        // Merge: devcontainer.json is base, cella.toml overrides (only when explicit).
+        let merged = cella_network::merge_network_configs(
+            dc_net.as_ref(),
+            Some(&toml_net),
+            toml_mode_override,
+        );
         let net_config = cella_network::NetworkConfig {
             mode: merged.mode,
             proxy: merged.proxy,
@@ -1106,6 +1111,7 @@ impl UpContext {
             proxy: net_config.proxy.clone(),
             has_blocking_rules: has_rules,
             full_config: if has_rules { Some(net_config) } else { None },
+            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
         };
         let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
 
@@ -1645,6 +1651,34 @@ pub async fn inject_post_start(
         remote_user,
     )
     .await;
+
+    // Execute privileged commands (e.g., CA trust store updates) as root.
+    for cmd in &post_start.root_commands {
+        let result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: cmd.clone(),
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(r) if r.exit_code != 0 => {
+                warn!(
+                    "Root command failed (exit {}): {}",
+                    r.exit_code,
+                    r.stderr.trim()
+                );
+            }
+            Err(e) => {
+                warn!("Failed to exec root command: {e}");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Add `/cella/bin` to PATH in the container's shell profile.

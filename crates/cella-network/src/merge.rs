@@ -21,13 +21,14 @@ pub struct LabeledRule {
 
 /// Merge network configs from `devcontainer.json` (base) and `cella.toml` (override).
 ///
-/// - Mode: `cella.toml` wins if set, otherwise `devcontainer.json`
+/// - Mode: `cella_toml_mode` wins if `Some`, otherwise `devcontainer.json`'s mode
 /// - Proxy: `cella.toml` wins entirely if its proxy section has any explicit values
 /// - Rules: union of both sources; if the same exact domain string appears in both,
 ///   the `cella.toml` rule takes precedence
 pub fn merge_network_configs(
     devcontainer: Option<&NetworkConfig>,
     cella_toml: Option<&NetworkConfig>,
+    cella_toml_mode: Option<NetworkMode>,
 ) -> MergedNetworkConfig {
     match (devcontainer, cella_toml) {
         (None, None) => MergedNetworkConfig::default(),
@@ -56,8 +57,8 @@ pub fn merge_network_configs(
                 .collect(),
         },
         (Some(dc), Some(ct)) => {
-            // Mode: cella.toml wins
-            let mode = ct.mode;
+            // Mode: cella.toml wins only if explicitly set
+            let mode = cella_toml_mode.unwrap_or(dc.mode);
 
             // Proxy: cella.toml wins if it has any explicit values
             let proxy = if ct.proxy.http.is_some()
@@ -134,7 +135,7 @@ mod tests {
 
     #[test]
     fn merge_none_returns_default() {
-        let merged = merge_network_configs(None, None);
+        let merged = merge_network_configs(None, None, None);
         assert_eq!(merged.mode, NetworkMode::Denylist);
         assert!(!merged.has_rules());
     }
@@ -150,14 +151,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let merged = merge_network_configs(Some(&dc), None);
+        let merged = merge_network_configs(Some(&dc), None, None);
         assert_eq!(merged.mode, NetworkMode::Allowlist);
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].source, SOURCE_DEVCONTAINER);
     }
 
     #[test]
-    fn merge_toml_wins_mode() {
+    fn merge_toml_wins_mode_when_explicit() {
         let dc = NetworkConfig {
             mode: NetworkMode::Allowlist,
             ..Default::default()
@@ -166,8 +167,21 @@ mod tests {
             mode: NetworkMode::Denylist,
             ..Default::default()
         };
-        let merged = merge_network_configs(Some(&dc), Some(&ct));
+        // Explicit toml mode overrides devcontainer.
+        let merged = merge_network_configs(Some(&dc), Some(&ct), Some(NetworkMode::Denylist));
         assert_eq!(merged.mode, NetworkMode::Denylist);
+    }
+
+    #[test]
+    fn merge_devcontainer_mode_preserved_when_toml_unset() {
+        let dc = NetworkConfig {
+            mode: NetworkMode::Allowlist,
+            ..Default::default()
+        };
+        let ct = NetworkConfig::default();
+        // No explicit toml mode — devcontainer.json's mode is preserved.
+        let merged = merge_network_configs(Some(&dc), Some(&ct), None);
+        assert_eq!(merged.mode, NetworkMode::Allowlist);
     }
 
     #[test]
@@ -196,7 +210,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let merged = merge_network_configs(Some(&dc), Some(&ct));
+        let merged = merge_network_configs(Some(&dc), Some(&ct), None);
 
         // *.prod.internal from devcontainer + api.example.com from toml
         assert_eq!(merged.rules.len(), 2);
@@ -233,7 +247,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let merged = merge_network_configs(Some(&dc), Some(&ct));
+        let merged = merge_network_configs(Some(&dc), Some(&ct), None);
         assert_eq!(merged.proxy.http.as_deref(), Some("http://toml-proxy:3128"));
     }
 
@@ -247,7 +261,7 @@ mod tests {
             ..Default::default()
         };
         let ct = NetworkConfig::default();
-        let merged = merge_network_configs(Some(&dc), Some(&ct));
+        let merged = merge_network_configs(Some(&dc), Some(&ct), None);
         assert_eq!(merged.proxy.http.as_deref(), Some("http://dc-proxy:3128"));
     }
 }
