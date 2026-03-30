@@ -16,6 +16,8 @@ struct CompiledRule {
     path_patterns: Vec<Vec<PatternPart>>,
     action: RuleAction,
     source: String,
+    /// Human-readable display of the original rule (e.g., "*.example.com /admin/** (block)").
+    pattern_display: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,9 +94,9 @@ impl RuleMatcher {
                     reason: format!(
                         "{} by rule: {}",
                         if allowed { "allowed" } else { "blocked" },
-                        rule.source,
+                        rule.pattern_display,
                     ),
-                    matched_rule: Some(rule.source.clone()),
+                    matched_rule: Some(rule.pattern_display.clone()),
                     source: Some(rule.source.clone()),
                 };
             }
@@ -132,11 +134,23 @@ impl RuleMatcher {
 fn compile_rule(rule: &NetworkRule, source: &str) -> CompiledRule {
     let domain_parts = parse_domain_pattern(&rule.domain);
     let path_patterns = rule.paths.iter().map(|p| parse_path_pattern(p)).collect();
+
+    let action_str = match rule.action {
+        RuleAction::Block => "block",
+        RuleAction::Allow => "allow",
+    };
+    let pattern_display = if rule.paths.is_empty() {
+        format!("{} ({})", rule.domain, action_str)
+    } else {
+        format!("{} {} ({})", rule.domain, rule.paths.join(", "), action_str)
+    };
+
     CompiledRule {
         domain_parts,
         path_patterns,
         action: rule.action,
         source: source.to_string(),
+        pattern_display,
     }
 }
 
@@ -202,11 +216,21 @@ fn match_segments(pattern: &[PatternPart], segments: &[&str]) -> bool {
 
 /// Segment matching with `**` support (for paths).
 fn match_segments_with_doublestar(pattern: &[PatternPart], segments: &[&str]) -> bool {
-    // Use a recursive approach with memoization-friendly structure.
-    match_recursive(pattern, segments, 0, 0)
+    let mut visited = std::collections::HashSet::new();
+    match_recursive(pattern, segments, 0, 0, &mut visited)
 }
 
-fn match_recursive(pattern: &[PatternPart], segments: &[&str], pi: usize, si: usize) -> bool {
+fn match_recursive(
+    pattern: &[PatternPart],
+    segments: &[&str],
+    pi: usize,
+    si: usize,
+    visited: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if !visited.insert((pi, si)) {
+        return false;
+    }
+
     // Both exhausted: match.
     if pi == pattern.len() && si == segments.len() {
         return true;
@@ -220,25 +244,23 @@ fn match_recursive(pattern: &[PatternPart], segments: &[&str], pi: usize, si: us
     match &pattern[pi] {
         PatternPart::DoubleStar => {
             // `**` matches zero or more segments.
-            // Try matching zero segments, then one, then two, etc.
             for skip in 0..=(segments.len() - si) {
-                if match_recursive(pattern, segments, pi + 1, si + skip) {
+                if match_recursive(pattern, segments, pi + 1, si + skip, visited) {
                     return true;
                 }
             }
             false
         }
         PatternPart::Star => {
-            // `*` matches exactly one segment.
             if si < segments.len() {
-                match_recursive(pattern, segments, pi + 1, si + 1)
+                match_recursive(pattern, segments, pi + 1, si + 1, visited)
             } else {
                 false
             }
         }
         PatternPart::Literal(lit) => {
             if si < segments.len() && lit == segments[si] {
-                match_recursive(pattern, segments, pi + 1, si + 1)
+                match_recursive(pattern, segments, pi + 1, si + 1, visited)
             } else {
                 false
             }
@@ -458,6 +480,42 @@ mod tests {
         // /secret matches second rule (block)
         let v = matcher.evaluate("api.example.com", "/secret");
         assert!(!v.allowed);
+    }
+
+    #[test]
+    fn rule_verdict_shows_pattern_not_source() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules: vec![NetworkRule {
+                domain: "*.prod.internal".to_string(),
+                paths: vec!["/admin/**".to_string()],
+                action: RuleAction::Block,
+            }],
+            ..Default::default()
+        };
+        let matcher = RuleMatcher::with_source(&config, "cella.toml");
+
+        let v = matcher.evaluate("api.prod.internal", "/admin/users");
+        assert!(!v.allowed);
+        assert_eq!(
+            v.matched_rule.as_deref(),
+            Some("*.prod.internal /admin/** (block)")
+        );
+        assert_eq!(v.source.as_deref(), Some("cella.toml"));
+        assert!(v.reason.contains("*.prod.internal"));
+    }
+
+    #[test]
+    fn memoization_handles_pathological_pattern() {
+        // Multiple ** patterns that could cause exponential blowup without memoization.
+        let parts = parse_path_pattern("/**/a/**/b/**/c");
+        // Should complete quickly (not hang) regardless of match result.
+        assert!(match_path(&parts, "/x/y/a/z/b/w/c"));
+        assert!(!match_path(&parts, "/x/y/a/z/b/w/d"));
+
+        // Long path with multiple ** — tests memoization prevents exponential time.
+        let parts = parse_path_pattern("/**/x/**/y/**/z");
+        assert!(match_path(&parts, "/a/b/c/x/d/e/f/y/g/h/i/j/k/l/m/z"));
     }
 
     #[test]
