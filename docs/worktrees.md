@@ -9,6 +9,8 @@ Every git worktree gets its own dev container. Create a branch, get an isolated 
 | Command | Description |
 |---------|-------------|
 | `$ cella branch <name> [--base <ref>]` | Create a worktree-backed branch with its own container |
+| `$ cella list` | List all containers with status and ports |
+| `$ cella switch <name>` | Open a shell in a worktree branch's container |
 | `$ cella down --branch <name> [--rm]` | Stop (or remove) a worktree container |
 | `$ cella up --branch <name>` | Start or restart a worktree container |
 | `$ cella prune [--all] [--dry-run]` | Remove stale worktrees and their containers |
@@ -61,9 +63,6 @@ cella-myapp-a3b4c5d6    f21e...      running  fix/login-timeout       /Users/you
 Run a command in the new branch's container:
 
 ```sh
-# From the host
-$ cella exec --branch fix/login-timeout -- cargo test
-
 # From inside another container
 container$ cella exec fix/login-timeout -- cargo test
 ```
@@ -272,7 +271,7 @@ container$ cella task logs feat/auth
 container$ cella task logs feat/ui
 ```
 
-The host equivalent for fire-and-forget execution is `cella branch --exec <cmd>`, which creates the branch and runs a command in one step.
+On the host, `cella branch --exec <cmd>` creates a branch and runs a command in the new container in one step (synchronous — it blocks until the command finishes).
 
 ## How It Works
 

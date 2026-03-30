@@ -9,7 +9,7 @@ devcontainers.
 ### Startup
 
 1. CLI (`cella up`) spawns the daemon if not already running.
-2. Daemon writes PID and auth token to `~/.cella/daemon.pid`.
+2. Daemon writes PID to `~/.cella/daemon.pid` and control port + auth token to `~/.cella/daemon.control`.
 3. Binds the management socket at `~/.cella/daemon.sock`.
 4. Binds the TCP control server on an ephemeral port (reported in status).
 5. Starts the proxy coordinator task.
@@ -76,8 +76,8 @@ The daemon detects OrbStack at startup. When running on OrbStack:
 
 - TCP proxies still run (for `localhost` access)
 - `ForwardedPortInfo::orb_url()` provides `container.orb.local:PORT` as an
-  alternative access method
-- Status output shows both URLs
+  alternative access method (available on the `ForwardedPortInfo` type but
+  not currently exposed through `QueryPorts`)
 
 ## Container Registration Flow
 

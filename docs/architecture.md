@@ -16,6 +16,7 @@ graph TD
         env[cella-env<br><i>env forwarding</i>]
         daemon[cella-daemon<br><i>host daemon</i>]
         doctor[cella-doctor<br><i>health checks</i>]
+        orchestrator[cella-orchestrator<br><i>worktree orchestration</i>]
         agent[cella-agent<br><i>in-container agent</i>]
         config[cella-config<br><i>devcontainer parsing</i>]
         features[cella-features<br><i>OCI feature resolution</i>]
@@ -28,17 +29,17 @@ graph TD
         credproxy[cella-credential-proxy<br><i>credential proxy</i>]
     end
 
-    cli --> docker & container & compose & git & env & daemon & doctor
+    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
 ```
 
-**Tier 1 — CLI:** cella-cli is the only binary entry point. It contains no business logic.
+**Tier 1 — CLI:** cella-cli is the host binary entry point. cella-agent is the in-container binary (also serves as the `cella` CLI inside containers). Neither contains business logic.
 
-**Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, and the in-container agent.
+**Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, worktree orchestration, in-container agent, configuration parsing, and feature resolution.
 
-**Tier 3 — Foundation:** Shared infrastructure crates. Configuration parsing, feature resolution, port protocol, code generation, and the legacy credential proxy.
+**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, and the legacy credential proxy.
 
 ## Crate Responsibilities
 
@@ -124,4 +125,4 @@ Each git worktree is bound to its own dev container instance. When you create a 
 4. Starts the container with the worktree mounted
 5. Allocates non-conflicting ports
 
-This binding is tracked so that `cella switch` can stop/start the correct containers, and `cella prune` can clean up both the worktree and its container.
+This binding is tracked so that `cella switch` can open a shell in the correct container, and `cella prune` can clean up both the worktree and its container.

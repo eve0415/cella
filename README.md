@@ -26,7 +26,7 @@ A terminal-native devcontainer CLI. Built for agents.
 
 ## Quick Start
 
-Requires a [Rust toolchain](https://rustup.rs/) and a Docker API-compatible runtime (Docker Engine, OrbStack, Podman, Colima, etc.).
+Requires a [Rust toolchain](https://rustup.rs/) and a Docker-compatible runtime (Docker Engine, OrbStack, or similar).
 
 ```sh
 # Build from source (no published binaries yet)
@@ -188,7 +188,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 
 ## Architecture
 
-cella is a Rust workspace with 15 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 16 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```mermaid
 graph TD
@@ -204,6 +204,7 @@ graph TD
         env[cella-env<br><i>env forwarding</i>]
         daemon[cella-daemon<br><i>host daemon</i>]
         doctor[cella-doctor<br><i>health checks</i>]
+        orchestrator[cella-orchestrator<br><i>worktree orchestration</i>]
         agent[cella-agent<br><i>in-container agent</i>]
         config[cella-config<br><i>devcontainer parsing</i>]
         features[cella-features<br><i>OCI feature resolution</i>]
@@ -216,7 +217,7 @@ graph TD
         credproxy[cella-credential-proxy<br><i>credential proxy</i>]
     end
 
-    cli --> docker & container & compose & git & env & daemon & doctor
+    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
