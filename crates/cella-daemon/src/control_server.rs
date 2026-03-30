@@ -842,6 +842,28 @@ fn parse_branch_json_output(stdout: &str) -> Option<cella_port::protocol::Worktr
     None
 }
 
+/// Parse JSON output from `cella prune --output json`.
+///
+/// Expected format: `{"pruned":["branch1","branch2"],"errors":["msg"]}`
+fn parse_prune_json_output(stdout: &str) -> (Vec<String>, Vec<String>) {
+    fn extract_strings(v: &serde_json::Value, key: &str) -> Vec<String> {
+        v.get(key)
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let trimmed = stdout.trim();
+    serde_json::from_str::<serde_json::Value>(trimmed).map_or_else(
+        |_| (vec![], vec![]),
+        |v| (extract_strings(&v, "pruned"), extract_strings(&v, "errors")),
+    )
+}
+
 /// Handle a `ListRequest` using direct git + container queries.
 async fn handle_list_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
@@ -1091,7 +1113,10 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), CellaDaemonError> {
 
     let mut cmd = tokio::process::Command::new(cella_bin);
-    cmd.arg("prune").arg("--force"); // Skip interactive prompt
+    cmd.arg("prune")
+        .arg("--force")
+        .arg("--output")
+        .arg("json");
     if dry_run {
         cmd.arg("--dry-run");
     }
@@ -1117,19 +1142,20 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    let (status, _stdout, stderr) = stream_child_output(&mut child, request_id, writer).await?;
+    let (status, last_stdout, stderr) =
+        stream_child_output(&mut child, request_id, writer).await?;
 
-    let errors = if status.success() {
-        vec![]
-    } else {
-        vec![stderr.trim().to_string()]
-    };
+    // Parse JSON result from stdout.
+    let (pruned, mut errors) = parse_prune_json_output(&last_stdout);
+    if !status.success() && errors.is_empty() {
+        errors.push(stderr.trim().to_string());
+    }
 
     send_message(
         writer,
         &DaemonMessage::PruneResult {
             request_id: request_id.to_string(),
-            pruned: vec![], // TODO: parse pruned branches from output
+            pruned,
             errors,
         },
     )
