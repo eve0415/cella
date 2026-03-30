@@ -145,7 +145,7 @@ async fn prepare_and_start(
 
     // 8. Resolve remote user from config
     let remote_user = resolve_remote_user(config, None, "root");
-    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
 
     // 9. Build extra environment variables
     let mut extra_env = daemon_env;
@@ -233,7 +233,7 @@ async fn finalize_compose(
     ctx.register_with_daemon(&primary.id).await;
 
     // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe)
-    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+    let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
     let settings = cella_config::Settings::load(&ctx.resolved.workspace_root);
     let (_probed_env, lifecycle_env) = ctx
         .post_create_setup(

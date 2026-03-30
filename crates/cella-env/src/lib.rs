@@ -142,6 +142,15 @@ fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
     ]);
 }
 
+/// Network configuration for proxy forwarding.
+pub struct ProxyForwardingConfig {
+    /// Proxy configuration from cella settings.
+    pub proxy: cella_network::config::ProxyConfig,
+    /// Whether blocking rules are active (determines if proxy env vars
+    /// point to cella-agent proxy or directly to upstream).
+    pub has_blocking_rules: bool,
+}
+
 /// Prepare environment forwarding for a container.
 ///
 /// Detects the Docker runtime, probes host SSH agent and git config,
@@ -149,7 +158,11 @@ fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
 ///
 /// Never fails — individual features log warnings and are skipped
 /// on error, per the design principle of never failing `cella up`.
-pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> EnvForwarding {
+pub fn prepare_env_forwarding(
+    config: &serde_json::Value,
+    remote_user: &str,
+    network: Option<&ProxyForwardingConfig>,
+) -> EnvForwarding {
     let runtime = platform::detect_runtime();
     tracing::debug!("Detected Docker runtime: {runtime:?}");
 
@@ -159,6 +172,10 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
     apply_ssh_config_files(&mut fwd, remote_user);
     apply_git_config(&mut fwd);
     apply_credential_forwarding(&mut fwd);
+
+    if let Some(net_config) = network {
+        proxy::apply_proxy_env(&mut fwd, &net_config.proxy, net_config.has_blocking_rules);
+    }
 
     fwd
 }

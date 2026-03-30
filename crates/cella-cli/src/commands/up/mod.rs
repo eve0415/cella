@@ -327,7 +327,7 @@ impl UpContext {
         let config = self.config();
 
         // Re-inject env forwarding (git config + SSH files may have changed)
-        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user);
+        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
         self.progress
             .run_step(
                 "Configuring environment...",
@@ -1056,7 +1056,7 @@ impl UpContext {
             resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
 
         super::ensure_cella_daemon().await;
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user);
+        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
 
         let labels = self.build_labels(
             resolved_features,
