@@ -203,7 +203,22 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         info!("Network rules disabled via CELLA_NO_NETWORK_RULES");
         None
     } else {
-        proxy_config_json.or_else(|| std::env::var("CELLA_PROXY_CONFIG").ok())
+        proxy_config_json.or_else(|| {
+            let val = std::env::var("CELLA_PROXY_CONFIG").ok()?;
+            if val.starts_with('/') {
+                // File path — read the config from disk (contains sensitive CA key).
+                match std::fs::read_to_string(&val) {
+                    Ok(content) => Some(content),
+                    Err(e) => {
+                        tracing::warn!("Failed to read proxy config from {val}: {e}");
+                        None
+                    }
+                }
+            } else {
+                // Raw JSON (legacy / direct injection).
+                Some(val)
+            }
+        })
     };
     if let Some(ref json) = proxy_json {
         match proxy_config::AgentProxyConfig::from_json(json) {
