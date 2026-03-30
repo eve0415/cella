@@ -20,26 +20,21 @@ This blocks the key workflow: an AI agent receiving a large task, decomposing it
 
 ## Architecture
 
-```
-Container A (main branch)                     Host
-┌─────────────────────────┐    ┌──────────────────────────────────┐
-│ User/AI agent            │    │ cella-daemon                     │
-│   $ cella branch feat-x  │    │                                  │
-│       │                  │    │   ┌─────────────────────┐        │
-│   cella-agent            │    │   │ worktree handler     │        │
-│       │ BranchRequest    │────│──>│   orchestrator::     │        │
-│       │                  │    │   │     branch_create()  │        │
-│       │ BranchProgress   │<───│───│   streams progress   │        │
-│       │ BranchResult     │<───│───│   returns result     │        │
-│       │                  │    │   └─────────────────────┘        │
-└─────────────────────────┘    │           │                       │
-                                │     ┌─────┴─────┐                │
-Container B (feat-x)           │     │ Docker API │                │
-┌─────────────────────────┐    │     └───────────┘                │
-│ Created by daemon        │    │           │                       │
-│ Worktree mounted from    │────│───────────┘                       │
-│   host filesystem        │    └──────────────────────────────────┘
-└─────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant U as User / AI Agent
+    participant A as Container A (agent)
+    participant D as Host (daemon)
+    participant API as Docker API
+    participant B as Container B (feat-x)
+
+    U->>A: cella branch feat-x
+    A->>D: BranchRequest (TCP)
+    D->>API: orchestrator::branch_create()
+    API-->>D: Container created
+    D-->>A: BranchProgress (streaming)
+    D-->>A: BranchResult
+    Note over B: Worktree mounted from host filesystem
 ```
 
 ## Components

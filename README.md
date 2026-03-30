@@ -82,7 +82,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] `cella doctor` — system diagnostics with PII redaction
 - [x] `read-configuration` — resolved devcontainer config output (devcontainer CLI compatible)
 - [x] Docker Compose support (`dockerComposeFile`)
-- [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`)
+- [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/worktrees.md)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
 - [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
@@ -155,8 +155,12 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | Command | Description |
 |---------|-------------|
 | `cella branch <name>` | Create a new worktree-backed branch with its own container |
+| `cella down --branch <name>` | Stop a worktree branch's container |
+| `cella up --branch <name>` | Start or restart a worktree branch's container |
 | `cella switch <name>` | Switch to a different worktree-backed branch |
 | `cella prune` | Remove stale worktrees and their associated containers |
+
+See the [worktree guide](docs/worktrees.md) for the full workflow, in-container commands, and background task system.
 
 ### Configuration & Diagnostics
 
@@ -186,30 +190,36 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 cella is a Rust workspace with 15 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                          cella-cli                           │
-│               (command parsing, user output)                 │
-├──────────┬──────────┬─────────┬─────────┬────────┬──────────┤
-│cella-    │cella-    │cella-git│cella-env│cella-  │cella-    │
-│docker    │compose   │(worktree│(env     │daemon  │doctor    │
-│(Docker   │(compose  │ mgmt)   │ fwding) │(host   │(health   │
-│ backend) │ orchestr)│         │         │ daemon)│ checks)  │
-├──────────┤          │         │         │        │          │
-│cella-    │          │         │         │        │          │
-│container │          │         │         │        │          │
-│(Apple    │          │         │         │        │          │
-│ backend) │          │         │         │        │          │
-├──────────┴──────┬───┴─────────┴─────────┴────────┴──────────┤
-│  cella-agent    │  cella-config    cella-features            │
-│  (in-container  │  (devcontainer   (OCI feature              │
-│   agent)        │   parsing)       resolution)               │
-├─────────────────┼────────────────────────────────────────────┤
-│  cella-backend  │  cella-codegen   cella-credential-proxy    │
-│  (backend trait)│  (schema codegen)(credential proxy)        │
-│  cella-port     │                                            │
-│  (IPC protocol) │                                            │
-└─────────────────┴────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph "Tier 1 — CLI"
+        cli[cella-cli<br><i>command parsing, user output</i>]
+    end
+
+    subgraph "Tier 2 — Domain"
+        docker[cella-docker<br><i>Docker backend</i>]
+        container[cella-container<br><i>Apple backend</i>]
+        compose[cella-compose<br><i>Compose orchestration</i>]
+        git[cella-git<br><i>worktree management</i>]
+        env[cella-env<br><i>env forwarding</i>]
+        daemon[cella-daemon<br><i>host daemon</i>]
+        doctor[cella-doctor<br><i>health checks</i>]
+        agent[cella-agent<br><i>in-container agent</i>]
+        config[cella-config<br><i>devcontainer parsing</i>]
+        features[cella-features<br><i>OCI feature resolution</i>]
+    end
+
+    subgraph "Tier 3 — Foundation"
+        backend[cella-backend<br><i>backend trait</i>]
+        port[cella-port<br><i>IPC protocol</i>]
+        codegen[cella-codegen<br><i>schema codegen</i>]
+        credproxy[cella-credential-proxy<br><i>credential proxy</i>]
+    end
+
+    cli --> docker & container & compose & git & env & daemon & doctor
+    docker & container --> backend
+    agent & daemon --> port
+    config --> codegen
 ```
 
 See [docs/architecture.md](docs/architecture.md) for details.

@@ -71,8 +71,9 @@ a shared token.
 
 For localhost-bound listeners, the agent runs a TCP proxy:
 
-```
-0.0.0.0:PORT  ──→  127.0.0.1:PORT
+```mermaid
+graph LR
+    A["0.0.0.0:PORT"] --> B["127.0.0.1:PORT"]
 ```
 
 This makes the service reachable from the container's external network
@@ -82,8 +83,9 @@ interface.
 
 For every allocated port, the daemon runs a TCP proxy:
 
-```
-127.0.0.1:HOST_PORT  ──→  CONTAINER_IP:CONTAINER_PORT
+```mermaid
+graph LR
+    A["127.0.0.1:HOST_PORT"] --> B["CONTAINER_IP:CONTAINER_PORT"]
 ```
 
 This makes the service reachable via `localhost:HOST_PORT` on the host,

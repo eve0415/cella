@@ -81,25 +81,31 @@ The daemon detects OrbStack at startup. When running on OrbStack:
 
 ## Container Registration Flow
 
-```
-cella up
-  ├── create container
-  ├── start container
-  ├── connect to cella network
-  ├── connect to per-repo network (cella-net-{hash})
-  ├── get container IP from network
-  └── RegisterContainer(id, name, ip, attrs, forwardPorts)
-        ├── port_manager.register_container()
-        ├── pre-allocate forwardPorts
-        └── store container handle for agent lookup
+```mermaid
+graph TD
+    up["cella up"] --> create["Create container"]
+    create --> start["Start container"]
+    start --> cnet["Connect to cella network"]
+    cnet --> rnet["Connect to per-repo network<br>(cella-net-{hash})"]
+    rnet --> ip["Get container IP from network"]
+    ip --> reg["RegisterContainer(id, name, ip, attrs, forwardPorts)"]
+
+    subgraph Registration
+        reg --> pm["port_manager.register_container()"]
+        reg --> alloc["Pre-allocate forwardPorts"]
+        reg --> store["Store container handle for agent lookup"]
+    end
 ```
 
 ## Container Deregistration Flow
 
-```
-cella down / cella prune
-  └── DeregisterContainer(name)
-        ├── release all allocated ports
-        ├── stop all proxies for this container
-        └── remove container handle
+```mermaid
+graph TD
+    down["cella down / cella prune"] --> dereg["DeregisterContainer(name)"]
+
+    subgraph Deregistration
+        dereg --> release["Release all allocated ports"]
+        dereg --> stop["Stop all proxies for this container"]
+        dereg --> remove["Remove container handle"]
+    end
 ```

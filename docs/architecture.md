@@ -2,23 +2,36 @@
 
 ## System Overview
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                          cella-cli                           │
-│               (command parsing, user output)                 │
-├──────────┬──────────┬─────────┬─────────┬────────┬──────────┤
-│cella-    │cella-    │cella-git│cella-env│cella-  │cella-    │
-│docker    │compose   │(worktree│(env     │daemon  │doctor    │
-│(container│(compose  │ mgmt)   │ fwding) │(host   │(health   │
-│ runtime) │ orchestr)│         │         │ daemon)│ checks)  │
-├──────────┴──────┬───┴─────────┴─────────┴────────┴──────────┤
-│  cella-agent    │  cella-config    cella-features            │
-│  (in-container  │  (devcontainer   (OCI feature              │
-│   agent)        │   parsing)       resolution)               │
-├─────────────────┼────────────────────────────────────────────┤
-│  cella-port     │  cella-codegen   cella-credential-proxy    │
-│  (IPC protocol) │  (schema codegen)(legacy credential proxy) │
-└─────────────────┴────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph "Tier 1 — CLI"
+        cli[cella-cli<br><i>command parsing, user output</i>]
+    end
+
+    subgraph "Tier 2 — Domain"
+        docker[cella-docker<br><i>Docker backend</i>]
+        container[cella-container<br><i>Apple backend</i>]
+        compose[cella-compose<br><i>Compose orchestration</i>]
+        git[cella-git<br><i>worktree management</i>]
+        env[cella-env<br><i>env forwarding</i>]
+        daemon[cella-daemon<br><i>host daemon</i>]
+        doctor[cella-doctor<br><i>health checks</i>]
+        agent[cella-agent<br><i>in-container agent</i>]
+        config[cella-config<br><i>devcontainer parsing</i>]
+        features[cella-features<br><i>OCI feature resolution</i>]
+    end
+
+    subgraph "Tier 3 — Foundation"
+        backend[cella-backend<br><i>backend trait</i>]
+        port[cella-port<br><i>IPC protocol</i>]
+        codegen[cella-codegen<br><i>schema codegen</i>]
+        credproxy[cella-credential-proxy<br><i>credential proxy</i>]
+    end
+
+    cli --> docker & container & compose & git & env & daemon & doctor
+    docker & container --> backend
+    agent & daemon --> port
+    config --> codegen
 ```
 
 **Tier 1 — CLI:** cella-cli is the only binary entry point. It contains no business logic.
