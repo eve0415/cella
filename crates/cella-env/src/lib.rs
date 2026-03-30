@@ -190,6 +190,29 @@ pub fn prepare_env_forwarding(
                 value: json,
             });
         }
+
+        // Inject host CA bundle into the container so TLS works behind
+        // corporate proxies.
+        let additional_ca = net_config.proxy.ca_cert.as_deref();
+        if let Some(ca_injection) = ca_bundle::prepare_ca_injection(additional_ca) {
+            ca_injection.apply_to(&mut fwd.post_start);
+        }
+
+        // If MITM CA was generated (for path-level blocking), also inject it
+        // so the container trusts cella's intercepted certificates.
+        if let Some(ref net_full) = net_config.full_config {
+            let has_path_rules = net_full.rules.iter().any(|r| !r.paths.is_empty());
+            if has_path_rules && let Ok(ca) = cella_network::ca::ensure_ca() {
+                let mitm_upload = FileUpload {
+                    container_path: "/usr/local/share/ca-certificates/cella-mitm-ca.crt"
+                        .to_string(),
+                    content: ca.cert_pem.into_bytes(),
+                    mode: 0o644,
+                };
+                fwd.post_start.file_uploads.push(mitm_upload);
+                // update-ca-certificates will be called by the host CA injection above
+            }
+        }
     }
 
     fwd
