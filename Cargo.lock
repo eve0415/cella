@@ -290,7 +290,6 @@ dependencies = [
  "cella-compose",
  "cella-config",
  "cella-container",
- "cella-credential-proxy",
  "cella-daemon",
  "cella-docker",
  "cella-doctor",
@@ -367,17 +366,6 @@ dependencies = [
  "cella-backend",
  "serde",
  "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cella-credential-proxy"
-version = "0.0.9"
-dependencies = [
- "cella-daemon",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

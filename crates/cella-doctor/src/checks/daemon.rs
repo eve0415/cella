@@ -8,7 +8,7 @@ use super::{CategoryReport, CheckResult, Severity};
 pub async fn check_daemon() -> CategoryReport {
     let mut checks = Vec::new();
 
-    let Some(data_dir) = cella_env::git_credential::cella_data_dir() else {
+    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         checks.push(CheckResult {
             name: "data directory".into(),
             severity: Severity::Warning,
@@ -19,8 +19,7 @@ pub async fn check_daemon() -> CategoryReport {
     };
 
     let pid_path = data_dir.join("daemon.pid");
-    let socket_path = data_dir.join("credential-proxy.sock");
-    let mgmt_socket = data_dir.join("daemon.sock");
+    let socket_path = data_dir.join("daemon.sock");
 
     // Daemon running
     let running = cella_daemon::daemon::is_daemon_running(&pid_path, &socket_path);
@@ -43,7 +42,7 @@ pub async fn check_daemon() -> CategoryReport {
 
     // Daemon version match
     match cella_daemon::management::send_management_request(
-        &mgmt_socket,
+        &socket_path,
         &ManagementRequest::QueryStatus,
     )
     .await

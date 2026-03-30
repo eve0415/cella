@@ -13,7 +13,6 @@ cella-backend.workspace = true
 cella-compose.workspace = true
 cella-config.workspace = true
 cella-container.workspace = true
-cella-credential-proxy.workspace = true
 cella-daemon.workspace = true
 cella-doctor.workspace = true
 cella-docker.workspace = true

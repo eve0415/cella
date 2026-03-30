@@ -1,8 +1,7 @@
 //! Git credential handling: protocol parsing and host invocation.
 //!
-//! Migrated from `cella-credential-proxy`. Handles both the legacy
-//! wire protocol (direct socket connections) and the new JSON protocol
-//! (via control socket from cella-agent).
+//! Handles credential requests from the in-container agent via the
+//! control socket JSON protocol.
 
 use std::collections::HashMap;
 use std::process::Stdio;

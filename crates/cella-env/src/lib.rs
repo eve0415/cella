@@ -1,6 +1,6 @@
 //! Environment forwarding orchestration for cella dev containers.
 //!
-//! Detects host SSH agent, git config, and credential proxy state,
+//! Detects host SSH agent, git config, and credential state,
 //! then produces mounts, env vars, and post-start injection commands
 //! for the container.
 
@@ -10,8 +10,8 @@ mod error;
 pub mod gemini;
 pub mod gh_credential;
 pub mod git_config;
-pub mod git_credential;
 pub mod nvim;
+pub mod paths;
 pub mod platform;
 pub mod ssh_agent;
 pub mod ssh_config;
@@ -70,8 +70,6 @@ pub struct PostStartInjection {
     /// Git config commands to execute inside the container.
     /// Each entry is a full command (e.g., `["git", "config", "--global", "user.name", "John"]`).
     pub git_config_commands: Vec<Vec<String>>,
-    /// Credential helper script to install (if credential proxy is running).
-    pub credential_helper: Option<FileUpload>,
 }
 
 /// Apply SSH agent forwarding to the environment.
@@ -129,67 +127,24 @@ fn apply_git_config(fwd: &mut EnvForwarding) {
     }
 }
 
-/// Apply credential proxy forwarding to the environment.
-fn apply_credential_forwarding(
-    fwd: &mut EnvForwarding,
-    runtime: &DockerRuntime,
-    remote_user: &str,
-) {
-    if needs_tcp_credential_proxy(runtime) {
-        apply_tcp_credential_forwarding(fwd, remote_user);
-    } else {
-        apply_socket_credential_forwarding(fwd, remote_user);
-    }
-}
-
-/// Apply TCP-based credential forwarding (VM-based runtimes).
-fn apply_tcp_credential_forwarding(fwd: &mut EnvForwarding, remote_user: &str) {
-    if let Some(tcp) = git_credential::credential_forwarding_tcp() {
-        tracing::info!(
-            "Credential proxy forwarding via TCP (host.docker.internal:{})",
-            tcp.port
-        );
-        fwd.env.push(ForwardEnv {
-            key: "CELLA_CREDENTIAL_HOST".to_string(),
-            value: format!("host.docker.internal:{}", tcp.port),
-        });
-        fwd.post_start.credential_helper =
-            Some(git_credential::credential_helper_script(remote_user));
-        fwd.post_start
-            .git_config_commands
-            .push(credential_helper_git_config());
-    }
-}
-
-/// Apply socket-based credential forwarding (direct runtimes).
-fn apply_socket_credential_forwarding(fwd: &mut EnvForwarding, remote_user: &str) {
-    if let Some(cred) = git_credential::credential_forwarding() {
-        tracing::info!(
-            "Credential proxy forwarding: {} -> {}",
-            cred.mount_source,
-            cred.mount_target
-        );
-        fwd.mounts.push(ForwardMount {
-            source: cred.mount_source,
-            target: cred.mount_target,
-        });
-        fwd.env.push(ForwardEnv {
-            key: "CELLA_CREDENTIAL_SOCKET".to_string(),
-            value: cred.env_value,
-        });
-        fwd.post_start.credential_helper =
-            Some(git_credential::credential_helper_script(remote_user));
-        fwd.post_start
-            .git_config_commands
-            .push(credential_helper_git_config());
-    }
+/// Apply credential forwarding via the agent-based credential helper.
+///
+/// Always installs the git credential helper pointing to `/cella/bin/cella-credential`.
+/// The in-container agent handles transport to the host daemon automatically.
+fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
+    fwd.post_start.git_config_commands.push(vec![
+        "git".to_string(),
+        "config".to_string(),
+        "--global".to_string(),
+        "credential.helper".to_string(),
+        "/cella/bin/cella-credential".to_string(),
+    ]);
 }
 
 /// Prepare environment forwarding for a container.
 ///
 /// Detects the Docker runtime, probes host SSH agent and git config,
-/// checks for the credential proxy daemon, and assembles the forwarding
-/// configuration.
+/// and assembles the forwarding configuration.
 ///
 /// Never fails — individual features log warnings and are skipped
 /// on error, per the design principle of never failing `cella up`.
@@ -202,35 +157,7 @@ pub fn prepare_env_forwarding(config: &serde_json::Value, remote_user: &str) -> 
     apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
     apply_ssh_config_files(&mut fwd, remote_user);
     apply_git_config(&mut fwd);
-    apply_credential_forwarding(&mut fwd, &runtime, remote_user);
+    apply_credential_forwarding(&mut fwd);
 
     fwd
-}
-
-/// Whether a runtime needs TCP-based credential proxy instead of socket bind-mount.
-///
-/// VM-based runtimes (where the host socket is not directly reachable from inside
-/// containers) use TCP via `host.docker.internal`. Direct runtimes use socket
-/// bind-mount.
-const fn needs_tcp_credential_proxy(runtime: &DockerRuntime) -> bool {
-    match runtime {
-        DockerRuntime::OrbStack
-        | DockerRuntime::Colima
-        | DockerRuntime::RancherDesktop
-        | DockerRuntime::Unknown => true,
-        // Podman Machine on macOS runs a VM; rootless Podman on Linux is direct.
-        DockerRuntime::Podman => cfg!(target_os = "macos"),
-        DockerRuntime::DockerDesktop | DockerRuntime::LinuxNative => false,
-    }
-}
-
-/// Git config command to set the credential helper.
-fn credential_helper_git_config() -> Vec<String> {
-    vec![
-        "git".to_string(),
-        "config".to_string(),
-        "--global".to_string(),
-        "credential.helper".to_string(),
-        "/usr/local/bin/cella-git-credential-helper".to_string(),
-    ]
 }

@@ -12,7 +12,7 @@ pub struct PortsArgs {
 impl PortsArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info
-        if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
+        if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
         {
             match cella_daemon::management::send_management_request(

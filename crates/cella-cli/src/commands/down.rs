@@ -6,13 +6,10 @@ use tracing::{debug, info};
 
 use super::up::OutputFormat;
 use cella_compose::discovery;
-use cella_credential_proxy::daemon::stop_daemon;
+use cella_daemon::daemon;
 use cella_daemon::shared::running_cella_container_count;
 use cella_docker::{ContainerInfo, ContainerState, ContainerTarget};
-use cella_env::git_credential::{
-    credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
-    daemon_management_socket_path,
-};
+use cella_env::paths::{cella_data_dir, daemon_socket_path};
 
 /// Stop the dev container for the current workspace.
 #[derive(Args)]
@@ -152,7 +149,7 @@ impl DownArgs {
                 })?;
 
             // Clean up override file
-            if let Some(data_dir) = cella_env::git_credential::cella_data_dir() {
+            if let Some(data_dir) = cella_data_dir() {
                 let override_path = data_dir
                     .join("compose")
                     .join(project_name)
@@ -161,7 +158,7 @@ impl DownArgs {
             }
 
             print_outcome(&self.output, "stopped", &container.id);
-            cleanup_credential_proxy();
+            cleanup_daemon();
             return Ok(());
         }
 
@@ -185,7 +182,7 @@ impl DownArgs {
         };
 
         print_outcome(&self.output, outcome, &container.id);
-        cleanup_credential_proxy();
+        cleanup_daemon();
 
         Ok(())
     }
@@ -193,7 +190,7 @@ impl DownArgs {
 
 /// Deregister a container from the daemon (before stop so proxy teardown is clean).
 async fn deregister_container(container: &ContainerInfo) {
-    let Some(mgmt_sock) = daemon_management_socket_path() else {
+    let Some(mgmt_sock) = daemon_socket_path() else {
         return;
     };
     if !mgmt_sock.exists() {
@@ -227,16 +224,12 @@ fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
     }
 }
 
-/// Stop the credential proxy if no cella containers remain.
-fn cleanup_credential_proxy() {
+/// Stop the daemon if no cella containers remain.
+fn cleanup_daemon() {
     if running_cella_container_count() == 0
-        && let (Some(pid_path), Some(socket_path), Some(port_path)) = (
-            credential_proxy_pid_path(),
-            credential_proxy_socket_path(),
-            credential_proxy_port_path(),
-        )
-        && stop_daemon(&pid_path, &socket_path, &port_path).is_ok()
+        && let Some(data_dir) = cella_data_dir()
+        && daemon::stop_daemon(&data_dir.join("daemon.pid"), &data_dir.join("daemon.sock")).is_ok()
     {
-        debug!("Credential proxy daemon stopped (no containers remain)");
+        debug!("Cella daemon stopped (no containers remain)");
     }
 }

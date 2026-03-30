@@ -50,26 +50,21 @@ fn write_control_file(
 
 /// Run the unified cella daemon.
 ///
-/// Starts the control server, legacy credential servers, and health monitor.
+/// Starts the control server and health monitor.
 ///
 /// # Errors
 ///
 /// Returns error if socket binding or PID file creation fails.
-pub async fn run_daemon(
-    socket_path: &Path,
-    pid_path: &Path,
-    port_path: &Path,
-    control_socket_path: &Path,
-) -> Result<(), CellaDaemonError> {
+pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), CellaDaemonError> {
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
     // Load persisted auth token (or generate + persist a new one).
     // Persisting the token across daemon restarts ensures existing containers
     // (which have the token baked into CELLA_DAEMON_TOKEN) can still connect.
-    let auth_token = load_or_create_auth_token(control_socket_path)?;
+    let auth_token = load_or_create_auth_token(socket_path)?;
 
     // Bind TCP listener for agent control connections
-    let control_listener = bind_control_tcp(control_socket_path).await?;
+    let control_listener = bind_control_tcp(socket_path).await?;
     let control_port = control_listener
         .local_addr()
         .map_err(|e| CellaDaemonError::Socket {
@@ -78,7 +73,7 @@ pub async fn run_daemon(
         .port();
 
     // Persist port+token to daemon.control for reclaiming on restart
-    let control_file_path = write_control_file(control_socket_path, control_port, &auth_token)?;
+    let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
 
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();
@@ -93,23 +88,6 @@ pub async fn run_daemon(
     let health_socket = socket_path.to_path_buf();
     tokio::spawn(async move {
         run_health_monitor(health_activity, &health_pid, &health_socket).await;
-    });
-
-    // Spawn legacy credential proxy servers (TCP + Unix socket)
-    let legacy_activity = last_activity.clone();
-    let legacy_socket = socket_path.to_path_buf();
-    tokio::spawn(async move {
-        if let Err(e) = run_legacy_credential_server(&legacy_socket, legacy_activity).await {
-            warn!("Legacy credential server error: {e}");
-        }
-    });
-
-    let tcp_activity = last_activity.clone();
-    let port_path_owned = port_path.to_path_buf();
-    tokio::spawn(async move {
-        if let Err(e) = run_legacy_tcp_server(&port_path_owned, tcp_activity).await {
-            warn!("Legacy TCP server error: {e}");
-        }
     });
 
     // Spawn proxy coordinator
@@ -140,18 +118,15 @@ pub async fn run_daemon(
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown
-    let result =
-        run_management_server(control_socket_path, ctx, shutdown_rx, control_listener).await;
+    let result = run_management_server(socket_path, ctx, shutdown_rx, control_listener).await;
 
     // Clean up on exit with a 5s timeout
     let cleanup_fut = tokio::task::spawn_blocking({
         let pid = pid_path.to_path_buf();
         let sock = socket_path.to_path_buf();
-        let port = port_path.to_path_buf();
-        let ctrl = control_socket_path.to_path_buf();
         let ctrl_file = control_file_path;
         move || {
-            cleanup_files(&[&pid, &sock, &port, &ctrl]);
+            cleanup_files(&[&pid, &sock]);
             let _ = std::fs::remove_file(&ctrl_file);
         }
     });
@@ -242,171 +217,6 @@ async fn bind_control_tcp(
         })
 }
 
-/// Legacy credential proxy Unix socket server (backward compatibility).
-async fn run_legacy_credential_server(
-    socket_path: &Path,
-    last_activity: Arc<AtomicU64>,
-) -> Result<(), CellaDaemonError> {
-    use std::sync::atomic::Ordering;
-    use tokio::net::UnixListener;
-
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path).map_err(|e| CellaDaemonError::Socket {
-        message: format!("failed to bind {}: {e}", socket_path.display()),
-    })?;
-
-    set_socket_permissions(socket_path);
-
-    info!(
-        "Legacy credential server listening on {}",
-        socket_path.display()
-    );
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                last_activity.store(current_time_secs(), Ordering::Relaxed);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_legacy_stream(stream).await {
-                        warn!("Legacy connection error: {e}");
-                    }
-                });
-            }
-            Err(e) => warn!("Legacy accept error: {e}"),
-        }
-    }
-}
-
-/// Handle a legacy credential proxy connection.
-async fn handle_legacy_stream(
-    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-) -> Result<(), CellaDaemonError> {
-    use crate::credential::{
-        CredentialResponse, format_credential_fields, invoke_git_credential, parse_request,
-    };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut buf = vec![0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("read error: {e}"),
-        })?;
-
-    if n == 0 {
-        return Ok(());
-    }
-
-    let data = String::from_utf8_lossy(&buf[..n]);
-    let request = parse_request(&data)?;
-
-    if request.operation == "ping" {
-        stream
-            .write_all(b"pong\n")
-            .await
-            .map_err(|e| CellaDaemonError::Socket {
-                message: format!("write error: {e}"),
-            })?;
-        return Ok(());
-    }
-
-    let operation = request.operation.clone();
-    let fields = request.fields.clone();
-
-    let result = tokio::task::spawn_blocking(move || invoke_git_credential(&operation, &fields))
-        .await
-        .map_err(|e| CellaDaemonError::GitCredential {
-            message: format!("task join error: {e}"),
-        })?;
-
-    match result {
-        Ok(response_fields) => {
-            let response = CredentialResponse {
-                fields: response_fields,
-            };
-            let output = format_credential_fields(&response.fields);
-            stream
-                .write_all(output.as_bytes())
-                .await
-                .map_err(|e| CellaDaemonError::Socket {
-                    message: format!("write error: {e}"),
-                })?;
-        }
-        Err(e) => {
-            warn!("git credential error: {e}");
-            stream
-                .write_all(b"\n")
-                .await
-                .map_err(|e| CellaDaemonError::Socket {
-                    message: format!("write error: {e}"),
-                })?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Bind a legacy TCP listener, attempting to reclaim a previously used port.
-async fn bind_legacy_tcp(port_path: &Path) -> Result<tokio::net::TcpListener, CellaDaemonError> {
-    let preferred_port = std::fs::read_to_string(port_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(0);
-
-    crate::shared::bind_tcp_reclaim(preferred_port)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("failed to bind TCP: {e}"),
-        })
-}
-
-/// Write the port number to a file so clients can discover it.
-fn write_legacy_port_file(port_path: &Path, port: u16) -> Result<(), CellaDaemonError> {
-    if let Some(parent) = port_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(port_path, port.to_string()).map_err(|e| CellaDaemonError::PidFile {
-        message: format!("failed to write port file: {e}"),
-    })
-}
-
-/// Legacy TCP credential server (for VM-based runtimes).
-async fn run_legacy_tcp_server(
-    port_path: &Path,
-    last_activity: Arc<AtomicU64>,
-) -> Result<(), CellaDaemonError> {
-    use std::sync::atomic::Ordering;
-
-    let listener = bind_legacy_tcp(port_path).await?;
-
-    let port = listener
-        .local_addr()
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("failed to get local addr: {e}"),
-        })?
-        .port();
-
-    write_legacy_port_file(port_path, port)?;
-
-    info!("Legacy TCP credential server on 127.0.0.1:{port}");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                last_activity.store(current_time_secs(), Ordering::Relaxed);
-                debug!("TCP connection from {peer}");
-                tokio::spawn(async move {
-                    if let Err(e) = handle_legacy_stream(stream).await {
-                        warn!("TCP handler error: {e}");
-                    }
-                });
-            }
-            Err(e) => warn!("TCP accept error: {e}"),
-        }
-    }
-}
-
 /// Check if the daemon is already running.
 pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
     crate::shared::is_daemon_running(pid_path, socket_path)
@@ -420,20 +230,14 @@ pub fn is_daemon_running(pid_path: &Path, socket_path: &Path) -> bool {
 pub fn start_daemon_background(
     socket_path: &Path,
     pid_path: &Path,
-    port_path: &Path,
-    control_socket_path: &Path,
 ) -> Result<(), CellaDaemonError> {
     let args = [
         "daemon",
         "start",
-        "--socket",
-        &socket_path.to_string_lossy(),
         "--pid-file",
         &pid_path.to_string_lossy(),
-        "--port-file",
-        &port_path.to_string_lossy(),
         "--control-socket",
-        &control_socket_path.to_string_lossy(),
+        &socket_path.to_string_lossy(),
     ];
     crate::shared::start_background_process(&args).map_err(|e| CellaDaemonError::PidFile {
         message: format!("failed to spawn daemon: {e}"),
@@ -451,15 +255,13 @@ pub fn start_daemon_background(
 pub fn ensure_daemon_running(
     socket_path: &Path,
     pid_path: &Path,
-    port_path: &Path,
-    control_socket_path: &Path,
 ) -> Result<PathBuf, CellaDaemonError> {
     if is_daemon_running(pid_path, socket_path) {
         debug!("Cella daemon already running");
         return Ok(socket_path.to_path_buf());
     }
 
-    start_daemon_background(socket_path, pid_path, port_path, control_socket_path)?;
+    start_daemon_background(socket_path, pid_path)?;
 
     // Brief wait for the daemon to create its socket
     for _ in 0..20 {
@@ -478,12 +280,7 @@ pub fn ensure_daemon_running(
 /// # Errors
 ///
 /// Returns `CellaDaemonError::NotRunning` if no daemon is running.
-pub fn stop_daemon(
-    pid_path: &Path,
-    socket_path: &Path,
-    port_path: &Path,
-    control_socket_path: &Path,
-) -> Result<(), CellaDaemonError> {
+pub fn stop_daemon(pid_path: &Path, socket_path: &Path) -> Result<(), CellaDaemonError> {
     let pid = read_pid_file(pid_path).ok_or(CellaDaemonError::NotRunning)?;
 
     #[cfg(unix)]
@@ -493,7 +290,8 @@ pub fn stop_daemon(
             .status();
     }
 
-    cleanup_files(&[pid_path, socket_path, port_path, control_socket_path]);
+    let control_file = socket_path.with_file_name("daemon.control");
+    cleanup_files(&[pid_path, socket_path, &control_file]);
     info!("Cella daemon stopped");
     Ok(())
 }

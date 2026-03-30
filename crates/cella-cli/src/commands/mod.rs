@@ -5,7 +5,6 @@ pub mod compose_features;
 mod compose_up;
 mod config;
 mod credential;
-mod credential_proxy;
 mod daemon;
 mod doctor;
 mod down;
@@ -84,9 +83,6 @@ pub enum Command {
     /// Read and output the resolved devcontainer configuration.
     #[command(name = "read-configuration")]
     ReadConfiguration(read_configuration::ReadConfigurationArgs),
-    /// Manage the credential proxy daemon (legacy).
-    #[command(name = "credential-proxy", hide = true)]
-    CredentialProxy(credential_proxy::CredentialProxyArgs),
     /// Manage the cella daemon.
     #[command(name = "daemon", hide = true)]
     Daemon(daemon::DaemonArgs),
@@ -154,7 +150,6 @@ impl Command {
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
             Self::Credential(args) => args.execute().await,
-            Self::CredentialProxy(args) => args.execute().await,
             Self::Ports(args) => args.execute().await,
             Self::Daemon(args) => args.execute().await,
         }
@@ -231,72 +226,38 @@ pub const TERMINAL_ENV_VARS: &[&str] = &[
     "LINES",
 ];
 
-/// Ensure the credential proxy daemon is running (legacy).
-///
-/// Starts it as a background process if not already running.
-/// Logs a warning and continues if it can't be started.
-pub fn ensure_credential_proxy() {
-    use cella_credential_proxy::daemon;
-    use cella_env::git_credential::{
-        credential_proxy_pid_path, credential_proxy_port_path, credential_proxy_socket_path,
-    };
-
-    let Some(socket_path) = credential_proxy_socket_path() else {
-        return;
-    };
-    let Some(pid_path) = credential_proxy_pid_path() else {
-        return;
-    };
-    let Some(port_path) = credential_proxy_port_path() else {
-        return;
-    };
-
-    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path) {
-        warn!("Failed to start credential proxy daemon: {e}");
-    }
-}
-
-/// Ensure the unified cella daemon is running and version-compatible.
+/// Ensure the cella daemon is running and version-compatible.
 ///
 /// Starts it as a background process if not already running.
 /// If running but stale (binary rebuilt in debug, or version mismatch in release),
 /// shuts it down gracefully and restarts.
 pub async fn ensure_cella_daemon() {
     use cella_daemon::daemon;
-    use cella_env::git_credential::cella_data_dir;
+    use cella_env::paths::cella_data_dir;
 
     let Some(data_dir) = cella_data_dir() else {
         warn!("Cannot determine cella data directory, skipping daemon start");
         return;
     };
 
-    let socket_path = data_dir.join("credential-proxy.sock");
     let pid_path = data_dir.join("daemon.pid");
-    let port_path = data_dir.join("credential-proxy.port");
-    let control_socket_path = data_dir.join("daemon.sock");
+    let socket_path = data_dir.join("daemon.sock");
 
     if daemon::is_daemon_running(&pid_path, &socket_path) {
-        check_and_restart_if_stale(&socket_path, &pid_path, &port_path, &control_socket_path).await;
+        check_and_restart_if_stale(&pid_path, &socket_path).await;
         return;
     }
 
-    if let Err(e) =
-        daemon::ensure_daemon_running(&socket_path, &pid_path, &port_path, &control_socket_path)
-    {
+    if let Err(e) = daemon::ensure_daemon_running(&socket_path, &pid_path) {
         warn!("Failed to start cella daemon: {e}");
     }
 }
 
 /// Check if the running daemon is stale and restart it if necessary.
-async fn check_and_restart_if_stale(
-    socket_path: &std::path::Path,
-    pid_path: &std::path::Path,
-    port_path: &std::path::Path,
-    control_socket_path: &std::path::Path,
-) {
-    if check_daemon_needs_restart(control_socket_path).await == Some(true) {
+async fn check_and_restart_if_stale(pid_path: &std::path::Path, socket_path: &std::path::Path) {
+    if check_daemon_needs_restart(socket_path).await == Some(true) {
         tracing::info!("Daemon version mismatch detected, restarting");
-        restart_daemon(socket_path, pid_path, port_path, control_socket_path).await;
+        restart_daemon(pid_path, socket_path).await;
     }
 }
 
@@ -355,42 +316,30 @@ fn is_binary_newer_than(daemon_started_at: u64) -> bool {
 }
 
 /// Shut down the old daemon and start a fresh one, then re-register containers.
-async fn restart_daemon(
-    socket_path: &std::path::Path,
-    pid_path: &std::path::Path,
-    port_path: &std::path::Path,
-    control_socket_path: &std::path::Path,
-) {
+async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Path) {
     use cella_daemon::daemon;
 
-    graceful_shutdown_daemon(socket_path, pid_path, port_path, control_socket_path).await;
+    graceful_shutdown_daemon(pid_path, socket_path).await;
 
-    if let Err(e) =
-        daemon::start_daemon_background(socket_path, pid_path, port_path, control_socket_path)
-    {
+    if let Err(e) = daemon::start_daemon_background(socket_path, pid_path) {
         warn!("Failed to restart daemon: {e}");
         return;
     }
 
-    wait_for_socket(control_socket_path).await;
+    wait_for_socket(socket_path).await;
 
-    if let Err(e) = re_register_containers(control_socket_path).await {
+    if let Err(e) = re_register_containers(socket_path).await {
         warn!("Failed to re-register containers after restart: {e}");
     }
 }
 
 /// Send shutdown request and wait for the old daemon to exit.
-async fn graceful_shutdown_daemon(
-    socket_path: &std::path::Path,
-    pid_path: &std::path::Path,
-    port_path: &std::path::Path,
-    control_socket_path: &std::path::Path,
-) {
+async fn graceful_shutdown_daemon(pid_path: &std::path::Path, socket_path: &std::path::Path) {
     use cella_port::protocol::ManagementRequest;
 
-    if control_socket_path.exists() {
+    if socket_path.exists() {
         let _ = cella_daemon::management::send_management_request(
-            control_socket_path,
+            socket_path,
             &ManagementRequest::Shutdown,
         )
         .await;
@@ -406,16 +355,14 @@ async fn graceful_shutdown_daemon(
     if pid_path.exists() {
         let _ = std::fs::remove_file(pid_path);
         let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(port_path);
-        let _ = std::fs::remove_file(control_socket_path);
     }
 }
 
-/// Wait for the daemon's control socket to appear (max 2s).
-async fn wait_for_socket(control_socket_path: &std::path::Path) {
+/// Wait for the daemon's socket to appear (max 2s).
+async fn wait_for_socket(socket_path: &std::path::Path) {
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if control_socket_path.exists() {
+        if socket_path.exists() {
             break;
         }
     }
@@ -423,7 +370,7 @@ async fn wait_for_socket(control_socket_path: &std::path::Path) {
 
 /// Re-register all running cella containers with the daemon.
 async fn re_register_containers(
-    control_socket_path: &std::path::Path,
+    socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cella_docker::DockerClient;
     use cella_port::protocol::ManagementRequest;
@@ -454,7 +401,7 @@ async fn re_register_containers(
             shutdown_action,
         };
 
-        match cella_daemon::management::send_management_request(control_socket_path, &req).await {
+        match cella_daemon::management::send_management_request(socket_path, &req).await {
             Ok(resp) => {
                 tracing::debug!("Re-registered container {}: {resp:?}", container.name);
             }

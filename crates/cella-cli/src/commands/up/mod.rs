@@ -552,7 +552,7 @@ impl UpContext {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Deregister from daemon before stopping (like down.rs)
         if container.state == ContainerState::Running {
-            if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
+            if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
                 && mgmt_sock.exists()
             {
                 let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
@@ -779,7 +779,7 @@ impl UpContext {
         let container_ip =
             cella_docker::network::get_container_cella_ip(self.client.inner(), container_id).await;
 
-        let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path() else {
+        let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
             return;
         };
         if !mgmt_sock.exists() {
@@ -1546,7 +1546,7 @@ pub fn output_result(
 
 /// Query the daemon for control port + auth token, returning env vars to inject.
 pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
-    if let Some(mgmt_sock) = cella_env::git_credential::daemon_management_socket_path()
+    if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
         && mgmt_sock.exists()
     {
         let status_resp = cella_daemon::management::send_management_request(
@@ -1573,7 +1573,7 @@ pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
 
 /// Inject post-start environment forwarding into a running container.
 ///
-/// Uploads SSH config files, sets git config, and installs credential helper.
+/// Uploads SSH config files and sets git config.
 /// Never fails — individual steps log warnings and are skipped on error.
 pub async fn inject_post_start(
     client: &DockerClient,
@@ -1582,7 +1582,6 @@ pub async fn inject_post_start(
     remote_user: &str,
 ) {
     upload_ssh_files(client, container_id, &post_start.file_uploads, remote_user).await;
-    install_credential_helper(client, container_id, post_start.credential_helper.as_ref()).await;
     apply_git_config(
         client,
         container_id,
@@ -1653,25 +1652,6 @@ async fn upload_ssh_files(
         warn!("Failed to upload SSH config files: {e}");
     } else {
         chown_in_container(client, container_id, remote_user, &ssh_dir).await;
-    }
-}
-
-/// Upload the credential helper script into the container.
-async fn install_credential_helper(
-    client: &DockerClient,
-    container_id: &str,
-    helper: Option<&cella_env::FileUpload>,
-) {
-    let Some(helper) = helper else {
-        return;
-    };
-    let helper_file = FileToUpload {
-        path: helper.container_path.clone(),
-        content: helper.content.clone(),
-        mode: helper.mode,
-    };
-    if let Err(e) = client.upload_files(container_id, &[helper_file]).await {
-        warn!("Failed to install credential helper: {e}");
     }
 }
 

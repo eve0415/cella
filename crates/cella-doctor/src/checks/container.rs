@@ -148,7 +148,7 @@ async fn check_single_container(
 }
 
 async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name: &str) {
-    let Some(data_dir) = cella_env::git_credential::cella_data_dir() else {
+    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         return;
     };
     let mgmt_socket = data_dir.join("daemon.sock");
@@ -239,7 +239,7 @@ async fn check_credentials(
 }
 
 async fn check_ports(checks: &mut Vec<CheckResult>, container_name: &str) {
-    let Some(data_dir) = cella_env::git_credential::cella_data_dir() else {
+    let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         return;
     };
     let mgmt_socket = data_dir.join("daemon.sock");

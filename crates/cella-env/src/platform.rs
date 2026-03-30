@@ -6,7 +6,7 @@ pub enum DockerRuntime {
     /// Docker Desktop (macOS/Windows) — provides SSH agent via VM.
     DockerDesktop,
     /// `OrbStack` (macOS) — uses `/run/host-services/ssh-auth.sock` for SSH agent
-    /// (like Docker Desktop) and TCP via `host.docker.internal` for credential proxy.
+    /// (like Docker Desktop).
     OrbStack,
     /// Native Docker on Linux — direct socket bind-mount works.
     LinuxNative,

@@ -2,10 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use cella_daemon::client::daemon_status;
 use cella_daemon::daemon;
 use cella_daemon::shared::running_cella_container_count;
-use cella_env::git_credential::cella_data_dir;
+use cella_env::paths::cella_data_dir;
 
 /// Manage the cella daemon (internal).
 #[derive(Args)]
@@ -26,16 +25,10 @@ enum DaemonCommand {
 
 #[derive(Args)]
 struct StartArgs {
-    /// Legacy credential socket path.
-    #[arg(long)]
-    socket: Option<PathBuf>,
     /// PID file path.
     #[arg(long)]
     pid_file: Option<PathBuf>,
-    /// TCP port file path.
-    #[arg(long)]
-    port_file: Option<PathBuf>,
-    /// Control socket path (for agent communication).
+    /// Control socket path (for management and agent communication).
     #[arg(long)]
     control_socket: Option<PathBuf>,
 }
@@ -52,63 +45,43 @@ impl DaemonArgs {
 
 async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
-
-    // Initialize file-based logging for the daemon process.
     cella_daemon::logging::init_daemon_logging(&data_dir.join("daemon.log"));
 
-    let socket_path = args
-        .socket
-        .unwrap_or_else(|| data_dir.join("credential-proxy.sock"));
     let pid_path = args.pid_file.unwrap_or_else(|| data_dir.join("daemon.pid"));
-    let port_path = args
-        .port_file
-        .unwrap_or_else(|| data_dir.join("credential-proxy.port"));
-    let control_socket_path = args
+    let socket_path = args
         .control_socket
         .unwrap_or_else(|| data_dir.join("daemon.sock"));
 
-    daemon::run_daemon(&socket_path, &pid_path, &port_path, &control_socket_path).await?;
+    daemon::run_daemon(&socket_path, &pid_path).await?;
     Ok(())
 }
 
 fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
-
-    let socket_path = data_dir.join("credential-proxy.sock");
     let pid_path = data_dir.join("daemon.pid");
-    let port_path = data_dir.join("credential-proxy.port");
-    let control_socket_path = data_dir.join("daemon.sock");
-
-    daemon::stop_daemon(&pid_path, &socket_path, &port_path, &control_socket_path)?;
+    let socket_path = data_dir.join("daemon.sock");
+    daemon::stop_daemon(&pid_path, &socket_path)?;
     eprintln!("Cella daemon stopped.");
     Ok(())
 }
 
 async fn run_status() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
-
-    let socket_path = data_dir.join("credential-proxy.sock");
     let pid_path = data_dir.join("daemon.pid");
-    let mgmt_socket = data_dir.join("daemon.sock");
+    let socket_path = data_dir.join("daemon.sock");
 
-    let status = daemon_status(&socket_path, &pid_path);
+    let running = daemon::is_daemon_running(&pid_path, &socket_path);
 
-    if status.running {
-        eprintln!("Cella daemon: running (PID {})", status.pid.unwrap_or(0));
+    if running {
+        eprintln!("Cella daemon: running");
     } else {
         eprintln!("Cella daemon: not running");
-        if status.pid.is_some() {
-            eprintln!("  PID file exists but daemon not responsive");
-        }
-        if status.socket_exists {
-            eprintln!("  Socket file exists: {}", socket_path.display());
-        }
     }
 
-    // Try to query daemon for detailed status
-    if mgmt_socket.exists() {
+    // Try to query daemon for detailed status via management socket
+    if socket_path.exists() {
         let result = cella_daemon::management::send_management_request(
-            &mgmt_socket,
+            &socket_path,
             &cella_port::protocol::ManagementRequest::QueryStatus,
         )
         .await;

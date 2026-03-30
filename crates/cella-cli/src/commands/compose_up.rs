@@ -119,7 +119,7 @@ async fn prepare_and_start(
     .await?;
 
     // 6. Ensure daemon is running and get daemon env vars
-    super::ensure_credential_proxy();
+    super::ensure_cella_daemon().await;
     let daemon_env = query_daemon_env(&ctx.container_nm).await;
 
     // 7. Detect container architecture and ensure agent volume is populated

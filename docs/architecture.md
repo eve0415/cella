@@ -26,7 +26,6 @@ graph TD
         backend[cella-backend<br><i>backend trait</i>]
         port[cella-port<br><i>IPC protocol</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
-        credproxy[cella-credential-proxy<br><i>credential proxy</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
@@ -39,7 +38,7 @@ graph TD
 
 **Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, worktree orchestration, in-container agent, configuration parsing, and feature resolution.
 
-**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, and the legacy credential proxy.
+**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, and code generation.
 
 ## Crate Responsibilities
 
@@ -65,7 +64,7 @@ Environment forwarding orchestration. Detects the host environment (SSH agent, g
 
 ### cella-daemon
 
-Unified host-side daemon for port forwarding, credential proxying, and browser handling. Runs as a background process, accepting TCP connections from in-container agents. Includes OrbStack-specific port coordination, health monitoring, auth token management, and file-based logging.
+Unified host-side daemon for credential forwarding, port management, and browser handling. Runs as a background process, accepting TCP connections from in-container agents. Includes OrbStack-specific port coordination, health monitoring, auth token management, and file-based logging.
 
 ### cella-agent
 
@@ -90,10 +89,6 @@ Port allocation, detection, and IPC protocol. Defines the wire format for daemon
 ### cella-codegen
 
 Build-time code generator. Transforms the devcontainer JSON Schema into typed Rust structs and validators. Runs during `cargo build` via cella-config's `build.rs` and produces formatted Rust source for `include!()`. Not a runtime dependency.
-
-### cella-credential-proxy
-
-Legacy git credential forwarding proxy over Unix socket and TCP. Being consolidated into cella-daemon. Runs as a host daemon, forwarding git credential requests from containers to the host's credential store with automatic idle timeout.
 
 ## Dependency Graph
 

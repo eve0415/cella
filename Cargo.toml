@@ -7,7 +7,6 @@ members = [
     "crates/cella-compose",
     "crates/cella-config",
     "crates/cella-container",
-    "crates/cella-credential-proxy",
     "crates/cella-daemon",
     "crates/cella-doctor",
     "crates/cella-docker",
@@ -121,7 +120,6 @@ cella-compose = { path = "crates/cella-compose" }
 cella-doctor = { path = "crates/cella-doctor" }
 cella-config = { path = "crates/cella-config" }
 cella-container = { path = "crates/cella-container" }
-cella-credential-proxy = { path = "crates/cella-credential-proxy" }
 cella-daemon = { path = "crates/cella-daemon" }
 cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }

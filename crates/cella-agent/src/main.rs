@@ -8,6 +8,9 @@
 //!
 //! When invoked as `cella` (via symlink), enters CLI mode for in-container
 //! worktree management commands that delegate to the host daemon.
+//!
+//! When invoked as `cella-credential` (via symlink), enters credential helper
+//! mode for git credential forwarding to the host daemon.
 
 mod browser;
 mod cli;
@@ -85,6 +88,16 @@ fn parse_args() -> Result<AgentArgs, String> {
     }
 }
 
+/// Check if invoked as `cella-credential` (credential helper mode).
+fn is_credential_mode() -> bool {
+    let exe = std::env::args().next().unwrap_or_default();
+    let stem = std::path::Path::new(&exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    stem == "cella-credential"
+}
+
 /// Check if this binary was invoked as `cella` (CLI mode) vs `cella-agent`.
 fn is_cli_mode() -> bool {
     let exe = std::env::args().next().unwrap_or_default();
@@ -98,6 +111,19 @@ fn is_cli_mode() -> bool {
 
 #[tokio::main]
 async fn main() {
+    // Check if invoked as `cella-credential` (credential helper mode via symlink)
+    if is_credential_mode() {
+        let operation = std::env::args().nth(1).unwrap_or_else(|| {
+            eprintln!("Usage: cella-credential <get|store|erase>");
+            std::process::exit(1);
+        });
+        if let Err(e) = credential::handle_credential(&operation).await {
+            eprintln!("credential error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Check if invoked as `cella` (CLI mode via symlink)
     if is_cli_mode() {
         let args: Vec<String> = std::env::args().collect();

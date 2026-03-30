@@ -36,7 +36,7 @@ impl SwitchArgs {
 
         let container = target.resolve(&client, true).await?;
 
-        super::ensure_credential_proxy();
+        super::ensure_cella_daemon().await;
 
         // Read exec metadata from container labels
         let user = container

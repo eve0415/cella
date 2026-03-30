@@ -48,7 +48,7 @@ impl ShellArgs {
         let container =
             super::resolve_service_container(&client, container, self.service.as_deref()).await?;
 
-        super::ensure_credential_proxy();
+        super::ensure_cella_daemon().await;
 
         // Read exec metadata from container labels
         let user = container

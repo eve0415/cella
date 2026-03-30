@@ -96,7 +96,7 @@ impl LogsArgs {
     }
 
     fn show_daemon_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(data_dir) = cella_env::git_credential::cella_data_dir() else {
+        let Some(data_dir) = cella_env::paths::cella_data_dir() else {
             return Err("Cannot determine cella data directory".into());
         };
         let log_path = data_dir.join("daemon.log");
@@ -116,7 +116,7 @@ impl LogsArgs {
 
     fn show_lifecycle_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self; // tail unused for lifecycle logs
-        let Some(data_dir) = cella_env::git_credential::cella_data_dir() else {
+        let Some(data_dir) = cella_env::paths::cella_data_dir() else {
             return Err("Cannot determine cella data directory".into());
         };
         let logs_dir = data_dir.join("logs");

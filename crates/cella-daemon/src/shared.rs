@@ -1,9 +1,5 @@
 //! Shared daemon primitives: PID management, process checks, socket helpers.
-//!
-//! Extracted from `cella-daemon` and `cella-credential-proxy` to eliminate
-//! duplication. Both crates import from this module.
 
-use std::io::{Read, Write};
 use std::path::Path;
 
 use tracing::{debug, warn};
@@ -162,70 +158,6 @@ pub async fn bind_tcp_reclaim(
 
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
     tokio::net::TcpListener::bind(addr).await
-}
-
-/// Ping a daemon over its Unix socket and check if it responds with "pong".
-///
-/// # Errors
-///
-/// Returns `io::Error` if connection or I/O fails.
-pub fn ping_daemon(socket_path: &Path) -> Result<bool, std::io::Error> {
-    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    stream.write_all(b"ping\n\n")?;
-
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf)?;
-    let response = String::from_utf8_lossy(&buf[..n]);
-    Ok(response.trim() == "pong")
-}
-
-/// Status of a daemon process.
-pub struct DaemonStatus {
-    pub running: bool,
-    pub pid: Option<u32>,
-    pub socket_exists: bool,
-    pub responsive: bool,
-}
-
-/// Check the full status of a daemon.
-pub fn daemon_status(socket_path: &Path, pid_path: &Path) -> DaemonStatus {
-    let pid = read_pid_file(pid_path);
-    let socket_exists = socket_path.exists();
-    let responsive = socket_exists && ping_daemon(socket_path).unwrap_or(false);
-    let running = pid.is_some() && responsive;
-
-    DaemonStatus {
-        running,
-        pid,
-        socket_exists,
-        responsive,
-    }
-}
-
-/// Common daemon lifecycle trait.
-///
-/// Provides default implementations for liveness checking and cleanup
-/// based on PID and socket paths.
-pub trait DaemonLifecycle {
-    /// Path to the PID file.
-    fn pid_path(&self) -> &Path;
-
-    /// Path to the Unix socket.
-    fn socket_path(&self) -> &Path;
-
-    /// Human-readable daemon name for logging.
-    fn name(&self) -> &str;
-
-    /// Check if this daemon is running (PID alive + socket exists).
-    fn is_running(&self) -> bool {
-        read_pid_file(self.pid_path()).is_some_and(is_process_alive) && self.socket_path().exists()
-    }
-
-    /// Remove PID and socket files.
-    fn cleanup(&self) {
-        cleanup_files(&[self.pid_path(), self.socket_path()]);
-    }
 }
 
 #[cfg(test)]
