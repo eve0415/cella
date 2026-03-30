@@ -532,14 +532,17 @@ async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
     client.send(&msg).await?;
 
-    loop {
+    // Wait for StreamReady or error.
+    let stream_port = loop {
         let resp = client.recv().await?;
         match resp {
+            DaemonMessage::StreamReady { port, .. } => break port,
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
                 OutputStream::Stdout => print!("{data}"),
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::SwitchResult { exit_code, .. } => {
+                // Got result before stream — error case.
                 if exit_code != 0 {
                     std::process::exit(exit_code);
                 }
@@ -547,7 +550,74 @@ async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
+    };
+
+    // Extract daemon host from CELLA_DAEMON_ADDR.
+    let daemon_addr = std::env::var("CELLA_DAEMON_ADDR").unwrap_or_default();
+    let host = daemon_addr
+        .rsplit_once(':')
+        .map_or(daemon_addr.as_str(), |(h, _)| h);
+    let stream_addr = format!("{host}:{stream_port}");
+
+    // Connect raw TCP to the stream bridge.
+    let stream = tokio::net::TcpStream::connect(&stream_addr).await?;
+    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
+
+    // Enter raw terminal mode.
+    let saved_termios = enter_raw_mode();
+
+    // Bidirectional forwarding: stdin -> TCP, TCP -> stdout.
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut tcp_writer).await;
+    });
+
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        let _ = tokio::io::copy(&mut tcp_reader, &mut stdout).await;
+    });
+
+    // Wait for either direction to end.
+    tokio::select! {
+        _ = stdin_task => {},
+        _ = stdout_task => {},
     }
+
+    // Restore terminal.
+    if let Some(termios) = saved_termios {
+        restore_terminal(&termios);
+    }
+
+    // Wait for SwitchResult on the JSON channel.
+    loop {
+        let resp = client.recv().await?;
+        if let DaemonMessage::SwitchResult { exit_code, .. } = resp {
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Enter raw terminal mode, returning the saved termios for later restoration.
+fn enter_raw_mode() -> Option<nix::sys::termios::Termios> {
+    use nix::sys::termios;
+
+    let stdin = std::io::stdin();
+    let original = termios::tcgetattr(&stdin).ok()?;
+    let mut raw = original.clone();
+    termios::cfmakeraw(&mut raw);
+    termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &raw).ok()?;
+    Some(original)
+}
+
+/// Restore terminal to the saved termios state.
+fn restore_terminal(termios: &nix::sys::termios::Termios) {
+    use nix::sys::termios as t;
+
+    let stdin = std::io::stdin();
+    let _ = t::tcsetattr(&stdin, t::SetArg::TCSANOW, termios);
 }
 
 fn print_worktree_table(worktrees: &[cella_port::protocol::WorktreeEntry]) {

@@ -104,7 +104,7 @@ glob = "0.3.3"
 notify = "8.2.0"
 
 # Process inspection
-nix = { version = "0.31.2", default-features = false, features = ["signal"] }
+nix = { version = "0.31.2", default-features = false, features = ["signal", "term"] }
 
 # PTY
 portable-pty = "0.9.0"
