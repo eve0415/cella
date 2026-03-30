@@ -20,17 +20,25 @@ pub async fn find_container_for_branch(
     client: &DockerClient,
     branch: &str,
 ) -> Result<Option<String>, OrchestratorError> {
-    let containers = client
-        .list_cella_containers(false)
-        .await
-        .map_err(|e| OrchestratorError::Docker {
-            message: format!("failed to list containers: {e}"),
-        })?;
+    let containers =
+        client
+            .list_cella_containers(false)
+            .await
+            .map_err(|e| OrchestratorError::Docker {
+                message: format!("failed to list containers: {e}"),
+            })?;
 
-    Ok(containers.into_iter().find(|c| {
-        c.labels.get("dev.cella.worktree").is_some_and(|v| v == "true")
-            && c.labels.get("dev.cella.branch").is_some_and(|v| v == branch)
-    }).map(|c| c.name))
+    Ok(containers
+        .into_iter()
+        .find(|c| {
+            c.labels
+                .get("dev.cella.worktree")
+                .is_some_and(|v| v == "true")
+                && c.labels
+                    .get("dev.cella.branch")
+                    .is_some_and(|v| v == branch)
+        })
+        .map(|c| c.name))
 }
 
 /// List all worktrees with their container status.
@@ -49,12 +57,13 @@ pub async fn worktree_list(
         message: format!("failed to list worktrees: {e}"),
     })?;
 
-    let cella_containers = client
-        .list_cella_containers(false)
-        .await
-        .map_err(|e| OrchestratorError::Docker {
-            message: format!("failed to list containers: {e}"),
-        })?;
+    let cella_containers =
+        client
+            .list_cella_containers(false)
+            .await
+            .map_err(|e| OrchestratorError::Docker {
+                message: format!("failed to list containers: {e}"),
+            })?;
 
     let mut results = Vec::with_capacity(worktrees.len());
     for wt in worktrees {
@@ -119,12 +128,13 @@ pub async fn verify_container_running(
     client: &DockerClient,
     container_id: &str,
 ) -> Result<(), OrchestratorError> {
-    let info = client
-        .inspect_container(container_id)
-        .await
-        .map_err(|e| OrchestratorError::Docker {
-            message: format!("inspect failed: {e}"),
-        })?;
+    let info =
+        client
+            .inspect_container(container_id)
+            .await
+            .map_err(|e| OrchestratorError::Docker {
+                message: format!("inspect failed: {e}"),
+            })?;
 
     if info.state != cella_backend::types::ContainerState::Running {
         return Err(OrchestratorError::ContainerExited {

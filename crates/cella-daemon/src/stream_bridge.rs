@@ -86,9 +86,7 @@ fn run_bridge(listener: &TcpListener, master: &(dyn MasterPty + Send)) -> i32 {
     let mut reader = master
         .try_clone_reader()
         .expect("failed to clone PTY reader");
-    let mut writer = master
-        .take_writer()
-        .expect("failed to take PTY writer");
+    let mut writer = master.take_writer().expect("failed to take PTY writer");
 
     // TCP -> PTY (agent stdin -> docker exec stdin)
     let mut stream_read = stream.try_clone().expect("failed to clone TCP stream");
@@ -125,10 +123,7 @@ fn run_bridge(listener: &TcpListener, master: &(dyn MasterPty + Send)) -> i32 {
     0
 }
 
-fn accept_with_timeout(
-    listener: &TcpListener,
-    timeout: Duration,
-) -> Option<std::net::TcpStream> {
+fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> Option<std::net::TcpStream> {
     listener.set_nonblocking(true).ok()?;
     let deadline = std::time::Instant::now() + timeout;
     loop {

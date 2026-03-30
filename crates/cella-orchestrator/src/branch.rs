@@ -45,10 +45,7 @@ pub fn create_worktree(
             message: format!("failed to create worktree for '{branch}': {e}"),
         })?;
 
-    step.finish_with(&format!(
-        "Worktree created at {}",
-        wt_info.path.display()
-    ));
+    step.finish_with(&format!("Worktree created at {}", wt_info.path.display()));
 
     Ok(wt_info.path)
 }

@@ -91,9 +91,9 @@ pub async fn build_features_layer(
         .await;
     let elapsed_str = format_elapsed(start.elapsed());
     match &result {
-        Ok(_) => ctx
-            .progress
-            .println(&format!("  \x1b[32m✓\x1b[0m Built features layer{elapsed_str}")),
+        Ok(_) => ctx.progress.println(&format!(
+            "  \x1b[32m✓\x1b[0m Built features layer{elapsed_str}"
+        )),
         Err(e) => ctx
             .progress
             .println(&format!("  \x1b[31m✗\x1b[0m Building features layer: {e}")),

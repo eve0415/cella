@@ -5,7 +5,9 @@
 
 use tracing::debug;
 
-use cella_docker::{CellaDockerError, DockerClient, ExecOptions, LifecycleContext, run_lifecycle_phase};
+use cella_docker::{
+    CellaDockerError, DockerClient, ExecOptions, LifecycleContext, run_lifecycle_phase,
+};
 
 use crate::progress::{ProgressSender, format_elapsed};
 
