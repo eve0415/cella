@@ -1078,9 +1078,28 @@ impl UpContext {
 
         super::ensure_cella_daemon().await;
 
-        // Build network proxy forwarding config from settings.
+        // Build network proxy forwarding config from settings + devcontainer.json.
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        let net_config = settings.network.to_network_config();
+        let toml_net = settings.network.to_network_config();
+
+        // Extract customizations.cella.network from devcontainer.json.
+        let dc_net = config
+            .get("customizations")
+            .and_then(|c| c.get("cella"))
+            .and_then(|c| c.get("network"))
+            .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
+
+        // Merge: devcontainer.json is base, cella.toml overrides.
+        let merged = cella_network::merge_network_configs(
+            dc_net.as_ref(),
+            Some(&toml_net),
+        );
+        let net_config = cella_network::NetworkConfig {
+            mode: merged.mode,
+            proxy: merged.proxy,
+            rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
+        };
+
         let skip_rules = self.network_rules == NetworkRulePolicy::Skip;
         let has_rules = net_config.has_rules() && !skip_rules;
         if skip_rules && net_config.has_rules() {
