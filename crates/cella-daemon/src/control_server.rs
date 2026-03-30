@@ -733,7 +733,10 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
             message: if stderr_collected.is_empty() {
                 format!("cella branch exited with code {status}")
             } else {
-                stderr_collected.trim().to_string()
+                format!(
+                    "cella branch failed (exit {status}): {}",
+                    stderr_collected.trim()
+                )
             },
         }
     };
