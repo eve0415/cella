@@ -41,11 +41,6 @@ impl ProxyEnvVars {
             .or_else(|| std::env::var("NO_PROXY").ok())
             .or_else(|| std::env::var("no_proxy").ok());
 
-        // If nothing detected and nothing configured, return empty.
-        if http_proxy.is_none() && https_proxy.is_none() {
-            return Some(Self::default());
-        }
-
         Some(Self {
             http_proxy,
             https_proxy,
@@ -230,6 +225,17 @@ mod tests {
         let no_proxy = vars.build_no_proxy(None);
         let count = no_proxy.matches("localhost").count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn detect_preserves_no_proxy_when_http_https_absent() {
+        let config = ProxyConfig {
+            no_proxy: Some(".internal,.corp".to_string()),
+            ..Default::default()
+        };
+        let vars = ProxyEnvVars::detect(&config).unwrap();
+        assert!(!vars.has_proxy());
+        assert_eq!(vars.no_proxy.as_deref(), Some(".internal,.corp"));
     }
 
     #[test]
