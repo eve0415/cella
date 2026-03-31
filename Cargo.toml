@@ -18,6 +18,7 @@ members = [
     "crates/cella-network",
     "crates/cella-orchestrator",
     "crates/cella-protocol",
+    "crates/cella-templates",
 ]
 
 [workspace.package]
@@ -123,6 +124,7 @@ portable-pty = "0.9.0"
 
 # Testing
 tempfile = "3.27.0"
+filetime = "0.2.25"
 insta = { version = "1.47.2", features = ["json", "yaml", "redactions"] }
 
 # Internal crates
@@ -142,6 +144,7 @@ cella-network = { path = "crates/cella-network" }
 cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-port = { path = "crates/cella-port" }
 cella-protocol = { path = "crates/cella-protocol" }
+cella-templates = { path = "crates/cella-templates" }
 
 [profile.release]
 strip = true

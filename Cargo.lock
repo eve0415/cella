@@ -568,6 +568,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-templates"
+version = "0.0.12"
+dependencies = [
+ "cella-features",
+ "dirs",
+ "filetime",
+ "flate2",
+ "hex",
+ "insta",
+ "miette",
+ "oci-distribution",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
