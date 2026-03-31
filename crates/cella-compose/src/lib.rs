@@ -17,7 +17,7 @@ pub mod override_file;
 pub mod parse;
 pub mod project;
 
-pub use cli::{ComposeCommand, ComposeServiceStatus};
+pub use cli::{ComposeCommand, ComposeServiceStatus, check_compose_features_support};
 pub use config::{ResolvedComposeConfig, ServiceBuildInfo, extract_service_build_info};
 pub use dockerfile::{
     AUTO_STAGE_NAME, FEATURES_TARGET_STAGE, ensure_stage_named, generate_combined_dockerfile,

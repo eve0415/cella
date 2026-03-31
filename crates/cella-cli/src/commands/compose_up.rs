@@ -107,7 +107,11 @@ async fn prepare_and_start(
     project: &ComposeProject,
 ) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
 {
-    // 5. Resolve features via combined-Dockerfile approach (if features configured)
+    // 5. Check Docker Compose version supports additional_contexts (>= 2.17.0)
+    //    before resolving features, so we fail early with a clear message.
+    cella_compose::check_compose_features_support().await?;
+
+    // 6. Resolve features via combined-Dockerfile approach (if features configured)
     let features_build = super::compose_features::resolve_compose_features(
         &ctx.client,
         config,
@@ -177,6 +181,10 @@ async fn prepare_and_start(
         build_context: features_build
             .as_ref()
             .and_then(|b| b.build_context.clone()),
+        additional_contexts: features_build
+            .as_ref()
+            .map(|b| b.additional_contexts.clone())
+            .unwrap_or_default(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;

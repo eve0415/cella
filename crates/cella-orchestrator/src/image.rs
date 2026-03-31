@@ -230,9 +230,12 @@ async fn resolve_and_build_features(
         input.config_path,
         &platform,
         &cache,
-        input.base_image_tag,
-        &input.base_image_details.user,
-        input.base_image_details.metadata.as_deref(),
+        &cella_features::BaseImageContext {
+            base_image: input.base_image_tag,
+            image_user: &input.base_image_details.user,
+            metadata: input.base_image_details.metadata.as_deref(),
+        },
+        false, // non-compose: build context IS the features dir, bare COPY works
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;

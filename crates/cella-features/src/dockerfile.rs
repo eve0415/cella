@@ -7,6 +7,14 @@ use std::fmt::Write;
 
 use crate::types::ResolvedFeature;
 
+/// Named build context for feature content in Docker Compose builds.
+///
+/// When `use_named_content_source` is enabled, all `COPY` instructions reference
+/// this named context via `--from=`, allowing Docker Compose `additional_contexts`
+/// to provide the features staging directory while keeping the original service's
+/// build context for the user's Dockerfile stage.
+pub const FEATURE_CONTENT_SOURCE: &str = "dev_containers_feature_content_source";
+
 /// Generate a Dockerfile that installs the given features into a base image.
 ///
 /// The generated Dockerfile follows the devcontainer CLI spec:
@@ -27,6 +35,7 @@ pub fn generate_dockerfile(
     container_user: &str,
     remote_user: &str,
     features: &[ResolvedFeature],
+    use_named_content_source: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -36,11 +45,16 @@ pub fn generate_dockerfile(
         features.iter().filter(|f| f.has_install_script).collect();
 
     if !installable.is_empty() {
-        write_builtin_env_resolution(&mut out, container_user, remote_user);
-        write_feature_install_blocks(&mut out, &installable);
+        write_builtin_env_resolution(
+            &mut out,
+            container_user,
+            remote_user,
+            use_named_content_source,
+        );
+        write_feature_install_blocks(&mut out, &installable, use_named_content_source);
     }
 
-    write_entrypoint_section(&mut out, features);
+    write_entrypoint_section(&mut out, features, use_named_content_source);
 
     if !installable.is_empty() {
         write_cleanup_and_user_reset(&mut out);
@@ -63,14 +77,25 @@ fn write_preamble(out: &mut String, base_image: &str, image_user: &str) {
 }
 
 /// Write USER root, COPY builtin env file, and RUN to resolve home directories.
-fn write_builtin_env_resolution(out: &mut String, container_user: &str, remote_user: &str) {
+fn write_builtin_env_resolution(
+    out: &mut String,
+    container_user: &str,
+    remote_user: &str,
+    use_named_content_source: bool,
+) {
+    let from_clause = if use_named_content_source {
+        format!("--from={FEATURE_CONTENT_SOURCE} ")
+    } else {
+        String::new()
+    };
+
     writeln!(out).unwrap();
     writeln!(out, "USER root").unwrap();
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "COPY devcontainer-features.builtin.env \
+        "COPY {from_clause}devcontainer-features.builtin.env \
          /tmp/dev-container-features/devcontainer-features.builtin.env"
     )
     .unwrap();
@@ -95,7 +120,17 @@ fn write_builtin_env_resolution(out: &mut String, container_user: &str, remote_u
 }
 
 /// Write per-feature COPY + RUN install blocks (including containerEnv ENV lines).
-fn write_feature_install_blocks(out: &mut String, installable: &[&ResolvedFeature]) {
+fn write_feature_install_blocks(
+    out: &mut String,
+    installable: &[&ResolvedFeature],
+    use_named_content_source: bool,
+) {
+    let from_clause = if use_named_content_source {
+        format!("--from={FEATURE_CONTENT_SOURCE} ")
+    } else {
+        String::new()
+    };
+
     for feature in installable {
         write_feature_container_env(out, feature);
 
@@ -108,7 +143,7 @@ fn write_feature_install_blocks(out: &mut String, installable: &[&ResolvedFeatur
         .unwrap();
         writeln!(
             out,
-            "COPY --chown=root:root {id}/ /tmp/dev-container-features/{id}/",
+            "COPY {from_clause}--chown=root:root {id}/ /tmp/dev-container-features/{id}/",
             id = feature.id
         )
         .unwrap();
@@ -156,13 +191,26 @@ fn write_feature_container_env(out: &mut String, feature: &ResolvedFeature) {
 }
 
 /// Write entrypoint init script COPY+RUN if any feature declares an entrypoint.
-fn write_entrypoint_section(out: &mut String, features: &[ResolvedFeature]) {
+fn write_entrypoint_section(
+    out: &mut String,
+    features: &[ResolvedFeature],
+    use_named_content_source: bool,
+) {
     let has_entrypoints = features.iter().any(|f| f.metadata.entrypoint.is_some());
 
     if has_entrypoints {
+        let from_clause = if use_named_content_source {
+            format!("--from={FEATURE_CONTENT_SOURCE} ")
+        } else {
+            String::new()
+        };
         writeln!(out).unwrap();
         writeln!(out, "# Entrypoint init script").unwrap();
-        writeln!(out, "COPY docker-init.sh /usr/local/share/docker-init.sh").unwrap();
+        writeln!(
+            out,
+            "COPY {from_clause}docker-init.sh /usr/local/share/docker-init.sh"
+        )
+        .unwrap();
         writeln!(out, "RUN chmod +x /usr/local/share/docker-init.sh").unwrap();
     }
 }
@@ -353,6 +401,7 @@ mod tests {
             "vscode",
             "vscode",
             &features,
+            false,
         );
         insta::assert_snapshot!(result);
     }
@@ -403,6 +452,7 @@ mod tests {
             "vscode",
             "vscode",
             &features,
+            false,
         );
         insta::assert_snapshot!(result);
     }
@@ -436,7 +486,7 @@ mod tests {
             ),
         ];
 
-        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!(result);
     }
 
@@ -458,7 +508,14 @@ mod tests {
             },
         )];
 
-        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &features);
+        let result = generate_dockerfile(
+            "ubuntu:22.04",
+            "vscode",
+            "vscode",
+            "vscode",
+            &features,
+            false,
+        );
         insta::assert_snapshot!(result);
     }
 
@@ -479,7 +536,14 @@ mod tests {
             },
         )];
 
-        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &features);
+        let result = generate_dockerfile(
+            "ubuntu:22.04",
+            "vscode",
+            "vscode",
+            "vscode",
+            &features,
+            false,
+        );
         insta::assert_snapshot!(result);
     }
 
@@ -500,7 +564,7 @@ mod tests {
             },
         )];
 
-        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!(result);
     }
 
@@ -522,7 +586,7 @@ mod tests {
         )];
 
         // Image user is root — USER root is still emitted (matches original CLI).
-        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!(result);
     }
 
@@ -555,7 +619,14 @@ mod tests {
             ),
         ];
 
-        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &features);
+        let result = generate_dockerfile(
+            "ubuntu:22.04",
+            "vscode",
+            "vscode",
+            "vscode",
+            &features,
+            false,
+        );
         insta::assert_snapshot!(result);
     }
 
@@ -599,7 +670,14 @@ mod tests {
             ),
         ];
 
-        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &features);
+        let result = generate_dockerfile(
+            "ubuntu:22.04",
+            "vscode",
+            "vscode",
+            "vscode",
+            &features,
+            false,
+        );
         insta::assert_snapshot!(result);
     }
 
@@ -676,7 +754,7 @@ mod tests {
             },
         )];
 
-        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!(result);
     }
 
@@ -714,7 +792,8 @@ mod tests {
         insta::assert_snapshot!(script);
 
         // Dockerfile should still have COPY for init script
-        let dockerfile = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let dockerfile =
+            generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!("dockerfile_with_metadata_only_entrypoint", dockerfile);
     }
 
@@ -742,7 +821,7 @@ mod tests {
             },
         )];
 
-        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features);
+        let result = generate_dockerfile("ubuntu:22.04", "root", "root", "root", &features, false);
         insta::assert_snapshot!(result);
     }
 
@@ -752,7 +831,7 @@ mod tests {
 
     #[test]
     fn empty_features_list() {
-        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &[]);
+        let result = generate_dockerfile("ubuntu:22.04", "vscode", "vscode", "vscode", &[], false);
         insta::assert_snapshot!(result);
     }
 

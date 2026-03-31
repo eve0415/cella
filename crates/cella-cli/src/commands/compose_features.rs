@@ -5,6 +5,7 @@
 //! is concatenated with feature installation layers, then the compose override
 //! points `build.dockerfile` to this combined file.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
@@ -24,8 +25,10 @@ pub struct ComposeFeaturesBuild {
     pub combined_dockerfile: PathBuf,
     /// Build target stage name (`dev_containers_target_stage`).
     pub build_target: String,
-    /// Build context override (only for image-only services).
+    /// Build context override (empty dir for image-only, `None` for build-based).
     pub build_context: Option<PathBuf>,
+    /// Named build contexts for Docker `BuildKit` `additional_contexts`.
+    pub additional_contexts: BTreeMap<String, PathBuf>,
     /// Resolved features (for lifecycle metadata, labels, etc.).
     pub resolved_features: ResolvedFeatures,
     /// Image name override (for image-only services, to avoid retagging).
@@ -134,24 +137,49 @@ pub async fn resolve_compose_features(
                 config_path,
                 &platform,
                 &cache,
-                &stage_name,
-                &image_user,
-                base_image_metadata.as_deref(),
+                &cella_features::BaseImageContext {
+                    base_image: &stage_name,
+                    image_user: &image_user,
+                    metadata: base_image_metadata.as_deref(),
+                },
+                true, // compose builds use named content source via additional_contexts
             )
             .await
             .map_err(|e| format!("feature resolution failed: {e}"))
         })
         .await?;
 
-    // 6. Generate combined Dockerfile
-    let combined = cella_compose::generate_combined_dockerfile(
+    // 6. Generate combined Dockerfile and write to disk.
+    let combined_path = write_combined_dockerfile(
+        &project.project_name,
         &original_dockerfile,
         &resolved.dockerfile,
         &stage_name,
-    );
+    )?;
 
-    // Write to project-specific directory
-    let combined_path = compose_dockerfile_path(&project.project_name);
+    // 7. Assemble build context overrides and return.
+    Ok(Some(assemble_features_build(
+        config,
+        &service_info,
+        project,
+        combined_path,
+        resolved,
+    )?))
+}
+
+/// Generate the combined Dockerfile and write it to disk.
+fn write_combined_dockerfile(
+    project_name: &str,
+    original_dockerfile: &str,
+    features_dockerfile: &str,
+    stage_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let combined = cella_compose::generate_combined_dockerfile(
+        original_dockerfile,
+        features_dockerfile,
+        stage_name,
+    );
+    let combined_path = compose_dockerfile_path(project_name);
     if let Some(parent) = combined_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -160,13 +188,28 @@ pub async fn resolve_compose_features(
         "Combined Dockerfile written to: {}",
         combined_path.display()
     );
+    Ok(combined_path)
+}
 
-    // 7. Determine build context and image name overrides
-    let (build_context, image_name_override) = match &service_info {
+/// Assemble the `ComposeFeaturesBuild` with build context overrides.
+fn assemble_features_build(
+    config: &serde_json::Value,
+    service_info: &ServiceBuildInfo,
+    project: &ComposeProject,
+    combined_dockerfile: PathBuf,
+    resolved: ResolvedFeatures,
+) -> Result<ComposeFeaturesBuild, Box<dyn std::error::Error>> {
+    let mut additional_contexts = BTreeMap::new();
+    additional_contexts.insert(
+        cella_features::FEATURE_CONTENT_SOURCE.to_string(),
+        resolved.build_context.clone(),
+    );
+
+    let (build_context, image_name_override) = match service_info {
         ServiceBuildInfo::Image { .. } => {
-            // For image-only services, we need to provide the features build
-            // context (which contains the feature install scripts) and override
-            // the image name to avoid retagging the original.
+            let empty_context = compose_empty_context_path(&project.project_name);
+            std::fs::create_dir_all(&empty_context)?;
+
             let config_name = config.get("name").and_then(|v| v.as_str());
             let features_digest = super::image::compute_features_digest(config);
             let img_name = cella_docker::image_name_with_features(
@@ -174,22 +217,19 @@ pub async fn resolve_compose_features(
                 config_name,
                 &features_digest,
             );
-            (Some(resolved.build_context.clone()), Some(img_name))
+            (Some(empty_context), Some(img_name))
         }
-        ServiceBuildInfo::Build { .. } => {
-            // For build-based services, the original context/args are inherited
-            // from the compose file. No context or image override needed.
-            (None, None)
-        }
+        ServiceBuildInfo::Build { .. } => (None, None),
     };
 
-    Ok(Some(ComposeFeaturesBuild {
-        combined_dockerfile: combined_path,
+    Ok(ComposeFeaturesBuild {
+        combined_dockerfile,
         build_target: FEATURES_TARGET_STAGE.to_string(),
         build_context,
+        additional_contexts,
         resolved_features: resolved,
         image_name_override,
-    }))
+    })
 }
 
 /// Check if the config has non-empty features.
@@ -205,6 +245,14 @@ fn compose_dockerfile_path(project_name: &str) -> PathBuf {
         .join("compose")
         .join(project_name)
         .join("Dockerfile.combined")
+}
+
+/// Compute the path for the empty build context directory (image-only services).
+fn compose_empty_context_path(project_name: &str) -> PathBuf {
+    cella_data_dir()
+        .join("compose")
+        .join(project_name)
+        .join("empty-context")
 }
 
 /// Get the cella data directory (`~/.cella/`).

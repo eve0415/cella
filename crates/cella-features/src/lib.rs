@@ -15,8 +15,8 @@ mod test_utils;
 
 pub use cache::FeatureCache;
 pub use dockerfile::{
-    generate_builtin_env, generate_dockerfile, generate_entrypoint_script, generate_feature_env,
-    generate_wrapper_script,
+    FEATURE_CONTENT_SOURCE, generate_builtin_env, generate_dockerfile, generate_entrypoint_script,
+    generate_feature_env, generate_wrapper_script,
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
@@ -66,6 +66,16 @@ use tracing::{debug, warn};
 // Internal intermediate type for parsed feature entries
 // ---------------------------------------------------------------------------
 
+/// Context about the base image for feature resolution.
+pub struct BaseImageContext<'a> {
+    /// The base image reference (e.g., stage name or `ubuntu:22.04`).
+    pub base_image: &'a str,
+    /// The user in the base image (e.g., `"root"`, `"vscode"`).
+    pub image_user: &'a str,
+    /// `devcontainer.metadata` label from the base image, if available.
+    pub metadata: Option<&'a str>,
+}
+
 /// Intermediate representation of a parsed feature before ordering.
 struct FeatureEntry {
     key: String,
@@ -93,15 +103,14 @@ pub async fn resolve_features(
     config_path: &Path,
     platform: &Platform,
     cache: &FeatureCache,
-    base_image: &str,
-    image_user: &str,
-    base_image_metadata: Option<&str>,
+    base_image_ctx: &BaseImageContext<'_>,
+    use_named_content_source: bool,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
         Some(obj) if !obj.is_empty() => obj,
         _ => {
-            return resolve_empty_features(config, cache, base_image_metadata);
+            return resolve_empty_features(config, cache, base_image_ctx.metadata);
         }
     };
 
@@ -131,14 +140,15 @@ pub async fn resolve_features(
         &build_context,
         &resolved,
         config,
-        base_image,
-        image_user,
-        base_image_metadata,
+        base_image_ctx.base_image,
+        base_image_ctx.image_user,
+        base_image_ctx.metadata,
+        use_named_content_source,
     )?;
 
     // Step 9: Merge feature metadata and generate label.
-    let container_config = merge_all_metadata(&resolved, config, base_image_metadata);
-    let metadata_label = generate_metadata_label(&resolved, config, base_image_metadata);
+    let container_config = merge_all_metadata(&resolved, config, base_image_ctx.metadata);
+    let metadata_label = generate_metadata_label(&resolved, config, base_image_ctx.metadata);
 
     debug!(
         "resolved {} features, build context at {}",
@@ -232,6 +242,7 @@ fn generate_and_write_build_context(
     base_image: &str,
     image_user: &str,
     base_image_metadata: Option<&str>,
+    use_named_content_source: bool,
 ) -> Result<String, FeatureError> {
     // User resolution per spec: devcontainer.json > image metadata > Config.User > "root"
     let meta_user = base_image_metadata.map(|m| parse_image_metadata(m).1);
@@ -252,6 +263,7 @@ fn generate_and_write_build_context(
         container_user,
         remote_user,
         resolved,
+        use_named_content_source,
     );
     let entrypoint_script = generate_entrypoint_script(resolved);
     let builtin_env = generate_builtin_env(container_user, remote_user);
@@ -786,9 +798,12 @@ mod tests {
                 architecture: "amd64".to_string(),
             },
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await
         .unwrap();
@@ -811,9 +826,12 @@ mod tests {
                 architecture: "amd64".to_string(),
             },
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await
         .unwrap();
@@ -860,9 +878,12 @@ mod tests {
             &config_path,
             &platform,
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await
         .unwrap();
@@ -972,9 +993,12 @@ mod tests {
             &config_path,
             &platform,
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await
         .unwrap();
@@ -1033,9 +1057,12 @@ mod tests {
             &config_path,
             &platform,
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await
         .unwrap();
@@ -1073,9 +1100,12 @@ mod tests {
             Path::new("/workspace/devcontainer.json"),
             &platform,
             &cache,
-            "ubuntu:22.04",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await;
 
@@ -1114,9 +1144,12 @@ mod tests {
             &config_path,
             &platform,
             &cache,
-            "mcr.microsoft.com/devcontainers/base:ubuntu",
-            "root",
-            None,
+            &BaseImageContext {
+                base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
         )
         .await;
         let resolved = result.expect("resolve_features should succeed");

@@ -380,6 +380,62 @@ pub async fn check_compose_cli() -> Result<String, CellaComposeError> {
     Ok(version)
 }
 
+/// Parse a semantic version triple from `docker compose version` output.
+///
+/// Accepts formats like:
+/// - `"Docker Compose version v2.29.1"`
+/// - `"Docker Compose version 2.17.0"`
+/// - `"v2.17.0"`
+///
+/// Returns `None` if the version cannot be parsed.
+pub fn parse_compose_version(version_str: &str) -> Option<(u32, u32, u32)> {
+    // Find a version-like pattern: optional 'v' prefix followed by digit.digit.digit
+    let version_part = version_str.split_whitespace().find(|s| {
+        let stripped = s.strip_prefix('v').unwrap_or(s);
+        stripped.starts_with(|c: char| c.is_ascii_digit()) && stripped.contains('.')
+    })?;
+    let version_part = version_part.strip_prefix('v').unwrap_or(version_part);
+    let mut parts = version_part.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|p| {
+        // Handle versions like "2.17.0-beta.1" — take only the numeric prefix.
+        let numeric: String = p.chars().take_while(char::is_ascii_digit).collect();
+        numeric.parse().ok()
+    })?;
+    Some((major, minor, patch))
+}
+
+/// Check that Docker Compose supports `additional_contexts` (>= 2.17.0).
+///
+/// This is required for compose builds with devcontainer features, which use
+/// named build contexts to provide feature content separately from the
+/// service's original build context.
+///
+/// # Errors
+///
+/// Returns [`CellaComposeError::UnsupportedVersion`] if the detected version
+/// is older than 2.17.0, or [`CellaComposeError::CliNotFound`] if docker
+/// compose is not available.
+pub async fn check_compose_features_support() -> Result<(), CellaComposeError> {
+    let version_str = check_compose_cli().await?;
+    let version = parse_compose_version(&version_str);
+
+    match version {
+        Some((major, minor, _)) if major > 2 || (major == 2 && minor >= 17) => Ok(()),
+        Some((major, minor, patch)) => Err(CellaComposeError::UnsupportedVersion {
+            required: "2.17.0".to_string(),
+            found: format!("{major}.{minor}.{patch}"),
+            feature: "devcontainer features with compose builds".to_string(),
+        }),
+        None => {
+            // Can't parse version — proceed optimistically, Docker will error if unsupported.
+            warn!("could not parse Docker Compose version from: {version_str}");
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +502,45 @@ mod tests {
         assert_eq!(args[3], "-f");
         assert_eq!(args[4], "/workspace/docker-compose.yml");
         assert_eq!(args.len(), 5); // No override file
+    }
+
+    #[test]
+    fn parse_compose_version_full() {
+        assert_eq!(
+            parse_compose_version("Docker Compose version v2.29.1"),
+            Some((2, 29, 1))
+        );
+    }
+
+    #[test]
+    fn parse_compose_version_no_prefix() {
+        assert_eq!(
+            parse_compose_version("Docker Compose version 2.17.0"),
+            Some((2, 17, 0))
+        );
+    }
+
+    #[test]
+    fn parse_compose_version_short() {
+        assert_eq!(parse_compose_version("v2.17.0"), Some((2, 17, 0)));
+    }
+
+    #[test]
+    fn parse_compose_version_prerelease() {
+        assert_eq!(
+            parse_compose_version("Docker Compose version v2.17.0-beta.1"),
+            Some((2, 17, 0))
+        );
+    }
+
+    #[test]
+    fn parse_compose_version_garbage() {
+        assert_eq!(parse_compose_version("not a version"), None);
+    }
+
+    #[test]
+    fn parse_compose_version_empty() {
+        assert_eq!(parse_compose_version(""), None);
     }
 
     #[test]

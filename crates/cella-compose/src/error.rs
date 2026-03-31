@@ -62,6 +62,17 @@ pub enum CellaComposeError {
         service: String,
     },
 
+    /// Docker Compose version is too old for the requested operation.
+    #[error("Docker Compose >= {required} required for {feature}. Found: {found}")]
+    UnsupportedVersion {
+        /// The minimum required version (e.g., "2.17.0").
+        required: String,
+        /// The detected version (e.g., "2.16.0").
+        found: String,
+        /// The feature that requires the newer version.
+        feature: String,
+    },
+
     /// Dockerfile parsing error.
     #[error("dockerfile error: {message}")]
     DockerfileParse {

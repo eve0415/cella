@@ -168,6 +168,7 @@ async fn execute_compose_build(
             build_dockerfile: Some(fb.combined_dockerfile.clone()),
             build_target: Some(fb.build_target.clone()),
             build_context: fb.build_context.clone(),
+            additional_contexts: fb.additional_contexts.clone(),
         };
         let yaml = cella_compose::override_file::generate_override_yaml(&override_config);
         cella_compose::override_file::write_override_file(&project.override_file, &yaml)?;
