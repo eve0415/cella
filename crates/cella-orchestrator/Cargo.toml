@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cella-backend.workspace = true
+cella-config.workspace = true
 cella-daemon.workspace = true
 cella-docker.workspace = true
 cella-env.workspace = true

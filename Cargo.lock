@@ -530,6 +530,7 @@ name = "cella-orchestrator"
 version = "0.0.10"
 dependencies = [
  "cella-backend",
+ "cella-config",
  "cella-daemon",
  "cella-docker",
  "cella-env",
