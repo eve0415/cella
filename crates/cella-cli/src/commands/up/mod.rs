@@ -83,14 +83,7 @@ impl UpArgs {
     }
 }
 
-/// Whether network blocking rules are enforced.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NetworkRulePolicy {
-    /// Enforce blocking rules from config.
-    Enforce,
-    /// Skip blocking rules (`--no-network-rules`).
-    Skip,
-}
+pub use cella_orchestrator::up::NetworkRulePolicy;
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
