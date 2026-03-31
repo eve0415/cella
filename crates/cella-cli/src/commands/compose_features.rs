@@ -144,8 +144,11 @@ pub async fn resolve_compose_features(
         .await?;
 
     // 6. Generate combined Dockerfile
-    let combined =
-        cella_compose::generate_combined_dockerfile(&original_dockerfile, &resolved.dockerfile);
+    let combined = cella_compose::generate_combined_dockerfile(
+        &original_dockerfile,
+        &resolved.dockerfile,
+        &stage_name,
+    );
 
     // Write to project-specific directory
     let combined_path = compose_dockerfile_path(&project.project_name);

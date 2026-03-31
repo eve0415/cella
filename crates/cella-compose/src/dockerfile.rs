@@ -6,6 +6,8 @@
 //! with the feature installation layers into a single Dockerfile that is
 //! built in one `docker compose build` pass.
 
+use std::fmt::Write;
+
 use crate::error::CellaComposeError;
 
 /// Default stage name added when a FROM line doesn't have an alias.
@@ -81,12 +83,35 @@ pub fn synthetic_dockerfile(image: &str) -> (String, String) {
 
 /// Generate a combined Dockerfile: original content + feature layers.
 ///
+/// Inserts a global-scope `ARG _DEV_CONTAINERS_BASE_IMAGE=<base_image>`
+/// after any parser directives but before the first `FROM`, so that the
+/// feature layers' `FROM $_DEV_CONTAINERS_BASE_IMAGE` resolves correctly
+/// in `docker compose build` (which cannot pass `--build-arg`).
+///
 /// The `feature_dockerfile` should be the output of
 /// `cella_features::dockerfile::generate_dockerfile()` called with the
 /// stage name (from [`ensure_stage_named`] or [`synthetic_dockerfile`])
 /// as the `base_image` parameter.
-pub fn generate_combined_dockerfile(original_content: &str, feature_dockerfile: &str) -> String {
-    let mut combined = original_content.to_string();
+pub fn generate_combined_dockerfile(
+    original_content: &str,
+    feature_dockerfile: &str,
+    base_image: &str,
+) -> String {
+    let directive_end = find_directive_end_offset(original_content);
+    let mut global_arg = String::new();
+    writeln!(global_arg, "ARG _DEV_CONTAINERS_BASE_IMAGE={base_image}").unwrap();
+
+    let mut combined = String::with_capacity(
+        original_content.len() + global_arg.len() + feature_dockerfile.len() + 2,
+    );
+
+    // Preserve parser directives at the top
+    combined.push_str(&original_content[..directive_end]);
+    // Global ARG so FROM $_DEV_CONTAINERS_BASE_IMAGE resolves across stages
+    combined.push_str(&global_arg);
+    // Rest of original Dockerfile
+    combined.push_str(&original_content[directive_end..]);
+
     if !combined.ends_with('\n') {
         combined.push('\n');
     }
@@ -98,6 +123,45 @@ pub fn generate_combined_dockerfile(original_content: &str, feature_dockerfile: 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Find the byte offset where Docker parser directives end.
+///
+/// Docker parser directives (`# syntax=`, `# escape=`, `# check=`) must
+/// appear at the very top of a Dockerfile before any blank lines, comments,
+/// or build instructions. They have the format `# key=value` where key is
+/// a single word. As soon as any non-directive line is encountered
+/// (including blank lines or regular comments), scanning stops.
+///
+/// Returns the byte offset immediately after the last directive's trailing
+/// newline, or 0 if no directives are found.
+fn find_directive_end_offset(content: &str) -> usize {
+    let mut offset = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if let Some(after_hash) = trimmed.strip_prefix('#') {
+            let rest = after_hash.trim_start();
+            if let Some(eq_pos) = rest.find('=') {
+                let key = &rest[..eq_pos];
+                if !key.is_empty() && !key.contains(char::is_whitespace) {
+                    offset += line.len();
+                    let remaining = &content[offset..];
+                    if remaining.starts_with("\r\n") {
+                        offset += 2;
+                    } else if remaining.starts_with('\n') {
+                        offset += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        break;
+    }
+
+    offset
+}
 
 /// A parsed FROM line entry.
 struct FromEntry {
@@ -290,9 +354,13 @@ RUN echo hello
     fn combined_dockerfile() {
         let original = "FROM node:18 AS base\nRUN npm install\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\nUSER root\n";
-        let combined = generate_combined_dockerfile(original, features);
-        assert!(combined.starts_with("FROM node:18 AS base"));
-        assert!(combined.contains("ARG _DEV_CONTAINERS_BASE_IMAGE=base"));
+        let combined = generate_combined_dockerfile(original, features, "base");
+        // Global ARG should appear before the first FROM
+        let arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_BASE_IMAGE=base")
+            .unwrap();
+        let from_pos = combined.find("FROM node:18 AS base").unwrap();
+        assert!(arg_pos < from_pos, "global ARG must precede first FROM");
         assert!(
             combined.contains("FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage")
         );
@@ -302,8 +370,116 @@ RUN echo hello
     fn combined_adds_newline_separator() {
         let original = "FROM node:18";
         let features = "FROM node:18 AS target";
-        let combined = generate_combined_dockerfile(original, features);
-        // Should have a blank line between original and features
-        assert!(combined.contains("FROM node:18\n\nFROM node:18 AS target"));
+        let combined = generate_combined_dockerfile(original, features, "node:18");
+        assert!(combined.contains("ARG _DEV_CONTAINERS_BASE_IMAGE=node:18\nFROM node:18"));
+        assert!(combined.contains("\n\nFROM node:18 AS target"));
+    }
+
+    #[test]
+    fn combined_with_syntax_directive() {
+        let original = "# syntax=docker/dockerfile:1\nFROM node:18 AS base\nRUN npm install\n";
+        let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\nUSER root\n";
+        let combined = generate_combined_dockerfile(original, features, "base");
+
+        // Parser directive must remain at the very top
+        assert!(combined.starts_with("# syntax=docker/dockerfile:1\n"));
+        // Global ARG after directive but before first FROM
+        let arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_BASE_IMAGE=base")
+            .unwrap();
+        let syntax_pos = combined.find("# syntax=docker/dockerfile:1").unwrap();
+        let from_pos = combined.find("FROM node:18 AS base").unwrap();
+        assert!(syntax_pos < arg_pos, "directive must precede global ARG");
+        assert!(arg_pos < from_pos, "global ARG must precede first FROM");
+    }
+
+    #[test]
+    fn combined_with_multiple_directives() {
+        let original = "# syntax=docker/dockerfile:1\n# escape=\\\nFROM ubuntu:22.04 AS base\nRUN apt-get update\n";
+        let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
+        let combined = generate_combined_dockerfile(original, features, "base");
+
+        assert!(combined.starts_with("# syntax=docker/dockerfile:1\n# escape=\\\n"));
+        let arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_BASE_IMAGE=base")
+            .unwrap();
+        let from_pos = combined.find("FROM ubuntu:22.04 AS base").unwrap();
+        assert!(arg_pos < from_pos);
+    }
+
+    #[test]
+    fn combined_no_directives() {
+        let original = "FROM alpine:3.18 AS base\nRUN echo hello\n";
+        let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
+        let combined = generate_combined_dockerfile(original, features, "base");
+
+        assert!(
+            combined.starts_with("ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM alpine:3.18 AS base")
+        );
+    }
+
+    #[test]
+    fn global_arg_always_before_first_from() {
+        // Original has ARG before FROM (common pattern)
+        let original = "ARG BASE=node:18\nFROM $BASE AS builder\nRUN npm install\n";
+        let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=builder\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
+        let combined = generate_combined_dockerfile(original, features, "builder");
+
+        let global_arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_BASE_IMAGE=builder")
+            .unwrap();
+        let first_from_pos = combined.find("FROM").unwrap();
+        assert!(
+            global_arg_pos < first_from_pos,
+            "global ARG must precede first FROM"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // find_directive_end_offset
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn directive_offset_no_directives() {
+        assert_eq!(find_directive_end_offset("FROM node:18\nRUN echo hi\n"), 0);
+    }
+
+    #[test]
+    fn directive_offset_empty_content() {
+        assert_eq!(find_directive_end_offset(""), 0);
+    }
+
+    #[test]
+    fn directive_offset_single_syntax() {
+        let content = "# syntax=docker/dockerfile:1\nFROM node:18\n";
+        assert_eq!(
+            find_directive_end_offset(content),
+            "# syntax=docker/dockerfile:1\n".len()
+        );
+    }
+
+    #[test]
+    fn directive_offset_multiple_directives() {
+        let content = "# syntax=docker/dockerfile:1\n# escape=\\\nFROM node:18\n";
+        let expected = "# syntax=docker/dockerfile:1\n# escape=\\\n".len();
+        assert_eq!(find_directive_end_offset(content), expected);
+    }
+
+    #[test]
+    fn directive_offset_comment_stops_scan() {
+        let content = "# This is a comment\nFROM node:18\n";
+        assert_eq!(find_directive_end_offset(content), 0);
+    }
+
+    #[test]
+    fn directive_offset_blank_line_stops_scan() {
+        let content = "\n# syntax=docker/dockerfile:1\nFROM node:18\n";
+        assert_eq!(find_directive_end_offset(content), 0);
+    }
+
+    #[test]
+    fn directive_offset_only_directives() {
+        let content = "# syntax=docker/dockerfile:1\n# check=skip=all\n";
+        assert_eq!(find_directive_end_offset(content), content.len());
     }
 }
