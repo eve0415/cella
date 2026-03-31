@@ -26,10 +26,12 @@ use std::time::Duration;
 use tracing::{error, info};
 
 /// Agent CLI arguments (parsed manually to avoid clap dep for smaller binary).
+#[cfg_attr(test, derive(Debug))]
 struct AgentArgs {
     command: AgentCommand,
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum AgentCommand {
     /// Run the agent daemon (port watching + credential helper).
     Daemon {
@@ -44,10 +46,14 @@ enum AgentCommand {
 
 fn parse_args() -> Result<AgentArgs, String> {
     let args: Vec<String> = std::env::args().collect();
+    parse_args_from(&args)
+}
+
+fn parse_args_from(args: &[String]) -> Result<AgentArgs, String> {
     if args.len() < 2 {
         return Err(format!(
             "Usage: {} <daemon|browser-open|credential> [options]",
-            args[0]
+            args.first().map_or("cella-agent", String::as_str)
         ));
     }
 
@@ -283,4 +289,153 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
 
     // Wait for watcher (runs forever)
     let _ = watcher_handle.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn parse_daemon_defaults() {
+        let a = parse_args_from(&args(&["cella-agent", "daemon"])).unwrap();
+        assert!(matches!(
+            a.command,
+            AgentCommand::Daemon {
+                poll_interval_ms: 1000,
+                proxy_config_json: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_daemon_with_poll_interval() {
+        let a =
+            parse_args_from(&args(&["cella-agent", "daemon", "--poll-interval", "500"])).unwrap();
+        assert!(matches!(
+            a.command,
+            AgentCommand::Daemon {
+                poll_interval_ms: 500,
+                proxy_config_json: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_daemon_with_proxy_config() {
+        let json = r#"{"listen_port":8080}"#;
+        let a = parse_args_from(&args(&["cella-agent", "daemon", "--proxy-config", json])).unwrap();
+        assert!(
+            matches!(a.command, AgentCommand::Daemon { poll_interval_ms: 1000, proxy_config_json: Some(ref j) } if j == json)
+        );
+    }
+
+    #[test]
+    fn parse_daemon_both_flags() {
+        let json = r#"{"p":1}"#;
+        let a = parse_args_from(&args(&[
+            "cella-agent",
+            "daemon",
+            "--poll-interval",
+            "250",
+            "--proxy-config",
+            json,
+        ]))
+        .unwrap();
+        assert!(
+            matches!(a.command, AgentCommand::Daemon { poll_interval_ms: 250, proxy_config_json: Some(ref j) } if j == json)
+        );
+    }
+
+    #[test]
+    fn parse_daemon_invalid_poll_interval() {
+        let result = parse_args_from(&args(&["cella-agent", "daemon", "--poll-interval", "abc"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid --poll-interval"));
+    }
+
+    #[test]
+    fn parse_daemon_missing_poll_interval_value() {
+        let result = parse_args_from(&args(&["cella-agent", "daemon", "--poll-interval"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing --poll-interval"));
+    }
+
+    #[test]
+    fn parse_daemon_missing_proxy_config_value() {
+        let result = parse_args_from(&args(&["cella-agent", "daemon", "--proxy-config"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing --proxy-config"));
+    }
+
+    #[test]
+    fn parse_daemon_unknown_flag() {
+        let result = parse_args_from(&args(&["cella-agent", "daemon", "--bogus"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown flag"));
+    }
+
+    #[test]
+    fn parse_browser_open() {
+        let a = parse_args_from(&args(&[
+            "cella-agent",
+            "browser-open",
+            "http://localhost:3000",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(a.command, AgentCommand::BrowserOpen { url } if url == "http://localhost:3000")
+        );
+    }
+
+    #[test]
+    fn parse_browser_open_missing_url() {
+        let result = parse_args_from(&args(&["cella-agent", "browser-open"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing URL"));
+    }
+
+    #[test]
+    fn parse_credential() {
+        let a = parse_args_from(&args(&["cella-agent", "credential", "get"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::Credential { operation } if operation == "get"));
+    }
+
+    #[test]
+    fn parse_credential_store() {
+        let a = parse_args_from(&args(&["cella-agent", "credential", "store"])).unwrap();
+        assert!(
+            matches!(a.command, AgentCommand::Credential { operation } if operation == "store")
+        );
+    }
+
+    #[test]
+    fn parse_credential_missing_operation() {
+        let result = parse_args_from(&args(&["cella-agent", "credential"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing operation"));
+    }
+
+    #[test]
+    fn parse_unknown_command() {
+        let result = parse_args_from(&args(&["cella-agent", "foo"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown command: foo"));
+    }
+
+    #[test]
+    fn parse_no_args_returns_usage_error() {
+        let result = parse_args_from(&args(&["cella-agent"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Usage:"));
+    }
+
+    #[test]
+    fn parse_empty_args_returns_error() {
+        let result = parse_args_from(&[]);
+        assert!(result.is_err());
+    }
 }

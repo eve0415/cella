@@ -92,3 +92,28 @@ pub async fn check_daemon() -> CategoryReport {
 
     CategoryReport::new("Daemon", checks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn check_daemon_returns_daemon_category() {
+        let report = check_daemon().await;
+        assert_eq!(report.name, "Daemon");
+        // Should always have at least one check result
+        assert!(!report.checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_daemon_first_check_is_data_dir_or_running() {
+        let report = check_daemon().await;
+        let first = &report.checks[0];
+        // Either "data directory" (if HOME is unset/cella dir missing) or "running"
+        assert!(
+            first.name == "data directory" || first.name == "running",
+            "unexpected first check name: '{}'",
+            first.name
+        );
+    }
+}

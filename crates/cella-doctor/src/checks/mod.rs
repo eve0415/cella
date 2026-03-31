@@ -386,4 +386,205 @@ mod tests {
         );
         assert_eq!(cat.status, Severity::Warning);
     }
+
+    #[test]
+    fn category_report_empty_checks_defaults_to_pass() {
+        let cat = CategoryReport::new("empty", Vec::new());
+        assert_eq!(cat.status, Severity::Pass);
+        assert!(cat.checks.is_empty());
+    }
+
+    #[test]
+    fn category_report_error_dominates_warning() {
+        let cat = CategoryReport::new(
+            "test",
+            vec![
+                CheckResult {
+                    name: "w".into(),
+                    severity: Severity::Warning,
+                    detail: String::new(),
+                    fix_hint: None,
+                },
+                CheckResult {
+                    name: "e".into(),
+                    severity: Severity::Error,
+                    detail: String::new(),
+                    fix_hint: None,
+                },
+                CheckResult {
+                    name: "p".into(),
+                    severity: Severity::Pass,
+                    detail: String::new(),
+                    fix_hint: None,
+                },
+            ],
+        );
+        assert_eq!(cat.status, Severity::Error);
+    }
+
+    #[test]
+    fn category_report_info_only() {
+        let cat = CategoryReport::new(
+            "info",
+            vec![CheckResult {
+                name: "i".into(),
+                severity: Severity::Info,
+                detail: "informational".into(),
+                fix_hint: None,
+            }],
+        );
+        assert_eq!(cat.status, Severity::Info);
+    }
+
+    #[test]
+    fn report_has_errors_empty_categories() {
+        let report = Report {
+            categories: Vec::new(),
+        };
+        assert!(!report.has_errors());
+    }
+
+    #[test]
+    fn report_overall_status_empty() {
+        let report = Report {
+            categories: Vec::new(),
+        };
+        assert_eq!(report.overall_status(), "ok");
+    }
+
+    #[test]
+    fn report_overall_info_only_is_ok() {
+        let report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "i".into(),
+                    severity: Severity::Info,
+                    detail: "info".into(),
+                    fix_hint: None,
+                }],
+            )],
+        };
+        assert_eq!(report.overall_status(), "ok");
+    }
+
+    #[test]
+    fn report_redact_redacts_detail_and_fix_hint() {
+        let redactor = crate::redact::Redactor::new();
+        let mut report = Report {
+            categories: vec![CategoryReport::new(
+                "test",
+                vec![CheckResult {
+                    name: "token".into(),
+                    severity: Severity::Info,
+                    detail: "Token gho_abcdef123456".into(),
+                    fix_hint: Some("Check gho_abcdef123456".into()),
+                }],
+            )],
+        };
+        report.redact(&redactor);
+        assert!(
+            report.categories[0].checks[0].detail.contains("<redacted>"),
+            "detail should be redacted"
+        );
+        assert!(
+            report.categories[0].checks[0]
+                .fix_hint
+                .as_ref()
+                .unwrap()
+                .contains("<redacted>"),
+            "fix_hint should be redacted"
+        );
+    }
+
+    #[test]
+    fn report_to_json_category_key_normalization() {
+        let report = Report {
+            categories: vec![
+                CategoryReport::new(
+                    "Git & Credentials",
+                    vec![CheckResult {
+                        name: "git".into(),
+                        severity: Severity::Pass,
+                        detail: "ok".into(),
+                        fix_hint: None,
+                    }],
+                ),
+                CategoryReport::new(
+                    "System Info",
+                    vec![CheckResult {
+                        name: "cella".into(),
+                        severity: Severity::Info,
+                        detail: "1.0.0".into(),
+                        fix_hint: None,
+                    }],
+                ),
+            ],
+        };
+        let json = report.to_json();
+        // "Git & Credentials" -> "git_credentials"
+        assert!(
+            json["categories"]["git_credentials"].is_object(),
+            "expected 'git_credentials' key, got: {json:?}"
+        );
+        // "System Info" -> "system_info"
+        assert!(
+            json["categories"]["system_info"].is_object(),
+            "expected 'system_info' key"
+        );
+    }
+
+    #[test]
+    fn report_to_json_has_version_and_overall() {
+        let report = Report {
+            categories: Vec::new(),
+        };
+        let json = report.to_json();
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["overall"], "ok");
+        assert!(json["categories"].is_object());
+    }
+
+    #[test]
+    fn check_result_serializes_severity_as_status() {
+        let check = CheckResult {
+            name: "test".into(),
+            severity: Severity::Pass,
+            detail: "ok".into(),
+            fix_hint: None,
+        };
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["status"], "pass");
+        assert!(
+            json.get("fix_hint").is_none(),
+            "None fix_hint should be skipped"
+        );
+    }
+
+    #[test]
+    fn check_result_serializes_fix_hint_when_present() {
+        let check = CheckResult {
+            name: "test".into(),
+            severity: Severity::Warning,
+            detail: "issue".into(),
+            fix_hint: Some("do this".into()),
+        };
+        let json = serde_json::to_value(&check).unwrap();
+        assert_eq!(json["fix_hint"], "do this");
+        assert_eq!(json["status"], "warning");
+    }
+
+    #[test]
+    fn severity_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&Severity::Pass).unwrap(), "\"pass\"");
+        assert_eq!(
+            serde_json::to_string(&Severity::Warning).unwrap(),
+            "\"warning\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Severity::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
+    }
 }

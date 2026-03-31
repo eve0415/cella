@@ -184,3 +184,53 @@ fn check_path_accessible(path: &str) -> CheckResult {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_path_accessible_existing_path() {
+        // /tmp always exists on Linux
+        let result = check_path_accessible("/tmp");
+        assert_eq!(result.severity, Severity::Pass);
+        assert_eq!(result.detail, "/tmp");
+        assert_eq!(result.name, "socket accessible");
+    }
+
+    #[test]
+    fn check_path_accessible_nonexistent_path() {
+        let result = check_path_accessible("/nonexistent/path/that/does/not/exist.sock");
+        assert_eq!(result.severity, Severity::Error);
+        assert!(result.detail.contains("/nonexistent/path"));
+        assert!(result.fix_hint.is_some());
+    }
+
+    #[test]
+    fn check_path_accessible_with_tempfile() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let result = check_path_accessible(path);
+        assert_eq!(result.severity, Severity::Pass);
+        assert_eq!(result.detail, path);
+    }
+
+    #[tokio::test]
+    async fn check_docker_no_client_returns_error() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_docker(&ctx).await;
+        assert_eq!(report.name, "Docker");
+
+        let daemon_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "daemon reachable")
+            .expect("should have daemon reachable check");
+        assert_eq!(daemon_check.severity, Severity::Error);
+        assert!(daemon_check.detail.contains("could not connect"));
+    }
+}

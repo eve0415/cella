@@ -406,4 +406,93 @@ mod tests {
             Some("proxy:3128".to_string())
         );
     }
+
+    // --- Additional edge case tests ---
+
+    #[test]
+    fn parse_host_port_non_standard() {
+        let (host, port) = parse_host_port("myhost:8443").unwrap();
+        assert_eq!(host, "myhost");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn parse_host_port_invalid_port() {
+        assert!(parse_host_port("myhost:notaport").is_none());
+    }
+
+    #[test]
+    fn parse_host_port_port_overflow() {
+        // u16 max is 65535
+        assert!(parse_host_port("myhost:99999").is_none());
+    }
+
+    #[test]
+    fn parse_http_url_https_prefix_rejected() {
+        assert!(parse_http_url("https://example.com/path").is_none());
+    }
+
+    #[test]
+    fn parse_http_url_no_scheme() {
+        assert!(parse_http_url("example.com/path").is_none());
+    }
+
+    #[test]
+    fn parse_http_url_with_query_string() {
+        let (host, port, path) = parse_http_url("http://example.com/api?key=val").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/api?key=val");
+    }
+
+    #[test]
+    fn parse_http_url_invalid_port() {
+        assert!(parse_http_url("http://example.com:abc/path").is_none());
+    }
+
+    #[test]
+    fn parse_proxy_url_no_scheme() {
+        assert!(parse_proxy_url("proxy:3128").is_none());
+    }
+
+    #[test]
+    fn parse_proxy_url_https_scheme() {
+        assert_eq!(
+            parse_proxy_url("https://secure-proxy:443"),
+            Some("secure-proxy:443".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_proxy_url_with_trailing_path() {
+        assert_eq!(
+            parse_proxy_url("http://proxy:3128/some/path"),
+            Some("proxy:3128".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_query_empty_path() {
+        assert_eq!(strip_query(""), "");
+    }
+
+    #[test]
+    fn strip_query_only_question_mark() {
+        assert_eq!(strip_query("?"), "");
+    }
+
+    #[test]
+    fn strip_query_only_hash() {
+        assert_eq!(strip_query("#"), "");
+    }
+
+    #[test]
+    fn strip_query_path_with_both() {
+        assert_eq!(strip_query("/page?q=1#top"), "/page");
+    }
+
+    #[test]
+    fn strip_query_hash_before_question() {
+        assert_eq!(strip_query("/page#section?q=1"), "/page");
+    }
 }

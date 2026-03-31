@@ -519,4 +519,198 @@ mod tests {
         assert!(!method_has_body("HEAD"));
         assert!(!method_has_body("DELETE"));
     }
+
+    // --- Additional header parsing edge cases ---
+
+    #[test]
+    fn parse_method_and_path_post() {
+        let headers = b"POST /submit HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/submit");
+    }
+
+    #[test]
+    fn parse_method_and_path_empty_bytes() {
+        let headers = b"";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_method_and_path_single_word() {
+        let headers = b"CONNECT\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "CONNECT");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_content_length_mixed_case() {
+        // Test the case-insensitive branch with "Content-length:" (not exact prefix match).
+        let headers = b"GET / HTTP/1.1\r\nContent-length: 77\r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(77));
+    }
+
+    #[test]
+    fn parse_content_length_uppercase() {
+        let headers = b"GET / HTTP/1.1\r\nCONTENT-LENGTH: 55\r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(55));
+    }
+
+    #[test]
+    fn parse_content_length_invalid_value() {
+        let headers = b"GET / HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n";
+        assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn chunked_transfer_mixed_case() {
+        let headers = b"POST / HTTP/1.1\r\nTRANSFER-ENCODING: chunked\r\n\r\n";
+        assert!(is_chunked_transfer(headers));
+    }
+
+    #[test]
+    fn chunked_transfer_not_set() {
+        let headers = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(!is_chunked_transfer(headers));
+    }
+
+    #[test]
+    fn chunked_transfer_invalid_utf8() {
+        let headers = &[0xFF, 0xFE, 0xFD];
+        assert!(!is_chunked_transfer(headers));
+    }
+
+    #[test]
+    fn connection_close_mixed_case() {
+        let headers = b"HTTP/1.1 200 OK\r\nCONNECTION: close\r\n\r\n";
+        assert!(has_connection_close(headers));
+    }
+
+    #[test]
+    fn connection_close_not_present() {
+        let headers = b"HTTP/1.1 200 OK\r\n\r\n";
+        assert!(!has_connection_close(headers));
+    }
+
+    #[test]
+    fn connection_close_invalid_utf8() {
+        let headers = &[0xFF, 0xFE];
+        assert!(!has_connection_close(headers));
+    }
+
+    #[test]
+    fn method_has_body_case_insensitive() {
+        assert!(method_has_body("post"));
+        assert!(method_has_body("Put"));
+        assert!(method_has_body("PATCH"));
+        assert!(!method_has_body("get"));
+        assert!(!method_has_body("head"));
+        assert!(!method_has_body("OPTIONS"));
+        assert!(!method_has_body("TRACE"));
+    }
+
+    // --- Async relay tests ---
+
+    #[tokio::test]
+    async fn read_request_headers_basic() {
+        let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_request_headers(&mut reader, &mut buf).await;
+        assert!(result.is_ok());
+        assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn read_request_headers_empty_stream() {
+        let data = b"";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_request_headers(&mut reader, &mut buf).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_request_headers_multiple_headers() {
+        let data = b"POST /api HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 5\r\n\r\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_request_headers(&mut reader, &mut buf).await;
+        assert!(result.is_ok());
+        assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn relay_fixed_body() {
+        let body = b"hello world";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_fixed(&mut reader, &mut writer, body.len() as u64).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, body);
+    }
+
+    #[tokio::test]
+    async fn relay_fixed_body_empty() {
+        let body = b"";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_fixed(&mut reader, &mut writer, 0).await;
+        assert!(result.is_ok());
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_fixed_body_premature_eof() {
+        let body = b"short";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_fixed(&mut reader, &mut writer, 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_body_no_body() {
+        let data = b"";
+        let mut reader = BufReader::new(&data[..]);
+        let mut writer = Vec::new();
+        // No content-length, not chunked: should be a no-op.
+        let result = relay_body(&mut reader, &mut writer, None, false).await;
+        assert!(result.is_ok());
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_body_with_content_length() {
+        let body = b"abcde";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_body(&mut reader, &mut writer, Some(5), false).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, b"abcde");
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_body() {
+        // A valid chunked body: one chunk of "hello" (5 bytes) then terminal chunk.
+        let chunked = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let mut writer = Vec::new();
+        let result = relay_chunked(&mut reader, &mut writer).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, chunked);
+    }
+
+    #[tokio::test]
+    async fn relay_body_chunked_mode() {
+        let chunked = b"3\r\nabc\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let mut writer = Vec::new();
+        let result = relay_body(&mut reader, &mut writer, None, true).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, chunked);
+    }
 }

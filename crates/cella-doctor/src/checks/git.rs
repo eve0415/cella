@@ -160,4 +160,33 @@ mod tests {
             "Docker Desktop VM"
         );
     }
+
+    #[test]
+    fn classify_ssh_socket_case_insensitive() {
+        assert_eq!(
+            classify_ssh_socket("/run/OrbStack/SSH-Agent.sock"),
+            "OrbStack"
+        );
+        assert_eq!(
+            classify_ssh_socket("/var/run/Docker-Desktop/agent.sock"),
+            "Docker Desktop VM"
+        );
+        assert_eq!(
+            classify_ssh_socket("/Users/x/.Colima/default/ssh.sock"),
+            "Colima"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_socket_empty_string() {
+        assert_eq!(classify_ssh_socket(""), "host-native");
+    }
+
+    #[test]
+    fn classify_ssh_socket_windows_style_path() {
+        assert_eq!(
+            classify_ssh_socket(r"C:\Users\x\AppData\ssh-agent.sock"),
+            "host-native"
+        );
+    }
 }

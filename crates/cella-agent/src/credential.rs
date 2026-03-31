@@ -109,4 +109,53 @@ mod tests {
         let fields = parse_credential_fields("");
         assert!(fields.is_empty());
     }
+
+    #[test]
+    fn parse_with_password() {
+        let input = "protocol=https\nhost=github.com\nusername=user\npassword=secret\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.get("protocol"), Some(&"https".to_string()));
+        assert_eq!(fields.get("host"), Some(&"github.com".to_string()));
+        assert_eq!(fields.get("username"), Some(&"user".to_string()));
+        assert_eq!(fields.get("password"), Some(&"secret".to_string()));
+    }
+
+    #[test]
+    fn parse_lines_without_equals_are_skipped() {
+        let input = "protocol=https\nbadline\nhost=github.com\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains_key("protocol"));
+        assert!(fields.contains_key("host"));
+    }
+
+    #[test]
+    fn parse_value_with_equals_sign() {
+        // Git credential protocol allows values with = (e.g., oauth tokens).
+        let input = "password=abc=def=ghi\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.get("password"), Some(&"abc=def=ghi".to_string()));
+    }
+
+    #[test]
+    fn parse_trailing_newlines_and_blanks() {
+        let input = "protocol=https\n\n\nhost=github.com\n\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn parse_only_blank_lines() {
+        let input = "\n\n\n";
+        let fields = parse_credential_fields(input);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parse_single_field() {
+        let input = "host=example.com";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields.get("host"), Some(&"example.com".to_string()));
+    }
 }

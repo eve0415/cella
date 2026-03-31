@@ -105,3 +105,130 @@ pub fn check_config(ctx: &CheckContext) -> CategoryReport {
 
     CategoryReport::new("Configuration", checks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with_workspace(path: Option<std::path::PathBuf>) -> CheckContext {
+        CheckContext {
+            workspace_folder: path,
+            all: false,
+            docker_client: None,
+        }
+    }
+
+    #[test]
+    fn no_workspace_returns_info() {
+        let ctx = ctx_with_workspace(None);
+        let report = check_config(&ctx);
+        assert_eq!(report.name, "Configuration");
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, "workspace");
+        assert_eq!(report.checks[0].severity, Severity::Info);
+        assert!(report.checks[0].detail.contains("no workspace"));
+    }
+
+    #[test]
+    fn workspace_without_devcontainer_json_returns_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_workspace(Some(tmp.path().to_path_buf()));
+        let report = check_config(&ctx);
+
+        // Should get a "not found" info result
+        let config_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "devcontainer.json")
+            .expect("should have devcontainer.json check");
+        assert_eq!(config_check.severity, Severity::Info);
+        assert!(config_check.detail.contains("not found"));
+        assert!(config_check.fix_hint.is_some());
+    }
+
+    #[test]
+    fn workspace_with_valid_devcontainer_json_returns_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dc_dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            r#"{ "name": "test", "image": "ubuntu" }"#,
+        )
+        .unwrap();
+
+        let ctx = ctx_with_workspace(Some(tmp.path().to_path_buf()));
+        let report = check_config(&ctx);
+
+        let discovery_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "devcontainer.json")
+            .expect("should have devcontainer.json check");
+        assert_eq!(discovery_check.severity, Severity::Pass);
+
+        let valid_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "config valid")
+            .expect("should have config valid check");
+        assert_eq!(valid_check.severity, Severity::Pass);
+        assert!(valid_check.detail.contains("parsed successfully"));
+    }
+
+    #[test]
+    fn workspace_with_invalid_json_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dc_dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "{ this is not valid json !!!",
+        )
+        .unwrap();
+
+        let ctx = ctx_with_workspace(Some(tmp.path().to_path_buf()));
+        let report = check_config(&ctx);
+
+        let valid_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "config valid")
+            .expect("should have config valid check");
+        assert_eq!(valid_check.severity, Severity::Error);
+        assert!(valid_check.detail.contains("parse failed"));
+    }
+
+    #[test]
+    fn workspace_with_ambiguous_configs_returns_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dc_dir = tmp.path().join(".devcontainer");
+
+        // Create two subfolder configs to trigger Ambiguous
+        let sub_a = dc_dir.join("alpha");
+        let sub_b = dc_dir.join("beta");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        std::fs::write(
+            sub_a.join("devcontainer.json"),
+            r#"{ "name": "a", "image": "ubuntu" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sub_b.join("devcontainer.json"),
+            r#"{ "name": "b", "image": "ubuntu" }"#,
+        )
+        .unwrap();
+
+        let ctx = ctx_with_workspace(Some(tmp.path().to_path_buf()));
+        let report = check_config(&ctx);
+
+        let config_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "devcontainer.json")
+            .expect("should have devcontainer.json check");
+        assert_eq!(config_check.severity, Severity::Warning);
+        assert!(config_check.detail.contains("multiple configs found"));
+    }
+}

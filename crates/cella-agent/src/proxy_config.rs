@@ -118,3 +118,116 @@ struct RuleJson {
     paths: Vec<String>,
     action: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_json(mode: &str, rules: &str, extras: &str) -> String {
+        format!(r#"{{"listen_port":8080,"mode":"{mode}","rules":[{rules}]{extras}}}"#,)
+    }
+
+    #[test]
+    fn from_json_denylist_mode() {
+        let json = make_json("denylist", r#"{"domain":"evil.com","action":"block"}"#, "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.listen_port, 8080);
+        assert!(config.upstream_proxy.is_none());
+        assert!(config.ca_cert_pem.is_none());
+        assert!(config.ca_key_pem.is_none());
+
+        // evil.com should be blocked in denylist mode.
+        let v = config.matcher.evaluate("evil.com", "/");
+        assert!(!v.allowed);
+
+        // Other domains should be allowed in denylist mode.
+        let v = config.matcher.evaluate("good.com", "/");
+        assert!(v.allowed);
+    }
+
+    #[test]
+    fn from_json_allowlist_mode() {
+        let json = make_json("allowlist", r#"{"domain":"good.com","action":"allow"}"#, "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        let v = config.matcher.evaluate("good.com", "/");
+        assert!(v.allowed);
+
+        // Non-allowed domains should be blocked in allowlist mode.
+        let v = config.matcher.evaluate("other.com", "/");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn from_json_with_upstream_proxy() {
+        let json = make_json("denylist", "", r#","upstream_proxy":"http://proxy:3128""#);
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.upstream_proxy.as_deref(), Some("http://proxy:3128"));
+    }
+
+    #[test]
+    fn from_json_with_ca_materials() {
+        let json = make_json(
+            "denylist",
+            "",
+            r#","ca_cert_pem":"CERT_PEM","ca_key_pem":"KEY_PEM""#,
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert_eq!(config.ca_cert_pem.as_deref(), Some("CERT_PEM"));
+        assert_eq!(config.ca_key_pem.as_deref(), Some("KEY_PEM"));
+    }
+
+    #[test]
+    fn from_json_invalid_json() {
+        let result = AgentProxyConfig::from_json("not json");
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.contains("invalid proxy config"));
+    }
+
+    #[test]
+    fn from_json_empty_rules() {
+        let json = make_json("denylist", "", "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        // With denylist and no rules, everything is allowed.
+        let v = config.matcher.evaluate("anything.com", "/");
+        assert!(v.allowed);
+    }
+
+    #[test]
+    fn from_json_multiple_rules() {
+        let rules = r#"{"domain":"evil.com","action":"block"},{"domain":"bad.org","paths":["/secret"],"action":"block"}"#;
+        let json = make_json("denylist", rules, "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        let v = config.matcher.evaluate("evil.com", "/");
+        assert!(!v.allowed);
+        let v = config.matcher.evaluate("bad.org", "/secret");
+        assert!(!v.allowed);
+        let v = config.matcher.evaluate("bad.org", "/public");
+        assert!(v.allowed);
+    }
+
+    #[test]
+    fn from_json_unknown_mode_defaults_to_denylist() {
+        let json = make_json(
+            "unknown_mode",
+            r#"{"domain":"evil.com","action":"block"}"#,
+            "",
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        // Should behave as denylist.
+        let v = config.matcher.evaluate("evil.com", "/");
+        assert!(!v.allowed);
+        let v = config.matcher.evaluate("good.com", "/");
+        assert!(v.allowed);
+    }
+
+    #[test]
+    fn log_blocked_does_not_panic() {
+        let json = make_json("denylist", "", "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        // Should not panic even if log file is available or not.
+        config.log_blocked("evil.com", "/", "test reason");
+    }
+}

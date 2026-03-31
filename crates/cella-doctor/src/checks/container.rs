@@ -307,3 +307,43 @@ async fn check_ports(checks: &mut Vec<CheckResult>, container_name: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_no_docker(workspace: Option<std::path::PathBuf>) -> CheckContext {
+        CheckContext {
+            workspace_folder: workspace,
+            all: false,
+            docker_client: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_when_daemon_not_running() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, false).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].checks[0].name, "skipped");
+        assert_eq!(reports[0].checks[0].severity, Severity::Info);
+        assert!(reports[0].checks[0].detail.contains("daemon not running"));
+    }
+
+    #[tokio::test]
+    async fn skip_when_no_docker_client() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, true).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].checks[0].name, "skipped");
+        assert!(reports[0].checks[0].detail.contains("Docker not connected"));
+    }
+
+    #[tokio::test]
+    async fn skip_workspace_container_when_no_workspace() {
+        let ctx = ctx_no_docker(Some(std::path::PathBuf::from("/nonexistent")));
+        let reports = check_containers(&ctx, false).await;
+        assert_eq!(reports[0].checks[0].name, "skipped");
+        assert!(reports[0].checks[0].detail.contains("daemon not running"));
+    }
+}
