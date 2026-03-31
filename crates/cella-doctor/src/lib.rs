@@ -4,5 +4,6 @@
 //! daemon status, configuration, and running containers.
 
 pub mod checks;
-pub mod host_requirements;
+/// Re-export from `cella_orchestrator` for backward compatibility.
+pub use cella_orchestrator::host_requirements;
 pub mod redact;

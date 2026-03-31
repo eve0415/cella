@@ -1283,7 +1283,7 @@ impl UpContext {
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
         // Validate hostRequirements
         if self.config().get("hostRequirements").is_some() {
-            let result = cella_doctor::host_requirements::validate(
+            let result = cella_orchestrator::host_requirements::validate(
                 self.config(),
                 &self.resolved.workspace_root,
             );

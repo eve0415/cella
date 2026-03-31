@@ -118,7 +118,7 @@ fn check_gpu(checks: &mut Vec<RequirementCheck>, gpu: &Value) {
 
 /// Parse a memory/storage string like "8gb", "512mb", "4096" into bytes.
 pub fn parse_memory_string(s: &str) -> Option<u64> {
-    cella_orchestrator::config_map::run_args::parse_byte_size(s).and_then(|v| u64::try_from(v).ok())
+    crate::config_map::run_args::parse_byte_size(s).and_then(|v| u64::try_from(v).ok())
 }
 
 /// Get total system memory in bytes.
