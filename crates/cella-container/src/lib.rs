@@ -9,3 +9,6 @@ pub mod discovery;
 pub mod sdk;
 
 pub use backend::AppleContainerBackend;
+
+#[cfg(all(test, feature = "integration-tests", target_os = "macos"))]
+mod integration_tests;
