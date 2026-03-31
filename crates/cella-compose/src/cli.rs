@@ -554,4 +554,97 @@ mod tests {
         // No -f flags
         assert_eq!(args.len(), 3);
     }
+
+    #[test]
+    fn from_project_name_has_no_compose_files() {
+        let cmd = ComposeCommand::from_project_name("cella-test");
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+        // Should only have: compose --project-name cella-test
+        assert!(!args.iter().any(|a| *a == "-f"), "expected no -f flags");
+    }
+
+    #[test]
+    fn without_override_multiple_compose_files() {
+        let project = ComposeProject {
+            project_name: "cella-multi-abc12345".to_string(),
+            compose_files: vec![
+                PathBuf::from("/workspace/docker-compose.yml"),
+                PathBuf::from("/workspace/docker-compose.dev.yml"),
+                PathBuf::from("/workspace/docker-compose.test.yml"),
+            ],
+            override_file: PathBuf::from(
+                "/home/user/.cella/compose/cella-multi-abc12345/docker-compose.cella.yml",
+            ),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace/.devcontainer"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+        };
+
+        let cmd = ComposeCommand::without_override(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+
+        // Count -f flags — should be exactly 3 (one per compose file, no override)
+        let f_count = args.iter().filter(|a| **a == "-f").count();
+        assert_eq!(f_count, 3);
+        assert!(args.contains(&std::ffi::OsStr::new("/workspace/docker-compose.yml")));
+        assert!(args.contains(&std::ffi::OsStr::new("/workspace/docker-compose.dev.yml")));
+        assert!(args.contains(&std::ffi::OsStr::new("/workspace/docker-compose.test.yml")));
+        // Override file must NOT appear
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("cella.yml")));
+    }
+
+    #[test]
+    fn new_includes_override_file() {
+        let project = ComposeProject {
+            project_name: "cella-ov-abc12345".to_string(),
+            compose_files: vec![PathBuf::from("/workspace/docker-compose.yml")],
+            override_file: PathBuf::from(
+                "/home/user/.cella/compose/cella-ov-abc12345/docker-compose.cella.yml",
+            ),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace/.devcontainer"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+        };
+
+        let cmd = ComposeCommand::new(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+
+        // Override file should be the last -f argument
+        let last_f_idx = args.iter().rposition(|a| *a == "-f").expect("no -f flag found");
+        let override_arg = &args[last_f_idx + 1];
+        assert!(
+            override_arg.to_string_lossy().contains("docker-compose.cella.yml"),
+            "override file should be last -f arg, got: {override_arg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_compose_version_two_part() {
+        // Only major.minor — missing patch should return None
+        assert_eq!(
+            parse_compose_version("Docker Compose version v2.17"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_compose_version_very_large() {
+        assert_eq!(
+            parse_compose_version("Docker Compose version v99.99.99"),
+            Some((99, 99, 99))
+        );
+    }
 }

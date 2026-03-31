@@ -176,4 +176,49 @@ mod tests {
             CellaComposeError::FileNotFound { .. }
         ));
     }
+
+    #[test]
+    fn validate_run_services_all_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_compose(
+            &dir,
+            "docker-compose.yml",
+            "services:\n  app:\n    image: node\n  db:\n    image: postgres\n  redis:\n    image: redis\n",
+        );
+        let result = validate_run_services(
+            &[&path],
+            &["app".to_string(), "db".to_string()],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_run_services_one_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_compose(
+            &dir,
+            "docker-compose.yml",
+            "services:\n  app:\n    image: node\n  db:\n    image: postgres\n",
+        );
+        let err = validate_run_services(
+            &[&path],
+            &["app".to_string(), "cache".to_string()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, CellaComposeError::ServiceNotFound { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("cache"));
+    }
+
+    #[test]
+    fn validate_run_services_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_compose(
+            &dir,
+            "docker-compose.yml",
+            "services:\n  app:\n    image: node\n",
+        );
+        let result = validate_run_services(&[&path], &[]);
+        assert!(result.is_ok());
+    }
 }

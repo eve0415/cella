@@ -377,4 +377,55 @@ mod tests {
         let err = ComposeProject::from_resolved(&config, &config_path, dir.path()).unwrap_err();
         assert!(matches!(err, CellaComposeError::MissingField { .. }));
     }
+
+    #[test]
+    fn sanitize_collapses_mixed_separators() {
+        assert_eq!(sanitize_name("a._-b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_trailing_dashes() {
+        assert_eq!(sanitize_name("-my-app-"), "my-app");
+    }
+
+    #[test]
+    fn from_resolved_with_run_services() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  app:\n    image: node\n  db:\n    image: postgres\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("devcontainer.json");
+        let config = serde_json::json!({
+            "dockerComposeFile": "docker-compose.yml",
+            "service": "app",
+            "workspaceFolder": "/workspaces/myapp",
+            "runServices": ["app", "db"]
+        });
+
+        let project = ComposeProject::from_resolved(&config, &config_path, dir.path()).unwrap();
+        let run_services = project.run_services.expect("run_services should be Some");
+        assert_eq!(run_services, vec!["app", "db"]);
+    }
+
+    #[test]
+    fn from_resolved_missing_workspace_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  app:\n    image: node\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("devcontainer.json");
+        let config = serde_json::json!({
+            "dockerComposeFile": "docker-compose.yml",
+            "service": "app"
+        });
+
+        let err = ComposeProject::from_resolved(&config, &config_path, dir.path()).unwrap_err();
+        assert!(matches!(err, CellaComposeError::MissingField { ref field } if field == "workspaceFolder"));
+    }
 }
