@@ -187,6 +187,70 @@ pub enum GpuRequest {
     DeviceIds(Vec<String>),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // ContainerState::parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_running() {
+        assert_eq!(ContainerState::parse("running"), ContainerState::Running);
+    }
+
+    #[test]
+    fn parse_exited() {
+        assert_eq!(ContainerState::parse("exited"), ContainerState::Stopped);
+    }
+
+    #[test]
+    fn parse_dead() {
+        assert_eq!(ContainerState::parse("dead"), ContainerState::Stopped);
+    }
+
+    #[test]
+    fn parse_created() {
+        assert_eq!(ContainerState::parse("created"), ContainerState::Created);
+    }
+
+    #[test]
+    fn parse_removing() {
+        assert_eq!(ContainerState::parse("removing"), ContainerState::Removing);
+    }
+
+    #[test]
+    fn parse_unknown_state() {
+        assert_eq!(
+            ContainerState::parse("paused"),
+            ContainerState::Other("paused".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_string() {
+        assert_eq!(
+            ContainerState::parse(""),
+            ContainerState::Other(String::new())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BackendKind::Display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn display_docker() {
+        assert_eq!(BackendKind::Docker.to_string(), "docker");
+    }
+
+    #[test]
+    fn display_apple_container() {
+        assert_eq!(BackendKind::AppleContainer.to_string(), "apple-container");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Container creation options
 // ---------------------------------------------------------------------------

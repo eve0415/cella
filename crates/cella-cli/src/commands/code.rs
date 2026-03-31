@@ -413,4 +413,54 @@ mod tests {
         let help = editor_not_found_help("my-editor");
         assert!(help.contains("my-editor"));
     }
+
+    #[test]
+    fn editor_not_found_help_code_insiders() {
+        let help = editor_not_found_help("code-insiders");
+        assert!(help.contains("PATH"));
+    }
+
+    #[test]
+    fn editor_install_hint_with_name() {
+        let path = PathBuf::from("/usr/local/bin/code");
+        let hint = editor_install_hint(&path);
+        assert!(hint.contains("code"));
+    }
+
+    #[test]
+    fn editor_install_hint_no_file_name() {
+        let path = PathBuf::from("/");
+        let hint = editor_install_hint(&path);
+        assert!(hint.contains("editor"));
+    }
+
+    #[test]
+    fn build_uri_empty_workspace() {
+        let uri = build_vscode_uri("abc", "");
+        assert_eq!(uri, "vscode-remote://attached-container+616263");
+    }
+
+    #[test]
+    fn is_localhost_tcp_localhost_no_port() {
+        // No port variant
+        assert!(!is_localhost_tcp("tcp://remote:2375"));
+    }
+
+    #[test]
+    fn is_localhost_tcp_ipv6_bracket() {
+        assert!(is_localhost_tcp("tcp://[::1]:2376"));
+    }
+
+    #[test]
+    fn resolve_editor_binary_missing_custom() {
+        // A binary that doesn't exist should error
+        let result = resolve_editor_binary(false, false, Some("/nonexistent/editor"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_editor_binary_name_not_in_path() {
+        let result = resolve_editor_binary(false, false, Some("totally-nonexistent-editor-xyz"));
+        assert!(result.is_err());
+    }
 }

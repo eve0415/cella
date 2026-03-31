@@ -182,4 +182,51 @@ mod tests {
         assert_eq!(domain, "example.com");
         assert_eq!(path, "/");
     }
+
+    #[test]
+    fn parse_https_root_path() {
+        let (domain, path) = parse_url_parts("https://example.com/");
+        assert_eq!(domain, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_http_no_path() {
+        let (domain, path) = parse_url_parts("http://example.com");
+        assert_eq!(domain, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_domain_with_port_no_path() {
+        let (domain, path) = parse_url_parts("example.com:8080");
+        assert_eq!(domain, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_deep_path() {
+        let (domain, path) = parse_url_parts("https://api.example.com/v2/users/123");
+        assert_eq!(domain, "api.example.com");
+        assert_eq!(path, "/v2/users/123");
+    }
+
+    #[test]
+    fn parse_url_with_query_string() {
+        let (domain, path) = parse_url_parts("https://example.com/search?q=test");
+        assert_eq!(domain, "example.com");
+        assert_eq!(path, "/search?q=test");
+    }
+
+    #[test]
+    fn dirs_home_returns_path() {
+        let home = dirs_home();
+        assert!(!home.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn execute_log_does_not_panic() {
+        // execute_log just prints instructions
+        execute_log();
+    }
 }
