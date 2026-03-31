@@ -3,7 +3,6 @@
 use cella_templates::types::{OutputFormat, SelectedFeature};
 
 /// Display a summary of the init configuration before writing.
-#[expect(dead_code, reason = "used by wizard in Phase 5")]
 pub fn display_summary(
     template_name: &str,
     template_options: &[(String, String)],
