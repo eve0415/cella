@@ -152,7 +152,7 @@ impl Command {
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
-            Self::Init(args) => args.execute(),
+            Self::Init(args) => args.execute(progress).await,
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
             Self::Completions(args) => {
