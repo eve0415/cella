@@ -1,0 +1,8 @@
+{
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "./test-feature": {}
+  }
+}

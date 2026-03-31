@@ -349,6 +349,18 @@ impl ComposeCommand {
 
         Ok(())
     }
+
+    /// Run `docker compose down --volumes --remove-orphans` for thorough cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `docker compose` CLI is not found or if the
+    /// command exits with a non-zero status.
+    pub async fn down_and_clean(&self) -> Result<(), CellaComposeError> {
+        let mut cmd = self.base_command();
+        cmd.args(["down", "--volumes", "--remove-orphans"]);
+        self.run_streaming(cmd, "down").await
+    }
 }
 
 /// Check that `docker compose` V2 is available.
@@ -597,7 +609,11 @@ mod tests {
         assert!(args.contains(&std::ffi::OsStr::new("/workspace/docker-compose.dev.yml")));
         assert!(args.contains(&std::ffi::OsStr::new("/workspace/docker-compose.test.yml")));
         // Override file must NOT appear
-        assert!(!args.iter().any(|a| a.to_string_lossy().contains("cella.yml")));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.to_string_lossy().contains("cella.yml"))
+        );
     }
 
     #[test]
@@ -623,10 +639,15 @@ mod tests {
         let args: Vec<_> = base.as_std().get_args().collect();
 
         // Override file should be the last -f argument
-        let last_f_idx = args.iter().rposition(|a| *a == "-f").expect("no -f flag found");
+        let last_f_idx = args
+            .iter()
+            .rposition(|a| *a == "-f")
+            .expect("no -f flag found");
         let override_arg = &args[last_f_idx + 1];
         assert!(
-            override_arg.to_string_lossy().contains("docker-compose.cella.yml"),
+            override_arg
+                .to_string_lossy()
+                .contains("docker-compose.cella.yml"),
             "override file should be last -f arg, got: {override_arg:?}"
         );
     }
@@ -634,10 +655,7 @@ mod tests {
     #[test]
     fn parse_compose_version_two_part() {
         // Only major.minor — missing patch should return None
-        assert_eq!(
-            parse_compose_version("Docker Compose version v2.17"),
-            None
-        );
+        assert_eq!(parse_compose_version("Docker Compose version v2.17"), None);
     }
 
     #[test]

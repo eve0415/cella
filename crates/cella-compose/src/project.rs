@@ -135,6 +135,14 @@ impl ComposeProject {
             config_hash,
         })
     }
+
+    /// Override the project name and recompute the override file path.
+    #[must_use]
+    pub fn with_project_name(mut self, name: String) -> Self {
+        self.override_file = compose_override_path(&name);
+        self.project_name = name;
+        self
+    }
 }
 
 /// Extract and resolve compose file paths from the config.
@@ -426,6 +434,8 @@ mod tests {
         });
 
         let err = ComposeProject::from_resolved(&config, &config_path, dir.path()).unwrap_err();
-        assert!(matches!(err, CellaComposeError::MissingField { ref field } if field == "workspaceFolder"));
+        assert!(
+            matches!(err, CellaComposeError::MissingField { ref field } if field == "workspaceFolder")
+        );
     }
 }
