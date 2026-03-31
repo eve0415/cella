@@ -8,6 +8,7 @@ license.workspace = true
 cella-backend.workspace = true
 cella-docker.workspace = true
 cella-features.workspace = true
+cella-port.workspace = true
 cella-git.workspace = true
 cella-network.workspace = true
 hex.workspace = true

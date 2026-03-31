@@ -6,6 +6,7 @@
 
 pub mod branch;
 pub mod config;
+pub mod config_map;
 pub mod docker_helpers;
 pub mod error;
 pub mod image;

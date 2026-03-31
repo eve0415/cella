@@ -116,7 +116,7 @@ struct ImageConfig {
     image_env: Vec<String>,
     remote_user: String,
     env_fwd: cella_env::EnvForwarding,
-    create_opts: cella_docker::config_map::CreateContainerOptions,
+    create_opts: cella_orchestrator::config_map::CreateContainerOptions,
 }
 
 impl UpContext {
@@ -634,12 +634,12 @@ impl UpContext {
             );
         }
 
-        let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
+        let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
         let other_ports_attrs =
-            cella_docker::config_map::ports::parse_other_ports_attributes(config);
+            cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
         labels.insert(
             "dev.cella.ports_attributes".to_string(),
-            cella_docker::config_map::ports::serialize_ports_attributes_label(
+            cella_orchestrator::config_map::ports::serialize_ports_attributes_label(
                 &ports_attrs,
                 other_ports_attrs.as_ref(),
             ),
@@ -817,9 +817,9 @@ impl UpContext {
             })
             .unwrap_or_default();
 
-        let ports_attrs = cella_docker::config_map::ports::parse_ports_attributes(config);
+        let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
         let other_ports_attrs =
-            cella_docker::config_map::ports::parse_other_ports_attributes(config);
+            cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
         let shutdown_action = config
             .get("shutdownAction")
             .and_then(|v| v.as_str())
@@ -1133,8 +1133,8 @@ impl UpContext {
         };
         let effective_feature_config = feature_config.or(image_meta_config.as_ref());
 
-        let create_opts =
-            cella_docker::config_map::map_config(cella_docker::config_map::MapConfigParams {
+        let create_opts = cella_orchestrator::config_map::map_config(
+            cella_orchestrator::config_map::MapConfigParams {
                 config,
                 container_name: &self.container_nm,
                 image_name: img_name,
@@ -1143,7 +1143,8 @@ impl UpContext {
                 feature_config: effective_feature_config,
                 image_env: &image_env,
                 agent_arch,
-            });
+            },
+        );
 
         ImageConfig {
             image_env,

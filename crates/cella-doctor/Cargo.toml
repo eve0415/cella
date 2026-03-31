@@ -8,6 +8,7 @@ license.workspace = true
 cella-config.workspace = true
 cella-daemon.workspace = true
 cella-docker.workspace = true
+cella-orchestrator.workspace = true
 cella-env.workspace = true
 cella-port.workspace = true
 serde.workspace = true

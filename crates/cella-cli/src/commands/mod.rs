@@ -390,7 +390,9 @@ async fn re_register_containers(
         let (ports_attrs, other_ports_attrs) = container
             .labels
             .get("dev.cella.ports_attributes")
-            .map(|label| cella_docker::config_map::ports::deserialize_ports_attributes_label(label))
+            .map(|label| {
+                cella_orchestrator::config_map::ports::deserialize_ports_attributes_label(label)
+            })
             .unwrap_or_default();
 
         let shutdown_action = container.labels.get("dev.cella.shutdown_action").cloned();

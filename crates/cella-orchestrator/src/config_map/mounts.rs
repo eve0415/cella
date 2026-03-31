@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::MountConfig;
+use cella_backend::MountConfig;
 
 pub(super) fn map_workspace_mount(
     config: &serde_json::Value,
@@ -69,7 +69,7 @@ pub(super) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConf
         .collect()
 }
 
-pub(super) fn parse_mount_string(s: &str) -> Option<MountConfig> {
+pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
     let mut mount_type = "bind".to_string();
     let mut source = String::new();
     let mut target = String::new();
