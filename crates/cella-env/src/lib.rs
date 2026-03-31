@@ -134,7 +134,7 @@ fn apply_git_config(fwd: &mut EnvForwarding) {
 
 /// Apply credential forwarding via the agent-based credential helper.
 ///
-/// Always installs the git credential helper pointing to `/cella/bin/cella-credential`.
+/// Always installs the git credential helper pointing to the agent binary.
 /// The in-container agent handles transport to the host daemon automatically.
 fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
     fwd.post_start.git_config_commands.push(vec![
@@ -142,7 +142,7 @@ fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
         "config".to_string(),
         "--global".to_string(),
         "credential.helper".to_string(),
-        "/cella/bin/cella-credential".to_string(),
+        "/cella/bin/cella-agent credential".to_string(),
     ]);
 }
 
