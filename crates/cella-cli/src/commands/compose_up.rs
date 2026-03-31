@@ -77,8 +77,7 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
         if ctx.remove_container || ctx.build_no_cache {
             ctx.progress
                 .run_step_result("Stopping existing compose project...", async {
-                    let compose_cmd =
-                        ComposeCommand::from_project_name(&project.project_name);
+                    let compose_cmd = ComposeCommand::from_project_name(&project.project_name);
                     compose_cmd.down().await
                 })
                 .await?;

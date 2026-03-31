@@ -6,9 +6,8 @@ use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
 use cella_docker::{
-    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions,
-    ImageDetails, LifecycleContext, MountConfig, container_labels, container_name,
-    update_remote_user_uid,
+    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, ImageDetails,
+    LifecycleContext, MountConfig, container_labels, container_name, update_remote_user_uid,
 };
 
 mod lifecycle;
@@ -1406,7 +1405,6 @@ fn lifecycle_entries_for_phase(
     cella_orchestrator::lifecycle::lifecycle_entries_for_phase(metadata, config, phase)
 }
 
-
 pub fn run_host_command(
     phase: &str,
     value: &serde_json::Value,
@@ -1464,7 +1462,13 @@ pub async fn inject_post_start(
     post_start: &cella_env::PostStartInjection,
     remote_user: &str,
 ) {
-    cella_orchestrator::container_setup::inject_post_start(client, container_id, post_start, remote_user).await;
+    cella_orchestrator::container_setup::inject_post_start(
+        client,
+        container_id,
+        post_start,
+        remote_user,
+    )
+    .await;
 }
 
 /// Add `/cella/bin` to PATH in the container's shell profile.
@@ -1492,18 +1496,24 @@ async fn seed_gh_credentials(
     workspace_root: &std::path::Path,
     remote_user: &str,
 ) {
-    cella_orchestrator::container_setup::seed_gh_credentials(client, container_id, workspace_root, remote_user).await;
+    cella_orchestrator::container_setup::seed_gh_credentials(
+        client,
+        container_id,
+        workspace_root,
+        remote_user,
+    )
+    .await;
 }
-
 
 /// Create a symlink from the host's `.claude` path to the container's so that
 /// hardcoded paths in plugin manifests resolve transparently.
 async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, remote_user: &str) {
-    cella_orchestrator::tool_install::create_claude_home_symlink(client, container_id, remote_user).await;
+    cella_orchestrator::tool_install::create_claude_home_symlink(client, container_id, remote_user)
+        .await;
 }
 
 /// Populate the tmpfs-backed `~/.claude/plugins/` directory.
 async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
-    cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user).await;
+    cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user)
+        .await;
 }
-
