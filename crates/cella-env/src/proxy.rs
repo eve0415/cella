@@ -101,3 +101,159 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
 
     json.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, ProxyConfig, RuleAction};
+
+    #[test]
+    fn test_apply_proxy_env_disabled_proxy() {
+        let mut fwd = EnvForwarding::default();
+        let config = ProxyConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        apply_proxy_env(&mut fwd, &config, false);
+        assert!(fwd.env.is_empty(), "disabled proxy should not add env vars");
+    }
+
+    #[test]
+    fn test_apply_proxy_env_no_proxy_no_rules() {
+        let mut fwd = EnvForwarding::default();
+        let config = ProxyConfig::default();
+        // In test env, no host HTTP_PROXY/HTTPS_PROXY are set, and no blocking rules.
+        apply_proxy_env(&mut fwd, &config, false);
+        assert!(
+            fwd.env.is_empty(),
+            "no host proxy and no blocking rules should not add env vars"
+        );
+    }
+
+    #[test]
+    fn test_apply_proxy_env_blocking_rules_adds_agent_proxy() {
+        let mut fwd = EnvForwarding::default();
+        let config = ProxyConfig::default();
+        apply_proxy_env(&mut fwd, &config, true);
+
+        // With blocking rules, agent proxy env vars should be injected.
+        assert!(
+            !fwd.env.is_empty(),
+            "blocking rules should inject proxy env vars"
+        );
+
+        let expected_url = format!("http://127.0.0.1:{}", config.proxy_port);
+        let http_proxy = fwd.env.iter().find(|e| e.key == "HTTP_PROXY");
+        assert!(http_proxy.is_some(), "should set HTTP_PROXY");
+        assert_eq!(http_proxy.unwrap().value, expected_url);
+
+        let https_proxy = fwd.env.iter().find(|e| e.key == "HTTPS_PROXY");
+        assert!(https_proxy.is_some(), "should set HTTPS_PROXY");
+        assert_eq!(https_proxy.unwrap().value, expected_url);
+
+        // Should also set lowercase variants.
+        assert!(
+            fwd.env.iter().any(|e| e.key == "http_proxy"),
+            "should set http_proxy (lowercase)"
+        );
+        assert!(
+            fwd.env.iter().any(|e| e.key == "https_proxy"),
+            "should set https_proxy (lowercase)"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_denylist() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            proxy: ProxyConfig::default(),
+            rules: vec![NetworkRule {
+                domain: "*.evil.com".to_string(),
+                paths: vec![],
+                action: RuleAction::Block,
+            }],
+        };
+
+        let json_str = build_agent_proxy_config_json(&config);
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(json["mode"], "denylist");
+        assert_eq!(json["listen_port"], config.proxy.proxy_port);
+
+        let rules = json["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["domain"], "*.evil.com");
+        assert_eq!(rules[0]["action"], "block");
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_allowlist() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Allowlist,
+            proxy: ProxyConfig::default(),
+            rules: vec![
+                NetworkRule {
+                    domain: "registry.npmjs.org".to_string(),
+                    paths: vec![],
+                    action: RuleAction::Allow,
+                },
+                NetworkRule {
+                    domain: "github.com".to_string(),
+                    paths: vec![],
+                    action: RuleAction::Allow,
+                },
+            ],
+        };
+
+        let json_str = build_agent_proxy_config_json(&config);
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(json["mode"], "allowlist");
+
+        let rules = json["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["domain"], "registry.npmjs.org");
+        assert_eq!(rules[1]["domain"], "github.com");
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_with_path_rules() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            proxy: ProxyConfig::default(),
+            rules: vec![NetworkRule {
+                domain: "api.example.com".to_string(),
+                paths: vec!["/v1/admin/*".to_string(), "/internal/*".to_string()],
+                action: RuleAction::Block,
+            }],
+        };
+
+        let json_str = build_agent_proxy_config_json(&config);
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let rules = json["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["domain"], "api.example.com");
+
+        let paths = rules[0]["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], "/v1/admin/*");
+        assert_eq!(paths[1], "/internal/*");
+    }
+
+    #[test]
+    fn test_build_agent_proxy_config_json_no_rules() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            proxy: ProxyConfig::default(),
+            rules: vec![],
+        };
+
+        let json_str = build_agent_proxy_config_json(&config);
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let rules = json["rules"].as_array().unwrap();
+        assert!(rules.is_empty(), "rules array should be empty");
+        assert_eq!(json["mode"], "denylist");
+    }
+}

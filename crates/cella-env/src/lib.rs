@@ -244,3 +244,85 @@ pub fn prepare_env_forwarding(
 
     fwd
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_credential_forwarding() {
+        let mut fwd = EnvForwarding::default();
+        apply_credential_forwarding(&mut fwd);
+
+        assert_eq!(
+            fwd.post_start.git_config_commands.len(),
+            1,
+            "should add exactly one git config command"
+        );
+
+        let cmd = &fwd.post_start.git_config_commands[0];
+        assert!(
+            cmd.iter().any(|s| s == "credential.helper"),
+            "command should set credential.helper"
+        );
+        assert!(
+            cmd.iter()
+                .any(|s| s.contains("/cella/bin/cella-agent credential")),
+            "command should point to cella-agent credential helper"
+        );
+    }
+
+    #[test]
+    fn test_env_forwarding_default() {
+        let fwd = EnvForwarding::default();
+        assert!(fwd.mounts.is_empty(), "default mounts should be empty");
+        assert!(fwd.env.is_empty(), "default env should be empty");
+        assert!(
+            fwd.post_start.file_uploads.is_empty(),
+            "default file_uploads should be empty"
+        );
+        assert!(
+            fwd.post_start.git_config_commands.is_empty(),
+            "default git_config_commands should be empty"
+        );
+        assert!(
+            fwd.post_start.root_commands.is_empty(),
+            "default root_commands should be empty"
+        );
+    }
+
+    #[test]
+    fn test_prepare_env_forwarding_minimal() {
+        let config: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let fwd = prepare_env_forwarding(&config, "root", None);
+
+        // Credential forwarding is always added regardless of other config.
+        let has_credential_helper = fwd
+            .post_start
+            .git_config_commands
+            .iter()
+            .any(|cmd| cmd.iter().any(|s| s == "credential.helper"));
+        assert!(
+            has_credential_helper,
+            "credential helper should always be present"
+        );
+    }
+
+    #[test]
+    fn test_proxy_forwarding_config_fields() {
+        let proxy = cella_network::config::ProxyConfig::default();
+        let net_config = cella_network::config::NetworkConfig::default();
+
+        let pfc = ProxyForwardingConfig {
+            proxy,
+            has_blocking_rules: true,
+            full_config: Some(net_config),
+            container_distro: ca_bundle::ContainerDistro::Debian,
+        };
+
+        assert!(pfc.has_blocking_rules);
+        assert!(pfc.proxy.enabled);
+        assert!(pfc.full_config.is_some());
+        assert_eq!(pfc.container_distro, ca_bundle::ContainerDistro::Debian);
+    }
+}

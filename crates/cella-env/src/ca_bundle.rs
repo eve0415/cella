@@ -232,4 +232,107 @@ ID=custom
         assert!(cmd[2].contains("update-ca-certificates"));
         assert!(cmd[2].contains("update-ca-trust"));
     }
+
+    #[test]
+    fn test_detect_fedora() {
+        let os_release = "NAME=\"Fedora\"\nID=fedora\n";
+        assert_eq!(
+            ContainerDistro::from_os_release(os_release),
+            ContainerDistro::Rhel
+        );
+    }
+
+    #[test]
+    fn test_detect_centos() {
+        let os_release = "NAME=\"CentOS Stream\"\nID=centos\nID_LIKE=\"rhel centos\"\n";
+        assert_eq!(
+            ContainerDistro::from_os_release(os_release),
+            ContainerDistro::Rhel
+        );
+    }
+
+    #[test]
+    fn test_detect_suse() {
+        let os_release = "NAME=\"openSUSE Leap\"\nID=opensuse-leap\n";
+        assert_eq!(
+            ContainerDistro::from_os_release(os_release),
+            ContainerDistro::Rhel
+        );
+    }
+
+    #[test]
+    fn test_detect_mint() {
+        let os_release = "NAME=\"Linux Mint\"\nID=linuxmint\nID_LIKE=\"ubuntu debian\"\n";
+        assert_eq!(
+            ContainerDistro::from_os_release(os_release),
+            ContainerDistro::Debian
+        );
+    }
+
+    #[test]
+    fn test_ca_injection_apply_to_debian() {
+        let injection = CaInjection {
+            pem_content: b"test-cert".to_vec(),
+        };
+        let mut post_start = PostStartInjection::default();
+        injection.apply_to(&mut post_start, &ContainerDistro::Debian);
+
+        assert_eq!(post_start.file_uploads.len(), 1);
+        assert_eq!(
+            post_start.file_uploads[0].container_path,
+            "/usr/local/share/ca-certificates/cella-host-ca.crt"
+        );
+        assert_eq!(post_start.file_uploads[0].content, b"test-cert");
+        assert_eq!(post_start.root_commands.len(), 1);
+        assert!(post_start.root_commands[0][2].contains("update-ca-certificates"));
+    }
+
+    #[test]
+    fn test_ca_injection_apply_to_rhel() {
+        let injection = CaInjection {
+            pem_content: b"test-cert".to_vec(),
+        };
+        let mut post_start = PostStartInjection::default();
+        injection.apply_to(&mut post_start, &ContainerDistro::Rhel);
+
+        assert_eq!(post_start.file_uploads.len(), 1);
+        assert_eq!(
+            post_start.file_uploads[0].container_path,
+            "/etc/pki/ca-trust/source/anchors/cella-host-ca.crt"
+        );
+        assert_eq!(post_start.file_uploads[0].content, b"test-cert");
+        assert_eq!(post_start.root_commands.len(), 1);
+        assert!(post_start.root_commands[0][2].contains("update-ca-trust"));
+    }
+
+    #[test]
+    fn test_ca_injection_apply_to_unknown() {
+        let injection = CaInjection {
+            pem_content: b"test-cert".to_vec(),
+        };
+        let mut post_start = PostStartInjection::default();
+        injection.apply_to(&mut post_start, &ContainerDistro::Unknown);
+
+        assert_eq!(post_start.file_uploads.len(), 2);
+        assert_eq!(
+            post_start.file_uploads[0].container_path,
+            "/usr/local/share/ca-certificates/cella-host-ca.crt"
+        );
+        assert_eq!(
+            post_start.file_uploads[1].container_path,
+            "/etc/pki/ca-trust/source/anchors/cella-host-ca.crt"
+        );
+        assert_eq!(post_start.root_commands.len(), 1);
+        let cmd = &post_start.root_commands[0][2];
+        assert!(cmd.contains("update-ca-certificates"));
+        assert!(cmd.contains("update-ca-trust"));
+    }
+
+    #[test]
+    fn test_ca_cert_path_unknown_uses_debian_path() {
+        assert_eq!(
+            ContainerDistro::Unknown.ca_cert_path("test.crt"),
+            "/usr/local/share/ca-certificates/test.crt"
+        );
+    }
 }
