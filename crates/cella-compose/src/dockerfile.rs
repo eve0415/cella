@@ -178,6 +178,7 @@ struct FromEntry {
 /// - `FROM image AS name`
 /// - `FROM image as name` (case-insensitive AS)
 /// - Lines with comments after (#)
+/// - `FROM --platform=linux/amd64 image [AS name]` (Docker flags)
 /// - ARG lines before FROM (ignored, they're not FROM lines)
 /// - Skips comment lines and empty lines
 fn parse_from_lines(lines: &[&str]) -> Vec<FromEntry> {
@@ -201,11 +202,20 @@ fn parse_from_lines(lines: &[&str]) -> Vec<FromEntry> {
             .find('#')
             .map_or(trimmed, |hash_pos| trimmed[..hash_pos].trim());
 
-        // Parse: FROM <image> [AS <name>]
+        // Parse: FROM [--flag=value...] <image> [AS <name>]
+        // Skip the FROM keyword and any --flag=value tokens to find the image
         let parts: Vec<&str> = without_comment.split_whitespace().collect();
-        // parts[0] = "FROM", parts[1] = image, parts[2] = "AS"?, parts[3] = name?
-        let stage_name = if parts.len() >= 4 && parts[2].eq_ignore_ascii_case("AS") {
-            Some(parts[3].to_string())
+        let non_flag_start = parts
+            .iter()
+            .skip(1) // skip "FROM"
+            .position(|p| !p.starts_with("--"))
+            .map_or(parts.len(), |pos| pos + 1);
+
+        let stage_name = if non_flag_start < parts.len()
+            && non_flag_start + 2 < parts.len()
+            && parts[non_flag_start + 1].eq_ignore_ascii_case("AS")
+        {
+            Some(parts[non_flag_start + 2].to_string())
         } else {
             None
         };
