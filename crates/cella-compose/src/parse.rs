@@ -185,10 +185,7 @@ mod tests {
             "docker-compose.yml",
             "services:\n  app:\n    image: node\n  db:\n    image: postgres\n  redis:\n    image: redis\n",
         );
-        let result = validate_run_services(
-            &[&path],
-            &["app".to_string(), "db".to_string()],
-        );
+        let result = validate_run_services(&[&path], &["app".to_string(), "db".to_string()]);
         assert!(result.is_ok());
     }
 
@@ -200,11 +197,8 @@ mod tests {
             "docker-compose.yml",
             "services:\n  app:\n    image: node\n  db:\n    image: postgres\n",
         );
-        let err = validate_run_services(
-            &[&path],
-            &["app".to_string(), "cache".to_string()],
-        )
-        .unwrap_err();
+        let err =
+            validate_run_services(&[&path], &["app".to_string(), "cache".to_string()]).unwrap_err();
         assert!(matches!(err, CellaComposeError::ServiceNotFound { .. }));
         let msg = err.to_string();
         assert!(msg.contains("cache"));

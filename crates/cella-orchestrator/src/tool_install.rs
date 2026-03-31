@@ -764,7 +764,6 @@ pub async fn install_tools(
     phase.finish();
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

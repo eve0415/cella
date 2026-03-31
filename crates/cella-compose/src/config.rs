@@ -286,8 +286,17 @@ mod tests {
         let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
         let err = extract_service_build_info(&config, "gamma").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("gamma"), "error should mention missing service");
-        assert!(msg.contains("alpha"), "error should list available service alpha");
-        assert!(msg.contains("beta"), "error should list available service beta");
+        assert!(
+            msg.contains("gamma"),
+            "error should mention missing service"
+        );
+        assert!(
+            msg.contains("alpha"),
+            "error should list available service alpha"
+        );
+        assert!(
+            msg.contains("beta"),
+            "error should list available service beta"
+        );
     }
 }

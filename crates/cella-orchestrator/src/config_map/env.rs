@@ -20,7 +20,6 @@ pub(super) fn map_remote_env(config: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

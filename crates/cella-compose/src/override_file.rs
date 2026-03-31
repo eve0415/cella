@@ -347,10 +347,9 @@ mod tests {
     fn additional_contexts_without_build_dockerfile_are_ignored() {
         let mut config = base_config();
         // Set additional_contexts but NOT build_dockerfile
-        config.additional_contexts.insert(
-            "feature_src".to_string(),
-            PathBuf::from("/tmp/features"),
-        );
+        config
+            .additional_contexts
+            .insert("feature_src".to_string(), PathBuf::from("/tmp/features"));
         let yaml = generate_override_yaml(&config);
         // additional_contexts should NOT appear since build_dockerfile is None
         assert!(
@@ -363,18 +362,15 @@ mod tests {
     fn multiple_additional_contexts_sorted() {
         let mut config = base_config();
         config.build_dockerfile = Some(PathBuf::from("/tmp/Dockerfile.combined"));
-        config.additional_contexts.insert(
-            "zulu_context".to_string(),
-            PathBuf::from("/tmp/zulu"),
-        );
-        config.additional_contexts.insert(
-            "alpha_context".to_string(),
-            PathBuf::from("/tmp/alpha"),
-        );
-        config.additional_contexts.insert(
-            "mike_context".to_string(),
-            PathBuf::from("/tmp/mike"),
-        );
+        config
+            .additional_contexts
+            .insert("zulu_context".to_string(), PathBuf::from("/tmp/zulu"));
+        config
+            .additional_contexts
+            .insert("alpha_context".to_string(), PathBuf::from("/tmp/alpha"));
+        config
+            .additional_contexts
+            .insert("mike_context".to_string(), PathBuf::from("/tmp/mike"));
         let yaml = generate_override_yaml(&config);
         // BTreeMap guarantees sorted order
         let alpha_pos = yaml.find("alpha_context").expect("alpha_context not found");

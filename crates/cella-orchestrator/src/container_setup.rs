@@ -484,7 +484,6 @@ pub async fn seed_gh_credentials(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,13 +548,11 @@ mod tests {
 
     #[test]
     fn convert_uploads_basic() {
-        let uploads = vec![
-            cella_env::FileUpload {
-                container_path: "/home/user/.config/test".to_string(),
-                content: b"hello".to_vec(),
-                mode: 0o644,
-            },
-        ];
+        let uploads = vec![cella_env::FileUpload {
+            container_path: "/home/user/.config/test".to_string(),
+            content: b"hello".to_vec(),
+            mode: 0o644,
+        }];
         let result = convert_uploads(&uploads);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "/home/user/.config/test");

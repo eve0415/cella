@@ -368,7 +368,6 @@ pub async fn check_and_run_content_update(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,10 +410,12 @@ mod tests {
             origin: "a".into(),
             command: json!("1"),
         });
-        lifecycle.update_content.push(cella_features::LifecycleEntry {
-            origin: "b".into(),
-            command: json!("2"),
-        });
+        lifecycle
+            .update_content
+            .push(cella_features::LifecycleEntry {
+                origin: "b".into(),
+                command: json!("2"),
+            });
         lifecycle.post_create.push(cella_features::LifecycleEntry {
             origin: "c".into(),
             command: json!("3"),
@@ -429,10 +430,22 @@ mod tests {
         });
         let rf = make_resolved_features(lifecycle);
         assert_eq!(resolve_phase_entries(Some(&rf), "onCreateCommand").len(), 1);
-        assert_eq!(resolve_phase_entries(Some(&rf), "updateContentCommand").len(), 1);
-        assert_eq!(resolve_phase_entries(Some(&rf), "postCreateCommand").len(), 1);
-        assert_eq!(resolve_phase_entries(Some(&rf), "postStartCommand").len(), 1);
-        assert_eq!(resolve_phase_entries(Some(&rf), "postAttachCommand").len(), 1);
+        assert_eq!(
+            resolve_phase_entries(Some(&rf), "updateContentCommand").len(),
+            1
+        );
+        assert_eq!(
+            resolve_phase_entries(Some(&rf), "postCreateCommand").len(),
+            1
+        );
+        assert_eq!(
+            resolve_phase_entries(Some(&rf), "postStartCommand").len(),
+            1
+        );
+        assert_eq!(
+            resolve_phase_entries(Some(&rf), "postAttachCommand").len(),
+            1
+        );
     }
 
     #[test]
