@@ -2128,4 +2128,41 @@ mod tests {
         let result = rewrite_browser_url("http://localhost:9999/path", &pm, "c1").await;
         assert_eq!(result, "http://localhost:9999/path");
     }
+
+    // -- AgentConnectionState --
+
+    #[test]
+    fn agent_state_new_defaults() {
+        let state = AgentConnectionState::new();
+        assert!(!state.connected.load(Ordering::Relaxed));
+        assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn agent_state_default_matches_new() {
+        let state = AgentConnectionState::default();
+        assert!(!state.connected.load(Ordering::Relaxed));
+        assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn agent_state_can_be_mutated() {
+        let state = AgentConnectionState::new();
+        state.connected.store(true, Ordering::Relaxed);
+        state.last_seen_secs.store(1234, Ordering::Relaxed);
+        assert!(state.connected.load(Ordering::Relaxed));
+        assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 1234);
+    }
+
+    // -- ContainerHandle --
+
+    #[test]
+    fn container_handle_fields() {
+        let handle = ContainerHandle {
+            container_id: "abc123".into(),
+            agent_state: Arc::new(AgentConnectionState::new()),
+        };
+        assert_eq!(handle.container_id, "abc123");
+        assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
+    }
 }

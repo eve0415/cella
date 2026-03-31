@@ -512,4 +512,140 @@ mod tests {
             WaitForPhase::UpdateContent
         );
     }
+
+    // ── lifecycle_entries_for_phase: array commands ──────────────────────
+
+    #[test]
+    fn lifecycle_entries_for_phase_from_config_array() {
+        let config = json!({"postCreateCommand": ["npm", "install"]});
+        let entries = lifecycle_entries_for_phase(None, &config, "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, json!(["npm", "install"]));
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_from_config_object() {
+        let config = json!({
+            "postCreateCommand": {
+                "build": "npm run build",
+                "test": "npm test"
+            }
+        });
+        let entries = lifecycle_entries_for_phase(None, &config, "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        // The whole object is preserved as the command value
+        assert!(entries[0].command.is_object());
+    }
+
+    // ── lifecycle_entries_for_phase: metadata path ───────────────────────
+
+    #[test]
+    fn lifecycle_entries_for_phase_from_metadata_label() {
+        let metadata = r#"[{"id":"ghcr.io/features/node","postCreateCommand":"npm i"}]"#;
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "ghcr.io/features/node");
+        assert_eq!(entries[0].command, json!("npm i"));
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_metadata_missing_phase() {
+        let metadata = r#"[{"id":"feature-a","onCreateCommand":"echo hi"}]"#;
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_metadata_null_command_skipped() {
+        let metadata = r#"[{"id":"feature-a","postCreateCommand":null}]"#;
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_metadata_multiple_entries() {
+        let metadata = r#"[
+            {"id":"feat-a","postStartCommand":"echo a"},
+            {"id":"feat-b","postStartCommand":"echo b"}
+        ]"#;
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postStartCommand");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].origin, "feat-a");
+        assert_eq!(entries[1].origin, "feat-b");
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_metadata_no_id_defaults_to_devcontainer_json() {
+        let metadata = r#"[{"postCreateCommand":"echo hi"}]"#;
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "devcontainer.json");
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_invalid_metadata_returns_empty() {
+        let metadata = "not valid json";
+        let entries = lifecycle_entries_for_phase(Some(metadata), &json!({}), "postCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    // ── resolve_phase_entries: additional edge cases ─────────────────────
+
+    #[test]
+    fn resolve_phase_entries_multiple_entries_per_phase() {
+        let mut lifecycle = cella_features::FeatureLifecycle::default();
+        lifecycle.on_create.push(cella_features::LifecycleEntry {
+            origin: "feat-a".into(),
+            command: json!("echo a"),
+        });
+        lifecycle.on_create.push(cella_features::LifecycleEntry {
+            origin: "feat-b".into(),
+            command: json!(["npm", "install"]),
+        });
+        let rf = make_resolved_features(lifecycle);
+        let entries = resolve_phase_entries(Some(&rf), "onCreateCommand");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, json!("echo a"));
+        assert_eq!(entries[1].command, json!(["npm", "install"]));
+    }
+
+    #[test]
+    fn resolve_phase_entries_empty_lifecycle() {
+        let rf = make_resolved_features(cella_features::FeatureLifecycle::default());
+        for phase in &[
+            "onCreateCommand",
+            "updateContentCommand",
+            "postCreateCommand",
+            "postStartCommand",
+            "postAttachCommand",
+        ] {
+            assert!(resolve_phase_entries(Some(&rf), phase).is_empty());
+        }
+    }
+
+    // ── WaitForPhase: ordinal values ─────────────────────────────────────
+
+    #[test]
+    fn wait_for_phase_ordinal_ordering() {
+        assert!(WaitForPhase::Initialize.ordinal() < WaitForPhase::OnCreate.ordinal());
+        assert!(WaitForPhase::OnCreate.ordinal() < WaitForPhase::UpdateContent.ordinal());
+        assert!(WaitForPhase::UpdateContent.ordinal() < WaitForPhase::PostCreate.ordinal());
+        assert!(WaitForPhase::PostCreate.ordinal() < WaitForPhase::PostStart.ordinal());
+    }
+
+    #[test]
+    fn wait_for_phase_unknown_string_defaults_to_update_content() {
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "somethingBogus"})),
+            WaitForPhase::UpdateContent
+        );
+    }
+
+    #[test]
+    fn wait_for_phase_null_value_defaults_to_update_content() {
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": null})),
+            WaitForPhase::UpdateContent
+        );
+    }
 }

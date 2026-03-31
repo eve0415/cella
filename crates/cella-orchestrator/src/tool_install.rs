@@ -811,4 +811,38 @@ mod tests {
         let cmd = tool_shell_cmd(Some(&env), "echo hello");
         assert_eq!(cmd, vec!["sh", "-l", "-c", "echo hello"]);
     }
+
+    #[test]
+    fn tool_exec_env_ignores_non_path_keys() {
+        let mut env = ProbedEnv::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("SHELL".to_string(), "/bin/bash".to_string());
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_exec_env_extracts_only_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        let result = tool_exec_env(Some(&env)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with("PATH="));
+    }
+
+    #[test]
+    fn tool_shell_cmd_preserves_complex_inner_command() {
+        let complex = "cd /app && npm install && npm run build 2>&1 | tee build.log";
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        let cmd = tool_shell_cmd(Some(&env), complex);
+        assert_eq!(cmd[2], complex);
+    }
+
+    #[test]
+    fn tool_shell_cmd_login_shell_for_empty_inner() {
+        let cmd = tool_shell_cmd(None, "");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
+    }
 }

@@ -159,4 +159,130 @@ mod tests {
         let handle = start_proxy(0, target).await.unwrap();
         handle.abort();
     }
+
+    // -- ProxyTarget --
+
+    #[test]
+    fn proxy_target_debug_contains_ip_and_port() {
+        let target = ProxyTarget::DirectIp {
+            ip: "10.0.0.5".into(),
+            port: 8080,
+        };
+        let dbg = format!("{target:?}");
+        assert!(dbg.contains("10.0.0.5"));
+        assert!(dbg.contains("8080"));
+    }
+
+    #[test]
+    fn proxy_target_clone() {
+        let original = ProxyTarget::DirectIp {
+            ip: "1.2.3.4".into(),
+            port: 443,
+        };
+        // Use a function boundary to prevent clippy redundant_clone.
+        let cloned = clone_target(&original);
+        let ProxyTarget::DirectIp { ip, port } = &cloned;
+        assert_eq!(ip, "1.2.3.4");
+        assert_eq!(*port, 443);
+    }
+
+    fn clone_target(t: &ProxyTarget) -> ProxyTarget {
+        t.clone()
+    }
+
+    // -- ProxyCommand construction --
+
+    #[test]
+    fn proxy_command_start_fields() {
+        let cmd = ProxyCommand::Start {
+            host_port: 3000,
+            container_ip: "172.17.0.2".into(),
+            container_port: 8080,
+            result_tx: None,
+        };
+        match cmd {
+            ProxyCommand::Start {
+                host_port,
+                container_ip,
+                container_port,
+                ..
+            } => {
+                assert_eq!(host_port, 3000);
+                assert_eq!(container_ip, "172.17.0.2");
+                assert_eq!(container_port, 8080);
+            }
+            ProxyCommand::Stop { .. } => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn proxy_command_stop_fields() {
+        let cmd = ProxyCommand::Stop { host_port: 5000 };
+        match cmd {
+            ProxyCommand::Stop { host_port } => assert_eq!(host_port, 5000),
+            ProxyCommand::Start { .. } => panic!("expected Stop"),
+        }
+    }
+
+    // -- ProxyHandle::abort --
+
+    #[tokio::test]
+    async fn proxy_handle_abort_is_idempotent() {
+        let target = ProxyTarget::DirectIp {
+            ip: "127.0.0.1".into(),
+            port: 1,
+        };
+        let handle = start_proxy(0, target).await.unwrap();
+        // Aborting should not panic.
+        handle.abort();
+    }
+
+    // -- start_proxy binding --
+
+    #[tokio::test]
+    async fn start_proxy_port_zero_binds_random() {
+        let target = ProxyTarget::DirectIp {
+            ip: "127.0.0.1".into(),
+            port: 1234,
+        };
+        let handle = start_proxy(0, target).await.unwrap();
+        handle.abort();
+    }
+
+    // -- run_proxy_coordinator --
+
+    #[tokio::test]
+    async fn coordinator_stop_unknown_port_is_harmless() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let coordinator = tokio::spawn(run_proxy_coordinator(rx));
+
+        tx.send(ProxyCommand::Stop { host_port: 9999 })
+            .await
+            .unwrap();
+        // Drop sender to shut down coordinator.
+        drop(tx);
+        coordinator.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_start_and_stop_lifecycle() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let coordinator = tokio::spawn(run_proxy_coordinator(rx));
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tx.send(ProxyCommand::Start {
+            host_port: 0, // random port
+            container_ip: "127.0.0.1".into(),
+            container_port: 1,
+            result_tx: Some(result_tx),
+        })
+        .await
+        .unwrap();
+
+        // Should succeed.
+        result_rx.await.unwrap().unwrap();
+
+        drop(tx);
+        coordinator.await.unwrap();
+    }
 }

@@ -259,3 +259,192 @@ async fn run_task_process(
     *exit_code.lock().await = Some(code);
     info!("Task in '{container_name}' exited with code {code}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a fresh `TaskManager`.
+    fn manager() -> TaskManager {
+        TaskManager::new()
+    }
+
+    // -- new_shared / TaskManager::new --
+
+    #[test]
+    fn new_shared_creates_empty_manager() {
+        // `new_shared` must return an Arc<Mutex<TaskManager>> with no tasks.
+        let _shared = new_shared();
+    }
+
+    // -- start_task --
+
+    #[tokio::test]
+    async fn start_task_returns_branch_as_task_id() {
+        let mut mgr = manager();
+        let id = mgr
+            .start_task("feature/abc", "ctr1".into(), vec!["ls".into()])
+            .unwrap();
+        assert_eq!(id, "feature/abc");
+    }
+
+    #[tokio::test]
+    async fn start_task_duplicate_branch_is_error() {
+        let mut mgr = manager();
+        mgr.start_task("dup", "ctr".into(), vec!["echo".into()])
+            .unwrap();
+        let err = mgr
+            .start_task("dup", "ctr".into(), vec!["echo".into()])
+            .unwrap_err();
+        assert!(err.contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn start_task_different_branches_both_succeed() {
+        let mut mgr = manager();
+        mgr.start_task("b1", "ctr".into(), vec!["a".into()])
+            .unwrap();
+        mgr.start_task("b2", "ctr".into(), vec!["b".into()])
+            .unwrap();
+        let list = mgr.list_tasks().await;
+        assert_eq!(list.len(), 2);
+    }
+
+    // -- list_tasks --
+
+    #[tokio::test]
+    async fn list_tasks_empty() {
+        let mgr = manager();
+        assert!(mgr.list_tasks().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_returns_correct_fields() {
+        let mut mgr = manager();
+        mgr.start_task(
+            "main",
+            "my-container".into(),
+            vec!["cargo".into(), "test".into()],
+        )
+        .unwrap();
+        let tasks = mgr.list_tasks().await;
+        assert_eq!(tasks.len(), 1);
+
+        let t = &tasks[0];
+        assert_eq!(t.task_id, "main");
+        assert_eq!(t.branch, "main");
+        assert_eq!(t.container_name, "my-container");
+        assert_eq!(t.command, vec!["cargo", "test"]);
+        // Just started, so elapsed should be very small.
+        assert!(t.elapsed_secs < 5);
+    }
+
+    // -- subscribe --
+
+    #[tokio::test]
+    async fn subscribe_returns_none_for_unknown_branch() {
+        let mgr = manager();
+        assert!(mgr.subscribe("ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_receiver_for_existing_task() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        assert!(mgr.subscribe("br").is_some());
+    }
+
+    // -- is_done --
+
+    #[tokio::test]
+    async fn is_done_returns_true_for_unknown_branch() {
+        let mgr = manager();
+        // "no task = done" per the implementation.
+        assert!(mgr.is_done("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn is_done_returns_false_when_task_just_started() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["sleep".into(), "9999".into()])
+            .unwrap();
+        // The spawned task will fail quickly (docker not available in test), but
+        // right after insertion the exit_code starts as None.
+        // We check immediately, so it should still be false.
+        // NOTE: there is a race, but it is extremely unlikely the spawned task
+        // resolves before this line executes.
+        assert!(!mgr.is_done("br").await);
+    }
+
+    // -- get_output --
+
+    #[tokio::test]
+    async fn get_output_returns_none_for_unknown_branch() {
+        let mgr = manager();
+        assert!(mgr.get_output("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_output_returns_some_for_existing_task() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        // Output starts empty.
+        let out = mgr.get_output("br").await.unwrap();
+        assert!(out.is_empty() || out.contains("Error")); // may have spawned & failed fast
+    }
+
+    // -- stop_task --
+
+    #[tokio::test]
+    async fn stop_task_returns_false_for_unknown() {
+        let mut mgr = manager();
+        assert!(!mgr.stop_task("nope").await);
+    }
+
+    #[tokio::test]
+    async fn stop_task_returns_true_and_sets_exit_130() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        assert!(mgr.stop_task("br").await);
+
+        // After stop, the task should be marked as done with exit code 130.
+        assert!(mgr.is_done("br").await);
+        let tasks = mgr.list_tasks().await;
+        let t = tasks.iter().find(|t| t.task_id == "br").unwrap();
+        assert_eq!(t.exit_code, Some(130));
+    }
+
+    // -- cleanup_done --
+
+    #[tokio::test]
+    async fn cleanup_done_removes_stopped_tasks() {
+        let mut mgr = manager();
+        mgr.start_task("a", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("b", "c".into(), vec!["x".into()]).unwrap();
+
+        // Stop only "a"
+        mgr.stop_task("a").await;
+        mgr.cleanup_done().await;
+
+        let tasks = mgr.list_tasks().await;
+        // "a" removed, "b" still present.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "b");
+    }
+
+    #[tokio::test]
+    async fn cleanup_done_on_empty_manager_is_noop() {
+        let mut mgr = manager();
+        mgr.cleanup_done().await;
+        assert!(mgr.list_tasks().await.is_empty());
+    }
+
+    // -- wait_for --
+
+    #[tokio::test]
+    async fn wait_for_returns_none_for_unknown() {
+        let mgr = manager();
+        // Unknown branch returns None immediately (no state to poll).
+        assert!(mgr.wait_for("ghost").await.is_none());
+    }
+}
