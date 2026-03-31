@@ -978,4 +978,229 @@ mod tests {
             other => panic!("expected ContainerLogs, got {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Additional edge case tests for container_info_from_summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summary_all_fields_none() {
+        let summary = ContainerSummary::default();
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.id, "");
+        assert_eq!(info.name, "");
+        assert!(info.labels.is_empty());
+        assert!(info.config_hash.is_none());
+        assert!(info.ports.is_empty());
+        assert!(info.created_at.is_none());
+        assert!(info.image.is_none());
+        assert_eq!(info.state, ContainerState::Other("unknown".to_string()));
+        assert_eq!(info.backend, BackendKind::Docker);
+    }
+
+    #[test]
+    fn summary_multiple_names_takes_first() {
+        let summary = make_summary(
+            Some("id"),
+            Some(vec!["/first", "/second", "/third"]),
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.name, "first");
+    }
+
+    #[test]
+    fn summary_name_without_leading_slash() {
+        let summary = make_summary(
+            Some("id"),
+            Some(vec!["no-slash"]),
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.name, "no-slash");
+    }
+
+    #[test]
+    fn summary_multiple_ports() {
+        let ports = vec![
+            PortSummary {
+                private_port: 80,
+                public_port: Some(8080),
+                typ: Some(PortSummaryTypeEnum::TCP),
+                ip: None,
+            },
+            PortSummary {
+                private_port: 443,
+                public_port: Some(8443),
+                typ: Some(PortSummaryTypeEnum::TCP),
+                ip: None,
+            },
+            PortSummary {
+                private_port: 53,
+                public_port: None,
+                typ: Some(PortSummaryTypeEnum::UDP),
+                ip: None,
+            },
+        ];
+
+        let summary = make_summary(
+            Some("multi-port"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            Some(ports),
+            None,
+        );
+
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.ports.len(), 3);
+    }
+
+    #[test]
+    fn summary_empty_labels_no_config_hash() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            Some(HashMap::new()),
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.labels.is_empty());
+        assert!(info.config_hash.is_none());
+    }
+
+    #[test]
+    fn summary_exited_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::EXITED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Stopped);
+    }
+
+    #[test]
+    fn summary_created_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::CREATED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Created);
+    }
+
+    #[test]
+    fn summary_exit_code_is_always_none() {
+        // container_info_from_summary doesn't have access to exit codes
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::EXITED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.exit_code.is_none());
+    }
+
+    #[test]
+    fn summary_container_user_is_always_none() {
+        // container_info_from_summary doesn't parse user info
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.container_user.is_none());
+    }
+
+    #[test]
+    fn summary_mounts_always_empty() {
+        // Summary-based info doesn't include mount details
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.mounts.is_empty());
+    }
+
+    #[test]
+    fn summary_created_at_none_when_no_timestamp() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.created_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ContainerState::parse additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_str_paused() {
+        // "paused" is not explicitly mapped, should become Other
+        assert_eq!(
+            ContainerState::parse("paused"),
+            ContainerState::Other("paused".to_string())
+        );
+    }
+
+    #[test]
+    fn from_str_empty_string() {
+        assert_eq!(
+            ContainerState::parse(""),
+            ContainerState::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn from_str_case_sensitive() {
+        // "Running" with capital R should be Other (not Running)
+        assert_eq!(
+            ContainerState::parse("Running"),
+            ContainerState::Other("Running".to_string())
+        );
+    }
 }

@@ -495,4 +495,499 @@ mod tests {
         let extra_hosts = bollard_config.host_config.unwrap().extra_hosts.unwrap();
         assert!(extra_hosts.contains(&"host.docker.internal:host-gateway".to_string()));
     }
+
+    /// Helper to build a minimal `CreateContainerOptions` for tests.
+    fn minimal_opts() -> CreateContainerOptions {
+        CreateContainerOptions {
+            name: "test".to_string(),
+            image: "ubuntu:latest".to_string(),
+            labels: HashMap::new(),
+            env: Vec::new(),
+            remote_env: Vec::new(),
+            user: None,
+            workspace_folder: "/workspace".to_string(),
+            workspace_mount: None,
+            mounts: Vec::new(),
+            port_bindings: HashMap::new(),
+            entrypoint: None,
+            cmd: None,
+            cap_add: Vec::new(),
+            security_opt: Vec::new(),
+            privileged: false,
+            run_args_overrides: None,
+            gpu_request: None,
+        }
+    }
+
+    #[test]
+    fn minimal_config_sets_image_and_workspace() {
+        let opts = minimal_opts();
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.image, Some("ubuntu:latest".to_string()));
+        assert_eq!(config.working_dir, Some("/workspace".to_string()));
+    }
+
+    #[test]
+    fn empty_env_produces_none() {
+        let opts = minimal_opts();
+        let config = to_bollard_config(&opts);
+        assert!(config.env.is_none());
+    }
+
+    #[test]
+    fn env_vars_passed_through() {
+        let mut opts = minimal_opts();
+        opts.env = vec!["FOO=bar".to_string(), "BAZ=qux".to_string()];
+        let config = to_bollard_config(&opts);
+        assert_eq!(
+            config.env,
+            Some(vec!["FOO=bar".to_string(), "BAZ=qux".to_string()])
+        );
+    }
+
+    #[test]
+    fn user_passed_through() {
+        let mut opts = minimal_opts();
+        opts.user = Some("vscode".to_string());
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.user, Some("vscode".to_string()));
+    }
+
+    #[test]
+    fn entrypoint_and_cmd_passed_through() {
+        let mut opts = minimal_opts();
+        opts.entrypoint = Some(vec!["/bin/sh".to_string()]);
+        opts.cmd = Some(vec!["-c".to_string(), "echo hi".to_string()]);
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        assert_eq!(
+            config.cmd,
+            Some(vec!["-c".to_string(), "echo hi".to_string()])
+        );
+    }
+
+    #[test]
+    fn labels_passed_through() {
+        let mut opts = minimal_opts();
+        opts.labels
+            .insert("dev.cella.test".to_string(), "yes".to_string());
+        let config = to_bollard_config(&opts);
+        let labels = config.labels.unwrap();
+        assert_eq!(labels.get("dev.cella.test"), Some(&"yes".to_string()));
+    }
+
+    #[test]
+    fn port_bindings_with_explicit_protocol() {
+        let mut opts = minimal_opts();
+        opts.port_bindings.insert(
+            "8080/udp".to_string(),
+            vec![cella_backend::PortForward {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some("9090".to_string()),
+            }],
+        );
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let pb = hc.port_bindings.unwrap();
+        assert!(pb.contains_key("8080/udp"));
+        let exposed = config.exposed_ports.unwrap();
+        assert!(exposed.contains(&"8080/udp".to_string()));
+    }
+
+    #[test]
+    fn port_bindings_default_to_tcp() {
+        let mut opts = minimal_opts();
+        opts.port_bindings.insert(
+            "3000".to_string(),
+            vec![cella_backend::PortForward {
+                host_ip: None,
+                host_port: None,
+            }],
+        );
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let pb = hc.port_bindings.unwrap();
+        assert!(pb.contains_key("3000/tcp"));
+    }
+
+    #[test]
+    fn empty_port_bindings_produces_none() {
+        let opts = minimal_opts();
+        let config = to_bollard_config(&opts);
+        assert!(config.exposed_ports.is_none());
+        assert!(config.host_config.unwrap().port_bindings.is_none());
+    }
+
+    #[test]
+    fn mount_type_volume() {
+        let m = MountConfig {
+            mount_type: "volume".to_string(),
+            source: "my-vol".to_string(),
+            target: "/data".to_string(),
+            consistency: None,
+        };
+        let bollard_mount = to_bollard_mount(&m);
+        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::VOLUME));
+    }
+
+    #[test]
+    fn mount_type_tmpfs() {
+        let m = MountConfig {
+            mount_type: "tmpfs".to_string(),
+            source: String::new(),
+            target: "/tmp".to_string(),
+            consistency: None,
+        };
+        let bollard_mount = to_bollard_mount(&m);
+        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::TMPFS));
+    }
+
+    #[test]
+    fn mount_type_defaults_to_bind() {
+        let m = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host".to_string(),
+            target: "/container".to_string(),
+            consistency: Some("cached".to_string()),
+        };
+        let bollard_mount = to_bollard_mount(&m);
+        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(bollard_mount.consistency, Some("cached".to_string()));
+    }
+
+    #[test]
+    fn mount_unknown_type_defaults_to_bind() {
+        let m = MountConfig {
+            mount_type: "something_else".to_string(),
+            source: "/a".to_string(),
+            target: "/b".to_string(),
+            consistency: None,
+        };
+        let bollard_mount = to_bollard_mount(&m);
+        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
+    }
+
+    #[test]
+    fn gpu_request_all() {
+        let req = GpuRequest::All;
+        let dev = gpu_request_to_device_request(&req);
+        assert_eq!(dev.count, Some(-1));
+        assert!(dev.capabilities.is_some());
+        assert_eq!(dev.capabilities.unwrap(), vec![vec!["gpu".to_string()]]);
+    }
+
+    #[test]
+    fn gpu_request_count() {
+        let req = GpuRequest::Count(2);
+        let dev = gpu_request_to_device_request(&req);
+        assert_eq!(dev.count, Some(2));
+    }
+
+    #[test]
+    fn gpu_request_device_ids() {
+        let req = GpuRequest::DeviceIds(vec!["0".to_string(), "1".to_string()]);
+        let dev = gpu_request_to_device_request(&req);
+        assert_eq!(dev.device_ids, Some(vec!["0".to_string(), "1".to_string()]));
+        assert!(dev.count.is_none());
+    }
+
+    #[test]
+    fn cap_add_and_security_opt() {
+        let mut opts = minimal_opts();
+        opts.cap_add = vec!["SYS_PTRACE".to_string()];
+        opts.security_opt = vec!["seccomp=unconfined".to_string()];
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(hc.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
+
+    #[test]
+    fn empty_cap_add_and_security_opt_produce_none() {
+        let opts = minimal_opts();
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert!(hc.cap_add.is_none());
+        assert!(hc.security_opt.is_none());
+    }
+
+    #[test]
+    fn privileged_flag() {
+        let mut opts = minimal_opts();
+        opts.privileged = true;
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(hc.privileged, Some(true));
+    }
+
+    #[test]
+    fn run_args_overrides_hostname() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            hostname: Some("my-host".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.hostname, Some("my-host".to_string()));
+    }
+
+    #[test]
+    fn run_args_overrides_extra_hosts_merged() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            extra_hosts: vec!["custom:1.2.3.4".to_string()],
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let extra_hosts = config.host_config.unwrap().extra_hosts.unwrap();
+        assert!(extra_hosts.contains(&"host.docker.internal:host-gateway".to_string()));
+        assert!(extra_hosts.contains(&"custom:1.2.3.4".to_string()));
+    }
+
+    #[test]
+    fn run_args_overrides_labels_merged() {
+        let mut opts = minimal_opts();
+        opts.labels.insert("base".to_string(), "value".to_string());
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            labels: std::iter::once(("override".to_string(), "yes".to_string())).collect(),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let labels = config.labels.unwrap();
+        assert_eq!(labels.get("base"), Some(&"value".to_string()));
+        assert_eq!(labels.get("override"), Some(&"yes".to_string()));
+    }
+
+    #[test]
+    fn run_args_privileged_or_with_base() {
+        let mut opts = minimal_opts();
+        opts.privileged = true;
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            privileged: Some(false),
+            ..Default::default()
+        });
+        // privileged is OR'd: true || false = true
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(hc.privileged, Some(true));
+    }
+
+    #[test]
+    fn run_args_gpu_takes_precedence_over_gpu_request() {
+        let mut opts = minimal_opts();
+        opts.gpu_request = Some(GpuRequest::All);
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            gpus: Some(GpuRequest::Count(2)),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let devs = hc.device_requests.unwrap();
+        // run_args GPU should win; only one device request
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].count, Some(2));
+    }
+
+    #[test]
+    fn gpu_request_used_when_no_run_args_gpu() {
+        let mut opts = minimal_opts();
+        opts.gpu_request = Some(GpuRequest::All);
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let devs = hc.device_requests.unwrap();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].count, Some(-1));
+    }
+
+    #[test]
+    fn run_args_network_and_resource_overrides() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            network_mode: Some("host".to_string()),
+            memory: Some(1_073_741_824),
+            shm_size: Some(67_108_864),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(hc.network_mode, Some("host".to_string()));
+        assert_eq!(hc.memory, Some(1_073_741_824));
+        assert_eq!(hc.shm_size, Some(67_108_864));
+    }
+
+    #[test]
+    fn run_args_restart_policy_always() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            restart_policy: Some("always".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let rp = hc.restart_policy.unwrap();
+        assert_eq!(rp.name, Some(RestartPolicyNameEnum::ALWAYS));
+        assert!(rp.maximum_retry_count.is_none());
+    }
+
+    #[test]
+    fn run_args_restart_policy_on_failure_with_count() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            restart_policy: Some("on-failure:5".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let rp = hc.restart_policy.unwrap();
+        assert_eq!(rp.name, Some(RestartPolicyNameEnum::ON_FAILURE));
+        assert_eq!(rp.maximum_retry_count, Some(5));
+    }
+
+    #[test]
+    fn run_args_restart_policy_unless_stopped() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            restart_policy: Some("unless-stopped".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let rp = hc.restart_policy.unwrap();
+        assert_eq!(rp.name, Some(RestartPolicyNameEnum::UNLESS_STOPPED));
+    }
+
+    #[test]
+    fn run_args_restart_policy_unknown_maps_to_empty() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            restart_policy: Some("garbage".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let rp = hc.restart_policy.unwrap();
+        assert_eq!(rp.name, Some(RestartPolicyNameEnum::EMPTY));
+    }
+
+    #[test]
+    fn run_args_log_driver_with_opts() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            log_driver: Some("json-file".to_string()),
+            log_opt: std::iter::once(("max-size".to_string(), "10m".to_string())).collect(),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let lc = hc.log_config.unwrap();
+        assert_eq!(lc.typ, Some("json-file".to_string()));
+        assert!(lc.config.is_some());
+    }
+
+    #[test]
+    fn run_args_log_opt_without_driver() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            log_opt: std::iter::once(("max-size".to_string(), "5m".to_string())).collect(),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let lc = hc.log_config.unwrap();
+        assert!(lc.typ.is_none());
+        assert!(lc.config.is_some());
+    }
+
+    #[test]
+    fn run_args_cgroupns_host() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            cgroupns_mode: Some("host".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(
+            hc.cgroupns_mode,
+            Some(bollard::models::HostConfigCgroupnsModeEnum::HOST)
+        );
+    }
+
+    #[test]
+    fn run_args_cgroupns_private() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            cgroupns_mode: Some("private".to_string()),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(
+            hc.cgroupns_mode,
+            Some(bollard::models::HostConfigCgroupnsModeEnum::PRIVATE)
+        );
+    }
+
+    #[test]
+    fn run_args_devices() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            devices: vec![cella_backend::DeviceSpec {
+                path_on_host: "/dev/sda".to_string(),
+                path_in_container: "/dev/xvda".to_string(),
+                cgroup_permissions: "rwm".to_string(),
+            }],
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let devs = hc.devices.unwrap();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].path_on_host, Some("/dev/sda".to_string()));
+        assert_eq!(devs[0].path_in_container, Some("/dev/xvda".to_string()));
+        assert_eq!(devs[0].cgroup_permissions, Some("rwm".to_string()));
+    }
+
+    #[test]
+    fn run_args_ulimits() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            ulimits: vec![cella_backend::UlimitSpec {
+                name: "nofile".to_string(),
+                soft: 1024,
+                hard: 2048,
+            }],
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        let ulimits = hc.ulimits.unwrap();
+        assert_eq!(ulimits.len(), 1);
+        assert_eq!(ulimits[0].name, Some("nofile".to_string()));
+        assert_eq!(ulimits[0].soft, Some(1024));
+        assert_eq!(ulimits[0].hard, Some(2048));
+    }
+
+    #[test]
+    fn run_args_init() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            init: Some(true),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert_eq!(hc.init, Some(true));
+    }
+
+    #[test]
+    fn no_mounts_produces_none() {
+        let opts = minimal_opts();
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert!(hc.mounts.is_none());
+    }
 }

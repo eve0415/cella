@@ -480,4 +480,218 @@ mod tests {
             assert!(!resume_phases.contains(phase));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // check_exit_code tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_exit_code_zero_is_ok() {
+        let result = ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(check_exit_code(&result, "postCreateCommand", None).is_ok());
+    }
+
+    #[test]
+    fn check_exit_code_nonzero_returns_error() {
+        let result = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "command not found".to_string(),
+        };
+        let err = check_exit_code(&result, "onCreateCommand", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("onCreateCommand"),
+            "error should contain phase name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_exit_code_nonzero_includes_exit_code_in_message() {
+        let result = ExecResult {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "sh: npm: not found".to_string(),
+        };
+        let err = check_exit_code(&result, "postCreateCommand", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("127"),
+            "error should contain exit code, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_exit_code_nonzero_includes_stderr() {
+        let result = ExecResult {
+            exit_code: 2,
+            stdout: "some output\n".to_string(),
+            stderr: "fatal error occurred\n".to_string(),
+        };
+        let err = check_exit_code(&result, "updateContentCommand", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("fatal error occurred"),
+            "error should contain trimmed stderr, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_exit_code_with_named_prefix() {
+        let result = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "failed".to_string(),
+        };
+        let err = check_exit_code(&result, "postStartCommand", Some("setup")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("[setup]"),
+            "error should contain [name] prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_exit_code_named_prefix_absent_when_none() {
+        let result = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "err".to_string(),
+        };
+        let err = check_exit_code(&result, "phase", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains('['),
+            "no bracket prefix expected without name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_exit_code_zero_with_name_still_ok() {
+        let result = ExecResult {
+            exit_code: 0,
+            stdout: "done".to_string(),
+            stderr: String::new(),
+        };
+        assert!(check_exit_code(&result, "phase", Some("task")).is_ok());
+    }
+
+    #[test]
+    fn check_exit_code_stderr_trimmed() {
+        let result = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "  whitespace  \n".to_string(),
+        };
+        let err = check_exit_code(&result, "phase", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("whitespace"),
+            "expected trimmed stderr in message, got: {msg}"
+        );
+        assert!(!msg.ends_with('\n'), "stderr should be trimmed, got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_lifecycle_command edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_object_with_non_string_non_array_value() {
+        let value = json!({"check": 42});
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Parallel(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert_eq!(cmds[0].1[0], "sh");
+                assert_eq!(cmds[0].1[1], "-c");
+                // Non-string/array fallback serializes with to_string()
+                assert_eq!(cmds[0].1[2], "42");
+            }
+            ParsedLifecycle::Sequential(_) => panic!("expected Parallel"),
+        }
+    }
+
+    #[test]
+    fn parse_boolean_value() {
+        // Booleans are not string/array/object, should produce empty Sequential
+        let value = json!(true);
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => assert!(cmds.is_empty()),
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn parse_number_value() {
+        let value = json!(42);
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => assert!(cmds.is_empty()),
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn parse_array_filters_non_string_elements() {
+        let value = json!(["echo", 42, "hello", null]);
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                // Non-string elements should be filtered out
+                assert_eq!(cmds[0], vec!["echo", "hello"]);
+            }
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_array() {
+        let value = json!([]);
+        match parse_lifecycle_command(&value) {
+            ParsedLifecycle::Sequential(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert!(cmds[0].is_empty());
+            }
+            ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CallbackWriter additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn callback_writer_handles_multiple_writes_for_one_line() {
+        use std::sync::Mutex;
+
+        let collected = Mutex::new(Vec::new());
+        let callback = |line: &str| {
+            collected.lock().unwrap().push(line.to_string());
+        };
+
+        let mut writer = CallbackWriter::new(&callback);
+        // Write a line in two separate write calls
+        io::Write::write_all(&mut writer, b"hello ").unwrap();
+        io::Write::write_all(&mut writer, b"world\n").unwrap();
+        drop(writer);
+
+        let lines = collected.into_inner().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "      hello world");
+    }
+
+    #[test]
+    fn callback_writer_handles_empty_input() {
+        let lines = collect_callback_lines(b"");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn callback_writer_only_newlines() {
+        let lines = collect_callback_lines(b"\n\n\n");
+        assert!(lines.is_empty());
+    }
 }

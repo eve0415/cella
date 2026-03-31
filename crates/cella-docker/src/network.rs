@@ -222,3 +222,62 @@ pub async fn get_container_cella_ip(docker: &Docker, container_id: &str) -> Opti
     }
     Some(ip.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn cella_network_name_constant() {
+        assert_eq!(CELLA_NETWORK_NAME, "cella");
+    }
+
+    #[test]
+    fn repo_network_name_deterministic() {
+        let path = Path::new("/home/user/my-project");
+        let name1 = repo_network_name(path);
+        let name2 = repo_network_name(path);
+        assert_eq!(name1, name2);
+    }
+
+    #[test]
+    fn repo_network_name_has_prefix() {
+        let name = repo_network_name(Path::new("/any/path"));
+        assert!(
+            name.starts_with("cella-net-"),
+            "name should start with 'cella-net-': {name}"
+        );
+    }
+
+    #[test]
+    fn repo_network_name_has_12_hex_chars() {
+        let name = repo_network_name(Path::new("/some/repo"));
+        let hash_part = name.strip_prefix("cella-net-").unwrap();
+        assert_eq!(
+            hash_part.len(),
+            12,
+            "hash portion should be 12 hex chars: {hash_part}"
+        );
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash portion should be hex: {hash_part}"
+        );
+    }
+
+    #[test]
+    fn repo_network_name_different_paths_differ() {
+        let name1 = repo_network_name(Path::new("/project/a"));
+        let name2 = repo_network_name(Path::new("/project/b"));
+        assert_ne!(name1, name2);
+    }
+
+    #[test]
+    fn repo_network_name_empty_path() {
+        // Edge case: empty path should still produce a valid name
+        let name = repo_network_name(Path::new(""));
+        assert!(name.starts_with("cella-net-"));
+        let hash_part = name.strip_prefix("cella-net-").unwrap();
+        assert_eq!(hash_part.len(), 12);
+    }
+}
