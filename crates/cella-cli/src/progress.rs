@@ -178,6 +178,31 @@ impl Progress {
         result
     }
 
+    /// Convenience: run a fallible async operation with a spinner.
+    ///
+    /// Shows `✓` on success, `✗` on error with the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the future, after marking the step as failed.
+    pub async fn run_step_result<F, T, E>(&self, label: &str, f: F) -> Result<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let step = self.step(label);
+        match f.await {
+            Ok(v) => {
+                step.finish();
+                Ok(v)
+            }
+            Err(e) => {
+                step.fail(&e.to_string());
+                Err(e)
+            }
+        }
+    }
+
     /// Print a warning message in the spinner flow.
     ///
     /// Shows a yellow `⚠` prefix. Always visible regardless of verbosity.

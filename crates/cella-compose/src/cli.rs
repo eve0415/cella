@@ -65,6 +65,19 @@ impl ComposeCommand {
         }
     }
 
+    /// Create a compose command without the override file.
+    ///
+    /// Used for operations that run before the override file has been written
+    /// (e.g., `docker compose config` during feature resolution).
+    pub fn without_override(project: &ComposeProject) -> Self {
+        Self {
+            project_name: project.project_name.clone(),
+            compose_files: project.compose_files.clone(),
+            override_file: None,
+            working_dir: project.config_dir.clone(),
+        }
+    }
+
     /// Create a minimal compose command from just a project name (for teardown).
     pub fn from_project_name(project_name: &str) -> Self {
         Self {
@@ -403,6 +416,36 @@ mod tests {
         assert_eq!(args[2], "cella-myapp-abc12345");
         assert_eq!(args[3], "-f");
         // File paths follow
+    }
+
+    #[test]
+    fn without_override_excludes_override_file() {
+        let project = ComposeProject {
+            project_name: "cella-myapp-abc12345".to_string(),
+            compose_files: vec![PathBuf::from("/workspace/docker-compose.yml")],
+            override_file: PathBuf::from(
+                "/home/user/.cella/compose/cella-myapp-abc12345/docker-compose.cella.yml",
+            ),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace/.devcontainer"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+        };
+
+        let cmd = ComposeCommand::without_override(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+        // Should have: compose --project-name NAME -f compose_file (no override)
+        assert_eq!(args[0], "compose");
+        assert_eq!(args[1], "--project-name");
+        assert_eq!(args[2], "cella-myapp-abc12345");
+        assert_eq!(args[3], "-f");
+        assert_eq!(args[4], "/workspace/docker-compose.yml");
+        assert_eq!(args.len(), 5); // No override file
     }
 
     #[test]

@@ -65,9 +65,10 @@ pub async fn resolve_compose_features(
     info!("Compose + features detected, resolving combined Dockerfile");
 
     // 2. Resolve compose config via `docker compose config --format json`
-    let compose_cmd = ComposeCommand::new(project);
+    //    Use without_override because the override file hasn't been written yet.
+    let compose_cmd = ComposeCommand::without_override(project);
     let resolved_compose = progress
-        .run_step("Resolving compose configuration...", compose_cmd.config())
+        .run_step_result("Resolving compose configuration...", compose_cmd.config())
         .await?;
 
     // 3. Extract primary service build info
@@ -107,7 +108,7 @@ pub async fn resolve_compose_features(
             // Pull image if needed for inspection
             if !client.image_exists(image).await? {
                 progress
-                    .run_step("Pulling compose service image...", client.pull_image(image))
+                    .run_step_result("Pulling compose service image...", client.pull_image(image))
                     .await?;
             }
 
@@ -127,7 +128,7 @@ pub async fn resolve_compose_features(
     let cache = cella_features::FeatureCache::new();
 
     let resolved = progress
-        .run_step("Resolving devcontainer features...", async {
+        .run_step_result("Resolving devcontainer features...", async {
             cella_features::resolve_features(
                 config,
                 config_path,
@@ -138,9 +139,9 @@ pub async fn resolve_compose_features(
                 base_image_metadata.as_deref(),
             )
             .await
+            .map_err(|e| format!("feature resolution failed: {e}"))
         })
-        .await
-        .map_err(|e| format!("feature resolution failed: {e}"))?;
+        .await?;
 
     // 6. Generate combined Dockerfile
     let combined =

@@ -32,7 +32,7 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
 
     // 2. Validate primary service exists in compose files
     ctx.progress
-        .run_step("Validating compose configuration...", async {
+        .run_step_result("Validating compose configuration...", async {
             cella_compose::parse::validate_primary_service(
                 &project.compose_files,
                 &project.primary_service,
@@ -76,8 +76,9 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
 
         if ctx.remove_container || ctx.build_no_cache {
             ctx.progress
-                .run_step("Stopping existing compose project...", async {
-                    let compose_cmd = ComposeCommand::new(&project);
+                .run_step_result("Stopping existing compose project...", async {
+                    let compose_cmd =
+                        ComposeCommand::from_project_name(&project.project_name);
                     compose_cmd.down().await
                 })
                 .await?;
@@ -131,7 +132,7 @@ async fn prepare_and_start(
         });
 
     ctx.progress
-        .run_step("Preparing agent volume...", async {
+        .run_step_result("Preparing agent volume...", async {
             cella_docker::volume::ensure_agent_volume_populated(
                 ctx.client.inner(),
                 &agent_arch,
@@ -189,13 +190,13 @@ async fn prepare_and_start(
     let compose_cmd = ComposeCommand::new(project);
     if features_build.is_some() || ctx.build_no_cache {
         ctx.progress
-            .run_step("Building compose services...", compose_cmd.build(None))
+            .run_step_result("Building compose services...", compose_cmd.build(None))
             .await?;
     }
 
     // 13. docker compose up -d (idempotent)
     ctx.progress
-        .run_step("Starting compose services...", async {
+        .run_step_result("Starting compose services...", async {
             compose_cmd.up(project.run_services.as_deref(), false).await
         })
         .await?;
