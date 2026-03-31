@@ -17,6 +17,7 @@ members = [
     "crates/cella-features",
     "crates/cella-network",
     "crates/cella-orchestrator",
+    "crates/cella-protocol",
 ]
 
 [workspace.package]
@@ -136,6 +137,7 @@ cella-git = { path = "crates/cella-git" }
 cella-network = { path = "crates/cella-network" }
 cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-port = { path = "crates/cella-port" }
+cella-protocol = { path = "crates/cella-protocol" }
 
 [profile.release]
 strip = true
