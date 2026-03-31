@@ -12,7 +12,6 @@ path = "src/main.rs"
 cella-backend.workspace = true
 cella-compose.workspace = true
 cella-config.workspace = true
-cella-container.workspace = true
 cella-daemon.workspace = true
 cella-doctor.workspace = true
 cella-docker.workspace = true
@@ -31,6 +30,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 indicatif.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cella-container.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

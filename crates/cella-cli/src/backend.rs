@@ -7,6 +7,7 @@ use cella_docker::DockerClient;
 #[derive(Clone, clap::ValueEnum)]
 pub enum BackendChoice {
     Docker,
+    #[cfg(target_os = "macos")]
     #[value(name = "apple-container")]
     AppleContainer,
 }
@@ -15,6 +16,7 @@ impl BackendChoice {
     pub const fn to_kind(&self) -> BackendKind {
         match self {
             Self::Docker => BackendKind::Docker,
+            #[cfg(target_os = "macos")]
             Self::AppleContainer => BackendKind::AppleContainer,
         }
     }
@@ -34,6 +36,7 @@ pub fn resolve_backend(
 ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
     match choice {
         Some(BackendChoice::Docker) => connect_docker_backend(docker_host),
+        #[cfg(target_os = "macos")]
         Some(BackendChoice::AppleContainer) => connect_apple_container_backend(),
         None => auto_detect(docker_host),
     }
@@ -47,7 +50,8 @@ fn auto_detect(
         return Ok(client);
     }
 
-    // Apple Container is lowest priority fallback
+    // Apple Container is lowest priority fallback (macOS only)
+    #[cfg(target_os = "macos")]
     if let Ok(client) = connect_apple_container_backend() {
         return Ok(client);
     }
@@ -67,6 +71,7 @@ fn connect_docker_backend(
     Ok(Box::new(client))
 }
 
+#[cfg(target_os = "macos")]
 fn connect_apple_container_backend() -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>>
 {
     let cli = cella_container::discovery::discover()
