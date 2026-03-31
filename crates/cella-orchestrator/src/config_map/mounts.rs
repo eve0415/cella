@@ -98,3 +98,57 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
         consistency,
     })
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_mount_string_with_src_dst_aliases() {
+        let mount = parse_mount_string("type=volume,src=myvolume,dst=/data").unwrap();
+        assert_eq!(mount.mount_type, "volume");
+        assert_eq!(mount.source, "myvolume");
+        assert_eq!(mount.target, "/data");
+    }
+
+    #[test]
+    fn parse_mount_string_empty_returns_none() {
+        assert!(parse_mount_string("").is_none());
+    }
+
+    #[test]
+    fn map_workspace_mount_explicitly_disabled() {
+        let config = json!({"workspaceMount": ""});
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn map_workspace_mount_custom() {
+        let config = json!({"workspaceMount": "type=bind,source=/host/code,target=/code"});
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        let mount = result.unwrap();
+        assert_eq!(mount.mount_type, "bind");
+        assert_eq!(mount.source, "/host/code");
+        assert_eq!(mount.target, "/code");
+    }
+
+    #[test]
+    fn map_additional_mounts_mixed_formats() {
+        let config = json!({
+            "mounts": [
+                "type=volume,source=vol1,target=/vol1",
+                {"type": "bind", "source": "/host", "target": "/container"}
+            ]
+        });
+        let mounts = map_additional_mounts(&config);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].mount_type, "volume");
+        assert_eq!(mounts[0].target, "/vol1");
+        assert_eq!(mounts[1].mount_type, "bind");
+        assert_eq!(mounts[1].source, "/host");
+        assert_eq!(mounts[1].target, "/container");
+    }
+}

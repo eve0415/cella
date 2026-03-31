@@ -367,3 +367,136 @@ pub async fn check_and_run_content_update(
 
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn make_resolved_features(
+        lifecycle: cella_features::FeatureLifecycle,
+    ) -> cella_features::ResolvedFeatures {
+        cella_features::ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: cella_features::FeatureContainerConfig {
+                lifecycle,
+                ..Default::default()
+            },
+            metadata_label: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_phase_entries_on_create() {
+        let mut lifecycle = cella_features::FeatureLifecycle::default();
+        lifecycle.on_create.push(cella_features::LifecycleEntry {
+            origin: "test-feature".into(),
+            command: json!("echo hello"),
+        });
+        let rf = make_resolved_features(lifecycle);
+        let entries = resolve_phase_entries(Some(&rf), "onCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "test-feature");
+        assert_eq!(entries[0].command, json!("echo hello"));
+    }
+
+    #[test]
+    fn resolve_phase_entries_all_phases() {
+        let mut lifecycle = cella_features::FeatureLifecycle::default();
+        lifecycle.on_create.push(cella_features::LifecycleEntry {
+            origin: "a".into(),
+            command: json!("1"),
+        });
+        lifecycle.update_content.push(cella_features::LifecycleEntry {
+            origin: "b".into(),
+            command: json!("2"),
+        });
+        lifecycle.post_create.push(cella_features::LifecycleEntry {
+            origin: "c".into(),
+            command: json!("3"),
+        });
+        lifecycle.post_start.push(cella_features::LifecycleEntry {
+            origin: "d".into(),
+            command: json!("4"),
+        });
+        lifecycle.post_attach.push(cella_features::LifecycleEntry {
+            origin: "e".into(),
+            command: json!("5"),
+        });
+        let rf = make_resolved_features(lifecycle);
+        assert_eq!(resolve_phase_entries(Some(&rf), "onCreateCommand").len(), 1);
+        assert_eq!(resolve_phase_entries(Some(&rf), "updateContentCommand").len(), 1);
+        assert_eq!(resolve_phase_entries(Some(&rf), "postCreateCommand").len(), 1);
+        assert_eq!(resolve_phase_entries(Some(&rf), "postStartCommand").len(), 1);
+        assert_eq!(resolve_phase_entries(Some(&rf), "postAttachCommand").len(), 1);
+    }
+
+    #[test]
+    fn resolve_phase_entries_unknown_phase_returns_empty() {
+        let rf = make_resolved_features(cella_features::FeatureLifecycle::default());
+        let entries = resolve_phase_entries(Some(&rf), "nonExistentPhase");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolve_phase_entries_none_features_returns_empty() {
+        let entries = resolve_phase_entries(None, "onCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_from_config_string() {
+        let config = json!({"postCreateCommand": "npm install"});
+        let entries = lifecycle_entries_for_phase(None, &config, "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "devcontainer.json");
+        assert_eq!(entries[0].command, json!("npm install"));
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_from_config_null() {
+        let config = json!({"postCreateCommand": null});
+        let entries = lifecycle_entries_for_phase(None, &config, "postCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_entries_for_phase_missing_key() {
+        let config = json!({});
+        let entries = lifecycle_entries_for_phase(None, &config, "postCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_entries_wait_for_phase_values() {
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "initializeCommand"})),
+            WaitForPhase::Initialize
+        );
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "onCreateCommand"})),
+            WaitForPhase::OnCreate
+        );
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "postCreateCommand"})),
+            WaitForPhase::PostCreate
+        );
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "postStartCommand"})),
+            WaitForPhase::PostStart
+        );
+        // Default (missing key or updateContentCommand) -> UpdateContent
+        assert_eq!(
+            WaitForPhase::from_config(&json!({})),
+            WaitForPhase::UpdateContent
+        );
+        assert_eq!(
+            WaitForPhase::from_config(&json!({"waitFor": "updateContentCommand"})),
+            WaitForPhase::UpdateContent
+        );
+    }
+}

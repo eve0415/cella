@@ -483,3 +483,83 @@ pub async fn seed_gh_credentials(
         debug!("Seeded gh CLI credentials into container");
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resolve_remote_user_from_config() {
+        let config = json!({"remoteUser": "vscode"});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "vscode");
+    }
+
+    #[test]
+    fn resolve_remote_user_from_container_user() {
+        let config = json!({"containerUser": "node"});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "node");
+    }
+
+    #[test]
+    fn resolve_remote_user_from_image_metadata() {
+        let config = json!({});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: Some("devuser".to_string()),
+            container_user: None,
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "root");
+        assert_eq!(result, "devuser");
+    }
+
+    #[test]
+    fn resolve_remote_user_fallback() {
+        let config = json!({});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "root");
+    }
+
+    #[test]
+    fn resolve_remote_user_priority_order() {
+        let config = json!({"remoteUser": "winner", "containerUser": "loser"});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: Some("also-loser".to_string()),
+            container_user: Some("yet-another-loser".to_string()),
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "fallback");
+        assert_eq!(result, "winner");
+    }
+
+    #[test]
+    fn map_env_object_basic() {
+        let val = json!({"FOO": "bar"});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn map_env_object_null_values() {
+        let val = json!({"KEY": null});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result, vec!["KEY="]);
+    }
+
+    #[test]
+    fn convert_uploads_basic() {
+        let uploads = vec![
+            cella_env::FileUpload {
+                container_path: "/home/user/.config/test".to_string(),
+                content: b"hello".to_vec(),
+                mode: 0o644,
+            },
+        ];
+        let result = convert_uploads(&uploads);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, "/home/user/.config/test");
+        assert_eq!(result[0].content, b"hello");
+        assert_eq!(result[0].mode, 0o644);
+    }
+}

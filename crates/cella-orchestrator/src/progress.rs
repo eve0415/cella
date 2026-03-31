@@ -385,4 +385,14 @@ mod tests {
         let sender = ProgressSender::new(tx, true);
         assert!(sender.verbose_step("visible").is_some());
     }
+
+    #[test]
+    fn format_elapsed_sub_100ms() {
+        assert_eq!(format_elapsed(Duration::from_millis(50)), "");
+    }
+
+    #[test]
+    fn format_elapsed_seconds() {
+        assert_eq!(format_elapsed(Duration::from_millis(1234)), " (1.2s)");
+    }
 }

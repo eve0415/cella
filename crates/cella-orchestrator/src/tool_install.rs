@@ -763,3 +763,53 @@ pub async fn install_tools(
     tokio::join!(claude_branch, npm_branch);
     phase.finish();
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_exec_env_with_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_some());
+        let vec = result.unwrap();
+        assert_eq!(vec, vec!["PATH=/usr/bin:/usr/local/bin"]);
+    }
+
+    #[test]
+    fn tool_exec_env_without_path() {
+        let env = ProbedEnv::new();
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_exec_env_none() {
+        let result = tool_exec_env(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_shell_cmd_with_probed_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        let cmd = tool_shell_cmd(Some(&env), "echo hello");
+        assert_eq!(cmd, vec!["sh", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn tool_shell_cmd_without_probed_path() {
+        let cmd = tool_shell_cmd(None, "echo hello");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn tool_shell_cmd_probed_env_without_path_key() {
+        let env = ProbedEnv::new();
+        let cmd = tool_shell_cmd(Some(&env), "echo hello");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", "echo hello"]);
+    }
+}

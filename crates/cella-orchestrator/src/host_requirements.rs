@@ -289,4 +289,14 @@ mod tests {
     fn format_bytes_mb() {
         assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MB");
     }
+
+    #[test]
+    fn format_bytes_small() {
+        assert_eq!(format_bytes(500), "500 bytes");
+    }
+
+    #[test]
+    fn format_bytes_boundary() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+    }
 }
