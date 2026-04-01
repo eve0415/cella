@@ -111,7 +111,28 @@ pub async fn fetch_feature_collection(
             }
             Ok(index)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // Fall back to stale cache (same pattern as template collection)
+            if let Some((stale_index, modified)) = cache.get_collection_stale(collection_ref) {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                tracing::warn!(
+                    "could not fetch feature collection from {collection_ref}: {e}; \
+                     using cached index ({age:.0?} old)"
+                );
+                let feature_index: FeatureCollectionIndex = serde_json::from_value(
+                    serde_json::to_value(stale_index).unwrap_or_default(),
+                )
+                .unwrap_or_else(|_| FeatureCollectionIndex {
+                    features: vec![],
+                    source_information: None,
+                });
+                Ok(feature_index)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
