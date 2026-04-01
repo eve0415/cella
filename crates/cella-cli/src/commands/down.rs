@@ -9,7 +9,7 @@ use cella_backend::ContainerTarget;
 use cella_compose::discovery;
 use cella_daemon::daemon;
 use cella_daemon::shared::running_cella_container_count;
-use cella_docker::{ContainerInfo, ContainerState};
+use cella_backend::{ContainerInfo, ContainerState};
 use cella_env::paths::{cella_data_dir, daemon_socket_path};
 
 use crate::picker;
@@ -95,9 +95,9 @@ impl DownArgs {
 
     pub async fn execute(
         self,
-        _backend: Option<&crate::backend::BackendChoice>,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {
             Some(resolve_branch_to_path(branch_name)?)
@@ -117,10 +117,10 @@ impl DownArgs {
             workspace_folder,
         };
 
-        let container = match target.resolve(&client, false).await {
+        let container = match target.resolve(client.as_ref(), false).await {
             Ok(c) => c,
             Err(_) if no_explicit_target => {
-                let containers = client.list_cella_containers(false).await?;
+                let containers = client.as_ref().list_cella_containers(false).await?;
                 picker::resolve_container_interactive(
                     &containers,
                     None,
@@ -186,14 +186,17 @@ impl DownArgs {
         }
 
         if container.state == ContainerState::Running {
-            client.stop_container(&container.id).await?;
+            client.as_ref().stop_container(&container.id).await?;
             info!("Container stopped");
         } else {
             info!("Container already stopped");
         }
 
         let outcome = if self.rm {
-            client.remove_container(&container.id, self.volumes).await?;
+            client
+                .as_ref()
+                .remove_container(&container.id, self.volumes)
+                .await?;
 
             if let Some(ref branch_name) = self.branch {
                 remove_worktree(branch_name)?;
