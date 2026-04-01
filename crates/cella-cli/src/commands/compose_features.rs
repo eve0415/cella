@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
+use cella_backend::ContainerBackend;
 use cella_compose::{
     ComposeCommand, ComposeProject, FEATURES_TARGET_STAGE, ServiceBuildInfo,
     extract_service_build_info,
 };
-use cella_backend::ContainerBackend;
 use cella_features::ResolvedFeatures;
 
 use crate::progress::Progress;

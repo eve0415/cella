@@ -67,9 +67,12 @@ impl CodeArgs {
         // 4. Resolve compose service if needed
         let container_id = if self.service.is_some() {
             let container = ctx.client.inspect_container(&result.container_id).await?;
-            let resolved =
-                super::resolve_service_container(ctx.client.as_ref(), container, self.service.as_deref())
-                    .await?;
+            let resolved = super::resolve_service_container(
+                ctx.client.as_ref(),
+                container,
+                self.service.as_deref(),
+            )
+            .await?;
             resolved.id
         } else {
             result.container_id.clone()
@@ -101,8 +104,13 @@ impl CodeArgs {
 
         // 7. Poll for VS Code Server connection
         let remote_user = &result.remote_user;
-        let connected =
-            poll_vscode_server(ctx.client.as_ref(), &container_id, remote_user, &ctx.progress).await;
+        let connected = poll_vscode_server(
+            ctx.client.as_ref(),
+            &container_id,
+            remote_user,
+            &ctx.progress,
+        )
+        .await;
 
         if connected {
             ctx.progress.hint("VS Code connected to dev container.");

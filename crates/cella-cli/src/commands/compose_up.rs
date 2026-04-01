@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use tracing::{debug, info, warn};
 
-use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig};
 use cella_backend::{
     ContainerBackend, ContainerInfo, ContainerState, ExecOptions, LifecycleContext,
     run_lifecycle_phase,
 };
+use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig};
 
 use super::up::{
     UpContext, output_result, query_daemon_env, resolve_remote_user, run_all_lifecycle_phases,
@@ -53,9 +53,12 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
     }
 
     // 4. Check for existing compose project
-    let existing =
-        find_compose_container(ctx.client.as_ref(), &project.project_name, &project.primary_service)
-            .await?;
+    let existing = find_compose_container(
+        ctx.client.as_ref(),
+        &project.project_name,
+        &project.primary_service,
+    )
+    .await?;
 
     if let Some(ref container) = existing {
         if let Some(old_hash) = &container.config_hash

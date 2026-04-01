@@ -4,11 +4,11 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-use cella_config::resolve::{self, ResolvedConfig};
 use cella_backend::{
     BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
     LifecycleContext, MountConfig, container_labels, container_name,
 };
+use cella_config::resolve::{self, ResolvedConfig};
 
 mod lifecycle;
 
@@ -347,13 +347,19 @@ impl UpContext {
         self.progress
             .run_step(
                 "Configuring environment...",
-                inject_post_start(self.client.as_ref(), container_id, &env_fwd.post_start, remote_user),
+                inject_post_start(
+                    self.client.as_ref(),
+                    container_id,
+                    &env_fwd.post_start,
+                    remote_user,
+                ),
             )
             .await;
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
         let shell =
-            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user).await;
+            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
+                .await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
@@ -593,11 +599,7 @@ impl UpContext {
 
                 // Prune old agent versions from the volume (non-fatal)
                 let prune_version = env!("CARGO_PKG_VERSION");
-                if let Err(e) = self
-                    .client
-                    .prune_old_agent_versions(prune_version)
-                    .await
-                {
+                if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
                     debug!("Agent version pruning failed: {e}");
                 }
 
@@ -922,11 +924,7 @@ impl UpContext {
             && remote_user != "root"
             && let Err(e) = self
                 .client
-                .update_remote_user_uid(
-                    container_id,
-                    remote_user,
-                    &self.resolved.workspace_root,
-                )
+                .update_remote_user_uid(container_id, remote_user, &self.resolved.workspace_root)
                 .await
         {
             warn!("Failed to update remote user UID: {e}");
@@ -936,7 +934,12 @@ impl UpContext {
         self.progress
             .run_step(
                 "Configuring environment...",
-                inject_post_start(self.client.as_ref(), container_id, &env_fwd.post_start, remote_user),
+                inject_post_start(
+                    self.client.as_ref(),
+                    container_id,
+                    &env_fwd.post_start,
+                    remote_user,
+                ),
             )
             .await;
 
@@ -956,7 +959,8 @@ impl UpContext {
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
         let shell =
-            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user).await;
+            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
+                .await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)

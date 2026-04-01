@@ -175,19 +175,6 @@ impl Command {
     }
 }
 
-/// Connect to the Docker daemon, optionally using an explicit host URL.
-///
-/// # Errors
-///
-/// Returns error if the Docker client cannot connect.
-pub fn connect_docker(
-    docker_host: Option<&str>,
-) -> Result<cella_docker::DockerClient, cella_docker::CellaDockerError> {
-    docker_host.map_or_else(cella_docker::DockerClient::connect, |host| {
-        cella_docker::DockerClient::connect_with_host(host)
-    })
-}
-
 /// Resolve the container backend from user choice, with optional Docker host override.
 ///
 /// # Errors
@@ -198,6 +185,7 @@ pub fn resolve_backend_for_command(
     docker_host: Option<&str>,
 ) -> Result<Box<dyn cella_backend::ContainerBackend>, Box<dyn std::error::Error>> {
     crate::backend::resolve_backend(backend, docker_host)
+        .map_err(|e| e as Box<dyn std::error::Error>)
 }
 
 /// Resolve the workspace folder from an optional argument or the current directory.
@@ -427,14 +415,12 @@ async fn re_register_containers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cella_port::protocol::ManagementRequest;
 
-    let client = crate::backend::resolve_backend(None, None)?;
+    let client =
+        crate::backend::resolve_backend(None, None).map_err(|e| e as Box<dyn std::error::Error>)?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
-        let container_ip = client
-            .get_container_ip(&container.id)
-            .await
-            .unwrap_or(None);
+        let container_ip = client.get_container_ip(&container.id).await.unwrap_or(None);
 
         // Read ports_attributes from container label
         let (ports_attrs, other_ports_attrs) = container

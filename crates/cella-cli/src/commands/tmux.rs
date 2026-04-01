@@ -58,9 +58,12 @@ impl TmuxArgs {
         // 2. Resolve compose service if needed
         let container_id = if self.service.is_some() {
             let container = ctx.client.inspect_container(&result.container_id).await?;
-            let resolved =
-                super::resolve_service_container(ctx.client.as_ref(), container, self.service.as_deref())
-                    .await?;
+            let resolved = super::resolve_service_container(
+                ctx.client.as_ref(),
+                container,
+                self.service.as_deref(),
+            )
+            .await?;
             resolved.id
         } else {
             result.container_id.clone()
@@ -106,9 +109,12 @@ impl TmuxArgs {
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
 
-        let base_env = if let Some(probed) =
-            super::env_cache::read_probed_env_cache(ctx.client.as_ref(), &container_id, &result.remote_user)
-                .await
+        let base_env = if let Some(probed) = super::env_cache::read_probed_env_cache(
+            ctx.client.as_ref(),
+            &container_id,
+            &result.remote_user,
+        )
+        .await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
         } else {

@@ -327,7 +327,7 @@ pub async fn resolve_up_workspace(up_args: &mut crate::commands::up::UpArgs) {
     }
 
     // Try to connect to Docker for container status
-    let container_states = if let Ok(client) = crate::commands::connect_docker(None) {
+    let container_states = if let Ok(client) = crate::backend::resolve_backend(None, None) {
         let containers = client
             .list_cella_containers(false)
             .await

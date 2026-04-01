@@ -4,8 +4,8 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{info, warn};
 
+use cella_backend::ContainerBackend;
 use cella_config::resolve;
-use cella_docker::DockerClient;
 
 use super::image::ensure_image;
 
@@ -67,8 +67,7 @@ impl BuildArgs {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
-        let _ = backend; // TODO: use resolve_backend once build internals are migrated
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
         client.ping().await?;
 
         // Docker Compose: build all services + feature-enriched primary image
@@ -77,7 +76,7 @@ impl BuildArgs {
                 config,
                 &resolved,
                 config_name,
-                &client,
+                client.as_ref(),
                 self.no_cache,
                 &self.output,
                 &progress,
@@ -87,7 +86,7 @@ impl BuildArgs {
 
         // 3. Build image via shared ensure_image logic
         let (img_name, _resolved_features, _image_details) = ensure_image(
-            &client,
+            client.as_ref(),
             config,
             &resolved.workspace_root,
             config_name,
@@ -134,7 +133,7 @@ async fn execute_compose_build(
     config: &serde_json::Value,
     resolved: &resolve::ResolvedConfig,
     _config_name: Option<&str>,
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     no_cache: bool,
     output: &OutputFormat,
     progress: &crate::progress::Progress,
@@ -158,13 +157,13 @@ async fn execute_compose_build(
 
     // Write override file if features were resolved
     if let Some(ref fb) = features_build {
-        let (agent_vol_name, agent_vol_target, _) = cella_docker::volume::agent_volume_mount();
+        let (agent_vol_name, agent_vol_target, _) = client.agent_volume_mount();
         let override_config = cella_compose::OverrideConfig {
             primary_service: project.primary_service.clone(),
             image_override: fb.image_name_override.clone(),
             override_command: project.override_command,
-            agent_volume_name: agent_vol_name.to_string(),
-            agent_volume_target: agent_vol_target.to_string(),
+            agent_volume_name: agent_vol_name,
+            agent_volume_target: agent_vol_target,
             extra_env: Vec::new(),
             extra_labels: std::collections::BTreeMap::new(),
             build_dockerfile: Some(fb.combined_dockerfile.clone()),
