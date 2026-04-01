@@ -360,7 +360,7 @@ pub async fn resolve_up_workspace(up_args: &mut crate::commands::up::UpArgs) {
 ///
 /// Returns `true` if the user provided at least one targeting flag,
 /// meaning we should NOT fall back to the interactive picker on error.
-pub const fn has_explicit_target(target: &cella_docker::ContainerTarget) -> bool {
+pub const fn has_explicit_target(target: &cella_backend::ContainerTarget) -> bool {
     target.container_id.is_some()
         || target.container_name.is_some()
         || target.id_label.is_some()
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn has_explicit_target_none() {
-        let target = cella_docker::ContainerTarget {
+        let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
             id_label: None,
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn has_explicit_target_container_id() {
-        let target = cella_docker::ContainerTarget {
+        let target = cella_backend::ContainerTarget {
             container_id: Some("abc123".to_string()),
             container_name: None,
             id_label: None,
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn has_explicit_target_container_name() {
-        let target = cella_docker::ContainerTarget {
+        let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: Some("my-container".to_string()),
             id_label: None,
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn has_explicit_target_id_label() {
-        let target = cella_docker::ContainerTarget {
+        let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
             id_label: Some("dev.cella.id=abc".to_string()),
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn has_explicit_target_workspace_folder() {
-        let target = cella_docker::ContainerTarget {
+        let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
             id_label: None,

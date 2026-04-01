@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::warn;
 
-use cella_docker::{ContainerTarget, ExecOptions, InteractiveExecOptions};
+use cella_backend::ContainerTarget;
+use cella_docker::{ExecOptions, InteractiveExecOptions};
 
 use crate::picker;
 
@@ -58,9 +59,8 @@ pub struct ExecArgs {
 impl ExecArgs {
     pub async fn execute(
         self,
-        backend: Option<&crate::backend::BackendChoice>,
+        _backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: use resolve_backend once ContainerTarget is migrated
         let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let target = ContainerTarget {

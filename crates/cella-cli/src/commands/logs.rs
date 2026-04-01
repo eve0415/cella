@@ -39,9 +39,8 @@ pub struct LogsArgs {
 impl LogsArgs {
     pub async fn execute(
         self,
-        backend: Option<&crate::backend::BackendChoice>,
+        _backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: use resolve_backend once ContainerTarget is migrated
         if self.daemon {
             return self.show_daemon_logs();
         }

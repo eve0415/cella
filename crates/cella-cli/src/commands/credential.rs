@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand, ValueEnum};
 use tracing::{info, warn};
 
-use cella_docker::{ContainerTarget, DockerClient, ExecOptions, FileToUpload};
+use cella_backend::ContainerTarget;
+use cella_docker::{DockerClient, ExecOptions, FileToUpload};
 
 /// Manage credential forwarding for dev containers.
 #[derive(Args)]
@@ -52,9 +53,8 @@ enum CredentialTool {
 impl CredentialArgs {
     pub async fn execute(
         self,
-        backend: Option<&crate::backend::BackendChoice>,
+        _backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: use resolve_backend once ContainerTarget is migrated
         match self.command {
             CredentialCommand::Sync(args) => run_sync(args).await,
             CredentialCommand::Status(args) => run_status(args).await,
