@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, MultiSelect, Select, Text};
 
 use cella_templates::cache::TemplateCache;
 use cella_templates::collection::{self, DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMPLATE_COLLECTION};
@@ -66,6 +66,9 @@ pub async fn run(args: InitArgs, _progress: Progress) -> Result<(), Box<dyn std:
     // Step 5: Template options
     let template_opts = prompt_all_options(&metadata)?;
 
+    // Step 5b: Optional paths
+    let excluded_paths = prompt_optional_paths(&metadata)?;
+
     // Step 6: Feature selection loop
     let features = prompt_feature_loop(&cache, args.refresh).await?;
 
@@ -103,6 +106,7 @@ pub async fn run(args: InitArgs, _progress: Progress) -> Result<(), Box<dyn std:
         &template_opts,
         &features,
         format,
+        &excluded_paths,
     )?;
 
     eprintln!("\u{2713} Created {}", written_path.display());
@@ -197,6 +201,32 @@ fn prompt_all_options(
     }
 
     Ok(resolved)
+}
+
+/// Prompt for which optional paths to include via multi-select.
+///
+/// All optional paths are pre-selected (included by default). Returns the
+/// list of paths the user chose to *exclude*.
+fn prompt_optional_paths(
+    metadata: &TemplateMetadata,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if metadata.optional_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let all_indices: Vec<usize> = (0..metadata.optional_paths.len()).collect();
+    let included = MultiSelect::new("Include optional paths:", metadata.optional_paths.clone())
+        .with_default(&all_indices)
+        .prompt()?;
+
+    let excluded: Vec<String> = metadata
+        .optional_paths
+        .iter()
+        .filter(|p| !included.contains(p))
+        .cloned()
+        .collect();
+
+    Ok(excluded)
 }
 
 /// Prompt for a single option value.

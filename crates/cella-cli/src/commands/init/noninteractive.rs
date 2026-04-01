@@ -46,13 +46,14 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Parse feature options from --option flags
     let features = parse_features(&args.feature, &args.option)?;
 
-    // Apply template
+    // Apply template (include all optional paths in non-interactive mode)
     let written_path = cella_templates::apply::apply_template(
         &template_dir,
         &workspace,
         &resolved_opts,
         &features,
         args.output_format.to_template_format(),
+        &[],
     )?;
 
     eprintln!("\u{2713} Created {}", written_path.display());

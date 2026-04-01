@@ -184,6 +184,7 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     options: &HashMap<String, serde_json::Value, S>,
     features: &[SelectedFeature],
     format: OutputFormat,
+    excluded_paths: &[String],
 ) -> Result<std::path::PathBuf, TemplateError> {
     let devcontainer_dir = output_dir.join(".devcontainer");
     std::fs::create_dir_all(&devcontainer_dir)?;
@@ -197,8 +198,14 @@ pub fn apply_template<S: std::hash::BuildHasher>(
         template_dir.to_path_buf()
     };
 
+    // Compile exclude patterns
+    let compiled_excludes: Vec<glob::Pattern> = excluded_paths
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+
     // Copy and substitute all files from the template
-    copy_and_substitute(&source_dir, &devcontainer_dir, options)?;
+    copy_and_substitute(&source_dir, &devcontainer_dir, options, &source_dir, &compiled_excludes)?;
 
     // Process the devcontainer.json specifically: merge features and format
     let config_path = devcontainer_dir.join("devcontainer.json");
@@ -221,11 +228,13 @@ pub fn apply_template<S: std::hash::BuildHasher>(
 }
 
 /// Recursively copy files from `src` to `dest`, applying template option
-/// substitution to text files.
+/// substitution to text files and skipping excluded paths.
 fn copy_and_substitute<S: std::hash::BuildHasher>(
     src: &Path,
     dest: &Path,
     options: &HashMap<String, serde_json::Value, S>,
+    template_root: &Path,
+    excluded_paths: &[glob::Pattern],
 ) -> Result<(), TemplateError> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -234,9 +243,20 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
         let src_path = entry.path();
         let dest_path = dest.join(&file_name);
 
+        // Check if this path should be excluded
+        if !excluded_paths.is_empty() {
+            let relative = src_path
+                .strip_prefix(template_root)
+                .unwrap_or(&src_path);
+            let relative_str = relative.to_string_lossy();
+            if excluded_paths.iter().any(|pat| pat.matches(&relative_str)) {
+                continue;
+            }
+        }
+
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
-            copy_and_substitute(&src_path, &dest_path, options)?;
+            copy_and_substitute(&src_path, &dest_path, options, template_root, excluded_paths)?;
         } else if file_type.is_file() {
             // Try to read as text and substitute; if it fails, copy as binary
             match std::fs::read_to_string(&src_path) {
@@ -430,6 +450,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
+            &[],
         )
         .unwrap();
 
@@ -463,6 +484,7 @@ mod tests {
             &HashMap::new(),
             &features,
             OutputFormat::Json,
+            &[],
         )
         .unwrap();
 
@@ -499,6 +521,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
+            &[],
         )
         .unwrap();
 
@@ -506,5 +529,46 @@ mod tests {
         assert!(dockerfile.exists());
         let content = std::fs::read_to_string(&dockerfile).unwrap();
         assert!(content.contains("FROM ubuntu:noble"));
+    }
+
+    #[test]
+    fn apply_template_excludes_optional_paths() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(dc_dir.join("devcontainer.json"), r#"{"name": "Test"}"#).unwrap();
+
+        // Create a .github directory with a file (optional path)
+        let github_dir = dc_dir.join(".github");
+        std::fs::create_dir_all(&github_dir).unwrap();
+        std::fs::write(github_dir.join("workflow.yml"), "name: CI").unwrap();
+
+        // Create a non-optional file
+        std::fs::write(dc_dir.join("Dockerfile"), "FROM ubuntu").unwrap();
+
+        apply_template(
+            template_dir.path(),
+            output_dir.path(),
+            &HashMap::new(),
+            &[],
+            OutputFormat::Json,
+            &[".github/*".to_owned()],
+        )
+        .unwrap();
+
+        // Config and Dockerfile should exist
+        assert!(output_dir
+            .path()
+            .join(".devcontainer/devcontainer.json")
+            .exists());
+        assert!(output_dir.path().join(".devcontainer/Dockerfile").exists());
+
+        // .github/workflow.yml should be excluded
+        assert!(!output_dir
+            .path()
+            .join(".devcontainer/.github/workflow.yml")
+            .exists());
     }
 }
