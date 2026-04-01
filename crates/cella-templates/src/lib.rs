@@ -13,6 +13,7 @@ pub mod cache;
 pub mod collection;
 pub mod error;
 pub mod fetcher;
+pub mod index;
 pub mod options;
 pub mod types;
 
@@ -20,6 +21,7 @@ pub use cache::TemplateCache;
 pub use collection::{DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMPLATE_COLLECTION};
 pub use error::TemplateError;
 pub use types::{
-    FeatureCollectionIndex, FeatureSummary, InitSelection, OutputFormat, SelectedFeature,
-    TemplateCollectionIndex, TemplateMetadata, TemplateOption, TemplateSummary,
+    DevcontainerIndex, FeatureCollectionIndex, FeatureSummary, IndexCollection,
+    IndexFeatureSummary, IndexTemplateSummary, InitSelection, OutputFormat, SelectedFeature,
+    SourceInformation, TemplateCollectionIndex, TemplateMetadata, TemplateOption, TemplateSummary,
 };

@@ -44,6 +44,10 @@ pub enum TemplateError {
     #[error("devcontainer configuration already exists at {}", path.display())]
     ConfigAlreadyExists { path: std::path::PathBuf },
 
+    /// Failed to fetch the aggregated devcontainer index.
+    #[error("failed to fetch devcontainer index: {message}")]
+    IndexFetchFailed { message: String },
+
     /// Cache I/O error.
     #[error("cache error: {message}")]
     CacheError { message: String },

@@ -2,6 +2,8 @@
 
 use cella_templates::types::{OutputFormat, SelectedFeature};
 
+use crate::style;
+
 /// Display a summary of the init configuration before writing.
 pub fn display_summary(
     template_name: &str,
@@ -11,24 +13,32 @@ pub fn display_summary(
     output_path: &std::path::Path,
 ) {
     eprintln!();
-    eprintln!("Configuration summary:");
-    eprintln!("  Template: {template_name}");
+    eprintln!("{}", style::label("Configuration summary:"));
+    eprintln!(
+        "  {}  {}",
+        style::label("Template:"),
+        style::value(template_name)
+    );
 
     if !template_options.is_empty() {
         for (key, value) in template_options {
-            eprintln!("    {key}: {value}");
+            eprintln!("    {}: {}", style::dim(key), style::value(value));
         }
     }
 
     if !features.is_empty() {
-        eprintln!("  Features:");
+        eprintln!("  {}", style::label("Features:"));
         for f in features {
             let short_name = f.reference.rsplit('/').next().unwrap_or(&f.reference);
             if f.options.is_empty() {
-                eprintln!("    - {short_name}");
+                eprintln!("    - {}", style::value(short_name));
             } else {
                 let opts: Vec<String> = f.options.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                eprintln!("    - {short_name} ({})", opts.join(", "));
+                eprintln!(
+                    "    - {} {}",
+                    style::value(short_name),
+                    style::dim(&format!("({})", opts.join(", ")))
+                );
             }
         }
     }
@@ -37,7 +47,15 @@ pub fn display_summary(
         OutputFormat::Jsonc => "JSONC (with comments)",
         OutputFormat::Json => "JSON",
     };
-    eprintln!("  Format:   {format_label}");
-    eprintln!("  Output:   {}", output_path.display());
+    eprintln!(
+        "  {}  {}",
+        style::label("Format:"),
+        style::value(format_label)
+    );
+    eprintln!(
+        "  {}  {}",
+        style::label("Output:"),
+        style::value(&output_path.display().to_string())
+    );
     eprintln!();
 }

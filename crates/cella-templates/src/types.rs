@@ -94,6 +94,116 @@ pub struct FeatureSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregated devcontainer index (from containers.dev)
+// ---------------------------------------------------------------------------
+
+/// The pre-crawled aggregate index from `containers.dev/static/devcontainer-index.json`.
+///
+/// Contains all registered template and feature collections, rebuilt daily.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevcontainerIndex {
+    /// All registered collections (each contains templates and/or features).
+    #[serde(default)]
+    pub collections: Vec<IndexCollection>,
+}
+
+/// A single collection entry from the aggregated index.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexCollection {
+    /// Metadata about the collection source (name, maintainer, OCI reference).
+    pub source_information: SourceInformation,
+
+    /// Templates available in this collection (IDs are fully-qualified OCI refs).
+    #[serde(default)]
+    pub templates: Vec<IndexTemplateSummary>,
+
+    /// Features available in this collection (IDs are fully-qualified OCI refs).
+    #[serde(default)]
+    pub features: Vec<IndexFeatureSummary>,
+}
+
+/// Source metadata for a collection in the aggregated index.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceInformation {
+    /// Human-readable name (e.g. "Reference Implementation Templates").
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Maintainer name (e.g. "Dev Container Spec Maintainers").
+    #[serde(default)]
+    pub maintainer: Option<String>,
+
+    /// Contact URL.
+    #[serde(default)]
+    pub contact: Option<String>,
+
+    /// Source repository URL.
+    #[serde(default)]
+    pub repository: Option<String>,
+
+    /// OCI registry reference (e.g. "ghcr.io/devcontainers/templates").
+    #[serde(default)]
+    pub oci_reference: Option<String>,
+}
+
+/// A template entry from the aggregated index.
+///
+/// IDs are fully-qualified OCI references (e.g. `ghcr.io/devcontainers/templates/rust`).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexTemplateSummary {
+    /// Fully-qualified OCI reference as the template ID.
+    pub id: String,
+
+    /// Semantic version.
+    pub version: String,
+
+    /// Human-readable display name.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Short description.
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Platform categories.
+    #[serde(default)]
+    pub platforms: Vec<String>,
+
+    /// Search keywords.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+/// A feature entry from the aggregated index.
+///
+/// IDs are fully-qualified OCI references (e.g. `ghcr.io/devcontainers/features/node`).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexFeatureSummary {
+    /// Fully-qualified OCI reference as the feature ID.
+    pub id: String,
+
+    /// Semantic version.
+    pub version: String,
+
+    /// Human-readable display name.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Short description.
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Search keywords.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Template metadata (from devcontainer-template.json inside the artifact)
 // ---------------------------------------------------------------------------
 

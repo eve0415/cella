@@ -42,6 +42,11 @@ impl TemplateCache {
         Self { root: root.into() }
     }
 
+    /// Return the cache root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     // -----------------------------------------------------------------------
     // Collection index cache
     // -----------------------------------------------------------------------
