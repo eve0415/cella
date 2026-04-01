@@ -2,7 +2,6 @@ mod branch;
 mod build;
 mod code;
 mod completions;
-pub mod compose_features;
 mod compose_up;
 mod config;
 mod credential;
