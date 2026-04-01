@@ -27,10 +27,6 @@ pub struct ListArgs {
 }
 
 impl ListArgs {
-    pub fn is_text_output(&self) -> bool {
-        !self.json
-    }
-
     /// Execute the list command.
     ///
     /// # Errors

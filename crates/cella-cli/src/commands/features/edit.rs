@@ -40,7 +40,7 @@ pub struct EditArgs {
 }
 
 impl EditArgs {
-    fn is_non_interactive(&self) -> bool {
+    const fn is_non_interactive(&self) -> bool {
         !self.add.is_empty() || !self.remove.is_empty() || !self.set_option.is_empty()
     }
 
@@ -51,13 +51,13 @@ impl EditArgs {
     /// Returns error on config discovery failure, parse errors, or I/O errors.
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_non_interactive() {
-            self.run_non_interactive().await
+            self.run_non_interactive()
         } else {
             self.run_interactive().await
         }
     }
 
-    async fn run_non_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_non_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
         let stripped = cella_config::jsonc::strip(&raw)?;
@@ -120,21 +120,7 @@ impl EditArgs {
         let mut edits: Vec<FeatureEdit> = Vec::new();
 
         loop {
-            // Show current state
-            if current_features.is_empty() {
-                eprintln!("\nNo features configured.");
-            } else {
-                eprintln!("\nCurrent features:");
-                for (i, (reference, options)) in current_features.iter().enumerate() {
-                    let name = resolve::resolve_feature_name(reference, &cache).await;
-                    let opts = format_opts(options);
-                    if opts.is_empty() {
-                        eprintln!("  {}. {} ({})", i + 1, name, reference);
-                    } else {
-                        eprintln!("  {}. {} ({})\n        {}", i + 1, name, reference, opts);
-                    }
-                }
-            }
+            display_current_features(&current_features, &cache).await;
 
             let actions = vec![
                 DONE.to_owned(),
@@ -147,91 +133,13 @@ impl EditArgs {
             match selection.as_str() {
                 DONE => break,
                 ADD_FEATURE => {
-                    if let Some((feature, opts)) =
-                        prompt_add_feature(&cache, self.common.registry.as_deref()).await?
-                    {
-                        current_features.push((
-                            feature.reference.clone(),
-                            if feature.options.is_empty() {
-                                serde_json::json!({})
-                            } else {
-                                serde_json::Value::Object(
-                                    feature
-                                        .options
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect(),
-                                )
-                            },
-                        ));
-                        edits.push(FeatureEdit::Add {
-                            reference: feature.reference,
-                            options: if opts.is_empty() {
-                                serde_json::json!({})
-                            } else {
-                                serde_json::Value::Object(
-                                    opts.iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect(),
-                                )
-                            },
-                        });
-                    }
+                    handle_add_feature(&mut current_features, &mut edits, &cache, self.common.registry.as_deref()).await?;
                 }
                 REMOVE_FEATURE => {
-                    if current_features.is_empty() {
-                        eprintln!("No features to remove.");
-                        continue;
-                    }
-                    let choices: Vec<String> = current_features
-                        .iter()
-                        .map(|(r, _)| r.clone())
-                        .collect();
-                    let selected = Select::new("Remove which feature?", choices).prompt()?;
-                    current_features.retain(|(r, _)| r != &selected);
-                    edits.push(FeatureEdit::Remove {
-                        reference: selected,
-                    });
+                    handle_remove_feature(&mut current_features, &mut edits)?;
                 }
                 EDIT_OPTIONS => {
-                    if current_features.is_empty() {
-                        eprintln!("No features to edit.");
-                        continue;
-                    }
-                    let choices: Vec<String> = current_features
-                        .iter()
-                        .map(|(r, _)| r.clone())
-                        .collect();
-                    let selected = Select::new("Edit options for which feature?", choices)
-                        .prompt()?;
-
-                    // Fetch metadata and prompt for options with current values
-                    let current_opts = current_features
-                        .iter()
-                        .find(|(r, _)| r == &selected)
-                        .map(|(_, o)| o.clone())
-                        .unwrap_or(serde_json::json!({}));
-
-                    let new_opts =
-                        prompt_edit_options(&selected, &current_opts, &cache).await?;
-
-                    // Update local state
-                    if let Some(entry) = current_features.iter_mut().find(|(r, _)| r == &selected)
-                    {
-                        entry.1 = serde_json::Value::Object(
-                            new_opts
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                        );
-                    }
-
-                    edits.push(FeatureEdit::ReplaceOptions {
-                        reference: selected,
-                        options: serde_json::Value::Object(
-                            new_opts.into_iter().collect(),
-                        ),
-                    });
+                    handle_edit_options(&mut current_features, &mut edits, &cache).await?;
                 }
                 _ => unreachable!(),
             }
@@ -248,6 +156,102 @@ impl EditArgs {
 
         Ok(())
     }
+}
+
+/// Display the list of currently configured features.
+async fn display_current_features(
+    features: &[(String, serde_json::Value)],
+    cache: &TemplateCache,
+) {
+    if features.is_empty() {
+        eprintln!("\nNo features configured.");
+    } else {
+        eprintln!("\nCurrent features:");
+        for (i, (reference, options)) in features.iter().enumerate() {
+            let name = resolve::resolve_feature_name(reference, cache).await;
+            let opts = format_opts(options);
+            if opts.is_empty() {
+                eprintln!("  {}. {} ({})", i + 1, name, reference);
+            } else {
+                eprintln!("  {}. {} ({})\n        {}", i + 1, name, reference, opts);
+            }
+        }
+    }
+}
+
+/// Convert a `HashMap` of options into a `serde_json::Value::Object`.
+fn options_to_json(opts: &HashMap<String, serde_json::Value>) -> serde_json::Value {
+    if opts.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::Value::Object(opts.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
+/// Handle the "Add a feature" interactive action.
+async fn handle_add_feature(
+    current_features: &mut Vec<(String, serde_json::Value)>,
+    edits: &mut Vec<FeatureEdit>,
+    cache: &TemplateCache,
+    registry: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((feature, opts)) = prompt_add_feature(cache, registry).await? {
+        current_features.push((feature.reference.clone(), options_to_json(&feature.options)));
+        edits.push(FeatureEdit::Add {
+            reference: feature.reference,
+            options: options_to_json(&opts),
+        });
+    }
+    Ok(())
+}
+
+/// Handle the "Remove a feature" interactive action.
+fn handle_remove_feature(
+    current_features: &mut Vec<(String, serde_json::Value)>,
+    edits: &mut Vec<FeatureEdit>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if current_features.is_empty() {
+        eprintln!("No features to remove.");
+        return Ok(());
+    }
+    let choices: Vec<String> = current_features.iter().map(|(r, _)| r.clone()).collect();
+    let selected = Select::new("Remove which feature?", choices).prompt()?;
+    current_features.retain(|(r, _)| r != &selected);
+    edits.push(FeatureEdit::Remove {
+        reference: selected,
+    });
+    Ok(())
+}
+
+/// Handle the "Edit feature options" interactive action.
+async fn handle_edit_options(
+    current_features: &mut [(String, serde_json::Value)],
+    edits: &mut Vec<FeatureEdit>,
+    cache: &TemplateCache,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if current_features.is_empty() {
+        eprintln!("No features to edit.");
+        return Ok(());
+    }
+    let choices: Vec<String> = current_features.iter().map(|(r, _)| r.clone()).collect();
+    let selected = Select::new("Edit options for which feature?", choices).prompt()?;
+
+    let current_opts = current_features
+        .iter()
+        .find(|(r, _)| r == &selected)
+        .map_or_else(|| serde_json::json!({}), |(_, o)| o.clone());
+
+    let new_opts = prompt_edit_options(&selected, &current_opts, cache).await?;
+
+    if let Some(entry) = current_features.iter_mut().find(|(r, _)| r == &selected) {
+        entry.1 = options_to_json(&new_opts);
+    }
+
+    edits.push(FeatureEdit::ReplaceOptions {
+        reference: selected,
+        options: serde_json::Value::Object(new_opts.into_iter().collect()),
+    });
+    Ok(())
 }
 
 /// Prompt user to select and configure a new feature.
@@ -337,30 +341,27 @@ async fn prompt_edit_options(
     cache: &TemplateCache,
 ) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
     // Try to fetch metadata for proper option types
-    if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await {
-        if let Ok(content) =
+    if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await
+        && let Ok(content) =
             std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
-        {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(options_obj) = meta.get("options").and_then(|o| o.as_object()) {
-                    let mut resolved = HashMap::new();
-                    for (key, opt_value) in options_obj {
-                        let mut opt: cella_templates::types::TemplateOption =
-                            match serde_json::from_value(opt_value.clone()) {
-                                Ok(o) => o,
-                                Err(_) => continue,
-                            };
-                        // Override default with current value if present
-                        if let Some(current) = current_options.get(key) {
-                            opt.default = current.clone();
-                        }
-                        let value = prompts::prompt_single_option(key, &opt)?;
-                        resolved.insert(key.clone(), value);
-                    }
-                    return Ok(resolved);
-                }
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(options_obj) = meta.get("options").and_then(|o| o.as_object())
+    {
+        let mut resolved = HashMap::new();
+        for (key, opt_value) in options_obj {
+            let mut opt: cella_templates::types::TemplateOption =
+                match serde_json::from_value(opt_value.clone()) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+            // Override default with current value if present
+            if let Some(current) = current_options.get(key) {
+                opt.default = current.clone();
             }
+            let value = prompts::prompt_single_option(key, &opt)?;
+            resolved.insert(key.clone(), value);
         }
+        return Ok(resolved);
     }
 
     // Fallback: free-form text editing of current options

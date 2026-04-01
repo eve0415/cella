@@ -106,16 +106,13 @@ pub fn match_feature_ref<'a>(
 /// Fetches `devcontainer-feature.json` from the cache/registry to get
 /// the display name. Falls back to the raw reference on failure.
 pub async fn resolve_feature_name(reference: &str, cache: &TemplateCache) -> String {
-    if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await {
-        if let Ok(content) =
+    if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await
+        && let Ok(content) =
             std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
-        {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(name) = meta.get("name").and_then(|n| n.as_str()) {
-                    return name.to_owned();
-                }
-            }
-        }
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(name) = meta.get("name").and_then(|n| n.as_str())
+    {
+        return name.to_owned();
     }
     // Fallback: extract short ID from reference
     reference

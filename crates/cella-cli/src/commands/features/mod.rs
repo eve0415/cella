@@ -6,6 +6,7 @@ pub mod jsonc_edit;
 pub mod list;
 pub mod prompts;
 pub mod resolve;
+pub mod update;
 
 use clap::{Args, Subcommand};
 
@@ -25,6 +26,8 @@ pub enum FeaturesCommand {
     Edit(edit::EditArgs),
     /// List configured or available features.
     List(list::ListArgs),
+    /// Check for and apply feature version updates.
+    Update(update::UpdateArgs),
 }
 
 impl FeaturesArgs {
@@ -32,6 +35,7 @@ impl FeaturesArgs {
         match self.command {
             FeaturesCommand::Edit(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
+            FeaturesCommand::Update(args) => args.execute().await,
         }
     }
 }

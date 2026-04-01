@@ -53,15 +53,15 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
                 );
             }
             FeatureEdit::Remove { reference } => {
-                if let Some(features_prop) = root_obj.get("features") {
-                    if let Some(features_obj) = features_prop.object_value() {
-                        if let Some(prop) = features_obj.get(reference) {
-                            prop.remove();
-                        }
-                        // If features object is now empty, remove the whole key
-                        if features_obj.properties().is_empty() {
-                            features_prop.remove();
-                        }
+                if let Some(features_prop) = root_obj.get("features")
+                    && let Some(features_obj) = features_prop.object_value()
+                {
+                    if let Some(prop) = features_obj.get(reference) {
+                        prop.remove();
+                    }
+                    // If features object is now empty, remove the whole key
+                    if features_obj.properties().is_empty() {
+                        features_prop.remove();
                     }
                 }
             }
@@ -70,16 +70,15 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
                 key,
                 value,
             } => {
-                if let Some(features_prop) = root_obj.get("features") {
-                    if let Some(features_obj) = features_prop.object_value() {
-                        if let Some(feature_prop) = features_obj.get(reference) {
-                            let feature_obj = feature_prop.object_value_or_set();
-                            if let Some(existing) = feature_obj.get(key) {
-                                existing.set_value(to_cst_value(value));
-                            } else {
-                                feature_obj.append(key, to_cst_value(value));
-                            }
-                        }
+                if let Some(features_prop) = root_obj.get("features")
+                    && let Some(features_obj) = features_prop.object_value()
+                    && let Some(feature_prop) = features_obj.get(reference)
+                {
+                    let feature_obj = feature_prop.object_value_or_set();
+                    if let Some(existing) = feature_obj.get(key) {
+                        existing.set_value(to_cst_value(value));
+                    } else {
+                        feature_obj.append(key, to_cst_value(value));
                     }
                 }
             }
@@ -87,12 +86,11 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
                 reference,
                 options,
             } => {
-                if let Some(features_prop) = root_obj.get("features") {
-                    if let Some(features_obj) = features_prop.object_value() {
-                        if let Some(feature_prop) = features_obj.get(reference) {
-                            feature_prop.set_value(to_cst_value(options));
-                        }
-                    }
+                if let Some(features_prop) = root_obj.get("features")
+                    && let Some(features_obj) = features_prop.object_value()
+                    && let Some(feature_prop) = features_obj.get(reference)
+                {
+                    feature_prop.set_value(to_cst_value(options));
                 }
             }
         }
@@ -106,10 +104,10 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
 fn ensure_features_object(
     root_obj: &jsonc_parser::cst::CstObject,
 ) -> jsonc_parser::cst::CstObject {
-    if let Some(prop) = root_obj.get("features") {
-        if let Some(obj) = prop.object_value() {
-            return obj;
-        }
+    if let Some(prop) = root_obj.get("features")
+        && let Some(obj) = prop.object_value()
+    {
+        return obj;
     }
     root_obj.append("features", CstInputValue::Object(vec![]));
     root_obj
