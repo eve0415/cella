@@ -209,13 +209,16 @@ mod tests {
     // We can test that binding to an invalid address fails.
     // This doesn't require Docker — it will fail at TCP bind or PTY allocation
     // depending on the platform.
-    #[test]
-    fn start_stream_bridge_nonexistent_container() {
-        // The function will try to allocate a PTY and spawn docker exec.
-        // On CI without a proper PTY or Docker, one of these steps should fail.
+    #[tokio::test]
+    async fn start_stream_bridge_nonexistent_container() {
+        // The function uses tokio::task::spawn_blocking internally,
+        // so it must be called from within a Tokio runtime.
         let result = start_stream_bridge("nonexistent-container-12345", "127.0.0.1");
-        // We expect either success (PTY allocated, docker exec will fail later)
-        // or error (PTY allocation fails). Either is valid, just don't panic.
-        let _ = result;
+        // On CI with Docker: PTY allocates, docker exec spawns (fails later), TCP binds -> Ok
+        // On CI without Docker: spawn_command fails -> Err
+        // Either is valid — just don't panic.
+        if let Ok(session) = result {
+            session.handle.abort();
+        }
     }
 }
