@@ -24,16 +24,17 @@ pub async fn send_browser_open(url: &str) -> Result<(), CellaPortError> {
     client.send(&msg).await
 }
 
-/// Resolve daemon connection info from env vars or `.daemon_addr` file.
+/// Resolve daemon connection info: `.daemon_addr` file first (authoritative),
+/// env vars as fallback (may be stale after container restart).
 fn resolve_daemon_connection() -> Result<(String, String), CellaPortError> {
+    if let Some(info) = crate::control::read_daemon_addr_file() {
+        return Ok((info.addr, info.token));
+    }
     if let (Ok(addr), Ok(token)) = (
         std::env::var("CELLA_DAEMON_ADDR"),
         std::env::var("CELLA_DAEMON_TOKEN"),
     ) {
         return Ok((addr, token));
-    }
-    if let Some(info) = crate::control::read_daemon_addr_file() {
-        return Ok((info.addr, info.token));
     }
     Err(CellaPortError::ControlSocket {
         message: "no daemon connection info available (env vars not set, .daemon_addr not found)"

@@ -327,11 +327,11 @@ Run `cella --help` on the host for all commands."
 /// Reads connection info from env vars, falling back to the `.daemon_addr`
 /// file on the shared agent volume.
 async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error>> {
-    let (addr, token) = if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
+    let (addr, token) = if let Some(info) = crate::control::read_daemon_addr_file() {
+        (info.addr, info.token)
+    } else if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
         let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
         (addr, token)
-    } else if let Some(info) = crate::control::read_daemon_addr_file() {
-        (info.addr, info.token)
     } else {
         return Err("No daemon connection info. Are you inside a cella dev container?".into());
     };
@@ -365,14 +365,14 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("    Run `cella up` on the host to fix");
     }
 
-    // 2. Resolve connection info
-    let (addr, token) = if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
+    // 2. Resolve connection info (file is authoritative, env vars are fallback)
+    let (addr, token) = if let Some(info) = crate::control::read_daemon_addr_file() {
+        eprintln!("  \u{2713} connection info (from .daemon_addr file)");
+        (info.addr, info.token)
+    } else if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
         let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
         eprintln!("  \u{2713} connection info (from env vars)");
         (addr, token)
-    } else if let Some(info) = crate::control::read_daemon_addr_file() {
-        eprintln!("  \u{2713} connection info (from .daemon_addr file)");
-        (info.addr, info.token)
     } else {
         eprintln!("  \u{2717} no connection info available");
         eprintln!("    Set CELLA_DAEMON_ADDR or ensure .daemon_addr exists");
