@@ -75,6 +75,14 @@ pub fn browser_helper_path() -> String {
     format!("{AGENT_PATH_PREFIX}/bin/cella-browser")
 }
 
+/// Stable symlink path for the agent binary inside the container.
+///
+/// Points to the latest versioned agent binary. Survives version upgrades
+/// so containers with hardcoded CMD paths continue to work.
+pub fn agent_symlink_path() -> String {
+    format!("{AGENT_PATH_PREFIX}/bin/cella-agent")
+}
+
 /// Get the CLI symlink path inside the container.
 ///
 /// This symlink points to the agent binary. When invoked via this path,
@@ -85,9 +93,17 @@ pub fn cli_symlink_path() -> String {
 
 /// Get the credential helper path inside the container.
 ///
-/// Uses the agent binary directly with the `credential` subcommand.
+/// Uses the stable agent symlink with the `credential` subcommand.
 pub fn credential_helper_path() -> String {
     format!("{AGENT_PATH_PREFIX}/bin/cella-agent credential")
+}
+
+/// Path for the daemon address file on the shared agent volume.
+///
+/// Contains two lines: `host:port` and auth token. Read by agents to
+/// discover the daemon, enabling self-healing on daemon restarts.
+pub const fn daemon_addr_file_path() -> &'static str {
+    "/cella/.daemon_addr"
 }
 
 /// Generate the mount configuration for the agent volume.
@@ -151,8 +167,10 @@ pub async fn detect_container_arch(docker: &Docker) -> Result<String, CellaDocke
 /// This script is placed at `/cella/bin/cella-browser` and set as the
 /// `BROWSER` env var. When called, it forwards the URL to the agent
 /// which sends it to the host daemon via the control socket.
-pub fn browser_helper_script(version: &str, arch: &str) -> Vec<u8> {
-    let agent_path = agent_binary_path(version, arch);
+///
+/// Uses the stable symlink so the script survives version upgrades.
+pub fn browser_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
     let script = format!(
         r#"#!/bin/sh
 # cella browser helper — forwards URLs to host via cella-agent.
@@ -258,7 +276,7 @@ async fn populate_volume(
     skip_checksum: bool,
 ) -> Result<(), CellaDockerError> {
     let agent_bytes = get_agent_binary_bytes(docker, arch, skip_checksum).await?;
-    let browser_script = browser_helper_script(version, arch);
+    let browser_script = browser_helper_script();
 
     upload_to_volume(
         docker,
@@ -911,16 +929,29 @@ fn build_volume_tar(
                 message: format!("tar append browser: {e}"),
             })?;
 
-        // CLI symlink: /cella/bin/cella -> agent binary
-        // When invoked as "cella", the agent enters CLI mode for in-container commands.
+        // Stable agent symlink: /cella/bin/cella-agent -> versioned binary
+        // Survives version upgrades so CMD paths and credential helpers keep working.
+        let agent_link_target = format!("/cella/v{version}/{arch}/cella-agent");
         let mut header = tar::Header::new_gnu();
-        let link_target = format!("/cella/v{version}/{arch}/cella-agent");
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_size(0);
         header.set_mode(0o755);
         header.set_cksum();
         archive
-            .append_link(&mut header, "cella/bin/cella", &link_target)
+            .append_link(&mut header, "cella/bin/cella-agent", &agent_link_target)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append cella-agent symlink: {e}"),
+            })?;
+
+        // CLI symlink: /cella/bin/cella -> stable agent symlink
+        // When invoked as "cella", the agent enters CLI mode for in-container commands.
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_link(&mut header, "cella/bin/cella", "/cella/bin/cella-agent")
             .map_err(|e| CellaDockerError::AgentVolume {
                 message: format!("tar append cella symlink: {e}"),
             })?;
@@ -944,6 +975,333 @@ fn build_volume_tar(
             })?;
     }
     Ok(buf)
+}
+
+/// Write the daemon address file to the agent volume.
+///
+/// The file contains two lines: the daemon address (`host:port`) and the
+/// auth token. Agents read this file on startup and reconnect to discover
+/// the current daemon, enabling self-healing after daemon restarts.
+///
+/// # Errors
+///
+/// Returns error if volume access or file upload fails.
+pub async fn write_daemon_addr_file(
+    docker: &Docker,
+    daemon_addr: &str,
+    daemon_token: &str,
+) -> Result<(), CellaDockerError> {
+    ensure_image_pulled(docker, "alpine:3").await?;
+
+    let container_name = "cella-daemon-addr-write";
+
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let config = ContainerCreateBody {
+        image: Some("alpine:3".to_string()),
+        cmd: Some(vec!["sleep".to_string(), "10".to_string()]),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/cella".to_string()),
+                source: Some(AGENT_VOLUME_NAME.to_string()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: Some(container_name.to_string()),
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions>)
+        .await?;
+
+    // Build a tar with just the .daemon_addr file
+    let content = format!("{daemon_addr}\n{daemon_token}\n");
+    let content_bytes = content.as_bytes();
+    let mut buf = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut buf);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cella/.daemon_addr", content_bytes)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append .daemon_addr: {e}"),
+            })?;
+        archive
+            .finish()
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar finish: {e}"),
+            })?;
+    }
+
+    docker
+        .upload_to_container(
+            container_name,
+            Some(bollard::query_parameters::UploadToContainerOptions {
+                path: "/".to_string(),
+                ..Default::default()
+            }),
+            bollard::body_full(buf.into()),
+        )
+        .await?;
+
+    let _ = docker
+        .stop_container(
+            container_name,
+            None::<bollard::query_parameters::StopContainerOptions>,
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    debug!("Wrote .daemon_addr file to agent volume");
+    Ok(())
+}
+
+/// Prune old agent versions from the volume, keeping the current version
+/// and any versions used by running containers.
+///
+/// # Errors
+///
+/// Returns error if Docker API calls fail.
+pub async fn prune_old_agent_versions(
+    docker: &Docker,
+    current_version: &str,
+) -> Result<(), CellaDockerError> {
+    ensure_image_pulled(docker, "alpine:3").await?;
+
+    // Find versions used by running cella containers
+    let mut versions_in_use = std::collections::HashSet::new();
+    versions_in_use.insert(current_version.to_string());
+
+    let filters: std::collections::HashMap<String, Vec<String>> = [
+        (
+            "label".to_string(),
+            vec!["dev.cella.tool=cella".to_string()],
+        ),
+        ("status".to_string(), vec!["running".to_string()]),
+    ]
+    .into_iter()
+    .collect();
+    if let Ok(containers) = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            filters: Some(filters),
+            ..Default::default()
+        }))
+        .await
+    {
+        for c in &containers {
+            if let Some(labels) = &c.labels
+                && let Some(ver) = labels.get("dev.cella.version")
+            {
+                versions_in_use.insert(ver.clone());
+            }
+        }
+    }
+
+    let versions_on_volume = list_volume_versions(docker).await?;
+
+    let to_delete: Vec<&String> = versions_on_volume
+        .iter()
+        .filter(|v| !versions_in_use.contains(v.as_str()))
+        .collect();
+
+    if to_delete.is_empty() {
+        return Ok(());
+    }
+
+    delete_version_dirs(docker, &to_delete).await
+}
+
+/// List agent version directories present on the volume.
+async fn list_volume_versions(docker: &Docker) -> Result<Vec<String>, CellaDockerError> {
+    let container_name = "cella-version-prune";
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let config = ContainerCreateBody {
+        image: Some("alpine:3".to_string()),
+        cmd: Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "ls -d /cella/v*/ 2>/dev/null | sed 's|/cella/v||;s|/||g'".to_string(),
+        ]),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/cella".to_string()),
+                source: Some(AGENT_VOLUME_NAME.to_string()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: Some(container_name.to_string()),
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions>)
+        .await?;
+
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
+    while let Some(result) = wait_stream.next().await {
+        if result.is_err() {
+            break;
+        }
+    }
+
+    let log_opts = bollard::query_parameters::LogsOptions {
+        stdout: true,
+        ..Default::default()
+    };
+    let mut log_stream = docker.logs(container_name, Some(log_opts));
+    let mut output = String::new();
+    while let Some(Ok(chunk)) = log_stream.next().await {
+        output.push_str(&chunk.to_string());
+    }
+
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    Ok(output
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Delete specific version directories from the agent volume.
+async fn delete_version_dirs(
+    docker: &Docker,
+    versions: &[&String],
+) -> Result<(), CellaDockerError> {
+    let rm_cmds: Vec<String> = versions
+        .iter()
+        .map(|v| format!("rm -rf /cella/v{v}"))
+        .collect();
+    let rm_script = rm_cmds.join(" && ");
+
+    let container_name = "cella-version-prune-rm";
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let config = ContainerCreateBody {
+        image: Some("alpine:3".to_string()),
+        cmd: Some(vec!["sh".to_string(), "-c".to_string(), rm_script]),
+        host_config: Some(bollard::models::HostConfig {
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/cella".to_string()),
+                source: Some(AGENT_VOLUME_NAME.to_string()),
+                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(BollardCreateOpts {
+                name: Some(container_name.to_string()),
+                ..Default::default()
+            }),
+            config,
+        )
+        .await?;
+
+    docker
+        .start_container(container_name, None::<StartContainerOptions>)
+        .await?;
+
+    let mut wait_stream =
+        docker.wait_container(container_name, Some(WaitContainerOptions::default()));
+    while let Some(result) = wait_stream.next().await {
+        if result.is_err() {
+            break;
+        }
+    }
+
+    info!(
+        "Pruned old agent versions: {}",
+        versions
+            .iter()
+            .map(|v| format!("v{v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -972,10 +1330,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_contains_agent_path() {
-        let script = browser_helper_script("0.1.0", "x86_64");
+    fn agent_symlink_path_format() {
+        assert_eq!(agent_symlink_path(), "/cella/bin/cella-agent");
+    }
+
+    #[test]
+    fn browser_script_uses_stable_symlink() {
+        let script = browser_helper_script();
         let content = String::from_utf8(script).unwrap();
-        assert!(content.contains("/cella/v0.1.0/x86_64/cella-agent"));
+        assert!(content.contains("/cella/bin/cella-agent"));
         assert!(content.contains("browser-open"));
     }
 
@@ -1034,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn build_volume_tar_cella_symlink_points_to_agent() {
+    fn build_volume_tar_agent_symlink_points_to_versioned() {
         let agent_bytes = b"fake-binary";
         let browser_bytes = b"#!/bin/sh";
         let marker = "0.1.0/x86_64\n";
@@ -1043,17 +1406,29 @@ mod tests {
             build_volume_tar("0.1.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut found_agent_symlink = false;
+        let mut found_cella_symlink = false;
         for entry in archive.entries().unwrap() {
             let entry = entry.unwrap();
             let path = entry.path().unwrap().to_string_lossy().to_string();
-            if path == "cella/bin/cella" {
+            if path == "cella/bin/cella-agent" {
                 assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
                 let link = entry.link_name().unwrap().unwrap();
                 assert_eq!(link.to_string_lossy(), "/cella/v0.1.0/x86_64/cella-agent");
-                return;
+                found_agent_symlink = true;
+            }
+            if path == "cella/bin/cella" {
+                assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+                let link = entry.link_name().unwrap().unwrap();
+                assert_eq!(link.to_string_lossy(), "/cella/bin/cella-agent");
+                found_cella_symlink = true;
             }
         }
-        panic!("cella/bin/cella symlink not found in tar");
+        assert!(
+            found_agent_symlink,
+            "cella/bin/cella-agent symlink not found"
+        );
+        assert!(found_cella_symlink, "cella/bin/cella symlink not found");
     }
 
     #[test]

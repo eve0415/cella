@@ -442,6 +442,34 @@ impl UpContext {
                 .hint("Run `cella logs --lifecycle` for details.");
         }
 
+        // Always update .daemon_addr (daemon may have restarted)
+        write_daemon_addr_to_volume(&self.client).await;
+
+        // Version-aware agent restart: if the container was created with a
+        // different cella version, repopulate the volume and restart the agent.
+        let container_version = container
+            .labels
+            .get("dev.cella.version")
+            .map_or("unknown", String::as_str);
+        let current_version = env!("CARGO_PKG_VERSION");
+        if container_version != current_version {
+            info!(
+                "Version change detected ({container_version} -> {current_version}), updating agent"
+            );
+            let agent_arch = self.detect_arch().await;
+            if let Err(e) = cella_docker::volume::ensure_agent_volume_populated(
+                self.client.inner(),
+                &agent_arch,
+                self.skip_checksum,
+            )
+            .await
+            {
+                warn!("Failed to repopulate agent volume: {e}");
+            }
+            self.register_with_daemon(&container.id).await;
+            restart_agent_in_container(&self.client, &container.id).await;
+        }
+
         let (_probed_env, lifecycle_env) =
             self.prepare_container_env(&container.id, remote_user).await;
 
@@ -510,6 +538,24 @@ impl UpContext {
             }
         }
 
+        // Repopulate agent volume before starting (may have been updated since
+        // the container was created, and the old versioned binary path in CMD
+        // would fail if the volume was repopulated by another `cella up`).
+        let agent_arch = self.detect_arch().await;
+        self.progress
+            .run_step(
+                "Populating agent volume...",
+                cella_docker::volume::ensure_agent_volume_populated(
+                    self.client.inner(),
+                    &agent_arch,
+                    self.skip_checksum,
+                ),
+            )
+            .await?;
+
+        // Write .daemon_addr so the agent can discover the current daemon
+        write_daemon_addr_to_volume(&self.client).await;
+
         // Attempt to start directly -- let Docker validate mounts
         let step = self.progress.step("Starting container...");
         let start_result = self.client.start_container(&container.id).await;
@@ -522,6 +568,14 @@ impl UpContext {
         match start_result {
             Ok(()) => {
                 verify_container_running(&self.client, &container.id).await?;
+
+                // Register with daemon (missing from the original code —
+                // without this the daemon rejects the agent with "unknown container")
+                self.register_with_daemon(&container.id).await;
+
+                // Kill + restart agent so it picks up the new binary and
+                // daemon address from the updated .daemon_addr file
+                restart_agent_in_container(&self.client, &container.id).await;
 
                 let (_probed_env, lifecycle_env) =
                     self.prepare_container_env(&container.id, remote_user).await;
@@ -536,6 +590,15 @@ impl UpContext {
                         phase,
                     );
                     run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
+                }
+
+                // Prune old agent versions from the volume (non-fatal)
+                let version = env!("CARGO_PKG_VERSION");
+                if let Err(e) =
+                    cella_docker::volume::prune_old_agent_versions(self.client.inner(), version)
+                        .await
+                {
+                    debug!("Agent version pruning failed: {e}");
                 }
 
                 Ok(Some(UpResult {
@@ -598,6 +661,10 @@ impl UpContext {
         );
 
         labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
+        labels.insert(
+            "dev.cella.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
         labels.insert(
             "dev.cella.workspace_folder".to_string(),
             self.workspace_folder_str().to_string(),
@@ -716,6 +783,9 @@ impl UpContext {
                     .hint(&format!("Agent volume population failed: {e}"));
             }
         }
+
+        // Write .daemon_addr to volume so agents can discover the daemon
+        write_daemon_addr_to_volume(&self.client).await;
 
         let agent_env = cella_docker::config_map::env::agent_env_vars();
         if create_opts.env.is_empty() {
@@ -1516,4 +1586,70 @@ async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, r
 async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
     cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user)
         .await;
+}
+
+// ── Version skew helpers ─────────────────────────────────────────────────
+
+/// Write the `.daemon_addr` file to the shared agent volume.
+///
+/// Queries the daemon for its current control port and auth token, then
+/// writes them to `/cella/.daemon_addr` on the volume so agents can
+/// discover the daemon on startup and reconnect after restarts.
+async fn write_daemon_addr_to_volume(client: &DockerClient) {
+    let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
+        return;
+    };
+    if !mgmt_sock.exists() {
+        return;
+    }
+
+    let Ok(cella_port::protocol::ManagementResponse::Status {
+        control_port,
+        control_token,
+        ..
+    }) = cella_daemon::management::send_management_request(
+        &mgmt_sock,
+        &cella_port::protocol::ManagementRequest::QueryStatus,
+    )
+    .await
+    else {
+        warn!("Failed to query daemon status for .daemon_addr write");
+        return;
+    };
+
+    let addr = format!("host.docker.internal:{control_port}");
+    if let Err(e) =
+        cella_docker::volume::write_daemon_addr_file(client.inner(), &addr, &control_token).await
+    {
+        warn!("Failed to write .daemon_addr to agent volume: {e}");
+    }
+}
+
+/// Kill the running cella-agent and restart it using the stable symlink.
+///
+/// Used after volume repopulation or daemon restart to ensure the agent
+/// connects to the current daemon with the latest binary.
+async fn restart_agent_in_container(client: &DockerClient, container_id: &str) {
+    let agent_path = cella_docker::volume::agent_symlink_path();
+    let script = format!(
+        "pkill -f 'cella-agent daemon' 2>/dev/null; \
+         \"{agent_path}\" daemon \
+         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
+    );
+
+    match client
+        .exec_detached(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), script],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(_) => info!("Agent restarted in container {container_id}"),
+        Err(e) => warn!("Failed to restart agent in container: {e}"),
+    }
 }

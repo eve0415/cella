@@ -155,7 +155,7 @@ fn map_merged_string_list(
 fn build_entrypoint_cmd(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
-    agent_arch: &str,
+    _agent_arch: &str,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     use std::fmt::Write;
 
@@ -170,8 +170,7 @@ fn build_entrypoint_cmd(
 
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
-    let version = env!("CARGO_PKG_VERSION");
-    let agent_path = cella_docker::volume::agent_binary_path(version, agent_arch);
+    let agent_path = cella_docker::volume::agent_symlink_path();
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \

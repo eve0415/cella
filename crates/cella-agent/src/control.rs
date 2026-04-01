@@ -132,3 +132,26 @@ impl ControlClient {
         Ok(msg)
     }
 }
+
+/// Daemon connection info read from the shared volume file.
+pub struct DaemonAddrInfo {
+    pub addr: String,
+    pub token: String,
+}
+
+/// Read daemon connection info from `/cella/.daemon_addr`.
+///
+/// The file contains two lines: the daemon address (`host:port`) and the
+/// auth token. Written by the host CLI during `cella up`.
+///
+/// Returns `None` if the file doesn't exist or can't be parsed.
+pub fn read_daemon_addr_file() -> Option<DaemonAddrInfo> {
+    let content = std::fs::read_to_string("/cella/.daemon_addr").ok()?;
+    let mut lines = content.lines();
+    let addr = lines.next()?.trim().to_string();
+    let token = lines.next()?.trim().to_string();
+    if addr.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some(DaemonAddrInfo { addr, token })
+}
