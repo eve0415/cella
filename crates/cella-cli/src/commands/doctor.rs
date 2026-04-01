@@ -18,9 +18,15 @@ pub struct DoctorArgs {
 }
 
 impl DoctorArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_folder = std::env::current_dir().ok();
-        let ctx = checks::CheckContext::new(workspace_folder, self.all);
+        let backend_kind = backend.map(crate::backend::BackendChoice::to_kind);
+        let backend_client = crate::commands::resolve_backend_for_command(backend, None).ok();
+        let ctx =
+            checks::CheckContext::new(workspace_folder, self.all, backend_kind, backend_client);
         let mut report = checks::run_all_checks(&ctx).await;
 
         if !self.no_redact {

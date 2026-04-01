@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::time::timeout;
 
-use cella_docker::DockerClient;
+use cella_backend::{BackendKind, ContainerBackend};
 
 /// Default timeout per check category.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -147,18 +147,25 @@ pub struct CheckContext {
     pub workspace_folder: Option<PathBuf>,
     /// Whether to check all containers (--all flag).
     pub all: bool,
-    /// Docker client, if connection succeeded.
-    pub docker_client: Option<DockerClient>,
+    /// Selected backend kind, even when connection fails.
+    pub backend_kind: Option<BackendKind>,
+    /// Connected backend client, if connection succeeded.
+    pub backend_client: Option<Box<dyn ContainerBackend>>,
 }
 
 impl CheckContext {
-    /// Build a new context, attempting Docker connection.
-    pub fn new(workspace_folder: Option<PathBuf>, all: bool) -> Self {
-        let docker_client = DockerClient::connect().ok();
+    /// Build a new context from the selected backend and workspace.
+    pub fn new(
+        workspace_folder: Option<PathBuf>,
+        all: bool,
+        backend_kind: Option<BackendKind>,
+        backend_client: Option<Box<dyn ContainerBackend>>,
+    ) -> Self {
         Self {
             workspace_folder,
             all,
-            docker_client,
+            backend_kind,
+            backend_client,
         }
     }
 }

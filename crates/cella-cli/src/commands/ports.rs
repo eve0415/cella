@@ -1,6 +1,8 @@
 use clap::Args;
 use tracing::debug;
 
+use cella_backend::ContainerInfo;
+
 /// View and manage port forwarding for dev containers.
 #[derive(Args)]
 pub struct PortsArgs {
@@ -10,7 +12,10 @@ pub struct PortsArgs {
 }
 
 impl PortsArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info
         if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
@@ -37,8 +42,8 @@ impl PortsArgs {
             }
         }
 
-        // Fall back to Docker API for static port bindings
-        print_docker_ports(self.all).await
+        // Fall back to the selected backend for static port bindings
+        print_backend_ports(self.all, backend).await
     }
 }
 
@@ -66,8 +71,11 @@ fn print_daemon_ports(ports: &[cella_port::protocol::ForwardedPortDetail]) {
     table.eprint();
 }
 
-async fn print_docker_ports(all: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let client = cella_docker::DockerClient::connect()?;
+async fn print_backend_ports(
+    all: bool,
+    backend: Option<&crate::backend::BackendChoice>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = super::resolve_backend_for_command(backend, None)?;
     let containers = client.list_cella_containers(true).await?;
 
     // Check if any container is compose-managed and try compose ps
@@ -158,7 +166,7 @@ async fn try_print_compose_ports(project_name: &str) -> bool {
     true
 }
 
-fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack: bool) {
+fn print_all_container_ports(containers: &[ContainerInfo], is_orbstack: bool) {
     use crate::table::{Column, Table};
 
     let mut table = if is_orbstack {
@@ -221,7 +229,7 @@ fn print_all_container_ports(containers: &[cella_docker::ContainerInfo], is_orbs
     table.eprint();
 }
 
-fn print_container_ports(containers: &[cella_docker::ContainerInfo], is_orbstack: bool) {
+fn print_container_ports(containers: &[ContainerInfo], is_orbstack: bool) {
     use crate::table::{Column, Table};
 
     let mut table = if is_orbstack {

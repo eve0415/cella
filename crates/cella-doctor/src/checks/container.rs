@@ -1,6 +1,6 @@
 //! Per-container health checks.
 
-use cella_docker::DockerClient;
+use cella_backend::{ContainerBackend, ContainerTarget, ExecOptions};
 use cella_port::protocol::{ManagementRequest, ManagementResponse};
 
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
@@ -22,26 +22,26 @@ pub async fn check_containers(ctx: &CheckContext, daemon_running: bool) -> Vec<C
         )];
     }
 
-    let Some(ref client) = ctx.docker_client else {
+    let Some(ref client) = ctx.backend_client else {
         return vec![CategoryReport::new(
             "Containers",
             vec![CheckResult {
                 name: "skipped".into(),
                 severity: Severity::Info,
-                detail: "container checks skipped: Docker not connected".into(),
+                detail: "container checks skipped: selected backend not connected".into(),
                 fix_hint: None,
             }],
         )];
     };
 
     if ctx.all {
-        check_all_containers(client).await
+        check_all_containers(client.as_ref()).await
     } else {
-        check_workspace_container(ctx, client).await
+        check_workspace_container(ctx, client.as_ref()).await
     }
 }
 
-async fn check_all_containers(client: &DockerClient) -> Vec<CategoryReport> {
+async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryReport> {
     match client.list_cella_containers(true).await {
         Ok(containers) if containers.is_empty() => {
             vec![CategoryReport::new(
@@ -79,7 +79,7 @@ async fn check_all_containers(client: &DockerClient) -> Vec<CategoryReport> {
 
 async fn check_workspace_container(
     ctx: &CheckContext,
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
 ) -> Vec<CategoryReport> {
     let Some(ref workspace) = ctx.workspace_folder else {
         return vec![CategoryReport::new(
@@ -93,7 +93,7 @@ async fn check_workspace_container(
         )];
     };
 
-    let target = cella_backend::ContainerTarget {
+    let target = ContainerTarget {
         container_id: None,
         container_name: None,
         id_label: None,
@@ -121,7 +121,7 @@ async fn check_workspace_container(
 }
 
 async fn check_single_container(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     container_name: &str,
 ) -> Vec<CheckResult> {
@@ -151,7 +151,7 @@ async fn check_single_container(
 }
 
 async fn check_version_skew(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     checks: &mut Vec<CheckResult>,
 ) {
@@ -226,7 +226,7 @@ async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name:
 }
 
 async fn check_credentials(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     checks: &mut Vec<CheckResult>,
 ) {
@@ -246,7 +246,7 @@ async fn check_credentials(
     let has_creds = client
         .exec_command(
             container_id,
-            &cella_docker::ExecOptions {
+            &ExecOptions {
                 cmd: check_cmd,
                 user: Some(remote_user),
                 env: None,
@@ -316,7 +316,8 @@ mod tests {
         CheckContext {
             workspace_folder: workspace,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         }
     }
 
@@ -336,7 +337,7 @@ mod tests {
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].checks[0].name, "skipped");
-        assert!(reports[0].checks[0].detail.contains("Docker not connected"));
+        assert!(reports[0].checks[0].detail.contains("backend not connected"));
     }
 
     #[tokio::test]
@@ -374,7 +375,7 @@ mod tests {
         let ctx = ctx_no_docker(Some(std::path::PathBuf::from("/workspace")));
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].checks[0].detail.contains("Docker not connected"));
+        assert!(reports[0].checks[0].detail.contains("backend not connected"));
     }
 
     #[tokio::test]
@@ -396,7 +397,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: true,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);

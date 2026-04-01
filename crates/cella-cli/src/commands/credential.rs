@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand, ValueEnum};
 use tracing::{info, warn};
 
-use cella_backend::ContainerTarget;
-use cella_docker::{DockerClient, ExecOptions, FileToUpload};
+use cella_backend::{ContainerTarget, ExecOptions, FileToUpload};
 
 /// Manage credential forwarding for dev containers.
 #[derive(Args)]
@@ -53,26 +52,30 @@ enum CredentialTool {
 impl CredentialArgs {
     pub async fn execute(
         self,
-        _backend: Option<&crate::backend::BackendChoice>,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
-            CredentialCommand::Sync(args) => run_sync(args).await,
-            CredentialCommand::Status(args) => run_status(args).await,
+            CredentialCommand::Sync(args) => run_sync(args, backend).await,
+            CredentialCommand::Status(args) => run_status(args, backend).await,
         }
     }
 }
 
-async fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_sync(
+    args: SyncArgs,
+    backend: Option<&crate::backend::BackendChoice>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match args.tool {
-        CredentialTool::Gh => sync_gh(args.container, args.workspace_folder).await,
+        CredentialTool::Gh => sync_gh(args.container, args.workspace_folder, backend).await,
     }
 }
 
 async fn sync_gh(
     container_id_override: Option<String>,
     workspace_folder: Option<PathBuf>,
+    backend: Option<&crate::backend::BackendChoice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DockerClient::connect()?;
+    let client = super::resolve_backend_for_command(backend, None)?;
 
     let cwd = super::resolve_workspace_folder(workspace_folder.as_deref())?;
 
@@ -83,7 +86,7 @@ async fn sync_gh(
         id_label: None,
         workspace_folder: Some(cwd.clone()),
     };
-    let container = target.resolve(&client, true).await?;
+    let container = target.resolve(client.as_ref(), true).await?;
 
     // Read remote_user from label
     let remote_user = container
@@ -173,7 +176,10 @@ async fn sync_gh(
     Ok(())
 }
 
-async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_status(
+    args: StatusArgs,
+    backend: Option<&crate::backend::BackendChoice>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let redactor = cella_doctor::redact::Redactor::new();
 
     // Host section: check gh auth status
@@ -216,7 +222,7 @@ async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     // Container section
-    let client = DockerClient::connect()?;
+    let client = super::resolve_backend_for_command(backend, None)?;
     let target = ContainerTarget {
         container_id: args.container,
         container_name: None,
@@ -226,7 +232,7 @@ async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     eprintln!();
     eprintln!("Container:");
-    match target.resolve(&client, false).await {
+    match target.resolve(client.as_ref(), false).await {
         Ok(container) => {
             let remote_user = container
                 .labels

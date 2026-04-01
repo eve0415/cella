@@ -114,7 +114,8 @@ mod tests {
         CheckContext {
             workspace_folder: path,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         }
     }
 

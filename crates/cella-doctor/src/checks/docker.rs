@@ -1,9 +1,27 @@
 //! Docker daemon and tooling checks.
 
+use cella_backend::BackendKind;
+
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
 /// Run Docker-related diagnostics.
 pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
+    if matches!(
+        ctx.backend_kind,
+        Some(kind) if !matches!(kind, BackendKind::Docker | BackendKind::Podman)
+    ) {
+        let backend = ctx.backend_kind.expect("matched Some(kind) guard");
+        return CategoryReport::new(
+            "Docker",
+            vec![CheckResult {
+                name: "skipped".into(),
+                severity: Severity::Info,
+                detail: format!("Docker checks skipped: selected backend is {backend}"),
+                fix_hint: None,
+            }],
+        );
+    }
+
     let mut checks = Vec::new();
 
     checks.push(check_daemon_reachable(ctx).await);
@@ -21,7 +39,7 @@ pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
 
 /// Check whether the Docker daemon is reachable via ping.
 async fn check_daemon_reachable(ctx: &CheckContext) -> CheckResult {
-    match ctx.docker_client {
+    match ctx.backend_client {
         Some(ref client) => match client.ping().await {
             Ok(()) => CheckResult {
                 name: "daemon reachable".into(),
@@ -220,7 +238,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_docker(&ctx).await;
         assert_eq!(report.name, "Docker");
@@ -239,7 +258,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_docker(&ctx).await;
         let daemon_check = report
@@ -262,7 +282,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_docker(&ctx).await;
         let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
@@ -298,7 +319,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let result = check_daemon_reachable(&ctx).await;
         assert_eq!(result.name, "daemon reachable");
@@ -311,7 +333,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_docker(&ctx).await;
         // At minimum: daemon reachable + docker CLI + buildx + compose

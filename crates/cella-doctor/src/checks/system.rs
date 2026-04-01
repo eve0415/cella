@@ -3,7 +3,7 @@
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
 /// Collect system information.
-pub async fn check_system(ctx: &CheckContext) -> CategoryReport {
+pub async fn check_system(_ctx: &CheckContext) -> CategoryReport {
     let mut checks = Vec::new();
 
     // cella version
@@ -40,14 +40,7 @@ pub async fn check_system(ctx: &CheckContext) -> CategoryReport {
     });
 
     // Docker version
-    let docker_version = if let Some(ref client) = ctx.docker_client {
-        match client.inner().version().await {
-            Ok(ver) => ver.version.unwrap_or_else(|| "unknown".into()),
-            Err(_) => docker_cli_version().await,
-        }
-    } else {
-        docker_cli_version().await
-    };
+    let docker_version = docker_cli_version().await;
     checks.push(CheckResult {
         name: "docker version".into(),
         severity: Severity::Info,
@@ -111,7 +104,8 @@ mod tests {
         CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         }
     }
 

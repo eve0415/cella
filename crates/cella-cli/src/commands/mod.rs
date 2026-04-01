@@ -151,7 +151,7 @@ impl Command {
             Self::Build(args) => args.execute(progress, backend).await,
             Self::List(args) => args.execute(backend).await,
             Self::Logs(args) => args.execute(backend).await,
-            Self::Doctor(args) => args.execute().await,
+            Self::Doctor(args) => args.execute(backend).await,
             Self::Branch(args) => args.execute(progress, backend).await,
 
             Self::Switch(args) => args.execute(backend).await,
@@ -169,7 +169,7 @@ impl Command {
             }
             Self::Credential(args) => args.execute(backend).await,
             Self::Network(args) => args.execute(),
-            Self::Ports(args) => args.execute().await,
+            Self::Ports(args) => args.execute(backend).await,
             Self::Daemon(args) => args.execute().await,
         }
     }
