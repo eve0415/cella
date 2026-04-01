@@ -121,7 +121,7 @@ jobs:
           echo "## Per-Crate Coverage" > per-crate-coverage.txt
           echo "" >> per-crate-coverage.txt
           for crate in cella-protocol cella-backend cella-port cella-network cella-codegen cella-config cella-compose cella-git cella-env cella-features cella-agent cella-daemon cella-orchestrator cella-doctor cella-docker cella-cli cella-container; do
-            line_cov=$(cargo llvm-cov report -p "$crate" 2>/dev/null | grep "^TOTAL" | awk '{print $NF}')
+            line_cov=$(cargo llvm-cov report -p "$crate" 2>/dev/null | grep "^TOTAL" | awk '{print $10}')
             if [ -n "$line_cov" ]; then
               printf "%-25s %s\n" "$crate" "$line_cov" >> per-crate-coverage.txt
             fi
