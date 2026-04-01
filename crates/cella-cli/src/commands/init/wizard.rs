@@ -66,8 +66,12 @@ pub async fn run(args: InitArgs, progress: Progress) -> Result<(), Box<dyn std::
         .registry
         .as_deref()
         .unwrap_or(DEFAULT_TEMPLATE_COLLECTION);
-    let template_collection =
-        collection::fetch_template_collection(collection_ref, &cache, args.refresh).await?;
+    let template_collection = progress
+        .run_step_result(
+            "Fetching templates",
+            collection::fetch_template_collection(collection_ref, &cache, args.refresh),
+        )
+        .await?;
 
     // Step 3: Template selection (with multi-source support)
     let (_oci_ref, template_dir, metadata) = select_template(
@@ -206,8 +210,14 @@ async fn select_template(
         let choice = prompt_official_templates(official_templates)?;
         match choice {
             TemplateChoice::Selected(summary) => {
+                let name = summary.name.as_deref().unwrap_or(&summary.id);
                 let oci_ref = format!("{collection_ref}/{}:{}", summary.id, summary.version);
-                let template_dir = fetcher::fetch_template(&oci_ref, cache).await?;
+                let template_dir = progress
+                    .run_step_result(
+                        &format!("Fetching template {name}"),
+                        fetcher::fetch_template(&oci_ref, cache),
+                    )
+                    .await?;
                 let metadata = fetcher::read_template_metadata(&template_dir)?;
                 return Ok((oci_ref, template_dir, Box::new(metadata)));
             }
@@ -217,7 +227,7 @@ async fn select_template(
                 }
             }
             TemplateChoice::CustomRegistry => {
-                if let Some(result) = browse_custom_registry(cache, refresh).await? {
+                if let Some(result) = browse_custom_registry(cache, refresh, progress).await? {
                     return Ok(result);
                 }
             }
@@ -281,7 +291,7 @@ async fn browse_all_template_sources(
             CollectionPick::Back => return Ok(None),
         };
 
-        if let Some(result) = prompt_index_templates(&collection, cache).await? {
+        if let Some(result) = prompt_index_templates(&collection, cache, progress).await? {
             return Ok(Some(result));
         }
         // None = Back to collection picker — loop
@@ -292,10 +302,15 @@ async fn browse_all_template_sources(
 async fn browse_custom_registry(
     cache: &TemplateCache,
     refresh: bool,
+    progress: &Progress,
 ) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error>> {
     let registry = Text::new("Enter registry (e.g. ghcr.io/myorg/templates):").prompt()?;
-    let custom_collection =
-        collection::fetch_template_collection(&registry, cache, refresh).await?;
+    let custom_collection = progress
+        .run_step_result(
+            &format!("Fetching templates from {registry}"),
+            collection::fetch_template_collection(&registry, cache, refresh),
+        )
+        .await?;
     if custom_collection.templates.is_empty() {
         eprintln!("No templates found in {registry}.");
         return Ok(None);
@@ -322,8 +337,14 @@ async fn browse_custom_registry(
     let idx = resolve_selection(&index_map, &selection)?;
 
     let t = &custom_collection.templates[idx];
+    let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{registry}/{}:{}", t.id, t.version);
-    let template_dir = fetcher::fetch_template(&oci_ref, cache).await?;
+    let template_dir = progress
+        .run_step_result(
+            &format!("Fetching template {name}"),
+            fetcher::fetch_template(&oci_ref, cache),
+        )
+        .await?;
     let metadata = fetcher::read_template_metadata(&template_dir)?;
     Ok(Some((oci_ref, template_dir, Box::new(metadata))))
 }
@@ -418,6 +439,7 @@ fn prompt_collection_picker(
 async fn prompt_index_templates(
     collection: &IndexCollection,
     cache: &TemplateCache,
+    progress: &Progress,
 ) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error>> {
     let source_name = collection
         .source_information
@@ -445,8 +467,14 @@ async fn prompt_index_templates(
     let idx = resolve_selection(&index_map, &selection)?;
 
     let t = &collection.templates[idx];
+    let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{}:{}", t.id, t.version);
-    let template_dir = fetcher::fetch_template(&oci_ref, cache).await?;
+    let template_dir = progress
+        .run_step_result(
+            &format!("Fetching template {name}"),
+            fetcher::fetch_template(&oci_ref, cache),
+        )
+        .await?;
     let metadata = fetcher::read_template_metadata(&template_dir)?;
     Ok(Some((oci_ref, template_dir, Box::new(metadata))))
 }
@@ -462,8 +490,12 @@ async fn select_features(
     refresh: bool,
     progress: &Progress,
 ) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error>> {
-    let feature_collection =
-        collection::fetch_feature_collection(DEFAULT_FEATURE_COLLECTION, cache, refresh).await?;
+    let feature_collection = progress
+        .run_step_result(
+            "Fetching features",
+            collection::fetch_feature_collection(DEFAULT_FEATURE_COLLECTION, cache, refresh),
+        )
+        .await?;
     let mut available: Vec<FeatureSummary> = feature_collection.features;
     let mut selected: Vec<SelectedFeature> = Vec::new();
 
@@ -484,7 +516,7 @@ async fn select_features(
             }
             FeatureChoice::Selected(idx) => {
                 let feature_summary = available.remove(idx);
-                let feature = configure_official_feature(&feature_summary, cache).await?;
+                let feature = configure_official_feature(&feature_summary, cache, progress).await?;
                 selected.push(feature);
             }
         }
@@ -531,6 +563,7 @@ fn prompt_feature_list(
 async fn configure_official_feature(
     feature_summary: &FeatureSummary,
     cache: &TemplateCache,
+    progress: &Progress,
 ) -> Result<SelectedFeature, Box<dyn std::error::Error>> {
     let feature_ref = format!(
         "{DEFAULT_FEATURE_COLLECTION}/{}:{}",
@@ -538,7 +571,8 @@ async fn configure_official_feature(
     );
 
     let feature_options =
-        fetch_and_prompt_feature_options(&feature_ref, &feature_summary.id, cache).await?;
+        fetch_and_prompt_feature_options(&feature_ref, &feature_summary.id, cache, progress)
+            .await?;
 
     let feature_name = feature_summary
         .name
@@ -575,7 +609,7 @@ async fn browse_all_feature_sources(
             CollectionPick::Back => return Ok(None),
         };
 
-        if let Some(feature) = prompt_index_features(&collection, cache).await? {
+        if let Some(feature) = prompt_index_features(&collection, cache, progress).await? {
             return Ok(Some(feature));
         }
         // None = Back to collection picker — loop
@@ -587,6 +621,7 @@ async fn browse_all_feature_sources(
 async fn prompt_index_features(
     collection: &IndexCollection,
     cache: &TemplateCache,
+    progress: &Progress,
 ) -> Result<Option<SelectedFeature>, Box<dyn std::error::Error>> {
     let source_name = collection
         .source_information
@@ -616,7 +651,8 @@ async fn prompt_index_features(
     let f = &collection.features[idx];
     let feature_ref = format!("{}:{}", f.id, f.version);
     let short_id = f.id.rsplit('/').next().unwrap_or(&f.id);
-    let feature_options = fetch_and_prompt_feature_options(&feature_ref, short_id, cache).await?;
+    let feature_options =
+        fetch_and_prompt_feature_options(&feature_ref, short_id, cache, progress).await?;
 
     Ok(Some(SelectedFeature {
         reference: feature_ref,
@@ -629,8 +665,15 @@ async fn fetch_and_prompt_feature_options(
     feature_ref: &str,
     display_id: &str,
     cache: &TemplateCache,
+    progress: &Progress,
 ) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
-    if let Ok(feature_dir) = fetcher::fetch_template(feature_ref, cache).await {
+    let fetch_result = progress
+        .run_step_result(
+            &format!("Fetching feature {display_id}"),
+            fetcher::fetch_template(feature_ref, cache),
+        )
+        .await;
+    if let Ok(feature_dir) = fetch_result {
         let options = std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
