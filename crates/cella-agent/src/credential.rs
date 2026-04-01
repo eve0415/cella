@@ -13,12 +13,12 @@ use crate::control::ControlClient;
 /// Reads credential fields from stdin (git credential protocol),
 /// sends to daemon, and writes response to stdout.
 ///
-/// Reads connection info from `CELLA_DAEMON_ADDR`, `CELLA_DAEMON_TOKEN`,
-/// and `CELLA_CONTAINER_NAME` environment variables.
+/// Reads connection info from `CELLA_DAEMON_ADDR` / `CELLA_DAEMON_TOKEN`
+/// env vars, falling back to the `.daemon_addr` file on the shared volume.
 ///
 /// # Errors
 ///
-/// Returns error if env vars are missing or control socket communication fails.
+/// Returns error if connection info is unavailable or control socket communication fails.
 pub async fn handle_credential(operation: &str) -> Result<(), CellaPortError> {
     // Read credential fields from stdin
     let mut stdin_data = String::new();
@@ -38,16 +38,8 @@ pub async fn handle_credential(operation: &str) -> Result<(), CellaPortError> {
             .as_millis()
     );
 
-    let addr = std::env::var("CELLA_DAEMON_ADDR").map_err(|_| CellaPortError::ControlSocket {
-        message: "CELLA_DAEMON_ADDR not set".to_string(),
-    })?;
-    let token = std::env::var("CELLA_DAEMON_TOKEN").map_err(|_| CellaPortError::ControlSocket {
-        message: "CELLA_DAEMON_TOKEN not set".to_string(),
-    })?;
-    let name =
-        std::env::var("CELLA_CONTAINER_NAME").map_err(|_| CellaPortError::ControlSocket {
-            message: "CELLA_CONTAINER_NAME not set".to_string(),
-        })?;
+    let (addr, token) = resolve_daemon_connection()?;
+    let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
     let (mut client, _hello) = ControlClient::connect(&addr, &name, &token).await?;
 
@@ -69,6 +61,23 @@ pub async fn handle_credential(operation: &str) -> Result<(), CellaPortError> {
     }
 
     Ok(())
+}
+
+/// Resolve daemon connection info from env vars or `.daemon_addr` file.
+fn resolve_daemon_connection() -> Result<(String, String), CellaPortError> {
+    if let (Ok(addr), Ok(token)) = (
+        std::env::var("CELLA_DAEMON_ADDR"),
+        std::env::var("CELLA_DAEMON_TOKEN"),
+    ) {
+        return Ok((addr, token));
+    }
+    if let Some(info) = crate::control::read_daemon_addr_file() {
+        return Ok((info.addr, info.token));
+    }
+    Err(CellaPortError::ControlSocket {
+        message: "no daemon connection info available (env vars not set, .daemon_addr not found)"
+            .to_string(),
+    })
 }
 
 /// Parse git credential protocol fields from stdin.

@@ -390,9 +390,8 @@ fn build_compose_labels(
 ///
 /// Since compose's `overrideCommand` defaults to `false`, the container runs its
 /// own entrypoint. The agent is started via `exec` as a background daemon.
-async fn launch_agent(ctx: &UpContext, container_id: &str, agent_arch: &str) {
-    let version = env!("CARGO_PKG_VERSION");
-    let agent_path = format!("/cella/v{version}/{agent_arch}/cella-agent");
+async fn launch_agent(ctx: &UpContext, container_id: &str, _agent_arch: &str) {
+    let agent_path = cella_docker::volume::agent_symlink_path();
 
     let script = format!(
         "if [ -x \"{agent_path}\" ]; then \

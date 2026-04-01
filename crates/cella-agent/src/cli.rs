@@ -74,6 +74,7 @@ pub enum CliCommand {
     Switch {
         branch: String,
     },
+    Doctor,
     Help,
     Unsupported {
         command: String,
@@ -163,6 +164,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Switch { branch }
         }
+        Some("doctor") => CliCommand::Doctor,
         Some("--help" | "-h") | None => CliCommand::Help,
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
@@ -244,6 +246,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> 
             print_help();
             Ok(())
         }
+        CliCommand::Doctor => run_doctor().await,
         CliCommand::Unsupported { command } => {
             print_unsupported(&command);
             std::process::exit(1);
@@ -292,6 +295,7 @@ Commands:
   task logs [-f] <branch>        Show output from a background task (-f to follow)
   task wait <branch>             Wait for a background task to complete
   task stop <branch>             Stop a running background task
+  doctor                         Check connectivity and version status
 
 Options:
   --help, -h                     Show this help message
@@ -319,10 +323,18 @@ Run `cella --help` on the host for all commands."
 }
 
 /// Connect to the host daemon for CLI commands.
+///
+/// Reads connection info from env vars, falling back to the `.daemon_addr`
+/// file on the shared agent volume.
 async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error>> {
-    let addr = std::env::var("CELLA_DAEMON_ADDR")
-        .map_err(|_| "CELLA_DAEMON_ADDR not set. Are you inside a cella dev container?")?;
-    let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
+    let (addr, token) = if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
+        let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
+        (addr, token)
+    } else if let Some(info) = crate::control::read_daemon_addr_file() {
+        (info.addr, info.token)
+    } else {
+        return Err("No daemon connection info. Are you inside a cella dev container?".into());
+    };
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
     let (client, _hello) = ControlClient::connect(&addr, &container_name, &token)
@@ -338,6 +350,71 @@ fn request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("cli-{n}")
+}
+
+async fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let agent_version = env!("CARGO_PKG_VERSION");
+    eprintln!("cella doctor (in-container, agent v{agent_version})\n");
+
+    // 1. .daemon_addr file
+    let daemon_addr_exists = std::path::Path::new("/cella/.daemon_addr").exists();
+    if daemon_addr_exists {
+        eprintln!("  \u{2713} daemon address file (/cella/.daemon_addr)");
+    } else {
+        eprintln!("  \u{2717} daemon address file not found (/cella/.daemon_addr)");
+        eprintln!("    Run `cella up` on the host to fix");
+    }
+
+    // 2. Resolve connection info
+    let (addr, token) = if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
+        let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
+        eprintln!("  \u{2713} connection info (from env vars)");
+        (addr, token)
+    } else if let Some(info) = crate::control::read_daemon_addr_file() {
+        eprintln!("  \u{2713} connection info (from .daemon_addr file)");
+        (info.addr, info.token)
+    } else {
+        eprintln!("  \u{2717} no connection info available");
+        eprintln!("    Set CELLA_DAEMON_ADDR or ensure .daemon_addr exists");
+        return Ok(());
+    };
+
+    // 3. Daemon connectivity
+    let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
+    match ControlClient::connect(&addr, &container_name, &token).await {
+        Ok((_client, hello)) => {
+            eprintln!("  \u{2713} daemon reachable at {addr}");
+            eprintln!(
+                "  \u{2713} protocol version: {} (matches)",
+                cella_port::protocol::PROTOCOL_VERSION
+            );
+
+            // 4. Version comparison
+            if hello.daemon_version == agent_version {
+                eprintln!("  \u{2713} version: {agent_version}");
+            } else {
+                eprintln!(
+                    "  \u{26a0} agent version {agent_version} != daemon version {}",
+                    hello.daemon_version
+                );
+                eprintln!("    Run `cella up` on the host to update");
+            }
+        }
+        Err(e) => {
+            eprintln!("  \u{2717} daemon unreachable at {addr}: {e}");
+        }
+    }
+
+    // 5. Credential helper
+    let browser = std::env::var("BROWSER").unwrap_or_default();
+    if browser.contains("cella") {
+        eprintln!("  \u{2713} browser helper configured");
+    } else {
+        eprintln!("  \u{26a0} browser helper not configured (BROWSER={browser})");
+    }
+
+    eprintln!();
+    Ok(())
 }
 
 async fn run_branch(name: &str, base: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -766,8 +843,11 @@ async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Extract daemon host from CELLA_DAEMON_ADDR.
-    let daemon_addr = std::env::var("CELLA_DAEMON_ADDR").unwrap_or_default();
+    // Extract daemon host from env var or .daemon_addr file.
+    let daemon_addr = std::env::var("CELLA_DAEMON_ADDR")
+        .ok()
+        .or_else(|| crate::control::read_daemon_addr_file().map(|i| i.addr))
+        .unwrap_or_default();
     let host = daemon_addr
         .rsplit_once(':')
         .map_or(daemon_addr.as_str(), |(h, _)| h);

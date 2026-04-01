@@ -213,13 +213,18 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         }
     }
 
-    // Read connection info from env vars
-    let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") else {
-        info!("CELLA_DAEMON_ADDR not set, running in standalone mode");
+    // Read connection info from env vars, falling back to .daemon_addr file
+    let (addr, token) = if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
+        let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
+        (addr, token)
+    } else if let Some(info) = control::read_daemon_addr_file() {
+        info!("Using daemon address from .daemon_addr file");
+        (info.addr, info.token)
+    } else {
+        info!("No daemon address available, running in standalone mode");
         port_watcher::run_standalone(poll_interval).await;
         return;
     };
-    let token = std::env::var("CELLA_DAEMON_TOKEN").unwrap_or_default();
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
     // Wait for the host daemon to accept connections (race with cella up).

@@ -135,6 +135,9 @@ async fn check_single_container(
         fix_hint: None,
     });
 
+    // Version skew check
+    check_version_skew(client, container_id, &mut checks).await;
+
     // Agent connectivity via daemon
     check_agent_connectivity(&mut checks, container_name).await;
 
@@ -145,6 +148,38 @@ async fn check_single_container(
     check_ports(&mut checks, container_name).await;
 
     checks
+}
+
+async fn check_version_skew(
+    client: &DockerClient,
+    container_id: &str,
+    checks: &mut Vec<CheckResult>,
+) {
+    let Ok(info) = client.inspect_container(container_id).await else {
+        return;
+    };
+
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let container_version = info
+        .labels
+        .get("dev.cella.version")
+        .map_or("unknown", String::as_str);
+
+    if container_version == cli_version {
+        checks.push(CheckResult {
+            name: "version".into(),
+            severity: Severity::Pass,
+            detail: container_version.to_string(),
+            fix_hint: None,
+        });
+    } else {
+        checks.push(CheckResult {
+            name: "version".into(),
+            severity: Severity::Warning,
+            detail: format!("container {container_version} != CLI {cli_version}"),
+            fix_hint: Some("Run `cella up` to update".into()),
+        });
+    }
 }
 
 async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name: &str) {

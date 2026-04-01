@@ -89,6 +89,13 @@ impl ReconnectingClient {
         self.inner.is_some()
     }
 
+    /// Check if the given daemon info matches the current connection params.
+    fn matches_current(&self, info: &crate::control::DaemonAddrInfo) -> bool {
+        let addr_matches = info.addr == self.addr;
+        let token_matches = info.token == self.auth_token;
+        addr_matches && token_matches
+    }
+
     /// Returns and clears the `reconnected` flag.
     ///
     /// When a reconnection succeeds the flag is set to `true`. Callers should
@@ -145,22 +152,52 @@ impl ReconnectingClient {
     }
 
     /// Attempt a single reconnect to the daemon.
+    ///
+    /// Tries the current address first, then falls back to reading the
+    /// `.daemon_addr` file on the shared volume (which the host CLI
+    /// updates on every `cella up` and daemon restart).
     async fn try_reconnect(&mut self) -> Result<(), CellaPortError> {
+        // 1. Try the current address
         match ControlClient::connect(&self.addr, &self.container_name, &self.auth_token).await {
             Ok((client, hello)) => {
                 info!("Reconnected to daemon at {}", self.addr);
                 self.inner = Some(client);
                 self.daemon_hello = Some(hello);
                 self.reconnected = true;
-                Ok(())
+                return Ok(());
             }
             Err(e) => {
-                warn!("Reconnect failed: {e}");
-                Err(CellaPortError::ControlSocket {
-                    message: format!("reconnect to {} failed: {e}", self.addr),
-                })
+                debug!("Reconnect to {} failed: {e}", self.addr);
             }
         }
+
+        // 2. Fallback: read updated address from .daemon_addr file
+        if let Some(info) =
+            crate::control::read_daemon_addr_file().filter(|info| !self.matches_current(info))
+        {
+            info!(
+                "Daemon address changed ({} -> {}), trying new address",
+                self.addr, info.addr
+            );
+            match ControlClient::connect(&info.addr, &self.container_name, &info.token).await {
+                Ok((client, hello)) => {
+                    info!("Reconnected to daemon at {} (from .daemon_addr)", info.addr);
+                    self.addr = info.addr;
+                    self.auth_token = info.token;
+                    self.inner = Some(client);
+                    self.daemon_hello = Some(hello);
+                    self.reconnected = true;
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Reconnect to {} (from .daemon_addr) failed: {e}", info.addr);
+                }
+            }
+        }
+
+        Err(CellaPortError::ControlSocket {
+            message: format!("reconnect to {} failed", self.addr),
+        })
     }
 }
 
