@@ -9,6 +9,7 @@ pub mod config;
 pub mod config_map;
 pub mod container_setup;
 pub mod docker_helpers;
+pub mod env_cache;
 pub mod error;
 pub mod host_requirements;
 pub mod image;
@@ -16,6 +17,7 @@ pub mod lifecycle;
 pub mod progress;
 pub mod prune;
 pub mod result;
+pub mod shell_detect;
 pub mod tool_install;
 pub mod up;
 
