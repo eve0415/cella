@@ -881,7 +881,7 @@ mod tests {
             })
             .collect();
 
-        insta::assert_snapshot!(results.join("\n"), @r"
+        insta::assert_snapshot!(results.join("\n"), @"
         0ms: (empty)
         50ms: (empty)
         99ms: (empty)

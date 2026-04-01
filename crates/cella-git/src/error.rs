@@ -84,7 +84,7 @@ mod tests {
             args: "worktree add /tmp/wt".to_string(),
             stderr: "fatal: something went wrong".to_string(),
         };
-        insta::assert_snapshot!(err.to_string(), @r"
+        insta::assert_snapshot!(err.to_string(), @"
         git command failed: `git worktree add /tmp/wt`
         fatal: something went wrong
         ");

@@ -238,7 +238,7 @@ mod tests {
         ]);
 
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME           ID      STATE
         short          abc123  running
         a-longer-name  def456  stopped
@@ -256,7 +256,7 @@ mod tests {
         // Terminal width forces shrinking: header "NAME" (4) + "ID" (6) + sep (2) = 12 min
         // Natural: 26 + 6 + 2 = 34. With term_width=20, excess=14.
         let output = table.render_with_width(Some(20));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME          ID
         a-very-long…  abc123
         ");
@@ -268,7 +268,7 @@ mod tests {
         table.add_row(vec!["short".to_string(), "abc".to_string()]);
 
         let output = table.render_with_width(Some(200));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME   ID
         short  abc
         ");
@@ -279,9 +279,7 @@ mod tests {
         let table = Table::new(vec![Column::fixed("NAME"), Column::fixed("STATE")]);
 
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
-        NAME  STATE
-        ");
+        insta::assert_snapshot!(output, @"NAME  STATE");
     }
 
     #[test]
@@ -318,7 +316,7 @@ mod tests {
         // PATH reduction: floor(10 * 20 / 36) = 5 -> width 19
         // remaining: 10 - 4 - 5 = 1, goes to PATH (more available)
         let output = table.render_with_width(Some(41));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME              ID   PATH
         name-that-is-tw…  abc  path-that-is-also…
         ");
@@ -336,7 +334,7 @@ mod tests {
         // Only X is shrinkable. Available: 20 - 1 = 19.
         // Reduction: min(12, 19) = 12. X width: 20 - 12 = 8.
         let output = table.render_with_width(Some(25));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         LONGHEADER       X
         long-value-here  shrink-…
         ");
@@ -354,7 +352,7 @@ mod tests {
         let mut table = Table::new(vec![Column::fixed("VALUE")]);
         table.add_row(vec!["hello".to_string()]);
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         VALUE
         hello
         ");
@@ -447,7 +445,7 @@ mod tests {
         table.add_row(vec!["22".to_string(), "bb".to_string()]);
         table.add_row(vec!["333".to_string(), "ccc".to_string()]);
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         ID   NAME
         1    a
         22   bb

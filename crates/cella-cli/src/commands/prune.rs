@@ -282,7 +282,7 @@ mod tests {
         ];
 
         let output = format_candidates(&candidates);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         BRANCH    WORKTREE                              CONTAINER             STATE
         fix/typo  /workspaces/cella-worktrees/fix-typo  cella-fix-typo-abc12  stopped
         feat/old  /workspaces/cella-worktrees/feat-old  cella-feat-old-def34  running
@@ -300,7 +300,7 @@ mod tests {
         }];
 
         let output = format_candidates(&candidates);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         BRANCH  WORKTREE           CONTAINER  STATE
         orphan  /worktrees/orphan  -          -
         ");
