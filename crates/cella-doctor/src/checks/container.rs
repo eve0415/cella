@@ -93,7 +93,7 @@ async fn check_workspace_container(
         )];
     };
 
-    let target = cella_docker::ContainerTarget {
+    let target = cella_backend::ContainerTarget {
         container_id: None,
         container_name: None,
         id_label: None,

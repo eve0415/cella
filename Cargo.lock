@@ -462,6 +462,7 @@ dependencies = [
 name = "cella-doctor"
 version = "0.0.14"
 dependencies = [
+ "cella-backend",
  "cella-config",
  "cella-daemon",
  "cella-docker",
