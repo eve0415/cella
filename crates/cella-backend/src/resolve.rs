@@ -109,26 +109,12 @@ impl ContainerTarget {
         label: &str,
     ) -> Result<ContainerInfo, BackendError> {
         debug!("Resolving container by label: {label}");
-        // Search all cella containers and filter by the requested label.
-        let containers = client.list_cella_containers(false).await?;
-
-        let matched = containers.into_iter().find(|c| {
-            // label can be "key=value" or just "key"
-            if let Some((key, value)) = label.split_once('=') {
-                c.labels.get(key).is_some_and(|v| v == value)
-            } else {
-                c.labels.contains_key(label)
-            }
-        });
-
-        if let Some(container) = matched {
-            // Re-inspect for full details (list may have sparse data).
-            client.inspect_container(&container.id).await
-        } else {
-            Err(BackendError::ContainerNotFound {
+        // Search all runtime containers (not just cella-managed ones).
+        client.find_container_by_label(label).await?.ok_or_else(|| {
+            BackendError::ContainerNotFound {
                 identifier: format!("label={label}"),
-            })
-        }
+            }
+        })
     }
 
     async fn find_by_workspace(

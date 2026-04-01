@@ -333,6 +333,13 @@ pub mod mock {
             Box::pin(async { Ok(None) })
         }
 
+        fn find_container_by_label<'a>(
+            &'a self,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
         fn container_logs<'a>(
             &'a self,
             id: &'a str,

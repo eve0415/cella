@@ -76,6 +76,15 @@ pub trait ContainerBackend: Send + Sync {
         service: &'a str,
     ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>>;
 
+    /// Find a container by an arbitrary label (e.g. `"key=value"` or `"key"`).
+    ///
+    /// Searches **all** runtime containers, not just cella-managed ones.
+    /// Returns the first match, or `None`.
+    fn find_container_by_label<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>>;
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

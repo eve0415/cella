@@ -102,6 +102,37 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn find_container_by_label<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            use bollard::query_parameters::ListContainersOptions;
+            use std::collections::HashMap;
+
+            let filters: HashMap<String, Vec<String>> =
+                HashMap::from([("label".to_string(), vec![label.to_string()])]);
+            let options = ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            };
+            let containers = self
+                .inner()
+                .list_containers(Some(options))
+                .await
+                .map_err(|e| BackendError::Runtime(Box::new(e)))?;
+
+            if let Some(summary) = containers.into_iter().next() {
+                let id = summary.id.as_deref().unwrap_or_default();
+                let info = self.inspect_container(id).await?;
+                Ok(Some(info))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

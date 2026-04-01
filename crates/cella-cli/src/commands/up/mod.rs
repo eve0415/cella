@@ -810,12 +810,14 @@ impl UpContext {
         }
 
         let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
-        create_opts.mounts.push(MountConfig {
-            mount_type: "volume".to_string(),
-            source: vol_name,
-            target: vol_target,
-            consistency: None,
-        });
+        if !vol_name.is_empty() {
+            create_opts.mounts.push(MountConfig {
+                mount_type: "volume".to_string(),
+                source: vol_name,
+                target: vol_target,
+                consistency: None,
+            });
+        }
 
         Ok(())
     }
