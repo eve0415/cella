@@ -5,6 +5,8 @@ use tracing::warn;
 
 use cella_docker::{ContainerTarget, ExecOptions, InteractiveExecOptions};
 
+use crate::picker;
+
 /// Execute a command inside the running dev container.
 #[derive(Args)]
 pub struct ExecArgs {
@@ -64,7 +66,25 @@ impl ExecArgs {
             workspace_folder: self.workspace_folder,
         };
 
-        let container = target.resolve(&client, true).await?;
+        let has_explicit = picker::has_explicit_target(&target);
+        let container = match target.resolve(&client, true).await {
+            Ok(c) => c,
+            Err(_) if !has_explicit => {
+                let containers = client.list_cella_containers(true).await?;
+                let cwd_container = client
+                    .find_container(&std::env::current_dir()?)
+                    .await
+                    .ok()
+                    .flatten();
+                picker::resolve_container_interactive(
+                    &containers,
+                    cwd_container.as_ref().map(|c| c.name.as_str()),
+                    "Select a container:",
+                    None,
+                )?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let container =
             super::resolve_service_container(&client, container, self.service.as_deref()).await?;
 

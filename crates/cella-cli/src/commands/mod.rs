@@ -1,6 +1,7 @@
 mod branch;
 mod build;
 mod code;
+mod completions;
 pub mod compose_features;
 mod compose_up;
 mod config;
@@ -25,7 +26,7 @@ mod tmux;
 
 mod switch;
 mod template;
-mod up;
+pub mod up;
 
 use clap::{Args, Subcommand};
 use tracing::warn;
@@ -86,6 +87,8 @@ pub enum Command {
     /// Read and output the resolved devcontainer configuration.
     #[command(name = "read-configuration")]
     ReadConfiguration(read_configuration::ReadConfigurationArgs),
+    /// Generate shell completion scripts.
+    Completions(completions::CompletionsArgs),
     /// Manage the cella daemon.
     #[command(name = "daemon", hide = true)]
     Daemon(daemon::DaemonArgs),
@@ -152,6 +155,10 @@ impl Command {
             Self::Init(args) => args.execute(),
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
+            Self::Completions(args) => {
+                args.execute();
+                Ok(())
+            }
             Self::Credential(args) => args.execute().await,
             Self::Network(args) => args.execute(),
             Self::Ports(args) => args.execute().await,

@@ -8,6 +8,8 @@ use cella_docker::{ExecOptions, InteractiveExecOptions};
 
 use super::up::{OutputFormat, UpArgs, UpContext};
 
+use crate::picker;
+
 /// Open a persistent tmux session inside the dev container.
 ///
 /// Ensures the container is running (auto-up if needed), runs `postAttachCommand`,
@@ -41,11 +43,15 @@ impl TmuxArgs {
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure container is up
-        let build_no_cache = self.up.build_no_cache;
-        let strict = self.up.strict.clone();
-        let output_format = self.up.output.clone();
-        let force = self.force;
-        let ctx = UpContext::new(&self.up, progress).await?;
+        let (build_no_cache, strict, output_format, force) = (
+            self.up.build_no_cache,
+            self.up.strict.clone(),
+            self.up.output.clone(),
+            self.force,
+        );
+        let mut up = self.up;
+        picker::resolve_up_workspace(&mut up).await;
+        let ctx = UpContext::new(&up, progress).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 2. Resolve compose service if needed
@@ -76,19 +82,12 @@ impl TmuxArgs {
 
         // 6. JSON output mode: report and exit
         if matches!(output_format, OutputFormat::Json) {
-            let output = json!({
-                "outcome": result.outcome,
-                "containerId": container_id,
-                "remoteUser": result.remote_user,
-                "remoteWorkspaceFolder": result.workspace_folder,
-                "tmuxInstalled": true,
-                "tmuxVersion": tmux_info.version,
-                "tmuxSession": session_name,
-                "tmuxSessionExists": session_exists,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).unwrap_or_default()
+            print_json_output(
+                &result,
+                &container_id,
+                &tmux_info,
+                &session_name,
+                session_exists,
             );
             return Ok(());
         }
@@ -165,6 +164,30 @@ impl TmuxArgs {
 
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
+}
+
+/// Print JSON output for the tmux command.
+fn print_json_output(
+    result: &super::up::UpResult,
+    container_id: &str,
+    tmux_info: &TmuxInfo,
+    session_name: &str,
+    session_exists: bool,
+) {
+    let output = json!({
+        "outcome": result.outcome,
+        "containerId": container_id,
+        "remoteUser": result.remote_user,
+        "remoteWorkspaceFolder": result.workspace_folder,
+        "tmuxInstalled": true,
+        "tmuxVersion": tmux_info.version,
+        "tmuxSession": session_name,
+        "tmuxSessionExists": session_exists,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
 }
 
 /// Info about the tmux installation in the container.

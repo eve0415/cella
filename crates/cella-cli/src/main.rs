@@ -1,5 +1,6 @@
 pub mod backend;
 mod commands;
+pub mod picker;
 pub mod progress;
 mod table;
 

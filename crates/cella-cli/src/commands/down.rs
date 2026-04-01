@@ -11,6 +11,8 @@ use cella_daemon::shared::running_cella_container_count;
 use cella_docker::{ContainerInfo, ContainerState, ContainerTarget};
 use cella_env::paths::{cella_data_dir, daemon_socket_path};
 
+use crate::picker;
+
 /// Stop the dev container for the current workspace.
 #[derive(Args)]
 pub struct DownArgs {
@@ -99,6 +101,11 @@ impl DownArgs {
             self.workspace_folder
         };
 
+        let no_explicit_target = self.container_id.is_none()
+            && self.container_name.is_none()
+            && self.branch.is_none()
+            && workspace_folder.is_none();
+
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
@@ -106,7 +113,19 @@ impl DownArgs {
             workspace_folder,
         };
 
-        let container = target.resolve(&client, false).await?;
+        let container = match target.resolve(&client, false).await {
+            Ok(c) => c,
+            Err(_) if no_explicit_target => {
+                let containers = client.list_cella_containers(false).await?;
+                picker::resolve_container_interactive(
+                    &containers,
+                    None,
+                    "Select a container to stop:",
+                    None,
+                )?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // For non-compose containers, honour shutdownAction from label
         if !discovery::is_compose_container(&container.labels) {

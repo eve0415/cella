@@ -1,15 +1,15 @@
-use std::path::PathBuf;
-
 use clap::Args;
 use tracing::debug;
 
 use cella_docker::{ContainerTarget, InteractiveExecOptions};
 
+use crate::picker;
+
 /// Switch to a different worktree-backed branch (opens a shell in its container).
 #[derive(Args)]
 pub struct SwitchArgs {
-    /// Name of the branch to switch to.
-    pub name: String,
+    /// Name of the branch to switch to (interactive picker if omitted).
+    pub name: Option<String>,
 
     /// Shell to use (e.g., bash, zsh, fish).
     #[arg(short, long)]
@@ -22,10 +22,26 @@ pub struct SwitchArgs {
 
 impl SwitchArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Resolve branch name to worktree path
-        let workspace_folder = resolve_branch_to_path(&self.name)?;
-
         let client = super::connect_docker(self.docker_host.as_deref())?;
+
+        // Discover repo and list worktrees
+        let cwd = std::env::current_dir()?;
+        let repo_info = cella_git::discover(&cwd)?;
+        let worktrees = cella_git::list(&repo_info.root)?;
+
+        // Build branch → container state map for picker display
+        let containers = client.list_cella_containers(false).await?;
+        let container_states = picker::branch_container_states(&containers);
+
+        // Resolve branch interactively (exact match, picker, or pre-filtered)
+        let wt = picker::resolve_worktree_interactive(
+            &worktrees,
+            &container_states,
+            self.name.as_deref(),
+            repo_info.head_branch.as_deref(),
+        )?;
+
+        let workspace_folder = wt.path;
 
         let target = ContainerTarget {
             container_id: None,
@@ -97,16 +113,4 @@ impl SwitchArgs {
 
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
-}
-
-/// Resolve a branch name to its worktree path.
-fn resolve_branch_to_path(branch_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
-    let repo_info = cella_git::discover(&cwd)?;
-    let worktrees = cella_git::list(&repo_info.root)?;
-    let wt = worktrees
-        .iter()
-        .find(|wt| wt.branch.as_deref() == Some(branch_name))
-        .ok_or_else(|| format!("No worktree found for branch '{branch_name}'"))?;
-    Ok(wt.path.clone())
 }

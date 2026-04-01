@@ -9,6 +9,8 @@ use cella_docker::ExecOptions;
 
 use super::up::{OutputFormat, UpArgs, UpContext, output_result};
 
+use crate::picker;
+
 /// Open VS Code connected to the dev container.
 ///
 /// Ensures the container is running (auto-up if needed), runs `postAttachCommand`,
@@ -56,7 +58,9 @@ impl CodeArgs {
         let build_no_cache = self.up.build_no_cache;
         let strict = self.up.strict.clone();
         let output_format = self.up.output.clone();
-        let ctx = UpContext::new(&self.up, progress).await?;
+        let mut up = self.up;
+        picker::resolve_up_workspace(&mut up).await;
+        let ctx = UpContext::new(&up, progress).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 4. Resolve compose service if needed

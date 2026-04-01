@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+use crate::picker;
+
 /// View logs from the dev container.
 #[derive(Args)]
 pub struct LogsArgs {
@@ -50,10 +52,19 @@ impl LogsArgs {
 
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
-        let container = client
-            .find_container(&cwd)
-            .await?
-            .ok_or("No cella container found for this workspace")?;
+        let container = match client.find_container(&cwd).await? {
+            Some(c) => c,
+            None if self.workspace_folder.is_none() => {
+                let containers = client.list_cella_containers(false).await?;
+                picker::resolve_container_interactive(
+                    &containers,
+                    None,
+                    "Select a container for logs:",
+                    None,
+                )?
+            }
+            None => return Err("No cella container found for this workspace".into()),
+        };
 
         // Docker Compose: use docker compose logs for all/specific services
         if let Some(project_name) =
