@@ -7,7 +7,7 @@ use std::process::Stdio;
 use cella_backend::{
     BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend, ContainerInfo,
     ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
-    InteractiveExecOptions, MountInfo, PortBinding,
+    InteractiveExecOptions, MountInfo, Platform, PortBinding,
 };
 use tracing::{debug, warn};
 
@@ -434,6 +434,155 @@ impl ContainerBackend for AppleContainerBackend {
 
             Ok(())
         })
+    }
+
+    // -- Connectivity --
+
+    fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            // Verify the container CLI is reachable by running `container list`.
+            let _ = self.cli.list(None).await?;
+            Ok(())
+        })
+    }
+
+    fn host_gateway(&self) -> &str {
+        // Apple Container uses the standard macOS localhost; containers
+        // can reach the host via this address when networking is enabled.
+        "host.local"
+    }
+
+    // -- Platform detection --
+
+    fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
+        Box::pin(async move {
+            Ok(Platform {
+                os: "linux".to_string(),
+                arch: if cfg!(target_arch = "aarch64") {
+                    "arm64".to_string()
+                } else {
+                    "amd64".to_string()
+                },
+            })
+        })
+    }
+
+    fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+        Box::pin(async move {
+            Ok(if cfg!(target_arch = "aarch64") {
+                "aarch64".to_string()
+            } else {
+                "x86_64".to_string()
+            })
+        })
+    }
+
+    // -- Extended image inspection --
+
+    fn inspect_image_env<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+        Box::pin(async move {
+            let details = self.inspect_image_details(image).await?;
+            Ok(details.env)
+        })
+    }
+
+    fn inspect_image_user<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let details = self.inspect_image_details(image).await?;
+            Ok(details.user)
+        })
+    }
+
+    // -- Network operations --
+
+    fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_network".to_string(),
+            })
+        })
+    }
+
+    fn ensure_container_network<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _repo_path: &'a Path,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_container_network".to_string(),
+            })
+        })
+    }
+
+    fn get_container_ip<'a>(
+        &'a self,
+        _container_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    // -- Agent provisioning --
+
+    fn ensure_agent_provisioned<'a>(
+        &'a self,
+        _version: &'a str,
+        _arch: &'a str,
+        _skip_checksum: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_agent_provisioned".to_string(),
+            })
+        })
+    }
+
+    fn write_agent_addr<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _addr: &'a str,
+        _token: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "write_agent_addr".to_string(),
+            })
+        })
+    }
+
+    fn agent_volume_mount(&self) -> (String, String, bool) {
+        // Apple Container doesn't use Docker volumes; return a
+        // placeholder that the CLI can detect and skip.
+        (String::new(), "/cella".to_string(), true)
+    }
+
+    fn prune_old_agent_versions<'a>(
+        &'a self,
+        _current_version: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    // -- UID remapping --
+
+    fn update_remote_user_uid<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _remote_user: &'a str,
+        _workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        // Apple Container runs as the user; UID remapping is not needed.
+        Box::pin(async move { Ok(()) })
     }
 }
 

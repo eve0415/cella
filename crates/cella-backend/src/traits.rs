@@ -214,7 +214,7 @@ pub trait ContainerBackend: Send + Sync {
         &'a self,
         container_id: &'a str,
         remote_user: &'a str,
-        image: &'a str,
+        workspace_root: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 }
 
