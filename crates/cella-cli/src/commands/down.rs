@@ -5,10 +5,10 @@ use serde_json::json;
 use tracing::{debug, info};
 
 use super::up::OutputFormat;
+use cella_backend::ContainerTarget;
 use cella_compose::discovery;
 use cella_daemon::daemon;
 use cella_daemon::shared::running_cella_container_count;
-use cella_backend::ContainerTarget;
 use cella_docker::{ContainerInfo, ContainerState};
 use cella_env::paths::{cella_data_dir, daemon_socket_path};
 

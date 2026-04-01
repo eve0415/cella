@@ -13,11 +13,7 @@ use cella_backend::{ContainerBackend, ExecOptions};
 /// 1. `$SHELL` environment variable
 /// 2. `/etc/passwd` entry for the user
 /// 3. Probing `/bin/zsh`, `/bin/bash`, `/bin/sh`
-pub async fn detect_shell(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-    user: &str,
-) -> String {
+pub async fn detect_shell(client: &dyn ContainerBackend, container_id: &str, user: &str) -> String {
     if let Some(shell) = detect_shell_from_env(client, container_id, user).await {
         return shell;
     }

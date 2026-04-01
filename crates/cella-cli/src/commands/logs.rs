@@ -106,7 +106,10 @@ impl LogsArgs {
                 .into());
             }
         } else {
-            let logs = client.as_ref().container_logs(&container.id, self.tail).await?;
+            let logs = client
+                .as_ref()
+                .container_logs(&container.id, self.tail)
+                .await?;
             print!("{logs}");
         }
         Ok(())
