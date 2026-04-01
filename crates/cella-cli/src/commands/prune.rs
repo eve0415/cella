@@ -1,15 +1,20 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 use clap::Args;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use cella_compose::discovery;
+use cella_docker::ContainerInfo;
 
 use super::up::OutputFormat;
 
 /// Remove stale worktrees and their associated containers.
 ///
 /// Identifies worktrees whose branches have been fully merged into the
-/// default branch, then removes both the worktree and any associated
-/// cella container.
+/// default branch or whose remote tracking ref has been deleted (e.g. after
+/// a squash-merge on GitHub), then removes the worktree, container, and
+/// local branch.
 #[derive(Args)]
 pub struct PruneArgs {
     /// Remove without confirmation.
@@ -33,13 +38,33 @@ pub struct PruneArgs {
     output: OutputFormat,
 }
 
+/// Why a worktree was selected for pruning.
+#[derive(Debug, Clone, Copy)]
+enum PruneReason {
+    /// Branch is fully merged into the default branch.
+    Merged,
+    /// Remote tracking ref was deleted (squash-merge or manual deletion).
+    Gone,
+    /// Included via `--all` but not merged or gone.
+    Unmerged,
+}
+
+impl PruneReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Gone => "gone",
+            Self::Unmerged => "unmerged",
+        }
+    }
+}
+
 /// A worktree that is a candidate for pruning.
 struct PruneCandidate {
     branch: String,
-    worktree_path: std::path::PathBuf,
-    container_name: Option<String>,
-    container_id: Option<String>,
-    container_state: Option<String>,
+    worktree_path: PathBuf,
+    container: Option<ContainerInfo>,
+    reason: PruneReason,
 }
 
 impl PruneArgs {
@@ -66,6 +91,43 @@ impl PruneArgs {
             return Ok(());
         }
 
+        // 3. Fetch, detect, and build candidates
+        let client = super::connect_docker(self.docker_host.as_deref())?;
+        let candidates = self
+            .build_candidates(repo_root, &linked_worktrees, &client)
+            .await?;
+
+        if candidates.is_empty() {
+            if self.is_json() {
+                print_json_result(&[], &[]);
+            } else if self.all {
+                eprintln!("Nothing to prune. No linked worktrees found.");
+            } else {
+                eprintln!("Nothing to prune. No merged or gone worktrees found.");
+            }
+            return Ok(());
+        }
+
+        // 4. Display, confirm, and execute
+        self.confirm_and_prune(candidates, &client, repo_root).await
+    }
+
+    async fn build_candidates(
+        &self,
+        repo_root: &std::path::Path,
+        linked_worktrees: &[cella_git::WorktreeInfo],
+        client: &cella_docker::DockerClient,
+    ) -> Result<Vec<PruneCandidate>, Box<dyn std::error::Error>> {
+        if !self.is_json() {
+            eprintln!("Fetching remote refs...");
+        }
+        if let Err(e) = cella_git::fetch_prune(repo_root) {
+            if !self.is_json() {
+                eprintln!("Warning: git fetch --prune failed: {e}");
+            }
+            warn!("git fetch --prune failed: {e}");
+        }
+
         let merged = if self.all {
             Vec::new()
         } else {
@@ -76,47 +138,37 @@ impl PruneArgs {
             merged
         };
 
-        let client = super::connect_docker(self.docker_host.as_deref())?;
-
         let mut candidates = Vec::new();
-        for wt in &linked_worktrees {
+        for wt in linked_worktrees {
             let Some(branch) = &wt.branch else {
                 continue; // Skip detached HEAD worktrees
             };
 
-            if !self.all && !merged.contains(branch) {
-                continue;
-            }
+            let reason = classify_branch(repo_root, branch, &merged, self.all);
+            let Some(reason) = reason else { continue };
 
             let container = client.find_container(&wt.path).await.ok().flatten();
             candidates.push(PruneCandidate {
                 branch: branch.clone(),
                 worktree_path: wt.path.clone(),
-                container_name: container.as_ref().map(|c| c.name.clone()),
-                container_id: container.as_ref().map(|c| c.id.clone()),
-                container_state: container
-                    .as_ref()
-                    .map(|c| format!("{:?}", c.state).to_lowercase()),
+                container,
+                reason,
             });
         }
 
-        if candidates.is_empty() {
-            if self.is_json() {
-                print_json_result(&[], &[]);
-            } else if self.all {
-                eprintln!("Nothing to prune. No linked worktrees found.");
-            } else {
-                eprintln!("Nothing to prune. No merged worktrees found.");
-            }
-            return Ok(());
-        }
+        Ok(candidates)
+    }
 
-        // 6. Display candidates (text mode only)
+    async fn confirm_and_prune(
+        &self,
+        candidates: Vec<PruneCandidate>,
+        client: &cella_docker::DockerClient,
+        repo_root: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.is_json() {
             print_candidates(&candidates);
         }
 
-        // 7. Handle dry run
         if self.dry_run {
             if self.is_json() {
                 let branch_names: Vec<&str> =
@@ -151,7 +203,7 @@ impl PruneArgs {
         }
 
         let (pruned_branches, errors) =
-            execute_prune(&candidates, &client, repo_root, self.is_json()).await;
+            execute_prune(&candidates, client, repo_root, self.is_json()).await;
 
         if self.is_json() {
             let names: Vec<&str> = pruned_branches.iter().map(String::as_str).collect();
@@ -167,6 +219,30 @@ impl PruneArgs {
     }
 }
 
+/// Classify a branch for pruning. Returns `None` if it should be skipped.
+fn classify_branch(
+    repo_root: &std::path::Path,
+    branch: &str,
+    merged: &[String],
+    include_all: bool,
+) -> Option<PruneReason> {
+    if include_all {
+        Some(if merged.contains(&branch.to_string()) {
+            PruneReason::Merged
+        } else if cella_git::is_tracking_gone(repo_root, branch).unwrap_or(false) {
+            PruneReason::Gone
+        } else {
+            PruneReason::Unmerged
+        })
+    } else if merged.contains(&branch.to_string()) {
+        Some(PruneReason::Merged)
+    } else if cella_git::is_tracking_gone(repo_root, branch).unwrap_or(false) {
+        Some(PruneReason::Gone)
+    } else {
+        None
+    }
+}
+
 async fn execute_prune(
     candidates: &[PruneCandidate],
     client: &cella_docker::DockerClient,
@@ -178,14 +254,41 @@ async fn execute_prune(
 
     for candidate in candidates {
         // Stop and remove container
-        if let Some(ref container_id) = candidate.container_id {
-            let _ = client.stop_container(container_id).await;
-            let _ = client.remove_container(container_id, false).await;
-            info!(
-                branch = %candidate.branch,
-                container = candidate.container_name.as_deref().unwrap_or("-"),
-                "removed container"
-            );
+        if let Some(ref container) = candidate.container {
+            super::down::deregister_container(container).await;
+
+            if discovery::is_compose_container(&container.labels)
+                && let Some(project_name) =
+                    discovery::compose_project_from_labels(&container.labels)
+            {
+                let compose_cmd = cella_compose::ComposeCommand::from_project_name(project_name);
+                if let Err(e) = compose_cmd.down().await {
+                    errors.push(format!(
+                        "failed to stop compose project for {}: {e}",
+                        candidate.branch
+                    ));
+                } else {
+                    info!(
+                        branch = %candidate.branch,
+                        project = project_name,
+                        "removed compose project"
+                    );
+                }
+            } else {
+                let _ = client.stop_container(&container.id).await;
+                if let Err(e) = client.remove_container(&container.id, true).await {
+                    errors.push(format!(
+                        "failed to remove container {}: {e}",
+                        container.name
+                    ));
+                } else {
+                    info!(
+                        branch = %candidate.branch,
+                        container = %container.name,
+                        "removed container"
+                    );
+                }
+            }
         }
 
         // Remove worktree
@@ -195,7 +298,7 @@ async fn execute_prune(
                     eprintln!(
                         "  Pruned: {} ({})",
                         candidate.branch,
-                        if candidate.container_id.is_some() {
+                        if candidate.container.is_some() {
                             "container removed"
                         } else {
                             "no container"
@@ -203,6 +306,14 @@ async fn execute_prune(
                     );
                 }
                 pruned_branches.push(candidate.branch.clone());
+
+                // Delete the local branch
+                if let Err(e) = cella_git::delete_branch(repo_root, &candidate.branch) {
+                    debug!(
+                        branch = %candidate.branch,
+                        "failed to delete branch (may already be gone): {e}"
+                    );
+                }
             }
             Err(e) => {
                 let msg = format!("failed to remove worktree for {}: {e}", candidate.branch);
@@ -219,6 +330,8 @@ async fn execute_prune(
         .args(["worktree", "prune"])
         .current_dir(repo_root)
         .output();
+
+    super::down::cleanup_daemon();
 
     (pruned_branches, errors)
 }
@@ -239,14 +352,21 @@ fn format_candidates(candidates: &[PruneCandidate]) -> String {
         Column::shrinkable("WORKTREE"),
         Column::fixed("CONTAINER"),
         Column::fixed("STATE"),
+        Column::fixed("REASON"),
     ]);
 
     for c in candidates {
         table.add_row(vec![
             c.branch.clone(),
             c.worktree_path.display().to_string(),
-            c.container_name.as_deref().unwrap_or("-").to_string(),
-            c.container_state.as_deref().unwrap_or("-").to_string(),
+            c.container
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |ci| ci.name.clone()),
+            c.container.as_ref().map_or_else(
+                || "-".to_string(),
+                |ci| format!("{:?}", ci.state).to_lowercase(),
+            ),
+            c.reason.as_str().to_string(),
         ]);
     }
 
@@ -260,7 +380,25 @@ fn print_candidates(candidates: &[PruneCandidate]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+
+    use cella_docker::ContainerState;
+
+    fn make_container(name: &str, id: &str, state: ContainerState) -> ContainerInfo {
+        ContainerInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            state,
+            exit_code: None,
+            labels: std::collections::HashMap::new(),
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: cella_backend::BackendKind::Docker,
+        }
+    }
 
     #[test]
     fn format_candidates_with_containers() {
@@ -268,24 +406,30 @@ mod tests {
             PruneCandidate {
                 branch: "fix/typo".to_string(),
                 worktree_path: PathBuf::from("/workspaces/cella-worktrees/fix-typo"),
-                container_name: Some("cella-fix-typo-abc12".to_string()),
-                container_id: Some("abc12345".to_string()),
-                container_state: Some("stopped".to_string()),
+                container: Some(make_container(
+                    "cella-fix-typo-abc12",
+                    "abc12345",
+                    ContainerState::Stopped,
+                )),
+                reason: PruneReason::Merged,
             },
             PruneCandidate {
                 branch: "feat/old".to_string(),
                 worktree_path: PathBuf::from("/workspaces/cella-worktrees/feat-old"),
-                container_name: Some("cella-feat-old-def34".to_string()),
-                container_id: Some("def34567".to_string()),
-                container_state: Some("running".to_string()),
+                container: Some(make_container(
+                    "cella-feat-old-def34",
+                    "def34567",
+                    ContainerState::Running,
+                )),
+                reason: PruneReason::Gone,
             },
         ];
 
         let output = format_candidates(&candidates);
         insta::assert_snapshot!(output, @"
-        BRANCH    WORKTREE                              CONTAINER             STATE
-        fix/typo  /workspaces/cella-worktrees/fix-typo  cella-fix-typo-abc12  stopped
-        feat/old  /workspaces/cella-worktrees/feat-old  cella-feat-old-def34  running
+        BRANCH    WORKTREE                              CONTAINER             STATE    REASON
+        fix/typo  /workspaces/cella-worktrees/fix-typo  cella-fix-typo-abc12  stopped  merged
+        feat/old  /workspaces/cella-worktrees/feat-old  cella-feat-old-def34  running  gone
         ");
     }
 
@@ -294,15 +438,14 @@ mod tests {
         let candidates = vec![PruneCandidate {
             branch: "orphan".to_string(),
             worktree_path: PathBuf::from("/worktrees/orphan"),
-            container_name: None,
-            container_id: None,
-            container_state: None,
+            container: None,
+            reason: PruneReason::Gone,
         }];
 
         let output = format_candidates(&candidates);
         insta::assert_snapshot!(output, @"
-        BRANCH  WORKTREE           CONTAINER  STATE
-        orphan  /worktrees/orphan  -          -
+        BRANCH  WORKTREE           CONTAINER  STATE  REASON
+        orphan  /worktrees/orphan  -          -      gone
         ");
     }
 
@@ -320,14 +463,18 @@ mod tests {
         let candidates = vec![PruneCandidate {
             branch: "feat/a-very-long-branch-name".to_string(),
             worktree_path: PathBuf::from("/very/long/worktree/path/feat-a-very-long-branch-name"),
-            container_name: Some("cella-feat-long-branch-name-xyz99".to_string()),
-            container_id: Some("xyz99".to_string()),
-            container_state: Some("stopped".to_string()),
+            container: Some(make_container(
+                "cella-feat-long-branch-name-xyz99",
+                "xyz99",
+                ContainerState::Stopped,
+            )),
+            reason: PruneReason::Unmerged,
         }];
 
         let output = format_candidates(&candidates);
         assert!(output.contains("feat/a-very-long-branch-name"));
         assert!(output.contains("stopped"));
+        assert!(output.contains("unmerged"));
     }
 
     #[test]
@@ -358,5 +505,12 @@ mod tests {
         if let crate::commands::Command::Prune(args) = &cli.command {
             assert!(args.is_json());
         }
+    }
+
+    #[test]
+    fn prune_reason_as_str() {
+        assert_eq!(PruneReason::Merged.as_str(), "merged");
+        assert_eq!(PruneReason::Gone.as_str(), "gone");
+        assert_eq!(PruneReason::Unmerged.as_str(), "unmerged");
     }
 }

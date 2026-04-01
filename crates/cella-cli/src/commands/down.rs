@@ -208,7 +208,7 @@ impl DownArgs {
 }
 
 /// Deregister a container from the daemon (before stop so proxy teardown is clean).
-async fn deregister_container(container: &ContainerInfo) {
+pub(super) async fn deregister_container(container: &ContainerInfo) {
     let Some(mgmt_sock) = daemon_socket_path() else {
         return;
     };
@@ -244,7 +244,7 @@ fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
 }
 
 /// Stop the daemon if no cella containers remain.
-fn cleanup_daemon() {
+pub(super) fn cleanup_daemon() {
     if running_cella_container_count() == 0
         && let Some(data_dir) = cella_data_dir()
         && daemon::stop_daemon(&data_dir.join("daemon.pid"), &data_dir.join("daemon.sock")).is_ok()

@@ -76,6 +76,32 @@ pub fn merged_branches(repo_root: &Path, base: &str) -> Result<Vec<String>, Cell
     Ok(branches)
 }
 
+/// Fetch from the default remote and prune deleted tracking refs.
+///
+/// Runs `git fetch --prune` so that `is_tracking_gone` can detect branches
+/// whose remote counterpart was deleted (e.g. after a squash-merge on GitHub).
+///
+/// # Errors
+///
+/// Returns `CellaGitError` if `git fetch --prune` fails (e.g. no remote, offline).
+pub fn fetch_prune(repo_root: &Path) -> Result<(), CellaGitError> {
+    cmd::run(repo_root, &["fetch", "--prune"])?;
+    Ok(())
+}
+
+/// Delete a local branch by force.
+///
+/// Uses `git branch -D` which deletes even if the branch is not fully merged.
+/// Intended for use after a worktree has already been removed.
+///
+/// # Errors
+///
+/// Returns `CellaGitError` if the branch doesn't exist or cannot be deleted.
+pub fn delete_branch(repo_root: &Path, branch: &str) -> Result<(), CellaGitError> {
+    cmd::run(repo_root, &["branch", "-D", branch])?;
+    Ok(())
+}
+
 /// Check if a branch's remote tracking ref is gone (deleted on remote).
 ///
 /// Returns `false` if the branch has no upstream or if it cannot be determined.
@@ -320,5 +346,48 @@ mod tests {
                 remote: "upstream".to_string()
             }
         );
+    }
+
+    #[test]
+    fn delete_branch_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        Command::new("git")
+            .args(["branch", "to-delete"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        assert!(delete_branch(tmp.path(), "to-delete").is_ok());
+
+        // Verify branch no longer exists
+        let state = resolve_branch(tmp.path(), "to-delete").unwrap();
+        assert_eq!(state, BranchState::New);
+    }
+
+    #[test]
+    fn delete_branch_nonexistent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let result = delete_branch(tmp.path(), "no-such-branch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_prune_no_remote_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        // No remote configured — fetch succeeds silently (nothing to do)
+        let result = fetch_prune(tmp.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fetch_prune_bad_dir() {
+        let result = fetch_prune(Path::new("/nonexistent"));
+        assert!(result.is_err());
     }
 }
