@@ -170,4 +170,58 @@ mod tests {
         assert_eq!(features.len(), 1);
         assert!(features[0].options.is_empty());
     }
+
+    #[test]
+    fn parse_key_value_pairs_empty() {
+        let map = parse_key_value_pairs(&[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_key_value_value_with_equals() {
+        // Value contains '=' — only first split matters
+        let pairs = vec!["cmd=echo=hello".to_owned()];
+        let map = parse_key_value_pairs(&pairs).unwrap();
+        assert_eq!(map["cmd"], serde_json::json!("echo=hello"));
+    }
+
+    #[test]
+    fn parse_features_invalid_option_format() {
+        let refs = vec!["ghcr.io/devcontainers/features/node:1".to_owned()];
+        let opts = vec!["no-equals-here".to_owned()];
+        assert!(parse_features(&refs, &opts).is_err());
+    }
+
+    #[test]
+    fn parse_features_option_missing_value() {
+        let refs = vec!["ghcr.io/devcontainers/features/node:1".to_owned()];
+        let opts = vec!["node=version".to_owned()]; // missing =VALUE
+        assert!(parse_features(&refs, &opts).is_err());
+    }
+
+    #[test]
+    fn parse_features_multiple_with_options() {
+        let refs = vec![
+            "ghcr.io/devcontainers/features/node:1".to_owned(),
+            "ghcr.io/devcontainers/features/python:1".to_owned(),
+        ];
+        let opts = vec![
+            "node=version=lts".to_owned(),
+            "python=version=3.12".to_owned(),
+        ];
+        let features = parse_features(&refs, &opts).unwrap();
+        assert_eq!(features.len(), 2);
+        assert_eq!(features[0].options["version"], serde_json::json!("lts"));
+        assert_eq!(features[1].options["version"], serde_json::json!("3.12"));
+    }
+
+    #[test]
+    fn parse_features_unmatched_options_ignored() {
+        // Options for a feature not in the refs list are silently ignored
+        let refs = vec!["ghcr.io/devcontainers/features/node:1".to_owned()];
+        let opts = vec!["python=version=3.12".to_owned()];
+        let features = parse_features(&refs, &opts).unwrap();
+        assert_eq!(features.len(), 1);
+        assert!(features[0].options.is_empty());
+    }
 }

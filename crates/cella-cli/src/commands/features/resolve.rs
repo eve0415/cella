@@ -207,4 +207,39 @@ mod tests {
         assert!(msg.contains("not found"));
         assert!(msg.contains("cella init"));
     }
+
+    #[test]
+    fn match_feature_ref_empty_list() {
+        let features: Vec<(String, serde_json::Value)> = vec![];
+        assert!(match_feature_ref("node", &features).is_none());
+    }
+
+    #[test]
+    fn extract_features_non_object_features() {
+        // features is an array instead of object — should return empty
+        let config = serde_json::json!({"features": ["not", "an", "object"]});
+        let features = extract_features(&config);
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn extract_features_features_is_null() {
+        let config = serde_json::json!({"features": null});
+        let features = extract_features(&config);
+        assert!(features.is_empty());
+    }
+
+    #[test]
+    fn match_feature_ref_prefers_exact_over_short() {
+        let features = vec![
+            ("node".to_owned(), serde_json::json!({})),
+            (
+                "ghcr.io/devcontainers/features/node:1".to_owned(),
+                serde_json::json!({}),
+            ),
+        ];
+        // Exact match should win
+        let result = match_feature_ref("node", &features);
+        assert_eq!(result, Some("node"));
+    }
 }

@@ -328,4 +328,79 @@ mod tests {
         ));
         assert!(result.is_none());
     }
+
+    #[test]
+    fn check_for_update_no_tag_returns_none() {
+        let collection = FeatureCollectionIndex {
+            features: vec![FeatureSummary {
+                id: "node".to_owned(),
+                version: "2.0.0".to_owned(),
+                name: None,
+                description: None,
+                keywords: vec![],
+            }],
+            source_information: None,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = cella_templates::cache::TemplateCache::with_root(
+            std::env::temp_dir().join("cella-test-update4"),
+        );
+        // No colon → rsplit_once(':') returns None
+        let result = rt.block_on(super::check_for_update(
+            "ghcr.io/devcontainers/features/node",
+            &collection,
+            &cache,
+        ));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn print_candidates_json_valid_output() {
+        let candidates = vec![super::UpdateCandidate {
+            current_ref: "ghcr.io/devcontainers/features/node:1".to_owned(),
+            name: "Node.js".to_owned(),
+            current_tag: "1".to_owned(),
+            latest_version: "2.0.0".to_owned(),
+            updated_ref: "ghcr.io/devcontainers/features/node:2.0.0".to_owned(),
+        }];
+        // Just verify it doesn't error; stdout capture is awkward in tests
+        assert!(super::print_candidates_json(&candidates).is_ok());
+    }
+
+    #[test]
+    fn apply_updates_writes_file() {
+        let dir = std::env::temp_dir().join("cella-test-apply-updates");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("devcontainer.json");
+
+        let raw = r#"{
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" }
+  }
+}"#;
+        std::fs::write(&config_path, raw).unwrap();
+
+        let features = vec![(
+            "ghcr.io/devcontainers/features/node:1".to_owned(),
+            serde_json::json!({"version": "lts"}),
+        )];
+
+        let to_update = vec![super::UpdateCandidate {
+            current_ref: "ghcr.io/devcontainers/features/node:1".to_owned(),
+            name: "Node.js".to_owned(),
+            current_tag: "1".to_owned(),
+            latest_version: "2.0.0".to_owned(),
+            updated_ref: "ghcr.io/devcontainers/features/node:2.0.0".to_owned(),
+        }];
+
+        super::apply_updates(raw, &config_path, &features, &to_update).unwrap();
+
+        let result = std::fs::read_to_string(&config_path).unwrap();
+        assert!(result.contains("node:2.0.0"));
+        assert!(!result.contains("node:1\""));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

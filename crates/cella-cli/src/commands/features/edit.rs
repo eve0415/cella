@@ -452,4 +452,130 @@ mod tests {
     fn parse_set_option_invalid_one_equals() {
         assert!(parse_set_option_flag("node=version").is_err());
     }
+
+    #[test]
+    fn parse_set_option_value_with_equals() {
+        // Value itself contains '=' — only first two splits matter
+        let (ref_id, key, value) = parse_set_option_flag("node=cmd=echo=hello").unwrap();
+        assert_eq!(ref_id, "node");
+        assert_eq!(key, "cmd");
+        // split_once on rest means value is "echo=hello"
+        assert_eq!(value, serde_json::json!("echo=hello"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_opts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_opts_empty_object() {
+        assert_eq!(format_opts(&serde_json::json!({})), "");
+    }
+
+    #[test]
+    fn format_opts_single() {
+        assert_eq!(
+            format_opts(&serde_json::json!({"version": "lts"})),
+            "version=lts"
+        );
+    }
+
+    #[test]
+    fn format_opts_boolean_value() {
+        assert_eq!(
+            format_opts(&serde_json::json!({"debug": true})),
+            "debug=true"
+        );
+    }
+
+    #[test]
+    fn format_opts_non_object() {
+        assert_eq!(format_opts(&serde_json::Value::Null), "");
+        assert_eq!(format_opts(&serde_json::json!("string")), "");
+        assert_eq!(format_opts(&serde_json::json!([1, 2])), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // options_to_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn options_to_json_empty() {
+        let result = options_to_json(&HashMap::new());
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn options_to_json_with_entries() {
+        let mut opts = HashMap::new();
+        opts.insert("version".to_owned(), serde_json::json!("lts"));
+        opts.insert("debug".to_owned(), serde_json::json!(true));
+        let result = options_to_json(&opts);
+        assert_eq!(result["version"], serde_json::json!("lts"));
+        assert_eq!(result["debug"], serde_json::json!(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_non_interactive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_non_interactive_empty() {
+        let args = EditArgs {
+            common: CommonFeatureFlags {
+                file: None,
+                workspace_folder: None,
+                registry: None,
+            },
+            add: vec![],
+            remove: vec![],
+            set_option: vec![],
+        };
+        assert!(!args.is_non_interactive());
+    }
+
+    #[test]
+    fn is_non_interactive_with_add() {
+        let args = EditArgs {
+            common: CommonFeatureFlags {
+                file: None,
+                workspace_folder: None,
+                registry: None,
+            },
+            add: vec!["ghcr.io/devcontainers/features/node:1".to_owned()],
+            remove: vec![],
+            set_option: vec![],
+        };
+        assert!(args.is_non_interactive());
+    }
+
+    #[test]
+    fn is_non_interactive_with_remove() {
+        let args = EditArgs {
+            common: CommonFeatureFlags {
+                file: None,
+                workspace_folder: None,
+                registry: None,
+            },
+            add: vec![],
+            remove: vec!["node".to_owned()],
+            set_option: vec![],
+        };
+        assert!(args.is_non_interactive());
+    }
+
+    #[test]
+    fn is_non_interactive_with_set_option() {
+        let args = EditArgs {
+            common: CommonFeatureFlags {
+                file: None,
+                workspace_folder: None,
+                registry: None,
+            },
+            add: vec![],
+            remove: vec![],
+            set_option: vec!["node=version=lts".to_owned()],
+        };
+        assert!(args.is_non_interactive());
+    }
 }

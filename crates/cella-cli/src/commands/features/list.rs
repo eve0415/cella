@@ -207,4 +207,33 @@ mod tests {
         let result = truncate("this is a very long description", 15);
         assert_eq!(result, "this is a ve...");
     }
+
+    #[test]
+    fn truncate_exact_boundary() {
+        let result = truncate("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn truncate_one_over() {
+        let result = truncate("abcdef", 5);
+        assert_eq!(result, "ab...");
+    }
+
+    #[test]
+    fn format_options_non_object() {
+        assert_eq!(format_options(&serde_json::Value::Null), "");
+        assert_eq!(format_options(&serde_json::json!("string")), "");
+        assert_eq!(format_options(&serde_json::json!([1, 2])), "");
+    }
+
+    #[test]
+    fn format_options_multiple() {
+        let opts = serde_json::json!({"version": "lts", "debug": true});
+        let result = format_options(&opts);
+        // Order is not guaranteed in JSON objects, check both parts
+        assert!(result.contains("version=lts"));
+        assert!(result.contains("debug=true"));
+        assert!(result.contains(", "));
+    }
 }
