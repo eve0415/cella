@@ -539,6 +539,7 @@ name = "cella-orchestrator"
 version = "0.0.14"
 dependencies = [
  "cella-backend",
+ "cella-compose",
  "cella-config",
  "cella-env",
  "cella-features",
