@@ -125,9 +125,11 @@ pub async fn resolve_compose_features(
     };
 
     // 5. Resolve features using stage name as the base image reference
-    let platform = cella_features::oci::detect_platform(client.inner())
+    let backend_platform = cella_backend::ContainerBackend::detect_platform(client)
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
+    let platform =
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
     let cache = cella_features::FeatureCache::new();
 
     let resolved = progress

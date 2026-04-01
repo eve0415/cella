@@ -203,18 +203,13 @@ async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
     info!("Resolving devcontainer features...");
-    // Use the backend trait's detect_platform and convert to the features
-    // crate's Platform type. TODO(task-8): remove this conversion once
-    // cella-features drops its bollard dependency and uses cella_backend::Platform.
     let backend_platform = input
         .client
         .detect_platform()
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
-    let platform = cella_features::Platform {
-        os: backend_platform.os,
-        architecture: backend_platform.arch,
-    };
+    let platform =
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
     let cache = cella_features::FeatureCache::new();
 
     let resolved = cella_features::resolve_features(

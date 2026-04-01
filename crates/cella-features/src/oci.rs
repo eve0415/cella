@@ -267,37 +267,21 @@ impl FeatureFetcher for OciFetcher {
 // Platform detection
 // ---------------------------------------------------------------------------
 
-/// Detect the target platform from the Docker daemon.
+/// Build a [`Platform`] from raw OS and architecture strings.
 ///
-/// Queries `docker version` via the bollard client and normalises the
-/// architecture string to Go/OCI conventions (`amd64`, `arm64`, etc.).
-///
-/// # Errors
-///
-/// Returns [`FeatureError::RegistryError`] if the Docker daemon is
-/// unreachable or the version query fails.
-pub async fn detect_platform(docker: &bollard::Docker) -> Result<Platform, FeatureError> {
-    let version = docker
-        .version()
-        .await
-        .map_err(|e| FeatureError::RegistryError {
-            registry: "docker".to_string(),
-            message: format!("failed to detect platform: {e}"),
-        })?;
-
-    let os = version.os.unwrap_or_else(|| "linux".to_string());
-    let arch = version.arch.unwrap_or_else(|| "amd64".to_string());
-
-    let architecture = match arch.as_str() {
+/// Normalises the architecture to Go/OCI conventions (`amd64`, `arm64`, etc.).
+/// Callers obtain the raw values from [`ContainerBackend::detect_platform()`].
+pub fn detect_platform(os: &str, arch: &str) -> Platform {
+    let architecture = match arch {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         other => other,
     };
 
-    Ok(Platform {
-        os,
+    Platform {
+        os: os.to_string(),
         architecture: architecture.to_string(),
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------

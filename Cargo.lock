@@ -490,7 +490,6 @@ name = "cella-features"
 version = "0.0.14"
 dependencies = [
  "base64 0.22.1",
- "bollard",
  "dirs",
  "flate2",
  "futures-util",
