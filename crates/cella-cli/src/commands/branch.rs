@@ -136,7 +136,7 @@ impl BranchArgs {
         )
         .await?;
 
-        let create_result = ctx.create_and_start(false).await?;
+        let create_result = ctx.ensure_up(false, &[]).await?;
 
         // If --exec provided, run the command in the new container
         if let Some(ref exec_cmd) = self.exec_cmd {

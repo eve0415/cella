@@ -21,7 +21,9 @@ pub mod shell_detect;
 pub mod tool_install;
 pub mod up;
 
-pub use config::{BranchConfig, ImageStrategy, PruneConfig, UpConfig};
+pub use config::{
+    BranchConfig, HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, PruneConfig, UpConfig,
+};
 pub use error::OrchestratorError;
 pub use progress::{PhaseChildHandle, PhaseHandle, ProgressEvent, ProgressSender, StepHandle};
 pub use result::{

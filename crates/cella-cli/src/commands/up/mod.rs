@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::future::Future;
+use std::pin::Pin;
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
@@ -1300,6 +1302,104 @@ pub struct UpResult {
     pub workspace_folder: String,
 }
 
+struct CliUpHooks<'a> {
+    config: &'a serde_json::Value,
+}
+
+impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
+    fn daemon_env<'a>(
+        &'a self,
+        container_name: &'a str,
+        host_gateway: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+        Box::pin(async move {
+            super::ensure_cella_daemon().await;
+            query_daemon_env(container_name, host_gateway).await
+        })
+    }
+
+    fn sync_agent_runtime<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            super::ensure_cella_daemon().await;
+            write_daemon_addr_to_volume(client).await;
+        })
+    }
+
+    fn on_container_started(
+        &self,
+        container_id: &str,
+        container_name: &str,
+        container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let config = self.config;
+        let container_id = container_id.to_string();
+        let container_name = container_name.to_string();
+        let container_ip = container_ip.map(str::to_string);
+        Box::pin(async move {
+            super::ensure_cella_daemon().await;
+
+            let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
+                return;
+            };
+            if !mgmt_sock.exists() {
+                return;
+            }
+
+            let forward_ports: Vec<u16> = config
+                .get("forwardPorts")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
+            let other_ports_attrs =
+                cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
+            let shutdown_action = config
+                .get("shutdownAction")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let req = cella_port::protocol::ManagementRequest::RegisterContainer {
+                container_id,
+                container_name,
+                container_ip,
+                ports_attributes: ports_attrs,
+                other_ports_attributes: other_ports_attrs,
+                forward_ports,
+                shutdown_action,
+            };
+            let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+        })
+    }
+
+    fn on_container_stopping(
+        &self,
+        container_name: &str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let container_name = container_name.to_string();
+        Box::pin(async move {
+            let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
+                return;
+            };
+            if !mgmt_sock.exists() {
+                return;
+            }
+
+            let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+                container_name,
+            };
+            let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+        })
+    }
+}
+
 impl UpContext {
     /// Ensure a container is up and ready, returning the result without printing output.
     ///
@@ -1310,86 +1410,53 @@ impl UpContext {
         build_no_cache: bool,
         strict: &[String],
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
-        // Validate hostRequirements
-        if self.config().get("hostRequirements").is_some() {
-            let result = cella_orchestrator::host_requirements::validate(
-                self.config(),
-                &self.resolved.workspace_root,
-            );
-            for check in &result.checks {
-                if !check.met {
-                    self.progress.warn(&format!(
-                        "Host does not meet requirement: {} (need {}, have {})",
-                        check.name, check.required, check.actual
-                    ));
-                }
-            }
-            if !result.all_met
-                && strict
-                    .iter()
-                    .any(|s| s == "host-requirements" || s == "all")
+        let (sender, renderer) = crate::progress::bridge(&self.progress);
+        let hooks = CliUpHooks {
+            config: self.config(),
+        };
+        let config = cella_orchestrator::UpConfig {
+            resolved: &self.resolved,
+            container_name: &self.container_nm,
+            remote_env: &self.remote_env,
+            workspace_folder_from_config: self.workspace_folder(),
+            default_workspace_folder: &self.default_workspace_folder,
+            extra_labels: &self.extra_labels,
+            image_strategy: if build_no_cache {
+                cella_orchestrator::ImageStrategy::RebuildNoCache
+            } else if self.remove_container {
+                cella_orchestrator::ImageStrategy::Rebuild
+            } else {
+                cella_orchestrator::ImageStrategy::Cached
+            },
+            remove_existing_container: self.remove_container,
+            skip_checksum: self.skip_checksum,
+            host_requirement_policy: if strict
+                .iter()
+                .any(|s| s == "host-requirements" || s == "all")
             {
-                return Err("Host does not meet hostRequirements (--strict mode)".into());
-            }
-        }
+                cella_orchestrator::HostRequirementPolicy::Error
+            } else {
+                cella_orchestrator::HostRequirementPolicy::Warn
+            },
+            network_rule_policy: self.network_rules,
+        };
 
-        // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
-        if self.config().get("dockerComposeFile").is_some() {
-            // Compose flow still uses the old path with its own output_result calls.
-            // For now, compose + code is not supported via ensure_up; callers should
-            // use compose_up directly.
-            return Err(
-                "Docker Compose projects are not yet supported with `cella code`. \
-                 Use `cella up` first, then `cella code`."
-                    .into(),
-            );
-        }
+        let result =
+            cella_orchestrator::up::ensure_up(self.client.as_ref(), &config, &hooks, sender)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
-        let existing = self
-            .client
-            .find_container(&self.resolved.workspace_root)
-            .await?;
+        let _ = renderer.await;
 
-        if let Some(container) = existing {
-            let remote_user = self.resolve_remote_user_from_container(&container).await;
-
-            match (&container.state, self.remove_container) {
-                (ContainerState::Running, false) if !build_no_cache => {
-                    return self.handle_running(&container, &remote_user).await;
-                }
-                (ContainerState::Stopped, false) => {
-                    if let Some(result) = self.handle_stopped(&container, &remote_user).await? {
-                        return Ok(result);
-                    }
-                    // Fall through to create_and_start
-                }
-                (ContainerState::Running, false) => {
-                    // build_no_cache=true with running container: stop, remove, rebuild
-                    self.remove_existing(&container, "--build-no-cache").await?;
-                }
-                (ContainerState::Running, true) => {
-                    self.remove_existing(&container, "rebuild").await?;
-                }
-                (_, true) => {
-                    // Rebuild: stop if running, then remove
-                    if container.state == ContainerState::Running {
-                        self.client.stop_container(&container.id).await?;
-                    }
-                    self.client.remove_container(&container.id, false).await?;
-                }
-                (_, false) => {
-                    // Created but never started, or other state — remove and recreate
-                    self.client.remove_container(&container.id, false).await?;
-                }
-            }
-        }
-
-        let create_result = self.create_and_start(build_no_cache).await?;
         Ok(UpResult {
-            container_id: create_result.container_id,
-            remote_user: create_result.remote_user,
-            outcome: "created".to_string(),
-            workspace_folder: self.workspace_folder_str().to_string(),
+            container_id: result.container_id,
+            remote_user: result.remote_user,
+            outcome: match result.outcome {
+                cella_orchestrator::UpOutcome::Running => "running".to_string(),
+                cella_orchestrator::UpOutcome::Started => "started".to_string(),
+                cella_orchestrator::UpOutcome::Created => "created".to_string(),
+            },
+            workspace_folder: result.workspace_folder,
         })
     }
 }

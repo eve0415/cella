@@ -3,8 +3,8 @@
 /// Errors from orchestrator operations.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
-    #[error("docker: {message}")]
-    Docker { message: String },
+    #[error("backend: {message}")]
+    Backend { message: String },
 
     #[error("git: {message}")]
     Git { message: String },
@@ -27,11 +27,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn docker_error_display() {
-        let err = OrchestratorError::Docker {
+    fn backend_error_display() {
+        let err = OrchestratorError::Backend {
             message: "connection refused".into(),
         };
-        assert_eq!(err.to_string(), "docker: connection refused");
+        assert_eq!(err.to_string(), "backend: connection refused");
     }
 
     #[test]
@@ -79,10 +79,10 @@ mod tests {
 
     #[test]
     fn error_is_debug() {
-        let err = OrchestratorError::Docker {
+        let err = OrchestratorError::Backend {
             message: "test".into(),
         };
         let debug = format!("{err:?}");
-        assert!(debug.contains("Docker"));
+        assert!(debug.contains("Backend"));
     }
 }

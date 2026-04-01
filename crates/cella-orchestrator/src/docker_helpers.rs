@@ -24,7 +24,7 @@ pub async fn find_container_for_branch(
         client
             .list_cella_containers(false)
             .await
-            .map_err(|e| OrchestratorError::Docker {
+            .map_err(|e| OrchestratorError::Backend {
                 message: format!("failed to list containers: {e}"),
             })?;
 
@@ -61,7 +61,7 @@ pub async fn worktree_list(
         client
             .list_cella_containers(false)
             .await
-            .map_err(|e| OrchestratorError::Docker {
+            .map_err(|e| OrchestratorError::Backend {
                 message: format!("failed to list containers: {e}"),
             })?;
 
@@ -110,7 +110,7 @@ pub async fn container_exec(
             },
         )
         .await
-        .map_err(|e| OrchestratorError::Docker {
+        .map_err(|e| OrchestratorError::Backend {
             message: format!("exec failed: {e}"),
         })?;
 
@@ -132,7 +132,7 @@ pub async fn verify_container_running(
         client
             .inspect_container(container_id)
             .await
-            .map_err(|e| OrchestratorError::Docker {
+            .map_err(|e| OrchestratorError::Backend {
                 message: format!("inspect failed: {e}"),
             })?;
 

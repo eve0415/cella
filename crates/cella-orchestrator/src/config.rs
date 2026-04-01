@@ -3,25 +3,32 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cella_config::resolve::ResolvedConfig;
+
 /// Configuration for the full container-up pipeline.
-pub struct UpConfig {
-    /// Workspace root directory on the host.
-    pub workspace_root: PathBuf,
-
-    /// Explicit devcontainer.json file path (overrides auto-discovery).
-    pub config_file: Option<PathBuf>,
-
-    /// Docker host URL override (overrides `DOCKER_HOST`).
-    pub docker_host: Option<String>,
-
+pub struct UpConfig<'a> {
+    /// Fully resolved devcontainer configuration.
+    pub resolved: &'a ResolvedConfig,
+    /// Resolved container name for this workspace.
+    pub container_name: &'a str,
+    /// Remote environment entries from config.
+    pub remote_env: &'a [String],
+    /// Optional workspace folder override from config.
+    pub workspace_folder_from_config: Option<&'a str>,
+    /// Default workspace folder inside the container.
+    pub default_workspace_folder: &'a str,
     /// Extra labels to merge into the container (e.g. worktree metadata).
-    pub extra_labels: HashMap<String, String>,
-
+    pub extra_labels: &'a HashMap<String, String>,
     /// How to handle the container image.
     pub image_strategy: ImageStrategy,
-
     /// Whether to remove an existing container before starting.
     pub remove_existing_container: bool,
+    /// Skip SHA256 verification for managed agent downloads.
+    pub skip_checksum: bool,
+    /// How to treat unmet host requirements.
+    pub host_requirement_policy: HostRequirementPolicy,
+    /// Whether network rules are enforced.
+    pub network_rule_policy: NetworkRulePolicy,
 }
 
 /// How the up pipeline should handle the container image.
@@ -36,6 +43,22 @@ pub enum ImageStrategy {
     RebuildNoCache,
 }
 
+/// How unmet host requirements should be handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRequirementPolicy {
+    Warn,
+    Error,
+}
+
+/// Whether network blocking rules are enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkRulePolicy {
+    /// Enforce blocking rules from config.
+    Enforce,
+    /// Skip blocking rules (e.g. `--no-network-rules`).
+    Skip,
+}
+
 /// Configuration for creating a worktree-backed branch container.
 pub struct BranchConfig {
     /// Git repository root path (host filesystem).
@@ -46,9 +69,6 @@ pub struct BranchConfig {
 
     /// Base ref for new branches (defaults to HEAD).
     pub base: Option<String>,
-
-    /// Docker host URL override.
-    pub docker_host: Option<String>,
 
     /// Command to execute in the new container after creation.
     pub exec_cmd: Option<String>,
@@ -62,6 +82,4 @@ pub struct PruneConfig {
     /// Dry-run mode (report what would be pruned without doing it).
     pub dry_run: bool,
 
-    /// Docker host URL override.
-    pub docker_host: Option<String>,
 }
