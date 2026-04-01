@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::debug;
 
-use cella_docker::{ExecOptions, InteractiveExecOptions};
+use cella_backend::{ExecOptions, InteractiveExecOptions};
 
 use super::up::{OutputFormat, UpArgs, UpContext};
 
@@ -43,7 +43,6 @@ impl TmuxArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         // 1. Ensure container is up
         let (build_no_cache, strict, output_format, force) = (
             self.up.build_no_cache,
@@ -53,14 +52,14 @@ impl TmuxArgs {
         );
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress).await?;
+        let ctx = UpContext::new(&up, progress, backend).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 2. Resolve compose service if needed
         let container_id = if self.service.is_some() {
             let container = ctx.client.inspect_container(&result.container_id).await?;
             let resolved =
-                super::resolve_service_container(&ctx.client, container, self.service.as_deref())
+                super::resolve_service_container(ctx.client.as_ref(), container, self.service.as_deref())
                     .await?;
             resolved.id
         } else {
@@ -75,7 +74,7 @@ impl TmuxArgs {
 
         // 5. Check if session exists
         let session_exists = check_tmux_session(
-            &ctx.client,
+            ctx.client.as_ref(),
             &container_id,
             &result.remote_user,
             &session_name,
@@ -108,7 +107,7 @@ impl TmuxArgs {
             .unwrap_or_default();
 
         let base_env = if let Some(probed) =
-            super::env_cache::read_probed_env_cache(&ctx.client, &container_id, &result.remote_user)
+            super::env_cache::read_probed_env_cache(ctx.client.as_ref(), &container_id, &result.remote_user)
                 .await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
@@ -118,7 +117,7 @@ impl TmuxArgs {
         let mut env = base_env;
 
         super::env_cache::ensure_ssh_auth_sock(
-            &ctx.client,
+            ctx.client.as_ref(),
             &container_id,
             &result.remote_user,
             &mut env,
@@ -217,7 +216,7 @@ async fn ensure_tmux(
         .await?;
 
     if check.exit_code == 0 {
-        let version = get_tmux_version(&ctx.client, container_id, remote_user).await;
+        let version = get_tmux_version(ctx.client.as_ref(), container_id, remote_user).await;
         debug!("tmux already installed: {version}");
         return Ok(TmuxInfo { version });
     }
@@ -226,7 +225,7 @@ async fn ensure_tmux(
     install_tmux(ctx, container_id).await?;
     step.finish();
 
-    let version = get_tmux_version(&ctx.client, container_id, remote_user).await;
+    let version = get_tmux_version(ctx.client.as_ref(), container_id, remote_user).await;
     ctx.progress
         .hint(&format!("tmux {version} installed in container."));
     Ok(TmuxInfo { version })
@@ -234,7 +233,7 @@ async fn ensure_tmux(
 
 /// Get the tmux version string from the container.
 async fn get_tmux_version(
-    client: &cella_docker::DockerClient,
+    client: &dyn cella_backend::ContainerBackend,
     container_id: &str,
     remote_user: &str,
 ) -> String {
@@ -328,7 +327,7 @@ async fn install_tmux(
 
 /// Check if a tmux session with the given name exists in the container.
 async fn check_tmux_session(
-    client: &cella_docker::DockerClient,
+    client: &dyn cella_backend::ContainerBackend,
     container_id: &str,
     remote_user: &str,
     session_name: &str,

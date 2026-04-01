@@ -5,7 +5,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::debug;
 
-use cella_docker::ExecOptions;
+use cella_backend::ExecOptions;
 
 use super::up::{OutputFormat, UpArgs, UpContext, output_result};
 
@@ -48,7 +48,6 @@ impl CodeArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         // 1. Check for remote Docker (unsupported)
         check_local_docker()?;
 
@@ -62,14 +61,14 @@ impl CodeArgs {
         let output_format = self.up.output.clone();
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress).await?;
+        let ctx = UpContext::new(&up, progress, backend).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 4. Resolve compose service if needed
         let container_id = if self.service.is_some() {
             let container = ctx.client.inspect_container(&result.container_id).await?;
             let resolved =
-                super::resolve_service_container(&ctx.client, container, self.service.as_deref())
+                super::resolve_service_container(ctx.client.as_ref(), container, self.service.as_deref())
                     .await?;
             resolved.id
         } else {
@@ -103,7 +102,7 @@ impl CodeArgs {
         // 7. Poll for VS Code Server connection
         let remote_user = &result.remote_user;
         let connected =
-            poll_vscode_server(&ctx.client, &container_id, remote_user, &ctx.progress).await;
+            poll_vscode_server(ctx.client.as_ref(), &container_id, remote_user, &ctx.progress).await;
 
         if connected {
             ctx.progress.hint("VS Code connected to dev container.");
@@ -282,7 +281,7 @@ fn is_localhost_tcp(url: &str) -> bool {
 /// Checks for `~/.vscode-server/bin` directory every 2 seconds, up to 60 seconds.
 /// Returns `true` if server was detected, `false` on timeout.
 async fn poll_vscode_server(
-    client: &cella_docker::DockerClient,
+    client: &dyn cella_backend::ContainerBackend,
     container_id: &str,
     remote_user: &str,
     progress: &crate::progress::Progress,

@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig};
-use cella_docker::{ContainerState, ExecOptions, LifecycleContext, run_lifecycle_phase};
+use cella_backend::{
+    ContainerBackend, ContainerInfo, ContainerState, ExecOptions, LifecycleContext,
+    run_lifecycle_phase,
+};
 
 use super::up::{
     UpContext, output_result, query_daemon_env, resolve_remote_user, run_all_lifecycle_phases,
@@ -50,10 +53,9 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
     }
 
     // 4. Check for existing compose project
-    let existing = ctx
-        .client
-        .find_compose_container(&project.project_name, &project.primary_service)
-        .await?;
+    let existing =
+        find_compose_container(ctx.client.as_ref(), &project.project_name, &project.primary_service)
+            .await?;
 
     if let Some(ref container) = existing {
         if let Some(old_hash) = &container.config_hash
@@ -113,7 +115,7 @@ async fn prepare_and_start(
 
     // 6. Resolve features via combined-Dockerfile approach (if features configured)
     let features_build = super::compose_features::resolve_compose_features(
-        &ctx.client,
+        ctx.client.as_ref(),
         config,
         &ctx.resolved.config_path,
         project,
@@ -127,25 +129,25 @@ async fn prepare_and_start(
     let daemon_env = query_daemon_env(&ctx.container_nm).await;
 
     // 7. Detect container architecture and ensure agent volume is populated
-    let agent_arch = cella_docker::volume::detect_container_arch(ctx.client.inner())
+    let agent_arch = ctx
+        .client
+        .detect_container_arch()
         .await
         .unwrap_or_else(|e| {
             warn!("Failed to detect container arch, defaulting to x86_64: {e}");
             "x86_64".to_string()
         });
 
+    let version = env!("CARGO_PKG_VERSION");
     ctx.progress
         .run_step_result("Preparing agent volume...", async {
-            cella_docker::volume::ensure_agent_volume_populated(
-                ctx.client.inner(),
-                &agent_arch,
-                ctx.skip_checksum,
-            )
-            .await
+            ctx.client
+                .ensure_agent_provisioned(version, &agent_arch, ctx.skip_checksum)
+                .await
         })
         .await?;
 
-    let (agent_vol_name, agent_vol_target, _) = cella_docker::volume::agent_volume_mount();
+    let (agent_vol_name, agent_vol_target, _) = ctx.client.agent_volume_mount();
 
     // 8. Resolve remote user from config
     let remote_user = resolve_remote_user(config, None, "root");
@@ -170,8 +172,8 @@ async fn prepare_and_start(
             .as_ref()
             .and_then(|b| b.image_name_override.clone()),
         override_command: project.override_command,
-        agent_volume_name: agent_vol_name.to_string(),
-        agent_volume_target: agent_vol_target.to_string(),
+        agent_volume_name: agent_vol_name,
+        agent_volume_target: agent_vol_target,
         extra_env,
         extra_labels: labels,
         build_dockerfile: features_build
@@ -221,12 +223,14 @@ async fn finalize_compose(
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     agent_arch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 14. Find primary container via bollard labels
-    let primary = ctx
-        .client
-        .find_compose_container(&project.project_name, &project.primary_service)
-        .await?
-        .ok_or("Primary service container not found after docker compose up")?;
+    // 14. Find primary container via compose labels
+    let primary = find_compose_container(
+        ctx.client.as_ref(),
+        &project.project_name,
+        &project.primary_service,
+    )
+    .await?
+    .ok_or("Primary service container not found after docker compose up")?;
 
     info!(
         "Primary container: {} ({})",
@@ -235,7 +239,7 @@ async fn finalize_compose(
     );
 
     // 15. Verify primary container is running
-    verify_container_running(&ctx.client, &primary.id).await?;
+    verify_container_running(ctx.client.as_ref(), &primary.id).await?;
 
     // 16. Register with daemon (primary container only)
     ctx.register_with_daemon(&primary.id).await;
@@ -259,7 +263,7 @@ async fn finalize_compose(
     // 19. Run lifecycle phases (primary service only)
     let progress_ref = ctx.progress.clone();
     let lc_ctx = LifecycleContext {
-        client: &ctx.client,
+        client: ctx.client.as_ref(),
         container_id: &primary.id,
         user: Some(remote_user),
         env: &lifecycle_env,
@@ -289,7 +293,7 @@ async fn finalize_compose(
 async fn handle_compose_running(
     ctx: &UpContext,
     project: &ComposeProject,
-    container: &cella_docker::ContainerInfo,
+    container: &ContainerInfo,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ctx.config();
     let remote_user = resolve_remote_user(config, None, "root");
@@ -303,7 +307,7 @@ async fn handle_compose_running(
         let lifecycle_env = ctx.remote_env.clone();
         let progress_ref = ctx.progress.clone();
         let lc_ctx = LifecycleContext {
-            client: &ctx.client,
+            client: ctx.client.as_ref(),
             container_id: &container.id,
             user: Some(remote_user.as_str()),
             env: &lifecycle_env,
@@ -391,7 +395,7 @@ fn build_compose_labels(
 /// Since compose's `overrideCommand` defaults to `false`, the container runs its
 /// own entrypoint. The agent is started via `exec` as a background daemon.
 async fn launch_agent(ctx: &UpContext, container_id: &str, _agent_arch: &str) {
-    let agent_path = cella_docker::volume::agent_symlink_path();
+    let agent_path = "/cella/bin/cella-agent";
 
     let script = format!(
         "if [ -x \"{agent_path}\" ]; then \
@@ -417,4 +421,23 @@ async fn launch_agent(ctx: &UpContext, container_id: &str, _agent_arch: &str) {
         Ok(_) => info!("Agent launched in container"),
         Err(e) => warn!("Failed to launch agent in container: {e}"),
     }
+}
+
+/// Find a compose container by project and service name using backend-agnostic
+/// label filtering via `list_cella_containers`.
+async fn find_compose_container(
+    client: &dyn ContainerBackend,
+    project_name: &str,
+    service_name: &str,
+) -> Result<Option<ContainerInfo>, Box<dyn std::error::Error>> {
+    let containers = client.list_cella_containers(false).await?;
+    let result = containers.into_iter().find(|c| {
+        c.labels
+            .get("com.docker.compose.project")
+            .is_some_and(|p| p == project_name)
+            && c.labels
+                .get("com.docker.compose.service")
+                .is_some_and(|s| s == service_name)
+    });
+    Ok(result)
 }

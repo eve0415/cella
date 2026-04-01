@@ -14,7 +14,7 @@ use cella_compose::{
     ComposeCommand, ComposeProject, FEATURES_TARGET_STAGE, ServiceBuildInfo,
     extract_service_build_info,
 };
-use cella_docker::DockerClient;
+use cella_backend::ContainerBackend;
 use cella_features::ResolvedFeatures;
 
 use crate::progress::Progress;
@@ -53,7 +53,7 @@ pub struct ComposeFeaturesBuild {
 /// Returns an error if compose config resolution fails, the Dockerfile
 /// cannot be read, or feature resolution fails.
 pub async fn resolve_compose_features(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     config: &serde_json::Value,
     config_path: &Path,
     project: &ComposeProject,
@@ -125,7 +125,7 @@ pub async fn resolve_compose_features(
     };
 
     // 5. Resolve features using stage name as the base image reference
-    let backend_platform = cella_backend::ContainerBackend::detect_platform(client)
+    let backend_platform = ContainerBackend::detect_platform(client)
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
     let platform =

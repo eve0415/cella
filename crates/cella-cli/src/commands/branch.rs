@@ -2,7 +2,7 @@ use clap::Args;
 use tracing::info;
 
 use super::up::{OutputFormat, UpContext};
-use cella_docker::{ExecOptions, worktree_labels};
+use cella_backend::{ExecOptions, worktree_labels};
 use cella_git::WorktreeInfo;
 
 /// Create a new worktree-backed branch with its own dev container.
@@ -37,7 +37,6 @@ impl BranchArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd).map_err(|e| -> Box<dyn std::error::Error> {
@@ -98,7 +97,7 @@ impl BranchArgs {
 
         // 4. Run container pipeline (with rollback on failure)
         let result = self
-            .run_container_pipeline(&wt_info, repo_root, &progress)
+            .run_container_pipeline(&wt_info, repo_root, &progress, backend)
             .await;
 
         if let Err(e) = &result {
@@ -121,6 +120,7 @@ impl BranchArgs {
         wt_info: &WorktreeInfo,
         repo_root: &std::path::Path,
         progress: &crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Prepare worktree-specific labels
         let extra_labels = worktree_labels(&self.name, repo_root);
@@ -132,6 +132,7 @@ impl BranchArgs {
             extra_labels,
             progress.clone(),
             self.output.clone(),
+            backend,
         )
         .await?;
 

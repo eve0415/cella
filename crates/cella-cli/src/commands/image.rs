@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use cella_docker::{DockerClient, ImageDetails};
+use cella_backend::{ContainerBackend, ImageDetails};
 use cella_features::ResolvedFeatures;
 
 use crate::progress::Progress;
@@ -19,7 +19,7 @@ pub use cella_orchestrator::image::compute_features_digest;
 /// Thin wrapper: creates a `ProgressSender` bridge, calls the orchestrator,
 /// and renders progress events via indicatif.
 pub async fn ensure_image(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     config: &serde_json::Value,
     workspace_root: &Path,
     config_name: Option<&str>,

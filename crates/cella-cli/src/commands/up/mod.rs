@@ -5,9 +5,9 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use cella_config::resolve::{self, ResolvedConfig};
-use cella_docker::{
-    CellaDockerError, ContainerInfo, ContainerState, DockerClient, ExecOptions, ImageDetails,
-    LifecycleContext, MountConfig, container_labels, container_name, update_remote_user_uid,
+use cella_backend::{
+    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
+    LifecycleContext, MountConfig, container_labels, container_name,
 };
 
 mod lifecycle;
@@ -87,7 +87,7 @@ pub use cella_orchestrator::up::NetworkRulePolicy;
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
     pub(crate) resolved: ResolvedConfig,
-    pub client: DockerClient,
+    pub client: Box<dyn ContainerBackend>,
     pub container_nm: String,
     pub(crate) remote_env: Vec<String>,
     workspace_folder_from_config: Option<String>,
@@ -115,6 +115,7 @@ impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
@@ -134,8 +135,8 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        // 2. Connect to Docker
-        let client = super::connect_docker(args.docker_host.as_deref())?;
+        // 2. Connect to backend
+        let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref())?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -182,6 +183,7 @@ impl UpContext {
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = workspace_path
             .canonicalize()
@@ -200,7 +202,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::connect_docker(docker_host)?;
+        let client = super::resolve_backend_for_command(backend, docker_host)?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -259,7 +261,7 @@ impl UpContext {
     ) -> LifecycleContext<'a> {
         let progress_ref = self.progress.clone();
         LifecycleContext {
-            client: &self.client,
+            client: &*self.client,
             container_id,
             user: Some(user),
             env,
@@ -317,9 +319,10 @@ impl UpContext {
             .unwrap_or_else(|| "root".to_string())
     }
 
-    /// Detect the container architecture from the Docker daemon.
+    /// Detect the container architecture from the backend runtime.
     async fn detect_arch(&self) -> String {
-        cella_docker::volume::detect_container_arch(self.client.inner())
+        self.client
+            .detect_container_arch()
             .await
             .unwrap_or_else(|e| {
                 warn!("Container arch detection failed, defaulting to x86_64: {e}");
@@ -344,13 +347,13 @@ impl UpContext {
         self.progress
             .run_step(
                 "Configuring environment...",
-                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
+                inject_post_start(self.client.as_ref(), container_id, &env_fwd.post_start, remote_user),
             )
             .await;
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
         let shell =
-            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user).await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
@@ -359,7 +362,7 @@ impl UpContext {
             .run_step(
                 "Running userEnvProbe...",
                 super::env_cache::probe_and_cache_user_env(
-                    &self.client,
+                    self.client.as_ref(),
                     container_id,
                     remote_user,
                     self.probe_type(),
@@ -371,8 +374,8 @@ impl UpContext {
         // Sequential prerequisites + tool installation
         let settings = cella_config::Settings::load(&self.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
-            create_claude_home_symlink(&self.client, container_id, remote_user).await;
-            setup_plugin_manifests(&self.client, container_id, remote_user).await;
+            create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
+            setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
         }
 
         let any_tool = settings.tools.claude_code.enabled
@@ -388,7 +391,7 @@ impl UpContext {
                 .run_step(
                     "Updating environment cache...",
                     super::env_cache::probe_and_cache_user_env(
-                        &self.client,
+                        self.client.as_ref(),
                         container_id,
                         remote_user,
                         self.probe_type(),
@@ -443,7 +446,7 @@ impl UpContext {
         }
 
         // Always update .daemon_addr (daemon may have restarted)
-        write_daemon_addr_to_volume(&self.client).await;
+        write_daemon_addr_to_volume(self.client.as_ref()).await;
 
         // Version-aware agent restart: if the container was created with a
         // different cella version, repopulate the volume and restart the agent.
@@ -457,17 +460,15 @@ impl UpContext {
                 "Version change detected ({container_version} -> {current_version}), updating agent"
             );
             let agent_arch = self.detect_arch().await;
-            if let Err(e) = cella_docker::volume::ensure_agent_volume_populated(
-                self.client.inner(),
-                &agent_arch,
-                self.skip_checksum,
-            )
-            .await
+            if let Err(e) = self
+                .client
+                .ensure_agent_provisioned(current_version, &agent_arch, self.skip_checksum)
+                .await
             {
                 warn!("Failed to repopulate agent volume: {e}");
             }
             self.register_with_daemon(&container.id).await;
-            restart_agent_in_container(&self.client, &container.id).await;
+            restart_agent_in_container(self.client.as_ref(), &container.id).await;
         }
 
         let (_probed_env, lifecycle_env) =
@@ -542,19 +543,17 @@ impl UpContext {
         // the container was created, and the old versioned binary path in CMD
         // would fail if the volume was repopulated by another `cella up`).
         let agent_arch = self.detect_arch().await;
+        let version = env!("CARGO_PKG_VERSION");
         self.progress
             .run_step(
                 "Populating agent volume...",
-                cella_docker::volume::ensure_agent_volume_populated(
-                    self.client.inner(),
-                    &agent_arch,
-                    self.skip_checksum,
-                ),
+                self.client
+                    .ensure_agent_provisioned(version, &agent_arch, self.skip_checksum),
             )
             .await?;
 
         // Write .daemon_addr so the agent can discover the current daemon
-        write_daemon_addr_to_volume(&self.client).await;
+        write_daemon_addr_to_volume(self.client.as_ref()).await;
 
         // Attempt to start directly -- let Docker validate mounts
         let step = self.progress.step("Starting container...");
@@ -567,7 +566,7 @@ impl UpContext {
 
         match start_result {
             Ok(()) => {
-                verify_container_running(&self.client, &container.id).await?;
+                verify_container_running(self.client.as_ref(), &container.id).await?;
 
                 // Register with daemon (missing from the original code —
                 // without this the daemon rejects the agent with "unknown container")
@@ -575,7 +574,7 @@ impl UpContext {
 
                 // Kill + restart agent so it picks up the new binary and
                 // daemon address from the updated .daemon_addr file
-                restart_agent_in_container(&self.client, &container.id).await;
+                restart_agent_in_container(self.client.as_ref(), &container.id).await;
 
                 let (_probed_env, lifecycle_env) =
                     self.prepare_container_env(&container.id, remote_user).await;
@@ -593,10 +592,11 @@ impl UpContext {
                 }
 
                 // Prune old agent versions from the volume (non-fatal)
-                let version = env!("CARGO_PKG_VERSION");
-                if let Err(e) =
-                    cella_docker::volume::prune_old_agent_versions(self.client.inner(), version)
-                        .await
+                let prune_version = env!("CARGO_PKG_VERSION");
+                if let Err(e) = self
+                    .client
+                    .prune_old_agent_versions(prune_version)
+                    .await
                 {
                     debug!("Agent version pruning failed: {e}");
                 }
@@ -719,7 +719,7 @@ impl UpContext {
     /// Tool config mounts (Claude Code, Codex, Gemini) are added via [`add_tool_config_mounts`].
     async fn apply_env_and_mounts(
         &self,
-        create_opts: &mut cella_docker::CreateContainerOptions,
+        create_opts: &mut cella_backend::CreateContainerOptions,
         env_fwd: &cella_env::EnvForwarding,
         image_env: &[String],
         remote_user: &str,
@@ -761,16 +761,15 @@ impl UpContext {
         }
 
         // Agent volume mount and env vars
+        let version = env!("CARGO_PKG_VERSION");
         let agent_step = self.progress.step("Populating agent volume...");
-        match cella_docker::volume::ensure_agent_volume_populated(
-            self.client.inner(),
-            agent_arch,
-            self.skip_checksum,
-        )
-        .await
+        match self
+            .client
+            .ensure_agent_provisioned(version, agent_arch, self.skip_checksum)
+            .await
         {
             Ok(()) => agent_step.finish(),
-            Err(e @ CellaDockerError::AgentChecksumMismatch { .. }) => {
+            Err(e @ BackendError::AgentChecksumMismatch { .. }) => {
                 agent_step.fail("checksum mismatch");
                 return Err(e.into());
             }
@@ -785,7 +784,7 @@ impl UpContext {
         }
 
         // Write .daemon_addr to volume so agents can discover the daemon
-        write_daemon_addr_to_volume(&self.client).await;
+        write_daemon_addr_to_volume(self.client.as_ref()).await;
 
         let agent_env = cella_docker::config_map::env::agent_env_vars();
         if create_opts.env.is_empty() {
@@ -808,11 +807,11 @@ impl UpContext {
             });
         }
 
-        let (vol_name, vol_target, _ro) = cella_docker::volume::agent_volume_mount();
+        let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
         create_opts.mounts.push(MountConfig {
             mount_type: "volume".to_string(),
-            source: vol_name.to_string(),
-            target: vol_target.to_string(),
+            source: vol_name,
+            target: vol_target,
             consistency: None,
         });
 
@@ -833,23 +832,14 @@ impl UpContext {
         self.progress
             .run_step(&start_label, self.client.start_container(container_id))
             .await?;
-        verify_container_running(&self.client, container_id).await?;
+        verify_container_running(self.client.as_ref(), container_id).await?;
 
-        if let Err(e) =
-            cella_docker::network::ensure_container_connected(self.client.inner(), container_id)
-                .await
+        if let Err(e) = self
+            .client
+            .ensure_container_network(container_id, &self.resolved.workspace_root)
+            .await
         {
-            warn!("Failed to connect container to cella network: {e}");
-        }
-
-        if let Err(e) = cella_docker::network::ensure_repo_network(
-            self.client.inner(),
-            container_id,
-            &self.resolved.workspace_root,
-        )
-        .await
-        {
-            warn!("Failed to connect container to repo network: {e}");
+            warn!("Failed to connect container to networks: {e}");
         }
 
         self.register_with_daemon(container_id).await;
@@ -859,8 +849,11 @@ impl UpContext {
     /// Register the container with the daemon for port management.
     pub(crate) async fn register_with_daemon(&self, container_id: &str) {
         let config = self.config();
-        let container_ip =
-            cella_docker::network::get_container_cella_ip(self.client.inner(), container_id).await;
+        let container_ip = self
+            .client
+            .get_container_ip(container_id)
+            .await
+            .unwrap_or(None);
 
         let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
             return;
@@ -927,13 +920,14 @@ impl UpContext {
 
         if update_uid
             && remote_user != "root"
-            && let Err(e) = update_remote_user_uid(
-                &self.client,
-                container_id,
-                remote_user,
-                &self.resolved.workspace_root,
-            )
-            .await
+            && let Err(e) = self
+                .client
+                .update_remote_user_uid(
+                    container_id,
+                    remote_user,
+                    &self.resolved.workspace_root,
+                )
+                .await
         {
             warn!("Failed to update remote user UID: {e}");
         }
@@ -942,17 +936,17 @@ impl UpContext {
         self.progress
             .run_step(
                 "Configuring environment...",
-                inject_post_start(&self.client, container_id, &env_fwd.post_start, remote_user),
+                inject_post_start(self.client.as_ref(), container_id, &env_fwd.post_start, remote_user),
             )
             .await;
 
         // Add /cella/bin to PATH in shell profiles so `cella` CLI is discoverable.
-        inject_cella_path(&self.client, container_id, remote_user).await;
+        inject_cella_path(self.client.as_ref(), container_id, remote_user).await;
 
         // Seed gh CLI credentials (first create only)
         if settings.credentials.gh {
             seed_gh_credentials(
-                &self.client,
+                self.client.as_ref(),
                 container_id,
                 &self.resolved.workspace_root,
                 remote_user,
@@ -962,7 +956,7 @@ impl UpContext {
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
         let shell =
-            super::shell_detect::detect_shell(&self.client, container_id, remote_user).await;
+            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user).await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
@@ -971,7 +965,7 @@ impl UpContext {
             .run_step(
                 "Running userEnvProbe...",
                 super::env_cache::probe_and_cache_user_env(
-                    &self.client,
+                    self.client.as_ref(),
                     container_id,
                     remote_user,
                     self.probe_type(),
@@ -1002,8 +996,8 @@ impl UpContext {
 
         // Create home path symlink and populate plugin manifests
         if settings.tools.claude_code.forward_config {
-            create_claude_home_symlink(&self.client, container_id, remote_user).await;
-            setup_plugin_manifests(&self.client, container_id, remote_user).await;
+            create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
+            setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
         }
 
         // Install AI coding tools
@@ -1020,7 +1014,7 @@ impl UpContext {
                 .run_step(
                     "Updating environment cache...",
                     super::env_cache::probe_and_cache_user_env(
-                        &self.client,
+                        self.client.as_ref(),
                         container_id,
                         remote_user,
                         self.probe_type(),
@@ -1053,7 +1047,7 @@ impl UpContext {
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         cella_orchestrator::tool_install::install_tools(
-            &self.client,
+            self.client.as_ref(),
             container_id,
             remote_user,
             settings,
@@ -1175,7 +1169,7 @@ impl UpContext {
 
         // Ensure image (with optional features layer)
         let (img_name, resolved_features, base_image_details) = ensure_image(
-            &self.client,
+            self.client.as_ref(),
             config,
             &self.resolved.workspace_root,
             self.config_name(),
@@ -1256,7 +1250,7 @@ impl UpContext {
         .await?;
 
         write_content_hash(
-            &self.client,
+            self.client.as_ref(),
             &container_id,
             &remote_user,
             &self.resolved.workspace_root,
@@ -1384,6 +1378,7 @@ impl UpArgs {
         &self,
         branch_name: &str,
         progress: crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
@@ -1398,13 +1393,14 @@ impl UpArgs {
                 )
             })?;
 
-        let extra_labels = cella_docker::worktree_labels(branch_name, &repo_info.root);
+        let extra_labels = cella_backend::worktree_labels(branch_name, &repo_info.root);
         let mut ctx = UpContext::for_workspace(
             &wt.path,
             self.docker_host.as_deref(),
             extra_labels,
             progress,
             self.output.clone(),
+            backend,
         )
         .await?;
         ctx.remove_container = self.rebuild || self.remove_existing_container;
@@ -1432,12 +1428,11 @@ impl UpArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         if let Some(ref branch_name) = self.branch {
-            return self.execute_branch(branch_name, progress).await;
+            return self.execute_branch(branch_name, progress, backend).await;
         }
 
-        let ctx = UpContext::new(&self, progress).await?;
+        let ctx = UpContext::new(&self, progress, backend).await?;
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {
@@ -1489,7 +1484,7 @@ pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 pub async fn verify_container_running(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cella_orchestrator::container_setup::verify_container_running(client, container_id).await
@@ -1551,7 +1546,7 @@ pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
 /// Uploads SSH config files and sets git config.
 /// Never fails — individual steps log warnings and are skipped on error.
 pub async fn inject_post_start(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     post_start: &cella_env::PostStartInjection,
     remote_user: &str,
@@ -1566,7 +1561,7 @@ pub async fn inject_post_start(
 }
 
 /// Add `/cella/bin` to PATH in the container's shell profile.
-async fn inject_cella_path(client: &DockerClient, container_id: &str, remote_user: &str) {
+async fn inject_cella_path(client: &dyn ContainerBackend, container_id: &str, remote_user: &str) {
     cella_orchestrator::container_setup::inject_cella_path(client, container_id, remote_user).await;
 }
 
@@ -1574,7 +1569,7 @@ async fn inject_cella_path(client: &DockerClient, container_id: &str, remote_use
 
 /// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
 fn add_tool_config_mounts(
-    create_opts: &mut cella_docker::CreateContainerOptions,
+    create_opts: &mut cella_backend::CreateContainerOptions,
     settings: &cella_config::Settings,
     remote_user: &str,
 ) {
@@ -1585,7 +1580,7 @@ fn add_tool_config_mounts(
 
 /// Seed gh CLI credentials into a container.
 async fn seed_gh_credentials(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     workspace_root: &std::path::Path,
     remote_user: &str,
@@ -1601,13 +1596,21 @@ async fn seed_gh_credentials(
 
 /// Create a symlink from the host's `.claude` path to the container's so that
 /// hardcoded paths in plugin manifests resolve transparently.
-async fn create_claude_home_symlink(client: &DockerClient, container_id: &str, remote_user: &str) {
+async fn create_claude_home_symlink(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
     cella_orchestrator::tool_install::create_claude_home_symlink(client, container_id, remote_user)
         .await;
 }
 
 /// Populate the tmpfs-backed `~/.claude/plugins/` directory.
-async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
+async fn setup_plugin_manifests(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
     cella_orchestrator::tool_install::setup_plugin_manifests(client, container_id, remote_user)
         .await;
 }
@@ -1619,7 +1622,7 @@ async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remot
 /// Queries the daemon for its current control port and auth token, then
 /// writes them to `/cella/.daemon_addr` on the volume so agents can
 /// discover the daemon on startup and reconnect after restarts.
-async fn write_daemon_addr_to_volume(client: &DockerClient) {
+async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
     let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
         return;
     };
@@ -1641,10 +1644,9 @@ async fn write_daemon_addr_to_volume(client: &DockerClient) {
         return;
     };
 
-    let addr = format!("host.docker.internal:{control_port}");
-    if let Err(e) =
-        cella_docker::volume::write_daemon_addr_file(client.inner(), &addr, &control_token).await
-    {
+    let gateway = client.host_gateway();
+    let addr = format!("{gateway}:{control_port}");
+    if let Err(e) = client.write_agent_addr("", &addr, &control_token).await {
         warn!("Failed to write .daemon_addr to agent volume: {e}");
     }
 }
@@ -1653,8 +1655,8 @@ async fn write_daemon_addr_to_volume(client: &DockerClient) {
 ///
 /// Used after volume repopulation or daemon restart to ensure the agent
 /// connects to the current daemon with the latest binary.
-async fn restart_agent_in_container(client: &DockerClient, container_id: &str) {
-    let agent_path = cella_docker::volume::agent_symlink_path();
+async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
+    let agent_path = "/cella/bin/cella-agent";
     let script = format!(
         "pkill -f 'cella-agent daemon' 2>/dev/null; \
          \"{agent_path}\" daemon \
