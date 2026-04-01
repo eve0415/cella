@@ -33,6 +33,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 indicatif.workspace = true
+jsonc-parser.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cella-container.workspace = true

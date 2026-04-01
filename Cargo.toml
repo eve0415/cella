@@ -106,6 +106,9 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 regex = "1.12.3"
 glob = "0.3.3"
 
+# JSONC editing
+jsonc-parser = { version = "0.32.1", features = ["cst"] }
+
 # Certificate management
 rcgen = "0.14.7"
 rustls = { version = "0.23.27", default-features = false, features = ["ring", "std"] }

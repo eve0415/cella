@@ -351,6 +351,7 @@ dependencies = [
  "indicatif",
  "inquire",
  "insta",
+ "jsonc-parser",
  "miette",
  "serde_json",
  "terminal_size",
@@ -576,6 +577,7 @@ dependencies = [
  "dirs",
  "filetime",
  "flate2",
+ "glob",
  "hex",
  "insta",
  "miette",
@@ -1673,6 +1675,12 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8de0ffda8def4eb16ed430641db8056c2509b20e38f2dd327bdb4c83239f88c4"
 
 [[package]]
 name = "jwt"
