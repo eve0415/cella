@@ -235,18 +235,14 @@ enum TemplateChoice {
 fn prompt_official_templates(
     templates: &[TemplateSummary],
 ) -> Result<TemplateChoice, Box<dyn std::error::Error>> {
-    let mut choices: Vec<String> = Vec::with_capacity(templates.len() + 3);
+    let entries = templates
+        .iter()
+        .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
+    let (entry_choices, index_map) = build_choices_with_index(entries);
 
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 2);
     choices.push(SHOW_ALL_SOURCES.to_owned());
-    choices.push(separator_line());
-
-    for t in templates {
-        choices.push(format_entry(
-            t.name.as_deref().unwrap_or(&t.id),
-            t.description.as_deref(),
-        ));
-    }
-
+    choices.extend(entry_choices);
     choices.push(SHOW_OTHER_REGISTRY.to_owned());
 
     let selection = Select::new("Select a template:", choices)
@@ -259,15 +255,8 @@ fn prompt_official_templates(
     if selection == SHOW_OTHER_REGISTRY {
         return Ok(TemplateChoice::CustomRegistry);
     }
-    // Skip separator (shouldn't normally be selectable but guard anyway)
-    if selection.contains('─') {
-        return prompt_official_templates(templates);
-    }
 
-    let idx = find_by_name(
-        templates.iter().map(|t| t.name.as_deref().unwrap_or(&t.id)),
-        &selection,
-    )?;
+    let idx = resolve_selection(&index_map, &selection)?;
     Ok(TemplateChoice::Selected(templates[idx].clone()))
 }
 
@@ -312,14 +301,15 @@ async fn browse_custom_registry(
         return Ok(None);
     }
 
-    let mut choices: Vec<String> = Vec::with_capacity(custom_collection.templates.len() + 1);
+    let entries = custom_collection
+        .templates
+        .iter()
+        .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
+    let (entry_choices, index_map) = build_choices_with_index(entries);
+
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 1);
     choices.push(BACK_TO_OFFICIAL.to_owned());
-    for t in &custom_collection.templates {
-        choices.push(format_entry(
-            t.name.as_deref().unwrap_or(&t.id),
-            t.description.as_deref(),
-        ));
-    }
+    choices.extend(entry_choices);
 
     let selection = Select::new("Select a template:", choices)
         .with_page_size(15)
@@ -329,13 +319,7 @@ async fn browse_custom_registry(
         return Ok(None);
     }
 
-    let idx = find_by_name(
-        custom_collection
-            .templates
-            .iter()
-            .map(|t| t.name.as_deref().unwrap_or(&t.id)),
-        &selection,
-    )?;
+    let idx = resolve_selection(&index_map, &selection)?;
 
     let t = &custom_collection.templates[idx];
     let oci_ref = format!("{registry}/{}:{}", t.id, t.version);
@@ -375,15 +359,12 @@ fn prompt_collection_picker(
         })
         .collect();
 
-    let mut choices: Vec<String> = Vec::with_capacity(relevant.len() + 1);
-    choices.push(back_label.to_owned());
-
     let kind_label = match kind {
         CollectionKind::Templates => "templates",
         CollectionKind::Features => "features",
     };
 
-    for c in &relevant {
+    let entries = relevant.iter().map(|c| {
         let oci_ref = c.source_information.oci_reference.as_deref().unwrap_or("");
         let name = c.source_information.name.as_deref().unwrap_or(oci_ref);
         let count = match kind {
@@ -392,21 +373,26 @@ fn prompt_collection_picker(
         };
 
         if is_official_collection(oci_ref) {
-            choices.push(format!(
+            format!(
                 "{} {} {}  {}",
                 "\u{2713}".green(),
                 name.bold(),
                 "(official)".green(),
                 format!("{count} {kind_label}").dimmed(),
-            ));
+            )
         } else {
-            choices.push(format!(
+            format!(
                 "  {} {}",
                 name.bold(),
                 format!("{count} {kind_label}").dimmed(),
-            ));
+            )
         }
-    }
+    });
+    let (entry_choices, index_map) = build_choices_with_index(entries);
+
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 1);
+    choices.push(back_label.to_owned());
+    choices.extend(entry_choices);
 
     let prompt_msg = match kind {
         CollectionKind::Templates => "Select a template source:",
@@ -421,19 +407,7 @@ fn prompt_collection_picker(
         return Ok(CollectionPick::Back);
     }
 
-    let idx = relevant
-        .iter()
-        .position(|c| {
-            let name = c
-                .source_information
-                .name
-                .as_deref()
-                .or(c.source_information.oci_reference.as_deref())
-                .unwrap_or("");
-            selection.contains(name)
-        })
-        .ok_or("collection not found in selection")?;
-
+    let idx = resolve_selection(&index_map, &selection)?;
     Ok(CollectionPick::Selected((*relevant[idx]).clone()))
 }
 
@@ -450,15 +424,15 @@ async fn prompt_index_templates(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let mut choices: Vec<String> = Vec::with_capacity(collection.templates.len() + 1);
-    choices.push(BACK_TO_SOURCE_LIST.to_owned());
+    let entries = collection
+        .templates
+        .iter()
+        .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
+    let (entry_choices, index_map) = build_choices_with_index(entries);
 
-    for t in &collection.templates {
-        choices.push(format_entry(
-            t.name.as_deref().unwrap_or(&t.id),
-            t.description.as_deref(),
-        ));
-    }
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 1);
+    choices.push(BACK_TO_SOURCE_LIST.to_owned());
+    choices.extend(entry_choices);
 
     let selection = Select::new(&format!("Select a template (from {source_name}):"), choices)
         .with_page_size(15)
@@ -468,13 +442,7 @@ async fn prompt_index_templates(
         return Ok(None);
     }
 
-    let idx = find_by_name(
-        collection
-            .templates
-            .iter()
-            .map(|t| t.name.as_deref().unwrap_or(&t.id)),
-        &selection,
-    )?;
+    let idx = resolve_selection(&index_map, &selection)?;
 
     let t = &collection.templates[idx];
     let oci_ref = format!("{}:{}", t.id, t.version);
@@ -534,16 +502,15 @@ enum FeatureChoice {
 fn prompt_feature_list(
     available: &[FeatureSummary],
 ) -> Result<FeatureChoice, Box<dyn std::error::Error>> {
-    let mut choices: Vec<String> = Vec::with_capacity(available.len() + 2);
+    let entries = available
+        .iter()
+        .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
+    let (entry_choices, index_map) = build_choices_with_index(entries);
+
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 2);
     choices.push(DONE_ADDING_FEATURES.to_owned());
     choices.push(SHOW_ALL_FEATURE_SOURCES.to_owned());
-
-    for f in available {
-        choices.push(format_entry(
-            f.name.as_deref().unwrap_or(&f.id),
-            f.description.as_deref(),
-        ));
-    }
+    choices.extend(entry_choices);
 
     let selection = Select::new("Add a feature (or Done):", choices)
         .with_page_size(15)
@@ -556,11 +523,7 @@ fn prompt_feature_list(
         return Ok(FeatureChoice::ShowAllSources);
     }
 
-    let idx = find_by_name(
-        available.iter().map(|f| f.name.as_deref().unwrap_or(&f.id)),
-        &selection,
-    )?;
-
+    let idx = resolve_selection(&index_map, &selection)?;
     Ok(FeatureChoice::Selected(idx))
 }
 
@@ -630,15 +593,15 @@ async fn prompt_index_features(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let mut choices: Vec<String> = Vec::with_capacity(collection.features.len() + 1);
-    choices.push(BACK_TO_FEATURE_SOURCE_LIST.to_owned());
+    let entries = collection
+        .features
+        .iter()
+        .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
+    let (entry_choices, index_map) = build_choices_with_index(entries);
 
-    for f in &collection.features {
-        choices.push(format_entry(
-            f.name.as_deref().unwrap_or(&f.id),
-            f.description.as_deref(),
-        ));
-    }
+    let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 1);
+    choices.push(BACK_TO_FEATURE_SOURCE_LIST.to_owned());
+    choices.extend(entry_choices);
 
     let selection = Select::new(&format!("Select a feature (from {source_name}):"), choices)
         .with_page_size(15)
@@ -648,13 +611,7 @@ async fn prompt_index_features(
         return Ok(None);
     }
 
-    let idx = find_by_name(
-        collection
-            .features
-            .iter()
-            .map(|f| f.name.as_deref().unwrap_or(&f.id)),
-        &selection,
-    )?;
+    let idx = resolve_selection(&index_map, &selection)?;
 
     let f = &collection.features[idx];
     let feature_ref = format!("{}:{}", f.id, f.version);
@@ -768,11 +725,6 @@ fn format_entry(name: &str, description: Option<&str>) -> String {
     )
 }
 
-/// A dim separator line for visual grouping in picker lists.
-fn separator_line() -> String {
-    format!("{}", "─".repeat(40).dimmed())
-}
-
 /// Extract a short display name from a feature OCI reference.
 fn feature_display_name(reference: &str) -> String {
     reference
@@ -782,13 +734,30 @@ fn feature_display_name(reference: &str) -> String {
         .to_string()
 }
 
-/// Find the index of a selection by matching the name within the display string.
-fn find_by_name<'a>(
-    names: impl Iterator<Item = &'a str>,
+/// Build a choices vec and an index map from formatted entries.
+///
+/// `inquire::Select` returns the exact string the user picked, so we
+/// map each formatted choice back to its original index via exact
+/// string equality (not substring matching).
+fn build_choices_with_index<I: Iterator<Item = String>>(
+    entries: I,
+) -> (Vec<String>, HashMap<String, usize>) {
+    let mut choices = Vec::new();
+    let mut index_map = HashMap::new();
+    for (i, entry) in entries.enumerate() {
+        index_map.insert(entry.clone(), i);
+        choices.push(entry);
+    }
+    (choices, index_map)
+}
+
+/// Look up the original index from a selected choice string.
+fn resolve_selection(
+    index_map: &HashMap<String, usize>,
     selection: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    names
-        .enumerate()
-        .find_map(|(i, name)| selection.contains(name).then_some(i))
+    index_map
+        .get(selection)
+        .copied()
         .ok_or_else(|| "item not found in selection".into())
 }
