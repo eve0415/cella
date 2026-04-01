@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::{debug, info, warn};
 
+use cella_backend::ContainerInfo;
 use cella_compose::discovery;
-use cella_docker::ContainerInfo;
 
 use super::up::OutputFormat;
 
@@ -95,10 +95,9 @@ impl PruneArgs {
         }
 
         // 3. Fetch, detect, and build candidates
-        let _ = backend; // TODO: use resolve_backend once prune internals are migrated
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
         let candidates = self
-            .build_candidates(repo_root, &linked_worktrees, &client)
+            .build_candidates(repo_root, &linked_worktrees, client.as_ref())
             .await?;
 
         if candidates.is_empty() {
@@ -113,14 +112,15 @@ impl PruneArgs {
         }
 
         // 4. Display, confirm, and execute
-        self.confirm_and_prune(candidates, &client, repo_root).await
+        self.confirm_and_prune(candidates, client.as_ref(), repo_root)
+            .await
     }
 
     async fn build_candidates(
         &self,
         repo_root: &std::path::Path,
         linked_worktrees: &[cella_git::WorktreeInfo],
-        client: &cella_docker::DockerClient,
+        client: &dyn cella_backend::ContainerBackend,
     ) -> Result<Vec<PruneCandidate>, Box<dyn std::error::Error>> {
         if !self.is_json() {
             eprintln!("Fetching remote refs...");
@@ -166,7 +166,7 @@ impl PruneArgs {
     async fn confirm_and_prune(
         &self,
         candidates: Vec<PruneCandidate>,
-        client: &cella_docker::DockerClient,
+        client: &dyn cella_backend::ContainerBackend,
         repo_root: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.is_json() {
@@ -249,7 +249,7 @@ fn classify_branch(
 
 async fn execute_prune(
     candidates: &[PruneCandidate],
-    client: &cella_docker::DockerClient,
+    client: &dyn cella_backend::ContainerBackend,
     repo_root: &std::path::Path,
     json_mode: bool,
 ) -> (Vec<String>, Vec<String>) {

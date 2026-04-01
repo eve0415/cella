@@ -5,7 +5,7 @@
 
 use tracing::{debug, warn};
 
-use cella_docker::{DockerClient, ExecOptions};
+use cella_backend::{ContainerBackend, ExecOptions};
 
 /// Detect the best available shell for a user inside a container.
 ///
@@ -13,7 +13,11 @@ use cella_docker::{DockerClient, ExecOptions};
 /// 1. `$SHELL` environment variable
 /// 2. `/etc/passwd` entry for the user
 /// 3. Probing `/bin/zsh`, `/bin/bash`, `/bin/sh`
-pub async fn detect_shell(client: &DockerClient, container_id: &str, user: &str) -> String {
+pub async fn detect_shell(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+) -> String {
     if let Some(shell) = detect_shell_from_env(client, container_id, user).await {
         return shell;
     }
@@ -61,7 +65,7 @@ pub fn wrap_in_login_shell(shell: &str, command: &[String]) -> Vec<String> {
 
 /// Try to detect the shell from the `$SHELL` environment variable.
 async fn detect_shell_from_env(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<String> {
@@ -92,7 +96,7 @@ async fn detect_shell_from_env(
 
 /// Try to detect the shell from `/etc/passwd`.
 async fn detect_shell_from_passwd(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<String> {
@@ -124,7 +128,7 @@ async fn detect_shell_from_passwd(
 
 /// Probe common shell paths to find one that exists.
 async fn detect_shell_by_probing(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<String> {

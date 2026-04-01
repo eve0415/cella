@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use cella_docker::{DockerClient, ExecOptions};
+use cella_backend::{ContainerBackend, ExecOptions, FileToUpload};
 use cella_env::platform::DockerRuntime;
 
 /// Compute the per-user cache path for the probed environment.
@@ -19,7 +19,7 @@ fn cache_path(user: &str) -> String {
 /// Returns `None` if the cache file doesn't exist or can't be parsed
 /// (graceful fallback -- never errors).
 pub async fn read_probed_env_cache(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<HashMap<String, String>> {
@@ -51,7 +51,7 @@ pub async fn read_probed_env_cache(
 ///
 /// Returns the probed environment, or `None` if probing is disabled or fails.
 pub async fn probe_and_cache_user_env(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     probe_type: &str,
@@ -64,7 +64,7 @@ pub async fn probe_and_cache_user_env(
 
 /// Execute the environment probe command and parse the output.
 async fn run_env_probe(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     probe_type: &str,
@@ -104,7 +104,7 @@ async fn run_env_probe(
 ///
 /// Creates the `~/.cella/` directory if it doesn't exist.
 async fn write_env_cache(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     env: &HashMap<String, String>,
@@ -130,7 +130,7 @@ async fn write_env_cache(
         )
         .await;
 
-    let cache_file = cella_docker::FileToUpload {
+    let cache_file = FileToUpload {
         path,
         content: json.into_bytes(),
         mode: 0o644,
@@ -147,7 +147,7 @@ async fn write_env_cache(
 /// check whether the well-known socket path exists inside the container.
 /// Appends `SSH_AUTH_SOCK=<path>` if found.
 pub async fn ensure_ssh_auth_sock(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     env: &mut Vec<String>,
