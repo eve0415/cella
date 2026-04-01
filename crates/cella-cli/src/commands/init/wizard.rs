@@ -114,18 +114,40 @@ pub async fn run(args: InitArgs, _progress: Progress) -> Result<(), Box<dyn std:
     // Step 10: Prompt to run cella up
     if args.up {
         eprintln!("Starting dev container...");
-        // TODO: invoke cella up programmatically
+        exec_cella_up()?;
     } else {
         let start_now = Confirm::new("Start the dev container now? (cella up)")
             .with_default(false)
             .prompt()?;
         if start_now {
-            eprintln!("Run: cella up");
-            // TODO: invoke cella up programmatically
+            exec_cella_up()?;
         }
     }
 
     Ok(())
+}
+
+/// Launch `cella up`, replacing the current process on Unix.
+fn exec_cella_up() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = std::process::Command::new("cella");
+    cmd.arg("up");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec() replaces the process; only returns on failure
+        let err = cmd.exec();
+        return Err(err.into());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = cmd.spawn()?.wait()?;
+        if !status.success() {
+            return Err(format!("cella up exited with status {status}").into());
+        }
+        Ok(())
+    }
 }
 
 /// Prompt the user to select a template from the collection.
