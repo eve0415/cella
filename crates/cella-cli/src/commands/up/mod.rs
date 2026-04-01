@@ -1519,7 +1519,29 @@ pub fn output_result(
 
 /// Query the daemon for control port + auth token, returning env vars to inject.
 pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
-    cella_orchestrator::container_setup::query_daemon_env(container_nm).await
+    if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
+        && mgmt_sock.exists()
+    {
+        let status_resp = cella_daemon::management::send_management_request(
+            &mgmt_sock,
+            &cella_port::protocol::ManagementRequest::QueryStatus,
+        )
+        .await;
+
+        if let Ok(cella_port::protocol::ManagementResponse::Status {
+            control_port,
+            control_token,
+            ..
+        }) = &status_resp
+        {
+            return vec![
+                format!("CELLA_DAEMON_ADDR=host.docker.internal:{control_port}"),
+                format!("CELLA_DAEMON_TOKEN={control_token}"),
+                format!("CELLA_CONTAINER_NAME={container_nm}"),
+            ];
+        }
+    }
+    vec![]
 }
 
 /// Inject post-start environment forwarding into a running container.

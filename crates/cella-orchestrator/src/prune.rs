@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tracing::info;
 
-use cella_docker::DockerClient;
+use cella_backend::ContainerBackend;
 
 use crate::error::OrchestratorError;
 use crate::progress::ProgressSender;
@@ -35,7 +35,7 @@ pub struct PruneCandidate {
 /// Returns an error if git operations fail.
 pub async fn prune_candidates(
     repo_root: &Path,
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     all: bool,
 ) -> Result<Vec<PruneCandidate>, OrchestratorError> {
     let worktrees = cella_git::list(repo_root).map_err(|e| OrchestratorError::Git {
@@ -91,7 +91,7 @@ pub async fn prune_candidates(
 /// Returns a result with pruned entries and any errors encountered.
 pub async fn execute_prune(
     repo_root: &Path,
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     candidates: &[PruneCandidate],
     progress: &ProgressSender,
 ) -> PruneResult {

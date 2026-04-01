@@ -170,7 +170,10 @@ fn build_entrypoint_cmd(
 
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
-    let agent_path = cella_docker::volume::agent_symlink_path();
+    // Stable agent binary path inside containers. This is a devcontainer
+    // convention, not Docker-specific, so we hardcode it here rather than
+    // pulling in a backend-specific crate.
+    let agent_path = "/cella/bin/cella-agent";
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \

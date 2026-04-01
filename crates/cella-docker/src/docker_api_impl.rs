@@ -212,7 +212,7 @@ impl ContainerBackend for DockerClient {
         })
     }
 
-    fn host_gateway(&self) -> &str {
+    fn host_gateway(&self) -> &'static str {
         "host.docker.internal"
     }
 

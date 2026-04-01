@@ -1,23 +1,23 @@
-//! Docker container lookup and exec helpers.
+//! Container lookup and exec helpers.
 //!
 //! These replace the subprocess-based helpers in the daemon's control server
-//! with direct bollard API calls via [`DockerClient`].
+//! with direct container backend API calls via [`ContainerBackend`].
 
-use cella_docker::DockerClient;
+use cella_backend::ContainerBackend;
 
 use crate::error::OrchestratorError;
 use crate::result::WorktreeStatus;
 
-/// Find a running container for a given branch by Docker label lookup.
+/// Find a running container for a given branch by label lookup.
 ///
 /// Queries cella-managed containers and matches the `dev.cella.branch` label.
 /// Returns the first matching container name.
 ///
 /// # Errors
 ///
-/// Returns an error if the Docker API query fails.
+/// Returns an error if the container backend query fails.
 pub async fn find_container_for_branch(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     branch: &str,
 ) -> Result<Option<String>, OrchestratorError> {
     let containers =
@@ -43,15 +43,15 @@ pub async fn find_container_for_branch(
 
 /// List all worktrees with their container status.
 ///
-/// Combines `git worktree list` output with Docker container label queries
+/// Combines `git worktree list` output with container backend label queries
 /// to produce a unified view of worktrees and their associated containers.
 ///
 /// # Errors
 ///
-/// Returns an error if git or Docker operations fail.
+/// Returns an error if git or container backend operations fail.
 pub async fn worktree_list(
     repo_root: &std::path::Path,
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
 ) -> Result<Vec<WorktreeStatus>, OrchestratorError> {
     let worktrees = cella_git::list(repo_root).map_err(|e| OrchestratorError::Git {
         message: format!("failed to list worktrees: {e}"),
@@ -91,9 +91,9 @@ pub async fn worktree_list(
 ///
 /// # Errors
 ///
-/// Returns an error if the Docker exec fails.
+/// Returns an error if the container exec fails.
 pub async fn container_exec(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_name: &str,
     cmd: &[String],
     user: Option<&str>,
@@ -102,7 +102,7 @@ pub async fn container_exec(
     let result = client
         .exec_command(
             container_name,
-            &cella_docker::ExecOptions {
+            &cella_backend::ExecOptions {
                 cmd: cmd.to_vec(),
                 user: user.map(String::from),
                 env: None,
@@ -125,7 +125,7 @@ pub async fn container_exec(
 ///
 /// Returns an error if the container is not running or the check fails.
 pub async fn verify_container_running(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
 ) -> Result<(), OrchestratorError> {
     let info =

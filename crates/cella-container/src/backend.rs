@@ -446,7 +446,7 @@ impl ContainerBackend for AppleContainerBackend {
         })
     }
 
-    fn host_gateway(&self) -> &str {
+    fn host_gateway(&self) -> &'static str {
         // Apple Container uses the standard macOS localhost; containers
         // can reach the host via this address when networking is enabled.
         "host.local"

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use cella_docker::{CellaDockerError, DockerClient, ExecOptions, ExecResult, MountConfig};
+use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountConfig};
 use tracing::{debug, warn};
 
 use crate::progress::ProgressSender;
@@ -49,7 +49,7 @@ pub fn tool_shell_cmd(probed_env: Option<&ProbedEnv>, inner_cmd: &str) -> Vec<St
 // ── Alpine detection ─────────────────────────────────────────────────────────
 
 /// Check if the container is Alpine-based.
-pub async fn is_alpine_container(client: &DockerClient, container_id: &str) -> bool {
+pub async fn is_alpine_container(client: &dyn ContainerBackend, container_id: &str) -> bool {
     client
         .exec_command(
             container_id,
@@ -78,7 +78,7 @@ pub async fn is_alpine_container(client: &DockerClient, container_id: &str) -> b
 /// to install Node.js via the system package manager (apt-get or apk).
 /// Returns `true` if npm is available after the check.
 pub async fn ensure_node_available(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     probed_env: Option<&ProbedEnv>,
 ) -> bool {
@@ -142,7 +142,7 @@ pub async fn ensure_node_available(
 /// Check if Claude Code is already installed at the desired version.
 /// Returns `true` if already installed and no (re)install is needed.
 pub async fn is_claude_code_installed(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     version: &str,
@@ -178,7 +178,7 @@ pub async fn is_claude_code_installed(
 
 /// Detect Alpine and install Claude Code native dependencies if needed.
 /// Returns `true` if the container is Alpine-based.
-pub async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str) -> bool {
+pub async fn ensure_alpine_claude_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
     let is_alpine = is_alpine_container(client, container_id).await;
 
     if is_alpine {
@@ -207,7 +207,7 @@ pub async fn ensure_alpine_claude_deps(client: &DockerClient, container_id: &str
 /// Checks if already installed at the desired version, installs Alpine
 /// dependencies if needed, then runs the native installer.
 pub async fn install_claude_code(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::ClaudeCode,
@@ -239,7 +239,7 @@ pub async fn install_claude_code(
 
 /// Execute the Claude Code install script inside the container.
 pub async fn run_claude_install(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     version: &str,
@@ -275,7 +275,7 @@ pub async fn run_claude_install(
 }
 
 /// Log the result of a Claude Code installation attempt.
-pub fn log_install_result(result: Result<ExecResult, CellaDockerError>) {
+pub fn log_install_result(result: Result<ExecResult, BackendError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("Claude Code installed successfully");
@@ -297,7 +297,7 @@ pub fn log_install_result(result: Result<ExecResult, CellaDockerError>) {
 
 /// Check if an npm-installed CLI tool is already present at the desired version.
 pub async fn is_npm_tool_installed(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     binary_name: &str,
@@ -336,15 +336,15 @@ pub async fn is_npm_tool_installed(
 ///
 /// # Errors
 ///
-/// Returns `CellaDockerError` if the exec command fails to run.
+/// Returns `BackendError` if the exec command fails to run.
 pub async fn npm_install_global(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     package: &str,
     version: &str,
     probed_env: Option<&ProbedEnv>,
-) -> Result<ExecResult, CellaDockerError> {
+) -> Result<ExecResult, BackendError> {
     let pkg = if version == "latest" {
         package.to_string()
     } else {
@@ -365,7 +365,7 @@ pub async fn npm_install_global(
 }
 
 /// Log the result of an npm tool installation attempt.
-pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, CellaDockerError>) {
+pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, BackendError>) {
     match result {
         Ok(r) if r.exit_code == 0 => {
             debug!("{tool_name} installed successfully");
@@ -390,7 +390,7 @@ pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, CellaD
 /// Checks if already installed, then runs `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
 pub async fn install_codex(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::Codex,
@@ -429,7 +429,7 @@ pub async fn install_codex(
 /// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
 /// Caller must ensure Node.js/npm are available before calling this.
 pub async fn install_gemini(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::Gemini,
@@ -470,7 +470,7 @@ pub async fn install_gemini(
 /// Example: host home `/home/node`, container home `/home/vscode`:
 ///   `/home/node/.claude` -> `/home/vscode/.claude`
 pub async fn create_claude_home_symlink(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
 ) {
@@ -511,7 +511,7 @@ pub async fn create_claude_home_symlink(
 /// and replace with the container user's path. This handles files written by
 /// previous containers with different users (e.g. `/home/node/.claude` ->
 /// `/home/vscode/.claude`).
-pub async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, remote_user: &str) {
+pub async fn setup_plugin_manifests(client: &dyn ContainerBackend, container_id: &str, remote_user: &str) {
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins = "/tmp/.cella/host-plugins";
@@ -568,7 +568,7 @@ pub async fn setup_plugin_manifests(client: &DockerClient, container_id: &str, r
 
 /// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
 pub fn add_tool_config_mounts(
-    create_opts: &mut cella_docker::CreateContainerOptions,
+    create_opts: &mut cella_backend::CreateContainerOptions,
     settings: &cella_config::Settings,
     remote_user: &str,
 ) {
@@ -688,7 +688,7 @@ pub fn add_tool_config_mounts(
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
 pub async fn install_tools(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::Settings,
@@ -869,9 +869,9 @@ mod tests {
 
     #[test]
     fn log_install_result_error() {
-        let result: Result<ExecResult, CellaDockerError> =
-            Err(CellaDockerError::ContainerNotFound {
-                workspace: "test".into(),
+        let result: Result<ExecResult, BackendError> =
+            Err(BackendError::ContainerNotFound {
+                identifier: "test".into(),
             });
         log_install_result(result);
     }
@@ -898,9 +898,9 @@ mod tests {
 
     #[test]
     fn log_npm_install_result_error() {
-        let result: Result<ExecResult, CellaDockerError> =
-            Err(CellaDockerError::ContainerNotFound {
-                workspace: "missing".into(),
+        let result: Result<ExecResult, BackendError> =
+            Err(BackendError::ContainerNotFound {
+                identifier: "missing".into(),
             });
         log_npm_install_result("TestTool", result);
     }

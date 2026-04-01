@@ -3,7 +3,7 @@
 //! These wrappers bridge the CLI's `Progress` type to the orchestrator's
 //! `ProgressSender` for functions called directly from `up/mod.rs`.
 
-use cella_docker::{CellaDockerError, DockerClient, LifecycleContext};
+use cella_backend::{BackendError, ContainerBackend, LifecycleContext};
 
 use crate::progress::Progress;
 
@@ -60,7 +60,7 @@ pub(super) async fn run_lifecycle_entries(
     phase: &str,
     entries: &[cella_features::LifecycleEntry],
     progress: &Progress,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     let (sender, renderer) = crate::progress::bridge(progress);
     let result =
         cella_orchestrator::lifecycle::run_lifecycle_entries(ctx, phase, entries, &sender).await;
@@ -95,7 +95,7 @@ pub(super) async fn check_and_run_content_update(
 
 /// Store the workspace content hash inside the container.
 pub(super) async fn write_content_hash(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     workspace_root: &std::path::Path,

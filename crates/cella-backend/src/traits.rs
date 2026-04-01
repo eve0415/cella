@@ -131,7 +131,7 @@ pub trait ContainerBackend: Send + Sync {
     /// The hostname used inside containers to reach the host machine.
     ///
     /// Docker: `"host.docker.internal"`, Podman: `"host.containers.internal"`.
-    fn host_gateway(&self) -> &str;
+    fn host_gateway(&self) -> &'static str;
 
     // -- Platform detection --
 
@@ -196,7 +196,7 @@ pub trait ContainerBackend: Send + Sync {
         token: &'a str,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// Return the (volume_name, mount_target, read_only) tuple for the
+    /// Return the (`volume_name`, `mount_target`, `read_only`) tuple for the
     /// agent binary volume mount.
     fn agent_volume_mount(&self) -> (String, String, bool);
 
