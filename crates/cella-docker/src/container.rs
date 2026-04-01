@@ -420,7 +420,7 @@ mod tests {
     use bollard::models::{
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
-    use cella_backend::{ComposeBackend, ContainerBackend};
+    use cella_backend::ContainerBackend;
 
     use super::*;
     use crate::client::mock::{MockCall, MockDockerClient};

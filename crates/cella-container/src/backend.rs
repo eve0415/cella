@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cella_backend::{
-    BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend, ContainerInfo,
-    ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
-    InteractiveExecOptions, MountInfo, Platform, PortBinding,
+    BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
+    ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
+    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding,
 };
 use tracing::{debug, warn};
 
@@ -52,6 +52,13 @@ fn default_staging_base() -> PathBuf {
 impl ContainerBackend for AppleContainerBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::AppleContainer
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            compose: false,
+            managed_agent: false,
+        }
     }
 
     // -- Container operations --

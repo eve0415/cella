@@ -1,10 +1,10 @@
-//! `ContainerBackend` and `ComposeBackend` trait implementations for `DockerClient`.
+//! `ContainerBackend` trait implementation for `DockerClient`.
 
 use std::io::Write;
 use std::path::Path;
 
 use cella_backend::{
-    BackendError, BackendKind, BoxFuture, BuildOptions, ComposeBackend, ContainerBackend,
+    BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
     InteractiveExecOptions, Platform,
 };
@@ -16,6 +16,13 @@ use crate::client::DockerClient;
 impl ContainerBackend for DockerClient {
     fn kind(&self) -> BackendKind {
         BackendKind::Docker
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            compose: true,
+            managed_agent: true,
+        }
     }
 
     fn find_container<'a>(
@@ -396,33 +403,6 @@ impl ContainerBackend for DockerClient {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             crate::uid::update_remote_user_uid(self, container_id, remote_user, workspace_root)
-                .await
-                .map_err(BackendError::from)
-        })
-    }
-}
-
-#[allow(unconditional_recursion)] // false positive: delegates to inherent methods, not trait
-#[allow(clippy::use_self)] // Self::method would call the trait method (recursion); must use DockerClient::
-impl ComposeBackend for DockerClient {
-    fn find_compose_container<'a>(
-        &'a self,
-        project_name: &'a str,
-        service_name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
-        Box::pin(async move {
-            DockerClient::find_compose_container(self, project_name, service_name)
-                .await
-                .map_err(BackendError::from)
-        })
-    }
-
-    fn list_compose_containers<'a>(
-        &'a self,
-        project_name: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, BackendError>> {
-        Box::pin(async move {
-            DockerClient::list_compose_containers(self, project_name)
                 .await
                 .map_err(BackendError::from)
         })

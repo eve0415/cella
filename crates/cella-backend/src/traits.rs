@@ -1,8 +1,7 @@
 //! Container backend trait definitions.
 //!
 //! [`ContainerBackend`] defines the core operations that all container runtimes
-//! must support. [`ComposeBackend`] is an extension trait for Docker Compose
-//! support (only implemented by the Docker backend).
+//! must support.
 
 use std::future::Future;
 use std::io::Write;
@@ -22,6 +21,13 @@ pub struct Platform {
     pub arch: String,
 }
 
+/// Capability flags exposed by a container backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    pub compose: bool,
+    pub managed_agent: bool,
+}
+
 /// Boxed future type alias for async trait methods (object-safe).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -32,6 +38,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait ContainerBackend: Send + Sync {
     /// Which backend this is.
     fn kind(&self) -> BackendKind;
+
+    /// Which optional behaviors this backend supports.
+    fn capabilities(&self) -> BackendCapabilities;
 
     // -- Container operations --
 
@@ -236,21 +245,4 @@ pub trait ContainerBackend: Send + Sync {
         remote_user: &'a str,
         workspace_root: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
-}
-
-/// Extension trait for Docker Compose support.
-///
-/// Only the Docker backend implements this. Commands that require Compose
-/// check for this capability via downcasting or backend kind checks.
-pub trait ComposeBackend: ContainerBackend {
-    fn find_compose_container<'a>(
-        &'a self,
-        project_name: &'a str,
-        service_name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>>;
-
-    fn list_compose_containers<'a>(
-        &'a self,
-        project_name: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, BackendError>>;
 }

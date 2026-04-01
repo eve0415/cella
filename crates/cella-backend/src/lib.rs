@@ -14,7 +14,7 @@ pub use names::{
     image_name_with_features, worktree_labels,
 };
 pub use resolve::ContainerTarget;
-pub use traits::{BoxFuture, ComposeBackend, ContainerBackend, Platform};
+pub use traits::{BackendCapabilities, BoxFuture, ContainerBackend, Platform};
 pub use types::{
     BackendKind, BuildOptions, ContainerInfo, ContainerState, CreateContainerOptions, DeviceSpec,
     ExecOptions, ExecResult, FileToUpload, GpuRequest, ImageDetails, InteractiveExecOptions,

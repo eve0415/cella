@@ -29,7 +29,7 @@ pub use cella_backend::names::{
     image_name_with_features, worktree_labels,
 };
 pub use cella_backend::{
-    BackendError, BackendKind, BoxFuture, BuildOptions, ComposeBackend, ContainerBackend,
+    BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
     ImageDetails, InteractiveExecOptions, MountConfig, MountInfo, PortBinding,
 };

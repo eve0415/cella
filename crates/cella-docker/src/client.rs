@@ -100,7 +100,7 @@ pub mod mock {
     use std::sync::Mutex;
 
     use cella_backend::{
-        BackendError, BackendKind, BoxFuture, BuildOptions, ComposeBackend, ContainerBackend,
+        BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
         ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
         InteractiveExecOptions,
     };
@@ -225,6 +225,13 @@ pub mod mock {
             BackendKind::Docker
         }
 
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                compose: true,
+                managed_agent: true,
+            }
+        }
+
         fn find_container<'a>(
             &'a self,
             workspace_root: &'a Path,
@@ -327,10 +334,10 @@ pub mod mock {
 
         fn find_compose_service<'a>(
             &'a self,
-            _project: &'a str,
-            _service: &'a str,
+            project: &'a str,
+            service: &'a str,
         ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move { self.find_compose_container(project, service).await })
         }
 
         fn find_container_by_label<'a>(
@@ -601,39 +608,37 @@ pub mod mock {
         }
     }
 
-    impl ComposeBackend for MockDockerClient {
-        fn find_compose_container<'a>(
-            &'a self,
-            project_name: &'a str,
-            service_name: &'a str,
-        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+    impl MockDockerClient {
+        pub async fn find_compose_container(
+            &self,
+            project_name: &str,
+            service_name: &str,
+        ) -> Result<Option<ContainerInfo>, BackendError> {
             self.record(MockCall::FindComposeContainer {
                 project_name: project_name.to_string(),
                 service_name: service_name.to_string(),
             });
-            let result = self
+            self
                 .find_compose_container_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("MockDockerClient: no find_compose_container response configured");
-            Box::pin(async move { result })
+                .expect("MockDockerClient: no find_compose_container response configured")
         }
 
-        fn list_compose_containers<'a>(
-            &'a self,
-            project_name: &'a str,
-        ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, BackendError>> {
+        pub async fn list_compose_containers(
+            &self,
+            project_name: &str,
+        ) -> Result<Vec<ContainerInfo>, BackendError> {
             self.record(MockCall::ListComposeContainers {
                 project_name: project_name.to_string(),
             });
-            let result = self
+            self
                 .list_compose_containers_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("MockDockerClient: no list_compose_containers response configured");
-            Box::pin(async move { result })
+                .expect("MockDockerClient: no list_compose_containers response configured")
         }
     }
 }
