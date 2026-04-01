@@ -2,6 +2,7 @@ pub mod backend;
 mod commands;
 pub mod picker;
 pub mod progress;
+pub mod style;
 mod table;
 
 use std::io::IsTerminal;

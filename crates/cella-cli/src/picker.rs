@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 
 use cella_docker::{ContainerInfo, ContainerState};
 use cella_git::WorktreeInfo;
+use owo_colors::OwoColorize;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -160,15 +161,14 @@ fn format_worktree_label(
     container_state: Option<&ContainerState>,
 ) -> String {
     if is_main {
-        return format!("{branch}  \x1b[33m\u{2605}\x1b[0m");
+        return format!("{branch}  {}", "★".yellow());
     }
-    let indicator = match container_state {
-        Some(ContainerState::Running) => "\x1b[32m\u{25cf}\x1b[0m",
-        Some(ContainerState::Stopped) => "\x1b[90m\u{25cb}\x1b[0m",
-        Some(_) => "\x1b[90m?\x1b[0m",
-        None => "\x1b[90m\u{00b7}\x1b[0m",
-    };
-    format!("{branch}  {indicator}")
+    match container_state {
+        Some(ContainerState::Running) => format!("{branch}  {}", "●".green()),
+        Some(ContainerState::Stopped) => format!("{branch}  {}", "○".dimmed()),
+        Some(_) => format!("{branch}  {}", "?".dimmed()),
+        None => format!("{branch}  {}", "·".dimmed()),
+    }
 }
 
 /// Resolve a branch name to a worktree, with fuzzy picker fallback.
@@ -244,9 +244,9 @@ fn format_container_label(container: &ContainerInfo) -> String {
         .get("dev.cella.branch")
         .map_or("-", String::as_str);
     let indicator = match &container.state {
-        ContainerState::Running => "\x1b[32m\u{25cf}\x1b[0m",
-        ContainerState::Stopped => "\x1b[90m\u{25cb}\x1b[0m",
-        _ => "\x1b[90m?\x1b[0m",
+        ContainerState::Running => format!("{}", "●".green()),
+        ContainerState::Stopped => format!("{}", "○".dimmed()),
+        _ => format!("{}", "?".dimmed()),
     };
     format!("{} ({branch})  {indicator}", container.name)
 }

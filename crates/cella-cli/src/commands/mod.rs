@@ -11,6 +11,7 @@ mod doctor;
 mod down;
 mod env_cache;
 mod exec;
+pub mod features;
 pub mod image;
 mod init;
 mod list;
@@ -70,6 +71,8 @@ pub enum Command {
     Config(config::ConfigArgs),
     /// Manage dev container templates.
     Template(template::TemplateArgs),
+    /// Manage devcontainer features.
+    Features(features::FeaturesArgs),
     /// Initialize cella in the current repository.
     Init(init::InitArgs),
     /// Open VS Code connected to the dev container.
@@ -152,7 +155,8 @@ impl Command {
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
-            Self::Init(args) => args.execute(),
+            Self::Features(args) => args.execute(progress).await,
+            Self::Init(args) => args.execute(progress).await,
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
             Self::Completions(args) => {

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use owo_colors::OwoColorize;
 use tracing_subscriber::fmt::MakeWriter;
 
 // ── style constants ──────────────────────────────────────────────────
@@ -210,17 +211,14 @@ impl Progress {
         let _ = self
             .inner
             .multi
-            .println(format!("  \x1b[33m⚠\x1b[0m {msg}"));
+            .println(format!("  {} {msg}", "⚠".yellow()));
     }
 
     /// Print an error message in the spinner flow.
     ///
     /// Shows a red `✗` prefix. Always visible regardless of verbosity.
     pub fn error(&self, msg: &str) {
-        let _ = self
-            .inner
-            .multi
-            .println(format!("  \x1b[31m✗\x1b[0m {msg}"));
+        let _ = self.inner.multi.println(format!("  {} {msg}", "✗".red()));
     }
 
     /// Print a hint/fix suggestion in the spinner flow.
@@ -230,7 +228,7 @@ impl Progress {
         let _ = self
             .inner
             .multi
-            .println(format!("    \x1b[2m→ {msg}\x1b[0m"));
+            .println(format!("    {}", format!("→ {msg}").dimmed()));
     }
 
     /// Print a line through the progress system (appears above spinners).
@@ -264,7 +262,7 @@ impl Step {
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let msg = format!("\x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
+        let msg = format!("{} {}{time_suffix}", "✓".green(), self.label);
         self.finish_impl(&msg);
     }
 
@@ -272,13 +270,13 @@ impl Step {
     pub fn finish_with(self, msg: &str) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let line = format!("\x1b[32m✓\x1b[0m {msg}{time_suffix}");
+        let line = format!("{} {msg}{time_suffix}", "✓".green());
         self.finish_impl(&line);
     }
 
     /// Mark as failed.
     pub fn fail(self, msg: &str) {
-        let line = format!("\x1b[31m✗\x1b[0m {}: {msg}", self.label);
+        let line = format!("{} {}: {msg}", "✗".red(), self.label);
         self.finish_impl(&line);
     }
 
@@ -351,7 +349,7 @@ impl Phase {
         // Print parent line first (permanent).
         let _ = self
             .multi
-            .println(format!("  \x1b[32m✓\x1b[0m {}{time_suffix}", self.label));
+            .println(format!("  {} {}{time_suffix}", "✓".green(), self.label));
 
         // Print completed children in the order they finished (permanent).
         let Ok(children) = self.completed_children.lock() else {
@@ -390,7 +388,7 @@ impl PhaseChild {
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
-        let msg = format!("      \x1b[32m✓\x1b[0m {}{time_suffix}", self.label);
+        let msg = format!("      {} {}{time_suffix}", "✓".green(), self.label);
         if let Ok(mut children) = self.completed.lock() {
             children.push(msg);
         }
