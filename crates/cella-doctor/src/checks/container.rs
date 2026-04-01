@@ -337,7 +337,11 @@ mod tests {
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].checks[0].name, "skipped");
-        assert!(reports[0].checks[0].detail.contains("backend not connected"));
+        assert!(
+            reports[0].checks[0]
+                .detail
+                .contains("backend not connected")
+        );
     }
 
     #[tokio::test]
@@ -375,7 +379,11 @@ mod tests {
         let ctx = ctx_no_docker(Some(std::path::PathBuf::from("/workspace")));
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].checks[0].detail.contains("backend not connected"));
+        assert!(
+            reports[0].checks[0]
+                .detail
+                .contains("backend not connected")
+        );
     }
 
     #[tokio::test]

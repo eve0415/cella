@@ -337,7 +337,7 @@ pub mod mock {
             project: &'a str,
             service: &'a str,
         ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
-            Box::pin(async move { self.find_compose_container(project, service).await })
+            Box::pin(async move { self.find_compose_container(project, service) })
         }
 
         fn find_container_by_label<'a>(
@@ -609,7 +609,16 @@ pub mod mock {
     }
 
     impl MockDockerClient {
-        pub async fn find_compose_container(
+        /// Find a compose container by project and service name.
+        ///
+        /// # Errors
+        ///
+        /// Returns `BackendError` from the pre-configured response queue.
+        ///
+        /// # Panics
+        ///
+        /// Panics if no response has been configured for this call.
+        pub fn find_compose_container(
             &self,
             project_name: &str,
             service_name: &str,
@@ -618,23 +627,30 @@ pub mod mock {
                 project_name: project_name.to_string(),
                 service_name: service_name.to_string(),
             });
-            self
-                .find_compose_container_responses
+            self.find_compose_container_responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("MockDockerClient: no find_compose_container response configured")
         }
 
-        pub async fn list_compose_containers(
+        /// List compose containers by project name.
+        ///
+        /// # Errors
+        ///
+        /// Returns `BackendError` from the pre-configured response queue.
+        ///
+        /// # Panics
+        ///
+        /// Panics if no response has been configured for this call.
+        pub fn list_compose_containers(
             &self,
             project_name: &str,
         ) -> Result<Vec<ContainerInfo>, BackendError> {
             self.record(MockCall::ListComposeContainers {
                 project_name: project_name.to_string(),
             });
-            self
-                .list_compose_containers_responses
+            self.list_compose_containers_responses
                 .lock()
                 .unwrap()
                 .pop_front()

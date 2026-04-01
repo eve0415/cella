@@ -14,8 +14,8 @@ pub use crate::config::NetworkRulePolicy;
 use crate::config::{HostRequirementPolicy, ImageStrategy, UpConfig};
 use crate::error::OrchestratorError;
 use crate::lifecycle::{
-    WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase,
-    run_lifecycle_entries, run_lifecycle_phases_with_wait_for, write_content_hash,
+    WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase, run_lifecycle_entries,
+    run_lifecycle_phases_with_wait_for, write_content_hash,
 };
 use crate::progress::ProgressSender;
 use crate::result::{UpOutcome, UpResult};
@@ -105,11 +105,7 @@ struct CreateResult {
     remote_user: String,
 }
 
-async fn run_step_result<F, T, E>(
-    progress: &ProgressSender,
-    label: &str,
-    future: F,
-) -> Result<T, E>
+async fn run_step_result<F, T, E>(progress: &ProgressSender, label: &str, future: F) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
@@ -127,8 +123,8 @@ where
     }
 }
 
-impl<'a> EnsureUpContext<'a> {
-    fn config_json(&self) -> &serde_json::Value {
+impl EnsureUpContext<'_> {
+    const fn config_json(&self) -> &serde_json::Value {
         &self.config.resolved.config
     }
 
@@ -217,40 +213,32 @@ impl<'a> EnsureUpContext<'a> {
         let config = self.config_json();
 
         let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
-        let _ = run_step_result(
-            &self.progress,
-            "Configuring environment...",
-            async {
-                crate::container_setup::inject_post_start(
-                    self.client,
-                    container_id,
-                    &env_fwd.post_start,
-                    remote_user,
-                )
-                .await;
-                Ok::<(), std::convert::Infallible>(())
-            },
-        )
+        let _ = run_step_result(&self.progress, "Configuring environment...", async {
+            crate::container_setup::inject_post_start(
+                self.client,
+                container_id,
+                &env_fwd.post_start,
+                remote_user,
+            )
+            .await;
+            Ok::<(), std::convert::Infallible>(())
+        })
         .await;
 
         let shell = crate::shell_detect::detect_shell(self.client, container_id, remote_user).await;
 
-        let probed_env = run_step_result(
-            &self.progress,
-            "Running userEnvProbe...",
-            async {
-                Ok::<_, std::convert::Infallible>(
-                    crate::env_cache::probe_and_cache_user_env(
-                        self.client,
-                        container_id,
-                        remote_user,
-                        self.probe_type(),
-                        &shell,
-                    )
-                    .await,
+        let probed_env = run_step_result(&self.progress, "Running userEnvProbe...", async {
+            Ok::<_, std::convert::Infallible>(
+                crate::env_cache::probe_and_cache_user_env(
+                    self.client,
+                    container_id,
+                    remote_user,
+                    self.probe_type(),
+                    &shell,
                 )
-            },
-        )
+                .await,
+            )
+        })
         .await
         .ok()
         .flatten();
@@ -277,23 +265,19 @@ impl<'a> EnsureUpContext<'a> {
         .await;
 
         let final_probed = if any_tool {
-            run_step_result(
-                &self.progress,
-                "Updating environment cache...",
-                async {
-                    Ok::<_, std::convert::Infallible>(
-                        crate::env_cache::probe_and_cache_user_env(
-                            self.client,
-                            container_id,
-                            remote_user,
-                            self.probe_type(),
-                            &shell,
-                        )
-                        .await
-                        .or(probed_env.clone()),
+            run_step_result(&self.progress, "Updating environment cache...", async {
+                Ok::<_, std::convert::Infallible>(
+                    crate::env_cache::probe_and_cache_user_env(
+                        self.client,
+                        container_id,
+                        remote_user,
+                        self.probe_type(),
+                        &shell,
                     )
-                },
-            )
+                    .await
+                    .or_else(|| probed_env.clone()),
+                )
+            })
             .await
             .ok()
             .flatten()
@@ -321,7 +305,10 @@ impl<'a> EnsureUpContext<'a> {
             .exec_command(
                 &container.id,
                 &ExecOptions {
-                    cmd: vec!["cat".to_string(), "/tmp/.cella/lifecycle_status.json".to_string()],
+                    cmd: vec![
+                        "cat".to_string(),
+                        "/tmp/.cella/lifecycle_status.json".to_string(),
+                    ],
                     user: Some(remote_user.to_string()),
                     env: None,
                     working_dir: None,
@@ -331,8 +318,10 @@ impl<'a> EnsureUpContext<'a> {
             && result.exit_code == 0
             && result.stdout.contains("\"failed\"")
         {
-            self.progress.warn("Previous background lifecycle phase failed.");
-            self.progress.hint("Run `cella logs --lifecycle` for details.");
+            self.progress
+                .warn("Previous background lifecycle phase failed.");
+            self.progress
+                .hint("Run `cella logs --lifecycle` for details.");
         }
 
         if capabilities.managed_agent {
@@ -359,12 +348,21 @@ impl<'a> EnsureUpContext<'a> {
             restart_agent_in_container(self.client, &container.id).await;
         }
 
-        let container_ip = self.client.get_container_ip(&container.id).await.unwrap_or(None);
+        let container_ip = self
+            .client
+            .get_container_ip(&container.id)
+            .await
+            .unwrap_or(None);
         self.hooks
-            .on_container_started(&container.id, self.config.container_name, container_ip.as_deref())
+            .on_container_started(
+                &container.id,
+                self.config.container_name,
+                container_ip.as_deref(),
+            )
             .await;
 
-        let (_probed_env, lifecycle_env) = self.prepare_container_env(&container.id, remote_user).await;
+        let (_probed_env, lifecycle_env) =
+            self.prepare_container_env(&container.id, remote_user).await;
 
         let metadata = container.labels.get("devcontainer.metadata");
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
@@ -428,8 +426,11 @@ impl<'a> EnsureUpContext<'a> {
             run_step_result(
                 &self.progress,
                 "Populating agent volume...",
-                self.client
-                    .ensure_agent_provisioned(version, &agent_arch, self.config.skip_checksum),
+                self.client.ensure_agent_provisioned(
+                    version,
+                    &agent_arch,
+                    self.config.skip_checksum,
+                ),
             )
             .await?;
             self.hooks.sync_agent_runtime(self.client).await;
@@ -445,9 +446,14 @@ impl<'a> EnsureUpContext<'a> {
 
         match start_result {
             Ok(()) => {
-                crate::container_setup::verify_container_running(self.client, &container.id).await?;
+                crate::container_setup::verify_container_running(self.client, &container.id)
+                    .await?;
 
-                let container_ip = self.client.get_container_ip(&container.id).await.unwrap_or(None);
+                let container_ip = self
+                    .client
+                    .get_container_ip(&container.id)
+                    .await
+                    .unwrap_or(None);
                 self.hooks
                     .on_container_started(
                         &container.id,
@@ -554,7 +560,10 @@ impl<'a> EnsureUpContext<'a> {
         }
 
         if let Some(rf) = resolved_features {
-            labels.insert("devcontainer.metadata".to_string(), rf.metadata_label.clone());
+            labels.insert(
+                "devcontainer.metadata".to_string(),
+                rf.metadata_label.clone(),
+            );
         } else if base_metadata.is_some() {
             labels.insert(
                 "devcontainer.metadata".to_string(),
@@ -693,7 +702,12 @@ impl<'a> EnsureUpContext<'a> {
         } else {
             "Starting container...".to_string()
         };
-        run_step_result(&self.progress, &label, self.client.start_container(container_id)).await?;
+        run_step_result(
+            &self.progress,
+            &label,
+            self.client.start_container(container_id),
+        )
+        .await?;
         crate::container_setup::verify_container_running(self.client, container_id).await?;
 
         if let Err(e) = self
@@ -704,9 +718,17 @@ impl<'a> EnsureUpContext<'a> {
             warn!("Failed to connect container to networks: {e}");
         }
 
-        let container_ip = self.client.get_container_ip(container_id).await.unwrap_or(None);
+        let container_ip = self
+            .client
+            .get_container_ip(container_id)
+            .await
+            .unwrap_or(None);
         self.hooks
-            .on_container_started(container_id, self.config.container_name, container_ip.as_deref())
+            .on_container_started(
+                container_id,
+                self.config.container_name,
+                container_ip.as_deref(),
+            )
             .await;
         Ok(())
     }
@@ -743,20 +765,16 @@ impl<'a> EnsureUpContext<'a> {
             warn!("Failed to update remote user UID: {e}");
         }
 
-        let _ = run_step_result(
-            &self.progress,
-            "Configuring environment...",
-            async {
-                crate::container_setup::inject_post_start(
-                    self.client,
-                    container_id,
-                    &env_fwd.post_start,
-                    remote_user,
-                )
-                .await;
-                Ok::<(), std::convert::Infallible>(())
-            },
-        )
+        let _ = run_step_result(&self.progress, "Configuring environment...", async {
+            crate::container_setup::inject_post_start(
+                self.client,
+                container_id,
+                &env_fwd.post_start,
+                remote_user,
+            )
+            .await;
+            Ok::<(), std::convert::Infallible>(())
+        })
         .await;
 
         crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
@@ -772,22 +790,18 @@ impl<'a> EnsureUpContext<'a> {
         }
 
         let shell = crate::shell_detect::detect_shell(self.client, container_id, remote_user).await;
-        let probed_env = run_step_result(
-            &self.progress,
-            "Running userEnvProbe...",
-            async {
-                Ok::<_, std::convert::Infallible>(
-                    crate::env_cache::probe_and_cache_user_env(
-                        self.client,
-                        container_id,
-                        remote_user,
-                        self.probe_type(),
-                        &shell,
-                    )
-                    .await,
+        let probed_env = run_step_result(&self.progress, "Running userEnvProbe...", async {
+            Ok::<_, std::convert::Infallible>(
+                crate::env_cache::probe_and_cache_user_env(
+                    self.client,
+                    container_id,
+                    remote_user,
+                    self.probe_type(),
+                    &shell,
                 )
-            },
-        )
+                .await,
+            )
+        })
         .await
         .ok()
         .flatten();
@@ -797,7 +811,11 @@ impl<'a> EnsureUpContext<'a> {
             .exec_command(
                 container_id,
                 &ExecOptions {
-                    cmd: vec!["sh".into(), "-c".into(), "chmod 1777 /tmp 2>/dev/null || true".into()],
+                    cmd: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "chmod 1777 /tmp 2>/dev/null || true".into(),
+                    ],
                     user: Some("root".to_string()),
                     env: None,
                     working_dir: None,
@@ -805,6 +823,29 @@ impl<'a> EnsureUpContext<'a> {
             )
             .await;
 
+        self.install_tools_and_probe_env(
+            container_id,
+            remote_user,
+            settings,
+            &shell,
+            probed_env,
+            remote_env,
+        )
+        .await
+    }
+
+    async fn install_tools_and_probe_env(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        settings: &cella_config::Settings,
+        shell: &str,
+        probed_env: Option<std::collections::HashMap<String, String>>,
+        remote_env: &[String],
+    ) -> (
+        Option<std::collections::HashMap<String, String>>,
+        Vec<String>,
+    ) {
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
@@ -826,23 +867,19 @@ impl<'a> EnsureUpContext<'a> {
         .await;
 
         let final_probed = if any_tool {
-            run_step_result(
-                &self.progress,
-                "Updating environment cache...",
-                async {
-                    Ok::<_, std::convert::Infallible>(
-                        crate::env_cache::probe_and_cache_user_env(
-                            self.client,
-                            container_id,
-                            remote_user,
-                            self.probe_type(),
-                            &shell,
-                        )
-                        .await
-                        .or(probed_env.clone()),
+            run_step_result(&self.progress, "Updating environment cache...", async {
+                Ok::<_, std::convert::Infallible>(
+                    crate::env_cache::probe_and_cache_user_env(
+                        self.client,
+                        container_id,
+                        remote_user,
+                        self.probe_type(),
+                        shell,
                     )
-                },
-            )
+                    .await
+                    .or_else(|| probed_env.clone()),
+                )
+            })
             .await
             .ok()
             .flatten()
@@ -858,7 +895,7 @@ impl<'a> EnsureUpContext<'a> {
         (final_probed, lifecycle_env)
     }
 
-    async fn resolve_image_config(
+    fn resolve_image_config(
         &self,
         img_name: &str,
         base_image_details: ImageDetails,
@@ -942,7 +979,10 @@ impl<'a> EnsureUpContext<'a> {
         }
     }
 
-    async fn create_and_start(&self, build_no_cache: bool) -> Result<CreateResult, Box<dyn std::error::Error>> {
+    async fn create_and_start(
+        &self,
+        build_no_cache: bool,
+    ) -> Result<CreateResult, Box<dyn std::error::Error>> {
         let config = self.config_json();
 
         if let Some(init_cmd) = config.get("initializeCommand") {
@@ -965,14 +1005,12 @@ impl<'a> EnsureUpContext<'a> {
             remote_user,
             env_fwd,
             mut create_opts,
-        } = self
-            .resolve_image_config(
-                &img_name,
-                base_image_details,
-                resolved_features.as_ref(),
-                &agent_arch,
-            )
-            .await;
+        } = self.resolve_image_config(
+            &img_name,
+            base_image_details,
+            resolved_features.as_ref(),
+            &agent_arch,
+        );
 
         let settings = cella_config::Settings::load(&self.config.resolved.workspace_root);
         self.apply_env_and_mounts(
@@ -986,9 +1024,10 @@ impl<'a> EnsureUpContext<'a> {
         .await?;
 
         let container_id = if self.progress.is_verbose() {
-            let step = self
-                .progress
-                .step(&format!("Creating container: {}...", self.config.container_name));
+            let step = self.progress.step(&format!(
+                "Creating container: {}...",
+                self.config.container_name
+            ));
             let result = self.client.create_container(&create_opts).await;
             match &result {
                 Ok(_) => step.finish(),
@@ -1107,6 +1146,11 @@ impl<'a> EnsureUpContext<'a> {
 }
 
 /// Run the full non-compose container-up pipeline.
+///
+/// # Errors
+///
+/// Returns `OrchestratorError` when the container cannot be created, started,
+/// or configured (e.g. image pull failure, host requirement violation).
 pub async fn ensure_up(
     client: &dyn ContainerBackend,
     config: &UpConfig<'_>,

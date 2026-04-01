@@ -1,31 +1,21 @@
-use std::path::PathBuf;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use cella_backend::{
-    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
-    LifecycleContext, MountConfig, agent_env_vars, container_labels, container_name,
-};
+use cella_backend::{ContainerBackend, ExecOptions, container_name};
 use cella_config::resolve::{self, ResolvedConfig};
 
 mod lifecycle;
 
-pub use lifecycle::{WaitForPhase, run_all_lifecycle_phases, run_lifecycle_phases_with_wait_for};
-use lifecycle::{check_and_run_content_update, run_lifecycle_entries, write_content_hash};
+pub use lifecycle::run_all_lifecycle_phases;
 
-use super::image::ensure_image;
-
-/// Start a dev container for the current workspace.
+/// Build and container-management flags for an `up` invocation.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)] // CLI arg structs naturally accumulate boolean flags
-pub struct UpArgs {
-    #[command(flatten)]
-    pub verbose: super::VerboseArgs,
-
+pub struct UpBuildArgs {
     /// Rebuild the container image before starting.
     #[arg(long)]
     pub(crate) rebuild: bool,
@@ -37,6 +27,16 @@ pub struct UpArgs {
     /// Remove existing container before starting.
     #[arg(long)]
     pub(crate) remove_existing_container: bool,
+}
+
+/// Start a dev container for the current workspace.
+#[derive(Args)]
+pub struct UpArgs {
+    #[command(flatten)]
+    pub verbose: super::VerboseArgs,
+
+    #[command(flatten)]
+    pub(crate) build: UpBuildArgs,
 
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
@@ -105,14 +105,6 @@ pub struct UpContext {
     network_rules: NetworkRulePolicy,
 }
 
-/// Resolved image configuration for container creation.
-struct ImageConfig {
-    image_env: Vec<String>,
-    remote_user: String,
-    env_fwd: cella_env::EnvForwarding,
-    create_opts: cella_orchestrator::config_map::CreateContainerOptions,
-}
-
 impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
@@ -121,7 +113,7 @@ impl UpContext {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
-        let remove_container = args.rebuild || args.remove_existing_container;
+        let remove_container = args.build.rebuild || args.build.remove_existing_container;
 
         // 1. Resolve config
         let resolved = progress
@@ -163,7 +155,7 @@ impl UpContext {
             progress,
             output: args.output.clone(),
             remove_container,
-            build_no_cache: args.build_no_cache,
+            build_no_cache: args.build.build_no_cache,
             skip_checksum: args.skip_checksum,
             extra_labels: std::collections::HashMap::new(),
             network_rules: if args.no_network_rules {
@@ -240,41 +232,8 @@ impl UpContext {
         &self.resolved.config
     }
 
-    pub(crate) fn config_name(&self) -> Option<&str> {
-        self.config().get("name").and_then(|v| v.as_str())
-    }
-
     pub(crate) fn workspace_folder(&self) -> Option<&str> {
         self.workspace_folder_from_config.as_deref()
-    }
-
-    pub(crate) fn workspace_folder_str(&self) -> &str {
-        self.workspace_folder_from_config
-            .as_deref()
-            .unwrap_or(&self.default_workspace_folder)
-    }
-
-    /// Build a `LifecycleContext` for running lifecycle phases in this container.
-    fn build_lifecycle_ctx<'a>(
-        &'a self,
-        container_id: &'a str,
-        user: &'a str,
-        env: &'a [String],
-    ) -> LifecycleContext<'a> {
-        let progress_ref = self.progress.clone();
-        LifecycleContext {
-            client: &*self.client,
-            container_id,
-            user: Some(user),
-            env,
-            working_dir: self.workspace_folder(),
-            is_text: self.progress.is_enabled(),
-            on_output: if self.progress.is_enabled() {
-                Some(Box::new(move |line| progress_ref.println(line)))
-            } else {
-                None
-            },
-        }
     }
 
     pub(crate) fn probe_type(&self) -> &str {
@@ -282,590 +241,6 @@ impl UpContext {
             .get("userEnvProbe")
             .and_then(|v| v.as_str())
             .unwrap_or("loginInteractiveShell")
-    }
-
-    /// Resolve `remote_user` from an existing container's labels and image metadata.
-    ///
-    /// Priority: `remoteUser` (config) > `containerUser` (config) > `remoteUser` (image metadata)
-    ///         > `containerUser` (image metadata) > image USER > label fallback > `"root"`
-    async fn resolve_remote_user_from_container(&self, container: &ContainerInfo) -> String {
-        let config = self.config();
-        if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
-            return u.to_string();
-        }
-        if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
-            return u.to_string();
-        }
-        // Check image metadata from stored container label
-        let meta_user = container
-            .labels
-            .get("devcontainer.metadata")
-            .map(|m| cella_features::parse_image_metadata(m).1);
-        if let Some(u) = meta_user.as_ref().and_then(|m| m.remote_user.as_deref()) {
-            return u.to_string();
-        }
-        if let Some(u) = meta_user.as_ref().and_then(|m| m.container_user.as_deref()) {
-            return u.to_string();
-        }
-        if let Some(ref img) = container.image {
-            return self
-                .client
-                .inspect_image_user(img)
-                .await
-                .unwrap_or_else(|_| "root".to_string());
-        }
-        container
-            .labels
-            .get("dev.cella.remote_user")
-            .cloned()
-            .unwrap_or_else(|| "root".to_string())
-    }
-
-    /// Detect the container architecture from the backend runtime.
-    async fn detect_arch(&self) -> String {
-        self.client
-            .detect_container_arch()
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Container arch detection failed, defaulting to x86_64: {e}");
-                "x86_64".to_string()
-            })
-    }
-
-    /// Run the env forwarding + userEnvProbe + tool auth/install sequence
-    /// that is shared between the running and stopped-restart paths.
-    async fn prepare_container_env(
-        &self,
-        container_id: &str,
-        remote_user: &str,
-    ) -> (
-        Option<std::collections::HashMap<String, String>>,
-        Vec<String>,
-    ) {
-        let config = self.config();
-
-        // Re-inject env forwarding (git config + SSH files may have changed)
-        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
-        self.progress
-            .run_step(
-                "Configuring environment...",
-                inject_post_start(
-                    self.client.as_ref(),
-                    container_id,
-                    &env_fwd.post_start,
-                    remote_user,
-                ),
-            )
-            .await;
-
-        // Detect user's shell for probing (use their actual shell, not /bin/sh)
-        let shell =
-            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
-                .await;
-
-        // Probe user environment first so tool installs can use feature-provided PATH
-        // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
-        let probed_env = self
-            .progress
-            .run_step(
-                "Running userEnvProbe...",
-                super::env_cache::probe_and_cache_user_env(
-                    self.client.as_ref(),
-                    container_id,
-                    remote_user,
-                    self.probe_type(),
-                    &shell,
-                ),
-            )
-            .await;
-
-        // Sequential prerequisites + tool installation
-        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        if settings.tools.claude_code.forward_config {
-            create_claude_home_symlink(self.client.as_ref(), container_id, remote_user).await;
-            setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
-        }
-
-        let any_tool = settings.tools.claude_code.enabled
-            || settings.tools.codex.enabled
-            || settings.tools.gemini.enabled;
-        self.install_tools(container_id, remote_user, &settings, probed_env.as_ref())
-            .await;
-
-        // Re-probe after tool installation to capture PATH changes
-        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
-        let final_probed = if any_tool {
-            self.progress
-                .run_step(
-                    "Updating environment cache...",
-                    super::env_cache::probe_and_cache_user_env(
-                        self.client.as_ref(),
-                        container_id,
-                        remote_user,
-                        self.probe_type(),
-                        &shell,
-                    ),
-                )
-                .await
-                .or(probed_env)
-        } else {
-            probed_env
-        };
-
-        let lifecycle_env = final_probed.as_ref().map_or_else(
-            || self.remote_env.clone(),
-            |probed| cella_env::user_env_probe::merge_env(probed, &self.remote_env),
-        );
-
-        (final_probed, lifecycle_env)
-    }
-
-    /// Handle an already-running container (no rebuild requested, no `--build-no-cache`).
-    async fn handle_running(
-        &self,
-        container: &ContainerInfo,
-        remote_user: &str,
-    ) -> Result<UpResult, Box<dyn std::error::Error>> {
-        let capabilities = self.client.capabilities();
-        super::ensure_cella_daemon().await;
-
-        // Check for previous background lifecycle failure
-        if let Ok(result) = self
-            .client
-            .exec_command(
-                &container.id,
-                &ExecOptions {
-                    cmd: vec![
-                        "cat".to_string(),
-                        "/tmp/.cella/lifecycle_status.json".to_string(),
-                    ],
-                    user: Some(remote_user.to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await
-            && result.exit_code == 0
-            && result.stdout.contains("\"failed\"")
-        {
-            self.progress
-                .warn("Previous background lifecycle phase failed.");
-            self.progress
-                .hint("Run `cella logs --lifecycle` for details.");
-        }
-
-        // Always update .daemon_addr (daemon may have restarted)
-        if capabilities.managed_agent {
-            write_daemon_addr_to_volume(self.client.as_ref()).await;
-        }
-
-        // Version-aware agent restart: if the container was created with a
-        // different cella version, repopulate the volume and restart the agent.
-        let container_version = container
-            .labels
-            .get("dev.cella.version")
-            .map_or("unknown", String::as_str);
-        let current_version = env!("CARGO_PKG_VERSION");
-        if capabilities.managed_agent && container_version != current_version {
-            info!(
-                "Version change detected ({container_version} -> {current_version}), updating agent"
-            );
-            let agent_arch = self.detect_arch().await;
-            if let Err(e) = self
-                .client
-                .ensure_agent_provisioned(current_version, &agent_arch, self.skip_checksum)
-                .await
-            {
-                warn!("Failed to repopulate agent volume: {e}");
-            }
-            self.register_with_daemon(&container.id).await;
-            restart_agent_in_container(self.client.as_ref(), &container.id).await;
-        }
-
-        let (_probed_env, lifecycle_env) =
-            self.prepare_container_env(&container.id, remote_user).await;
-
-        let metadata = container.labels.get("devcontainer.metadata");
-
-        // Check for workspace content changes (updateContentCommand)
-        let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-        check_and_run_content_update(
-            &lc_ctx_content,
-            self.config(),
-            metadata.map(String::as_str),
-            &self.resolved.workspace_root,
-            &self.progress,
-        )
-        .await?;
-
-        // Already running -- run postAttachCommand from metadata (includes features)
-        let entries = lifecycle_entries_for_phase(
-            metadata.map(String::as_str),
-            self.config(),
-            "postAttachCommand",
-        );
-        let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
-
-        Ok(UpResult {
-            container_id: container.id.clone(),
-            remote_user: remote_user.to_string(),
-            outcome: "running".to_string(),
-            workspace_folder: self.workspace_folder_str().to_string(),
-        })
-    }
-
-    /// Handle a stopped container: try to restart it.
-    ///
-    /// Returns `Ok(Some(result))` if the container was successfully restarted,
-    /// `Ok(None)` if restart failed and the container was removed (caller should
-    /// fall through to the create path).
-    async fn handle_stopped(
-        &self,
-        container: &ContainerInfo,
-        remote_user: &str,
-    ) -> Result<Option<UpResult>, Box<dyn std::error::Error>> {
-        let capabilities = self.client.capabilities();
-        super::ensure_cella_daemon().await;
-
-        // Warn if config has changed
-        if let Some(old_hash) = &container.config_hash
-            && *old_hash != self.resolved.config_hash
-        {
-            self.progress
-                .warn("Config has changed since this container was created.");
-            self.progress
-                .hint("Run `cella up --rebuild` to recreate with the updated config.");
-        }
-
-        // Warn if Docker runtime has changed
-        let current_runtime = cella_env::platform::detect_runtime();
-        if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime") {
-            let current_label = current_runtime.as_label();
-            if old_runtime != current_label {
-                self.progress.warn(&format!(
-                    "Docker runtime changed ({old_runtime} \u{2192} {current_label})."
-                ));
-                self.progress
-                    .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
-            }
-        }
-
-        // Repopulate agent volume before starting (may have been updated since
-        // the container was created, and the old versioned binary path in CMD
-        // would fail if the volume was repopulated by another `cella up`).
-        if capabilities.managed_agent {
-            let agent_arch = self.detect_arch().await;
-            let version = env!("CARGO_PKG_VERSION");
-            self.progress
-                .run_step(
-                    "Populating agent volume...",
-                    self.client
-                        .ensure_agent_provisioned(version, &agent_arch, self.skip_checksum),
-                )
-                .await?;
-
-            // Write .daemon_addr so the agent can discover the current daemon
-            write_daemon_addr_to_volume(self.client.as_ref()).await;
-        }
-
-        // Attempt to start directly -- let Docker validate mounts
-        let step = self.progress.step("Starting container...");
-        let start_result = self.client.start_container(&container.id).await;
-        if start_result.is_ok() {
-            step.finish();
-        } else {
-            step.fail("failed to start");
-        }
-
-        match start_result {
-            Ok(()) => {
-                verify_container_running(self.client.as_ref(), &container.id).await?;
-
-                // Register with daemon (missing from the original code —
-                // without this the daemon rejects the agent with "unknown container")
-                self.register_with_daemon(&container.id).await;
-
-                // Kill + restart agent so it picks up the new binary and
-                // daemon address from the updated .daemon_addr file
-                if capabilities.managed_agent {
-                    restart_agent_in_container(self.client.as_ref(), &container.id).await;
-                }
-
-                let (_probed_env, lifecycle_env) =
-                    self.prepare_container_env(&container.id, remote_user).await;
-
-                // Run lifecycle from metadata label (includes features)
-                let metadata = container.labels.get("devcontainer.metadata");
-                let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-                for phase in ["postStartCommand", "postAttachCommand"] {
-                    let entries = lifecycle_entries_for_phase(
-                        metadata.map(String::as_str),
-                        self.config(),
-                        phase,
-                    );
-                    run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
-                }
-
-                // Prune old agent versions from the volume (non-fatal)
-                if capabilities.managed_agent {
-                    let prune_version = env!("CARGO_PKG_VERSION");
-                    if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
-                        debug!("Agent version pruning failed: {e}");
-                    }
-                }
-
-                Ok(Some(UpResult {
-                    container_id: container.id.clone(),
-                    remote_user: remote_user.to_string(),
-                    outcome: "started".to_string(),
-                    workspace_folder: self.workspace_folder_str().to_string(),
-                }))
-            }
-            Err(e) => {
-                warn!("Failed to start existing container: {e}");
-                self.progress
-                    .warn(&format!("Could not start existing container: {e}"));
-                self.progress.hint("Recreating container...");
-                let _ = self.client.remove_container(&container.id, false).await;
-                // Fall through to creation path
-                Ok(None)
-            }
-        }
-    }
-
-    /// Deregister, stop, and remove an existing container.
-    async fn remove_existing(
-        &self,
-        container: &ContainerInfo,
-        reason: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Deregister from daemon before stopping (like down.rs)
-        if container.state == ContainerState::Running {
-            if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
-                && mgmt_sock.exists()
-            {
-                let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
-                    container_name: self.container_nm.clone(),
-                };
-                let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
-            }
-            info!("Stopping container for {reason}...");
-            self.client.stop_container(&container.id).await?;
-        }
-        self.client.remove_container(&container.id, false).await?;
-        Ok(())
-    }
-
-    /// Build container labels from resolved config, features, and image metadata.
-    fn build_labels(
-        &self,
-        resolved_features: Option<&cella_features::ResolvedFeatures>,
-        base_metadata: Option<&str>,
-        env_fwd: &cella_env::EnvForwarding,
-        remote_user: &str,
-    ) -> std::collections::HashMap<String, String> {
-        let config = self.config();
-        let docker_runtime = cella_env::platform::detect_runtime();
-        let mut labels = container_labels(
-            &self.resolved.workspace_root,
-            &self.resolved.config_path,
-            &self.resolved.config_hash,
-            docker_runtime.as_label(),
-        );
-
-        labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
-        labels.insert(
-            "dev.cella.version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        );
-        labels.insert(
-            "dev.cella.workspace_folder".to_string(),
-            self.workspace_folder_str().to_string(),
-        );
-
-        let mut label_remote_env = self.remote_env.clone();
-        for e in &env_fwd.env {
-            label_remote_env.push(format!("{}={}", e.key, e.value));
-        }
-        if !label_remote_env.is_empty() {
-            labels.insert(
-                "dev.cella.remote_env".to_string(),
-                serde_json::to_string(&label_remote_env).unwrap_or_default(),
-            );
-        }
-
-        if let Some(rf) = resolved_features {
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                rf.metadata_label.clone(),
-            );
-        } else if base_metadata.is_some() {
-            labels.insert(
-                "devcontainer.metadata".to_string(),
-                cella_features::generate_metadata_label(&[], config, base_metadata),
-            );
-        }
-
-        let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
-        let other_ports_attrs =
-            cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
-        labels.insert(
-            "dev.cella.ports_attributes".to_string(),
-            cella_orchestrator::config_map::ports::serialize_ports_attributes_label(
-                &ports_attrs,
-                other_ports_attrs.as_ref(),
-            ),
-        );
-
-        if let Some(action) = config.get("shutdownAction").and_then(|v| v.as_str()) {
-            labels.insert("dev.cella.shutdown_action".to_string(), action.to_string());
-        }
-
-        // Merge extra labels (e.g., worktree labels from `cella branch`)
-        labels.extend(self.extra_labels.clone());
-
-        labels
-    }
-
-    /// Merge forwarding mounts, env vars, daemon env, and agent volume into create options.
-    ///
-    /// Tool config mounts (Claude Code, Codex, Gemini) are added via [`add_tool_config_mounts`].
-    async fn apply_env_and_mounts(
-        &self,
-        create_opts: &mut cella_backend::CreateContainerOptions,
-        env_fwd: &cella_env::EnvForwarding,
-        image_env: &[String],
-        remote_user: &str,
-        settings: &cella_config::Settings,
-        agent_arch: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let capabilities = self.client.capabilities();
-        // Forwarding mounts
-        for m in &env_fwd.mounts {
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: m.source.clone(),
-                target: m.target.clone(),
-                consistency: None,
-            });
-        }
-
-        add_tool_config_mounts(create_opts, settings, remote_user);
-
-        // Forwarding env vars
-        if !env_fwd.env.is_empty() {
-            let fwd_env: Vec<String> = env_fwd
-                .env
-                .iter()
-                .map(|e| format!("{}={}", e.key, e.value))
-                .collect();
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(fwd_env);
-        }
-
-        // Daemon control port + token env vars
-        let daemon_env = query_daemon_env(&self.container_nm, self.client.host_gateway()).await;
-        if !daemon_env.is_empty() {
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(daemon_env);
-        }
-
-        // Agent volume mount and env vars
-        if capabilities.managed_agent {
-            let version = env!("CARGO_PKG_VERSION");
-            let agent_step = self.progress.step("Populating agent volume...");
-            match self
-                .client
-                .ensure_agent_provisioned(version, agent_arch, self.skip_checksum)
-                .await
-            {
-                Ok(()) => agent_step.finish(),
-                Err(e @ BackendError::AgentChecksumMismatch { .. }) => {
-                    agent_step.fail("checksum mismatch");
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    agent_step.fail("failed");
-                    warn!("Failed to populate agent volume: {e}");
-                    self.progress
-                        .warn("Port forwarding and BROWSER interception will not work.");
-                    self.progress
-                        .hint(&format!("Agent volume population failed: {e}"));
-                }
-            }
-
-            // Write .daemon_addr to volume so agents can discover the daemon
-            write_daemon_addr_to_volume(self.client.as_ref()).await;
-
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
-            }
-            create_opts.env.extend(agent_env_vars());
-        } else {
-            self.progress.warn(
-                "Selected backend does not support managed agent provisioning; port forwarding and BROWSER interception are disabled.",
-            );
-        }
-
-        // If the workspace is a linked git worktree, mount the parent repo's
-        // .git directory at the same host path so gitdir references resolve.
-        if let Some(parent_git) = cella_git::parent_git_dir(&self.resolved.workspace_root) {
-            let canonical = parent_git
-                .canonicalize()
-                .unwrap_or_else(|_| parent_git.clone());
-            let path_str = canonical.to_string_lossy().to_string();
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: path_str.clone(),
-                target: path_str,
-                consistency: None,
-            });
-        }
-
-        let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
-        if capabilities.managed_agent && !vol_name.is_empty() {
-            create_opts.mounts.push(MountConfig {
-                mount_type: "volume".to_string(),
-                source: vol_name,
-                target: vol_target,
-                consistency: None,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Start the container, connect networks, and register with the daemon.
-    async fn start_and_register(
-        &self,
-        container_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let start_label = if self.progress.is_verbose() {
-            let short_id = &container_id[..12.min(container_id.len())];
-            format!("Starting container: {short_id}...")
-        } else {
-            "Starting container...".to_string()
-        };
-        self.progress
-            .run_step(&start_label, self.client.start_container(container_id))
-            .await?;
-        verify_container_running(self.client.as_ref(), container_id).await?;
-
-        if let Err(e) = self
-            .client
-            .ensure_container_network(container_id, &self.resolved.workspace_root)
-            .await
-        {
-            warn!("Failed to connect container to networks: {e}");
-        }
-
-        self.register_with_daemon(container_id).await;
-        Ok(())
     }
 
     /// Register the container with the daemon for port management.
@@ -1082,216 +457,6 @@ impl UpContext {
         drop(sender);
         let _ = renderer.await;
     }
-
-    /// Resolve image metadata, environment forwarding, and container creation options.
-    async fn resolve_image_config(
-        &self,
-        config: &serde_json::Value,
-        img_name: &str,
-        base_image_details: ImageDetails,
-        resolved_features: Option<&cella_features::ResolvedFeatures>,
-        agent_arch: &str,
-    ) -> ImageConfig {
-        let image_env = base_image_details.env;
-        let image_meta_user = base_image_details
-            .metadata
-            .as_deref()
-            .map(|m| cella_features::parse_image_metadata(m).1);
-        let remote_user =
-            resolve_remote_user(config, image_meta_user.as_ref(), &base_image_details.user);
-
-        super::ensure_cella_daemon().await;
-
-        // Build network proxy forwarding config from settings + devcontainer.json.
-        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        let toml_net = settings.network.to_network_config();
-        let toml_mode_override = settings.network.mode_override();
-
-        // Extract customizations.cella.network from devcontainer.json.
-        let dc_net = config
-            .get("customizations")
-            .and_then(|c| c.get("cella"))
-            .and_then(|c| c.get("network"))
-            .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
-
-        // Merge: devcontainer.json is base, cella.toml overrides (only when explicit).
-        let merged = cella_network::merge_network_configs(
-            dc_net.as_ref(),
-            Some(&toml_net),
-            toml_mode_override,
-        );
-        let net_config = cella_network::NetworkConfig {
-            mode: merged.mode,
-            proxy: merged.proxy,
-            rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
-        };
-
-        let skip_rules = self.network_rules == NetworkRulePolicy::Skip;
-        let has_rules = net_config.has_rules() && !skip_rules;
-        if skip_rules && net_config.has_rules() {
-            tracing::info!("Network blocking rules disabled via --no-network-rules");
-        }
-        let proxy_fwd = cella_env::ProxyForwardingConfig {
-            proxy: net_config.proxy.clone(),
-            has_blocking_rules: has_rules,
-            full_config: if has_rules { Some(net_config) } else { None },
-            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-        };
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
-
-        let labels = self.build_labels(
-            resolved_features,
-            base_image_details.metadata.as_deref(),
-            &env_fwd,
-            &remote_user,
-        );
-
-        let feature_config = resolved_features.map(|r| &r.container_config);
-        let image_meta_config = if feature_config.is_none() {
-            base_image_details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).0)
-        } else {
-            None
-        };
-        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
-
-        let create_opts = cella_orchestrator::config_map::map_config(
-            cella_orchestrator::config_map::MapConfigParams {
-                config,
-                container_name: &self.container_nm,
-                image_name: img_name,
-                labels,
-                workspace_root: &self.resolved.workspace_root,
-                feature_config: effective_feature_config,
-                image_env: &image_env,
-                agent_arch,
-            },
-        );
-
-        ImageConfig {
-            image_env,
-            remote_user,
-            env_fwd,
-            create_opts,
-        }
-    }
-
-    /// The full build/create/start/lifecycle path for a new container.
-    ///
-    /// Returns the container ID and remote user on success.
-    pub async fn create_and_start(
-        &self,
-        build_no_cache: bool,
-    ) -> Result<CreateResult, Box<dyn std::error::Error>> {
-        let config = self.config();
-        // Run initializeCommand on host (runs every invocation per spec)
-        if let Some(init_cmd) = config.get("initializeCommand") {
-            run_host_command("initializeCommand", init_cmd)?;
-        }
-
-        // Ensure image (with optional features layer)
-        let (img_name, resolved_features, base_image_details) = ensure_image(
-            self.client.as_ref(),
-            config,
-            &self.resolved.workspace_root,
-            self.config_name(),
-            &self.resolved.config_path,
-            build_no_cache,
-            &self.progress,
-        )
-        .await?;
-        let agent_arch = self.detect_arch().await;
-        let ImageConfig {
-            image_env,
-            remote_user,
-            env_fwd,
-            mut create_opts,
-        } = self
-            .resolve_image_config(
-                config,
-                &img_name,
-                base_image_details,
-                resolved_features.as_ref(),
-                &agent_arch,
-            )
-            .await;
-
-        let settings = cella_config::Settings::load(&self.resolved.workspace_root);
-        self.apply_env_and_mounts(
-            &mut create_opts,
-            &env_fwd,
-            &image_env,
-            &remote_user,
-            &settings,
-            &agent_arch,
-        )
-        .await?;
-
-        // Create and start container
-        let container_id = if self.progress.is_verbose() {
-            let step = self
-                .progress
-                .step(&format!("Creating container: {}...", self.container_nm));
-            let result = self.client.create_container(&create_opts).await;
-            match &result {
-                Ok(_) => step.finish(),
-                Err(e) => step.fail(&e.to_string()),
-            }
-            result?
-        } else {
-            self.progress
-                .run_step(
-                    "Creating container...",
-                    self.client.create_container(&create_opts),
-                )
-                .await?
-        };
-
-        self.start_and_register(&container_id).await?;
-
-        // Post-create setup (UID, env, credentials, Claude Code, userEnvProbe)
-        let (_probed_env, lifecycle_env) = self
-            .post_create_setup(
-                &container_id,
-                &remote_user,
-                &env_fwd,
-                &settings,
-                &create_opts.remote_env,
-            )
-            .await;
-
-        // Lifecycle commands (first create)
-        let lc_ctx = self.build_lifecycle_ctx(&container_id, &remote_user, &lifecycle_env);
-        run_lifecycle_phases_with_wait_for(
-            &lc_ctx,
-            config,
-            resolved_features.as_ref(),
-            &self.progress,
-            WaitForPhase::from_config(config),
-        )
-        .await?;
-
-        write_content_hash(
-            self.client.as_ref(),
-            &container_id,
-            &remote_user,
-            &self.resolved.workspace_root,
-        )
-        .await;
-
-        Ok(CreateResult {
-            container_id: container_id.clone(),
-            remote_user: remote_user.clone(),
-        })
-    }
-}
-
-/// Result of creating and starting a container.
-pub struct CreateResult {
-    pub container_id: String,
-    pub remote_user: String,
 }
 
 /// Result of ensuring a container is up and ready.
@@ -1392,9 +557,8 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 return;
             }
 
-            let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
-                container_name,
-            };
+            let req =
+                cella_port::protocol::ManagementRequest::DeregisterContainer { container_name };
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
     }
@@ -1492,8 +656,8 @@ impl UpArgs {
             backend,
         )
         .await?;
-        ctx.remove_container = self.rebuild || self.remove_existing_container;
-        ctx.build_no_cache = self.build_no_cache;
+        ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
+        ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
         ctx.network_rules = if self.no_network_rules {
             NetworkRulePolicy::Skip
@@ -1501,7 +665,9 @@ impl UpArgs {
             NetworkRulePolicy::Enforce
         };
 
-        let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
+        let result = ctx
+            .ensure_up(self.build.build_no_cache, &self.strict)
+            .await?;
         output_result(
             &ctx.output,
             &result.outcome,
@@ -1528,7 +694,9 @@ impl UpArgs {
             return super::compose_up::compose_up(ctx).await;
         }
 
-        let result = ctx.ensure_up(self.build_no_cache, &self.strict).await?;
+        let result = ctx
+            .ensure_up(self.build.build_no_cache, &self.strict)
+            .await?;
         output_result(
             &ctx.output,
             &result.outcome,
@@ -1550,15 +718,6 @@ pub fn resolve_remote_user(
     fallback: &str,
 ) -> String {
     cella_orchestrator::container_setup::resolve_remote_user(config, image_meta_user, fallback)
-}
-
-/// Build lifecycle entries for a phase — delegates to orchestrator.
-fn lifecycle_entries_for_phase(
-    metadata: Option<&str>,
-    config: &serde_json::Value,
-    phase: &str,
-) -> Vec<cella_features::LifecycleEntry> {
-    cella_orchestrator::lifecycle::lifecycle_entries_for_phase(metadata, config, phase)
 }
 
 pub fn run_host_command(
@@ -1657,17 +816,6 @@ async fn inject_cella_path(client: &dyn ContainerBackend, container_id: &str, re
     cella_orchestrator::container_setup::inject_cella_path(client, container_id, remote_user).await;
 }
 
-// ── Tool config mounts ─────────────────────────────────────────────────────
-
-/// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
-fn add_tool_config_mounts(
-    create_opts: &mut cella_backend::CreateContainerOptions,
-    settings: &cella_config::Settings,
-    remote_user: &str,
-) {
-    cella_orchestrator::tool_install::add_tool_config_mounts(create_opts, settings, remote_user);
-}
-
 // ── Shared container-operation helpers (delegated to orchestrator) ─────────
 
 /// Seed gh CLI credentials into a container.
@@ -1740,35 +888,6 @@ async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
     let addr = format!("{gateway}:{control_port}");
     if let Err(e) = client.write_agent_addr("", &addr, &control_token).await {
         warn!("Failed to write .daemon_addr to agent volume: {e}");
-    }
-}
-
-/// Kill the running cella-agent and restart it using the stable symlink.
-///
-/// Used after volume repopulation or daemon restart to ensure the agent
-/// connects to the current daemon with the latest binary.
-async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
-    let agent_path = "/cella/bin/cella-agent";
-    let script = format!(
-        "pkill -f 'cella-agent daemon' 2>/dev/null; \
-         \"{agent_path}\" daemon \
-         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
-    );
-
-    match client
-        .exec_detached(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), script],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-    {
-        Ok(_) => info!("Agent restarted in container {container_id}"),
-        Err(e) => warn!("Failed to restart agent in container: {e}"),
     }
 }
 

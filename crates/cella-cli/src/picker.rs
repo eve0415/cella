@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::io::IsTerminal;
 
-use cella_backend::{BackendKind, ContainerInfo, ContainerState};
+use cella_backend::{ContainerInfo, ContainerState};
 use cella_git::WorktreeInfo;
 use owo_colors::OwoColorize;
 
@@ -375,6 +375,7 @@ pub const fn has_explicit_target(target: &cella_backend::ContainerTarget) -> boo
 mod tests {
     use std::collections::HashMap;
 
+    use cella_backend::BackendKind;
     use cella_git::WorktreeInfo;
 
     use super::*;

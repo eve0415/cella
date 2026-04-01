@@ -81,5 +81,4 @@ pub struct PruneConfig {
 
     /// Dry-run mode (report what would be pruned without doing it).
     pub dry_run: bool,
-
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use clap::Args;
 use serde_json::json;
 
-use cella_backend::{BackendKind, ContainerInfo, ContainerState, PortBinding};
+use cella_backend::{ContainerInfo, ContainerState};
 use cella_compose::discovery;
 
 /// List all dev containers managed by cella.
@@ -219,6 +219,8 @@ fn print_json(containers: &[ContainerInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use cella_backend::{BackendKind, PortBinding};
+
     use super::*;
 
     #[test]

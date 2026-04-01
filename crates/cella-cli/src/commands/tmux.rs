@@ -43,7 +43,7 @@ impl TmuxArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (build_no_cache, force) = (self.up.build_no_cache, self.force);
+        let (build_no_cache, force) = (self.up.build.build_no_cache, self.force);
         let (strict, output_format) = (self.up.strict.clone(), self.up.output.clone());
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;

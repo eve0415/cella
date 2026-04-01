@@ -56,7 +56,7 @@ impl CodeArgs {
         debug!("Resolved editor binary: {}", editor.display());
 
         // 3. Ensure container is up
-        let build_no_cache = self.up.build_no_cache;
+        let build_no_cache = self.up.build.build_no_cache;
         let strict = self.up.strict.clone();
         let output_format = self.up.output.clone();
         let mut up = self.up;

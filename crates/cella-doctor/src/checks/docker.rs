@@ -5,6 +5,11 @@ use cella_backend::BackendKind;
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 
 /// Run Docker-related diagnostics.
+///
+/// # Panics
+///
+/// Panics if `ctx.backend_kind` is `None` after matching `Some(_)`.
+/// This is unreachable in practice.
 pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
     if matches!(
         ctx.backend_kind,

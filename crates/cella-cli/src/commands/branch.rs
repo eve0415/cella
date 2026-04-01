@@ -44,15 +44,14 @@ impl BranchArgs {
 
         // 2. Create git worktree via orchestrator
         let (sender, renderer) = crate::progress::bridge(&progress);
-        let wt_path =
-            cella_orchestrator::branch::create_worktree(
-                repo_root,
-                &self.name,
-                self.base.as_deref(),
-                None,
-                &sender,
-            )
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let wt_path = cella_orchestrator::branch::create_worktree(
+            repo_root,
+            &self.name,
+            self.base.as_deref(),
+            None,
+            &sender,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
         drop(sender);
         let _ = renderer.await;
 
