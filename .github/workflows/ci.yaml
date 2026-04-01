@@ -175,7 +175,7 @@ jobs:
           rm container.pkg
 
       - name: Start container service
-        run: container system start
+        run: yes | container system start
 
       - name: Verify container CLI
         run: container version
