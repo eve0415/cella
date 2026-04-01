@@ -3,3 +3,4 @@
 
 pub mod jsonc_edit;
 pub mod prompts;
+pub mod resolve;
