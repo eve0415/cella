@@ -11,9 +11,10 @@ use cella_templates::cache::TemplateCache;
 use cella_templates::collection::{self, DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMPLATE_COLLECTION};
 use cella_templates::fetcher;
 use cella_templates::types::{
-    FeatureSummary, OutputFormat, SelectedFeature, TemplateMetadata, TemplateOption,
-    TemplateSummary,
+    FeatureSummary, OutputFormat, SelectedFeature, TemplateMetadata, TemplateSummary,
 };
+
+use crate::commands::features::prompts::{prompt_feature_options, prompt_single_option};
 
 use super::InitArgs;
 use super::summary;
@@ -128,6 +129,7 @@ pub async fn run(args: InitArgs, _progress: Progress) -> Result<(), Box<dyn std:
 }
 
 /// Launch `cella up`, replacing the current process on Unix.
+#[expect(clippy::needless_return)]
 fn exec_cella_up() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new("cella");
     cmd.arg("up");
@@ -251,58 +253,6 @@ fn prompt_optional_paths(
     Ok(excluded)
 }
 
-/// Prompt for a single option value.
-fn prompt_single_option(
-    key: &str,
-    opt: &TemplateOption,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let description = opt.description.as_deref().unwrap_or(key);
-
-    match opt.option_type.as_str() {
-        "boolean" => {
-            let default = opt.default.as_bool().unwrap_or(false);
-            let value = Confirm::new(description).with_default(default).prompt()?;
-            Ok(serde_json::json!(value))
-        }
-        _ => {
-            if let Some(enum_values) = &opt.enum_values {
-                // Strict enum: must pick from list
-                let default_str = opt.default.as_str().unwrap_or("");
-                let default_idx = enum_values
-                    .iter()
-                    .position(|v| v == default_str)
-                    .unwrap_or(0);
-                let selection = Select::new(description, enum_values.clone())
-                    .with_starting_cursor(default_idx)
-                    .prompt()?;
-                Ok(serde_json::json!(selection))
-            } else if let Some(proposals) = &opt.proposals {
-                // Proposals: suggest values but allow custom
-                let mut choices = proposals.clone();
-                choices.push("(custom)".to_owned());
-                let default_str = opt.default.as_str().unwrap_or("");
-                let default_idx = choices.iter().position(|v| v == default_str).unwrap_or(0);
-                let selection = Select::new(description, choices)
-                    .with_starting_cursor(default_idx)
-                    .prompt()?;
-                if selection == "(custom)" {
-                    let custom = Text::new(&format!("{description} (custom value):"))
-                        .with_default(default_str)
-                        .prompt()?;
-                    Ok(serde_json::json!(custom))
-                } else {
-                    Ok(serde_json::json!(selection))
-                }
-            } else {
-                // Free-form text
-                let default_str = opt.default.as_str().unwrap_or("");
-                let value = Text::new(description).with_default(default_str).prompt()?;
-                Ok(serde_json::json!(value))
-            }
-        }
-    }
-}
-
 /// Feature selection loop: pick features one at a time, configure each.
 async fn prompt_feature_loop(
     cache: &TemplateCache,
@@ -379,34 +329,6 @@ async fn prompt_feature_loop(
     }
 
     Ok(selected)
-}
-
-/// Prompt for feature options from its metadata JSON.
-fn prompt_feature_options(
-    feature_id: &str,
-    meta: &serde_json::Value,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
-    let Some(options_obj) = meta.get("options").and_then(|o| o.as_object()) else {
-        return Ok(HashMap::new());
-    };
-
-    if options_obj.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    eprintln!("  Configure {feature_id} options:");
-
-    let mut resolved = HashMap::new();
-    for (key, opt_value) in options_obj {
-        let opt: TemplateOption = match serde_json::from_value(opt_value.clone()) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        let value = prompt_single_option(key, &opt)?;
-        resolved.insert(key.clone(), value);
-    }
-
-    Ok(resolved)
 }
 
 /// Prompt for output format.

@@ -11,6 +11,7 @@ mod doctor;
 mod down;
 mod env_cache;
 mod exec;
+pub mod features;
 pub mod image;
 mod init;
 mod list;
