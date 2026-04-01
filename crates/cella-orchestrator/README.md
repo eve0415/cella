@@ -6,13 +6,13 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-orchestrator extracts the shared container management logic so that both the CLI (`cella`) and daemon (`cella-daemon`) can call the same Rust functions instead of the daemon shelling out to CLI subprocesses. It owns the full container-up pipeline (image resolution, lifecycle phase execution, feature installation), worktree-backed branch creation, and worktree pruning. All operations report progress through a channel-based `ProgressSender` that consumers render however they choose -- indicatif spinners in the CLI, serialized messages in the daemon.
+cella-orchestrator extracts the shared container management logic so that both the CLI (`cella`) and daemon (`cella-daemon`) can call the same Rust functions instead of the daemon shelling out to CLI subprocesses. It owns the non-compose container-up pipeline, image resolution, lifecycle phase execution, tool installation, worktree-backed branch helpers, and worktree pruning helpers. All operations report progress through a channel-based `ProgressSender` that consumers render however they choose -- indicatif spinners in the CLI, serialized messages in the daemon.
 
 ## Architecture
 
 ### Key Types
 
-- `UpConfig` -- configuration for the full container-up pipeline (workspace root, image strategy, extra labels, Docker host override)
+- `UpConfig` -- borrowed configuration for the non-compose container-up pipeline (resolved config, image strategy, extra labels, host requirement policy, network rule policy)
 - `ImageStrategy` -- how the up pipeline handles the container image: `Cached`, `Rebuild`, or `RebuildNoCache`
 - `BranchConfig` -- configuration for creating a worktree-backed branch container (repo root, branch name, base ref, exec command)
 - `PruneConfig` -- configuration for pruning merged worktrees (repo root, dry-run mode)
@@ -21,7 +21,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 - `PruneResult` / `PrunedEntry` -- result of pruning with list of removed branches and errors
 - `ExecResult` -- result of executing a command in a container (exit code)
 - `WorktreeStatus` -- a worktree with its optional container status (branch, container name, state)
-- `OrchestratorError` -- error type with variants for Docker, git, config, container-exited, host-requirements, and other failures
+- `OrchestratorError` -- error type with variants for backend, git, config, container-exited, host-requirements, and other failures
 - `ProgressSender` -- channel-based progress reporter with `step()`, `phase()`, `warn()`, `hint()`, and `println()` methods
 - `ProgressEvent` -- enum of events (step started/completed/failed, phase started/completed, warnings, hints, output lines, errors)
 - `StepHandle` / `PhaseHandle` / `PhaseChildHandle` -- RAII handles that send completion or failure events on finish or drop
@@ -30,7 +30,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 
 | Module | Purpose |
 |--------|---------|
-| `config` | Input configuration types (`UpConfig`, `ImageStrategy`, `BranchConfig`, `PruneConfig`) |
+| `config` | Input configuration types (`UpConfig`, `ImageStrategy`, `HostRequirementPolicy`, `BranchConfig`, `PruneConfig`) |
 | `result` | Output types (`UpResult`, `BranchResult`, `PruneResult`, `ExecResult`, `WorktreeStatus`) |
 | `error` | `OrchestratorError` unified error type |
 | `progress` | Channel-based progress reporting (`ProgressSender`, `ProgressEvent`, handle types) |
@@ -42,7 +42,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-docker](../cella-docker), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network)
+**Depends on:** [cella-backend](../cella-backend), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network)
 
 **Depended on by:** [cella-cli](../cella-cli)
 

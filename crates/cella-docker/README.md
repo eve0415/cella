@@ -28,7 +28,7 @@ Implements the container lifecycle portions of the [Dev Container specification]
 ### Key Types
 
 - `DockerApi` — internal trait wrapping bollard Docker operations (not the extension point for new runtimes — see `ContainerBackend` in [cella-backend](../cella-backend))
-- `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend` and `ComposeBackend`
+- `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend`
 - `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend) and re-exported here
 - `ParsedLifecycle` — parsed lifecycle command (string, array, or map form)
 - `ContainerTarget` — resolved container identifier
