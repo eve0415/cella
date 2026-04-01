@@ -145,7 +145,9 @@ async fn prompt_template_selection(
             .collect();
         choices.push(SHOW_OTHER_REGISTRY.to_owned());
 
-        let selection = Select::new("Select a template:", choices).prompt()?;
+        let selection = Select::new("Select a template:", choices)
+            .with_page_size(15)
+            .prompt()?;
 
         if selection == SHOW_OTHER_REGISTRY {
             let registry = Text::new("Enter registry (e.g. ghcr.io/myorg/templates):").prompt()?;
@@ -272,7 +274,9 @@ async fn prompt_feature_loop(
             format!("{name}{desc}")
         }));
 
-        let selection = Select::new("Add a feature (or Done):", choices).prompt()?;
+        let selection = Select::new("Add a feature (or Done):", choices)
+            .with_page_size(15)
+            .prompt()?;
 
         if selection == DONE_ADDING_FEATURES {
             break;
