@@ -175,7 +175,18 @@ jobs:
           rm container.pkg
 
       - name: Start container service
-        run: container system start --timeout 120 --enable-kernel-install
+        run: |
+          container system start --timeout 120 --enable-kernel-install
+          # Kernel installs async; wait for the version plugin to be available
+          for i in $(seq 1 60); do
+            if container version --format json >/dev/null 2>&1; then
+              echo "Container service fully ready"
+              break
+            fi
+            echo "Waiting for container plugins... ($i/60)"
+            sleep 5
+          done
+          container version --format json
 
       - name: Pull test image
         run: container image pull alpine:3.21
