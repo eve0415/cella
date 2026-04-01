@@ -34,7 +34,10 @@ pub enum FeatureEdit {
 /// # Errors
 ///
 /// Returns error if the JSONC cannot be parsed or edits target invalid paths.
-pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dyn std::error::Error>> {
+pub fn apply_edits(
+    source: &str,
+    edits: &[FeatureEdit],
+) -> Result<String, Box<dyn std::error::Error>> {
     if edits.is_empty() {
         return Ok(source.to_owned());
     }
@@ -47,10 +50,7 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
         match edit {
             FeatureEdit::Add { reference, options } => {
                 let features_obj = ensure_features_object(&root_obj);
-                features_obj.append(
-                    reference,
-                    to_cst_value(options),
-                );
+                features_obj.append(reference, to_cst_value(options));
             }
             FeatureEdit::Remove { reference } => {
                 if let Some(features_prop) = root_obj.get("features")
@@ -82,10 +82,7 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
                     }
                 }
             }
-            FeatureEdit::ReplaceOptions {
-                reference,
-                options,
-            } => {
+            FeatureEdit::ReplaceOptions { reference, options } => {
                 if let Some(features_prop) = root_obj.get("features")
                     && let Some(features_obj) = features_prop.object_value()
                     && let Some(feature_prop) = features_obj.get(reference)
@@ -101,9 +98,7 @@ pub fn apply_edits(source: &str, edits: &[FeatureEdit]) -> Result<String, Box<dy
 
 /// Ensure the root object has a `"features"` property with an object value.
 /// Returns the features object (creating it if needed).
-fn ensure_features_object(
-    root_obj: &jsonc_parser::cst::CstObject,
-) -> jsonc_parser::cst::CstObject {
+fn ensure_features_object(root_obj: &jsonc_parser::cst::CstObject) -> jsonc_parser::cst::CstObject {
     if let Some(prop) = root_obj.get("features")
         && let Some(obj) = prop.object_value()
     {

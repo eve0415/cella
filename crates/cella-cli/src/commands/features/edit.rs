@@ -91,10 +91,9 @@ impl EditArgs {
         // Process --set-option flags
         for opt_str in &self.set_option {
             let (ref_id, key, value) = parse_set_option_flag(opt_str)?;
-            let full_ref = resolve::match_feature_ref(&ref_id, &features)
-                .ok_or_else(|| {
-                    format!("feature '{ref_id}' not found in config for --set-option")
-                })?;
+            let full_ref = resolve::match_feature_ref(&ref_id, &features).ok_or_else(|| {
+                format!("feature '{ref_id}' not found in config for --set-option")
+            })?;
             edits.push(FeatureEdit::SetOption {
                 reference: full_ref.to_owned(),
                 key,
@@ -133,7 +132,13 @@ impl EditArgs {
             match selection.as_str() {
                 DONE => break,
                 ADD_FEATURE => {
-                    handle_add_feature(&mut current_features, &mut edits, &cache, self.common.registry.as_deref()).await?;
+                    handle_add_feature(
+                        &mut current_features,
+                        &mut edits,
+                        &cache,
+                        self.common.registry.as_deref(),
+                    )
+                    .await?;
                 }
                 REMOVE_FEATURE => {
                     handle_remove_feature(&mut current_features, &mut edits)?;
@@ -159,10 +164,7 @@ impl EditArgs {
 }
 
 /// Display the list of currently configured features.
-async fn display_current_features(
-    features: &[(String, serde_json::Value)],
-    cache: &TemplateCache,
-) {
+async fn display_current_features(features: &[(String, serde_json::Value)], cache: &TemplateCache) {
     if features.is_empty() {
         eprintln!("\nNo features configured.");
     } else {
@@ -258,10 +260,8 @@ async fn handle_edit_options(
 async fn prompt_add_feature(
     cache: &TemplateCache,
     registry: Option<&str>,
-) -> Result<
-    Option<(SelectedFeature, HashMap<String, serde_json::Value>)>,
-    Box<dyn std::error::Error>,
-> {
+) -> Result<Option<(SelectedFeature, HashMap<String, serde_json::Value>)>, Box<dyn std::error::Error>>
+{
     let reg = registry.unwrap_or(DEFAULT_FEATURE_COLLECTION);
     let collection = collection::fetch_feature_collection(reg, cache, false).await?;
 
@@ -342,8 +342,7 @@ async fn prompt_edit_options(
 ) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
     // Try to fetch metadata for proper option types
     if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await
-        && let Ok(content) =
-            std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
+        && let Ok(content) = std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
         && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(options_obj) = meta.get("options").and_then(|o| o.as_object())
     {
@@ -373,8 +372,9 @@ async fn prompt_edit_options(
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let new_val =
-                inquire::Text::new(&format!("{key}:")).with_default(&default).prompt()?;
+            let new_val = inquire::Text::new(&format!("{key}:"))
+                .with_default(&default)
+                .prompt()?;
             resolved.insert(key.clone(), serde_json::json!(new_val));
         }
     }
@@ -385,12 +385,12 @@ async fn prompt_edit_options(
 fn parse_set_option_flag(
     s: &str,
 ) -> Result<(String, String, serde_json::Value), Box<dyn std::error::Error>> {
-    let (ref_id, rest) = s.split_once('=').ok_or_else(|| {
-        format!("invalid --set-option format: {s:?} (expected REF=KEY=VALUE)")
-    })?;
-    let (key, value) = rest.split_once('=').ok_or_else(|| {
-        format!("invalid --set-option format: {s:?} (expected REF=KEY=VALUE)")
-    })?;
+    let (ref_id, rest) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --set-option format: {s:?} (expected REF=KEY=VALUE)"))?;
+    let (key, value) = rest
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --set-option format: {s:?} (expected REF=KEY=VALUE)"))?;
     Ok((
         ref_id.to_owned(),
         key.to_owned(),

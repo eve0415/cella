@@ -205,7 +205,13 @@ pub fn apply_template<S: std::hash::BuildHasher>(
         .collect();
 
     // Copy and substitute all files from the template
-    copy_and_substitute(&source_dir, &devcontainer_dir, options, &source_dir, &compiled_excludes)?;
+    copy_and_substitute(
+        &source_dir,
+        &devcontainer_dir,
+        options,
+        &source_dir,
+        &compiled_excludes,
+    )?;
 
     // Process the devcontainer.json specifically: merge features and format
     let config_path = devcontainer_dir.join("devcontainer.json");
@@ -245,9 +251,7 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
 
         // Check if this path should be excluded
         if !excluded_paths.is_empty() {
-            let relative = src_path
-                .strip_prefix(template_root)
-                .unwrap_or(&src_path);
+            let relative = src_path.strip_prefix(template_root).unwrap_or(&src_path);
             let relative_str = relative.to_string_lossy();
             if excluded_paths.iter().any(|pat| pat.matches(&relative_str)) {
                 continue;
@@ -256,7 +260,13 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
 
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
-            copy_and_substitute(&src_path, &dest_path, options, template_root, excluded_paths)?;
+            copy_and_substitute(
+                &src_path,
+                &dest_path,
+                options,
+                template_root,
+                excluded_paths,
+            )?;
         } else if file_type.is_file() {
             // Try to read as text and substitute; if it fails, copy as binary
             match std::fs::read_to_string(&src_path) {
@@ -559,16 +569,20 @@ mod tests {
         .unwrap();
 
         // Config and Dockerfile should exist
-        assert!(output_dir
-            .path()
-            .join(".devcontainer/devcontainer.json")
-            .exists());
+        assert!(
+            output_dir
+                .path()
+                .join(".devcontainer/devcontainer.json")
+                .exists()
+        );
         assert!(output_dir.path().join(".devcontainer/Dockerfile").exists());
 
         // .github/workflow.yml should be excluded
-        assert!(!output_dir
-            .path()
-            .join(".devcontainer/.github/workflow.yml")
-            .exists());
+        assert!(
+            !output_dir
+                .path()
+                .join(".devcontainer/.github/workflow.yml")
+                .exists()
+        );
     }
 }

@@ -123,9 +123,7 @@ async fn find_update_candidates(
 }
 
 /// Print update candidates as JSON.
-fn print_candidates_json(
-    candidates: &[UpdateCandidate],
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_candidates_json(candidates: &[UpdateCandidate]) -> Result<(), Box<dyn std::error::Error>> {
     let json_candidates: Vec<serde_json::Value> = candidates
         .iter()
         .map(|c| {
@@ -148,8 +146,7 @@ fn display_update_table(candidates: &[UpdateCandidate]) {
     for candidate in candidates {
         eprintln!(
             "  {} ({}) : {} -> {}",
-            candidate.name, candidate.current_ref, candidate.current_tag,
-            candidate.latest_version
+            candidate.name, candidate.current_ref, candidate.current_tag, candidate.latest_version
         );
     }
 }

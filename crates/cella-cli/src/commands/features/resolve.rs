@@ -64,9 +64,7 @@ pub fn read_raw_config(path: &Path) -> Result<String, Box<dyn std::error::Error>
 /// Extract features from a parsed JSON config.
 ///
 /// Returns pairs of `(reference, options_value)` preserving insertion order.
-pub fn extract_features(
-    config: &serde_json::Value,
-) -> Vec<(String, serde_json::Value)> {
+pub fn extract_features(config: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
     let Some(features) = config.get("features").and_then(|f| f.as_object()) else {
         return Vec::new();
     };
@@ -107,19 +105,14 @@ pub fn match_feature_ref<'a>(
 /// the display name. Falls back to the raw reference on failure.
 pub async fn resolve_feature_name(reference: &str, cache: &TemplateCache) -> String {
     if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await
-        && let Ok(content) =
-            std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
+        && let Ok(content) = std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
         && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(name) = meta.get("name").and_then(|n| n.as_str())
     {
         return name.to_owned();
     }
     // Fallback: extract short ID from reference
-    reference
-        .rsplit('/')
-        .next()
-        .unwrap_or(reference)
-        .to_owned()
+    reference.rsplit('/').next().unwrap_or(reference).to_owned()
 }
 
 // ===========================================================================

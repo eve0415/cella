@@ -121,13 +121,12 @@ pub async fn fetch_feature_collection(
                     "could not fetch feature collection from {collection_ref}: {e}; \
                      using cached index ({age:.0?} old)"
                 );
-                let feature_index: FeatureCollectionIndex = serde_json::from_value(
-                    serde_json::to_value(stale_index).unwrap_or_default(),
-                )
-                .unwrap_or_else(|_| FeatureCollectionIndex {
-                    features: vec![],
-                    source_information: None,
-                });
+                let feature_index: FeatureCollectionIndex =
+                    serde_json::from_value(serde_json::to_value(stale_index).unwrap_or_default())
+                        .unwrap_or_else(|_| FeatureCollectionIndex {
+                            features: vec![],
+                            source_information: None,
+                        });
                 Ok(feature_index)
             } else {
                 Err(e)
