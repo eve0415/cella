@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     Docker,
+    Podman,
     AppleContainer,
 }
 
@@ -19,6 +20,7 @@ impl fmt::Display for BackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Docker => f.write_str("docker"),
+            Self::Podman => f.write_str("podman"),
             Self::AppleContainer => f.write_str("apple-container"),
         }
     }
@@ -243,6 +245,11 @@ mod tests {
     #[test]
     fn display_docker() {
         assert_eq!(BackendKind::Docker.to_string(), "docker");
+    }
+
+    #[test]
+    fn display_podman() {
+        assert_eq!(BackendKind::Podman.to_string(), "podman");
     }
 
     #[test]
