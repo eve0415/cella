@@ -87,6 +87,11 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            // Ensure the staging directory exists before creating the container,
+            // since it is mounted as a volume.
+            let staging_dir = self.staging_base.join(&opts.name);
+            tokio::fs::create_dir_all(&staging_dir).await?;
+
             let args = build_create_args(opts, &self.staging_base);
             debug!(?args, "container create arguments");
             self.cli.create(&args).await
