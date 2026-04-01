@@ -175,10 +175,13 @@ jobs:
           rm container.pkg
 
       - name: Start container service
-        run: yes | container system start
-
-      - name: Verify container CLI
-        run: container version
+        run: |
+          yes | container system start
+          # Kernel download may still be in progress; wait for the service to be ready
+          for i in $(seq 1 30); do
+            container version && break
+            sleep 2
+          done
 
       - name: Pull test image
         run: container image pull alpine:3.21
