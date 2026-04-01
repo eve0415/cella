@@ -511,7 +511,11 @@ pub async fn create_claude_home_symlink(
 /// and replace with the container user's path. This handles files written by
 /// previous containers with different users (e.g. `/home/node/.claude` ->
 /// `/home/vscode/.claude`).
-pub async fn setup_plugin_manifests(client: &dyn ContainerBackend, container_id: &str, remote_user: &str) {
+pub async fn setup_plugin_manifests(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
     let container_home = cella_env::claude_code::container_home(remote_user);
     let plugins_dir = format!("{container_home}/.claude/plugins");
     let host_plugins = "/tmp/.cella/host-plugins";
@@ -869,10 +873,9 @@ mod tests {
 
     #[test]
     fn log_install_result_error() {
-        let result: Result<ExecResult, BackendError> =
-            Err(BackendError::ContainerNotFound {
-                identifier: "test".into(),
-            });
+        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
+            identifier: "test".into(),
+        });
         log_install_result(result);
     }
 
@@ -898,10 +901,9 @@ mod tests {
 
     #[test]
     fn log_npm_install_result_error() {
-        let result: Result<ExecResult, BackendError> =
-            Err(BackendError::ContainerNotFound {
-                identifier: "missing".into(),
-            });
+        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
+            identifier: "missing".into(),
+        });
         log_npm_install_result("TestTool", result);
     }
 }

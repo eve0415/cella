@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use cella_backend::{BuildOptions, ContainerBackend, ImageDetails, image_name, image_name_with_features};
+use cella_backend::{
+    BuildOptions, ContainerBackend, ImageDetails, image_name, image_name_with_features,
+};
 use cella_features::ResolvedFeatures;
 
 use crate::progress::{ProgressSender, format_elapsed};

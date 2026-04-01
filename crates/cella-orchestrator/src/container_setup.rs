@@ -374,7 +374,11 @@ async fn apply_git_config(
 ///
 /// This makes the `cella` CLI (symlinked to the agent binary) discoverable
 /// by users and AI agents running inside the container.
-pub async fn inject_cella_path(client: &dyn ContainerBackend, container_id: &str, remote_user: &str) {
+pub async fn inject_cella_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
     let snippet = r#"
 # cella CLI (in-container worktree commands)
 if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then

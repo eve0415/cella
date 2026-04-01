@@ -205,11 +205,7 @@ impl ContainerBackend for DockerClient {
     // -- Connectivity --
 
     fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
-        Box::pin(async move {
-            DockerClient::ping(self)
-                .await
-                .map_err(BackendError::from)
-        })
+        Box::pin(async move { DockerClient::ping(self).await.map_err(BackendError::from) })
     }
 
     fn host_gateway(&self) -> &'static str {
@@ -220,9 +216,11 @@ impl ContainerBackend for DockerClient {
 
     fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
         Box::pin(async move {
-            let version = self.inner().version().await.map_err(|e| {
-                BackendError::Runtime(Box::new(e))
-            })?;
+            let version = self
+                .inner()
+                .version()
+                .await
+                .map_err(|e| BackendError::Runtime(Box::new(e)))?;
             let os = version.os.unwrap_or_else(|| "linux".to_string());
             let arch = version.arch.unwrap_or_else(|| "amd64".to_string());
             Ok(Platform { os, arch })
