@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
-use cella_backend::ContainerBackend;
+use cella_backend::{ContainerBackend, image_name_with_features};
 use cella_compose::{
     ComposeCommand, ComposeProject, FEATURES_TARGET_STAGE, ServiceBuildInfo,
     extract_service_build_info,
@@ -214,11 +214,8 @@ fn assemble_features_build(
 
             let config_name = config.get("name").and_then(|v| v.as_str());
             let features_digest = super::image::compute_features_digest(config);
-            let img_name = cella_docker::image_name_with_features(
-                &project.workspace_root,
-                config_name,
-                &features_digest,
-            );
+            let img_name =
+                image_name_with_features(&project.workspace_root, config_name, &features_digest);
             (Some(empty_context), Some(img_name))
         }
         ServiceBuildInfo::Build { .. } => (None, None),

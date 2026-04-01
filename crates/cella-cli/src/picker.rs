@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::io::IsTerminal;
 
-use cella_docker::{ContainerInfo, ContainerState};
+use cella_backend::{BackendKind, ContainerInfo, ContainerState};
 use cella_git::WorktreeInfo;
 use owo_colors::OwoColorize;
 
@@ -375,7 +375,6 @@ pub const fn has_explicit_target(target: &cella_backend::ContainerTarget) -> boo
 mod tests {
     use std::collections::HashMap;
 
-    use cella_docker::{ContainerInfo, ContainerState};
     use cella_git::WorktreeInfo;
 
     use super::*;
@@ -404,7 +403,7 @@ mod tests {
             container_user: None,
             image: None,
             mounts: vec![],
-            backend: cella_docker::BackendKind::Docker,
+            backend: BackendKind::Docker,
         }
     }
 
@@ -615,7 +614,7 @@ mod tests {
             container_user: None,
             image: None,
             mounts: vec![],
-            backend: cella_docker::BackendKind::Docker,
+            backend: BackendKind::Docker,
         };
         let label = format_container_label(&c);
         assert!(label.contains('-')); // branch defaults to "-"
@@ -635,7 +634,7 @@ mod tests {
             container_user: None,
             image: None,
             mounts: vec![],
-            backend: cella_docker::BackendKind::Docker,
+            backend: BackendKind::Docker,
         };
         let map = branch_container_states(&[c]);
         assert!(map.is_empty());
