@@ -90,7 +90,7 @@ fn minimal_create_opts(name: &str) -> CreateContainerOptions {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_full_lifecycle() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("lifecycle");
@@ -131,7 +131,7 @@ async fn test_full_lifecycle() {
     guard.container_id = None; // already removed
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_exec_with_env_and_workdir() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("execenv");
@@ -166,7 +166,7 @@ async fn test_exec_with_env_and_workdir() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_exec_exit_code() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("exitcode");
@@ -191,7 +191,7 @@ async fn test_exec_exit_code() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_env_vars_in_container() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("envvars");
@@ -225,7 +225,7 @@ async fn test_env_vars_in_container() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_labels_roundtrip() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("labels");
@@ -255,7 +255,7 @@ async fn test_labels_roundtrip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_list_cella_containers() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("list");
@@ -293,7 +293,7 @@ async fn test_list_cella_containers() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_file_upload() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("upload");
@@ -325,7 +325,7 @@ async fn test_file_upload() {
     assert_eq!(result.stdout.trim(), "hello from integration test");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_find_container_by_workspace_path() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("findws");
@@ -361,7 +361,7 @@ async fn test_find_container_by_workspace_path() {
     let _ = tokio::fs::remove_dir_all(&workspace_path).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_inspect_image_details() {
     let (backend, _cli_path) = setup_backend();
 
@@ -378,7 +378,7 @@ async fn test_inspect_image_details() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_privileged_warns_not_errors() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("priv");
@@ -393,7 +393,7 @@ async fn test_privileged_warns_not_errors() {
     assert!(!id.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cap_add_warns_not_errors() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("capadd");
@@ -407,7 +407,7 @@ async fn test_cap_add_warns_not_errors() {
     assert!(!id.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_security_opt_warns_not_errors() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("secopt");
@@ -421,7 +421,7 @@ async fn test_security_opt_warns_not_errors() {
     assert!(!id.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_gpu_request_warns_not_errors() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("gpu");
@@ -435,7 +435,7 @@ async fn test_gpu_request_warns_not_errors() {
     assert!(!id.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_container_restart() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("restart");
@@ -462,7 +462,7 @@ async fn test_container_restart() {
     assert!(result.stdout.contains("after-restart"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_exec_stderr_capture() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("stderr");
@@ -492,7 +492,7 @@ async fn test_exec_stderr_capture() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_file_uploads() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("multiup");
@@ -535,7 +535,7 @@ async fn test_multiple_file_uploads() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_remove_nonexistent_container() {
     let (backend, _cli_path) = setup_backend();
 
@@ -548,7 +548,7 @@ async fn test_remove_nonexistent_container() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_workspace_folder_label_set() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("wslabel");
