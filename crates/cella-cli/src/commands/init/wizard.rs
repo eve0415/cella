@@ -28,7 +28,7 @@ const DONE_ADDING_FEATURES: &str = "Done adding features";
 ///
 /// Returns errors for network failures, user cancellation, or I/O errors.
 pub async fn run(args: InitArgs, _progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = std::env::current_dir()?;
+    let workspace = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
     let config_path = workspace.join(".devcontainer").join("devcontainer.json");
     let cache = TemplateCache::new();
 

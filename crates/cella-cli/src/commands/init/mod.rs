@@ -2,6 +2,8 @@ mod noninteractive;
 mod summary;
 mod wizard;
 
+use std::path::PathBuf;
+
 use clap::Args;
 
 use crate::progress::Progress;
@@ -13,6 +15,10 @@ pub struct InitArgs {
     /// When provided, runs in non-interactive mode.
     #[arg(long)]
     pub template: Option<String>,
+
+    /// Workspace folder path (defaults to current directory).
+    #[arg(short = 'w', long)]
+    pub workspace_folder: Option<PathBuf>,
 
     /// Template option: KEY=VALUE (repeatable).
     #[arg(long = "template-option", value_name = "KEY=VALUE")]

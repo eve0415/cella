@@ -22,7 +22,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         .template
         .as_deref()
         .expect("template required for non-interactive mode");
-    let workspace = std::env::current_dir()?;
+    let workspace = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
     let config_path = workspace.join(".devcontainer").join("devcontainer.json");
 
     // Check for existing config
