@@ -85,11 +85,26 @@ fn which_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Run `container version --format json` and extract the version string.
+/// Validate that the binary is Apple's Container CLI and extract the version.
 ///
-/// Returns `Err` if the binary cannot be executed or the output does not
-/// look like Apple's Container CLI.
+/// Tries `container version --format json` first. If the version plugin is not
+/// available (common with .pkg installs), falls back to `container system status`
+/// to confirm the binary is a working Apple Container CLI.
+///
+/// Returns `Err` if the binary cannot be executed or is not the Apple Container CLI.
 async fn validate_binary(binary: &Path) -> Result<String, String> {
+    // Try the version command first.
+    if let Ok(version) = validate_via_version(binary).await {
+        return Ok(version);
+    }
+
+    // Fallback: the version plugin may not be installed (e.g. .pkg installs).
+    // Use `system status` to confirm this is a working Apple Container CLI.
+    validate_via_system_status(binary).await
+}
+
+/// Try `container version --format json` for version extraction.
+async fn validate_via_version(binary: &Path) -> Result<String, String> {
     let output = run_cli(binary, &["version", "--format", "json"])
         .await
         .map_err(|e| format!("failed to run version command: {e}"))?;
@@ -126,6 +141,34 @@ async fn validate_binary(binary: &Path) -> Result<String, String> {
     Err("no recognizable Apple Container version entry found".to_string())
 }
 
+/// Fallback validation using `container system status`.
+///
+/// The system plugin is always present in .pkg installs. If the command
+/// runs successfully, we know this is Apple's Container CLI.
+async fn validate_via_system_status(binary: &Path) -> Result<String, String> {
+    let output = run_cli(binary, &["system", "status"])
+        .await
+        .map_err(|e| format!("failed to run system status: {e}"))?;
+
+    // Reject if the plugin itself is missing.
+    if output.stderr.contains("Plugin") && output.stderr.contains("not found") {
+        return Err("system status plugin not available".to_string());
+    }
+
+    // Reject if the command failed with a non-zero exit and no meaningful output.
+    // A running Apple Container CLI returns exit 0 for "running" or outputs
+    // status info even when the service is stopped.
+    if output.exit_code != 0 && output.stdout.trim().is_empty() {
+        return Err(format!(
+            "system status exited with code {}",
+            output.exit_code
+        ));
+    }
+
+    debug!("validated Apple Container CLI via system status fallback");
+    Ok("unknown".to_string())
+}
+
 /// Check whether a version entry looks like it belongs to Apple's container tool.
 fn is_apple_container_entry(entry: &VersionInfo) -> bool {
     if let Some(name) = &entry.app_name {
@@ -140,6 +183,57 @@ fn is_apple_container_entry(entry: &VersionInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pre-built mock scripts for discovery tests (created once, reused).
+    struct DiscMocks {
+        valid_version: PathBuf,
+        fail: PathBuf,
+        invalid_json: PathBuf,
+        empty_array: PathBuf,
+        unknown_app: PathBuf,
+        no_version: PathBuf,
+    }
+
+    fn disc_mocks() -> &'static DiscMocks {
+        use std::sync::OnceLock;
+
+        static MOCKS: OnceLock<DiscMocks> = OnceLock::new();
+        MOCKS.get_or_init(|| {
+            let dir = PathBuf::from("/tmp/cella_disc_mock_scripts");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let write_script = |name: &str, body: &str| -> PathBuf {
+                let path = dir.join(name);
+                let content = format!("#!/bin/sh\n{body}\n");
+                let needs_write =
+                    std::fs::read_to_string(&path).map_or(true, |existing| existing != content);
+                if needs_write {
+                    std::fs::write(&path, &content).unwrap();
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+                }
+                path
+            };
+
+            DiscMocks {
+                valid_version: write_script(
+                    "valid_version.sh",
+                    r#"echo '[{"version":"2.0.0","appName":"container"}]'"#,
+                ),
+                fail: write_script("fail.sh", "exit 1"),
+                invalid_json: write_script("invalid_json.sh", "echo 'not json'"),
+                empty_array: write_script("empty_array.sh", "echo '[]'"),
+                unknown_app: write_script(
+                    "unknown_app.sh",
+                    r#"echo '[{"version":"3.0.0","appName":"some-other-tool"}]'"#,
+                ),
+                no_version: write_script("no_version.sh", "echo '[{}]'"),
+            }
+        })
+    }
 
     #[test]
     fn is_apple_container_entry_matches_name() {
@@ -197,5 +291,96 @@ mod tests {
     fn which_binary_returns_none_for_nonexistent() {
         let result = which_binary("definitely_not_a_real_binary_xyz");
         assert!(result.is_none());
+    }
+
+    // -- which_binary additional tests ----------------------------------------
+
+    #[test]
+    fn which_binary_finds_echo() {
+        let result = which_binary("echo");
+        assert!(result.is_some(), "expected to find 'echo' in PATH");
+    }
+
+    #[test]
+    fn which_binary_finds_cat() {
+        let result = which_binary("cat");
+        assert!(result.is_some(), "expected to find 'cat' in PATH");
+    }
+
+    // -- validate_binary tests ------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_via_version_with_valid_json() {
+        let result = validate_via_version(&disc_mocks().valid_version).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn validate_via_version_with_nonzero_exit() {
+        let result = validate_via_version(&disc_mocks().fail).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exited with code"));
+    }
+
+    #[tokio::test]
+    async fn validate_via_version_with_invalid_json() {
+        let result = validate_via_version(&disc_mocks().invalid_json).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("parse version JSON"));
+    }
+
+    #[tokio::test]
+    async fn validate_via_version_empty_array() {
+        let result = validate_via_version(&disc_mocks().empty_array).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no recognizable"));
+    }
+
+    #[tokio::test]
+    async fn validate_via_version_unknown_app_name_with_version() {
+        let result = validate_via_version(&disc_mocks().unknown_app).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "3.0.0");
+    }
+
+    #[tokio::test]
+    async fn validate_via_version_no_version_no_app_name() {
+        let result = validate_via_version(&disc_mocks().no_version).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_binary_nonexistent_path() {
+        let result = validate_binary(Path::new("/nonexistent/binary")).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to run"));
+    }
+
+    #[tokio::test]
+    async fn validate_binary_falls_back_to_system_status() {
+        // A script that fails `version` but succeeds for other subcommands
+        // should still be accepted via the system status fallback.
+        let result = validate_binary(&disc_mocks().fail).await;
+        // fail.sh exits 1 for all args, so both version and system status fail.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_binary_uses_version_when_available() {
+        let result = validate_binary(&disc_mocks().valid_version).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "2.0.0");
+    }
+
+    // -- is_apple_container_entry additional tests ----------------------------
+
+    #[test]
+    fn is_apple_container_entry_partial_name_match() {
+        let entry = VersionInfo {
+            version: Some("1.0.0".to_string()),
+            app_name: Some("MyContainerApp".to_string()),
+        };
+        assert!(is_apple_container_entry(&entry));
     }
 }

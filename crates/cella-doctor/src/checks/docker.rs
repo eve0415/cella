@@ -184,3 +184,142 @@ fn check_path_accessible(path: &str) -> CheckResult {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_path_accessible_existing_path() {
+        // /tmp always exists on Linux
+        let result = check_path_accessible("/tmp");
+        assert_eq!(result.severity, Severity::Pass);
+        assert_eq!(result.detail, "/tmp");
+        assert_eq!(result.name, "socket accessible");
+    }
+
+    #[test]
+    fn check_path_accessible_nonexistent_path() {
+        let result = check_path_accessible("/nonexistent/path/that/does/not/exist.sock");
+        assert_eq!(result.severity, Severity::Error);
+        assert!(result.detail.contains("/nonexistent/path"));
+        assert!(result.fix_hint.is_some());
+    }
+
+    #[test]
+    fn check_path_accessible_with_tempfile() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let result = check_path_accessible(path);
+        assert_eq!(result.severity, Severity::Pass);
+        assert_eq!(result.detail, path);
+    }
+
+    #[tokio::test]
+    async fn check_docker_no_client_returns_error() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_docker(&ctx).await;
+        assert_eq!(report.name, "Docker");
+
+        let daemon_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "daemon reachable")
+            .expect("should have daemon reachable check");
+        assert_eq!(daemon_check.severity, Severity::Error);
+        assert!(daemon_check.detail.contains("could not connect"));
+    }
+
+    #[tokio::test]
+    async fn check_docker_no_client_has_fix_hint() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_docker(&ctx).await;
+        let daemon_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "daemon reachable")
+            .unwrap();
+        assert!(daemon_check.fix_hint.is_some());
+        assert!(
+            daemon_check
+                .fix_hint
+                .as_ref()
+                .unwrap()
+                .contains("Docker running")
+        );
+    }
+
+    #[tokio::test]
+    async fn check_docker_no_client_has_cli_and_buildx_and_compose_checks() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_docker(&ctx).await;
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"daemon reachable"),
+            "should have daemon reachable"
+        );
+        assert!(names.contains(&"docker CLI"), "should have docker CLI");
+        assert!(names.contains(&"buildx"), "should have buildx");
+        assert!(names.contains(&"compose"), "should have compose");
+    }
+
+    #[test]
+    fn check_path_accessible_error_has_fix_hint_with_path() {
+        let path = "/nonexistent/socket.sock";
+        let result = check_path_accessible(path);
+        assert_eq!(result.severity, Severity::Error);
+        let hint = result.fix_hint.unwrap();
+        assert!(
+            hint.contains(path),
+            "fix_hint should contain the path, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn check_path_accessible_pass_has_no_fix_hint() {
+        let result = check_path_accessible("/tmp");
+        assert!(result.fix_hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_daemon_reachable_no_client() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let result = check_daemon_reachable(&ctx).await;
+        assert_eq!(result.name, "daemon reachable");
+        assert_eq!(result.severity, Severity::Error);
+        assert_eq!(result.detail, "could not connect to Docker");
+    }
+
+    #[tokio::test]
+    async fn check_docker_report_has_at_least_four_checks() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_docker(&ctx).await;
+        // At minimum: daemon reachable + docker CLI + buildx + compose
+        // (socket check may or may not be present depending on environment)
+        assert!(
+            report.checks.len() >= 4,
+            "expected at least 4 checks, got {}",
+            report.checks.len()
+        );
+    }
+}

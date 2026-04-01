@@ -223,6 +223,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── parse_memory_string ──────────────────────────────────────────────
+
     #[test]
     fn parse_memory_gb() {
         assert_eq!(parse_memory_string("8gb"), Some(8 * 1024 * 1024 * 1024));
@@ -247,6 +249,84 @@ mod tests {
     fn parse_memory_empty() {
         assert_eq!(parse_memory_string(""), None);
     }
+
+    #[test]
+    fn parse_memory_kb() {
+        assert_eq!(parse_memory_string("1024kb"), Some(1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_tb() {
+        assert_eq!(parse_memory_string("1tb"), Some(1024 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_short_suffix_g() {
+        assert_eq!(parse_memory_string("4g"), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_short_suffix_m() {
+        assert_eq!(parse_memory_string("256m"), Some(256 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_invalid_string() {
+        assert_eq!(parse_memory_string("notanumber"), None);
+    }
+
+    #[test]
+    fn parse_memory_whitespace_trimmed() {
+        assert_eq!(parse_memory_string("  4gb  "), Some(4 * 1024 * 1024 * 1024));
+    }
+
+    // ── format_bytes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_bytes_gb() {
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn format_bytes_mb() {
+        assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MB");
+    }
+
+    #[test]
+    fn format_bytes_small() {
+        assert_eq!(format_bytes(500), "500 bytes");
+    }
+
+    #[test]
+    fn format_bytes_boundary() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 bytes");
+    }
+
+    #[test]
+    fn format_bytes_fractional_gb() {
+        // 1.5 GB = 1 GB + 512 MB
+        let bytes = 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+        assert_eq!(format_bytes(bytes), "1.5 GB");
+    }
+
+    #[test]
+    fn format_bytes_fractional_mb() {
+        // 1.5 MB = 1 MB + 512 KB
+        let bytes = 1024 * 1024 + 512 * 1024;
+        assert_eq!(format_bytes(bytes), "1.5 MB");
+    }
+
+    #[test]
+    fn format_bytes_just_under_mb() {
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1048575 bytes");
+    }
+
+    // ── validate ─────────────────────────────────────────────────────────
 
     #[test]
     fn validate_no_requirements() {
@@ -281,12 +361,167 @@ mod tests {
     }
 
     #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
+    fn validate_memory_requirement() {
+        // Request 1 byte of memory -- any real system should have this
+        let config = json!({"hostRequirements": {"memory": "1b"}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].name, "memory");
+        assert!(result.checks[0].met);
     }
 
     #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MB");
+    fn validate_memory_extreme_not_met() {
+        // Request 1 PB of memory -- no system has this
+        let config = json!({"hostRequirements": {"memory": "999999tb"}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert!(!result.checks[0].met);
+    }
+
+    #[test]
+    fn validate_storage_requirement() {
+        // Request 1 byte of storage at /tmp -- always available
+        let config = json!({"hostRequirements": {"storage": "1b"}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].name, "storage");
+        assert!(result.checks[0].met);
+    }
+
+    #[test]
+    fn validate_storage_extreme_not_met() {
+        let config = json!({"hostRequirements": {"storage": "999999tb"}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert!(!result.checks[0].met);
+    }
+
+    #[test]
+    fn validate_gpu_bool_true_checked() {
+        let config = json!({"hostRequirements": {"gpu": true}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].name, "gpu");
+        // CI/test hosts typically don't have GPUs
+    }
+
+    #[test]
+    fn validate_gpu_bool_false_skipped() {
+        let config = json!({"hostRequirements": {"gpu": false}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert!(result.checks.is_empty());
+    }
+
+    #[test]
+    fn validate_gpu_object_treated_as_required() {
+        let config = json!({"hostRequirements": {"gpu": {"cores": 4}}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].name, "gpu");
+    }
+
+    #[test]
+    fn validate_multiple_requirements() {
+        let config = json!({
+            "hostRequirements": {
+                "cpus": 1,
+                "memory": "1b",
+                "storage": "1b",
+                "gpu": "optional"
+            }
+        });
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 4);
+    }
+
+    #[test]
+    fn validate_all_met_reflects_individual_checks() {
+        let config = json!({
+            "hostRequirements": {
+                "cpus": 1,
+                "memory": "999999tb"
+            }
+        });
+        let result = validate(&config, Path::new("/tmp"));
+        assert!(!result.all_met);
+    }
+
+    #[test]
+    fn validate_host_requirements_null_treated_as_absent() {
+        let config = json!({"hostRequirements": null});
+        let result = validate(&config, Path::new("/tmp"));
+        assert!(result.all_met);
+        assert!(result.checks.is_empty());
+    }
+
+    #[test]
+    fn validate_invalid_memory_string_skipped() {
+        let config = json!({"hostRequirements": {"memory": "not-a-size"}});
+        let result = validate(&config, Path::new("/tmp"));
+        // Invalid memory string is silently skipped (no check added)
+        assert!(result.checks.is_empty());
+    }
+
+    // ── check_gpu helper ─────────────────────────────────────────────────
+
+    #[test]
+    fn check_gpu_optional_label() {
+        let mut checks = Vec::new();
+        check_gpu(&mut checks, &json!("optional"));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "gpu (optional)");
+        assert!(checks[0].met); // optional always met
+    }
+
+    #[test]
+    fn check_gpu_required_label() {
+        let mut checks = Vec::new();
+        check_gpu(&mut checks, &json!(true));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "gpu");
+    }
+
+    #[test]
+    fn check_gpu_false_no_check() {
+        let mut checks = Vec::new();
+        check_gpu(&mut checks, &json!(false));
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn check_gpu_random_string_no_check() {
+        let mut checks = Vec::new();
+        check_gpu(&mut checks, &json!("foobar"));
+        assert!(checks.is_empty());
+    }
+
+    // ── check_memory / check_storage helpers ─────────────────────────────
+
+    #[test]
+    fn check_memory_creates_check() {
+        let mut checks = Vec::new();
+        check_memory(&mut checks, 1);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "memory");
+        assert!(checks[0].met);
+    }
+
+    #[test]
+    fn check_storage_creates_check() {
+        let mut checks = Vec::new();
+        check_storage(&mut checks, 1, Path::new("/tmp"));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "storage");
+        assert!(checks[0].met);
+    }
+
+    #[test]
+    fn check_cpus_creates_check() {
+        let mut checks = Vec::new();
+        check_cpus(&mut checks, 1);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "cpus");
+        assert!(checks[0].met);
     }
 }

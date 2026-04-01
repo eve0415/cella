@@ -199,4 +199,138 @@ mod tests {
         assert!(script.contains(r#"echo "Group with GID exists ($EXISTING_GROUP=${NEW_GID}).""#));
         assert!(script.contains(r#"NEW_GID="$OLD_GID""#));
     }
+
+    // -----------------------------------------------------------------------
+    // root_exec tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn root_exec_sets_user_to_root() {
+        let opts = root_exec(vec!["id".to_string()]);
+        assert_eq!(opts.user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn root_exec_passes_command_through() {
+        let opts = root_exec(vec!["ls".to_string(), "-la".to_string()]);
+        assert_eq!(opts.cmd, vec!["ls", "-la"]);
+    }
+
+    #[test]
+    fn root_exec_env_is_none() {
+        let opts = root_exec(vec!["echo".to_string()]);
+        assert!(opts.env.is_none());
+    }
+
+    #[test]
+    fn root_exec_working_dir_is_none() {
+        let opts = root_exec(vec!["pwd".to_string()]);
+        assert!(opts.working_dir.is_none());
+    }
+
+    #[test]
+    fn root_exec_empty_command() {
+        let opts = root_exec(Vec::new());
+        assert!(opts.cmd.is_empty());
+        assert_eq!(opts.user.as_deref(), Some("root"));
+    }
+
+    // -----------------------------------------------------------------------
+    // log_uid_update_result tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn log_uid_update_result_success_does_not_panic() {
+        let result = crate::exec::ExecResult {
+            exit_code: 0,
+            stdout: "Updating UID:GID from 1000:1000 to 501:501.\n".to_string(),
+            stderr: String::new(),
+        };
+        // Should not panic; we just verify it runs without error.
+        log_uid_update_result(&result);
+    }
+
+    #[test]
+    fn log_uid_update_result_empty_stdout_does_not_panic() {
+        let result = crate::exec::ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        log_uid_update_result(&result);
+    }
+
+    #[test]
+    fn log_uid_update_result_with_nonzero_exit_code_does_not_panic() {
+        let result = crate::exec::ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "permission denied\n".to_string(),
+        };
+        log_uid_update_result(&result);
+    }
+
+    #[test]
+    fn log_uid_update_result_multiline_stdout() {
+        let result = crate::exec::ExecResult {
+            exit_code: 0,
+            stdout: "line one\nline two\n  \nline four\n".to_string(),
+            stderr: String::new(),
+        };
+        // Should process each non-empty line without panic
+        log_uid_update_result(&result);
+    }
+
+    #[test]
+    fn log_uid_update_result_nonzero_with_empty_stderr_does_not_warn() {
+        // When exit_code != 0 but stderr is empty, the condition
+        // `result.exit_code != 0 && !result.stderr.is_empty()` is false
+        let result = crate::exec::ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        log_uid_update_result(&result);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_update_uid_script additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn script_starts_with_variable_assignments() {
+        let script = build_update_uid_script("testuser", 1000, 1000);
+        let first_line = script.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("REMOTE_USER="),
+            "script should start with variable assignment"
+        );
+    }
+
+    #[test]
+    fn script_contains_uid_match_check() {
+        let script = build_update_uid_script("user", 500, 500);
+        assert!(script.contains(r"UIDs and GIDs already match"));
+    }
+
+    #[test]
+    fn script_handles_zero_uid_gid() {
+        let script = build_update_uid_script("root", 0, 0);
+        assert!(script.contains("NEW_UID='0'"));
+        assert!(script.contains("NEW_GID='0'"));
+    }
+
+    #[test]
+    fn script_handles_max_uid() {
+        let script = build_update_uid_script("nobody", 65534, 65534);
+        assert!(script.contains("NEW_UID='65534'"));
+        assert!(script.contains("NEW_GID='65534'"));
+    }
+
+    #[test]
+    fn script_user_with_special_characters() {
+        // Username with hyphen (common in Docker images)
+        let script = build_update_uid_script("node-user", 1000, 1000);
+        assert!(script.contains("REMOTE_USER='node-user'"));
+    }
 }

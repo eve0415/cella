@@ -65,3 +65,51 @@ pub async fn ensure_up(
     tokio::task::yield_now().await;
     todo!("Will be extracted from CLI in a follow-up commit")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_rule_policy_enforce_eq() {
+        assert_eq!(NetworkRulePolicy::Enforce, NetworkRulePolicy::Enforce);
+        assert_ne!(NetworkRulePolicy::Enforce, NetworkRulePolicy::Skip);
+    }
+
+    #[test]
+    fn network_rule_policy_skip_eq() {
+        assert_eq!(NetworkRulePolicy::Skip, NetworkRulePolicy::Skip);
+    }
+
+    #[test]
+    fn network_rule_policy_debug() {
+        let enforce = format!("{:?}", NetworkRulePolicy::Enforce);
+        let skip = format!("{:?}", NetworkRulePolicy::Skip);
+        assert_eq!(enforce, "Enforce");
+        assert_eq!(skip, "Skip");
+    }
+
+    #[test]
+    fn network_rule_policy_clone() {
+        let original = NetworkRulePolicy::Enforce;
+        let cloned = original;
+        assert_eq!(original, cloned);
+    }
+
+    #[tokio::test]
+    async fn noop_hooks_on_container_started() {
+        let hooks = NoOpHooks;
+        // Should complete without error
+        hooks
+            .on_container_started("container-123", "test-container", Some("172.17.0.2"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn noop_hooks_on_container_started_no_ip() {
+        let hooks = NoOpHooks;
+        hooks
+            .on_container_started("container-456", "test-container", None)
+            .await;
+    }
+}

@@ -364,4 +364,46 @@ mod tests {
         let hostnames = github_hostnames_from_remotes(&workspace);
         let _ = hostnames;
     }
+
+    #[test]
+    fn test_extract_github_hostname_ghes_https() {
+        let line = "upstream\thttps://git.corp.github.com/org/repo.git (fetch)";
+        assert_eq!(
+            extract_github_hostname(line),
+            Some("git.corp.github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_github_hostname_empty_line() {
+        assert_eq!(extract_github_hostname(""), None);
+    }
+
+    #[test]
+    fn test_extract_github_hostname_no_url() {
+        assert_eq!(extract_github_hostname("origin"), None);
+    }
+
+    #[test]
+    fn test_extract_github_hostname_non_github_https() {
+        let line = "origin\thttps://gitlab.com/user/repo.git (fetch)";
+        assert_eq!(extract_github_hostname(line), None);
+    }
+
+    #[test]
+    fn test_extract_github_hostname_http() {
+        let line = "origin\thttp://github.com/user/repo.git (fetch)";
+        assert_eq!(
+            extract_github_hostname(line),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gh_config_dir_custom_user() {
+        assert_eq!(
+            gh_config_dir_for_user("devuser"),
+            "/home/devuser/.config/gh"
+        );
+    }
 }

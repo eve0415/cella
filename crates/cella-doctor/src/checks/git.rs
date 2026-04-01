@@ -160,4 +160,105 @@ mod tests {
             "Docker Desktop VM"
         );
     }
+
+    #[test]
+    fn classify_ssh_socket_case_insensitive() {
+        assert_eq!(
+            classify_ssh_socket("/run/OrbStack/SSH-Agent.sock"),
+            "OrbStack"
+        );
+        assert_eq!(
+            classify_ssh_socket("/var/run/Docker-Desktop/agent.sock"),
+            "Docker Desktop VM"
+        );
+        assert_eq!(
+            classify_ssh_socket("/Users/x/.Colima/default/ssh.sock"),
+            "Colima"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_socket_empty_string() {
+        assert_eq!(classify_ssh_socket(""), "host-native");
+    }
+
+    #[test]
+    fn classify_ssh_socket_windows_style_path() {
+        assert_eq!(
+            classify_ssh_socket(r"C:\Users\x\AppData\ssh-agent.sock"),
+            "host-native"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_socket_orbstack_variants() {
+        assert_eq!(
+            classify_ssh_socket("/var/run/orbstack/agent.sock"),
+            "OrbStack"
+        );
+        assert_eq!(classify_ssh_socket("/tmp/ORBSTACK/ssh.sock"), "OrbStack");
+    }
+
+    #[test]
+    fn classify_ssh_socket_colima_subpath() {
+        assert_eq!(
+            classify_ssh_socket("/Users/user/.colima/default/ssh-agent.sock"),
+            "Colima"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_socket_docker_desktop_various() {
+        assert_eq!(
+            classify_ssh_socket("/run/docker-desktop/ssh.sock"),
+            "Docker Desktop VM"
+        );
+        assert_eq!(
+            classify_ssh_socket("/private/tmp/com.apple.launchd.xyz/Listeners"),
+            "Docker Desktop VM"
+        );
+    }
+
+    #[test]
+    fn classify_ssh_socket_generic_path() {
+        assert_eq!(
+            classify_ssh_socket("/run/user/1000/ssh-agent.sock"),
+            "host-native"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_git_returns_category_name() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_git(&ctx).await;
+        assert_eq!(report.name, "Git & Credentials");
+    }
+
+    #[tokio::test]
+    async fn check_git_has_ssh_agent_check() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_git(&ctx).await;
+        let has_ssh = report.checks.iter().any(|c| c.name == "SSH agent");
+        assert!(has_ssh, "should have SSH agent check");
+    }
+
+    #[tokio::test]
+    async fn check_git_has_git_check() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: false,
+            docker_client: None,
+        };
+        let report = check_git(&ctx).await;
+        let has_git = report.checks.iter().any(|c| c.name == "git");
+        assert!(has_git, "should have git check");
+    }
 }

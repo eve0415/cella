@@ -426,3 +426,154 @@ async fn re_register_containers(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    // ── TERMINAL_ENV_VARS ───────────────────────────────────────────
+
+    #[test]
+    fn terminal_env_vars_contains_term() {
+        assert!(TERMINAL_ENV_VARS.contains(&"TERM"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_colorterm() {
+        assert!(TERMINAL_ENV_VARS.contains(&"COLORTERM"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_lang() {
+        assert!(TERMINAL_ENV_VARS.contains(&"LANG"));
+    }
+
+    #[test]
+    fn terminal_env_vars_is_not_empty() {
+        assert!(!TERMINAL_ENV_VARS.is_empty());
+    }
+
+    #[test]
+    fn terminal_env_vars_all_uppercase() {
+        for var in TERMINAL_ENV_VARS {
+            assert_eq!(
+                *var,
+                var.to_uppercase(),
+                "env var should be uppercase: {var}"
+            );
+        }
+    }
+
+    // ── resolve_workspace_folder ────────────────────────────────────
+
+    #[test]
+    fn resolve_workspace_folder_none_returns_cwd() {
+        let result = resolve_workspace_folder(None).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(result, cwd);
+    }
+
+    #[test]
+    fn resolve_workspace_folder_with_existing_path() {
+        let tmp = std::env::temp_dir();
+        let result = resolve_workspace_folder(Some(&tmp)).unwrap();
+        // canonicalize should succeed for an existing directory
+        assert_eq!(result, tmp.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_workspace_folder_with_nonexistent_path() {
+        let fake = PathBuf::from("/nonexistent/path/to/workspace");
+        let result =
+            resolve_workspace_folder(Some(Path::new("/nonexistent/path/to/workspace"))).unwrap();
+        // canonicalize fails, so it returns the path as-is
+        assert_eq!(result, fake);
+    }
+
+    // ── is_binary_newer_than ────────────────────────────────────────
+
+    #[test]
+    fn is_binary_newer_than_zero_is_true() {
+        // Current binary was certainly modified after epoch
+        assert!(is_binary_newer_than(0));
+    }
+
+    #[test]
+    fn is_binary_newer_than_far_future_is_false() {
+        // A timestamp far in the future should not be older than the binary
+        let far_future = u64::MAX / 2;
+        assert!(!is_binary_newer_than(far_future));
+    }
+
+    // ── VerboseArgs ─────────────────────────────────────────────────
+
+    #[test]
+    fn verbose_args_default_is_false() {
+        let args = VerboseArgs { verbose: false };
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn verbose_args_set_to_true() {
+        let args = VerboseArgs { verbose: true };
+        assert!(args.verbose);
+    }
+
+    // ── TERMINAL_ENV_VARS coverage ─────────────────────────────────
+
+    #[test]
+    fn terminal_env_vars_count() {
+        assert_eq!(TERMINAL_ENV_VARS.len(), 7);
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_term_program() {
+        assert!(TERMINAL_ENV_VARS.contains(&"TERM_PROGRAM"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_term_program_version() {
+        assert!(TERMINAL_ENV_VARS.contains(&"TERM_PROGRAM_VERSION"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_columns() {
+        assert!(TERMINAL_ENV_VARS.contains(&"COLUMNS"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_lines() {
+        assert!(TERMINAL_ENV_VARS.contains(&"LINES"));
+    }
+
+    #[test]
+    fn terminal_env_vars_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for var in TERMINAL_ENV_VARS {
+            assert!(seen.insert(var), "duplicate env var: {var}");
+        }
+    }
+
+    // ── is_binary_newer_than ────────────────────────────────────────
+
+    #[test]
+    fn is_binary_newer_than_recent_past() {
+        // A timestamp from a few seconds ago should still be older than the binary
+        let recent = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 5;
+        // Binary may or may not be newer than 5s ago, but it shouldn't panic
+        let _ = is_binary_newer_than(recent);
+    }
+
+    // ── resolve_workspace_folder edge cases ────────────────────────
+
+    #[test]
+    fn resolve_workspace_folder_returns_absolute_path() {
+        let result = resolve_workspace_folder(None).unwrap();
+        assert!(result.is_absolute());
+    }
+}

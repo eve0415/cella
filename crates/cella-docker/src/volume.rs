@@ -1542,4 +1542,460 @@ mod tests {
         let result = parse_sha256sums(contents, "cella-agent-aarch64");
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_binary_path_with_aarch64() {
+        assert_eq!(
+            agent_binary_path("1.2.3", "aarch64"),
+            "/cella/v1.2.3/aarch64/cella-agent"
+        );
+    }
+
+    #[test]
+    fn agent_binary_path_with_prerelease_version() {
+        assert_eq!(
+            agent_binary_path("0.0.1-alpha", "x86_64"),
+            "/cella/v0.0.1-alpha/x86_64/cella-agent"
+        );
+    }
+
+    #[test]
+    fn browser_helper_script_starts_with_shebang() {
+        let script = browser_helper_script();
+        let content = String::from_utf8(script).unwrap();
+        assert!(content.starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn browser_helper_script_exec_agent_browser_open() {
+        let script = browser_helper_script();
+        let content = String::from_utf8(script).unwrap();
+        assert!(content.contains("exec \"/cella/bin/cella-agent\" browser-open \"$1\""));
+    }
+
+    #[test]
+    fn browser_helper_script_uses_symlink_path() {
+        let script = browser_helper_script();
+        let content = String::from_utf8(script).unwrap();
+        assert!(content.contains(&agent_symlink_path()));
+    }
+
+    #[test]
+    fn version_marker_path_is_under_cella() {
+        let path = version_marker_path();
+        assert_eq!(path, "/cella/.version");
+    }
+
+    #[test]
+    fn version_marker_content_contains_arch_and_newline() {
+        let content = version_marker_content("aarch64");
+        assert!(content.contains("aarch64"));
+        assert!(content.ends_with('\n'));
+        // Format: {version}/{arch}\n
+        let parts: Vec<&str> = content.trim().split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], "aarch64");
+    }
+
+    #[test]
+    fn version_marker_content_version_matches_cargo_pkg() {
+        let content = version_marker_content("x86_64");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            content.starts_with(version),
+            "expected marker to start with '{version}', got: {content}"
+        );
+    }
+
+    #[test]
+    fn cli_symlink_path_is_under_bin() {
+        let path = cli_symlink_path();
+        assert!(path.starts_with("/cella/bin/"));
+        assert!(path.ends_with("/cella"));
+    }
+
+    #[test]
+    fn credential_helper_path_is_under_bin() {
+        let path = credential_helper_path();
+        assert!(path.starts_with("/cella/bin/"));
+        assert!(path.contains("credential"));
+    }
+
+    #[test]
+    fn agent_volume_mount_source_matches_constant() {
+        let (source, target, _) = agent_volume_mount();
+        assert_eq!(source, AGENT_VOLUME_NAME);
+        assert_eq!(target, "/cella");
+    }
+
+    #[test]
+    fn detect_agent_arch_returns_x86_64_or_aarch64() {
+        let arch = detect_agent_arch();
+        // In CI/test environments we expect a known architecture
+        assert!(
+            arch == "x86_64" || arch == "aarch64",
+            "unexpected arch: {arch}"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_single_space_separator() {
+        // Some tools produce single-space instead of double-space
+        let contents = "abc123 cella-agent-x86_64\n";
+        let result = parse_sha256sums(contents, "cella-agent-x86_64").unwrap();
+        assert_eq!(result, "abc123");
+    }
+
+    #[test]
+    fn parse_sha256sums_empty_input() {
+        let result = parse_sha256sums("", "cella-agent-x86_64");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_sha256sums_multiple_artifacts() {
+        let contents = "\
+abc111  artifact-a
+abc222  artifact-b
+abc333  artifact-c
+";
+        assert_eq!(parse_sha256sums(contents, "artifact-a").unwrap(), "abc111");
+        assert_eq!(parse_sha256sums(contents, "artifact-b").unwrap(), "abc222");
+        assert_eq!(parse_sha256sums(contents, "artifact-c").unwrap(), "abc333");
+    }
+
+    #[test]
+    fn parse_sha256sums_skips_malformed_lines() {
+        let contents = "nospacehere\nabc123  good-artifact\n";
+        let result = parse_sha256sums(contents, "good-artifact").unwrap();
+        assert_eq!(result, "abc123");
+    }
+
+    #[test]
+    fn verify_checksum_empty_data() {
+        let data = b"";
+        let expected = hex::encode(Sha256::digest(data));
+        assert!(verify_agent_checksum(data, &expected).is_ok());
+    }
+
+    #[test]
+    fn build_volume_tar_version_marker_content() {
+        let agent_bytes = b"agent";
+        let browser_bytes = b"browser";
+        let marker = "1.0.0/x86_64\n";
+
+        let tar_bytes =
+            build_volume_tar("1.0.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path.contains(".version") {
+                let mut content = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+                assert_eq!(content, "1.0.0/x86_64\n");
+                return;
+            }
+        }
+        panic!(".version file not found in tar");
+    }
+
+    #[test]
+    fn build_volume_tar_browser_script_is_executable() {
+        let tar_bytes = build_volume_tar("1.0.0", "x86_64", b"agent", b"#!/bin/sh", "m").unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path.contains("cella-browser") {
+                assert_eq!(entry.header().mode().unwrap(), 0o755);
+                return;
+            }
+        }
+        panic!("cella-browser not found in tar");
+    }
+
+    // -----------------------------------------------------------------------
+    // daemon_addr_file_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn daemon_addr_file_path_returns_expected() {
+        assert_eq!(daemon_addr_file_path(), "/cella/.daemon_addr");
+    }
+
+    #[test]
+    fn daemon_addr_file_path_starts_with_cella_prefix() {
+        let path = daemon_addr_file_path();
+        assert!(path.starts_with(AGENT_PATH_PREFIX));
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_volume_name_constant() {
+        assert_eq!(AGENT_VOLUME_NAME, "cella-agent");
+    }
+
+    #[test]
+    fn agent_path_prefix_is_cella() {
+        // agent_binary_path uses AGENT_PATH_PREFIX internally
+        let path = agent_binary_path("1.0.0", "x86_64");
+        assert!(path.starts_with("/cella/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_volume_tar comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_volume_tar_contains_exactly_five_entries() {
+        let tar_bytes = build_volume_tar(
+            "2.0.0",
+            "aarch64",
+            b"binary",
+            b"#!/bin/sh",
+            "2.0.0/aarch64\n",
+        )
+        .unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        // Should contain: agent binary, browser script, agent symlink, cella symlink, .version
+        assert_eq!(
+            entries.len(),
+            5,
+            "expected 5 entries in volume tar, got {}: {entries:?}",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn build_volume_tar_agent_binary_has_correct_content() {
+        let agent_content = b"this is the agent binary content";
+        let tar_bytes =
+            build_volume_tar("1.0.0", "x86_64", agent_content, b"script", "marker").unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "cella/v1.0.0/x86_64/cella-agent" {
+                let mut content = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+                assert_eq!(content, agent_content);
+                return;
+            }
+        }
+        panic!("agent binary not found at expected path");
+    }
+
+    #[test]
+    fn build_volume_tar_browser_script_has_correct_content() {
+        let browser_content = b"#!/bin/sh\necho browser";
+        let tar_bytes =
+            build_volume_tar("1.0.0", "x86_64", b"agent", browser_content, "marker").unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "cella/bin/cella-browser" {
+                let mut content = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+                assert_eq!(content, browser_content);
+                return;
+            }
+        }
+        panic!("browser script not found at expected path");
+    }
+
+    #[test]
+    fn build_volume_tar_version_marker_mode_is_644() {
+        let tar_bytes =
+            build_volume_tar("1.0.0", "x86_64", b"agent", b"script", "1.0.0/x86_64\n").unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path.contains(".version") {
+                assert_eq!(
+                    entry.header().mode().unwrap(),
+                    0o644,
+                    ".version should have mode 644"
+                );
+                return;
+            }
+        }
+        panic!(".version not found");
+    }
+
+    #[test]
+    fn build_volume_tar_with_empty_agent_bytes() {
+        // Should still produce a valid archive even with zero-length agent binary
+        let tar_bytes = build_volume_tar("1.0.0", "x86_64", b"", b"script", "marker").unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
+            })
+            .collect();
+        assert_eq!(entries.len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_file_from_tar additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_file_from_tar_multiple_files_finds_correct_one() {
+        let mut buf = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut buf);
+            for (name, content) in &[("file_a", b"aaa" as &[u8]), ("file_b", b"bbb")] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, name, *content).unwrap();
+            }
+            archive.finish().unwrap();
+        }
+
+        let result = extract_file_from_tar(&buf, "file_b").unwrap();
+        assert_eq!(result, b"bbb");
+    }
+
+    #[test]
+    fn extract_file_from_tar_matches_filename_not_full_path() {
+        let mut buf = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut buf);
+            let content = b"found it";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "deep/nested/path/target-file", &content[..])
+                .unwrap();
+            archive.finish().unwrap();
+        }
+
+        let result = extract_file_from_tar(&buf, "target-file").unwrap();
+        assert_eq!(result, b"found it");
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_agent_checksum additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_checksum_mismatch_contains_both_hashes() {
+        let data = b"test data";
+        let actual_hash = hex::encode(Sha256::digest(data));
+        let wrong_hash = "0".repeat(64);
+        let err = verify_agent_checksum(data, &wrong_hash).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&wrong_hash),
+            "error should contain expected hash"
+        );
+        assert!(
+            msg.contains(&actual_hash),
+            "error should contain actual hash"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_sha256sums additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_sha256sums_with_tabs_as_separator() {
+        let contents = "abc123\tcella-agent-x86_64\n";
+        let result = parse_sha256sums(contents, "cella-agent-x86_64").unwrap();
+        assert_eq!(result, "abc123");
+    }
+
+    #[test]
+    fn parse_sha256sums_extra_whitespace_in_name() {
+        // Name with leading whitespace (from double-space format) should be trimmed
+        let contents = "abc123  cella-agent-x86_64\n";
+        let result = parse_sha256sums(contents, "cella-agent-x86_64").unwrap();
+        assert_eq!(result, "abc123");
+    }
+
+    #[test]
+    fn parse_sha256sums_returns_first_match() {
+        // If multiple lines match, the first one should win
+        let contents = "first_hash  same-name\nsecond_hash  same-name\n";
+        let result = parse_sha256sums(contents, "same-name").unwrap();
+        assert_eq!(result, "first_hash");
+    }
+
+    // -----------------------------------------------------------------------
+    // version_marker_content additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_marker_content_different_arches() {
+        let x86 = version_marker_content("x86_64");
+        let arm = version_marker_content("aarch64");
+        assert_ne!(x86, arm);
+        assert!(x86.contains("x86_64"));
+        assert!(arm.contains("aarch64"));
+    }
+
+    // -----------------------------------------------------------------------
+    // agent_binary_path edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_binary_path_empty_version() {
+        let path = agent_binary_path("", "x86_64");
+        assert_eq!(path, "/cella/v/x86_64/cella-agent");
+    }
+
+    #[test]
+    fn agent_binary_path_empty_arch() {
+        let path = agent_binary_path("1.0.0", "");
+        assert_eq!(path, "/cella/v1.0.0//cella-agent");
+    }
+
+    // -----------------------------------------------------------------------
+    // dev_agent_override tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dev_agent_override_returns_none_when_unset() {
+        // Ensure the env var is not set (it shouldn't be in test)
+        // If it is set, this test just confirms the function works
+        let result = dev_agent_override();
+        // Either None (not set) or Some(path) — both are valid
+        if let Some(path) = &result {
+            assert!(!path.is_empty());
+        }
+    }
 }

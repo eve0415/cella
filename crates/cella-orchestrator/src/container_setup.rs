@@ -483,3 +483,271 @@ pub async fn seed_gh_credentials(
         debug!("Seeded gh CLI credentials into container");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── resolve_remote_user ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_remote_user_from_config() {
+        let config = json!({"remoteUser": "vscode"});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "vscode");
+    }
+
+    #[test]
+    fn resolve_remote_user_from_container_user() {
+        let config = json!({"containerUser": "node"});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "node");
+    }
+
+    #[test]
+    fn resolve_remote_user_from_image_metadata() {
+        let config = json!({});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: Some("devuser".to_string()),
+            container_user: None,
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "root");
+        assert_eq!(result, "devuser");
+    }
+
+    #[test]
+    fn resolve_remote_user_fallback() {
+        let config = json!({});
+        let result = resolve_remote_user(&config, None, "root");
+        assert_eq!(result, "root");
+    }
+
+    #[test]
+    fn resolve_remote_user_priority_order() {
+        let config = json!({"remoteUser": "winner", "containerUser": "loser"});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: Some("also-loser".to_string()),
+            container_user: Some("yet-another-loser".to_string()),
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "fallback");
+        assert_eq!(result, "winner");
+    }
+
+    #[test]
+    fn resolve_remote_user_container_user_beats_metadata() {
+        let config = json!({"containerUser": "config-user"});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: Some("meta-remote".to_string()),
+            container_user: Some("meta-container".to_string()),
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "fallback");
+        assert_eq!(result, "config-user");
+    }
+
+    #[test]
+    fn resolve_remote_user_metadata_container_user_over_fallback() {
+        let config = json!({});
+        let meta = cella_features::ImageMetadataUserInfo {
+            remote_user: None,
+            container_user: Some("meta-container".to_string()),
+        };
+        let result = resolve_remote_user(&config, Some(&meta), "fallback");
+        assert_eq!(result, "meta-container");
+    }
+
+    #[test]
+    fn resolve_remote_user_non_string_values_ignored() {
+        let config = json!({"remoteUser": 42, "containerUser": true});
+        let result = resolve_remote_user(&config, None, "fallback");
+        assert_eq!(result, "fallback");
+    }
+
+    // ── map_env_object ───────────────────────────────────────────────────
+
+    #[test]
+    fn map_env_object_basic() {
+        let val = json!({"FOO": "bar"});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn map_env_object_null_values() {
+        let val = json!({"KEY": null});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result, vec!["KEY="]);
+    }
+
+    #[test]
+    fn map_env_object_none_input() {
+        let result = map_env_object(None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_non_object_value() {
+        let val = json!("not an object");
+        let result = map_env_object(Some(&val));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_multiple_keys() {
+        let val = json!({"A": "1", "B": "2", "C": "3"});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result.len(), 3);
+        // Object iteration order is consistent within serde_json
+        for item in &result {
+            assert!(item.contains('='));
+        }
+    }
+
+    #[test]
+    fn map_env_object_empty_object() {
+        let val = json!({});
+        let result = map_env_object(Some(&val));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_integer_value_treated_as_empty() {
+        let val = json!({"PORT": 8080});
+        let result = map_env_object(Some(&val));
+        assert_eq!(result, vec!["PORT="]);
+    }
+
+    // ── convert_uploads ──────────────────────────────────────────────────
+
+    #[test]
+    fn convert_uploads_basic() {
+        let uploads = vec![cella_env::FileUpload {
+            container_path: "/home/user/.config/test".to_string(),
+            content: b"hello".to_vec(),
+            mode: 0o644,
+        }];
+        let result = convert_uploads(&uploads);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, "/home/user/.config/test");
+        assert_eq!(result[0].content, b"hello");
+        assert_eq!(result[0].mode, 0o644);
+    }
+
+    #[test]
+    fn convert_uploads_empty() {
+        let result = convert_uploads(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn convert_uploads_multiple() {
+        let uploads = vec![
+            cella_env::FileUpload {
+                container_path: "/a".to_string(),
+                content: b"content-a".to_vec(),
+                mode: 0o600,
+            },
+            cella_env::FileUpload {
+                container_path: "/b".to_string(),
+                content: b"content-b".to_vec(),
+                mode: 0o755,
+            },
+        ];
+        let result = convert_uploads(&uploads);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].path, "/a");
+        assert_eq!(result[0].mode, 0o600);
+        assert_eq!(result[1].path, "/b");
+        assert_eq!(result[1].mode, 0o755);
+    }
+
+    #[test]
+    fn convert_uploads_preserves_binary_content() {
+        let uploads = vec![cella_env::FileUpload {
+            container_path: "/bin/key".to_string(),
+            content: vec![0x00, 0xFF, 0xDE, 0xAD],
+            mode: 0o400,
+        }];
+        let result = convert_uploads(&uploads);
+        assert_eq!(result[0].content, vec![0x00, 0xFF, 0xDE, 0xAD]);
+    }
+
+    // ── run_host_command ─────────────────────────────────────────────────
+
+    #[test]
+    fn run_host_command_string_form() {
+        let cmd = json!("true");
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_array_form() {
+        let cmd = json!(["echo", "hello"]);
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_object_form() {
+        let cmd = json!({"step1": "true", "step2": ["echo", "done"]});
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_failing_string() {
+        let cmd = json!("false");
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_host_command_null_is_noop() {
+        let cmd = json!(null);
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_bool_is_noop() {
+        let cmd = json!(true);
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_empty_array() {
+        let cmd = json!([]);
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_empty_object() {
+        let cmd = json!({});
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_object_with_failing_step() {
+        let cmd = json!({"step1": "false"});
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_host_command_object_with_array_value() {
+        let cmd = json!({"build": ["echo", "building"]});
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_host_command_object_ignores_non_string_non_array() {
+        let cmd = json!({"step": 42});
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_ok());
+    }
+}

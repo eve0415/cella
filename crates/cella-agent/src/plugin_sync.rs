@@ -168,4 +168,46 @@ mod tests {
         let json = r#"{"name": "no paths here"}"#;
         assert_eq!(detect_home_from_json(json), None);
     }
+
+    #[test]
+    fn detect_home_empty_json() {
+        assert_eq!(detect_home_from_json("{}"), None);
+    }
+
+    #[test]
+    fn detect_home_empty_string() {
+        assert_eq!(detect_home_from_json(""), None);
+    }
+
+    #[test]
+    fn detect_home_relative_path_rejected() {
+        // Path not starting with / should not match.
+        let json = r#"{"path": "relative/.claude/plugins"}"#;
+        assert_eq!(detect_home_from_json(json), None);
+    }
+
+    #[test]
+    fn detect_home_deep_nested_path() {
+        let json = r#"{"installPath": "/home/user/deep/.claude/plugins/market/data"}"#;
+        assert_eq!(
+            detect_home_from_json(json),
+            Some("/home/user/deep".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_home_multiline_json() {
+        let json = r#"{
+            "name": "plugin-a",
+            "installPath": "/Users/bob/.claude/plugins/plugin-a"
+        }"#;
+        assert_eq!(detect_home_from_json(json), Some("/Users/bob".to_string()));
+    }
+
+    #[test]
+    fn detect_home_first_match_wins() {
+        let json = r#"{"a": "/home/first/.claude/x", "b": "/home/second/.claude/y"}"#;
+        // Should return the first match found.
+        assert_eq!(detect_home_from_json(json), Some("/home/first".to_string()));
+    }
 }

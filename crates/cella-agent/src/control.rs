@@ -155,3 +155,225 @@ pub fn read_daemon_addr_file() -> Option<DaemonAddrInfo> {
     }
     Some(DaemonAddrInfo { addr, token })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn read_daemon_addr_file_returns_a_result() {
+        // Returns Some if the file exists, None if not — either is valid.
+        let _result = read_daemon_addr_file();
+    }
+
+    #[test]
+    fn daemon_addr_info_fields() {
+        let info = DaemonAddrInfo {
+            addr: "127.0.0.1:5000".to_string(),
+            token: "secret-token".to_string(),
+        };
+        assert_eq!(info.addr, "127.0.0.1:5000");
+        assert_eq!(info.token, "secret-token");
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_unreachable_address() {
+        let result = ControlClient::connect("127.0.0.1:1", "test-container", "token").await;
+        let Err(err) = result else {
+            panic!("expected error on unreachable address");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_server_closes_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes connection immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_invalid_json_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            stream.write_all(b"not-json\n").await.unwrap();
+        });
+
+        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        let Err(err) = result else {
+            panic!("expected error on invalid JSON");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("protocol error"));
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_daemon_rejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: Some("auth failed".to_string()),
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+        });
+
+        let result = ControlClient::connect(&addr.to_string(), "test-container", "bad-token").await;
+        let Err(err) = result else {
+            panic!("expected error when daemon rejects");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("daemon rejected connection"));
+        assert!(msg.contains("auth failed"));
+    }
+
+    #[tokio::test]
+    async fn connect_succeeds_with_valid_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read the AgentHello.
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            // Send a valid DaemonHello.
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: None,
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+        });
+
+        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        assert!(result.is_ok());
+        let (_client, hello) = result.unwrap();
+        assert_eq!(hello.daemon_version, "0.1.0");
+        assert!(hello.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_and_recv_roundtrip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read AgentHello.
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            // Send DaemonHello.
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: None,
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+
+            // Read the agent message.
+            let mut msg_buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut msg_buf).await;
+
+            // Send a DaemonMessage response (Ack).
+            let response = DaemonMessage::Ack {
+                id: Some("test-1".to_string()),
+            };
+            let mut resp_json = serde_json::to_string(&response).unwrap();
+            resp_json.push('\n');
+            stream.write_all(resp_json.as_bytes()).await.unwrap();
+        });
+
+        let (mut client, _hello) =
+            ControlClient::connect(&addr.to_string(), "test-container", "token")
+                .await
+                .unwrap();
+
+        // Send a message.
+        let msg = AgentMessage::Health {
+            uptime_secs: 42,
+            ports_detected: 3,
+        };
+        client.send(&msg).await.unwrap();
+
+        // Receive the response.
+        let resp = client.recv().await.unwrap();
+        assert!(matches!(resp, DaemonMessage::Ack { id } if id.as_deref() == Some("test-1")));
+    }
+
+    #[tokio::test]
+    async fn recv_returns_error_on_closed_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read AgentHello.
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            // Send DaemonHello.
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: None,
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+            // Close the connection.
+            drop(stream);
+        });
+
+        let (mut client, _hello) =
+            ControlClient::connect(&addr.to_string(), "test-container", "token")
+                .await
+                .unwrap();
+
+        let result = client.recv().await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("connection closed"));
+    }
+}

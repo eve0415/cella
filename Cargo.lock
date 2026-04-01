@@ -464,6 +464,7 @@ dependencies = [
  "cella-port",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -473,6 +474,7 @@ version = "0.0.14"
 dependencies = [
  "cella-network",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

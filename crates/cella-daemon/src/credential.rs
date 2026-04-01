@@ -168,6 +168,10 @@ pub fn invoke_git_credential<S: std::hash::BuildHasher>(
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // parse_request
+    // ---------------------------------------------------------------
+
     #[test]
     fn parse_get_request() {
         let data = "get\nprotocol=https\nhost=github.com\n\n";
@@ -182,6 +186,113 @@ mod tests {
     }
 
     #[test]
+    fn parse_store_request() {
+        let data = "store\nprotocol=https\nhost=github.com\nusername=user\npassword=pass\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.operation, "store");
+        assert_eq!(req.fields.get("username"), Some(&"user".to_string()));
+        assert_eq!(req.fields.get("password"), Some(&"pass".to_string()));
+        assert_eq!(req.fields.len(), 4);
+    }
+
+    #[test]
+    fn parse_erase_request() {
+        let data = "erase\nhost=gitlab.com\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.operation, "erase");
+        assert_eq!(req.fields.get("host"), Some(&"gitlab.com".to_string()));
+    }
+
+    #[test]
+    fn parse_request_whitespace_only_operation_fails() {
+        let result = parse_request("   \nhost=github.com\n");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("empty operation"));
+    }
+
+    #[test]
+    fn parse_request_operation_only_no_fields() {
+        let data = "get\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.operation, "get");
+        assert!(req.fields.is_empty());
+    }
+
+    #[test]
+    fn parse_request_stops_at_blank_line() {
+        let data = "get\nprotocol=https\n\nhost=extra\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.len(), 1);
+        assert_eq!(req.fields.get("protocol"), Some(&"https".to_string()));
+        // "host=extra" should not be parsed (comes after blank line)
+        assert!(!req.fields.contains_key("host"));
+    }
+
+    #[test]
+    fn parse_request_ignores_lines_without_equals() {
+        let data = "get\nnoequals\nprotocol=https\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.len(), 1);
+        assert_eq!(req.fields.get("protocol"), Some(&"https".to_string()));
+    }
+
+    #[test]
+    fn parse_request_trims_operation_whitespace() {
+        let data = "  get  \nprotocol=https\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.operation, "get");
+    }
+
+    #[test]
+    fn parse_request_trims_field_whitespace() {
+        let data = "get\n  protocol=https  \n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.get("protocol"), Some(&"https".to_string()));
+    }
+
+    #[test]
+    fn parse_request_value_with_equals_sign() {
+        // Values can contain '=' (split_once splits only at first '=')
+        let data = "get\npath=/a=b\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.get("path"), Some(&"/a=b".to_string()));
+    }
+
+    #[test]
+    fn parse_request_operation_only_no_newline() {
+        let data = "ping";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.operation, "ping");
+        assert!(req.fields.is_empty());
+    }
+
+    #[test]
+    fn parse_request_multiple_fields() {
+        let data = "get\nprotocol=https\nhost=github.com\npath=/repo.git\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.len(), 3);
+        assert_eq!(req.fields.get("path"), Some(&"/repo.git".to_string()));
+    }
+
+    #[test]
+    fn parse_request_empty_value() {
+        let data = "get\npassword=\n\n";
+        let req = parse_request(data).unwrap();
+        assert_eq!(req.fields.get("password"), Some(&String::new()));
+    }
+
+    #[test]
+    fn parse_request_error_display() {
+        let err = parse_request("").unwrap_err();
+        assert!(err.to_string().contains("protocol error"));
+    }
+
+    // ---------------------------------------------------------------
+    // format_credential_fields
+    // ---------------------------------------------------------------
+
+    #[test]
     fn format_credential_fields_output() {
         let mut fields = HashMap::new();
         fields.insert("protocol".to_string(), "https".to_string());
@@ -191,6 +302,93 @@ mod tests {
     }
 
     #[test]
+    fn format_credential_fields_empty() {
+        let fields: HashMap<String, String> = HashMap::new();
+        let output = format_credential_fields(&fields);
+        assert_eq!(output, "\n");
+    }
+
+    #[test]
+    fn format_credential_fields_multiple() {
+        let mut fields = HashMap::new();
+        fields.insert("protocol".to_string(), "https".to_string());
+        fields.insert("host".to_string(), "github.com".to_string());
+        let output = format_credential_fields(&fields);
+        // Both fields present
+        assert!(output.contains("protocol=https\n"));
+        assert!(output.contains("host=github.com\n"));
+        // Ends with blank line terminator
+        assert!(output.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn format_credential_fields_empty_value() {
+        let mut fields = HashMap::new();
+        fields.insert("password".to_string(), String::new());
+        let output = format_credential_fields(&fields);
+        assert!(output.contains("password=\n"));
+    }
+
+    // ---------------------------------------------------------------
+    // parse_credential_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_credential_output() {
+        let input = "protocol=https\nhost=github.com\nusername=user\n";
+        let fields = parse_credential_output(input);
+        assert_eq!(fields.get("username"), Some(&"user".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_output_empty_input() {
+        let fields = parse_credential_output("");
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parse_credential_output_blank_lines_ignored() {
+        let input = "protocol=https\n\n\nhost=github.com\n";
+        let fields = parse_credential_output(input);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.get("protocol"), Some(&"https".to_string()));
+        assert_eq!(fields.get("host"), Some(&"github.com".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_output_no_equals_ignored() {
+        let input = "protocol=https\ngarbage\nhost=github.com\n";
+        let fields = parse_credential_output(input);
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn parse_credential_output_value_with_equals() {
+        let input = "path=/a=b=c\n";
+        let fields = parse_credential_output(input);
+        assert_eq!(fields.get("path"), Some(&"/a=b=c".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_output_empty_value() {
+        let input = "password=\n";
+        let fields = parse_credential_output(input);
+        assert_eq!(fields.get("password"), Some(&String::new()));
+    }
+
+    #[test]
+    fn parse_credential_output_duplicate_keys_last_wins() {
+        let input = "host=first\nhost=second\n";
+        let fields = parse_credential_output(input);
+        // HashMap behavior: last value wins when collecting
+        assert_eq!(fields.get("host"), Some(&"second".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // invoke_git_credential (operation validation only)
+    // ---------------------------------------------------------------
+
+    #[test]
     fn unknown_operation_fails() {
         let fields = HashMap::new();
         let result = invoke_git_credential("unknown", &fields);
@@ -198,9 +396,69 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_credential_output() {
-        let input = "protocol=https\nhost=github.com\nusername=user\n";
-        let fields = parse_credential_output(input);
-        assert_eq!(fields.get("username"), Some(&"user".to_string()));
+    fn unknown_operation_error_message() {
+        let fields = HashMap::new();
+        let err = invoke_git_credential("delete", &fields).unwrap_err();
+        assert!(err.to_string().contains("unknown operation: delete"));
+    }
+
+    #[test]
+    fn empty_operation_fails() {
+        let fields = HashMap::new();
+        let err = invoke_git_credential("", &fields).unwrap_err();
+        assert!(err.to_string().contains("unknown operation"));
+    }
+
+    // ---------------------------------------------------------------
+    // CredentialRequest / CredentialResponse struct construction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn credential_request_debug() {
+        let req = CredentialRequest {
+            operation: "get".to_string(),
+            fields: HashMap::new(),
+        };
+        let debug = format!("{req:?}");
+        assert!(debug.contains("get"));
+    }
+
+    #[test]
+    fn credential_request_clone() {
+        let mut fields = HashMap::new();
+        fields.insert("host".to_string(), "github.com".to_string());
+        let req = CredentialRequest {
+            operation: "get".to_string(),
+            fields,
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = req.clone();
+        assert_eq!(cloned.operation, "get");
+        assert_eq!(cloned.fields.get("host"), Some(&"github.com".to_string()));
+    }
+
+    #[test]
+    fn credential_response_debug_and_clone() {
+        let mut fields = HashMap::new();
+        fields.insert("username".to_string(), "user".to_string());
+        let resp = CredentialResponse { fields };
+        let cloned = resp.clone();
+        assert_eq!(cloned.fields.get("username"), Some(&"user".to_string()));
+        let debug = format!("{resp:?}");
+        assert!(debug.contains("username"));
+    }
+
+    // ---------------------------------------------------------------
+    // Roundtrip: parse_request -> format_credential_fields -> parse_credential_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_parse_format_parse() {
+        let data = "get\nprotocol=https\nhost=github.com\n\n";
+        let req = parse_request(data).unwrap();
+        let formatted = format_credential_fields(&req.fields);
+        let parsed_back = parse_credential_output(&formatted);
+        assert_eq!(parsed_back.get("protocol"), Some(&"https".to_string()));
+        assert_eq!(parsed_back.get("host"), Some(&"github.com".to_string()));
     }
 }

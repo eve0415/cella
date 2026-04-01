@@ -682,6 +682,179 @@ mod tests {
 
     // ── Snapshot tests for output formatting ─────────────────────────
 
+    // ── format_elapsed_pub ────────────────────────────────────────
+
+    #[test]
+    fn format_elapsed_pub_delegates_correctly() {
+        assert_eq!(
+            format_elapsed_pub(Duration::from_millis(500)),
+            format_elapsed(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn format_elapsed_pub_below_threshold() {
+        assert!(format_elapsed_pub(Duration::from_millis(50)).is_empty());
+    }
+
+    // ── Step lifecycle ──────────────────────────────────────────────
+
+    #[test]
+    fn step_auto_clears_on_drop() {
+        let p = Progress::new(false, Verbosity::Normal);
+        {
+            let _step = p.step("will be dropped");
+            // step goes out of scope without finish()
+        }
+        // No panic = success
+    }
+
+    #[test]
+    fn step_finish_does_not_panic() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let step = p.step("test step");
+        step.finish();
+    }
+
+    #[test]
+    fn step_finish_with_custom_message() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let step = p.step("test step");
+        step.finish_with("custom completion");
+    }
+
+    #[test]
+    fn step_fail_does_not_panic() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let step = p.step("failing step");
+        step.fail("something went wrong");
+    }
+
+    // ── Phase lifecycle ─────────────────────────────────────────────
+
+    #[test]
+    fn phase_finish_does_not_panic() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let phase = p.phase("test phase");
+        phase.finish();
+    }
+
+    #[test]
+    fn phase_auto_clears_on_drop() {
+        let p = Progress::new(false, Verbosity::Normal);
+        {
+            let _phase = p.phase("will be dropped");
+        }
+        // No panic = success
+    }
+
+    #[test]
+    fn phase_child_finish() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let phase = p.phase("parent");
+        let child = phase.step("child");
+        child.finish();
+        phase.finish();
+    }
+
+    #[test]
+    fn phase_child_auto_clears_on_drop() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let phase = p.phase("parent");
+        {
+            let _child = phase.step("will be dropped");
+        }
+        phase.finish();
+    }
+
+    #[test]
+    fn phase_multiple_children() {
+        let p = Progress::new(false, Verbosity::Normal);
+        let phase = p.phase("parent");
+        let c1 = phase.step("child 1");
+        let c2 = phase.step("child 2");
+        c1.finish();
+        c2.finish();
+        phase.finish();
+    }
+
+    // ── Progress println ────────────────────────────────────────────
+
+    #[test]
+    fn println_does_not_panic() {
+        let p = Progress::new(false, Verbosity::Normal);
+        p.println("some output line");
+    }
+
+    // ── IndicatifMakeWriter ─────────────────────────────────────────
+
+    #[test]
+    fn indicatif_make_writer_clone() {
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let writer = IndicatifMakeWriter::new(multi);
+        let _cloned = Clone::clone(&writer);
+    }
+
+    #[test]
+    fn indicatif_line_writer_whitespace_only_is_noop() {
+        use std::io::Write;
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let mut writer = IndicatifLineWriter {
+            multi,
+            buf: Vec::new(),
+        };
+        writer.write_all(b"   \n").unwrap();
+        writer.flush().unwrap();
+        assert!(writer.buf.is_empty());
+    }
+
+    #[test]
+    fn indicatif_line_writer_drop_flushes() {
+        use std::io::Write;
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let mut writer = IndicatifLineWriter {
+            multi,
+            buf: Vec::new(),
+        };
+        writer.write_all(b"pending data").unwrap();
+        // Drop should flush - no panic = success
+        drop(writer);
+    }
+
+    #[test]
+    fn indicatif_line_writer_multiple_writes() {
+        use std::io::Write;
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let mut writer = IndicatifLineWriter {
+            multi,
+            buf: Vec::new(),
+        };
+        writer.write_all(b"hello ").unwrap();
+        writer.write_all(b"world").unwrap();
+        assert_eq!(writer.buf.len(), 11);
+        writer.flush().unwrap();
+        assert!(writer.buf.is_empty());
+    }
+
+    // ── Enabled progress with spinners ──────────────────────────────
+
+    #[test]
+    fn enabled_progress_step_and_finish() {
+        let p = Progress::new(true, Verbosity::Normal);
+        assert!(p.is_enabled());
+        let step = p.step("enabled step");
+        step.finish();
+    }
+
+    #[test]
+    fn enabled_progress_phase_and_finish() {
+        let p = Progress::new(true, Verbosity::Verbose);
+        let phase = p.phase("enabled phase");
+        let child = phase.step("child step");
+        child.finish();
+        phase.finish();
+    }
+
     #[test]
     fn snapshot_format_elapsed_values() {
         let cases = [
@@ -708,7 +881,7 @@ mod tests {
             })
             .collect();
 
-        insta::assert_snapshot!(results.join("\n"), @r"
+        insta::assert_snapshot!(results.join("\n"), @"
         0ms: (empty)
         50ms: (empty)
         99ms: (empty)

@@ -1,6 +1,5 @@
 ---
 source: crates/cella-codegen/src/emit/format.rs
-assertion_line: 22
 expression: result
 ---
 pub struct Foo {

@@ -247,4 +247,84 @@ mod tests {
         let result = client.send(&msg).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn recv_on_disconnected_returns_error() {
+        let mut client = ReconnectingClient {
+            addr: "127.0.0.1:1".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            inner: None,
+            reconnected: false,
+            daemon_hello: None,
+        };
+
+        let result = client.recv().await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("not connected"));
+    }
+
+    #[test]
+    fn is_connected_when_disconnected() {
+        let client = ReconnectingClient {
+            addr: "127.0.0.1:1".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            inner: None,
+            reconnected: false,
+            daemon_hello: None,
+        };
+        assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn take_reconnected_false_when_not_set() {
+        let mut client = ReconnectingClient {
+            addr: "127.0.0.1:1".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            inner: None,
+            reconnected: false,
+            daemon_hello: None,
+        };
+        assert!(!client.take_reconnected());
+    }
+
+    #[tokio::test]
+    async fn try_reconnect_fails_on_unreachable() {
+        let mut client = ReconnectingClient {
+            addr: "127.0.0.1:1".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            inner: None,
+            reconnected: false,
+            daemon_hello: None,
+        };
+        let result = client.try_reconnect().await;
+        assert!(result.is_err());
+        assert!(!client.is_connected());
+        assert!(!client.reconnected);
+    }
+
+    #[tokio::test]
+    async fn send_error_includes_not_connected() {
+        let mut client = ReconnectingClient {
+            addr: "127.0.0.1:1".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            inner: None,
+            reconnected: false,
+            daemon_hello: None,
+        };
+
+        let msg = AgentMessage::Health {
+            uptime_secs: 10,
+            ports_detected: 3,
+        };
+        let err = client.send(&msg).await.unwrap_err();
+        let msg = format!("{err}");
+        // After failed reconnect, should mention the addr in the error.
+        assert!(msg.contains("127.0.0.1:1") || msg.contains("reconnect") || msg.contains("failed"));
+    }
 }

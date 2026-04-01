@@ -763,3 +763,145 @@ pub async fn install_tools(
     tokio::join!(claude_branch, npm_branch);
     phase.finish();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_exec_env_with_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_some());
+        let vec = result.unwrap();
+        assert_eq!(vec, vec!["PATH=/usr/bin:/usr/local/bin"]);
+    }
+
+    #[test]
+    fn tool_exec_env_without_path() {
+        let env = ProbedEnv::new();
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_exec_env_none() {
+        let result = tool_exec_env(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_shell_cmd_with_probed_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        let cmd = tool_shell_cmd(Some(&env), "echo hello");
+        assert_eq!(cmd, vec!["sh", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn tool_shell_cmd_without_probed_path() {
+        let cmd = tool_shell_cmd(None, "echo hello");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn tool_shell_cmd_probed_env_without_path_key() {
+        let env = ProbedEnv::new();
+        let cmd = tool_shell_cmd(Some(&env), "echo hello");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn tool_exec_env_ignores_non_path_keys() {
+        let mut env = ProbedEnv::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("SHELL".to_string(), "/bin/bash".to_string());
+        let result = tool_exec_env(Some(&env));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tool_exec_env_extracts_only_path() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        let result = tool_exec_env(Some(&env)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with("PATH="));
+    }
+
+    #[test]
+    fn tool_shell_cmd_preserves_complex_inner_command() {
+        let complex = "cd /app && npm install && npm run build 2>&1 | tee build.log";
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        let cmd = tool_shell_cmd(Some(&env), complex);
+        assert_eq!(cmd[2], complex);
+    }
+
+    #[test]
+    fn tool_shell_cmd_login_shell_for_empty_inner() {
+        let cmd = tool_shell_cmd(None, "");
+        assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
+    }
+
+    #[test]
+    fn log_install_result_success() {
+        let result = Ok(ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        // Should not panic
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_install_result_nonzero_exit() {
+        let result = Ok(ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "error occurred".to_string(),
+        });
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_install_result_error() {
+        let result: Result<ExecResult, CellaDockerError> =
+            Err(CellaDockerError::ContainerNotFound {
+                workspace: "test".into(),
+            });
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_npm_install_result_success() {
+        let result = Ok(ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        log_npm_install_result("TestTool", result);
+    }
+
+    #[test]
+    fn log_npm_install_result_nonzero_exit() {
+        let result = Ok(ExecResult {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "command not found".to_string(),
+        });
+        log_npm_install_result("TestTool", result);
+    }
+
+    #[test]
+    fn log_npm_install_result_error() {
+        let result: Result<ExecResult, CellaDockerError> =
+            Err(CellaDockerError::ContainerNotFound {
+                workspace: "missing".into(),
+            });
+        log_npm_install_result("TestTool", result);
+    }
+}

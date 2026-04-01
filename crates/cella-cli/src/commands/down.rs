@@ -252,3 +252,50 @@ fn cleanup_daemon() {
         debug!("Cella daemon stopped (no containers remain)");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_outcome_text_stopped() {
+        // Should not panic when printing "stopped" outcome
+        print_outcome(&OutputFormat::Text, "stopped", "abc123");
+    }
+
+    #[test]
+    fn print_outcome_text_removed() {
+        // Should not panic when printing "removed" outcome
+        print_outcome(&OutputFormat::Text, "removed", "abc123");
+    }
+
+    #[test]
+    fn print_outcome_json_stopped() {
+        // Should not panic when printing JSON "stopped" outcome
+        print_outcome(&OutputFormat::Json, "stopped", "abc123456789");
+    }
+
+    #[test]
+    fn print_outcome_json_removed() {
+        // Should not panic when printing JSON "removed" outcome
+        print_outcome(&OutputFormat::Json, "removed", "abc123456789");
+    }
+
+    #[test]
+    fn down_args_is_text_output_default() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "down"]).unwrap();
+        if let crate::commands::Command::Down(args) = &cli.command {
+            assert!(args.is_text_output());
+        }
+    }
+
+    #[test]
+    fn down_args_is_json_output() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "down", "--output", "json"]).unwrap();
+        if let crate::commands::Command::Down(args) = &cli.command {
+            assert!(!args.is_text_output());
+        }
+    }
+}

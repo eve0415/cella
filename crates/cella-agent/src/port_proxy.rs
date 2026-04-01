@@ -57,3 +57,87 @@ pub async fn proxy_localhost_to_all(app_port: u16) -> Result<(u16, JoinHandle<()
 
     Ok((proxy_port, handle))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn proxy_binds_to_random_port() {
+        let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app_listener.local_addr().unwrap().port();
+
+        let (proxy_port, handle) = proxy_localhost_to_all(app_port).await.unwrap();
+
+        assert_ne!(proxy_port, 0);
+        assert_ne!(proxy_port, app_port);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_data_to_app() {
+        let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app_listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = app_listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let n = AsyncReadExt::read(&mut stream, &mut buf).await.unwrap_or(0);
+                let _ = AsyncWriteExt::write_all(&mut stream, &buf[..n]).await;
+            }
+        });
+
+        let (proxy_port, handle) = proxy_localhost_to_all(app_port).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        let test_data = b"hello from test";
+        AsyncWriteExt::write_all(&mut stream, test_data)
+            .await
+            .unwrap();
+        AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+
+        let mut response = Vec::new();
+        AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        assert_eq!(response, test_data);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_valid_port_range() {
+        let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app_listener.local_addr().unwrap().port();
+
+        let (proxy_port, handle) = proxy_localhost_to_all(app_port).await.unwrap();
+        assert!(proxy_port > 0);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_handles_connection_to_closed_app() {
+        let tmp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = tmp_listener.local_addr().unwrap().port();
+        drop(tmp_listener);
+
+        let (proxy_port, handle) = proxy_localhost_to_all(dead_port).await.unwrap();
+
+        let stream = TcpStream::connect(("127.0.0.1", proxy_port)).await;
+        assert!(stream.is_ok());
+
+        let mut stream = stream.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let result = AsyncReadExt::read(&mut stream, &mut buf).await;
+        match result {
+            Ok(0) | Err(_) => {}
+            Ok(_) => panic!("expected connection to be closed"),
+        }
+
+        handle.abort();
+    }
+}

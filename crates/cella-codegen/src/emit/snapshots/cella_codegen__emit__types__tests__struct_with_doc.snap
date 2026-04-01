@@ -1,7 +1,6 @@
 ---
 source: crates/cella-codegen/src/emit/types.rs
-assertion_line: 206
-expression: fmt(tokens)
+expression: fmt(&tokens)
 ---
 ///This is a documented struct.
 #[derive(Debug, Clone)]

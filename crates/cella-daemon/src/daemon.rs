@@ -391,4 +391,119 @@ mod tests {
             .permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
+
+    // -- generate_auth_token --
+
+    #[test]
+    fn generate_auth_token_is_64_hex_chars() {
+        let token = generate_auth_token();
+        assert!(is_valid_token(&token), "token was: {token}");
+    }
+
+    #[test]
+    fn generate_auth_token_is_unique() {
+        let a = generate_auth_token();
+        let b = generate_auth_token();
+        assert_ne!(a, b);
+    }
+
+    // -- write_pid_and_ensure_dir --
+
+    #[test]
+    fn write_pid_creates_file_with_current_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sub").join("daemon.sock");
+        let pid_path = dir.path().join("sub").join("daemon.pid");
+
+        let pid = write_pid_and_ensure_dir(&sock, &pid_path).unwrap();
+        assert_eq!(pid, std::process::id());
+
+        let contents = std::fs::read_to_string(&pid_path).unwrap();
+        assert_eq!(contents, pid.to_string());
+    }
+
+    #[test]
+    fn write_pid_creates_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b").join("c");
+        let sock = deep.join("daemon.sock");
+        let pid_path = deep.join("daemon.pid");
+
+        write_pid_and_ensure_dir(&sock, &pid_path).unwrap();
+        assert!(pid_path.exists());
+    }
+
+    // -- write_control_file --
+
+    #[test]
+    fn write_control_file_creates_file_with_port_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let path = write_control_file(&sock, 12345, "tok123").unwrap();
+
+        assert_eq!(path, dir.path().join("daemon.control"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "12345\ntok123");
+    }
+
+    #[test]
+    fn write_control_file_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        write_control_file(&sock, 1111, "old").unwrap();
+        let path = write_control_file(&sock, 2222, "new").unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(contents, "2222\nnew");
+    }
+
+    // -- is_valid_token edge cases --
+
+    #[test]
+    fn is_valid_token_all_digits() {
+        let token = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(is_valid_token(token));
+    }
+
+    #[test]
+    fn is_valid_token_uppercase_hex() {
+        let token = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        assert!(is_valid_token(token));
+    }
+
+    #[test]
+    fn is_valid_token_65_chars_rejected() {
+        let token = "a".repeat(65);
+        assert!(!is_valid_token(&token));
+    }
+
+    // -- stop_daemon --
+
+    #[test]
+    fn stop_daemon_no_pid_file_returns_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = stop_daemon(
+            &dir.path().join("daemon.pid"),
+            &dir.path().join("daemon.sock"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CellaDaemonError::NotRunning));
+    }
+
+    #[test]
+    fn stop_daemon_cleans_up_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        let sock_path = dir.path().join("daemon.sock");
+        let control_path = dir.path().join("daemon.control");
+
+        // Write a PID that is not a real running process so kill is harmless.
+        std::fs::write(&pid_path, "4000000000").unwrap();
+        std::fs::write(&sock_path, "").unwrap();
+        std::fs::write(&control_path, "").unwrap();
+
+        let _ = stop_daemon(&pid_path, &sock_path);
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
+        assert!(!control_path.exists());
+    }
 }

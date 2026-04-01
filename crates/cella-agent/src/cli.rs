@@ -1163,4 +1163,551 @@ mod tests {
         let cmd = parse_cli_args(&args);
         assert!(matches!(cmd, CliCommand::Help));
     }
+
+    // --- task subcommand tests ---
+
+    #[test]
+    fn parse_task_run() {
+        let args: Vec<String> = ["cella", "task", "run", "feat/ci", "--", "cargo", "test"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskRun { branch, command, base }
+                if branch == "feat/ci"
+                    && command == ["cargo", "test"]
+                    && base.is_none()));
+    }
+
+    #[test]
+    fn parse_task_run_with_base() {
+        let args: Vec<String> = [
+            "cella", "task", "run", "feat/ci", "--base", "develop", "--", "make", "build",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskRun { branch, command, base }
+                if branch == "feat/ci"
+                    && command == ["make", "build"]
+                    && base.as_deref() == Some("develop")));
+    }
+
+    #[test]
+    fn parse_task_run_missing_command_shows_help() {
+        let args: Vec<String> = ["cella", "task", "run", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_run_missing_branch_shows_help() {
+        let args: Vec<String> = ["cella", "task", "run"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_list() {
+        let args: Vec<String> = ["cella", "task", "list"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskList));
+    }
+
+    #[test]
+    fn parse_task_ls_alias() {
+        let args: Vec<String> = ["cella", "task", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskList));
+    }
+
+    #[test]
+    fn parse_task_logs() {
+        let args: Vec<String> = ["cella", "task", "logs", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskLogs { branch, follow }
+                if branch == "feat/ci" && !follow));
+    }
+
+    #[test]
+    fn parse_task_logs_follow() {
+        let args: Vec<String> = ["cella", "task", "logs", "-f", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskLogs { branch, follow }
+                if branch == "feat/ci" && follow));
+    }
+
+    #[test]
+    fn parse_task_logs_follow_long() {
+        let args: Vec<String> = ["cella", "task", "logs", "--follow", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskLogs { branch, follow }
+                if branch == "feat/ci" && follow));
+    }
+
+    #[test]
+    fn parse_task_logs_missing_branch_shows_help() {
+        let args: Vec<String> = ["cella", "task", "logs"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_wait() {
+        let args: Vec<String> = ["cella", "task", "wait", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskWait { branch } if branch == "feat/ci"));
+    }
+
+    #[test]
+    fn parse_task_wait_missing_branch_shows_help() {
+        let args: Vec<String> = ["cella", "task", "wait"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_stop() {
+        let args: Vec<String> = ["cella", "task", "stop", "feat/ci"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskStop { branch } if branch == "feat/ci"));
+    }
+
+    #[test]
+    fn parse_task_stop_missing_branch_shows_help() {
+        let args: Vec<String> = ["cella", "task", "stop"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_unknown_subcommand_shows_help() {
+        let args: Vec<String> = ["cella", "task", "bogus"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_no_subcommand_shows_help() {
+        let args: Vec<String> = ["cella", "task"].iter().map(ToString::to_string).collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    // --- switch/down flag tests ---
+
+    #[test]
+    fn parse_switch_command() {
+        let args: Vec<String> = ["cella", "switch", "feat/other"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Switch { branch } if branch == "feat/other"));
+    }
+
+    #[test]
+    fn parse_switch_missing_branch_shows_help() {
+        let args: Vec<String> = ["cella", "switch"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_down_all_flags() {
+        let args: Vec<String> = ["cella", "down", "feat/auth", "--rm", "--volumes", "--force"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(
+            cmd,
+            CliCommand::Down {
+                branch,
+                rm: true,
+                volumes: true,
+                force: true,
+            } if branch == "feat/auth"
+        ));
+    }
+
+    #[test]
+    fn parse_down_volumes_only() {
+        let args: Vec<String> = ["cella", "down", "feat/auth", "--volumes"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(
+            cmd,
+            CliCommand::Down {
+                volumes: true,
+                rm: false,
+                force: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_down_force_only() {
+        let args: Vec<String> = ["cella", "down", "feat/auth", "--force"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(
+            cmd,
+            CliCommand::Down {
+                force: true,
+                rm: false,
+                volumes: false,
+                ..
+            }
+        ));
+    }
+
+    // --- request_id tests ---
+
+    #[test]
+    fn request_id_increments() {
+        let id1 = request_id();
+        let id2 = request_id();
+        let id3 = request_id();
+
+        assert!(id1.starts_with("cli-"));
+        assert!(id2.starts_with("cli-"));
+        assert!(id3.starts_with("cli-"));
+
+        // Parse the numeric parts and verify they increment.
+        let n1: u64 = id1.strip_prefix("cli-").unwrap().parse().unwrap();
+        let n2: u64 = id2.strip_prefix("cli-").unwrap().parse().unwrap();
+        let n3: u64 = id3.strip_prefix("cli-").unwrap().parse().unwrap();
+        assert!(n2 > n1);
+        assert!(n3 > n2);
+    }
+
+    // --- print functions don't panic ---
+
+    #[test]
+    fn print_help_does_not_panic() {
+        // Just verifying it does not panic; output goes to stderr.
+        print_help();
+    }
+
+    #[test]
+    fn print_unsupported_does_not_panic() {
+        print_unsupported("bogus");
+    }
+
+    #[test]
+    fn print_worktree_table_does_not_panic() {
+        let worktrees = vec![
+            cella_port::protocol::WorktreeEntry {
+                branch: Some("main".to_string()),
+                worktree_path: "/home/user/project".to_string(),
+                is_main: true,
+                container_name: Some("project-main".to_string()),
+                container_state: Some("running".to_string()),
+            },
+            cella_port::protocol::WorktreeEntry {
+                branch: Some("feat/auth".to_string()),
+                worktree_path: "/home/user/project-auth".to_string(),
+                is_main: false,
+                container_name: None,
+                container_state: None,
+            },
+            cella_port::protocol::WorktreeEntry {
+                branch: None,
+                worktree_path: "/home/user/project-detached".to_string(),
+                is_main: false,
+                container_name: Some("detached-ctr".to_string()),
+                container_state: Some("exited".to_string()),
+            },
+        ];
+        print_worktree_table(&worktrees);
+    }
+
+    #[test]
+    fn parse_h_flag() {
+        let args: Vec<String> = ["cella", "-h"].iter().map(ToString::to_string).collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_branch_name_starting_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "branch", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_exec_branch_starting_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "exec", "--bad", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_prune_all_and_dry_run() {
+        let args: Vec<String> = ["cella", "prune", "--all", "--dry-run"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(
+            cmd,
+            CliCommand::Prune {
+                dry_run: true,
+                all: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_up_rebuild() {
+        let args: Vec<String> = ["cella", "up", "my-branch", "--rebuild"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Up { branch, rebuild: true } if branch == "my-branch"));
+    }
+
+    #[test]
+    fn parse_doctor_command() {
+        let args: Vec<String> = ["cella", "doctor"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Doctor));
+    }
+
+    #[test]
+    fn parse_branch_base_missing_value_shows_help() {
+        let args: Vec<String> = ["cella", "branch", "my-branch", "--base"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_branch_base_value_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "branch", "my-branch", "--base", "--other"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_branch_ignores_unknown_flags() {
+        let args: Vec<String> = ["cella", "branch", "my-branch", "--unknown"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(
+            matches!(cmd, CliCommand::Branch { name, base } if name == "my-branch" && base.is_none())
+        );
+    }
+
+    #[test]
+    fn parse_exec_branch_is_separator_shows_help() {
+        let args: Vec<String> = ["cella", "exec", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_exec_empty_command_after_separator_shows_help() {
+        let args: Vec<String> = ["cella", "exec", "feat/x", "--"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_exec_no_branch_shows_help() {
+        let args: Vec<String> = ["cella", "exec"].iter().map(ToString::to_string).collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_down_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "down", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_up_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "up", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_switch_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "switch", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_run_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "task", "run", "--bad", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_run_branch_is_separator_shows_help() {
+        let args: Vec<String> = ["cella", "task", "run", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_run_base_missing_value_shows_help() {
+        let args: Vec<String> = ["cella", "task", "run", "feat/x", "--base", "--", "ls"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_wait_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "task", "wait", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_stop_branch_starts_with_dash_shows_help() {
+        let args: Vec<String> = ["cella", "task", "stop", "--bad"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_logs_only_flags_shows_help() {
+        // Only -f, no branch name
+        let args: Vec<String> = ["cella", "task", "logs", "-f"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn timeout_constants_ordering() {
+        assert!(TIMEOUT_FAST < TIMEOUT_MEDIUM);
+        assert!(TIMEOUT_MEDIUM < TIMEOUT_SLOW);
+    }
+
+    #[test]
+    fn timeout_fast_is_30s() {
+        assert_eq!(TIMEOUT_FAST, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn timeout_medium_is_120s() {
+        assert_eq!(TIMEOUT_MEDIUM, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn timeout_slow_is_600s() {
+        assert_eq!(TIMEOUT_SLOW, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn print_worktree_table_empty() {
+        // Should not panic on empty slice.
+        print_worktree_table(&[]);
+    }
 }

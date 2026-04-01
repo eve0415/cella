@@ -196,4 +196,52 @@ mod tests {
         );
         assert_eq!(extract_mount_target("source=/a"), None);
     }
+
+    #[test]
+    fn test_desktop_ssh_forwarding_returns_docker_desktop_path() {
+        let fwd = desktop_ssh_forwarding(None);
+        assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
+        assert_eq!(fwd.mount_target, "/run/host-services/ssh-auth.sock");
+        assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
+    }
+
+    #[test]
+    fn test_desktop_ssh_forwarding_with_socket_ignores_it() {
+        let host = "/tmp/ssh.sock".to_string();
+        let fwd = desktop_ssh_forwarding(Some(&host));
+        assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
+        assert_eq!(fwd.mount_target, "/run/host-services/ssh-auth.sock");
+        assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
+    }
+
+    #[test]
+    fn test_direct_ssh_forwarding_none_returns_none() {
+        assert!(direct_ssh_forwarding(None).is_none());
+    }
+
+    #[test]
+    fn test_direct_ssh_forwarding_nonexistent_returns_none() {
+        assert!(direct_ssh_forwarding(Some("/nonexistent/path/to/ssh.sock".to_string())).is_none());
+    }
+
+    #[test]
+    fn test_extract_mount_target_destination_key() {
+        assert_eq!(
+            extract_mount_target("source=/a,destination=/b"),
+            Some("/b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mount_target_no_match() {
+        assert_eq!(extract_mount_target("type=bind,source=/a"), None);
+    }
+
+    #[test]
+    fn test_no_override_empty_mounts() {
+        let config = json!({
+            "mounts": []
+        });
+        assert!(!has_user_ssh_override(&config));
+    }
 }

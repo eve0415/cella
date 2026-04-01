@@ -325,3 +325,98 @@ pub async fn run_standalone(poll_interval: Duration) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use cella_port::protocol::BindAddress;
+    use std::collections::HashSet;
+
+    fn make_listener(port: u16, protocol: PortProtocol) -> DetectedListener {
+        DetectedListener {
+            port,
+            protocol,
+            bind: BindAddress::All,
+            inode: u64::from(port),
+        }
+    }
+
+    #[test]
+    fn collect_closed_keys_empty_known() {
+        let known = HashMap::new();
+        let current = HashSet::new();
+        let closed = collect_closed_keys(&known, &current);
+        assert!(closed.is_empty());
+    }
+
+    #[test]
+    fn collect_closed_keys_nothing_closed() {
+        let l1 = make_listener(8080, PortProtocol::Tcp);
+        let l2 = make_listener(3000, PortProtocol::Tcp);
+        let mut known = HashMap::new();
+        known.insert((l1.port, l1.protocol), l1.clone());
+        known.insert((l2.port, l2.protocol), l2.clone());
+
+        let mut current = HashSet::new();
+        current.insert(l1);
+        current.insert(l2);
+
+        let closed = collect_closed_keys(&known, &current);
+        assert!(closed.is_empty());
+    }
+
+    #[test]
+    fn collect_closed_keys_one_closed() {
+        let l1 = make_listener(8080, PortProtocol::Tcp);
+        let l2 = make_listener(3000, PortProtocol::Tcp);
+        let mut known = HashMap::new();
+        known.insert((l1.port, l1.protocol), l1.clone());
+        known.insert((l2.port, l2.protocol), l2);
+
+        // Only l1 remains in current.
+        let mut current = HashSet::new();
+        current.insert(l1);
+
+        let closed = collect_closed_keys(&known, &current);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0], (3000, PortProtocol::Tcp));
+    }
+
+    #[test]
+    fn collect_closed_keys_all_closed() {
+        let l1 = make_listener(8080, PortProtocol::Tcp);
+        let l2 = make_listener(9090, PortProtocol::Tcp);
+        let mut known = HashMap::new();
+        known.insert((l1.port, l1.protocol), l1);
+        known.insert((l2.port, l2.protocol), l2);
+
+        let current = HashSet::new();
+        let closed = collect_closed_keys(&known, &current);
+        assert_eq!(closed.len(), 2);
+        assert!(closed.contains(&(8080, PortProtocol::Tcp)));
+        assert!(closed.contains(&(9090, PortProtocol::Tcp)));
+    }
+
+    #[test]
+    fn collect_closed_keys_different_protocols() {
+        let tcp = make_listener(8080, PortProtocol::Tcp);
+        let udp = DetectedListener {
+            port: 8080,
+            protocol: PortProtocol::Udp,
+            bind: BindAddress::All,
+            inode: 8081,
+        };
+        let mut known = HashMap::new();
+        known.insert((tcp.port, tcp.protocol), tcp.clone());
+        known.insert((udp.port, udp.protocol), udp);
+
+        // Only TCP remains, UDP should be closed.
+        let mut current = HashSet::new();
+        current.insert(tcp);
+
+        let closed = collect_closed_keys(&known, &current);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0], (8080, PortProtocol::Udp));
+    }
+}

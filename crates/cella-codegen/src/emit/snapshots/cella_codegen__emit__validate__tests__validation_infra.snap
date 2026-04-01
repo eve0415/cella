@@ -1,7 +1,6 @@
 ---
 source: crates/cella-codegen/src/emit/validate.rs
-assertion_line: 526
-expression: fmt(tokens)
+expression: fmt(&tokens)
 ---
 #[derive(Debug, Clone)]
 pub struct ValidationError {

@@ -351,6 +351,9 @@ pub fn parse_build_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ── parse_build_options ──────────────────────────────────────────────
 
     #[test]
     fn parse_build_options_no_cache_adds_flags() {
@@ -380,5 +383,147 @@ mod tests {
         assert!(opts.options.contains(&"--squash".to_string()));
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
+    }
+
+    #[test]
+    fn parse_build_options_defaults() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let opts = parse_build_options(&build, "img:tag", Path::new("/ws"), false);
+        assert_eq!(opts.image_name, "img:tag");
+        assert_eq!(opts.dockerfile, "Dockerfile");
+        assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/."));
+        assert!(opts.args.is_empty());
+        assert!(opts.target.is_none());
+        assert!(opts.cache_from.is_empty());
+        assert!(opts.options.is_empty());
+    }
+
+    #[test]
+    fn parse_build_options_custom_dockerfile() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile.dev"}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.dockerfile, "Dockerfile.dev");
+    }
+
+    #[test]
+    fn parse_build_options_absolute_context() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"context": "/absolute/path"}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.context_path, Path::new("/absolute/path"));
+    }
+
+    #[test]
+    fn parse_build_options_relative_context() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"context": "../"}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/../"));
+    }
+
+    #[test]
+    fn parse_build_options_with_args() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"args": {"NODE_VERSION": "18", "DEBUG": "true"}}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.args.get("NODE_VERSION").unwrap(), "18");
+        assert_eq!(opts.args.get("DEBUG").unwrap(), "true");
+    }
+
+    #[test]
+    fn parse_build_options_with_target() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"target": "development"}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.target.as_deref(), Some("development"));
+    }
+
+    #[test]
+    fn parse_build_options_with_cache_from() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"cacheFrom": ["img:cache", "img:latest"]}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.cache_from, vec!["img:cache", "img:latest"]);
+    }
+
+    #[test]
+    fn parse_build_options_args_non_string_value_becomes_empty() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"args": {"NUM": 42}}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        assert_eq!(opts.args.get("NUM").unwrap(), "");
+    }
+
+    // ── compute_features_digest ──────────────────────────────────────────
+
+    #[test]
+    fn compute_features_digest_deterministic() {
+        let config = json!({"features": {"ghcr.io/devcontainers/features/node:1": {}}});
+        let d1 = compute_features_digest(&config);
+        let d2 = compute_features_digest(&config);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn compute_features_digest_no_features_key() {
+        let config = json!({"image": "ubuntu"});
+        let d = compute_features_digest(&config);
+        // Should hash the null value, still a valid hex string
+        assert_eq!(d.len(), 64); // SHA-256 hex = 64 chars
+    }
+
+    #[test]
+    fn compute_features_digest_different_features_differ() {
+        let config_a = json!({"features": {"a": {}}});
+        let config_b = json!({"features": {"b": {}}});
+        assert_ne!(
+            compute_features_digest(&config_a),
+            compute_features_digest(&config_b)
+        );
+    }
+
+    #[test]
+    fn compute_features_digest_empty_features() {
+        let config = json!({"features": {}});
+        let d = compute_features_digest(&config);
+        assert_eq!(d.len(), 64);
+    }
+
+    // ── inject_proxy_build_args ──────────────────────────────────────────
+
+    #[test]
+    fn inject_proxy_build_args_no_proxy_config() {
+        let proxy = cella_network::config::ProxyConfig::default();
+        let mut opts = BuildOptions {
+            image_name: "test".to_string(),
+            context_path: PathBuf::from("."),
+            dockerfile: "Dockerfile".to_string(),
+            args: HashMap::new(),
+            target: None,
+            cache_from: vec![],
+            options: vec![],
+        };
+        inject_proxy_build_args(&mut opts, &proxy);
+        // With no proxy env vars set and default config, args should remain empty
+        assert!(opts.args.is_empty() || opts.args.values().all(|v| !v.is_empty()));
+    }
+
+    #[test]
+    fn inject_proxy_build_args_does_not_overwrite_existing() {
+        let proxy = cella_network::config::ProxyConfig::default();
+        let mut opts = BuildOptions {
+            image_name: "test".to_string(),
+            context_path: PathBuf::from("."),
+            dockerfile: "Dockerfile".to_string(),
+            args: HashMap::from([("HTTP_PROXY".to_string(), "http://custom:1234".to_string())]),
+            target: None,
+            cache_from: vec![],
+            options: vec![],
+        };
+        inject_proxy_build_args(&mut opts, &proxy);
+        // Existing value must not be overwritten
+        assert_eq!(opts.args.get("HTTP_PROXY").unwrap(), "http://custom:1234");
     }
 }

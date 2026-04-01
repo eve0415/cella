@@ -420,7 +420,7 @@ mod tests {
     use bollard::models::{
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
-    use cella_backend::ContainerBackend;
+    use cella_backend::{ComposeBackend, ContainerBackend};
 
     use super::*;
     use crate::client::mock::{MockCall, MockDockerClient};
@@ -977,5 +977,551 @@ mod tests {
             }
             other => panic!("expected ContainerLogs, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional edge case tests for container_info_from_summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summary_all_fields_none() {
+        let summary = ContainerSummary::default();
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.id, "");
+        assert_eq!(info.name, "");
+        assert!(info.labels.is_empty());
+        assert!(info.config_hash.is_none());
+        assert!(info.ports.is_empty());
+        assert!(info.created_at.is_none());
+        assert!(info.image.is_none());
+        assert_eq!(info.state, ContainerState::Other("unknown".to_string()));
+        assert_eq!(info.backend, BackendKind::Docker);
+    }
+
+    #[test]
+    fn summary_multiple_names_takes_first() {
+        let summary = make_summary(
+            Some("id"),
+            Some(vec!["/first", "/second", "/third"]),
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.name, "first");
+    }
+
+    #[test]
+    fn summary_name_without_leading_slash() {
+        let summary = make_summary(
+            Some("id"),
+            Some(vec!["no-slash"]),
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.name, "no-slash");
+    }
+
+    #[test]
+    fn summary_multiple_ports() {
+        let ports = vec![
+            PortSummary {
+                private_port: 80,
+                public_port: Some(8080),
+                typ: Some(PortSummaryTypeEnum::TCP),
+                ip: None,
+            },
+            PortSummary {
+                private_port: 443,
+                public_port: Some(8443),
+                typ: Some(PortSummaryTypeEnum::TCP),
+                ip: None,
+            },
+            PortSummary {
+                private_port: 53,
+                public_port: None,
+                typ: Some(PortSummaryTypeEnum::UDP),
+                ip: None,
+            },
+        ];
+
+        let summary = make_summary(
+            Some("multi-port"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            Some(ports),
+            None,
+        );
+
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.ports.len(), 3);
+    }
+
+    #[test]
+    fn summary_empty_labels_no_config_hash() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            Some(HashMap::new()),
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.labels.is_empty());
+        assert!(info.config_hash.is_none());
+    }
+
+    #[test]
+    fn summary_exited_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::EXITED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Stopped);
+    }
+
+    #[test]
+    fn summary_created_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::CREATED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Created);
+    }
+
+    #[test]
+    fn summary_exit_code_is_always_none() {
+        // container_info_from_summary doesn't have access to exit codes
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::EXITED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.exit_code.is_none());
+    }
+
+    #[test]
+    fn summary_container_user_is_always_none() {
+        // container_info_from_summary doesn't parse user info
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.container_user.is_none());
+    }
+
+    #[test]
+    fn summary_mounts_always_empty() {
+        // Summary-based info doesn't include mount details
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.mounts.is_empty());
+    }
+
+    #[test]
+    fn summary_created_at_none_when_no_timestamp() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(info.created_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ContainerState::parse additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_str_paused() {
+        // "paused" is not explicitly mapped, should become Other
+        assert_eq!(
+            ContainerState::parse("paused"),
+            ContainerState::Other("paused".to_string())
+        );
+    }
+
+    #[test]
+    fn from_str_empty_string() {
+        assert_eq!(
+            ContainerState::parse(""),
+            ContainerState::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn from_str_case_sensitive() {
+        // "Running" with capital R should be Other (not Running)
+        assert_eq!(
+            ContainerState::parse("Running"),
+            ContainerState::Other("Running".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // container_state_from_bollard additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_bollard_paused_becomes_other() {
+        let state = container_state_from_bollard(ContainerStateStatusEnum::PAUSED);
+        assert!(matches!(state, ContainerState::Other(_)));
+    }
+
+    #[test]
+    fn from_bollard_restarting_becomes_other() {
+        let state = container_state_from_bollard(ContainerStateStatusEnum::RESTARTING);
+        assert!(matches!(state, ContainerState::Other(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock-based compose container operation tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn find_compose_container_returns_none_when_no_match() {
+        let mock = MockDockerClient::new();
+        mock.find_compose_container_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(None));
+
+        let result = mock
+            .find_compose_container("my-project", "web")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        let calls = mock.get_calls();
+        assert!(matches!(calls[0], MockCall::FindComposeContainer { .. }));
+    }
+
+    #[tokio::test]
+    async fn find_compose_container_returns_some() {
+        let mock = MockDockerClient::new();
+        let info = sample_container_info("comp-1", "my-project-web-1", ContainerState::Running);
+        mock.find_compose_container_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(info)));
+
+        let result = mock
+            .find_compose_container("my-project", "web")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.id, "comp-1");
+        assert_eq!(result.name, "my-project-web-1");
+    }
+
+    #[tokio::test]
+    async fn list_compose_containers_returns_empty() {
+        let mock = MockDockerClient::new();
+        mock.list_compose_containers_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(Vec::new()));
+
+        let result = mock.list_compose_containers("my-project").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_compose_containers_returns_multiple() {
+        let mock = MockDockerClient::new();
+        let containers = vec![
+            sample_container_info("c1", "proj-web-1", ContainerState::Running),
+            sample_container_info("c2", "proj-db-1", ContainerState::Running),
+        ];
+        mock.list_compose_containers_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(containers));
+
+        let result = mock.list_compose_containers("proj").await.unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock-based exec tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn exec_command_records_correct_call() {
+        let mock = MockDockerClient::new();
+        mock.exec_command_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(cella_backend::ExecResult {
+                exit_code: 0,
+                stdout: "hello\n".to_string(),
+                stderr: String::new(),
+            }));
+
+        let opts = cella_backend::ExecOptions {
+            cmd: vec!["echo".to_string(), "hello".to_string()],
+            user: None,
+            env: None,
+            working_dir: None,
+        };
+        let result = mock.exec_command("test-container", &opts).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+
+        let calls = mock.get_calls();
+        match &calls[0] {
+            MockCall::ExecCommand { container_id, cmd } => {
+                assert_eq!(container_id, "test-container");
+                assert_eq!(cmd, &["echo", "hello"]);
+            }
+            other => panic!("expected ExecCommand, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_detached_returns_exec_id() {
+        let mock = MockDockerClient::new();
+        mock.exec_detached_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok("exec-id-123".to_string()));
+
+        let opts = cella_backend::ExecOptions {
+            cmd: vec!["sleep".to_string(), "infinity".to_string()],
+            user: None,
+            env: None,
+            working_dir: None,
+        };
+        let exec_id = mock.exec_detached("container-1", &opts).await.unwrap();
+        assert_eq!(exec_id, "exec-id-123");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock-based image tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pull_image_records_call() {
+        let mock = MockDockerClient::new();
+        mock.pull_image_responses.lock().unwrap().push_back(Ok(()));
+
+        mock.pull_image("ubuntu:22.04").await.unwrap();
+
+        let calls = mock.get_calls();
+        match &calls[0] {
+            MockCall::PullImage { image } => {
+                assert_eq!(image, "ubuntu:22.04");
+            }
+            other => panic!("expected PullImage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_exists_returns_true() {
+        let mock = MockDockerClient::new();
+        mock.image_exists_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(true));
+
+        let exists = mock.image_exists("alpine:3").await.unwrap();
+        assert!(exists);
+    }
+
+    #[tokio::test]
+    async fn image_exists_returns_false() {
+        let mock = MockDockerClient::new();
+        mock.image_exists_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(false));
+
+        let exists = mock.image_exists("nonexistent:latest").await.unwrap();
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_details_returns_details() {
+        let mock = MockDockerClient::new();
+        mock.inspect_image_details_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(cella_backend::ImageDetails {
+                user: "vscode".to_string(),
+                env: vec!["PATH=/usr/local/bin".to_string()],
+                metadata: Some("{\"remoteUser\":\"vscode\"}".to_string()),
+            }));
+
+        let details = mock.inspect_image_details("ubuntu:latest").await.unwrap();
+        assert_eq!(details.user, "vscode");
+        assert_eq!(details.env.len(), 1);
+        assert!(details.metadata.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock-based upload tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_files_records_call() {
+        let mock = MockDockerClient::new();
+        mock.upload_files_responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(()));
+
+        let files = vec![cella_backend::FileToUpload {
+            path: "/tmp/test.txt".to_string(),
+            content: b"hello".to_vec(),
+            mode: 0o644,
+        }];
+        mock.upload_files("container-1", &files).await.unwrap();
+
+        let calls = mock.get_calls();
+        match &calls[0] {
+            MockCall::UploadFiles {
+                container_id,
+                count,
+            } => {
+                assert_eq!(container_id, "container-1");
+                assert_eq!(*count, 1);
+            }
+            other => panic!("expected UploadFiles, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // container_info_from_summary additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summary_dead_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::DEAD),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Stopped);
+    }
+
+    #[test]
+    fn summary_removing_state() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::REMOVING),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.state, ContainerState::Removing);
+    }
+
+    #[test]
+    fn summary_paused_state_becomes_other() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::PAUSED),
+            None,
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+        assert!(matches!(info.state, ContainerState::Other(_)));
+    }
+
+    #[test]
+    fn summary_backend_is_always_docker() {
+        let summary = ContainerSummary::default();
+        let info = container_info_from_summary(summary);
+        assert_eq!(info.backend, BackendKind::Docker);
+    }
+
+    #[test]
+    fn summary_negative_timestamp() {
+        // Negative timestamps are valid Unix timestamps (before epoch)
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            Some(-1),
+        );
+        let info = container_info_from_summary(summary);
+        // Should still produce a created_at value (as string representation)
+        assert!(info.created_at.is_some());
+    }
+
+    #[test]
+    fn summary_zero_timestamp() {
+        let summary = make_summary(
+            Some("id"),
+            None,
+            None,
+            Some(ContainerSummaryStateEnum::RUNNING),
+            None,
+            None,
+            Some(0),
+        );
+        let info = container_info_from_summary(summary);
+        let created = info.created_at.unwrap();
+        assert!(created.contains("1970"), "epoch should be 1970: {created}");
     }
 }

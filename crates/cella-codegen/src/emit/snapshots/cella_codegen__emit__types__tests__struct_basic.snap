@@ -1,7 +1,6 @@
 ---
 source: crates/cella-codegen/src/emit/types.rs
-assertion_line: 181
-expression: fmt(tokens)
+expression: fmt(&tokens)
 ---
 #[derive(Debug, Clone)]
 pub struct Foo {

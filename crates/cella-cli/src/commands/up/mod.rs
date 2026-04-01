@@ -1653,3 +1653,136 @@ async fn restart_agent_in_container(client: &DockerClient, container_id: &str) {
         Err(e) => warn!("Failed to restart agent in container: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── map_env_object ─────────────────────────────────────────────
+
+    #[test]
+    fn map_env_object_none() {
+        let result = map_env_object(None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_null_value() {
+        let val = serde_json::Value::Null;
+        let result = map_env_object(Some(&val));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_with_entries() {
+        let val = serde_json::json!({
+            "FOO": "bar",
+            "BAZ": "qux"
+        });
+        let result = map_env_object(Some(&val));
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"FOO=bar".to_string()));
+        assert!(result.contains(&"BAZ=qux".to_string()));
+    }
+
+    #[test]
+    fn map_env_object_empty_object() {
+        let val = serde_json::json!({});
+        let result = map_env_object(Some(&val));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn map_env_object_with_null_values() {
+        let val = serde_json::json!({
+            "FOO": "bar",
+            "SKIP": null
+        });
+        let result = map_env_object(Some(&val));
+        // null values are typically filtered out
+        assert!(result.iter().any(|e| e.starts_with("FOO=")));
+    }
+
+    // ── output_result ──────────────────────────────────────────────
+
+    #[test]
+    fn output_result_text_mode_does_not_panic() {
+        // Text mode writes to stderr, just verify it doesn't panic
+        output_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+        );
+    }
+
+    #[test]
+    fn output_result_json_mode_does_not_panic() {
+        // JSON mode writes to stdout, just verify it doesn't panic
+        output_result(
+            &OutputFormat::Json,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+        );
+    }
+
+    // ── resolve_remote_user ────────────────────────────────────────
+
+    #[test]
+    fn resolve_remote_user_from_config() {
+        let config = serde_json::json!({
+            "remoteUser": "devuser"
+        });
+        let user = resolve_remote_user(&config, None, "root");
+        assert_eq!(user, "devuser");
+    }
+
+    #[test]
+    fn resolve_remote_user_container_user_fallback() {
+        let config = serde_json::json!({
+            "containerUser": "containeruser"
+        });
+        let user = resolve_remote_user(&config, None, "root");
+        assert_eq!(user, "containeruser");
+    }
+
+    #[test]
+    fn resolve_remote_user_fallback_to_default() {
+        let config = serde_json::json!({});
+        let user = resolve_remote_user(&config, None, "root");
+        assert_eq!(user, "root");
+    }
+
+    #[test]
+    fn resolve_remote_user_remote_user_takes_priority() {
+        let config = serde_json::json!({
+            "remoteUser": "remote",
+            "containerUser": "container"
+        });
+        let user = resolve_remote_user(&config, None, "root");
+        assert_eq!(user, "remote");
+    }
+
+    // ── UpArgs::is_text_output ─────────────────────────────────────
+
+    #[test]
+    fn up_args_text_output() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "up"]).unwrap();
+        if let crate::commands::Command::Up(args) = &cli.command {
+            assert!(args.is_text_output());
+        }
+    }
+
+    #[test]
+    fn up_args_json_output() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "up", "--output", "json"]).unwrap();
+        if let crate::commands::Command::Up(args) = &cli.command {
+            assert!(!args.is_text_output());
+        }
+    }
+}

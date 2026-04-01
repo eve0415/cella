@@ -205,4 +205,131 @@ mod tests {
             "filesystem probe"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // build_candidate_paths tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_candidate_paths_at_least_two_entries() {
+        let home = Path::new("/home/user");
+        let paths = build_candidate_paths(home);
+        // Should always have at least colima + rancher
+        assert!(
+            paths.len() >= 2,
+            "expected at least 2 candidate paths, got {}",
+            paths.len()
+        );
+    }
+
+    #[test]
+    fn build_candidate_paths_colima_is_first() {
+        let home = Path::new("/home/user");
+        let paths = build_candidate_paths(home);
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/home/user/.colima/default/docker.sock")
+        );
+    }
+
+    #[test]
+    fn build_candidate_paths_rancher_is_second() {
+        let home = Path::new("/home/user");
+        let paths = build_candidate_paths(home);
+        assert_eq!(paths[1], PathBuf::from("/home/user/.rd/docker.sock"));
+    }
+
+    #[test]
+    fn build_candidate_paths_uses_home_prefix() {
+        let home = Path::new("/Users/developer");
+        let paths = build_candidate_paths(home);
+        assert!(paths[0].starts_with("/Users/developer"));
+        assert!(paths[1].starts_with("/Users/developer"));
+    }
+
+    // -----------------------------------------------------------------------
+    // discovery_failure_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discovery_failure_message_contains_checked_section() {
+        let msg = discovery_failure_message();
+        assert!(msg.contains("Checked:"));
+        assert!(msg.contains("/var/run/docker.sock"));
+    }
+
+    #[test]
+    fn discovery_failure_message_contains_docker_context() {
+        let msg = discovery_failure_message();
+        assert!(msg.contains("docker context inspect"));
+    }
+
+    #[test]
+    fn discovery_failure_message_contains_suggestions_section() {
+        let msg = discovery_failure_message();
+        assert!(msg.contains("Suggestions:"));
+    }
+
+    #[test]
+    fn discovery_failure_message_mentions_docker_host_flag() {
+        let msg = discovery_failure_message();
+        assert!(msg.contains("--docker-host"));
+    }
+
+    #[test]
+    fn discovery_failure_message_mentions_all_runtimes() {
+        let msg = discovery_failure_message();
+        assert!(msg.contains("Docker Desktop"));
+        assert!(msg.contains("Colima"));
+        assert!(msg.contains("Podman"));
+        assert!(msg.contains("Rancher Desktop"));
+    }
+
+    #[test]
+    fn discovery_failure_message_starts_with_error_description() {
+        let msg = discovery_failure_message();
+        assert!(msg.starts_with("could not connect"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DiscoveredSocket tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discovered_socket_debug_impl() {
+        let socket = DiscoveredSocket {
+            path: PathBuf::from("/var/run/docker.sock"),
+            method: DiscoveryMethod::FilesystemProbe,
+        };
+        let debug_str = format!("{socket:?}");
+        assert!(debug_str.contains("docker.sock"));
+        assert!(debug_str.contains("FilesystemProbe"));
+    }
+
+    #[test]
+    fn discovered_socket_clone() {
+        let socket = DiscoveredSocket {
+            path: PathBuf::from("/tmp/test.sock"),
+            method: DiscoveryMethod::DockerContext,
+        };
+        let cloned = socket.clone();
+        assert_eq!(cloned.path, socket.path);
+        assert!(matches!(cloned.method, DiscoveryMethod::DockerContext));
+    }
+
+    #[test]
+    fn discovery_method_clone() {
+        let method = DiscoveryMethod::FilesystemProbe;
+        // Clone and verify both copies produce the same display output
+        let cloned = Clone::clone(&method);
+        assert_eq!(method.to_string(), cloned.to_string());
+    }
+
+    #[test]
+    fn discovery_method_debug() {
+        let context = DiscoveryMethod::DockerContext;
+        let probe = DiscoveryMethod::FilesystemProbe;
+        assert!(format!("{context:?}").contains("DockerContext"));
+        assert!(format!("{probe:?}").contains("FilesystemProbe"));
+    }
 }

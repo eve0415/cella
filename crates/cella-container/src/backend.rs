@@ -87,6 +87,11 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            // Ensure the staging directory exists before creating the container,
+            // since it is mounted as a volume.
+            let staging_dir = self.staging_base.join(&opts.name);
+            tokio::fs::create_dir_all(&staging_dir).await?;
+
             let args = build_create_args(opts, &self.staging_base);
             debug!(?args, "container create arguments");
             self.cli.create(&args).await
@@ -994,5 +999,390 @@ mod tests {
 
         // Should not panic — just emits warnings.
         emit_unsupported_warnings(&opts);
+    }
+
+    // -- Additional build_create_args edge cases ------------------------------
+
+    #[test]
+    fn build_create_args_with_additional_mounts() {
+        let mut opts = minimal_create_opts();
+        opts.mounts = vec![
+            MountConfig {
+                mount_type: "bind".to_string(),
+                source: "/host/data".to_string(),
+                target: "/data".to_string(),
+                consistency: None,
+            },
+            MountConfig {
+                mount_type: "volume".to_string(),
+                source: "vol1".to_string(),
+                target: "/vol".to_string(),
+                consistency: None,
+            },
+        ];
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let vol_args: Vec<&str> = args
+            .windows(2)
+            .filter_map(|w| {
+                if w[0] == "--volume" {
+                    Some(w[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            vol_args.contains(&"/host/data:/data"),
+            "expected /host/data:/data mount, got: {vol_args:?}"
+        );
+        assert!(
+            vol_args.contains(&"vol1:/vol"),
+            "expected vol1:/vol mount, got: {vol_args:?}"
+        );
+    }
+
+    #[test]
+    fn build_create_args_port_with_host_ip() {
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "443/tcp".to_string(),
+            vec![PortForward {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some("8443".to_string()),
+            }],
+        );
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let port_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[port_idx + 1], "127.0.0.1:8443:443/tcp");
+    }
+
+    #[test]
+    fn build_create_args_port_with_host_ip_only() {
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "80/tcp".to_string(),
+            vec![PortForward {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: None,
+            }],
+        );
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let port_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[port_idx + 1], "0.0.0.0::80/tcp");
+    }
+
+    #[test]
+    fn build_create_args_port_no_host() {
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "5432/tcp".to_string(),
+            vec![PortForward {
+                host_ip: None,
+                host_port: None,
+            }],
+        );
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let port_idx = args.iter().position(|a| a == "-p").unwrap();
+        // When both host_ip and host_port are None, just the container port.
+        assert_eq!(args[port_idx + 1], "5432/tcp");
+    }
+
+    #[test]
+    fn build_create_args_multiple_port_forwards() {
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "8080/tcp".to_string(),
+            vec![
+                PortForward {
+                    host_ip: None,
+                    host_port: Some("3000".to_string()),
+                },
+                PortForward {
+                    host_ip: None,
+                    host_port: Some("3001".to_string()),
+                },
+            ],
+        );
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let port_count = args.iter().filter(|a| *a == "-p").count();
+        assert_eq!(port_count, 2);
+    }
+
+    #[test]
+    fn build_create_args_empty_entrypoint_is_skipped() {
+        let mut opts = minimal_create_opts();
+        opts.entrypoint = Some(Vec::new());
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        assert!(
+            !args.contains(&"--entrypoint".to_string()),
+            "empty entrypoint should be skipped"
+        );
+    }
+
+    #[test]
+    fn build_create_args_none_entrypoint_is_skipped() {
+        let opts = minimal_create_opts();
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        assert!(
+            !args.contains(&"--entrypoint".to_string()),
+            "None entrypoint should be skipped"
+        );
+    }
+
+    // -- Additional entry_to_container_info edge cases ------------------------
+
+    #[test]
+    fn entry_to_container_info_with_ports() {
+        let entry = ContainerListEntry {
+            status: Some(crate::sdk::types::ContainerStatus {
+                state: Some("running".to_string()),
+                exit_code: None,
+            }),
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("p1".to_string()),
+                name: Some("with-ports".to_string()),
+                image: Some("nginx".to_string()),
+                labels: None,
+                published_ports: Some(vec![
+                    crate::sdk::types::PublishedPort {
+                        container_port: Some(80),
+                        host_port: Some(8080),
+                        protocol: Some("tcp".to_string()),
+                    },
+                    crate::sdk::types::PublishedPort {
+                        container_port: Some(443),
+                        host_port: None,
+                        protocol: None,
+                    },
+                    // Port entry missing container_port should be filtered out.
+                    crate::sdk::types::PublishedPort {
+                        container_port: None,
+                        host_port: Some(9999),
+                        protocol: None,
+                    },
+                ]),
+                mounts: None,
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.ports.len(), 2);
+        assert_eq!(info.ports[0].container_port, 80);
+        assert_eq!(info.ports[0].host_port, Some(8080));
+        assert_eq!(info.ports[0].protocol, "tcp");
+        assert_eq!(info.ports[1].container_port, 443);
+        assert_eq!(info.ports[1].host_port, None);
+        assert_eq!(info.ports[1].protocol, "tcp"); // default
+    }
+
+    #[test]
+    fn entry_to_container_info_with_mounts() {
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("m1".to_string()),
+                name: None,
+                image: None,
+                labels: None,
+                published_ports: None,
+                mounts: Some(vec![crate::sdk::types::MountEntry {
+                    source: Some("/host".to_string()),
+                    destination: Some("/container".to_string()),
+                    mount_type: Some("bind".to_string()),
+                }]),
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.mounts.len(), 1);
+        assert_eq!(info.mounts[0].source, "/host");
+        assert_eq!(info.mounts[0].destination, "/container");
+        assert_eq!(info.mounts[0].mount_type, "bind");
+    }
+
+    #[test]
+    fn entry_to_container_info_with_config_hash_label() {
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("h1".to_string()),
+                name: None,
+                image: None,
+                labels: Some(HashMap::from([(
+                    "dev.cella.config_hash".to_string(),
+                    "abc123hash".to_string(),
+                )])),
+                published_ports: None,
+                mounts: None,
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.config_hash.as_deref(), Some("abc123hash"));
+    }
+
+    #[test]
+    fn entry_to_container_info_with_created_at_label() {
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("ca1".to_string()),
+                name: None,
+                image: None,
+                labels: Some(HashMap::from([(
+                    "dev.cella.created_at".to_string(),
+                    "2026-01-01T00:00:00Z".to_string(),
+                )])),
+                published_ports: None,
+                mounts: None,
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn entry_to_container_info_unknown_state() {
+        let entry = ContainerListEntry {
+            status: Some(crate::sdk::types::ContainerStatus {
+                state: Some("paused".to_string()),
+                exit_code: None,
+            }),
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("u1".to_string()),
+                name: None,
+                image: None,
+                labels: None,
+                published_ports: None,
+                mounts: None,
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.state, ContainerState::Other("paused".to_string()));
+    }
+
+    #[test]
+    fn entry_to_container_info_no_status_defaults_to_unknown() {
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("ns1".to_string()),
+                name: None,
+                image: None,
+                labels: None,
+                published_ports: None,
+                mounts: None,
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.state, ContainerState::Other("unknown".to_string()));
+    }
+
+    #[test]
+    fn entry_to_container_info_empty_mount_fields() {
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(crate::sdk::types::ContainerConfiguration {
+                id: Some("em1".to_string()),
+                name: None,
+                image: None,
+                labels: None,
+                published_ports: None,
+                mounts: Some(vec![crate::sdk::types::MountEntry {
+                    source: None,
+                    destination: None,
+                    mount_type: None,
+                }]),
+            }),
+        };
+
+        let info = entry_to_container_info(&entry).unwrap();
+        assert_eq!(info.mounts.len(), 1);
+        assert_eq!(info.mounts[0].source, "");
+        assert_eq!(info.mounts[0].destination, "");
+        assert_eq!(info.mounts[0].mount_type, "");
+    }
+
+    // -- Additional parse_image_details_best_effort edge cases ----------------
+
+    #[test]
+    fn parse_image_details_lowercase_keys() {
+        let raw = r#"{
+            "config": {
+                "user": "app",
+                "env": ["PATH=/usr/bin"],
+                "labels": {
+                    "devcontainer.metadata": "[{}]"
+                }
+            }
+        }"#;
+        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        assert_eq!(user, "app");
+        assert_eq!(env, vec!["PATH=/usr/bin"]);
+        assert!(metadata.is_some());
+    }
+
+    #[test]
+    fn parse_image_details_container_config_key() {
+        let raw = r#"{
+            "container_config": {
+                "User": "deploy",
+                "Env": ["LANG=C"]
+            }
+        }"#;
+        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        assert_eq!(user, "deploy");
+        assert_eq!(env, vec!["LANG=C"]);
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn parse_image_details_user_with_colon() {
+        let raw = r#"{"Config": {"User": "1000:1000"}}"#;
+        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        assert_eq!(user, "1000");
+        assert!(env.is_empty());
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn parse_image_details_empty_user_stays_root() {
+        let raw = r#"{"Config": {"User": ""}}"#;
+        let (user, _, _) = parse_image_details_best_effort(raw);
+        assert_eq!(user, "root");
+    }
+
+    #[test]
+    fn parse_image_details_no_labels() {
+        let raw = r#"{"Config": {"User": "web", "Env": []}}"#;
+        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        assert_eq!(user, "web");
+        assert!(env.is_empty());
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn parse_image_details_env_with_non_string_values() {
+        let raw = r#"{"Config": {"Env": ["GOOD=val", 42, null]}}"#;
+        let (_, env, _) = parse_image_details_best_effort(raw);
+        // Only string values should be collected.
+        assert_eq!(env, vec!["GOOD=val"]);
     }
 }

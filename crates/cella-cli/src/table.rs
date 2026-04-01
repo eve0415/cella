@@ -238,7 +238,7 @@ mod tests {
         ]);
 
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME           ID      STATE
         short          abc123  running
         a-longer-name  def456  stopped
@@ -256,7 +256,7 @@ mod tests {
         // Terminal width forces shrinking: header "NAME" (4) + "ID" (6) + sep (2) = 12 min
         // Natural: 26 + 6 + 2 = 34. With term_width=20, excess=14.
         let output = table.render_with_width(Some(20));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME          ID
         a-very-long…  abc123
         ");
@@ -268,7 +268,7 @@ mod tests {
         table.add_row(vec!["short".to_string(), "abc".to_string()]);
 
         let output = table.render_with_width(Some(200));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME   ID
         short  abc
         ");
@@ -279,9 +279,7 @@ mod tests {
         let table = Table::new(vec![Column::fixed("NAME"), Column::fixed("STATE")]);
 
         let output = table.render_with_width(None);
-        insta::assert_snapshot!(output, @r"
-        NAME  STATE
-        ");
+        insta::assert_snapshot!(output, @"NAME  STATE");
     }
 
     #[test]
@@ -318,7 +316,7 @@ mod tests {
         // PATH reduction: floor(10 * 20 / 36) = 5 -> width 19
         // remaining: 10 - 4 - 5 = 1, goes to PATH (more available)
         let output = table.render_with_width(Some(41));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         NAME              ID   PATH
         name-that-is-tw…  abc  path-that-is-also…
         ");
@@ -336,9 +334,122 @@ mod tests {
         // Only X is shrinkable. Available: 20 - 1 = 19.
         // Reduction: min(12, 19) = 12. X width: 20 - 12 = 8.
         let output = table.render_with_width(Some(25));
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         LONGHEADER       X
         long-value-here  shrink-…
+        ");
+    }
+
+    #[test]
+    fn empty_columns_returns_empty_string() {
+        let table = Table::new(vec![]);
+        let output = table.render_with_width(None);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn single_column_no_separator() {
+        let mut table = Table::new(vec![Column::fixed("VALUE")]);
+        table.add_row(vec!["hello".to_string()]);
+        let output = table.render_with_width(None);
+        insta::assert_snapshot!(output, @"
+        VALUE
+        hello
+        ");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_width_1() {
+        let mut buf = String::new();
+        truncate_with_ellipsis(&mut buf, "hello world", 1);
+        assert_eq!(buf, "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_width_2() {
+        let mut buf = String::new();
+        truncate_with_ellipsis(&mut buf, "hello world", 2);
+        assert_eq!(buf, "h\u{2026}");
+    }
+
+    #[test]
+    fn column_effective_min_uses_header_length() {
+        let col = Column::fixed("NAME");
+        assert_eq!(col.effective_min(), 4);
+    }
+
+    #[test]
+    fn column_effective_min_uses_min_width_if_larger() {
+        let col = Column {
+            header: "X",
+            shrinkable: true,
+            min_width: 10,
+        };
+        assert_eq!(col.effective_min(), 10);
+    }
+
+    #[test]
+    fn column_effective_min_uses_header_if_longer() {
+        let col = Column {
+            header: "LONGHEADER",
+            shrinkable: true,
+            min_width: 3,
+        };
+        assert_eq!(col.effective_min(), 10);
+    }
+
+    #[test]
+    fn table_with_empty_values() {
+        let mut table = Table::new(vec![Column::fixed("A"), Column::fixed("B")]);
+        table.add_row(vec![String::new(), String::new()]);
+        let output = table.render_with_width(None);
+        // Should still render with proper spacing
+        assert!(output.contains('A'));
+        assert!(output.contains('B'));
+    }
+
+    #[test]
+    fn extreme_shrink_all_columns_to_min() {
+        let mut table = Table::new(vec![
+            Column::shrinkable("ABCDE"),
+            Column::shrinkable("FGHIJ"),
+        ]);
+        table.add_row(vec![
+            "very-long-value-here".to_string(),
+            "another-long-value".to_string(),
+        ]);
+        // Terminal width so small both columns shrink to header length
+        let output = table.render_with_width(Some(12));
+        // Both columns should be truncated
+        assert!(output.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn no_shrinkable_columns_excess_ignored() {
+        let mut table = Table::new(vec![Column::fixed("AAAA"), Column::fixed("BBBB")]);
+        table.add_row(vec![
+            "long-value-aaaa".to_string(),
+            "long-value-bbbb".to_string(),
+        ]);
+        // Even though term is narrow, fixed columns never shrink
+        let output = table.render_with_width(Some(10));
+        // Should still render full values without truncation
+        assert!(output.contains("long-value-aaaa"));
+        assert!(output.contains("long-value-bbbb"));
+    }
+
+    #[test]
+    fn multiple_rows_alignment() {
+        let mut table = Table::new(vec![Column::fixed("ID"), Column::fixed("NAME")]);
+        table.add_row(vec!["1".to_string(), "a".to_string()]);
+        table.add_row(vec!["22".to_string(), "bb".to_string()]);
+        table.add_row(vec!["333".to_string(), "ccc".to_string()]);
+        let output = table.render_with_width(None);
+        insta::assert_snapshot!(output, @"
+        ID   NAME
+        1    a
+        22   bb
+        333  ccc
         ");
     }
 }

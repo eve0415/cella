@@ -384,3 +384,75 @@ fn spawn_resize_handler(exec_id: &str, docker: &Docker, tty: bool) -> Option<Joi
         }
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cella_backend::ExecOptions;
+
+    #[test]
+    fn build_base_exec_options_minimal() {
+        let opts = ExecOptions {
+            cmd: vec!["echo".to_string(), "hello".to_string()],
+            user: None,
+            env: None,
+            working_dir: None,
+        };
+
+        let exec_opts = build_base_exec_options(&opts);
+
+        assert_eq!(exec_opts.cmd, Some(vec!["echo", "hello"]));
+        assert_eq!(exec_opts.user, None);
+        assert_eq!(exec_opts.working_dir, None);
+        assert_eq!(exec_opts.env, None);
+    }
+
+    #[test]
+    fn build_base_exec_options_with_all_fields() {
+        let opts = ExecOptions {
+            cmd: vec!["bash".to_string(), "-c".to_string(), "ls -la".to_string()],
+            user: Some("vscode".to_string()),
+            env: Some(vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]),
+            working_dir: Some("/workspace".to_string()),
+        };
+
+        let exec_opts = build_base_exec_options(&opts);
+
+        assert_eq!(exec_opts.cmd, Some(vec!["bash", "-c", "ls -la"]));
+        assert_eq!(exec_opts.user, Some("vscode"));
+        assert_eq!(exec_opts.working_dir, Some("/workspace"));
+        assert_eq!(exec_opts.env, Some(vec!["FOO=bar", "BAZ=qux"]));
+    }
+
+    #[test]
+    fn build_base_exec_options_empty_env_vs_none() {
+        // env: Some(vec![]) should produce Some(vec![]), not None
+        let opts = ExecOptions {
+            cmd: vec!["true".to_string()],
+            user: None,
+            env: Some(vec![]),
+            working_dir: None,
+        };
+
+        let exec_opts = build_base_exec_options(&opts);
+        assert_eq!(exec_opts.env, Some(vec![]));
+    }
+
+    #[test]
+    fn build_base_exec_options_defaults_not_attached() {
+        let opts = ExecOptions {
+            cmd: vec!["true".to_string()],
+            user: None,
+            env: None,
+            working_dir: None,
+        };
+
+        let exec_opts = build_base_exec_options(&opts);
+
+        // build_base_exec_options does NOT set attach flags -- callers do
+        assert_eq!(exec_opts.attach_stdout, None);
+        assert_eq!(exec_opts.attach_stderr, None);
+        assert_eq!(exec_opts.attach_stdin, None);
+        assert_eq!(exec_opts.tty, None);
+    }
+}

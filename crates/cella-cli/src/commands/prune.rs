@@ -282,7 +282,7 @@ mod tests {
         ];
 
         let output = format_candidates(&candidates);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         BRANCH    WORKTREE                              CONTAINER             STATE
         fix/typo  /workspaces/cella-worktrees/fix-typo  cella-fix-typo-abc12  stopped
         feat/old  /workspaces/cella-worktrees/feat-old  cella-feat-old-def34  running
@@ -300,7 +300,7 @@ mod tests {
         }];
 
         let output = format_candidates(&candidates);
-        insta::assert_snapshot!(output, @r"
+        insta::assert_snapshot!(output, @"
         BRANCH  WORKTREE           CONTAINER  STATE
         orphan  /worktrees/orphan  -          -
         ");
@@ -313,5 +313,50 @@ mod tests {
         // Only the header line
         assert_eq!(output.lines().count(), 1);
         assert!(output.starts_with("BRANCH"));
+    }
+
+    #[test]
+    fn format_candidates_long_paths() {
+        let candidates = vec![PruneCandidate {
+            branch: "feat/a-very-long-branch-name".to_string(),
+            worktree_path: PathBuf::from("/very/long/worktree/path/feat-a-very-long-branch-name"),
+            container_name: Some("cella-feat-long-branch-name-xyz99".to_string()),
+            container_id: Some("xyz99".to_string()),
+            container_state: Some("stopped".to_string()),
+        }];
+
+        let output = format_candidates(&candidates);
+        assert!(output.contains("feat/a-very-long-branch-name"));
+        assert!(output.contains("stopped"));
+    }
+
+    #[test]
+    fn print_json_result_empty() {
+        // Just verify it doesn't panic with empty inputs
+        print_json_result(&[], &[]);
+    }
+
+    #[test]
+    fn print_json_result_with_errors() {
+        // Verify it doesn't panic with error messages
+        print_json_result(&["main"], &["failed to remove worktree".to_string()]);
+    }
+
+    #[test]
+    fn prune_args_is_json_text() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "prune"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert!(!args.is_json());
+        }
+    }
+
+    #[test]
+    fn prune_args_is_json_json() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "prune", "--output", "json"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert!(args.is_json());
+        }
     }
 }

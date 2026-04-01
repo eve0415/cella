@@ -1,7 +1,6 @@
 ---
 source: crates/cella-codegen/src/emit/validate.rs
-assertion_line: 566
-expression: fmt(tokens)
+expression: fmt(&tokens)
 ---
 impl Strict {
     pub fn validate(

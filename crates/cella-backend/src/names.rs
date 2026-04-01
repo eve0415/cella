@@ -301,4 +301,46 @@ mod tests {
         let labels = worktree_labels("feature/auth/oauth2", &PathBuf::from("/tmp/repo"));
         assert_eq!(labels["dev.cella.branch"], "feature/auth/oauth2");
     }
+
+    #[test]
+    fn compose_project_name_format() {
+        let path = PathBuf::from("/tmp/my-project");
+        let name = compose_project_name(&path, Some("web"));
+        assert!(name.starts_with("cella-web-"));
+        assert_eq!(name.len(), "cella-web-".len() + 8);
+    }
+
+    #[test]
+    fn compose_project_name_from_folder() {
+        let path = PathBuf::from("/tmp/my-project");
+        let name = compose_project_name(&path, None);
+        assert!(name.starts_with("cella-my-project-"));
+    }
+
+    #[test]
+    fn compose_labels_contain_base_and_compose_keys() {
+        let labels = compose_labels(
+            &PathBuf::from("/tmp/test"),
+            &PathBuf::from("/tmp/test/.devcontainer/devcontainer.json"),
+            "abc123",
+            "linux-native",
+            "cella-test-12345678",
+            "app",
+        );
+        // Base container labels must be present.
+        assert_eq!(labels["dev.cella.tool"], "cella");
+        assert_eq!(labels["dev.cella.config_hash"], "abc123");
+        assert_eq!(labels["dev.cella.docker_runtime"], "linux-native");
+        // Compose-specific labels.
+        assert_eq!(labels["dev.cella.compose_project"], "cella-test-12345678");
+        assert_eq!(labels["dev.cella.primary_service"], "app");
+    }
+
+    #[test]
+    fn identifier_from_root_path() {
+        // When workspace_root has no file_name (e.g., "/"), use "unnamed".
+        let path = PathBuf::from("/");
+        let name = container_name(&path, None);
+        assert!(name.starts_with("cella-unnamed-"));
+    }
 }

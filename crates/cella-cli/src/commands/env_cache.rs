@@ -189,3 +189,29 @@ pub async fn ensure_ssh_auth_sock(
         env.push(format!("SSH_AUTH_SOCK={socket_path}"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_path_root_user() {
+        let path = cache_path("root");
+        assert!(path.contains("root"));
+        assert!(path.ends_with("/.cella/probed-env.json"));
+    }
+
+    #[test]
+    fn cache_path_regular_user() {
+        let path = cache_path("vscode");
+        assert!(path.contains("vscode"));
+        assert!(path.ends_with("/.cella/probed-env.json"));
+    }
+
+    #[test]
+    fn cache_path_custom_user() {
+        let path = cache_path("devuser");
+        assert!(path.contains("devuser"));
+        assert!(path.ends_with("probed-env.json"));
+    }
+}

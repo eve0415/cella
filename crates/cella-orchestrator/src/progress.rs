@@ -385,4 +385,167 @@ mod tests {
         let sender = ProgressSender::new(tx, true);
         assert!(sender.verbose_step("visible").is_some());
     }
+
+    #[test]
+    fn format_elapsed_sub_100ms() {
+        assert_eq!(format_elapsed(Duration::from_millis(50)), "");
+    }
+
+    #[test]
+    fn format_elapsed_seconds() {
+        assert_eq!(format_elapsed(Duration::from_millis(1234)), " (1.2s)");
+    }
+
+    #[test]
+    fn format_elapsed_exactly_100ms() {
+        let result = format_elapsed(Duration::from_millis(100));
+        assert!(result.starts_with(" (0.1"));
+    }
+
+    #[test]
+    fn format_elapsed_zero() {
+        assert_eq!(format_elapsed(Duration::ZERO), "");
+    }
+
+    #[test]
+    fn format_elapsed_large_duration() {
+        let result = format_elapsed(Duration::from_secs(65));
+        assert!(result.contains("65.0"));
+    }
+
+    #[tokio::test]
+    async fn step_finish_with_custom_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        let step = sender.step("test step");
+        step.finish_with("custom result");
+
+        let _ = rx.recv().await.unwrap(); // StepStarted
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::StepCompletedWith { message, .. } => {
+                assert_eq!(message, "custom result");
+            }
+            other => panic!("Expected StepCompletedWith, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_fail_sends_failed_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        let step = sender.step("failing step");
+        step.fail("something broke");
+
+        let _ = rx.recv().await.unwrap(); // StepStarted
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::StepFailed { message, .. } => {
+                assert_eq!(message, "something broke");
+            }
+            other => panic!("Expected StepFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn warn_sends_warn_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        sender.warn("watch out");
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::Warn { message } => assert_eq!(message, "watch out"),
+            other => panic!("Expected Warn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hint_sends_hint_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        sender.hint("try this");
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::Hint { message } => assert_eq!(message, "try this"),
+            other => panic!("Expected Hint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_sends_error_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        sender.error("bad thing");
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::Error { message } => assert_eq!(message, "bad thing"),
+            other => panic!("Expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn println_sends_output_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        sender.println("output line");
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::Output { line } => assert_eq!(line, "output line"),
+            other => panic!("Expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_verbose_returns_correct_value() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ProgressEvent>(1);
+        let sender_verbose = ProgressSender::new(tx.clone(), true);
+        let sender_normal = ProgressSender::new(tx, false);
+        assert!(sender_verbose.is_verbose());
+        assert!(!sender_normal.is_verbose());
+    }
+
+    #[tokio::test]
+    async fn dropped_phase_child_sends_completed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        let phase = sender.phase("test phase");
+        {
+            let _child = phase.step("will be dropped");
+        }
+        // Drop phase explicitly
+        drop(phase);
+
+        let _ = rx.recv().await.unwrap(); // PhaseStarted
+        let _ = rx.recv().await.unwrap(); // PhaseChildStarted
+        let ev = rx.recv().await.unwrap(); // PhaseChildCompleted (from drop)
+        assert!(matches!(ev, ProgressEvent::PhaseChildCompleted { .. }));
+        let ev = rx.recv().await.unwrap(); // PhaseCompleted (from drop)
+        assert!(matches!(ev, ProgressEvent::PhaseCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn alloc_id_increments() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        let _s1 = sender.step("first");
+        let _s2 = sender.step("second");
+
+        let ev1 = rx.recv().await.unwrap();
+        let ev2 = rx.recv().await.unwrap();
+        let ProgressEvent::StepStarted { id: id1, .. } = ev1 else {
+            panic!("Expected StepStarted")
+        };
+        let ProgressEvent::StepStarted { id: id2, .. } = ev2 else {
+            panic!("Expected StepStarted")
+        };
+        assert_eq!(id2, id1 + 1);
+    }
 }

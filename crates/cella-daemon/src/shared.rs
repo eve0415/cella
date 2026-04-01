@@ -209,4 +209,158 @@ mod tests {
     fn container_count_with_no_containers() {
         assert_eq!(running_cella_container_count(), 0);
     }
+
+    // -- is_process_alive --
+
+    #[cfg(unix)]
+    #[test]
+    fn current_process_is_alive() {
+        let pid = std::process::id();
+        assert!(is_process_alive(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bogus_pid_is_not_alive() {
+        // PID 4_000_000_000 is well above any realistic PID.
+        assert!(!is_process_alive(4_000_000_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_zero_is_not_alive() {
+        // PID 0 would map to the idle/swapper process — kill(0, 0) signals the
+        // calling process group, but we convert to i32 first which stays 0.
+        // Regardless, this shouldn't panic.
+        let _ = is_process_alive(0);
+    }
+
+    // -- set_socket_permissions --
+
+    #[cfg(unix)]
+    #[test]
+    fn set_socket_permissions_restricts_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        std::fs::write(&path, "").unwrap();
+        set_socket_permissions(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn set_socket_permissions_nonexistent_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file exists — must not panic.
+        set_socket_permissions(&dir.path().join("nope"));
+    }
+
+    // -- is_daemon_running --
+
+    #[test]
+    fn daemon_not_running_without_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_daemon_running(
+            &dir.path().join("test.pid"),
+            &dir.path().join("test.sock"),
+        ));
+    }
+
+    #[test]
+    fn daemon_not_running_with_stale_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("test.pid");
+        let sock = dir.path().join("test.sock");
+        // Write a PID that almost certainly does not exist.
+        std::fs::write(&pid, "4000000000").unwrap();
+        std::fs::write(&sock, "").unwrap();
+
+        assert!(!is_daemon_running(&pid, &sock));
+        // Stale files should be cleaned up.
+        assert!(!pid.exists());
+        assert!(!sock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_running_with_current_pid_and_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("test.pid");
+        let sock = dir.path().join("test.sock");
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        std::fs::write(&sock, "").unwrap();
+
+        assert!(is_daemon_running(&pid, &sock));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_not_running_when_socket_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("test.pid");
+        let sock = dir.path().join("test.sock");
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        // Socket file does not exist.
+        assert!(!is_daemon_running(&pid, &sock));
+    }
+
+    // -- current_time_secs --
+
+    #[test]
+    fn current_time_secs_is_reasonable() {
+        let ts = current_time_secs();
+        // Should be well past 2020-01-01 (1_577_836_800) and below some far
+        // future date. Loose bounds to avoid flakiness.
+        assert!(ts > 1_577_836_800);
+    }
+
+    // -- read_pid_file edge cases --
+
+    #[test]
+    fn read_pid_file_with_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ws.pid");
+        std::fs::write(&p, "  42  \n").unwrap();
+        assert_eq!(read_pid_file(&p), Some(42));
+    }
+
+    #[test]
+    fn read_pid_file_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("z.pid");
+        std::fs::write(&p, "0").unwrap();
+        assert_eq!(read_pid_file(&p), Some(0));
+    }
+
+    // -- bind_tcp_reclaim --
+
+    #[tokio::test]
+    async fn bind_tcp_reclaim_zero_gives_random_port() {
+        let listener = bind_tcp_reclaim(0).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port > 0);
+    }
+
+    #[tokio::test]
+    async fn bind_tcp_reclaim_preferred_port_works() {
+        // First bind to get a free port, then drop and reclaim it.
+        let first = bind_tcp_reclaim(0).await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        drop(first);
+
+        let second = bind_tcp_reclaim(port).await.unwrap();
+        assert_eq!(second.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn bind_tcp_reclaim_occupied_falls_back() {
+        // Bind a port and hold it, then request the same port.
+        let held = bind_tcp_reclaim(0).await.unwrap();
+        let occupied = held.local_addr().unwrap().port();
+
+        let fallback = bind_tcp_reclaim(occupied).await.unwrap();
+        let fallback_port = fallback.local_addr().unwrap().port();
+        assert_ne!(fallback_port, occupied);
+    }
 }

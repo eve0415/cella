@@ -229,4 +229,74 @@ mod tests {
             ServiceBuildInfo::Image { .. } => panic!("expected Build variant"),
         }
     }
+
+    #[test]
+    fn empty_services_map() {
+        let json = r#"{"services": {}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let err = extract_service_build_info(&config, "app").unwrap_err();
+        assert!(matches!(err, CellaComposeError::ServiceNotFound { .. }));
+    }
+
+    #[test]
+    fn build_with_empty_args() {
+        let json = r#"{
+            "services": {
+                "app": {
+                    "build": {
+                        "context": "/workspace",
+                        "args": {}
+                    }
+                }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let info = extract_service_build_info(&config, "app").unwrap();
+        match info {
+            ServiceBuildInfo::Build { context, args, .. } => {
+                assert_eq!(context, PathBuf::from("/workspace"));
+                assert!(args.is_empty());
+            }
+            ServiceBuildInfo::Image { .. } => panic!("expected Build variant"),
+        }
+    }
+
+    #[test]
+    fn multiple_services_correct_one_selected() {
+        let json = r#"{
+            "services": {
+                "web": { "image": "nginx:latest" },
+                "api": { "image": "node:20" },
+                "db": { "image": "postgres:16" }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let info = extract_service_build_info(&config, "api").unwrap();
+        assert!(matches!(info, ServiceBuildInfo::Image { image } if image == "node:20"));
+    }
+
+    #[test]
+    fn service_not_found_lists_available() {
+        let json = r#"{
+            "services": {
+                "alpha": { "image": "a:1" },
+                "beta": { "image": "b:2" }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let err = extract_service_build_info(&config, "gamma").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gamma"),
+            "error should mention missing service"
+        );
+        assert!(
+            msg.contains("alpha"),
+            "error should list available service alpha"
+        );
+        assert!(
+            msg.contains("beta"),
+            "error should list available service beta"
+        );
+    }
 }

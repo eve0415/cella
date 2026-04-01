@@ -71,6 +71,60 @@ fn connect_docker_backend(
     Ok(Box::new(client))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_choice_docker_to_kind() {
+        let choice = BackendChoice::Docker;
+        assert!(matches!(choice.to_kind(), BackendKind::Docker));
+    }
+
+    #[test]
+    fn backend_choice_implements_clone() {
+        let choice = BackendChoice::Docker;
+        #[allow(clippy::clone_on_copy)]
+        let cloned = Clone::clone(&choice);
+        assert!(matches!(cloned.to_kind(), BackendKind::Docker));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn backend_choice_apple_container_to_kind() {
+        let choice = BackendChoice::AppleContainer;
+        assert!(matches!(choice.to_kind(), BackendKind::AppleContainer));
+    }
+
+    #[test]
+    fn resolve_backend_explicit_docker() {
+        // Explicit Docker choice should attempt Docker connection.
+        // This will succeed or fail depending on Docker availability,
+        // but the match arm is exercised either way.
+        let result = resolve_backend(Some(&BackendChoice::Docker), None);
+        // We only care that it doesn't panic - Docker may or may not be available
+        let _ = result;
+    }
+
+    #[test]
+    fn resolve_backend_auto_detect() {
+        // Auto-detect with no choice should try Docker first.
+        let result = resolve_backend(None, None);
+        let _ = result;
+    }
+
+    #[test]
+    fn resolve_backend_with_invalid_host() {
+        // A clearly invalid host should fail
+        let result = resolve_backend(
+            Some(&BackendChoice::Docker),
+            Some("tcp://invalid-host-that-does-not-exist:99999"),
+        );
+        // Either connect succeeds (unlikely) or fails - we just exercise the path
+        let _ = result;
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn connect_apple_container_backend() -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>>
 {

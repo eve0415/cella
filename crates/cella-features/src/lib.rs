@@ -787,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_features_empty_config() {
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
         let config = json!({"image": "ubuntu:22.04"});
 
         let result = resolve_features(
@@ -815,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_features_empty_features_object() {
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
         let config = json!({"image": "ubuntu:22.04", "features": {}});
 
         let result = resolve_features(
@@ -856,7 +856,7 @@ mod tests {
         std::fs::write(feature_path.join("install.sh"), "#!/bin/sh\necho installed").unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
 
         // Config references the local feature with a relative path.
         let config_path = feature_dir.path().join("devcontainer.json");
@@ -973,7 +973,7 @@ mod tests {
         // No install.sh -- metadata-only feature.
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
 
         let config_path = feature_dir.path().join("devcontainer.json");
         let config = json!({
@@ -1036,7 +1036,7 @@ mod tests {
         std::fs::write(b_path.join("install.sh"), "#!/bin/sh").unwrap();
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
 
         let config_path = feature_dir.path().join("devcontainer.json");
         let config = json!({
@@ -1081,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_features_invalid_ref() {
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = FeatureCache::with_root(cache_dir.path());
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
 
         let config = json!({
             "image": "ubuntu:22.04",
