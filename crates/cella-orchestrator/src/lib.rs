@@ -5,6 +5,8 @@
 //! functions instead of the daemon shelling out to CLI subprocesses.
 
 pub mod branch;
+pub mod compose_features;
+pub mod compose_up;
 pub mod config;
 pub mod config_map;
 pub mod container_setup;

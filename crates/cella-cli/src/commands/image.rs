@@ -11,9 +11,6 @@ use cella_features::ResolvedFeatures;
 
 use crate::progress::Progress;
 
-// Re-export items that are used directly by other CLI modules.
-pub use cella_orchestrator::image::compute_features_digest;
-
 /// Ensure the dev container image exists (pull or build), including features layer.
 ///
 /// Thin wrapper: creates a `ProgressSender` bridge, calls the orchestrator,

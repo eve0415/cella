@@ -9,10 +9,6 @@ use tracing::{debug, warn};
 use cella_backend::{ContainerBackend, ExecOptions, container_name};
 use cella_config::resolve::{self, ResolvedConfig};
 
-mod lifecycle;
-
-pub use lifecycle::run_all_lifecycle_phases;
-
 /// Build and container-management flags for an `up` invocation.
 #[derive(Args)]
 pub struct UpBuildArgs {
@@ -708,34 +704,8 @@ impl UpArgs {
     }
 }
 
-/// Resolve the remote user from config and image metadata.
-///
-/// Priority: `remoteUser` (config) > `containerUser` (config) > `remoteUser` (image metadata)
-/// > `containerUser` (image metadata) > `fallback` (typically Docker USER or `"root"`)
-pub fn resolve_remote_user(
-    config: &serde_json::Value,
-    image_meta_user: Option<&cella_features::ImageMetadataUserInfo>,
-    fallback: &str,
-) -> String {
-    cella_orchestrator::container_setup::resolve_remote_user(config, image_meta_user, fallback)
-}
-
-pub fn run_host_command(
-    phase: &str,
-    value: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    cella_orchestrator::container_setup::run_host_command(phase, value)
-}
-
 pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
     cella_orchestrator::container_setup::map_env_object(value)
-}
-
-pub async fn verify_container_running(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    cella_orchestrator::container_setup::verify_container_running(client, container_id).await
 }
 
 pub fn output_result(
@@ -973,7 +943,7 @@ mod tests {
         let config = serde_json::json!({
             "remoteUser": "devuser"
         });
-        let user = resolve_remote_user(&config, None, "root");
+        let user = cella_orchestrator::container_setup::resolve_remote_user(&config, None, "root");
         assert_eq!(user, "devuser");
     }
 
@@ -982,14 +952,14 @@ mod tests {
         let config = serde_json::json!({
             "containerUser": "containeruser"
         });
-        let user = resolve_remote_user(&config, None, "root");
+        let user = cella_orchestrator::container_setup::resolve_remote_user(&config, None, "root");
         assert_eq!(user, "containeruser");
     }
 
     #[test]
     fn resolve_remote_user_fallback_to_default() {
         let config = serde_json::json!({});
-        let user = resolve_remote_user(&config, None, "root");
+        let user = cella_orchestrator::container_setup::resolve_remote_user(&config, None, "root");
         assert_eq!(user, "root");
     }
 
@@ -999,7 +969,7 @@ mod tests {
             "remoteUser": "remote",
             "containerUser": "container"
         });
-        let user = resolve_remote_user(&config, None, "root");
+        let user = cella_orchestrator::container_setup::resolve_remote_user(&config, None, "root");
         assert_eq!(user, "remote");
     }
 
