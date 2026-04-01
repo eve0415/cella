@@ -1,9 +1,7 @@
 use clap::Args;
-use tracing::info;
 
 use super::up::{OutputFormat, UpContext};
 use cella_backend::{ExecOptions, worktree_labels};
-use cella_git::WorktreeInfo;
 
 /// Create a new worktree-backed branch with its own dev container.
 #[derive(Args)]
@@ -44,67 +42,30 @@ impl BranchArgs {
         })?;
         let repo_root = &repo_info.root;
 
-        // 2. Resolve branch state
-        let branch_state = cella_git::resolve_branch(repo_root, &self.name)?;
-        info!(
-            branch = %self.name,
-            state = ?branch_state,
-            "resolved branch"
-        );
+        // 2. Create git worktree via orchestrator
+        let (sender, renderer) = crate::progress::bridge(&progress);
+        let wt_path =
+            cella_orchestrator::branch::create_worktree(
+                repo_root,
+                &self.name,
+                self.base.as_deref(),
+                None,
+                &sender,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        drop(sender);
+        let _ = renderer.await;
 
-        // 3. Create git worktree
-        let step = progress.step(&format!("Creating worktree for '{}'...", self.name));
-        let wt_info = match cella_git::create(
-            repo_root,
-            &self.name,
-            &branch_state,
-            None, // worktree_root config — will read from cella.toml when field is added
-            self.base.as_deref(),
-        ) {
-            Ok(info) => {
-                step.finish();
-                info
-            }
-            Err(cella_git::CellaGitError::WorktreeAlreadyExists { path }) => {
-                step.fail("already exists");
-                return Err(format!(
-                    "Worktree for '{}' already exists at {}\n\
-                     Use `cella switch {}` to switch to it, or \
-                     `cella up --workspace-folder {}` to start its container.",
-                    self.name,
-                    path.display(),
-                    self.name,
-                    path.display(),
-                )
-                .into());
-            }
-            Err(cella_git::CellaGitError::BranchCheckedOut {
-                branch,
-                worktree_path,
-            }) => {
-                step.fail("branch in use");
-                return Err(format!(
-                    "Branch '{branch}' is already checked out at {}",
-                    worktree_path.display(),
-                )
-                .into());
-            }
-            Err(e) => {
-                step.fail("failed");
-                return Err(e.into());
-            }
-        };
-
-        // 4. Run container pipeline (with rollback on failure)
+        // 3. Run container pipeline (with rollback on failure)
         let result = self
-            .run_container_pipeline(&wt_info, repo_root, &progress, backend)
+            .run_container_pipeline(&wt_path, repo_root, &progress, backend)
             .await;
 
         if let Err(e) = &result {
             // Rollback: remove the worktree on container failure
             progress.warn(&format!("Container creation failed: {e}"));
             let rollback_step = progress.step("Rolling back worktree...");
-            if let Err(re) = cella_git::remove(repo_root, &wt_info.path) {
+            if let Err(re) = cella_git::remove(repo_root, &wt_path) {
                 rollback_step.fail("rollback failed");
                 progress.warn(&format!("Failed to remove worktree: {re}"));
             } else {
@@ -117,7 +78,7 @@ impl BranchArgs {
 
     async fn run_container_pipeline(
         &self,
-        wt_info: &WorktreeInfo,
+        wt_path: &std::path::Path,
         repo_root: &std::path::Path,
         progress: &crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
@@ -127,7 +88,7 @@ impl BranchArgs {
 
         // Create the container using the up pipeline
         let ctx = UpContext::for_workspace(
-            &wt_info.path,
+            wt_path,
             self.docker_host.as_deref(),
             extra_labels,
             progress.clone(),
@@ -166,7 +127,7 @@ impl BranchArgs {
             OutputFormat::Text => {
                 eprintln!(
                     "Ready: {} (container: {})",
-                    wt_info.path.display(),
+                    wt_path.display(),
                     ctx.container_nm,
                 );
             }
@@ -174,7 +135,7 @@ impl BranchArgs {
                 let output = serde_json::json!({
                     "containerId": create_result.container_id,
                     "containerName": ctx.container_nm,
-                    "worktreePath": wt_info.path.display().to_string(),
+                    "worktreePath": wt_path.display().to_string(),
                     "branch": self.name,
                 });
                 println!("{}", serde_json::to_string(&output).unwrap_or_default());
