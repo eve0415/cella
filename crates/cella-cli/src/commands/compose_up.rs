@@ -112,6 +112,14 @@ async fn prepare_and_start(
     project: &ComposeProject,
 ) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
 {
+    if !ctx.client.capabilities().compose {
+        return Err(format!(
+            "selected backend '{}' does not support Docker Compose devcontainers",
+            ctx.client.kind()
+        )
+        .into());
+    }
+
     // 5. Check Docker Compose version supports additional_contexts (>= 2.17.0)
     //    before resolving features, so we fail early with a clear message.
     cella_compose::check_compose_features_support().await?;
@@ -141,16 +149,19 @@ async fn prepare_and_start(
             "x86_64".to_string()
         });
 
-    let version = env!("CARGO_PKG_VERSION");
-    ctx.progress
-        .run_step_result("Preparing agent volume...", async {
-            ctx.client
-                .ensure_agent_provisioned(version, &agent_arch, ctx.skip_checksum)
-                .await
-        })
-        .await?;
-
-    let (agent_vol_name, agent_vol_target, _) = ctx.client.agent_volume_mount();
+    let (agent_vol_name, agent_vol_target, _) = if ctx.client.capabilities().managed_agent {
+        let version = env!("CARGO_PKG_VERSION");
+        ctx.progress
+            .run_step_result("Preparing agent volume...", async {
+                ctx.client
+                    .ensure_agent_provisioned(version, &agent_arch, ctx.skip_checksum)
+                    .await
+            })
+            .await?;
+        ctx.client.agent_volume_mount()
+    } else {
+        (String::new(), String::new(), true)
+    };
 
     // 8. Resolve remote user from config
     let remote_user = resolve_remote_user(config, None, "root");

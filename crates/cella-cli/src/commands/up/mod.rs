@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use cella_backend::{
     BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
-    LifecycleContext, MountConfig, container_labels, container_name,
+    LifecycleContext, MountConfig, agent_env_vars, container_labels, container_name,
 };
 use cella_config::resolve::{self, ResolvedConfig};
 
@@ -424,6 +424,7 @@ impl UpContext {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
+        let capabilities = self.client.capabilities();
         super::ensure_cella_daemon().await;
 
         // Check for previous background lifecycle failure
@@ -452,7 +453,9 @@ impl UpContext {
         }
 
         // Always update .daemon_addr (daemon may have restarted)
-        write_daemon_addr_to_volume(self.client.as_ref()).await;
+        if capabilities.managed_agent {
+            write_daemon_addr_to_volume(self.client.as_ref()).await;
+        }
 
         // Version-aware agent restart: if the container was created with a
         // different cella version, repopulate the volume and restart the agent.
@@ -461,7 +464,7 @@ impl UpContext {
             .get("dev.cella.version")
             .map_or("unknown", String::as_str);
         let current_version = env!("CARGO_PKG_VERSION");
-        if container_version != current_version {
+        if capabilities.managed_agent && container_version != current_version {
             info!(
                 "Version change detected ({container_version} -> {current_version}), updating agent"
             );
@@ -520,6 +523,7 @@ impl UpContext {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<Option<UpResult>, Box<dyn std::error::Error>> {
+        let capabilities = self.client.capabilities();
         super::ensure_cella_daemon().await;
 
         // Warn if config has changed
@@ -548,18 +552,20 @@ impl UpContext {
         // Repopulate agent volume before starting (may have been updated since
         // the container was created, and the old versioned binary path in CMD
         // would fail if the volume was repopulated by another `cella up`).
-        let agent_arch = self.detect_arch().await;
-        let version = env!("CARGO_PKG_VERSION");
-        self.progress
-            .run_step(
-                "Populating agent volume...",
-                self.client
-                    .ensure_agent_provisioned(version, &agent_arch, self.skip_checksum),
-            )
-            .await?;
+        if capabilities.managed_agent {
+            let agent_arch = self.detect_arch().await;
+            let version = env!("CARGO_PKG_VERSION");
+            self.progress
+                .run_step(
+                    "Populating agent volume...",
+                    self.client
+                        .ensure_agent_provisioned(version, &agent_arch, self.skip_checksum),
+                )
+                .await?;
 
-        // Write .daemon_addr so the agent can discover the current daemon
-        write_daemon_addr_to_volume(self.client.as_ref()).await;
+            // Write .daemon_addr so the agent can discover the current daemon
+            write_daemon_addr_to_volume(self.client.as_ref()).await;
+        }
 
         // Attempt to start directly -- let Docker validate mounts
         let step = self.progress.step("Starting container...");
@@ -580,7 +586,9 @@ impl UpContext {
 
                 // Kill + restart agent so it picks up the new binary and
                 // daemon address from the updated .daemon_addr file
-                restart_agent_in_container(self.client.as_ref(), &container.id).await;
+                if capabilities.managed_agent {
+                    restart_agent_in_container(self.client.as_ref(), &container.id).await;
+                }
 
                 let (_probed_env, lifecycle_env) =
                     self.prepare_container_env(&container.id, remote_user).await;
@@ -598,9 +606,11 @@ impl UpContext {
                 }
 
                 // Prune old agent versions from the volume (non-fatal)
-                let prune_version = env!("CARGO_PKG_VERSION");
-                if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
-                    debug!("Agent version pruning failed: {e}");
+                if capabilities.managed_agent {
+                    let prune_version = env!("CARGO_PKG_VERSION");
+                    if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
+                        debug!("Agent version pruning failed: {e}");
+                    }
                 }
 
                 Ok(Some(UpResult {
@@ -728,6 +738,7 @@ impl UpContext {
         settings: &cella_config::Settings,
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = self.client.capabilities();
         // Forwarding mounts
         for m in &env_fwd.mounts {
             create_opts.mounts.push(MountConfig {
@@ -763,36 +774,41 @@ impl UpContext {
         }
 
         // Agent volume mount and env vars
-        let version = env!("CARGO_PKG_VERSION");
-        let agent_step = self.progress.step("Populating agent volume...");
-        match self
-            .client
-            .ensure_agent_provisioned(version, agent_arch, self.skip_checksum)
-            .await
-        {
-            Ok(()) => agent_step.finish(),
-            Err(e @ BackendError::AgentChecksumMismatch { .. }) => {
-                agent_step.fail("checksum mismatch");
-                return Err(e.into());
+        if capabilities.managed_agent {
+            let version = env!("CARGO_PKG_VERSION");
+            let agent_step = self.progress.step("Populating agent volume...");
+            match self
+                .client
+                .ensure_agent_provisioned(version, agent_arch, self.skip_checksum)
+                .await
+            {
+                Ok(()) => agent_step.finish(),
+                Err(e @ BackendError::AgentChecksumMismatch { .. }) => {
+                    agent_step.fail("checksum mismatch");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    agent_step.fail("failed");
+                    warn!("Failed to populate agent volume: {e}");
+                    self.progress
+                        .warn("Port forwarding and BROWSER interception will not work.");
+                    self.progress
+                        .hint(&format!("Agent volume population failed: {e}"));
+                }
             }
-            Err(e) => {
-                agent_step.fail("failed");
-                warn!("Failed to populate agent volume: {e}");
-                self.progress
-                    .warn("Port forwarding and BROWSER interception will not work.");
-                self.progress
-                    .hint(&format!("Agent volume population failed: {e}"));
+
+            // Write .daemon_addr to volume so agents can discover the daemon
+            write_daemon_addr_to_volume(self.client.as_ref()).await;
+
+            if create_opts.env.is_empty() {
+                create_opts.env = image_env.to_vec();
             }
+            create_opts.env.extend(agent_env_vars());
+        } else {
+            self.progress.warn(
+                "Selected backend does not support managed agent provisioning; port forwarding and BROWSER interception are disabled.",
+            );
         }
-
-        // Write .daemon_addr to volume so agents can discover the daemon
-        write_daemon_addr_to_volume(self.client.as_ref()).await;
-
-        let agent_env = cella_docker::config_map::env::agent_env_vars();
-        if create_opts.env.is_empty() {
-            create_opts.env = image_env.to_vec();
-        }
-        create_opts.env.extend(agent_env);
 
         // If the workspace is a linked git worktree, mount the parent repo's
         // .git directory at the same host path so gitdir references resolve.
@@ -810,7 +826,7 @@ impl UpContext {
         }
 
         let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
-        if !vol_name.is_empty() {
+        if capabilities.managed_agent && !vol_name.is_empty() {
             create_opts.mounts.push(MountConfig {
                 mount_type: "volume".to_string(),
                 source: vol_name,

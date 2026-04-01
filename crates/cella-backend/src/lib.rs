@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod error;
 pub mod lifecycle;
 pub mod names;
@@ -5,6 +6,7 @@ pub mod resolve;
 pub mod traits;
 pub mod types;
 
+pub use agent::agent_env_vars;
 pub use error::BackendError;
 pub use lifecycle::{
     LifecycleContext, OutputCallback, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,

@@ -138,6 +138,14 @@ async fn execute_compose_build(
     output: &OutputFormat,
     progress: &crate::progress::Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !client.capabilities().compose {
+        return Err(format!(
+            "selected backend '{}' does not support Docker Compose builds",
+            client.kind()
+        )
+        .into());
+    }
+
     let project = cella_compose::ComposeProject::from_resolved(
         config,
         &resolved.config_path,
@@ -157,7 +165,11 @@ async fn execute_compose_build(
 
     // Write override file if features were resolved
     if let Some(ref fb) = features_build {
-        let (agent_vol_name, agent_vol_target, _) = client.agent_volume_mount();
+        let (agent_vol_name, agent_vol_target, _) = if client.capabilities().managed_agent {
+            client.agent_volume_mount()
+        } else {
+            (String::new(), String::new(), true)
+        };
         let override_config = cella_compose::OverrideConfig {
             primary_service: project.primary_service.clone(),
             image_override: fb.image_name_override.clone(),
