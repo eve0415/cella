@@ -224,10 +224,10 @@ pub fn resolve_workspace_folder(
 ///
 /// Returns error if the container is not compose-based or the service is not found.
 pub async fn resolve_service_container(
-    client: &cella_docker::DockerClient,
-    container: cella_docker::ContainerInfo,
+    client: &dyn cella_backend::ContainerBackend,
+    container: cella_backend::ContainerInfo,
     service: Option<&str>,
-) -> Result<cella_docker::ContainerInfo, Box<dyn std::error::Error>> {
+) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error>> {
     let Some(svc) = service else {
         return Ok(container);
     };
@@ -240,10 +240,32 @@ pub async fn resolve_service_container(
             )
         })?;
 
-    client
-        .find_compose_container(project, svc)
-        .await?
-        .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
+    // Compose support requires the Docker backend.
+    if client.kind() != cella_backend::BackendKind::Docker {
+        return Err(format!(
+            "--service flag requires Docker backend, but current backend is {}",
+            client.kind()
+        )
+        .into());
+    }
+
+    // Use list_cella_containers + label filter as a backend-agnostic
+    // replacement for ComposeBackend::find_compose_container.
+    let project_label = format!("com.docker.compose.project={project}");
+    let service_label = format!("com.docker.compose.service={svc}");
+    let containers = client.list_cella_containers(false).await?;
+    let found = containers.into_iter().find(|c| {
+        c.labels
+            .get("com.docker.compose.project")
+            .is_some_and(|v| v == project)
+            && c.labels
+                .get("com.docker.compose.service")
+                .is_some_and(|v| v == svc)
+    });
+
+    let _ = (project_label, service_label); // used in filter above via project/svc
+
+    found.ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
 
 /// Terminal environment variables to forward into the container.
@@ -403,15 +425,16 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
 async fn re_register_containers(
     socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use cella_docker::DockerClient;
     use cella_port::protocol::ManagementRequest;
 
-    let client = DockerClient::connect()?;
+    let client = crate::backend::resolve_backend(None, None)?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
-        let container_ip =
-            cella_docker::network::get_container_cella_ip(client.inner(), &container.id).await;
+        let container_ip = client
+            .get_container_ip(&container.id)
+            .await
+            .unwrap_or(None);
 
         // Read ports_attributes from container label
         let (ports_attrs, other_ports_attrs) = container
