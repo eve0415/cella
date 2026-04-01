@@ -283,4 +283,181 @@ mod tests {
             "agent binary checksum mismatch: expected aaa, got bbb"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Display format tests for all remaining variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn display_image_not_found() {
+        let err = CellaDockerError::ImageNotFound {
+            image: "myimage:latest".to_string(),
+        };
+        assert_eq!(err.to_string(), "image not found: myimage:latest");
+    }
+
+    #[test]
+    fn display_docker_cli_not_found() {
+        let err = CellaDockerError::DockerCliNotFound {
+            message: "not in PATH".to_string(),
+        };
+        assert_eq!(err.to_string(), "docker CLI not found: not in PATH");
+    }
+
+    #[test]
+    fn display_build_failed() {
+        let err = CellaDockerError::BuildFailed {
+            message: "Dockerfile syntax error".to_string(),
+        };
+        assert_eq!(err.to_string(), "build failed: Dockerfile syntax error");
+    }
+
+    #[test]
+    fn display_container_not_found() {
+        let err = CellaDockerError::ContainerNotFound {
+            workspace: "/home/user/project".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "container not found for workspace: /home/user/project"
+        );
+    }
+
+    #[test]
+    fn display_container_not_running() {
+        let err = CellaDockerError::ContainerNotRunning {
+            hint: "Run cella up to start it.".to_string(),
+        };
+        assert_eq!(err.to_string(), "Run cella up to start it.");
+    }
+
+    #[test]
+    fn display_lifecycle_failed() {
+        let err = CellaDockerError::LifecycleFailed {
+            phase: "postCreate".to_string(),
+            message: "command exited 1".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "lifecycle command failed: postCreate — command exited 1"
+        );
+    }
+
+    #[test]
+    fn display_host_command_failed() {
+        let err = CellaDockerError::HostCommandFailed {
+            command: "docker compose up".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        assert_eq!(err.to_string(), "host command failed: docker compose up");
+    }
+
+    #[test]
+    fn display_container_exited_immediately() {
+        let err = CellaDockerError::ContainerExitedImmediately {
+            exit_code: 137,
+            logs_tail: "OOM killed".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("137"));
+        assert!(msg.contains("OOM killed"));
+    }
+
+    #[test]
+    fn display_agent_volume() {
+        let err = CellaDockerError::AgentVolume {
+            message: "volume missing".to_string(),
+        };
+        assert_eq!(err.to_string(), "agent volume error: volume missing");
+    }
+
+    #[test]
+    fn display_io_error() {
+        let err = CellaDockerError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("access denied"));
+    }
+
+    // -----------------------------------------------------------------------
+    // From conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_io_error_into_cella_docker_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let err: CellaDockerError = io_err.into();
+        assert!(matches!(err, CellaDockerError::Io(_)));
+        assert!(err.to_string().contains("broken pipe"));
+    }
+
+    #[test]
+    fn from_bollard_error_into_cella_docker_error() {
+        let bollard_err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such container".to_string(),
+        };
+        let err: CellaDockerError = bollard_err.into();
+        assert!(matches!(err, CellaDockerError::DockerApi(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug trait test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_debug_impl() {
+        let err = CellaDockerError::RuntimeNotFound {
+            message: "test".to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("RuntimeNotFound"));
+        assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn error_debug_all_variants() {
+        let variants: Vec<CellaDockerError> = vec![
+            CellaDockerError::ImageNotFound {
+                image: "x".to_string(),
+            },
+            CellaDockerError::DockerCliNotFound {
+                message: "x".to_string(),
+            },
+            CellaDockerError::BuildFailed {
+                message: "x".to_string(),
+            },
+            CellaDockerError::ContainerNotFound {
+                workspace: "x".to_string(),
+            },
+            CellaDockerError::ContainerNotRunning {
+                hint: "x".to_string(),
+            },
+            CellaDockerError::ExecFailed {
+                command: "x".to_string(),
+                exit_code: 1,
+            },
+            CellaDockerError::LifecycleFailed {
+                phase: "x".to_string(),
+                message: "y".to_string(),
+            },
+            CellaDockerError::ContainerExitedImmediately {
+                exit_code: 1,
+                logs_tail: "x".to_string(),
+            },
+            CellaDockerError::AgentVolume {
+                message: "x".to_string(),
+            },
+            CellaDockerError::AgentChecksumMismatch {
+                expected: "a".to_string(),
+                actual: "b".to_string(),
+            },
+        ];
+        for err in variants {
+            let debug = format!("{err:?}");
+            assert!(!debug.is_empty());
+        }
+    }
 }

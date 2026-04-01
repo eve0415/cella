@@ -116,4 +116,59 @@ mod tests {
             first.name
         );
     }
+
+    #[tokio::test]
+    async fn check_daemon_has_at_least_one_check() {
+        let report = check_daemon().await;
+        assert!(
+            !report.checks.is_empty(),
+            "daemon report should have at least one check"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_daemon_running_check_severity() {
+        let report = check_daemon().await;
+        let running = report.checks.iter().find(|c| c.name == "running");
+        if let Some(check) = running {
+            // Running check is either Pass (running) or Warning (not running)
+            assert!(
+                check.severity == Severity::Pass || check.severity == Severity::Warning,
+                "running check severity should be Pass or Warning, got {:?}",
+                check.severity
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_daemon_not_running_has_fix_hint() {
+        let report = check_daemon().await;
+        let running = report.checks.iter().find(|c| c.name == "running");
+        if let Some(check) = running
+            && check.severity == Severity::Warning
+        {
+            assert!(
+                check.fix_hint.is_some(),
+                "not-running check should have a fix_hint"
+            );
+            assert!(
+                check.fix_hint.as_ref().unwrap().contains("cella up"),
+                "fix_hint should mention 'cella up'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_daemon_data_dir_warning_has_fix_hint() {
+        let report = check_daemon().await;
+        let data_dir = report.checks.iter().find(|c| c.name == "data directory");
+        if let Some(check) = data_dir {
+            assert_eq!(check.severity, Severity::Warning);
+            assert!(check.fix_hint.is_some());
+            assert!(
+                check.fix_hint.as_ref().unwrap().contains("HOME"),
+                "fix_hint should mention HOME"
+            );
+        }
+    }
 }

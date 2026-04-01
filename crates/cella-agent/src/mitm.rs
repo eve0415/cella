@@ -713,4 +713,194 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(writer, chunked);
     }
+
+    // --- Additional edge cases for parse_method_and_path ---
+
+    #[test]
+    fn parse_method_and_path_delete() {
+        let headers = b"DELETE /api/resource/42 HTTP/1.1\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "DELETE");
+        assert_eq!(path, "/api/resource/42");
+    }
+
+    #[test]
+    fn parse_method_and_path_options() {
+        let headers = b"OPTIONS * HTTP/1.1\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "OPTIONS");
+        assert_eq!(path, "*");
+    }
+
+    #[test]
+    fn parse_method_and_path_connect() {
+        let headers = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "CONNECT");
+        assert_eq!(path, "example.com:443");
+    }
+
+    #[test]
+    fn parse_method_and_path_put_with_long_path() {
+        let headers = b"PUT /api/v2/users/12345/settings/preferences HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "PUT");
+        assert_eq!(path, "/api/v2/users/12345/settings/preferences");
+    }
+
+    #[test]
+    fn parse_method_and_path_patch() {
+        let headers = b"PATCH /resource HTTP/1.1\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "PATCH");
+        assert_eq!(path, "/resource");
+    }
+
+    #[test]
+    fn parse_method_and_path_head() {
+        let headers = b"HEAD / HTTP/1.1\r\n\r\n";
+        let (method, path) = parse_method_and_path(headers);
+        assert_eq!(method, "HEAD");
+        assert_eq!(path, "/");
+    }
+
+    // --- Content-Length edge cases ---
+
+    #[test]
+    fn parse_content_length_with_extra_whitespace() {
+        let headers = b"POST / HTTP/1.1\r\nContent-Length:   99  \r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(99));
+    }
+
+    #[test]
+    fn parse_content_length_zero() {
+        let headers = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(0));
+    }
+
+    #[test]
+    fn parse_content_length_large_value() {
+        let headers = b"POST / HTTP/1.1\r\nContent-Length: 4294967296\r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(4_294_967_296));
+    }
+
+    #[test]
+    fn parse_content_length_invalid_utf8() {
+        let headers = &[0xFF, 0xFE, 0xFD];
+        assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn parse_content_length_among_many_headers() {
+        let headers = b"POST /api HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nContent-Length: 256\r\nContent-Type: application/json\r\n\r\n";
+        assert_eq!(parse_content_length(headers), Some(256));
+    }
+
+    // --- Transfer-Encoding edge cases ---
+
+    #[test]
+    fn chunked_transfer_with_extra_encoding() {
+        let headers = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        assert!(is_chunked_transfer(headers));
+    }
+
+    #[test]
+    fn chunked_transfer_not_chunked_encoding() {
+        let headers = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n";
+        assert!(!is_chunked_transfer(headers));
+    }
+
+    // --- Connection: close edge cases ---
+
+    #[test]
+    fn connection_keep_alive_is_not_close() {
+        let headers = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n";
+        assert!(!has_connection_close(headers));
+    }
+
+    #[test]
+    fn no_connection_header_is_not_close() {
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+        assert!(!has_connection_close(headers));
+    }
+
+    // --- Async header reading edge cases ---
+
+    #[tokio::test]
+    async fn read_request_headers_lf_only() {
+        // Some servers use bare LF.
+        let data = b"GET / HTTP/1.1\nHost: example.com\n\n";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_request_headers(&mut reader, &mut buf).await;
+        assert!(result.is_ok());
+        assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn read_request_headers_stops_at_separator() {
+        // Data after the header separator should not be consumed.
+        let data = b"GET / HTTP/1.1\r\n\r\nbody data here";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_request_headers(&mut reader, &mut buf).await;
+        assert!(result.is_ok());
+        assert_eq!(buf, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    // --- Relay body edge cases ---
+
+    #[tokio::test]
+    async fn relay_body_content_length_takes_precedence_over_no_body() {
+        let body = b"hello";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        // Content-Length is set but chunked is false.
+        let result = relay_body(&mut reader, &mut writer, Some(5), false).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, b"hello");
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_multiple_chunks() {
+        let chunked = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let mut writer = Vec::new();
+        let result = relay_chunked(&mut reader, &mut writer).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, chunked);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_with_extension() {
+        // Chunk with extension (;ext=val) should still work.
+        let chunked = b"3;ext=val\r\nabc\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let mut writer = Vec::new();
+        let result = relay_chunked(&mut reader, &mut writer).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, chunked);
+    }
+
+    #[tokio::test]
+    async fn relay_fixed_exact_size() {
+        let body = b"exact";
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_fixed(&mut reader, &mut writer, 5).await;
+        assert!(result.is_ok());
+        assert_eq!(writer, b"exact");
+    }
+
+    #[tokio::test]
+    async fn relay_fixed_large_body() {
+        // Body larger than internal buffer size (8192).
+        let body = vec![0x42u8; 16384];
+        let mut reader = BufReader::new(&body[..]);
+        let mut writer = Vec::new();
+        let result = relay_fixed(&mut reader, &mut writer, 16384).await;
+        assert!(result.is_ok());
+        assert_eq!(writer.len(), 16384);
+        assert!(writer.iter().all(|&b| b == 0x42));
+    }
 }

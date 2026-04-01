@@ -463,4 +463,54 @@ mod tests {
         let result = resolve_editor_binary(false, false, Some("totally-nonexistent-editor-xyz"));
         assert!(result.is_err());
     }
+
+    // ── check_local_docker ─────────────────────────────────────────
+    // Note: check_local_docker reads DOCKER_HOST env var. Setting env vars
+    // in tests is unsafe in Edition 2024 and racy across threads, so we
+    // test the underlying is_localhost_tcp helper instead for most logic.
+
+    // ── is_localhost_tcp additional cases ───────────────────────────
+
+    #[test]
+    fn is_localhost_tcp_127_no_port() {
+        assert!(is_localhost_tcp("tcp://127.0.0.1"));
+    }
+
+    #[test]
+    fn is_localhost_tcp_ipv6_loopback_raw() {
+        assert!(is_localhost_tcp("tcp://::1"));
+    }
+
+    #[test]
+    fn is_localhost_tcp_empty_authority() {
+        assert!(!is_localhost_tcp("tcp://"));
+    }
+
+    // ── hex_encode_container_id ────────────────────────────────────
+
+    #[test]
+    fn hex_encode_uppercase_chars() {
+        // Uppercase A-F should encode correctly
+        let encoded = hex_encode_container_id("ABCDEF");
+        assert_eq!(encoded, "414243444546");
+    }
+
+    // ── build_vscode_uri ───────────────────────────────────────────
+
+    #[test]
+    fn build_uri_with_nested_workspace() {
+        let uri = build_vscode_uri("abc", "/workspaces/project/sub/dir");
+        assert!(uri.starts_with("vscode-remote://attached-container+"));
+        assert!(uri.ends_with("/workspaces/project/sub/dir"));
+    }
+
+    // ── editor_install_hint ────────────────────────────────────────
+
+    #[test]
+    fn editor_install_hint_with_nested_path() {
+        let path = PathBuf::from("/usr/local/bin/my-editor");
+        let hint = editor_install_hint(&path);
+        assert!(hint.contains("my-editor"));
+        assert!(hint.contains("terminal"));
+    }
 }

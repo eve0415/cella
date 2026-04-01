@@ -82,3 +82,97 @@ fn print_check(check: &CheckResult) {
         eprintln!("    \x1b[2m\u{2192} {hint}\x1b[0m");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_check_pass_does_not_panic() {
+        let check = CheckResult {
+            name: "Docker".to_string(),
+            detail: "installed".to_string(),
+            severity: Severity::Pass,
+            fix_hint: None,
+        };
+        print_check(&check);
+    }
+
+    #[test]
+    fn print_check_warning_does_not_panic() {
+        let check = CheckResult {
+            name: "Docker".to_string(),
+            detail: "old version".to_string(),
+            severity: Severity::Warning,
+            fix_hint: Some("upgrade Docker".to_string()),
+        };
+        print_check(&check);
+    }
+
+    #[test]
+    fn print_check_error_does_not_panic() {
+        let check = CheckResult {
+            name: "Docker".to_string(),
+            detail: "not found".to_string(),
+            severity: Severity::Error,
+            fix_hint: Some("install Docker".to_string()),
+        };
+        print_check(&check);
+    }
+
+    #[test]
+    fn print_check_info_does_not_panic() {
+        let check = CheckResult {
+            name: "Platform".to_string(),
+            detail: "linux/amd64".to_string(),
+            severity: Severity::Info,
+            fix_hint: None,
+        };
+        print_check(&check);
+    }
+
+    #[test]
+    fn print_category_does_not_panic() {
+        let category = CategoryReport {
+            name: "System".to_string(),
+            status: Severity::Pass,
+            checks: vec![CheckResult {
+                name: "OS".to_string(),
+                detail: "Linux".to_string(),
+                severity: Severity::Pass,
+                fix_hint: None,
+            }],
+        };
+        print_category(&category);
+    }
+
+    #[test]
+    fn print_report_empty_does_not_panic() {
+        let report = Report { categories: vec![] };
+        print_report(&report);
+    }
+
+    #[test]
+    fn print_report_multiple_categories() {
+        let report = Report {
+            categories: vec![
+                CategoryReport {
+                    name: "System".to_string(),
+                    status: Severity::Pass,
+                    checks: vec![],
+                },
+                CategoryReport {
+                    name: "Docker".to_string(),
+                    status: Severity::Pass,
+                    checks: vec![CheckResult {
+                        name: "Installed".to_string(),
+                        detail: "yes".to_string(),
+                        severity: Severity::Pass,
+                        fix_hint: None,
+                    }],
+                },
+            ],
+        };
+        print_report(&report);
+    }
+}

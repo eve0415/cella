@@ -2165,4 +2165,709 @@ mod tests {
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
     }
+
+    // ---------------------------------------------------------------
+    // extract_port
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_port_standard_url() {
+        assert_eq!(extract_port("http://localhost:3000/path"), Some(3000));
+    }
+
+    #[test]
+    fn extract_port_https() {
+        assert_eq!(extract_port("https://localhost:8443"), Some(8443));
+    }
+
+    #[test]
+    fn extract_port_no_path() {
+        assert_eq!(extract_port("http://localhost:8080"), Some(8080));
+    }
+
+    #[test]
+    fn extract_port_with_trailing_slash() {
+        assert_eq!(extract_port("http://localhost:5000/"), Some(5000));
+    }
+
+    #[test]
+    fn extract_port_no_port_in_url() {
+        assert_eq!(extract_port("http://localhost/path"), None);
+    }
+
+    #[test]
+    fn extract_port_no_scheme() {
+        assert_eq!(extract_port("localhost:3000"), None);
+    }
+
+    #[test]
+    fn extract_port_empty_string() {
+        assert_eq!(extract_port(""), None);
+    }
+
+    #[test]
+    fn extract_port_ip_address() {
+        assert_eq!(extract_port("http://127.0.0.1:9000/api"), Some(9000));
+    }
+
+    #[test]
+    fn extract_port_invalid_port_number() {
+        assert_eq!(extract_port("http://localhost:notaport/path"), None);
+    }
+
+    #[test]
+    fn extract_port_port_zero() {
+        assert_eq!(extract_port("http://localhost:0/path"), Some(0));
+    }
+
+    #[test]
+    fn extract_port_max_port() {
+        assert_eq!(extract_port("http://localhost:65535/path"), Some(65535));
+    }
+
+    #[test]
+    fn extract_port_overflow_port() {
+        // 65536 does not fit in u16
+        assert_eq!(extract_port("http://localhost:65536/path"), None);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_worktree_porcelain
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_worktree_porcelain_empty() {
+        let entries = parse_worktree_porcelain("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_single_main() {
+        let output = "worktree /home/user/repo\nbranch refs/heads/main\n\n";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].worktree_path, "/home/user/repo");
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert!(entries[0].is_main);
+        assert!(entries[0].container_name.is_none());
+        assert!(entries[0].container_state.is_none());
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_strips_refs_heads() {
+        let output = "worktree /repo\nbranch refs/heads/feature/my-branch\n\n";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries[0].branch.as_deref(), Some("feature/my-branch"));
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_bare_not_main() {
+        let output = "worktree /repo.git\nbare\n\n";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_main); // bare repos are not main
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_multiple() {
+        let output = "\
+worktree /home/user/repo
+branch refs/heads/main
+
+worktree /home/user/repo-feat
+branch refs/heads/feat/x
+
+";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].worktree_path, "/home/user/repo");
+        assert!(entries[0].is_main);
+        assert_eq!(entries[1].worktree_path, "/home/user/repo-feat");
+        assert_eq!(entries[1].branch.as_deref(), Some("feat/x"));
+        assert!(!entries[1].is_main);
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_no_branch() {
+        // Detached HEAD — no branch line
+        let output = "worktree /repo\nHEAD abc123\n\n";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].branch.is_none());
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_no_trailing_blank_line() {
+        // Some git versions might not emit a trailing blank line
+        let output = "worktree /repo\nbranch refs/heads/main";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].worktree_path, "/repo");
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_three_worktrees() {
+        let output = "\
+worktree /main
+branch refs/heads/main
+
+worktree /feat-a
+branch refs/heads/feat-a
+
+worktree /feat-b
+branch refs/heads/feat-b
+
+";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].is_main);
+        assert!(!entries[1].is_main);
+        assert!(!entries[2].is_main);
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_branch_without_refs_heads() {
+        // Rare but possible: branch that doesn't start with refs/heads/
+        let output = "worktree /repo\nbranch refs/tags/v1.0\n\n";
+        let entries = parse_worktree_porcelain(output);
+        assert_eq!(entries[0].branch.as_deref(), Some("refs/tags/v1.0"));
+    }
+
+    // ---------------------------------------------------------------
+    // parse_branch_json_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_branch_json_with_container_id() {
+        let json = r#"{"containerId":"my-container","workspaceFolder":"/ws"}"#;
+        let result = parse_branch_json_output(json);
+        assert!(result.is_some());
+        if let Some(cella_port::protocol::WorktreeOperationResult::Success {
+            container_name,
+            worktree_path,
+        }) = result
+        {
+            assert_eq!(container_name, "my-container");
+            assert_eq!(worktree_path, "/ws");
+        } else {
+            panic!("Expected Success variant");
+        }
+    }
+
+    #[test]
+    fn parse_branch_json_with_outcome() {
+        let json = r#"{"outcome":"created","containerId":"c1","workspaceFolder":"/ws"}"#;
+        let result = parse_branch_json_output(json);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn parse_branch_json_with_container_name_key() {
+        let json = r#"{"containerName":"my-container","remoteWorkspaceFolder":"/remote/ws"}"#;
+        let result = parse_branch_json_output(json);
+        // containerName without containerId or outcome — should return None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_branch_json_invalid_json() {
+        let result = parse_branch_json_output("not json at all");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_branch_json_empty_string() {
+        let result = parse_branch_json_output("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_branch_json_multiline_last_object() {
+        let json = "some progress line\n{\"containerId\":\"c1\",\"workspaceFolder\":\"/ws\"}";
+        let result = parse_branch_json_output(json);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn parse_branch_json_no_matching_keys() {
+        let json = r#"{"status":"ok","data":"value"}"#;
+        let result = parse_branch_json_output(json);
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_prune_json_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_prune_json_both_fields() {
+        let json = r#"{"pruned":["branch-a","branch-b"],"errors":["err1"]}"#;
+        let (pruned, errors) = parse_prune_json_output(json);
+        assert_eq!(pruned, vec!["branch-a", "branch-b"]);
+        assert_eq!(errors, vec!["err1"]);
+    }
+
+    #[test]
+    fn parse_prune_json_empty_arrays() {
+        let json = r#"{"pruned":[],"errors":[]}"#;
+        let (pruned, errors) = parse_prune_json_output(json);
+        assert!(pruned.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_prune_json_missing_fields() {
+        let json = r"{}";
+        let (pruned, errors) = parse_prune_json_output(json);
+        assert!(pruned.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_prune_json_invalid() {
+        let (pruned, errors) = parse_prune_json_output("not json");
+        assert!(pruned.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_prune_json_empty() {
+        let (pruned, errors) = parse_prune_json_output("");
+        assert!(pruned.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_prune_json_only_pruned() {
+        let json = r#"{"pruned":["x"]}"#;
+        let (pruned, errors) = parse_prune_json_output(json);
+        assert_eq!(pruned, vec!["x"]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_prune_json_only_errors() {
+        let json = r#"{"errors":["failed"]}"#;
+        let (pruned, errors) = parse_prune_json_output(json);
+        assert!(pruned.is_empty());
+        assert_eq!(errors, vec!["failed"]);
+    }
+
+    #[test]
+    fn parse_prune_json_with_whitespace() {
+        let json = "  {\"pruned\":[\"a\"]}  \n";
+        let (pruned, _) = parse_prune_json_output(json);
+        assert_eq!(pruned, vec!["a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_down_json_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_down_json_stopped() {
+        let json = r#"{"outcome":"stopped","containerId":"my-container"}"#;
+        let result = parse_down_json_output(json);
+        match result {
+            cella_port::protocol::DownOperationResult::Success {
+                outcome,
+                container_name,
+            } => {
+                assert!(matches!(
+                    outcome,
+                    cella_port::protocol::DownOutcome::Stopped
+                ));
+                assert_eq!(container_name, "my-container");
+            }
+            cella_port::protocol::DownOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_down_json_removed() {
+        let json = r#"{"outcome":"removed","containerId":"c1"}"#;
+        let result = parse_down_json_output(json);
+        match result {
+            cella_port::protocol::DownOperationResult::Success { outcome, .. } => {
+                assert!(matches!(
+                    outcome,
+                    cella_port::protocol::DownOutcome::Removed
+                ));
+            }
+            cella_port::protocol::DownOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_down_json_no_outcome_defaults_stopped() {
+        let json = r#"{"containerId":"c1"}"#;
+        let result = parse_down_json_output(json);
+        match result {
+            cella_port::protocol::DownOperationResult::Success { outcome, .. } => {
+                assert!(matches!(
+                    outcome,
+                    cella_port::protocol::DownOutcome::Stopped
+                ));
+            }
+            cella_port::protocol::DownOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_down_json_invalid() {
+        let result = parse_down_json_output("invalid json");
+        assert!(matches!(
+            result,
+            cella_port::protocol::DownOperationResult::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_down_json_empty() {
+        let result = parse_down_json_output("");
+        assert!(matches!(
+            result,
+            cella_port::protocol::DownOperationResult::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_down_json_no_container_id() {
+        let json = r#"{"outcome":"stopped"}"#;
+        let result = parse_down_json_output(json);
+        match result {
+            cella_port::protocol::DownOperationResult::Success { container_name, .. } => {
+                assert_eq!(container_name, "");
+            }
+            cella_port::protocol::DownOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // parse_up_json_output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_up_json_success() {
+        let json = r#"{"containerId":"c1","workspaceFolder":"/workspace"}"#;
+        let result = parse_up_json_output(json);
+        match result {
+            cella_port::protocol::WorktreeOperationResult::Success {
+                container_name,
+                worktree_path,
+            } => {
+                assert_eq!(container_name, "c1");
+                assert_eq!(worktree_path, "/workspace");
+            }
+            cella_port::protocol::WorktreeOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_up_json_missing_fields() {
+        let json = r"{}";
+        let result = parse_up_json_output(json);
+        match result {
+            cella_port::protocol::WorktreeOperationResult::Success {
+                container_name,
+                worktree_path,
+            } => {
+                assert_eq!(container_name, "");
+                assert_eq!(worktree_path, "");
+            }
+            cella_port::protocol::WorktreeOperationResult::Error { .. } => {
+                panic!("Expected Success with empty fields")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_up_json_invalid() {
+        let result = parse_up_json_output("garbage");
+        assert!(matches!(
+            result,
+            cella_port::protocol::WorktreeOperationResult::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_up_json_empty() {
+        let result = parse_up_json_output("");
+        assert!(matches!(
+            result,
+            cella_port::protocol::WorktreeOperationResult::Error { .. }
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // send_message
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_message_writes_json_newline() {
+        let msg = DaemonMessage::PortMapping {
+            container_port: 3000,
+            host_port: 3000,
+        };
+        let mut output = Vec::<u8>::new();
+        send_message(&mut output, &msg).await.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(text.contains("port_mapping"));
+    }
+
+    #[tokio::test]
+    async fn send_message_credential_response() {
+        let msg = DaemonMessage::CredentialResponse {
+            id: "req-1".to_string(),
+            fields: HashMap::new(),
+        };
+        let mut output = Vec::<u8>::new();
+        send_message(&mut output, &msg).await.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("credential_response"));
+        assert!(text.contains("req-1"));
+    }
+
+    // ---------------------------------------------------------------
+    // send_reject
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_reject_writes_daemon_hello_with_error() {
+        let mut output = Vec::<u8>::new();
+        send_reject(&mut output, "test error".to_string()).await;
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("test error"));
+        assert!(text.contains("protocol_version"));
+        assert!(text.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn send_reject_empty_error() {
+        let mut output = Vec::<u8>::new();
+        send_reject(&mut output, String::new()).await;
+        let text = String::from_utf8(output).unwrap();
+        // Should contain an error field even if empty
+        let hello: DaemonHello = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(hello.error, Some(String::new()));
+    }
+
+    // ---------------------------------------------------------------
+    // handle_agent_message — Health variant
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_health_message_returns_none() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+        };
+
+        let msg = AgentMessage::Health {
+            uptime_secs: 100,
+            ports_detected: 5,
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(result.is_none());
+        // Should update state
+        assert!(state.connected.load(Ordering::Relaxed));
+        assert!(state.last_seen_secs.load(Ordering::Relaxed) > 0);
+    }
+
+    // ---------------------------------------------------------------
+    // handle_agent_message — PortClosed variant
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_port_closed_returns_none() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+        }
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+        };
+
+        let msg = AgentMessage::PortClosed {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // handle_agent_message — CredentialRequest
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_credential_request_returns_response() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+        };
+
+        // Use an unknown operation so it fails fast without needing real git
+        let msg = AgentMessage::CredentialRequest {
+            id: "req-42".to_string(),
+            operation: "badop".to_string(),
+            fields: HashMap::new(),
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(result.is_some());
+        match result.unwrap() {
+            DaemonMessage::CredentialResponse { id, fields } => {
+                assert_eq!(id, "req-42");
+                // Failed credential call returns empty fields
+                assert!(fields.is_empty());
+            }
+            other => panic!("Expected CredentialResponse, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // handle_agent_message updates agent_state
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_state_updated_on_message() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        assert!(!state.connected.load(Ordering::Relaxed));
+        assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 0);
+
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+        };
+
+        let msg = AgentMessage::Health {
+            uptime_secs: 0,
+            ports_detected: 0,
+        };
+        let _ = handle_agent_message(msg, &ctx, &state).await;
+
+        assert!(state.connected.load(Ordering::Relaxed));
+        let ts = state.last_seen_secs.load(Ordering::Relaxed);
+        assert!(ts > 0, "last_seen_secs should be non-zero after message");
+    }
+
+    // ---------------------------------------------------------------
+    // rewrite_browser_url — additional edge cases
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rewrite_url_no_scheme_untouched() {
+        let pm = pm_with_forwarded_port(3000).await;
+        let result = rewrite_browser_url("localhost:3000/path", &pm, "c1").await;
+        assert_eq!(result, "localhost:3000/path");
+    }
+
+    #[tokio::test]
+    async fn rewrite_url_ipv6_localhost() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container("c1", "a", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container("c2", "b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.handle_port_open("c1", 4000, PortProtocol::Tcp, None);
+            guard.handle_port_open("c2", 4000, PortProtocol::Tcp, None);
+        }
+        let result = rewrite_browser_url("http://[::1]:4000/path", &pm, "c2").await;
+        assert_eq!(result, "http://localhost:4001/path");
+    }
+
+    #[tokio::test]
+    async fn rewrite_url_empty_string() {
+        let pm = pm_with_forwarded_port(3000).await;
+        let result = rewrite_browser_url("", &pm, "c1").await;
+        assert_eq!(result, "");
+    }
+
+    // ---------------------------------------------------------------
+    // handle_port_open — without proxy
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_port_open_returns_mapping() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+        }
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+        };
+
+        let msg = AgentMessage::PortOpen {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+            process: None,
+            bind: cella_port::protocol::BindAddress::All,
+            proxy_port: None,
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        // Without proxy_cmd_tx, should return PortMapping
+        match result {
+            Some(DaemonMessage::PortMapping {
+                container_port,
+                host_port,
+            }) => {
+                assert_eq!(container_port, 3000);
+                assert_eq!(host_port, 3000);
+            }
+            other => panic!("Expected PortMapping, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // snapshot_binary
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn snapshot_binary_nonexistent_source() {
+        let result = snapshot_binary(std::path::Path::new("/nonexistent/binary/path"));
+        assert!(result.is_none());
+    }
 }

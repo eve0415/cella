@@ -229,4 +229,39 @@ mod tests {
         // execute_log just prints instructions
         execute_log();
     }
+
+    #[test]
+    fn parse_url_with_fragment() {
+        let (domain, path) = parse_url_parts("https://example.com/page#section");
+        assert_eq!(domain, "example.com");
+        assert_eq!(path, "/page#section");
+    }
+
+    #[test]
+    fn parse_bare_domain_with_path() {
+        let (domain, path) = parse_url_parts("api.internal/v1/resource");
+        assert_eq!(domain, "api.internal");
+        assert_eq!(path, "/v1/resource");
+    }
+
+    #[test]
+    fn parse_domain_with_subdomain_and_port() {
+        let (domain, path) = parse_url_parts("https://api.staging.example.com:9443/health");
+        assert_eq!(domain, "api.staging.example.com");
+        assert_eq!(path, "/health");
+    }
+
+    #[test]
+    fn parse_localhost_url() {
+        let (domain, path) = parse_url_parts("http://localhost:3000/api");
+        assert_eq!(domain, "localhost");
+        assert_eq!(path, "/api");
+    }
+
+    #[test]
+    fn parse_ip_address_url() {
+        let (domain, path) = parse_url_parts("http://192.168.1.1:8080/status");
+        assert_eq!(domain, "192.168.1.1");
+        assert_eq!(path, "/status");
+    }
 }

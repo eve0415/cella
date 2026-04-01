@@ -845,4 +845,63 @@ mod tests {
         let cmd = tool_shell_cmd(None, "");
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
     }
+
+    #[test]
+    fn log_install_result_success() {
+        let result = Ok(ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        // Should not panic
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_install_result_nonzero_exit() {
+        let result = Ok(ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "error occurred".to_string(),
+        });
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_install_result_error() {
+        let result: Result<ExecResult, CellaDockerError> =
+            Err(CellaDockerError::ContainerNotFound {
+                workspace: "test".into(),
+            });
+        log_install_result(result);
+    }
+
+    #[test]
+    fn log_npm_install_result_success() {
+        let result = Ok(ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        log_npm_install_result("TestTool", result);
+    }
+
+    #[test]
+    fn log_npm_install_result_nonzero_exit() {
+        let result = Ok(ExecResult {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "command not found".to_string(),
+        });
+        log_npm_install_result("TestTool", result);
+    }
+
+    #[test]
+    fn log_npm_install_result_error() {
+        let result: Result<ExecResult, CellaDockerError> =
+            Err(CellaDockerError::ContainerNotFound {
+                workspace: "missing".into(),
+            });
+        log_npm_install_result("TestTool", result);
+    }
 }

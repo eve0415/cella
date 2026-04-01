@@ -337,4 +337,43 @@ mod tests {
             .trim();
         assert_eq!(version, "unknown");
     }
+
+    #[test]
+    fn nvim_version_parse_no_prefix() {
+        let output = "v0.9.5";
+        let version = output
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .strip_prefix("NVIM ")
+            .unwrap_or("unknown")
+            .trim();
+        assert_eq!(version, "unknown");
+    }
+
+    #[test]
+    fn nvim_version_parse_with_whitespace() {
+        let output = "NVIM v0.10.0  \n";
+        let version = output
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .strip_prefix("NVIM ")
+            .unwrap_or("unknown")
+            .trim();
+        assert_eq!(version, "v0.10.0");
+    }
+
+    #[test]
+    fn nvim_version_multiline_first_line() {
+        let output = "NVIM v0.11.0\nBuild type: Release\nLuaJIT 2.1.1713484068";
+        let version = output
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .strip_prefix("NVIM ")
+            .unwrap_or("unknown")
+            .trim();
+        assert_eq!(version, "v0.11.0");
+    }
 }

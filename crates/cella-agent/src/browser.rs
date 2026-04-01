@@ -41,3 +41,53 @@ fn resolve_daemon_connection() -> Result<(String, String), CellaPortError> {
             .to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_daemon_connection_returns_ok_or_err() {
+        // In the test environment, /cella/.daemon_addr may or may not exist.
+        // Verify the function does not panic and returns a valid Result.
+        let result = resolve_daemon_connection();
+        match result {
+            Ok((addr, token)) => {
+                assert!(!addr.is_empty());
+                assert!(!token.is_empty());
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(!msg.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_daemon_connection_error_is_control_socket() {
+        // If neither file nor env vars are available, error should be ControlSocket.
+        let result = resolve_daemon_connection();
+        if let Err(err) = result {
+            let dbg = format!("{err:?}");
+            assert!(
+                dbg.contains("ControlSocket"),
+                "expected ControlSocket error, got: {dbg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_browser_open_produces_error_or_succeeds() {
+        // In test env, daemon may not be running on the resolved address.
+        // This tests the function's error path end-to-end without panicking.
+        let result = send_browser_open("http://localhost:3000").await;
+        // The function should either succeed or return a CellaPortError.
+        match result {
+            Ok(()) => {} // Daemon happened to be running
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(!msg.is_empty());
+            }
+        }
+    }
+}

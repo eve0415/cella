@@ -388,4 +388,34 @@ mod tests {
         // We just verify the check doesn't panic
         let _ = is_nested;
     }
+
+    #[test]
+    fn tmux_version_with_leading_whitespace() {
+        let output = "  tmux 3.5a  ";
+        assert_eq!(output.trim(), "tmux 3.5a");
+    }
+
+    #[test]
+    fn tmux_version_empty_string() {
+        let output = "";
+        assert_eq!(output.trim(), "");
+    }
+
+    #[test]
+    fn tmux_args_is_text_output_default() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "tmux"]).unwrap();
+        if let crate::commands::Command::Tmux(args) = &cli.command {
+            assert!(args.is_text_output());
+        }
+    }
+
+    #[test]
+    fn tmux_args_is_json_output() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "tmux", "--output", "json"]).unwrap();
+        if let crate::commands::Command::Tmux(args) = &cli.command {
+            assert!(!args.is_text_output());
+        }
+    }
 }

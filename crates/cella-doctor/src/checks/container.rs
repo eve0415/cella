@@ -346,4 +346,60 @@ mod tests {
         assert_eq!(reports[0].checks[0].name, "skipped");
         assert!(reports[0].checks[0].detail.contains("daemon not running"));
     }
+
+    #[tokio::test]
+    async fn skip_when_daemon_not_running_has_single_report() {
+        let ctx = ctx_no_docker(Some(std::path::PathBuf::from("/some/workspace")));
+        let reports = check_containers(&ctx, false).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].name, "Containers");
+    }
+
+    #[tokio::test]
+    async fn skip_when_daemon_not_running_severity_is_info() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, false).await;
+        assert_eq!(reports[0].checks[0].severity, Severity::Info);
+    }
+
+    #[tokio::test]
+    async fn skip_when_no_docker_client_severity_is_info() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, true).await;
+        assert_eq!(reports[0].checks[0].severity, Severity::Info);
+    }
+
+    #[tokio::test]
+    async fn skip_when_no_docker_client_has_correct_detail() {
+        let ctx = ctx_no_docker(Some(std::path::PathBuf::from("/workspace")));
+        let reports = check_containers(&ctx, true).await;
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].checks[0].detail.contains("Docker not connected"));
+    }
+
+    #[tokio::test]
+    async fn daemon_not_running_check_has_no_fix_hint() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, false).await;
+        assert!(reports[0].checks[0].fix_hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_docker_client_check_has_no_fix_hint() {
+        let ctx = ctx_no_docker(None);
+        let reports = check_containers(&ctx, true).await;
+        assert!(reports[0].checks[0].fix_hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn ctx_with_all_flag_still_skips_without_client() {
+        let ctx = CheckContext {
+            workspace_folder: None,
+            all: true,
+            docker_client: None,
+        };
+        let reports = check_containers(&ctx, true).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].checks[0].name, "skipped");
+    }
 }

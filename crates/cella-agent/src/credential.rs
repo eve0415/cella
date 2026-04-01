@@ -158,4 +158,65 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields.get("host"), Some(&"example.com".to_string()));
     }
+
+    #[test]
+    fn resolve_daemon_connection_returns_result() {
+        let result = resolve_daemon_connection();
+        match result {
+            Ok((addr, token)) => {
+                assert!(!addr.is_empty());
+                assert!(!token.is_empty());
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(!msg.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn parse_credential_fields_duplicate_keys_last_wins() {
+        let input = "host=first.com\nhost=second.com\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.get("host"), Some(&"second.com".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_fields_empty_value() {
+        let input = "host=\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.get("host"), Some(&String::new()));
+    }
+
+    #[test]
+    fn parse_credential_fields_windows_line_endings() {
+        let input = "protocol=https\r\nhost=github.com\r\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains_key("protocol"));
+        assert!(fields.contains_key("host"));
+    }
+
+    #[test]
+    fn parse_credential_fields_many_fields() {
+        let input =
+            "protocol=https\nhost=github.com\nusername=bot\npassword=token123\npath=org/repo\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields.get("path"), Some(&"org/repo".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_fields_key_only_no_equals() {
+        let input = "noequals\n";
+        let fields = parse_credential_fields(input);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parse_credential_fields_equals_in_key_position() {
+        let input = "=value\n";
+        let fields = parse_credential_fields(input);
+        assert_eq!(fields.get(""), Some(&"value".to_string()));
+    }
 }

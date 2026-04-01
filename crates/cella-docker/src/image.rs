@@ -423,4 +423,100 @@ mod tests {
     fn normalize_user_colon_only_defaults_to_root() {
         assert_eq!(normalize_user(":1000"), "root");
     }
+
+    // -----------------------------------------------------------------------
+    // normalize_user additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_user_multiple_colons() {
+        // "user:group:extra" should return "user"
+        assert_eq!(normalize_user("user:group:extra"), "user");
+    }
+
+    #[test]
+    fn normalize_user_numeric_with_colon_and_extra() {
+        assert_eq!(normalize_user("1000:1000:extra"), "1000");
+    }
+
+    #[test]
+    fn normalize_user_whitespace() {
+        // Whitespace is not trimmed -- returned as-is
+        assert_eq!(normalize_user(" user "), " user ");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_command_args additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_args_context_path_is_always_last() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    #[test]
+    fn build_args_buildx_loads_image() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert!(args.contains(&"--load".to_string()));
+    }
+
+    #[test]
+    fn build_args_without_buildx_no_load() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert!(!args.contains(&"--load".to_string()));
+    }
+
+    #[test]
+    fn build_args_always_has_progress_plain() {
+        let opts = basic_opts();
+        let args_no_buildx = build_command_args(&opts, false);
+        let args_buildx = build_command_args(&opts, true);
+        assert!(args_no_buildx.contains(&"--progress=plain".to_string()));
+        assert!(args_buildx.contains(&"--progress=plain".to_string()));
+    }
+
+    #[test]
+    fn build_args_dockerfile_joined_with_context() {
+        let mut opts = basic_opts();
+        opts.dockerfile = "docker/Dockerfile.dev".to_string();
+        let args = build_command_args(&opts, false);
+        assert!(
+            args.contains(&"/src/project/docker/Dockerfile.dev".to_string()),
+            "Dockerfile path should be joined with context: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_multiple_build_args() {
+        let mut opts = basic_opts();
+        opts.args
+            .insert("NODE_VERSION".to_string(), "20".to_string());
+        opts.args
+            .insert("PYTHON_VERSION".to_string(), "3.11".to_string());
+        let args = build_command_args(&opts, false);
+        // Both build args should appear
+        let build_arg_count = args.iter().filter(|a| *a == "--build-arg").count();
+        assert_eq!(build_arg_count, 2);
+    }
+
+    #[test]
+    fn build_args_multiple_cache_from() {
+        let mut opts = basic_opts();
+        opts.cache_from = vec!["cache1".to_string(), "cache2".to_string()];
+        let args = build_command_args(&opts, false);
+        let cache_count = args.iter().filter(|a| *a == "--cache-from").count();
+        assert_eq!(cache_count, 2);
+    }
+
+    #[test]
+    fn build_args_empty_options() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        // Should be minimal: ["build", "--progress=plain", "-t", name, "-f", path, context]
+        assert_eq!(args.len(), 7);
+    }
 }

@@ -722,9 +722,9 @@ mod tests {
     // ── switch command ──────────────────────────────────────────────
 
     #[test]
-    fn parse_switch_requires_name() {
-        let result = parse(&["cella", "switch"]);
-        assert!(result.is_err());
+    fn parse_switch_without_name_uses_picker() {
+        let cli = parse(&["cella", "switch"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Switch(_)));
     }
 
     #[test]

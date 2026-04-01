@@ -280,4 +280,73 @@ mod tests {
         let hash_part = name.strip_prefix("cella-net-").unwrap();
         assert_eq!(hash_part.len(), 12);
     }
+
+    // -----------------------------------------------------------------------
+    // repo_network_name additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repo_network_name_with_unicode_path() {
+        let name = repo_network_name(Path::new("/home/user/proyecto-espanol"));
+        assert!(name.starts_with("cella-net-"));
+        let hash = name.strip_prefix("cella-net-").unwrap();
+        assert_eq!(hash.len(), 12);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn repo_network_name_with_spaces() {
+        let name = repo_network_name(Path::new("/home/user/my project"));
+        assert!(name.starts_with("cella-net-"));
+        let hash = name.strip_prefix("cella-net-").unwrap();
+        assert_eq!(hash.len(), 12);
+    }
+
+    #[test]
+    fn repo_network_name_with_dots() {
+        let name = repo_network_name(Path::new("/home/user/.hidden-project"));
+        assert!(name.starts_with("cella-net-"));
+    }
+
+    #[test]
+    fn repo_network_name_very_long_path() {
+        let long_path = "/".to_string() + &"a".repeat(1000);
+        let name = repo_network_name(Path::new(&long_path));
+        assert!(name.starts_with("cella-net-"));
+        let hash = name.strip_prefix("cella-net-").unwrap();
+        assert_eq!(
+            hash.len(),
+            12,
+            "hash should always be 12 chars regardless of path length"
+        );
+    }
+
+    #[test]
+    fn repo_network_name_root_path() {
+        let name = repo_network_name(Path::new("/"));
+        assert!(name.starts_with("cella-net-"));
+    }
+
+    #[test]
+    fn repo_network_name_similar_paths_differ() {
+        let name1 = repo_network_name(Path::new("/project/a"));
+        let name2 = repo_network_name(Path::new("/project/A"));
+        assert_ne!(
+            name1, name2,
+            "case-different paths should produce different hashes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Network constant test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cella_network_name_is_valid_docker_network_name() {
+        // Docker network names must be lowercase alphanumeric
+        assert!(
+            CELLA_NETWORK_NAME.chars().all(|c| c.is_ascii_lowercase()),
+            "network name should be all lowercase"
+        );
+    }
 }

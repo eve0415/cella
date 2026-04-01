@@ -560,4 +560,235 @@ mod tests {
         assert!(msg.contains("  a"));
         assert!(msg.contains("  b"));
     }
+
+    #[test]
+    fn format_non_interactive_empty_candidates() {
+        let msg = format_non_interactive_error("Nothing", &[]);
+        assert!(msg.contains("Nothing"));
+        assert!(msg.contains("Available options:"));
+    }
+
+    #[test]
+    fn format_non_interactive_single_candidate() {
+        let msg = format_non_interactive_error("Pick one", &["only".into()]);
+        assert!(msg.contains("  only"));
+    }
+
+    #[test]
+    fn worktree_label_other_state_shows_question_mark() {
+        let label = format_worktree_label(
+            "feat",
+            false,
+            Some(&ContainerState::Other("restarting".to_string())),
+        );
+        assert!(label.contains('?'));
+    }
+
+    #[test]
+    fn container_label_stopped_state() {
+        let c = make_container("dev-main", "main", ContainerState::Stopped);
+        let label = format_container_label(&c);
+        assert!(label.contains("dev-main"));
+        assert!(label.contains("main"));
+        assert!(label.contains('\u{25cb}')); // ○
+    }
+
+    #[test]
+    fn container_label_other_state() {
+        let mut c = make_container("dev-other", "feat", ContainerState::Running);
+        c.state = ContainerState::Other("paused".to_string());
+        let label = format_container_label(&c);
+        assert!(label.contains('?'));
+    }
+
+    #[test]
+    fn container_label_no_branch_label() {
+        let c = ContainerInfo {
+            id: "id-1".to_string(),
+            name: "no-branch".to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels: HashMap::new(),
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: cella_docker::BackendKind::Docker,
+        };
+        let label = format_container_label(&c);
+        assert!(label.contains('-')); // branch defaults to "-"
+    }
+
+    #[test]
+    fn branch_container_states_skips_without_branch_label() {
+        let c = ContainerInfo {
+            id: "id-1".to_string(),
+            name: "no-label".to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels: HashMap::new(),
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: cella_docker::BackendKind::Docker,
+        };
+        let map = branch_container_states(&[c]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn branch_container_states_empty_input() {
+        let map = branch_container_states(&[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn has_explicit_target_none() {
+        let target = cella_docker::ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert!(!has_explicit_target(&target));
+    }
+
+    #[test]
+    fn has_explicit_target_container_id() {
+        let target = cella_docker::ContainerTarget {
+            container_id: Some("abc123".to_string()),
+            container_name: None,
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert!(has_explicit_target(&target));
+    }
+
+    #[test]
+    fn has_explicit_target_container_name() {
+        let target = cella_docker::ContainerTarget {
+            container_id: None,
+            container_name: Some("my-container".to_string()),
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert!(has_explicit_target(&target));
+    }
+
+    #[test]
+    fn has_explicit_target_id_label() {
+        let target = cella_docker::ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: Some("dev.cella.id=abc".to_string()),
+            workspace_folder: None,
+        };
+        assert!(has_explicit_target(&target));
+    }
+
+    #[test]
+    fn has_explicit_target_workspace_folder() {
+        let target = cella_docker::ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: None,
+            workspace_folder: Some("/workspaces/myapp".into()),
+        };
+        assert!(has_explicit_target(&target));
+    }
+
+    #[test]
+    fn picker_error_display_no_candidates() {
+        let err = PickerError::NoCandidates;
+        assert_eq!(err.to_string(), "no candidates available");
+    }
+
+    #[test]
+    fn picker_error_display_non_interactive() {
+        let err = PickerError::NonInteractive {
+            message: "Select a branch:".to_string(),
+            candidates: vec!["main".to_string(), "feat".to_string()],
+        };
+        assert_eq!(err.to_string(), "Select a branch:");
+    }
+
+    #[test]
+    fn picker_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(PickerError::NoCandidates);
+        assert_eq!(err.to_string(), "no candidates available");
+    }
+
+    #[test]
+    fn picker_item_display() {
+        let item: PickerItem<String> = PickerItem {
+            label: "my-label".to_string(),
+            value: "my-value".to_string(),
+        };
+        assert_eq!(format!("{item}"), "my-label");
+    }
+
+    #[test]
+    fn json_candidates_error_empty() {
+        let result = json_candidates_error("empty", &[]);
+        assert_eq!(result["error"], "empty");
+        assert!(result["candidates"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn container_picker_items_empty() {
+        let items = container_picker_items(&[], None);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn worktree_items_all_detached() {
+        let mut wt1 = make_worktree("a", false);
+        wt1.branch = None;
+        let mut wt2 = make_worktree("b", false);
+        wt2.branch = None;
+        let items = worktree_picker_items(&[wt1, wt2], &HashMap::new(), None);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn worktree_items_with_running_container_state() {
+        let worktrees = vec![make_worktree("feat/auth", false)];
+        let mut states = HashMap::new();
+        states.insert("feat/auth".to_string(), ContainerState::Running);
+
+        let items = worktree_picker_items(&worktrees, &states, None);
+        assert_eq!(items.len(), 1);
+        // Label should contain the running indicator
+        assert!(items[0].label.contains('\u{25cf}')); // ●
+    }
+
+    #[test]
+    fn resolve_worktree_exact_match_returns_correct_path() {
+        let worktrees = vec![make_worktree("main", true), make_worktree("feat/x", false)];
+        let states = HashMap::new();
+
+        let result = resolve_worktree_interactive(&worktrees, &states, Some("main"), None);
+        assert!(result.is_ok());
+        let wt = result.unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("main"));
+        assert!(wt.is_main);
+    }
+
+    #[test]
+    fn resolve_worktree_no_match_empty_worktrees() {
+        let states = HashMap::new();
+        let result = resolve_worktree_interactive(&[], &states, Some("nonexistent"), None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No worktree branches")
+        );
+    }
 }

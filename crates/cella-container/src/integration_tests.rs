@@ -434,3 +434,139 @@ async fn test_gpu_request_warns_not_errors() {
     guard.set_id(id.clone());
     assert!(!id.is_empty());
 }
+
+#[tokio::test]
+async fn test_container_restart() {
+    let (backend, cli_path) = setup_backend();
+    let name = test_container_name("restart");
+    let mut guard = ContainerGuard::new(cli_path);
+
+    let opts = minimal_create_opts(&name);
+    let id = backend.create_container(&opts).await.unwrap();
+    guard.set_id(id.clone());
+
+    // Start → stop → start again.
+    backend.start_container(&id).await.unwrap();
+    backend.stop_container(&id).await.unwrap();
+    backend.start_container(&id).await.unwrap();
+
+    // Should still be functional after restart.
+    let exec_opts = ExecOptions {
+        cmd: vec!["echo".to_string(), "after-restart".to_string()],
+        user: None,
+        env: None,
+        working_dir: None,
+    };
+    let result = backend.exec_command(&id, &exec_opts).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("after-restart"));
+}
+
+#[tokio::test]
+async fn test_exec_stderr_capture() {
+    let (backend, cli_path) = setup_backend();
+    let name = test_container_name("stderr");
+    let mut guard = ContainerGuard::new(cli_path);
+
+    let opts = minimal_create_opts(&name);
+    let id = backend.create_container(&opts).await.unwrap();
+    guard.set_id(id.clone());
+    backend.start_container(&id).await.unwrap();
+
+    let exec_opts = ExecOptions {
+        cmd: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo err_msg >&2".to_string(),
+        ],
+        user: None,
+        env: None,
+        working_dir: None,
+    };
+    let result = backend.exec_command(&id, &exec_opts).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(
+        result.stderr.contains("err_msg"),
+        "expected stderr to contain err_msg, got: {}",
+        result.stderr
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_file_uploads() {
+    let (backend, cli_path) = setup_backend();
+    let name = test_container_name("multiup");
+    let mut guard = ContainerGuard::new(cli_path);
+
+    let opts = minimal_create_opts(&name);
+    let id = backend.create_container(&opts).await.unwrap();
+    guard.set_id(id.clone());
+    backend.start_container(&id).await.unwrap();
+
+    let files = vec![
+        FileToUpload {
+            path: "/tmp/cella-test-a.txt".to_string(),
+            content: b"file-a-content".to_vec(),
+            mode: 0o644,
+        },
+        FileToUpload {
+            path: "/tmp/cella-test-b.txt".to_string(),
+            content: b"file-b-content".to_vec(),
+            mode: 0o600,
+        },
+    ];
+
+    backend.upload_files(&id, &files).await.unwrap();
+
+    // Verify both files.
+    for (path, expected) in [
+        ("/tmp/cella-test-a.txt", "file-a-content"),
+        ("/tmp/cella-test-b.txt", "file-b-content"),
+    ] {
+        let exec_opts = ExecOptions {
+            cmd: vec!["cat".to_string(), path.to_string()],
+            user: None,
+            env: None,
+            working_dir: None,
+        };
+        let result = backend.exec_command(&id, &exec_opts).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout.trim(), expected, "file {path} mismatch");
+    }
+}
+
+#[tokio::test]
+async fn test_remove_nonexistent_container() {
+    let (backend, _cli_path) = setup_backend();
+
+    let result = backend
+        .remove_container("nonexistent-container-id-12345", false)
+        .await;
+    assert!(
+        result.is_err(),
+        "removing a nonexistent container should fail"
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_folder_label_set() {
+    let (backend, cli_path) = setup_backend();
+    let name = test_container_name("wslabel");
+    let mut guard = ContainerGuard::new(cli_path);
+
+    let mut opts = minimal_create_opts(&name);
+    opts.labels
+        .insert("dev.cella.tool".to_string(), "cella".to_string());
+
+    let id = backend.create_container(&opts).await.unwrap();
+    guard.set_id(id.clone());
+
+    let info = backend.inspect_container(&id).await.unwrap();
+    // workspace_folder from create opts should be reflected
+    assert_eq!(
+        info.labels
+            .get("dev.cella.workspace_folder")
+            .map(String::as_str),
+        Some("/workspace"),
+    );
+}

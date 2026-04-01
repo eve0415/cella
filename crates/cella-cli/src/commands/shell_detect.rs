@@ -287,4 +287,37 @@ mod tests {
         let wrapped = wrap_in_login_shell("/bin/sh", &cmd);
         assert!(wrapped[2].starts_with("exec "));
     }
+
+    #[test]
+    fn wrap_in_login_shell_empty_command() {
+        let cmd: Vec<String> = vec![];
+        let wrapped = wrap_in_login_shell("/bin/sh", &cmd);
+        assert_eq!(wrapped.len(), 3);
+        assert_eq!(wrapped[2], "exec ");
+    }
+
+    #[test]
+    fn shell_quote_tab_in_arg() {
+        let args: Vec<String> = vec!["col1\tcol2".into()];
+        assert_eq!(shell_quote(&args), "'col1\tcol2'");
+    }
+
+    #[test]
+    fn shell_quote_unicode_arg() {
+        let args: Vec<String> = vec!["echo".into(), "\u{1f600}".into()];
+        assert_eq!(shell_quote(&args), "'echo' '\u{1f600}'");
+    }
+
+    #[test]
+    fn wrap_in_login_shell_many_args() {
+        let cmd: Vec<String> = vec!["cmd".into(), "arg1".into(), "arg2".into(), "arg3".into()];
+        let wrapped = wrap_in_login_shell("/bin/bash", &cmd);
+        assert_eq!(wrapped[2], "exec 'cmd' 'arg1' 'arg2' 'arg3'");
+    }
+
+    #[test]
+    fn shell_quote_all_single_quotes() {
+        let args: Vec<String> = vec!["'''".into()];
+        assert_eq!(shell_quote(&args), "''\\'''\\'''\\'''");
+    }
 }

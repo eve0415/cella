@@ -390,4 +390,65 @@ mod tests {
         let created = (now - chrono::Duration::seconds(86400)).to_rfc3339();
         assert_eq!(format_age(Some(&created)), "1d");
     }
+
+    // ── format_age additional edge cases ───────────────────────────
+
+    #[test]
+    fn format_age_zero_seconds() {
+        let now = chrono::Utc::now();
+        let created = now.to_rfc3339();
+        assert_eq!(format_age(Some(&created)), "0s");
+    }
+
+    #[test]
+    fn format_age_59_seconds() {
+        let now = chrono::Utc::now();
+        let created = (now - chrono::Duration::seconds(59)).to_rfc3339();
+        assert_eq!(format_age(Some(&created)), "59s");
+    }
+
+    #[test]
+    fn format_age_large_days() {
+        let now = chrono::Utc::now();
+        let created = (now - chrono::Duration::days(365)).to_rfc3339();
+        assert_eq!(format_age(Some(&created)), "365d");
+    }
+
+    // ── short_id edge cases ────────────────────────────────────────
+
+    #[test]
+    fn short_id_empty() {
+        assert_eq!(short_id(""), "");
+    }
+
+    #[test]
+    fn short_id_single_char() {
+        assert_eq!(short_id("a"), "a");
+    }
+
+    // ── format_ports edge cases ────────────────────────────────────
+
+    #[test]
+    fn format_ports_mixed_host_ports() {
+        let info = make_container(vec![
+            cella_docker::PortBinding {
+                container_port: 80,
+                host_port: Some(8080),
+                protocol: "tcp".into(),
+            },
+            cella_docker::PortBinding {
+                container_port: 443,
+                host_port: None,
+                protocol: "tcp".into(),
+            },
+        ]);
+        assert_eq!(format_ports(&info), "8080:80,443");
+    }
+
+    // ── state_str completeness ─────────────────────────────────────
+
+    #[test]
+    fn state_str_other_empty() {
+        assert_eq!(state_str(&ContainerState::Other(String::new())), "");
+    }
 }

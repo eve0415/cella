@@ -144,3 +144,101 @@ impl ContainerTarget {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // ContainerTarget construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn container_target_default_fields_are_none() {
+        let target = ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert!(target.container_id.is_none());
+        assert!(target.container_name.is_none());
+        assert!(target.id_label.is_none());
+        assert!(target.workspace_folder.is_none());
+    }
+
+    #[test]
+    fn container_target_with_id() {
+        let target = ContainerTarget {
+            container_id: Some("abc123".to_string()),
+            container_name: None,
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert_eq!(target.container_id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn container_target_with_name() {
+        let target = ContainerTarget {
+            container_id: None,
+            container_name: Some("my-container".to_string()),
+            id_label: None,
+            workspace_folder: None,
+        };
+        assert_eq!(target.container_name.as_deref(), Some("my-container"));
+    }
+
+    #[test]
+    fn container_target_with_label() {
+        let target = ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: Some("dev.cella.id=xyz".to_string()),
+            workspace_folder: None,
+        };
+        assert_eq!(target.id_label.as_deref(), Some("dev.cella.id=xyz"));
+    }
+
+    #[test]
+    fn container_target_with_workspace() {
+        let target = ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: None,
+            workspace_folder: Some(PathBuf::from("/home/user/project")),
+        };
+        assert_eq!(
+            target.workspace_folder.as_deref(),
+            Some(Path::new("/home/user/project"))
+        );
+    }
+
+    #[test]
+    fn container_target_all_fields_set() {
+        let target = ContainerTarget {
+            container_id: Some("id-1".to_string()),
+            container_name: Some("name-1".to_string()),
+            id_label: Some("label=val".to_string()),
+            workspace_folder: Some(PathBuf::from("/ws")),
+        };
+        assert!(target.container_id.is_some());
+        assert!(target.container_name.is_some());
+        assert!(target.id_label.is_some());
+        assert!(target.workspace_folder.is_some());
+    }
+
+    #[test]
+    fn container_target_workspace_folder_with_spaces() {
+        let target = ContainerTarget {
+            container_id: None,
+            container_name: None,
+            id_label: None,
+            workspace_folder: Some(PathBuf::from("/home/user/my project/repo")),
+        };
+        assert_eq!(
+            target.workspace_folder.unwrap().to_string_lossy(),
+            "/home/user/my project/repo"
+        );
+    }
+}

@@ -263,4 +263,161 @@ mod tests {
         let expected = "Logged in to github.com as john (~/.config/gh/hosts.yml)";
         assert_eq!(r.redact(input), expected);
     }
+
+    // --- find_gh_token_end edge cases ---
+
+    #[test]
+    fn find_gh_token_end_too_short() {
+        // Less than 5 chars remaining
+        assert_eq!(find_gh_token_end("gho_", 0), None);
+        assert_eq!(find_gh_token_end("gh", 0), None);
+        assert_eq!(find_gh_token_end("g", 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_no_gh_prefix() {
+        assert_eq!(find_gh_token_end("abcdefghij", 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_wrong_third_char() {
+        // gh followed by a char that is not o/p/s
+        assert_eq!(find_gh_token_end("ghx_abcdef", 0), None);
+        assert_eq!(find_gh_token_end("gha_abcdef", 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_no_underscore_fourth() {
+        assert_eq!(find_gh_token_end("ghoxabcdef", 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_no_char_after_prefix() {
+        // gh[ops]_ followed by non-alphanumeric
+        assert_eq!(find_gh_token_end("gho_ space", 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_valid_minimal() {
+        // Minimum valid token: gho_X (5 chars)
+        assert_eq!(find_gh_token_end("gho_X", 0), Some(5));
+    }
+
+    #[test]
+    fn find_gh_token_end_at_offset() {
+        // Token starts at offset 7
+        let s = "Token: gho_abc123";
+        assert_eq!(find_gh_token_end(s, 7), Some(17));
+        // Non-token at offset 0
+        assert_eq!(find_gh_token_end(s, 0), None);
+    }
+
+    #[test]
+    fn find_gh_token_end_stops_at_non_alnum() {
+        assert_eq!(find_gh_token_end("ghp_abc.rest", 0), Some(7));
+        assert_eq!(find_gh_token_end("ghs_token value", 0), Some(9));
+    }
+
+    #[test]
+    fn find_gh_token_end_underscores_inside_token() {
+        // Underscores within the token body are allowed
+        assert_eq!(find_gh_token_end("gho_a_b_c", 0), Some(9));
+    }
+
+    // --- redact_tokens edge cases ---
+
+    #[test]
+    fn redact_tokens_empty_string() {
+        assert_eq!(redact_tokens(""), "");
+    }
+
+    #[test]
+    fn redact_tokens_multiple_tokens() {
+        assert_eq!(
+            redact_tokens("first ghp_aaa then ghs_bbb end"),
+            "first <redacted> then <redacted> end"
+        );
+    }
+
+    #[test]
+    fn redact_tokens_adjacent_tokens() {
+        assert_eq!(redact_tokens("gho_abc ghs_def"), "<redacted> <redacted>");
+    }
+
+    #[test]
+    fn redact_tokens_token_at_end_of_string() {
+        assert_eq!(redact_tokens("key=ghp_secret123"), "key=<redacted>");
+    }
+
+    // --- redact_enterprise_username_line edge cases ---
+
+    #[test]
+    fn redact_enterprise_line_no_space_after_host() {
+        // "Logged in to host" with no trailing space
+        let line = "Logged in to enterprise.com";
+        assert_eq!(redact_enterprise_username_line(line), line);
+    }
+
+    #[test]
+    fn redact_enterprise_line_no_as_keyword() {
+        let line = "Logged in to enterprise.com with token";
+        assert_eq!(redact_enterprise_username_line(line), line);
+    }
+
+    #[test]
+    fn redact_enterprise_line_empty_username() {
+        // " as " followed immediately by a parenthesis (empty username)
+        let line = "Logged in to enterprise.com as (token)";
+        assert_eq!(redact_enterprise_username_line(line), line);
+    }
+
+    #[test]
+    fn redact_enterprise_username_multiline() {
+        let input = "line1\nLogged in to ghe.corp.com as admin\nline3";
+        let expected = "line1\nLogged in to ghe.corp.com as <redacted>\nline3";
+        assert_eq!(redact_enterprise_username(input), expected);
+    }
+
+    #[test]
+    fn redact_enterprise_username_multiple_hosts() {
+        let input = "Logged in to github.com as pubuser\nLogged in to ghe.corp.com as privuser";
+        let expected =
+            "Logged in to github.com as pubuser\nLogged in to ghe.corp.com as <redacted>";
+        assert_eq!(redact_enterprise_username(input), expected);
+    }
+
+    // --- Redactor edge cases ---
+
+    #[test]
+    fn redactor_home_dir_trailing_slash_stripped() {
+        let r = redactor_with_home("/home/user");
+        // Verify it was stored without trailing slash
+        assert_eq!(r.home_dir.as_deref(), Some("/home/user"));
+    }
+
+    #[test]
+    fn redactor_redact_home_no_home_set() {
+        let r = Redactor { home_dir: None };
+        assert_eq!(r.redact_home_dir("/home/user/file"), "/home/user/file");
+    }
+
+    #[test]
+    fn redactor_default_creates_instance() {
+        // Just verify Default trait works (coverage for Default impl)
+        let _r = Redactor::default();
+    }
+
+    #[test]
+    fn redact_all_three_layers_applied() {
+        let r = redactor_with_home("/home/test");
+        // String with home dir, a GH token, and an enterprise username
+        let input = "/home/test/.config ghp_secret123 Logged in to ghe.example.com as admin";
+        let result = r.redact(input);
+        assert!(result.contains("~/.config"), "home should be redacted");
+        assert!(result.contains("<redacted>"), "token should be redacted");
+        assert!(
+            !result.contains("admin"),
+            "enterprise username should be redacted"
+        );
+    }
 }

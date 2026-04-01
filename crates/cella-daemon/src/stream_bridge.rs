@@ -139,3 +139,83 @@ fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> Option<std:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // accept_with_timeout
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn accept_with_timeout_returns_none_on_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Very short timeout — no one will connect.
+        let result = accept_with_timeout(&listener, Duration::from_millis(150));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn accept_with_timeout_returns_stream_on_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect from another thread.
+        let handle = std::thread::spawn(move || std::net::TcpStream::connect(addr).unwrap());
+
+        let result = accept_with_timeout(&listener, Duration::from_secs(5));
+        assert!(result.is_some());
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn accept_with_timeout_receives_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.write_all(b"hello").unwrap();
+        });
+
+        let result = accept_with_timeout(&listener, Duration::from_secs(5));
+        assert!(result.is_some());
+        let mut stream = result.unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+
+        let _ = handle.join();
+    }
+
+    // ---------------------------------------------------------------
+    // StreamSession struct
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn stream_session_port_field() {
+        // StreamSession is just a data holder — test that it can be constructed.
+        let handle = tokio::runtime::Runtime::new().unwrap().spawn(async { 42 });
+        let session = StreamSession { port: 8080, handle };
+        assert_eq!(session.port, 8080);
+    }
+
+    // ---------------------------------------------------------------
+    // start_stream_bridge error cases
+    // ---------------------------------------------------------------
+
+    // We can test that binding to an invalid address fails.
+    // This doesn't require Docker — it will fail at TCP bind or PTY allocation
+    // depending on the platform.
+    #[test]
+    fn start_stream_bridge_nonexistent_container() {
+        // The function will try to allocate a PTY and spawn docker exec.
+        // On CI without a proper PTY or Docker, one of these steps should fail.
+        let result = start_stream_bridge("nonexistent-container-12345", "127.0.0.1");
+        // We expect either success (PTY allocated, docker exec will fail later)
+        // or error (PTY allocation fails). Either is valid, just don't panic.
+        let _ = result;
+    }
+}

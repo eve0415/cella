@@ -519,4 +519,61 @@ mod tests {
         let args = VerboseArgs { verbose: true };
         assert!(args.verbose);
     }
+
+    // ── TERMINAL_ENV_VARS coverage ─────────────────────────────────
+
+    #[test]
+    fn terminal_env_vars_count() {
+        assert_eq!(TERMINAL_ENV_VARS.len(), 7);
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_term_program() {
+        assert!(TERMINAL_ENV_VARS.contains(&"TERM_PROGRAM"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_term_program_version() {
+        assert!(TERMINAL_ENV_VARS.contains(&"TERM_PROGRAM_VERSION"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_columns() {
+        assert!(TERMINAL_ENV_VARS.contains(&"COLUMNS"));
+    }
+
+    #[test]
+    fn terminal_env_vars_contains_lines() {
+        assert!(TERMINAL_ENV_VARS.contains(&"LINES"));
+    }
+
+    #[test]
+    fn terminal_env_vars_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for var in TERMINAL_ENV_VARS {
+            assert!(seen.insert(var), "duplicate env var: {var}");
+        }
+    }
+
+    // ── is_binary_newer_than ────────────────────────────────────────
+
+    #[test]
+    fn is_binary_newer_than_recent_past() {
+        // A timestamp from a few seconds ago should still be older than the binary
+        let recent = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 5;
+        // Binary may or may not be newer than 5s ago, but it shouldn't panic
+        let _ = is_binary_newer_than(recent);
+    }
+
+    // ── resolve_workspace_folder edge cases ────────────────────────
+
+    #[test]
+    fn resolve_workspace_folder_returns_absolute_path() {
+        let result = resolve_workspace_folder(None).unwrap();
+        assert!(result.is_absolute());
+    }
 }

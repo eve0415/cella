@@ -182,4 +182,41 @@ mod tests {
             assert_eq!(format!("{runtime}"), runtime.as_label());
         }
     }
+
+    #[test]
+    fn runtime_clone_and_debug() {
+        let runtime = DockerRuntime::OrbStack;
+        let cloned = runtime.clone();
+        assert_eq!(runtime, cloned);
+        let debug = format!("{runtime:?}");
+        assert!(debug.contains("OrbStack"));
+    }
+
+    #[test]
+    fn all_variants_have_unique_labels() {
+        let variants = [
+            DockerRuntime::DockerDesktop,
+            DockerRuntime::OrbStack,
+            DockerRuntime::LinuxNative,
+            DockerRuntime::Colima,
+            DockerRuntime::Podman,
+            DockerRuntime::RancherDesktop,
+            DockerRuntime::Unknown,
+        ];
+        let labels: Vec<&str> = variants.iter().map(DockerRuntime::as_label).collect();
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
+                assert_ne!(a, b, "duplicate label found: {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn detect_runtime_does_not_panic() {
+        // Integration-style: detect_runtime reads real env + may call docker.
+        // Just verify it returns a valid variant without panicking.
+        let runtime = detect_runtime();
+        // Label should be a non-empty string
+        assert!(!runtime.as_label().is_empty());
+    }
 }

@@ -116,6 +116,17 @@ jobs:
       - name: Generate combined coverage report
         run: cargo llvm-cov report > coverage-report.txt
 
+      - name: Generate per-crate coverage summary
+        run: |
+          echo "## Per-Crate Coverage" > per-crate-coverage.txt
+          echo "" >> per-crate-coverage.txt
+          for crate in cella-protocol cella-backend cella-port cella-network cella-codegen cella-config cella-compose cella-git cella-env cella-features cella-agent cella-daemon cella-orchestrator cella-doctor cella-docker cella-cli cella-container; do
+            line_cov=$(cargo llvm-cov report -p "$crate" 2>/dev/null | grep "^TOTAL" | awk '{print $NF}')
+            if [ -n "$line_cov" ]; then
+              printf "%-25s %s\n" "$crate" "$line_cov" >> per-crate-coverage.txt
+            fi
+          done
+
       - name: Build coverage comment
         if: github.event_name == 'pull_request'
         id: coverage
@@ -124,8 +135,14 @@ jobs:
             echo 'comment<<EOF'
             echo '## Coverage Report'
             echo ''
+            echo '### Workspace Total'
             echo '```'
             grep -E '^(Filename|-|TOTAL)' coverage-report.txt
+            echo '```'
+            echo ''
+            echo '### Per-Crate Breakdown'
+            echo '```'
+            cat per-crate-coverage.txt
             echo '```'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
