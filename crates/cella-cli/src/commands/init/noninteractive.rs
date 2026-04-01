@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use cella_templates::cache::TemplateCache;
 use cella_templates::fetcher;
 use cella_templates::options;
-use cella_templates::types::{OutputFormat, SelectedFeature};
+use cella_templates::types::SelectedFeature;
 
 use super::InitArgs;
 
@@ -52,7 +52,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         &workspace,
         &resolved_opts,
         &features,
-        OutputFormat::Jsonc,
+        args.output_format.to_template_format(),
     )?;
 
     eprintln!("\u{2713} Created {}", written_path.display());

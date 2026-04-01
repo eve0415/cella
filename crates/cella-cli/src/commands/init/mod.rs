@@ -4,9 +4,27 @@ mod wizard;
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::progress::Progress;
+
+/// Output format for generated devcontainer configuration.
+#[derive(Clone, ValueEnum)]
+pub enum ConfigFormat {
+    /// JSONC with section comments (default).
+    Jsonc,
+    /// Plain JSON.
+    Json,
+}
+
+impl ConfigFormat {
+    pub const fn to_template_format(&self) -> cella_templates::types::OutputFormat {
+        match self {
+            Self::Jsonc => cella_templates::types::OutputFormat::Jsonc,
+            Self::Json => cella_templates::types::OutputFormat::Json,
+        }
+    }
+}
 
 /// Initialize a devcontainer configuration for the current workspace.
 #[derive(Args)]
@@ -31,6 +49,10 @@ pub struct InitArgs {
     /// Feature option: `FEATURE_ID=KEY=VALUE` (repeatable).
     #[arg(long, value_name = "FEATURE_ID=KEY=VALUE")]
     pub option: Vec<String>,
+
+    /// Output format for generated devcontainer configuration (non-interactive).
+    #[arg(long, value_enum, default_value = "jsonc")]
+    pub output_format: ConfigFormat,
 
     /// Overwrite existing configuration without prompting.
     #[arg(long)]
