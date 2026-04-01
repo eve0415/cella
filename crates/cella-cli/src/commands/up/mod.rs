@@ -754,7 +754,7 @@ impl UpContext {
         }
 
         // Daemon control port + token env vars
-        let daemon_env = query_daemon_env(&self.container_nm).await;
+        let daemon_env = query_daemon_env(&self.container_nm, self.client.host_gateway()).await;
         if !daemon_env.is_empty() {
             if create_opts.env.is_empty() {
                 create_opts.env = image_env.to_vec();
@@ -1519,7 +1519,10 @@ pub fn output_result(
 }
 
 /// Query the daemon for control port + auth token, returning env vars to inject.
-pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
+///
+/// `host_gateway` is the hostname the container uses to reach the host
+/// (e.g. `"host.docker.internal"` for Docker, `"host.local"` for Apple Container).
+pub async fn query_daemon_env(container_nm: &str, host_gateway: &str) -> Vec<String> {
     if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
         && mgmt_sock.exists()
     {
@@ -1536,7 +1539,7 @@ pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
         }) = &status_resp
         {
             return vec![
-                format!("CELLA_DAEMON_ADDR=host.docker.internal:{control_port}"),
+                format!("CELLA_DAEMON_ADDR={host_gateway}:{control_port}"),
                 format!("CELLA_DAEMON_TOKEN={control_token}"),
                 format!("CELLA_CONTAINER_NAME={container_nm}"),
             ];
