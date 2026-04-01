@@ -137,33 +137,37 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
-    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        progress: Progress,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Up(args) => args.execute(progress).await,
-            Self::Code(args) => args.execute(progress).await,
-            Self::Down(args) => args.execute().await,
-            Self::Shell(args) => args.execute().await,
-            Self::Exec(args) => args.execute().await,
-            Self::Build(args) => args.execute(progress).await,
-            Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute().await,
+            Self::Up(args) => args.execute(progress, backend).await,
+            Self::Code(args) => args.execute(progress, backend).await,
+            Self::Down(args) => args.execute(backend).await,
+            Self::Shell(args) => args.execute(backend).await,
+            Self::Exec(args) => args.execute(backend).await,
+            Self::Build(args) => args.execute(progress, backend).await,
+            Self::List(args) => args.execute(backend).await,
+            Self::Logs(args) => args.execute(backend).await,
             Self::Doctor(args) => args.execute().await,
-            Self::Branch(args) => args.execute(progress).await,
+            Self::Branch(args) => args.execute(progress, backend).await,
 
-            Self::Switch(args) => args.execute().await,
-            Self::Prune(args) => args.execute().await,
+            Self::Switch(args) => args.execute(backend).await,
+            Self::Prune(args) => args.execute(backend).await,
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
             Self::Init(args) => args.execute(progress).await,
-            Self::Nvim(args) => args.execute(progress).await,
-            Self::Tmux(args) => args.execute(progress).await,
+            Self::Nvim(args) => args.execute(progress, backend).await,
+            Self::Tmux(args) => args.execute(progress, backend).await,
             Self::Completions(args) => {
                 args.execute();
                 Ok(())
             }
-            Self::Credential(args) => args.execute().await,
+            Self::Credential(args) => args.execute(backend).await,
             Self::Network(args) => args.execute(),
             Self::Ports(args) => args.execute().await,
             Self::Daemon(args) => args.execute().await,
@@ -182,6 +186,18 @@ pub fn connect_docker(
     docker_host.map_or_else(cella_docker::DockerClient::connect, |host| {
         cella_docker::DockerClient::connect_with_host(host)
     })
+}
+
+/// Resolve the container backend from user choice, with optional Docker host override.
+///
+/// # Errors
+///
+/// Returns error if no backend is available.
+pub fn resolve_backend_for_command(
+    backend: Option<&crate::backend::BackendChoice>,
+    docker_host: Option<&str>,
+) -> Result<Box<dyn cella_backend::ContainerBackend>, Box<dyn std::error::Error>> {
+    crate::backend::resolve_backend(backend, docker_host)
 }
 
 /// Resolve the workspace folder from an optional argument or the current directory.

@@ -50,7 +50,11 @@ enum CredentialTool {
 }
 
 impl CredentialArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = backend; // TODO: use resolve_backend once ContainerTarget is migrated
         match self.command {
             CredentialCommand::Sync(args) => run_sync(args).await,
             CredentialCommand::Status(args) => run_status(args).await,

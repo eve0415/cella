@@ -51,6 +51,7 @@ impl BuildArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
@@ -66,6 +67,7 @@ impl BuildArgs {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to Docker
+        let _ = backend; // TODO: use resolve_backend once build internals are migrated
         let client = super::connect_docker(self.docker_host.as_deref())?;
         client.ping().await?;
 

@@ -92,7 +92,11 @@ impl DownArgs {
         matches!(self.output, OutputFormat::Text)
     }
 
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = backend; // TODO: use resolve_backend once ContainerTarget is migrated
         let client = super::connect_docker(self.docker_host.as_deref())?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {

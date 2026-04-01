@@ -23,8 +23,11 @@ pub struct ListArgs {
 }
 
 impl ListArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let containers = client.list_cella_containers(self.running).await?;
 

@@ -34,7 +34,9 @@ impl NvimArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         // 1. Ensure container is up
         let build_no_cache = self.up.build_no_cache;
         let strict = self.up.strict.clone();

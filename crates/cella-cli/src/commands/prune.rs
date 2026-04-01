@@ -72,7 +72,10 @@ impl PruneArgs {
         matches!(self.output, OutputFormat::Json)
     }
 
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
@@ -92,6 +95,7 @@ impl PruneArgs {
         }
 
         // 3. Fetch, detect, and build candidates
+        let _ = backend; // TODO: use resolve_backend once prune internals are migrated
         let client = super::connect_docker(self.docker_host.as_deref())?;
         let candidates = self
             .build_candidates(repo_root, &linked_worktrees, &client)

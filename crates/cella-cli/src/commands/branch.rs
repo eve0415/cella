@@ -35,7 +35,9 @@ impl BranchArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
+        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = backend; // TODO: pass through to UpContext once it accepts backend
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd).map_err(|e| -> Box<dyn std::error::Error> {

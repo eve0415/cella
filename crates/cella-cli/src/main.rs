@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    cli.command.execute(progress).await
+    cli.command.execute(progress, cli.backend.as_ref()).await
 }
 
 #[cfg(test)]
