@@ -276,7 +276,9 @@ mod tests {
             "official collection should have features"
         );
 
-        let ids: Vec<&str> = index.features.iter().map(|f| f.id.as_str()).collect();
-        assert!(ids.contains(&"node"), "should contain node feature");
+        assert!(
+            index.features.iter().any(|f| f.id == "node"),
+            "should contain node feature"
+        );
     }
 }
