@@ -65,6 +65,17 @@ pub trait ContainerBackend: Send + Sync {
         running_only: bool,
     ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>>;
 
+    /// Find a container by compose project and service labels.
+    ///
+    /// Searches across **all** runtime containers (not just cella-managed ones)
+    /// for the `com.docker.compose.project` and `com.docker.compose.service`
+    /// labels. Returns `None` if no match is found.
+    fn find_compose_service<'a>(
+        &'a self,
+        project: &'a str,
+        service: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>>;
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

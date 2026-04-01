@@ -325,6 +325,14 @@ pub mod mock {
             Box::pin(async move { result })
         }
 
+        fn find_compose_service<'a>(
+            &'a self,
+            _project: &'a str,
+            _service: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
         fn container_logs<'a>(
             &'a self,
             id: &'a str,

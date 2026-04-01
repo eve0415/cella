@@ -228,32 +228,10 @@ pub async fn resolve_service_container(
             )
         })?;
 
-    // Compose support requires the Docker backend.
-    if client.kind() != cella_backend::BackendKind::Docker {
-        return Err(format!(
-            "--service flag requires Docker backend, but current backend is {}",
-            client.kind()
-        )
-        .into());
-    }
-
-    // Use list_cella_containers + label filter as a backend-agnostic
-    // replacement for ComposeBackend::find_compose_container.
-    let project_label = format!("com.docker.compose.project={project}");
-    let service_label = format!("com.docker.compose.service={svc}");
-    let containers = client.list_cella_containers(false).await?;
-    let found = containers.into_iter().find(|c| {
-        c.labels
-            .get("com.docker.compose.project")
-            .is_some_and(|v| v == project)
-            && c.labels
-                .get("com.docker.compose.service")
-                .is_some_and(|v| v == svc)
-    });
-
-    let _ = (project_label, service_label); // used in filter above via project/svc
-
-    found.ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
+    client
+        .find_compose_service(project, svc)
+        .await?
+        .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
 
 /// Terminal environment variables to forward into the container.

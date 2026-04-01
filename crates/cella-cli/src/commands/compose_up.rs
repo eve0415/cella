@@ -433,14 +433,7 @@ async fn find_compose_container(
     project_name: &str,
     service_name: &str,
 ) -> Result<Option<ContainerInfo>, Box<dyn std::error::Error>> {
-    let containers = client.list_cella_containers(false).await?;
-    let result = containers.into_iter().find(|c| {
-        c.labels
-            .get("com.docker.compose.project")
-            .is_some_and(|p| p == project_name)
-            && c.labels
-                .get("com.docker.compose.service")
-                .is_some_and(|s| s == service_name)
-    });
-    Ok(result)
+    Ok(client
+        .find_compose_service(project_name, service_name)
+        .await?)
 }

@@ -90,6 +90,18 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn find_compose_service<'a>(
+        &'a self,
+        project: &'a str,
+        service: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            DockerClient::find_compose_container(self, project, service)
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,

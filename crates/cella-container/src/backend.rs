@@ -158,6 +158,15 @@ impl ContainerBackend for AppleContainerBackend {
         })
     }
 
+    fn find_compose_service<'a>(
+        &'a self,
+        _project: &'a str,
+        _service: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        // Apple Container does not support Docker Compose.
+        Box::pin(async { Ok(None) })
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,
