@@ -465,6 +465,7 @@ pub struct UpResult {
 
 struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
+    managed_agent: bool,
 }
 
 impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
@@ -499,7 +500,12 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         let container_id = container_id.to_string();
         let container_name = container_name.to_string();
         let container_ip = container_ip.map(str::to_string);
+        let managed_agent = self.managed_agent;
         Box::pin(async move {
+            if !managed_agent {
+                return;
+            }
+
             super::ensure_cella_daemon().await;
 
             let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
@@ -572,6 +578,7 @@ impl UpContext {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         let hooks = CliUpHooks {
             config: self.config(),
+            managed_agent: self.client.capabilities().managed_agent,
         };
         let config = cella_orchestrator::UpConfig {
             resolved: &self.resolved,

@@ -23,8 +23,11 @@ impl DoctorArgs {
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_folder = std::env::current_dir().ok();
-        let backend_kind = backend.map(crate::backend::BackendChoice::to_kind);
         let backend_client = crate::commands::resolve_backend_for_command(backend, None).ok();
+        let backend_kind = backend_client
+            .as_ref()
+            .map(|c| c.kind())
+            .or_else(|| backend.map(crate::backend::BackendChoice::to_kind));
         let ctx =
             checks::CheckContext::new(workspace_folder, self.all, backend_kind, backend_client);
         let mut report = checks::run_all_checks(&ctx).await;

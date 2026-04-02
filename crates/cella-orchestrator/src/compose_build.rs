@@ -32,6 +32,14 @@ pub async fn compose_build(
     workspace_root: &Path,
     progress: &ProgressSender,
 ) -> Result<ComposeBuildResult, Box<dyn std::error::Error>> {
+    if !client.capabilities().compose {
+        return Err(format!(
+            "selected backend '{}' does not support Docker Compose devcontainers",
+            client.kind()
+        )
+        .into());
+    }
+
     let project = ComposeProject::from_resolved(config, config_path, workspace_root)?;
 
     // Resolve features via combined-Dockerfile approach
