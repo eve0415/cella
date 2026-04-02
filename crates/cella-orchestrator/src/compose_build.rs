@@ -4,7 +4,7 @@
 //! `docker compose build`. Shared by both `cella build` and `cella up`
 //! (compose path).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cella_backend::ContainerBackend;
 use cella_compose::ComposeProject;
@@ -19,6 +19,22 @@ pub struct ComposeBuildResult {
     pub had_features: bool,
 }
 
+/// Configuration for a compose build invocation.
+pub struct ComposeBuildConfig<'a> {
+    /// Parsed devcontainer JSON.
+    pub config: &'a serde_json::Value,
+    /// Path to devcontainer.json.
+    pub config_path: &'a Path,
+    /// Workspace root on the host.
+    pub workspace_root: &'a Path,
+    /// Docker Compose profiles to activate (`--profile` flags).
+    pub profiles: Vec<String>,
+    /// Extra env-file paths for docker compose (`--env-file` flags).
+    pub env_files: Vec<PathBuf>,
+    /// Pull policy for docker compose build (`--pull` flag).
+    pub pull_policy: Option<String>,
+}
+
 /// Run the compose build pipeline: resolve features, write override, build.
 ///
 /// # Errors
@@ -27,9 +43,7 @@ pub struct ComposeBuildResult {
 /// compose build command fails.
 pub async fn compose_build(
     client: &dyn ContainerBackend,
-    config: &serde_json::Value,
-    config_path: &Path,
-    workspace_root: &Path,
+    cfg: &ComposeBuildConfig<'_>,
     progress: &ProgressSender,
 ) -> Result<ComposeBuildResult, Box<dyn std::error::Error>> {
     if !client.capabilities().compose {
@@ -40,7 +54,15 @@ pub async fn compose_build(
         .into());
     }
 
-    let project = ComposeProject::from_resolved(config, config_path, workspace_root)?;
+    let config = cfg.config;
+    let config_path = cfg.config_path;
+    let workspace_root = cfg.workspace_root;
+    let mut project = ComposeProject::from_resolved(config, config_path, workspace_root)?;
+    project.set_compose_options(
+        cfg.profiles.clone(),
+        cfg.env_files.clone(),
+        cfg.pull_policy.clone(),
+    );
 
     // Resolve features via combined-Dockerfile approach
     let features_build = crate::compose_features::resolve_compose_features(

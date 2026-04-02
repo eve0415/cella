@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use tracing::{debug, info, warn};
@@ -42,6 +42,12 @@ pub struct ComposeUpConfig<'a> {
     pub build_no_cache: bool,
     /// Skip agent checksum verification.
     pub skip_checksum: bool,
+    /// Docker Compose profiles to activate (`--profile` flags).
+    pub profiles: Vec<String>,
+    /// Extra env-file paths for docker compose (`--env-file` flags).
+    pub env_files: Vec<PathBuf>,
+    /// Pull policy for docker compose up/build (`--pull` flag).
+    pub pull_policy: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +154,12 @@ pub async fn compose_up(
     let config = cfg.config;
 
     // 1. Build ComposeProject from resolved config
-    let project = ComposeProject::from_resolved(config, cfg.config_path, cfg.workspace_root)?;
+    let mut project = ComposeProject::from_resolved(config, cfg.config_path, cfg.workspace_root)?;
+    project.set_compose_options(
+        cfg.profiles.clone(),
+        cfg.env_files.clone(),
+        cfg.pull_policy.clone(),
+    );
 
     info!(
         "Compose project: {} (primary service: {})",

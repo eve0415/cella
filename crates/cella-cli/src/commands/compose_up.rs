@@ -28,6 +28,9 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
         remove_container: ctx.remove_container,
         build_no_cache: ctx.build_no_cache,
         skip_checksum: ctx.skip_checksum,
+        profiles: ctx.compose_profiles.clone(),
+        env_files: ctx.compose_env_files.clone(),
+        pull_policy: ctx.compose_pull_policy.clone(),
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
