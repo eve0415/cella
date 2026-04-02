@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Backend kind
 // ---------------------------------------------------------------------------
 
 /// Which container backend is in use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Docker,
     Podman,
@@ -22,6 +24,19 @@ impl fmt::Display for BackendKind {
             Self::Docker => f.write_str("docker"),
             Self::Podman => f.write_str("podman"),
             Self::AppleContainer => f.write_str("apple-container"),
+        }
+    }
+}
+
+impl FromStr for BackendKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "docker" => Ok(Self::Docker),
+            "podman" => Ok(Self::Podman),
+            "apple-container" => Ok(Self::AppleContainer),
+            other => Err(format!("unknown backend kind: {other}")),
         }
     }
 }
@@ -255,6 +270,69 @@ mod tests {
     #[test]
     fn display_apple_container() {
         assert_eq!(BackendKind::AppleContainer.to_string(), "apple-container");
+    }
+
+    // -----------------------------------------------------------------------
+    // BackendKind::FromStr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_str_docker() {
+        assert_eq!("docker".parse::<BackendKind>().unwrap(), BackendKind::Docker);
+    }
+
+    #[test]
+    fn from_str_podman() {
+        assert_eq!("podman".parse::<BackendKind>().unwrap(), BackendKind::Podman);
+    }
+
+    #[test]
+    fn from_str_apple_container() {
+        assert_eq!(
+            "apple-container".parse::<BackendKind>().unwrap(),
+            BackendKind::AppleContainer
+        );
+    }
+
+    #[test]
+    fn from_str_unknown() {
+        assert!("nope".parse::<BackendKind>().is_err());
+    }
+
+    #[test]
+    fn display_from_str_roundtrip() {
+        for kind in [
+            BackendKind::Docker,
+            BackendKind::Podman,
+            BackendKind::AppleContainer,
+        ] {
+            assert_eq!(kind.to_string().parse::<BackendKind>().unwrap(), kind);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BackendKind serde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serde_roundtrip() {
+        for kind in [
+            BackendKind::Docker,
+            BackendKind::Podman,
+            BackendKind::AppleContainer,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: BackendKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn serde_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&BackendKind::AppleContainer).unwrap(),
+            "\"apple-container\""
+        );
     }
 }
 
