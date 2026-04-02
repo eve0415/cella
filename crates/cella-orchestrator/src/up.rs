@@ -1141,6 +1141,7 @@ impl EnsureUpContext<'_> {
                 config_path: &self.config.resolved.config_path,
                 no_cache: build_no_cache,
                 pull_policy: self.config.pull_policy,
+                secrets: &self.config.build_secrets,
                 progress: &self.progress,
             })
             .await?;

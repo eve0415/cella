@@ -151,6 +151,14 @@ pub struct ImageDetails {
     pub metadata: Option<String>,
 }
 
+/// A `BuildKit` build secret (`--secret id=X,src=Y` or `--secret id=X,env=Y`).
+#[derive(Debug, Clone)]
+pub struct BuildSecret {
+    pub id: String,
+    pub src: Option<PathBuf>,
+    pub env: Option<String>,
+}
+
 /// Options for building a container image from a Dockerfile.
 pub struct BuildOptions {
     pub image_name: String,
@@ -160,6 +168,7 @@ pub struct BuildOptions {
     pub target: Option<String>,
     pub cache_from: Vec<String>,
     pub options: Vec<String>,
+    pub secrets: Vec<BuildSecret>,
 }
 
 // ---------------------------------------------------------------------------

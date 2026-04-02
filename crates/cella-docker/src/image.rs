@@ -1,5 +1,6 @@
 //! Image pull and Dockerfile build operations.
 
+use std::fmt::Write as _;
 use std::process::Stdio;
 use std::sync::OnceLock;
 
@@ -98,6 +99,17 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
 
     for opt in &opts.options {
         args.push(opt.clone());
+    }
+
+    for secret in &opts.secrets {
+        let mut spec = format!("id={}", secret.id);
+        if let Some(ref src) = secret.src {
+            let _ = write!(spec, ",src={}", src.display());
+        }
+        if let Some(ref env) = secret.env {
+            let _ = write!(spec, ",env={env}");
+        }
+        args.extend(["--secret".to_string(), spec]);
     }
 
     args.push(opts.context_path.to_string_lossy().to_string());
@@ -324,6 +336,7 @@ mod tests {
             target: None,
             cache_from: Vec::new(),
             options: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 
@@ -518,5 +531,80 @@ mod tests {
         let args = build_command_args(&opts, false);
         // Should be minimal: ["build", "--progress=plain", "-t", name, "-f", path, context]
         assert_eq!(args.len(), 7);
+    }
+
+    #[test]
+    fn build_args_with_secret_id_only() {
+        let mut opts = basic_opts();
+        opts.secrets = vec![cella_backend::BuildSecret {
+            id: "mysecret".to_string(),
+            src: None,
+            env: None,
+        }];
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--secret".to_string()));
+        assert!(args.contains(&"id=mysecret".to_string()));
+        // Context path is still last
+        assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    #[test]
+    fn build_args_with_secret_src() {
+        let mut opts = basic_opts();
+        opts.secrets = vec![cella_backend::BuildSecret {
+            id: "token".to_string(),
+            src: Some(PathBuf::from("/run/secrets/token")),
+            env: None,
+        }];
+        let args = build_command_args(&opts, false);
+        let secret_idx = args.iter().position(|a| a == "--secret").unwrap();
+        assert_eq!(args[secret_idx + 1], "id=token,src=/run/secrets/token");
+    }
+
+    #[test]
+    fn build_args_with_secret_env() {
+        let mut opts = basic_opts();
+        opts.secrets = vec![cella_backend::BuildSecret {
+            id: "token".to_string(),
+            src: None,
+            env: Some("MY_TOKEN".to_string()),
+        }];
+        let args = build_command_args(&opts, false);
+        let secret_idx = args.iter().position(|a| a == "--secret").unwrap();
+        assert_eq!(args[secret_idx + 1], "id=token,env=MY_TOKEN");
+    }
+
+    #[test]
+    fn build_args_with_secret_src_and_env() {
+        let mut opts = basic_opts();
+        opts.secrets = vec![cella_backend::BuildSecret {
+            id: "s".to_string(),
+            src: Some(PathBuf::from("/tmp/s")),
+            env: Some("S_VAR".to_string()),
+        }];
+        let args = build_command_args(&opts, false);
+        let secret_idx = args.iter().position(|a| a == "--secret").unwrap();
+        assert_eq!(args[secret_idx + 1], "id=s,src=/tmp/s,env=S_VAR");
+    }
+
+    #[test]
+    fn build_args_with_multiple_secrets() {
+        let mut opts = basic_opts();
+        opts.secrets = vec![
+            cella_backend::BuildSecret {
+                id: "a".to_string(),
+                src: None,
+                env: None,
+            },
+            cella_backend::BuildSecret {
+                id: "b".to_string(),
+                src: Some(PathBuf::from("/tmp/b")),
+                env: None,
+            },
+        ];
+        let args = build_command_args(&opts, false);
+        let secret_count = args.iter().filter(|a| *a == "--secret").count();
+        assert_eq!(secret_count, 2);
+        assert_eq!(args.last().unwrap(), "/src/project");
     }
 }

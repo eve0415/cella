@@ -6,7 +6,7 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use cella_backend::{ContainerBackend, ExecOptions, container_name};
+use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::shell_detect::detect_shell;
@@ -29,6 +29,11 @@ pub struct UpBuildArgs {
     /// Image pull policy (e.g. "always", "missing", "never").
     #[arg(long)]
     pub(crate) pull: Option<String>,
+
+    /// `BuildKit` secret to pass to the build (format: `id=X[,src=Y][,env=Z]`).
+    /// Can be specified multiple times.
+    #[arg(long = "secret")]
+    pub(crate) secrets: Vec<String>,
 }
 
 /// Start a dev container for the current workspace.
@@ -126,6 +131,8 @@ pub struct UpContext {
     pub(crate) compose_env_files: Vec<PathBuf>,
     /// Pull policy for Docker Compose services.
     pub(crate) compose_pull_policy: Option<String>,
+    /// `BuildKit` secrets for image builds.
+    build_secrets: Vec<BuildSecret>,
 }
 
 impl UpContext {
@@ -167,6 +174,14 @@ impl UpContext {
         );
         let default_workspace_folder = format!("/workspaces/{workspace_basename}");
 
+        let build_secrets = args
+            .build
+            .secrets
+            .iter()
+            .map(|s| super::build::parse_build_secret(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
         Ok(Self {
             resolved,
             client,
@@ -190,6 +205,7 @@ impl UpContext {
             compose_profiles: args.profile.clone(),
             compose_env_files: args.env_file.clone(),
             compose_pull_policy: args.pull_policy.clone(),
+            build_secrets,
         })
     }
 
@@ -256,6 +272,7 @@ impl UpContext {
             compose_profiles: Vec::new(),
             compose_env_files: Vec::new(),
             compose_pull_policy: None,
+            build_secrets: vec![],
         })
     }
 
@@ -653,6 +670,7 @@ impl UpContext {
             },
             network_rule_policy: self.network_rules,
             pull_policy: self.pull_policy.as_deref(),
+            build_secrets: self.build_secrets.clone(),
         };
 
         let result =

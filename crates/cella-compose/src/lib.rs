@@ -24,7 +24,7 @@ pub use dockerfile::{
     synthetic_dockerfile,
 };
 pub use error::CellaComposeError;
-pub use override_file::OverrideConfig;
+pub use override_file::{ComposeSecret, OverrideConfig};
 pub use project::{ComposeProject, ShutdownAction};
 
 #[cfg(all(test, feature = "integration-tests"))]
