@@ -5,14 +5,19 @@
 
 use std::path::{Path, PathBuf};
 
+use miette::Diagnostic;
+
 /// Errors that can occur during config discovery.
-#[derive(Debug)]
+#[derive(Debug, Diagnostic)]
 pub enum Error {
     /// No devcontainer.json found in any standard location.
+    #[diagnostic(code(cella::config::discover::not_found))]
     NotFound,
     /// Multiple subfolder configs found — user must specify `--file`.
+    #[diagnostic(code(cella::config::discover::ambiguous))]
     Ambiguous(Vec<PathBuf>),
     /// Failed to read a directory during discovery.
+    #[diagnostic(code(cella::config::discover::read_dir))]
     ReadDir {
         path: PathBuf,
         source: std::io::Error,

@@ -1090,7 +1090,7 @@ impl EnsureUpContext<'_> {
             )
             .await;
 
-        {
+        let lifecycle_err = {
             let lc_ctx = self.build_lifecycle_ctx(&container_id, &remote_user, &lifecycle_env);
             run_lifecycle_phases_with_wait_for(
                 &lc_ctx,
@@ -1099,7 +1099,15 @@ impl EnsureUpContext<'_> {
                 &self.progress,
                 WaitForPhase::from_config(config),
             )
-            .await?;
+            .await
+            .err()
+            .map(|e| e.to_string())
+        };
+        if let Some(msg) = lifecycle_err {
+            tracing::warn!("Lifecycle failed, cleaning up container {container_id}");
+            let _ = self.client.stop_container(&container_id).await;
+            let _ = self.client.remove_container(&container_id, false).await;
+            return Err(msg.into());
         }
 
         write_content_hash(

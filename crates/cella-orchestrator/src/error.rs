@@ -1,24 +1,35 @@
 //! Orchestrator error types.
 
+use miette::Diagnostic;
+
 /// Errors from orchestrator operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum OrchestratorError {
     #[error("backend: {message}")]
+    #[diagnostic(code(cella::orchestrator::backend))]
     Backend { message: String },
 
     #[error("git: {message}")]
+    #[diagnostic(code(cella::orchestrator::git))]
     Git { message: String },
 
     #[error("config: {message}")]
+    #[diagnostic(code(cella::orchestrator::config))]
     Config { message: String },
 
     #[error("container exited immediately: {message}")]
+    #[diagnostic(code(cella::orchestrator::container_exited))]
     ContainerExited { message: String },
 
     #[error("host requirements not met: {message}")]
+    #[diagnostic(
+        code(cella::host_requirements),
+        help("Run `cella doctor` to check system dependencies.")
+    )]
     HostRequirements { message: String },
 
     #[error("{message}")]
+    #[diagnostic(code(cella::orchestrator::other))]
     Other { message: String },
 }
 

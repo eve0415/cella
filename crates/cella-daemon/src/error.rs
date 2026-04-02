@@ -1,38 +1,47 @@
+use miette::Diagnostic;
 use thiserror::Error;
 
 /// Errors that can occur in the cella daemon.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Diagnostic)]
 pub enum CellaDaemonError {
     /// Failed to create or bind a socket.
     #[error("socket error: {message}")]
+    #[diagnostic(code(cella::daemon::socket))]
     Socket { message: String },
 
     /// Failed to write or read the PID file.
     #[error("PID file error: {message}")]
+    #[diagnostic(code(cella::daemon::pid_file))]
     PidFile { message: String },
 
     /// Failed to invoke the host git credential helper.
     #[error("git credential error: {message}")]
+    #[diagnostic(code(cella::daemon::git_credential))]
     GitCredential { message: String },
 
     /// Protocol parse error.
     #[error("protocol error: {message}")]
+    #[diagnostic(code(cella::daemon::protocol))]
     Protocol { message: String },
 
     /// The daemon is already running.
     #[error("cella daemon is already running (PID {pid})")]
+    #[diagnostic(code(cella::daemon::already_running))]
     AlreadyRunning { pid: u32 },
 
     /// The daemon is not running.
     #[error("cella daemon is not running")]
+    #[diagnostic(code(cella::daemon::not_running))]
     NotRunning,
 
     /// Port forwarding error.
     #[error("port forwarding error: {message}")]
+    #[diagnostic(code(cella::daemon::port_forwarding))]
     PortForwarding { message: String },
 
     /// Generic I/O error.
     #[error("I/O error: {0}")]
+    #[diagnostic(code(cella::daemon::io))]
     Io(#[from] std::io::Error),
 }
 

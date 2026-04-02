@@ -10,6 +10,7 @@ reqwest.workspace = true
 cella-backend.workspace = true
 crossterm.workspace = true
 glob.workspace = true
+miette.workspace = true
 tar.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
