@@ -48,9 +48,8 @@ pub struct ExecArgs {
     #[arg(short, long)]
     detach: bool,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// The command to execute.
     #[arg(trailing_var_arg = true, required = true)]
@@ -58,11 +57,8 @@ pub struct ExecArgs {
 }
 
 impl ExecArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.backend.resolve_client().await?;
 
         let target = ContainerTarget {
             container_id: self.container_id,

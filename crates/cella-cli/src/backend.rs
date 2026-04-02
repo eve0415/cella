@@ -55,6 +55,19 @@ impl BackendArgs {
         }
         resolve_backend(self.backend.as_ref(), self.docker_host.as_deref()).await
     }
+
+    /// Convenience wrapper that coerces the error to `Box<dyn Error>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if backend resolution fails (see [`resolve`](Self::resolve)).
+    pub async fn resolve_client(
+        &self,
+    ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
+        self.resolve()
+            .await
+            .map_err(|e| e as Box<dyn std::error::Error>)
+    }
 }
 
 /// Resolve the container backend from user choice, auto-detecting if needed.

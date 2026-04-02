@@ -40,9 +40,8 @@ pub struct UpArgs {
     #[arg(long)]
     pub(crate) workspace_folder: Option<PathBuf>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    pub(crate) docker_host: Option<String>,
+    #[command(flatten)]
+    pub(crate) backend: crate::backend::BackendArgs,
 
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
@@ -107,7 +106,6 @@ impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
@@ -128,11 +126,7 @@ impl UpContext {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to backend
-        // NOTE: auto-detect picks the first backend whose socket exists.
-        // If Docker's socket exists but the daemon is stopped, auto-detect
-        // won't fall through to Apple Container. Users can work around this
-        // with `--backend apple-container`.
-        let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref()).await?;
+        let client = args.backend.resolve_client().await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -175,11 +169,10 @@ impl UpContext {
     /// `build_no_cache` to false.
     pub async fn for_workspace(
         workspace_path: &std::path::Path,
-        docker_host: Option<&str>,
+        backend_args: &crate::backend::BackendArgs,
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = workspace_path
             .canonicalize()
@@ -198,7 +191,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::resolve_backend_for_command(backend, docker_host).await?;
+        let client = backend_args.resolve_client().await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -639,7 +632,6 @@ impl UpArgs {
         &self,
         branch_name: &str,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
@@ -657,11 +649,10 @@ impl UpArgs {
         let extra_labels = cella_backend::worktree_labels(branch_name, &repo_info.root);
         let mut ctx = UpContext::for_workspace(
             &wt.path,
-            self.docker_host.as_deref(),
+            &self.backend,
             extra_labels,
             progress,
             self.output.clone(),
-            backend,
         )
         .await?;
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
@@ -689,13 +680,12 @@ impl UpArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref branch_name) = self.branch {
-            return self.execute_branch(branch_name, progress, backend).await;
+            return self.execute_branch(branch_name, progress).await;
         }
 
-        let ctx = UpContext::new(&self, progress, backend).await?;
+        let ctx = UpContext::new(&self, progress).await?;
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {

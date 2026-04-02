@@ -29,9 +29,8 @@ pub struct PruneArgs {
     #[arg(long)]
     all: bool,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// Output format (text or json).
     #[arg(long, default_value = "text")]
@@ -43,17 +42,14 @@ impl PruneArgs {
         matches!(self.output, OutputFormat::Json)
     }
 
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
         let repo_root = &repo_info.root;
 
         // 2. Build candidates via orchestrator
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
+        let client = self.backend.resolve_client().await?;
         if !self.is_json() {
             eprintln!("Fetching remote refs...");
         }

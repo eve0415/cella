@@ -15,17 +15,13 @@ pub struct SwitchArgs {
     #[arg(short, long)]
     shell: Option<String>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 }
 
 impl SwitchArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.backend.resolve_client().await?;
 
         // Discover repo and list worktrees
         let cwd = std::env::current_dir()?;

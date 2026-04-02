@@ -46,7 +46,6 @@ impl CodeArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Check for remote Docker (unsupported)
         check_local_docker()?;
@@ -61,7 +60,7 @@ impl CodeArgs {
         let output_format = self.up.output.clone();
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress, backend).await?;
+        let ctx = UpContext::new(&up, progress).await?;
 
         // Reject non-Docker backends — VS Code attach URI is Docker-specific
         if ctx.client.kind() != cella_backend::BackendKind::Docker {

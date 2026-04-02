@@ -20,10 +20,6 @@ struct Cli {
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
-    /// Container backend to use (auto-detected if not specified).
-    #[arg(long, global = true, value_enum)]
-    backend: Option<backend::BackendChoice>,
-
     #[command(subcommand)]
     command: commands::Command,
 }
@@ -59,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    cli.command.execute(progress, cli.backend.as_ref()).await
+    cli.command.execute(progress).await
 }
 
 #[cfg(test)]
@@ -487,24 +483,51 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── global backend flag ─────────────────────────────────────────
+    // ── per-command backend flag ──────────────────────────────────────
 
     #[test]
-    fn parse_global_backend_docker() {
-        let cli = parse(&["cella", "--backend", "docker", "list"]).unwrap();
-        assert!(cli.backend.is_some());
+    fn parse_up_with_backend_docker() {
+        let cli = parse(&["cella", "up", "--backend", "docker"]).unwrap();
+        if let super::commands::Command::Up(args) = &cli.command {
+            assert!(args.backend.backend.is_some());
+        } else {
+            panic!("expected Up command");
+        }
     }
 
     #[test]
-    fn parse_global_backend_invalid() {
-        let result = parse(&["cella", "--backend", "invalid", "list"]);
+    fn parse_list_with_backend_and_docker_host() {
+        let cli =
+            parse(&["cella", "list", "--backend", "docker", "--docker-host", "tcp://host:2375"])
+                .unwrap();
+        assert!(matches!(cli.command, super::commands::Command::List(_)));
+    }
+
+    #[test]
+    fn parse_backend_invalid_value() {
+        let result = parse(&["cella", "list", "--backend", "invalid"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_no_backend_is_none() {
+        // Without --backend, parsing should still succeed
         let cli = parse(&["cella", "list"]).unwrap();
-        assert!(cli.backend.is_none());
+        assert!(matches!(cli.command, super::commands::Command::List(_)));
+    }
+
+    #[test]
+    fn parse_config_rejects_backend() {
+        // Commands that don't use BackendArgs should reject --backend
+        let result = parse(&["cella", "config", "show", "--backend", "docker"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_global_backend_no_longer_accepted() {
+        // --backend before the subcommand should fail (it's no longer global)
+        let result = parse(&["cella", "--backend", "docker", "list"]);
+        assert!(result.is_err());
     }
 
     // ── Command::is_text_output / verbosity / is_daemon_start ──────

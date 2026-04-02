@@ -44,9 +44,8 @@ pub struct DownArgs {
     #[arg(long)]
     branch: Option<String>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// Force stop even when shutdownAction is "none".
     #[arg(long)]
@@ -93,11 +92,8 @@ impl DownArgs {
         matches!(self.output, OutputFormat::Text)
     }
 
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.backend.resolve_client().await?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {
             Some(resolve_branch_to_path(branch_name)?)

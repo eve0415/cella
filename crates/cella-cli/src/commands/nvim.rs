@@ -34,7 +34,6 @@ impl NvimArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Ensure container is up
         let build_no_cache = self.up.build.build_no_cache;
@@ -42,7 +41,7 @@ impl NvimArgs {
         let output_format = self.up.output.clone();
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress, backend).await?;
+        let ctx = UpContext::new(&up, progress).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 2. Resolve compose service if needed

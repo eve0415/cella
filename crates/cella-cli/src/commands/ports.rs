@@ -9,16 +9,19 @@ pub struct PortsArgs {
     /// Show ports across all worktrees/containers.
     #[arg(long)]
     all: bool,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 }
 
 impl PortsArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info — only when
         // the selected backend uses daemon-managed port forwarding.
-        let use_daemon = backend.is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
+        let use_daemon = self
+            .backend
+            .backend
+            .as_ref()
+            .is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
         if use_daemon
             && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
@@ -46,7 +49,7 @@ impl PortsArgs {
         }
 
         // Fall back to the selected backend for static port bindings
-        print_backend_ports(self.all, backend).await
+        print_backend_ports(self.all, &self.backend).await
     }
 }
 
@@ -76,9 +79,9 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
 
 async fn print_backend_ports(
     all: bool,
-    backend: Option<&crate::backend::BackendChoice>,
+    backend_args: &crate::backend::BackendArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = super::resolve_backend_for_command(backend, None).await?;
+    let client = backend_args.resolve_client().await?;
     let containers = client.list_cella_containers(true).await?;
 
     // Check if any container is compose-managed and try compose ps
