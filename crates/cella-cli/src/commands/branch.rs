@@ -100,6 +100,15 @@ impl BranchArgs {
         // ensure_up always runs the full first-create path (lifecycle hooks,
         // tool setup, etc.) rather than reusing a half-initialized container.
         if let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
+            // Deregister from daemon to clean up forwarded ports
+            if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
+                && mgmt_sock.exists()
+            {
+                let req = cella_protocol::ManagementRequest::DeregisterContainer {
+                    container_name: existing.name.clone(),
+                };
+                let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+            }
             let _ = ctx.client.stop_container(&existing.id).await;
             let _ = ctx.client.remove_container(&existing.id, false).await;
         }

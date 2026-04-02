@@ -218,6 +218,23 @@ impl ContainerCli {
         tag: &str,
         args: &[(String, String)],
     ) -> Result<String, BackendError> {
+        self.build_with_extra_args(context, dockerfile, tag, args, &[])
+            .await
+    }
+
+    /// Build an image with additional CLI flags (target, cache, options).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BackendError::ImageBuildFailed` if the build exits non-zero.
+    pub async fn build_with_extra_args(
+        &self,
+        context: &Path,
+        dockerfile: &str,
+        tag: &str,
+        args: &[(String, String)],
+        extra_args: &[String],
+    ) -> Result<String, BackendError> {
         let mut cli_args = vec![
             "build".to_string(),
             "-f".to_string(),
@@ -225,6 +242,7 @@ impl ContainerCli {
             "-t".to_string(),
             tag.to_string(),
         ];
+        cli_args.extend_from_slice(extra_args);
         for (key, value) in args {
             cli_args.push("--build-arg".to_string());
             cli_args.push(format!("{key}={value}"));

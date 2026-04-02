@@ -376,17 +376,31 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a BuildOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            let mut extra_args = Vec::new();
+            if let Some(ref target) = opts.target {
+                extra_args.push("--target".to_string());
+                extra_args.push(target.clone());
+            }
+            for cache in &opts.cache_from {
+                extra_args.push("--cache-from".to_string());
+                extra_args.push(cache.clone());
+            }
+            for opt in &opts.options {
+                extra_args.push(opt.clone());
+            }
+
             let build_args: Vec<(String, String)> = opts
                 .args
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             self.cli
-                .build(
+                .build_with_extra_args(
                     &opts.context_path,
                     &opts.dockerfile,
                     &opts.image_name,
                     &build_args,
+                    &extra_args,
                 )
                 .await
         })
