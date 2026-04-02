@@ -74,11 +74,28 @@ async fn detect_shell_from_env(
     None
 }
 
+/// Escape regex metacharacters so the string is treated as a literal in `grep -E`.
+fn escape_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '[' | ']' | '(' | ')' | '{' | '}' | '*' | '+' | '?' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 async fn detect_shell_from_passwd(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<String> {
+    let escaped_shell = shell_quote(&[user.to_string()]);
+    let escaped_regex = escape_regex(user);
     let result = client
         .exec_command(
             container_id,
@@ -86,7 +103,9 @@ async fn detect_shell_from_passwd(
                 cmd: vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    format!("getent passwd {user} 2>/dev/null || grep '^{user}:' /etc/passwd"),
+                    format!(
+                        "getent passwd {escaped_shell} 2>/dev/null || grep '^{escaped_regex}:' /etc/passwd"
+                    ),
                 ],
                 user: Some(user.to_string()),
                 env: None,
@@ -167,6 +186,23 @@ mod tests {
     fn shell_quote_special_chars() {
         let args: Vec<String> = vec!["echo".into(), "$HOME && rm -rf /".into()];
         assert_eq!(shell_quote(&args), "'echo' '$HOME && rm -rf /'");
+    }
+
+    #[test]
+    fn escape_regex_plain_username() {
+        assert_eq!(escape_regex("vscode"), "vscode");
+    }
+
+    #[test]
+    fn escape_regex_special_chars() {
+        assert_eq!(escape_regex("foo.bar"), "foo\\.bar");
+        assert_eq!(escape_regex("user$"), "user\\$");
+        assert_eq!(escape_regex("a+b"), "a\\+b");
+    }
+
+    #[test]
+    fn escape_regex_backslash() {
+        assert_eq!(escape_regex("foo\\bar"), "foo\\\\bar");
     }
 
     #[test]

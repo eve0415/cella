@@ -25,7 +25,7 @@ impl ContainerTarget {
     /// Resolution priority (first match wins):
     /// 1. `container_id` — direct inspect
     /// 2. `container_name` — backend resolves names via inspect
-    /// 3. `id_label` — search cella containers by label
+    /// 3. `id_label` — search containers by label
     /// 4. `workspace_folder` — search by `dev.cella.workspace_path` label
     /// 5. CWD fallback — `std::env::current_dir()` as `workspace_folder`
     ///

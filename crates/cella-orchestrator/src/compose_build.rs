@@ -85,12 +85,13 @@ pub async fn compose_build(
             format!("docker compose build failed: {e}").into()
         })?;
 
+    let had_features = features_build.is_some();
     let image_name = features_build
         .and_then(|b| b.image_name_override)
         .unwrap_or_else(|| "(compose)".to_string());
 
     Ok(ComposeBuildResult {
-        had_features: image_name != "(compose)",
         image_name,
+        had_features,
     })
 }

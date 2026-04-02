@@ -211,7 +211,7 @@ pub async fn execute_prune(
                 }
             } else {
                 let _ = client.stop_container(&container.id).await;
-                if let Err(e) = client.remove_container(&container.id, true).await {
+                if let Err(e) = client.remove_container(&container.id, false).await {
                     errors.push(format!(
                         "failed to remove container {}: {e}",
                         container.name
