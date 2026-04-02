@@ -10,8 +10,7 @@ use cella_backend::{
     LifecycleContext, MountConfig, agent_env_vars, container_labels,
 };
 
-pub use crate::config::NetworkRulePolicy;
-use crate::config::{HostRequirementPolicy, ImageStrategy, UpConfig};
+use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
 use crate::error::OrchestratorError;
 use crate::lifecycle::{
     WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase, run_lifecycle_entries,
@@ -97,7 +96,7 @@ struct ImageConfig {
     image_env: Vec<String>,
     remote_user: String,
     env_fwd: cella_env::EnvForwarding,
-    create_opts: crate::config_map::CreateContainerOptions,
+    create_opts: cella_backend::CreateContainerOptions,
 }
 
 struct CreateResult {

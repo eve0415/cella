@@ -80,7 +80,7 @@ impl UpArgs {
     }
 }
 
-pub use cella_orchestrator::up::NetworkRulePolicy;
+use cella_orchestrator::NetworkRulePolicy;
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {

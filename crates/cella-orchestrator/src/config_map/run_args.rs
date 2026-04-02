@@ -5,11 +5,7 @@
 
 use tracing::warn;
 
-pub use cella_backend::{DeviceSpec, GpuRequest, RunArgsOverrides, UlimitSpec};
-
-/// Type alias for backward compatibility — `GpuSpec` was renamed to `GpuRequest` in
-/// `cella-backend`.
-pub type GpuSpec = GpuRequest;
+use cella_backend::{DeviceSpec, GpuRequest, RunArgsOverrides, UlimitSpec};
 
 /// Parse `runArgs` from devcontainer.json into overrides.
 ///
@@ -567,13 +563,13 @@ mod tests {
     #[test]
     fn parse_gpus_all() {
         let r = parse_run_args(&args(&["--gpus", "all"]));
-        assert_eq!(r.gpus, Some(GpuSpec::All));
+        assert_eq!(r.gpus, Some(GpuRequest::All));
     }
 
     #[test]
     fn parse_gpus_count() {
         let r = parse_run_args(&args(&["--gpus", "2"]));
-        assert_eq!(r.gpus, Some(GpuSpec::Count(2)));
+        assert_eq!(r.gpus, Some(GpuRequest::Count(2)));
     }
 
     #[test]
@@ -581,7 +577,7 @@ mod tests {
         let r = parse_run_args(&args(&["--gpus", "device=0,1"]));
         // "device=0,1" gets split on first comma which is inside the device= value
         // The entire "device=0,1" is one arg so parse_gpu_spec handles it
-        assert!(matches!(r.gpus, Some(GpuSpec::DeviceIds(_))));
+        assert!(matches!(r.gpus, Some(GpuRequest::DeviceIds(_))));
     }
 
     // -- Other --
@@ -719,7 +715,7 @@ mod tests {
         assert_eq!(r.network_mode.as_deref(), Some("host"));
         assert_eq!(r.memory, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(r.privileged, Some(true));
-        assert_eq!(r.gpus, Some(GpuSpec::All));
+        assert_eq!(r.gpus, Some(GpuRequest::All));
         assert_eq!(r.shm_size, Some(64 * 1024 * 1024));
     }
 

@@ -11,7 +11,7 @@ pub mod run_args;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
+use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
