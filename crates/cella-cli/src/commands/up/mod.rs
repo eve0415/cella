@@ -349,9 +349,12 @@ impl UpContext {
         }
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
-        let shell =
-            cella_orchestrator::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
-                .await;
+        let shell = cella_orchestrator::shell_detect::detect_shell(
+            self.client.as_ref(),
+            container_id,
+            remote_user,
+        )
+        .await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
@@ -553,8 +556,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 return;
             }
 
-            let req =
-                cella_protocol::ManagementRequest::DeregisterContainer { container_name };
+            let req = cella_protocol::ManagementRequest::DeregisterContainer { container_name };
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
     }

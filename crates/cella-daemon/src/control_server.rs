@@ -1538,9 +1538,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::TaskRunResult {
                     request_id: request_id.to_string(),
-                    result: cella_protocol::TaskRunOperationResult::Error {
-                        message: error_msg,
-                    },
+                    result: cella_protocol::TaskRunOperationResult::Error { message: error_msg },
                 },
             )
             .await?;
@@ -2474,10 +2472,7 @@ branch refs/heads/feat-b
                 outcome,
                 container_name,
             } => {
-                assert!(matches!(
-                    outcome,
-                    cella_protocol::DownOutcome::Stopped
-                ));
+                assert!(matches!(outcome, cella_protocol::DownOutcome::Stopped));
                 assert_eq!(container_name, "my-container");
             }
             cella_protocol::DownOperationResult::Error { .. } => {
@@ -2492,10 +2487,7 @@ branch refs/heads/feat-b
         let result = parse_down_json_output(json);
         match result {
             cella_protocol::DownOperationResult::Success { outcome, .. } => {
-                assert!(matches!(
-                    outcome,
-                    cella_protocol::DownOutcome::Removed
-                ));
+                assert!(matches!(outcome, cella_protocol::DownOutcome::Removed));
             }
             cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")
@@ -2509,10 +2501,7 @@ branch refs/heads/feat-b
         let result = parse_down_json_output(json);
         match result {
             cella_protocol::DownOperationResult::Success { outcome, .. } => {
-                assert!(matches!(
-                    outcome,
-                    cella_protocol::DownOutcome::Stopped
-                ));
+                assert!(matches!(outcome, cella_protocol::DownOutcome::Stopped));
             }
             cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")

@@ -237,7 +237,8 @@ async fn install_nvim(
     debug!("Container architecture: {arch}");
 
     // Resolve version from settings
-    let settings = cella_config::settings::Settings::load(&std::env::current_dir().unwrap_or_default());
+    let settings =
+        cella_config::settings::Settings::load(&std::env::current_dir().unwrap_or_default());
     let version = &settings.tools.nvim.version;
 
     let version_tag = version.as_str();
