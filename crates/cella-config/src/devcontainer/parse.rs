@@ -1,8 +1,8 @@
 /// Parse orchestrator: JSONC → `serde_json::Value` → validate → typed config.
-use crate::diagnostic::{Diagnostic, Diagnostics, Severity};
-use crate::jsonc;
+use super::diagnostic::{Diagnostic, Diagnostics, Severity};
+use super::jsonc;
 use crate::schema;
-use crate::span::SourceText;
+use super::span::SourceText;
 
 /// Parse and validate a devcontainer.json file.
 ///
@@ -113,7 +113,7 @@ pub fn devcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::Severity;
+    use super::diagnostic::Severity;
 
     /// Helper: unwrap Ok or panic with rendered diagnostics.
     fn unwrap_ok(

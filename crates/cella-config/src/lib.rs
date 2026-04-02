@@ -1,10 +1,6 @@
 pub mod devcontainer;
 pub mod settings;
 
-// Re-export all devcontainer modules at crate root for backward compatibility.
-pub use devcontainer::*;
-pub use settings::{ClaudeCode, Codex, Gemini, Settings};
-
 /// Types and validators generated from the devcontainer JSON Schema.
 #[allow(
     unused_variables,

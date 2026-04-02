@@ -7,7 +7,7 @@ use serde_json::json;
 use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ExecOptions, container_name};
-use cella_config::resolve::{self, ResolvedConfig};
+use cella_config::devcontainer::resolve::{self, ResolvedConfig};
 
 /// Build and container-management flags for an `up` invocation.
 #[derive(Args)]
@@ -297,7 +297,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::Settings,
+        settings: &cella_config::settings::Settings,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -437,7 +437,7 @@ impl UpContext {
         &self,
         container_id: &str,
         remote_user: &str,
-        settings: &cella_config::Settings,
+        settings: &cella_config::settings::Settings,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);

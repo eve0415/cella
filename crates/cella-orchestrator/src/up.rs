@@ -243,7 +243,7 @@ impl EnsureUpContext<'_> {
         .ok()
         .flatten();
 
-        let settings = cella_config::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
@@ -595,7 +595,7 @@ impl EnsureUpContext<'_> {
         env_fwd: &cella_env::EnvForwarding,
         image_env: &[String],
         remote_user: &str,
-        settings: &cella_config::Settings,
+        settings: &cella_config::settings::Settings,
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let capabilities = self.client.capabilities();
@@ -738,7 +738,7 @@ impl EnsureUpContext<'_> {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::Settings,
+        settings: &cella_config::settings::Settings,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -838,7 +838,7 @@ impl EnsureUpContext<'_> {
         &self,
         container_id: &str,
         remote_user: &str,
-        settings: &cella_config::Settings,
+        settings: &cella_config::settings::Settings,
         shell: &str,
         probed_env: Option<std::collections::HashMap<String, String>>,
         remote_env: &[String],
@@ -914,7 +914,7 @@ impl EnsureUpContext<'_> {
             &base_image_details.user,
         );
 
-        let settings = cella_config::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
         let toml_net = settings.network.to_network_config();
         let toml_mode_override = settings.network.mode_override();
         let dc_net = config
@@ -1012,7 +1012,7 @@ impl EnsureUpContext<'_> {
             &agent_arch,
         );
 
-        let settings = cella_config::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
         self.apply_env_and_mounts(
             &mut create_opts,
             &env_fwd,

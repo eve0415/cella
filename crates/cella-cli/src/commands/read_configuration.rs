@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use serde_json::json;
 
-use cella_config::resolve;
+use cella_config::devcontainer::resolve;
 
 /// Read and output the resolved devcontainer configuration.
 #[derive(Args)]

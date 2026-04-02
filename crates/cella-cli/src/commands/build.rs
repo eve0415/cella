@@ -4,7 +4,7 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::{info, warn};
 
-use cella_config::resolve;
+use cella_config::devcontainer::resolve;
 
 use super::image::ensure_image;
 

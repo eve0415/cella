@@ -210,7 +210,7 @@ pub async fn install_claude_code(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::ClaudeCode,
+    settings: &cella_config::settings::ClaudeCode,
     probed_env: Option<&ProbedEnv>,
 ) {
     if is_claude_code_installed(
@@ -393,7 +393,7 @@ pub async fn install_codex(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::Codex,
+    settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) {
     if is_npm_tool_installed(
@@ -432,7 +432,7 @@ pub async fn install_gemini(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::Gemini,
+    settings: &cella_config::settings::Gemini,
     probed_env: Option<&ProbedEnv>,
 ) {
     if is_npm_tool_installed(
@@ -573,7 +573,7 @@ pub async fn setup_plugin_manifests(
 /// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
 pub fn add_tool_config_mounts(
     create_opts: &mut cella_backend::CreateContainerOptions,
-    settings: &cella_config::Settings,
+    settings: &cella_config::settings::Settings,
     remote_user: &str,
 ) {
     // Claude Code: ~/.claude.json (single file) and ~/.claude/ (directory)
@@ -695,7 +695,7 @@ pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::Settings,
+    settings: &cella_config::settings::Settings,
     probed_env: Option<&ProbedEnv>,
     progress: &ProgressSender,
 ) {

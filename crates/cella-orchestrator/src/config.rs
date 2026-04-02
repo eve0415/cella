@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cella_config::resolve::ResolvedConfig;
+use cella_config::devcontainer::resolve::ResolvedConfig;
 
 /// Configuration for the full container-up pipeline.
 pub struct UpConfig<'a> {

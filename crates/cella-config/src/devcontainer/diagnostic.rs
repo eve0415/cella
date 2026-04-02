@@ -5,7 +5,7 @@ use std::fmt::Write;
 use miette::{GraphicalReportHandler, GraphicalTheme, Report};
 use thiserror::Error;
 
-use crate::span::{Range, SourceText};
+use super::span::{Range, SourceText};
 
 /// Severity level for a config diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +120,7 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::span::SourceText;
+    use super::span::SourceText;
 
     fn dummy_source() -> SourceText {
         let text = r#"{"image": "ubuntu"}"#.to_string();
