@@ -23,7 +23,8 @@ impl PortsArgs {
             .backend
             .as_ref()
             .is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
-        let has_custom_host = self.backend.docker_host.is_some();
+        let has_custom_host =
+            self.backend.docker_host.is_some() || std::env::var_os("DOCKER_HOST").is_some();
         if is_docker_backend
             && !has_custom_host
             && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()

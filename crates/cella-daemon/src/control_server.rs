@@ -569,13 +569,14 @@ async fn lookup_container_labels(
     container_id: &str,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
 ) -> HashMap<String, String> {
-    // Determine which CLI binary to use from the registered backend kind.
-    let backend_kind = {
+    // Determine which CLI binary and Docker host to use from the registered handle.
+    let (backend_kind, docker_host) = {
         let handles = container_handles.lock().await;
         handles
             .values()
             .find(|h| h.container_id == container_id)
-            .and_then(|h| h.backend_kind.clone())
+            .map(|h| (h.backend_kind.clone(), h.docker_host.clone()))
+            .unwrap_or_default()
     };
 
     let cmd_name = match backend_kind.as_deref() {
@@ -583,17 +584,20 @@ async fn lookup_container_labels(
         _ => "docker",
     };
 
-    let output = tokio::process::Command::new(cmd_name)
-        .args([
-            "inspect",
-            "--format",
-            "{{json .Config.Labels}}",
-            container_id,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
+    let mut cmd = tokio::process::Command::new(cmd_name);
+    if let Some(ref host) = docker_host {
+        cmd.arg("-H").arg(host);
+    }
+    cmd.args([
+        "inspect",
+        "--format",
+        "{{json .Config.Labels}}",
+        container_id,
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let output = cmd.output().await;
 
     let Ok(output) = output else {
         return HashMap::new();
@@ -632,15 +636,7 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             branch,
             base,
         } => {
-            handle_branch_request(
-                &request_id,
-                &branch,
-                base.as_deref(),
-                wt.workspace_path,
-                wt.cella_bin,
-                writer,
-            )
-            .await?;
+            handle_branch_request(&request_id, &branch, base.as_deref(), &wt, writer).await?;
         }
         AgentMessage::ListRequest { request_id } => {
             handle_list_request(&request_id, wt.workspace_path, writer).await?;
@@ -655,15 +651,7 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             dry_run,
             all,
         } => {
-            handle_prune_request(
-                &request_id,
-                dry_run,
-                all,
-                wt.workspace_path,
-                wt.cella_bin,
-                writer,
-            )
-            .await?;
+            handle_prune_request(&request_id, dry_run, all, &wt, writer).await?;
         }
         AgentMessage::DownRequest {
             request_id,
@@ -720,8 +708,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     base: Option<&str>,
-    workspace_path: Option<&str>,
-    cella_bin: &std::path::Path,
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     use cella_protocol::WorktreeOperationResult;
@@ -729,7 +716,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
 
     info!(
         "Handling BranchRequest: branch={branch} base={base:?} via {}",
-        cella_bin.display()
+        wt.cella_bin.display()
     );
 
     // Send initial progress
@@ -744,12 +731,14 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     .await?;
 
     // Build command
-    let mut cmd = Command::new(cella_bin);
-    cmd.arg("branch").arg(branch).arg("--output").arg("json");
+    let mut cmd = Command::new(wt.cella_bin);
+    cmd.arg("branch");
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg(branch).arg("--output").arg("json");
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
     }
-    if let Some(ws) = workspace_path {
+    if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
     }
     cmd.stdout(std::process::Stdio::piped());
@@ -1172,19 +1161,20 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     dry_run: bool,
     all: bool,
-    workspace_path: Option<&str>,
-    cella_bin: &std::path::Path,
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    let mut cmd = tokio::process::Command::new(cella_bin);
-    cmd.arg("prune").arg("--force").arg("--output").arg("json");
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("prune");
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg("--force").arg("--output").arg("json");
     if dry_run {
         cmd.arg("--dry-run");
     }
     if all {
         cmd.arg("--all");
     }
-    if let Some(ws) = workspace_path {
+    if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
     }
     cmd.stdout(std::process::Stdio::piped());
@@ -1254,11 +1244,9 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
     .await?;
 
     let mut cmd = tokio::process::Command::new(wt.cella_bin);
-    cmd.arg("down")
-        .arg("--branch")
-        .arg(branch)
-        .arg("--output")
-        .arg("json");
+    cmd.arg("down");
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg("--branch").arg(branch).arg("--output").arg("json");
     if rm {
         cmd.arg("--rm");
     }
@@ -1981,23 +1969,25 @@ fn snapshot_binary(source: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Uses the calling container's backend metadata to determine which CLI binary
 /// to invoke (`docker` or `container`), avoiding hardcoded Docker assumptions.
 async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) -> Option<String> {
-    let cmd_name = resolve_backend_cli(wt).await;
+    let (cmd_name, docker_host) = resolve_backend_cli_and_host(wt).await;
 
-    let output = tokio::process::Command::new(&cmd_name)
-        .args([
-            "ps",
-            "--filter",
-            &format!("label=dev.cella.branch={branch}"),
-            "--filter",
-            "label=dev.cella.worktree=true",
-            "--format",
-            "{{.Names}}",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new(&cmd_name);
+    if let Some(ref host) = docker_host {
+        cmd.arg("-H").arg(host);
+    }
+    cmd.args([
+        "ps",
+        "--filter",
+        &format!("label=dev.cella.branch={branch}"),
+        "--filter",
+        "label=dev.cella.worktree=true",
+        "--format",
+        "{{.Names}}",
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let output = cmd.output().await.ok()?;
 
     if !output.status.success() {
         return None;
@@ -2020,19 +2010,20 @@ async fn forward_backend_flags(cmd: &mut tokio::process::Command, wt: &WorktreeH
     }
 }
 
-/// Resolve the backend CLI binary name from the calling container's handle.
-async fn resolve_backend_cli(wt: &WorktreeHandlerCtx<'_>) -> String {
+/// Resolve the backend CLI binary name and Docker host from the calling container's handle.
+async fn resolve_backend_cli_and_host(wt: &WorktreeHandlerCtx<'_>) -> (String, Option<String>) {
     let handles = wt.container_handles.lock().await;
-    handles
-        .get(wt.container_name)
-        .and_then(|h| h.backend_kind.as_deref())
-        .map_or_else(
-            || "docker".to_string(),
-            |kind| match kind {
-                "apple-container" => "container".to_string(),
-                other => other.to_string(),
-            },
-        )
+    let (kind, host) = handles.get(wt.container_name).map_or(
+        (None, None),
+        |h| (h.backend_kind.clone(), h.docker_host.clone()),
+    );
+    drop(handles);
+    let cmd_name = match kind.as_deref() {
+        Some("apple-container") => "container".to_string(),
+        Some(other) => other.to_string(),
+        None => "docker".to_string(),
+    };
+    (cmd_name, host)
 }
 
 /// Extract the port number from a URL like `http://localhost:3000/path`.
