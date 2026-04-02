@@ -76,7 +76,7 @@ All variants are tagged with `"type"` in snake_case.
 | `protocol` | `PortProtocol` | `"tcp"` or `"udp"` |
 | `process` | `string?` | Process name (from `/proc/<pid>/cmdline`), if readable |
 | `bind` | `BindAddress` | `"localhost"` or `"all"` |
-| `proxy_port` | `u16?` | Agent-side localhost proxy port; when set, daemon connects to `container_ip:proxy_port` instead of `container_ip:port`. Omitted when null. |
+| `proxy_port` | `u16?` | Agent-side localhost proxy port; when set, daemon connects to `container_ip:proxy_port` instead of `container_ip:port` |
 
 ```json
 {"type":"port_open","port":3000,"protocol":"tcp","process":"node","bind":"localhost"}

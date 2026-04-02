@@ -94,7 +94,7 @@ Devcontainer template lifecycle. Discovers templates from OCI registries (defaul
 
 ### cella-port
 
-Port allocation, detection, and IPC protocol re-exports. Provides `/proc/net/tcp` parsing for port detection, manages host port allocation to avoid conflicts across concurrent containers, and re-exports wire format types from cella-protocol for convenience.
+Port allocation and detection. Provides `/proc/net/tcp` parsing for port detection and manages host port allocation to avoid conflicts across concurrent containers.
 
 ### cella-orchestrator
 

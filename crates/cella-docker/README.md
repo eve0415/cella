@@ -29,10 +29,7 @@ Implements the container lifecycle portions of the [Dev Container specification]
 
 - `DockerApi` — internal trait wrapping bollard Docker operations (not the extension point for new runtimes — see `ContainerBackend` in [cella-backend](../cella-backend))
 - `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend`
-- `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend) and re-exported here
-- `ParsedLifecycle` — parsed lifecycle command (string, array, or map form)
-- `ContainerTarget` — resolved container identifier
-- `FileToUpload` — file content for upload into containers
+- `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend)
 
 ### Modules
 
@@ -46,11 +43,8 @@ Implements the container lifecycle portions of the [Dev Container specification]
 | `discovery` | Docker socket auto-discovery (Colima, Podman, Rancher Desktop, standard paths) |
 | `exec` | Command execution (interactive with PTY and detached) |
 | `image` | Image building via Docker build API |
-| `lifecycle` | Lifecycle command parsing and execution (`postCreate`, `postStart`, `postAttach`) |
-| `names` | Container/image naming conventions and label management |
 | `network` | Network creation and configuration |
 | `volume` | Volume and mount management |
-| `resolve` | Container resolution by ID, name, or label |
 | `uid` | UID remapping for `updateRemoteUserUID` |
 | `upload` | File upload to running containers via tar streaming |
 

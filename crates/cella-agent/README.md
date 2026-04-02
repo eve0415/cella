@@ -75,4 +75,4 @@ The agent connects to the host daemon using environment variables set during con
 
 Log level is controlled via `CELLA_AGENT_LOG` (or `RUST_LOG`).
 
-The agent protocol must stay in sync with the daemon. Message types are defined in `cella_port::protocol` — changes there affect both this crate and cella-daemon. The `reconnecting_client` module handles connection drops gracefully, which is important because the agent may start before the daemon is ready.
+The agent protocol must stay in sync with the daemon. Message types are defined in `cella_protocol` — changes there affect both this crate and cella-daemon. The `reconnecting_client` module handles connection drops gracefully, which is important because the agent may start before the daemon is ready.

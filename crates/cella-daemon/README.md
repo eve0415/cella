@@ -56,7 +56,7 @@ Unit tests use tempfile for PID file and socket path management. Integration tes
 
 ## Development
 
-The daemon communicates with agents using the protocol defined in `cella_port::protocol`. Any changes to message types must be coordinated across cella-daemon, cella-agent, and cella-port.
+The daemon communicates with agents using the protocol defined in `cella_protocol`. Any changes to message types must be coordinated across cella-daemon, cella-agent, and cella-protocol.
 
 Key runtime files:
 - **PID file** — tracks whether the daemon is running

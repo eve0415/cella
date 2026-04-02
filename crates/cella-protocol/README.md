@@ -55,7 +55,7 @@ See [docs/specs/ipc-protocol.md](../../docs/specs/ipc-protocol.md) for the full 
 cargo test -p cella-protocol
 ```
 
-Unit tests cover message serialization round-trips, backward compatibility (missing optional fields), and credential field parsing/formatting.
+Unit tests cover message serialization round-trips and credential field parsing/formatting.
 
 ## Development
 

@@ -29,7 +29,6 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 |--------|---------|
 | `allocation` | `ForwardedPort`, `PortAllocationTable`, port range management (default range: 1024-65535) |
 | `detection` | `/proc/net/tcp` parser, LISTEN state detection (TCP state code `0A`) |
-| `protocol` | Re-exports from [cella-protocol](../cella-protocol) for convenience |
 
 ## Crate Dependencies
 
@@ -43,10 +42,6 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 cargo test -p cella-port
 ```
 
-Unit tests cover `/proc/net/tcp` parsing with synthetic data via tempfile, port allocation conflict resolution, and protocol message round-trips.
-
-## Development
-
-This crate is a shared dependency across five consumers (cella-agent, cella-cli, cella-daemon, cella-doctor, cella-orchestrator). The protocol module re-exports types from [cella-protocol](../cella-protocol) — wire format changes should be made there.
+Unit tests cover `/proc/net/tcp` parsing with synthetic data via tempfile and port allocation conflict resolution.
 
 The `/proc/net/tcp` parser handles both IPv4 (`/proc/net/tcp`) and IPv6 (`/proc/net/tcp6`). The LISTEN state is identified by TCP state code `0A` in the hex-encoded state field.
