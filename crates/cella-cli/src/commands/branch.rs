@@ -96,6 +96,13 @@ impl BranchArgs {
         )
         .await?;
 
+        // Remove any leftover container from a previous failed attempt so
+        // ensure_up always runs the full first-create path (lifecycle hooks,
+        // tool setup, etc.) rather than reusing a half-initialized container.
+        if let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
+            let _ = ctx.client.remove_container(&existing.id, true).await;
+        }
+
         let create_result = ctx.ensure_up(false, &[]).await?;
 
         // If --exec provided, run the command in the new container

@@ -608,11 +608,13 @@ impl UpContext {
         };
 
         let result =
-            cella_orchestrator::up::ensure_up(self.client.as_ref(), &config, &hooks, sender)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            cella_orchestrator::up::ensure_up(self.client.as_ref(), &config, &hooks, sender).await;
 
+        // Drain the progress renderer on both success and error paths so
+        // queued events (final step, warnings) are flushed before exit.
         let _ = renderer.await;
+
+        let result = result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
         Ok(UpResult {
             container_id: result.container_id,
