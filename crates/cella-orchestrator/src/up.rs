@@ -622,15 +622,17 @@ impl EnsureUpContext<'_> {
             create_opts.env.extend(fwd_env);
         }
 
-        let daemon_env = self
-            .hooks
-            .daemon_env(self.config.container_name, self.client.host_gateway())
-            .await;
-        if !daemon_env.is_empty() {
-            if create_opts.env.is_empty() {
-                create_opts.env = image_env.to_vec();
+        if capabilities.managed_agent {
+            let daemon_env = self
+                .hooks
+                .daemon_env(self.config.container_name, self.client.host_gateway())
+                .await;
+            if !daemon_env.is_empty() {
+                if create_opts.env.is_empty() {
+                    create_opts.env = image_env.to_vec();
+                }
+                create_opts.env.extend(daemon_env);
             }
-            create_opts.env.extend(daemon_env);
         }
 
         if capabilities.managed_agent {

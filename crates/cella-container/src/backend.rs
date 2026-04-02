@@ -21,6 +21,23 @@ pub struct AppleContainerBackend {
 }
 
 impl AppleContainerBackend {
+    /// Resolve the staging directory for a container by looking up its name.
+    ///
+    /// The staging directory is mounted at create time using the container name,
+    /// but subsequent operations receive the container ID. This helper bridges
+    /// the gap by inspecting the container to retrieve its name.
+    async fn staging_dir_for(&self, container_id: &str) -> Result<PathBuf, BackendError> {
+        let entry = self.cli.inspect(container_id).await?;
+        let name = entry
+            .configuration
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+            .unwrap_or(container_id);
+        Ok(self.staging_base.join(name))
+    }
+}
+
+impl AppleContainerBackend {
     /// Create a new backend wrapping the given CLI handle.
     pub fn new(cli: ContainerCli) -> Self {
         warn!(
@@ -119,9 +136,10 @@ impl ContainerBackend for AppleContainerBackend {
         remove_volumes: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
+            let staging_dir = self.staging_dir_for(id).await.ok();
             self.cli.rm(id).await?;
             if remove_volumes {
-                let staging_dir = self.staging_base.join(id);
+                let staging_dir = staging_dir.unwrap_or_else(|| self.staging_base.join(id));
                 if staging_dir.exists() {
                     debug!(path = %staging_dir.display(), "removing staging directory");
                     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -396,7 +414,7 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_base.join(container_id);
+            let staging_dir = self.staging_dir_for(container_id).await?;
             tokio::fs::create_dir_all(&staging_dir).await?;
 
             let staging_mount = "/tmp/.cella-staging";
