@@ -66,6 +66,18 @@ pub struct UpArgs {
     /// Start container without network blocking rules (proxy forwarding still active).
     #[arg(long)]
     pub(crate) no_network_rules: bool,
+
+    /// Docker Compose profile(s) to activate (repeatable).
+    #[arg(long = "profile")]
+    pub(crate) profile: Vec<String>,
+
+    /// Extra env-file(s) to pass to Docker Compose (repeatable).
+    #[arg(long = "env-file")]
+    pub(crate) env_file: Vec<PathBuf>,
+
+    /// Pull policy for Docker Compose services (always, missing, never).
+    #[arg(long = "pull-policy")]
+    pub(crate) pull_policy: Option<String>,
 }
 
 /// Output format for container commands.
@@ -102,6 +114,12 @@ pub struct UpContext {
     network_rules: NetworkRulePolicy,
     /// Docker host override (forwarded to daemon registration).
     docker_host: Option<String>,
+    /// Docker Compose profiles to activate.
+    pub(crate) compose_profiles: Vec<String>,
+    /// Extra env-file paths for Docker Compose.
+    pub(crate) compose_env_files: Vec<PathBuf>,
+    /// Pull policy for Docker Compose services.
+    pub(crate) compose_pull_policy: Option<String>,
 }
 
 impl UpContext {
@@ -162,6 +180,9 @@ impl UpContext {
                 NetworkRulePolicy::Enforce
             },
             docker_host: effective_docker_host(&args.backend),
+            compose_profiles: args.profile.clone(),
+            compose_env_files: args.env_file.clone(),
+            compose_pull_policy: args.pull_policy.clone(),
         })
     }
 
@@ -224,6 +245,9 @@ impl UpContext {
             extra_labels,
             network_rules: NetworkRulePolicy::Enforce,
             docker_host: effective_docker_host(backend_args),
+            compose_profiles: Vec::new(),
+            compose_env_files: Vec::new(),
+            compose_pull_policy: None,
         })
     }
 

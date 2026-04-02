@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 use crate::error::CellaComposeError;
 use crate::hash::compute_compose_hash;
@@ -50,6 +51,12 @@ pub struct ComposeProject {
     pub workspace_root: PathBuf,
     /// SHA256 hash of devcontainer.json + all compose files.
     pub config_hash: String,
+    /// Docker Compose profiles to activate (`--profile` flags).
+    pub profiles: Vec<String>,
+    /// Extra env-file paths to pass to docker compose (`--env-file` flags).
+    pub env_files: Vec<PathBuf>,
+    /// Pull policy for `docker compose up`/`build` (`--pull` flag).
+    pub pull_policy: Option<String>,
 }
 
 impl ComposeProject {
@@ -133,6 +140,9 @@ impl ComposeProject {
             config_dir,
             workspace_root: workspace_root.to_path_buf(),
             config_hash,
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         })
     }
 
@@ -142,6 +152,47 @@ impl ComposeProject {
         self.override_file = compose_override_path(&name);
         self.project_name = name;
         self
+    }
+
+    /// Set compose profiles, env-file paths, and pull policy from CLI arguments.
+    ///
+    /// Recomputes `config_hash` to include the new options so that changing
+    /// e.g. `--profile` triggers container re-creation.
+    pub fn set_compose_options(
+        &mut self,
+        profiles: Vec<String>,
+        env_files: Vec<PathBuf>,
+        pull_policy: Option<String>,
+    ) {
+        if !profiles.is_empty() {
+            debug!("Compose profiles: {profiles:?}");
+        }
+        if !env_files.is_empty() {
+            debug!("Compose env files: {env_files:?}");
+        }
+        if let Some(ref policy) = pull_policy {
+            debug!("Compose pull policy: {policy}");
+        }
+        self.profiles = profiles;
+        self.env_files = env_files;
+        self.pull_policy = pull_policy;
+
+        // Recompute hash to include CLI options that affect the compose project.
+        let mut hasher = Sha256::new();
+        hasher.update(self.config_hash.as_bytes());
+        for p in &self.profiles {
+            hasher.update(b"profile:");
+            hasher.update(p.as_bytes());
+        }
+        for ef in &self.env_files {
+            hasher.update(b"env_file:");
+            hasher.update(ef.to_string_lossy().as_bytes());
+        }
+        if let Some(ref pp) = self.pull_policy {
+            hasher.update(b"pull_policy:");
+            hasher.update(pp.as_bytes());
+        }
+        self.config_hash = hex::encode(hasher.finalize());
     }
 }
 

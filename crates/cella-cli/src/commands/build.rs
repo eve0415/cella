@@ -32,6 +32,18 @@ pub struct BuildArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     output: OutputFormat,
+
+    /// Docker Compose profile(s) to activate (repeatable).
+    #[arg(long = "profile")]
+    profile: Vec<String>,
+
+    /// Extra env-file(s) to pass to Docker Compose (repeatable).
+    #[arg(long = "env-file")]
+    env_file: Vec<PathBuf>,
+
+    /// Pull policy for Docker Compose services (always, missing, never).
+    #[arg(long = "pull-policy")]
+    pull_policy: Option<String>,
 }
 
 /// Output format for build command.
@@ -68,11 +80,17 @@ impl BuildArgs {
         // Docker Compose path: delegate to orchestrator
         if config.get("dockerComposeFile").is_some() {
             let (sender, renderer) = crate::progress::bridge(&progress);
+            let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
+                config,
+                config_path: &resolved.config_path,
+                workspace_root: &resolved.workspace_root,
+                profiles: self.profile.clone(),
+                env_files: self.env_file.clone(),
+                pull_policy: self.pull_policy.clone(),
+            };
             let result = cella_orchestrator::compose_build::compose_build(
                 client.as_ref(),
-                config,
-                &resolved.config_path,
-                &resolved.workspace_root,
+                &build_cfg,
                 &sender,
             )
             .await

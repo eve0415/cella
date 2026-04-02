@@ -52,6 +52,9 @@ pub struct ComposeCommand {
     compose_files: Vec<PathBuf>,
     override_file: Option<PathBuf>,
     working_dir: PathBuf,
+    profiles: Vec<String>,
+    env_files: Vec<PathBuf>,
+    pull_policy: Option<String>,
 }
 
 impl ComposeCommand {
@@ -62,6 +65,9 @@ impl ComposeCommand {
             compose_files: project.compose_files.clone(),
             override_file: Some(project.override_file.clone()),
             working_dir: project.config_dir.clone(),
+            profiles: project.profiles.clone(),
+            env_files: project.env_files.clone(),
+            pull_policy: project.pull_policy.clone(),
         }
     }
 
@@ -75,6 +81,9 @@ impl ComposeCommand {
             compose_files: project.compose_files.clone(),
             override_file: None,
             working_dir: project.config_dir.clone(),
+            profiles: project.profiles.clone(),
+            env_files: project.env_files.clone(),
+            pull_policy: project.pull_policy.clone(),
         }
     }
 
@@ -85,6 +94,9 @@ impl ComposeCommand {
             compose_files: Vec::new(),
             override_file: None,
             working_dir: PathBuf::from("."),
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         }
     }
 
@@ -93,6 +105,12 @@ impl ComposeCommand {
         let mut cmd = Command::new("docker");
         cmd.arg("compose");
         cmd.arg("--project-name").arg(&self.project_name);
+        for p in &self.profiles {
+            cmd.arg("--profile").arg(p);
+        }
+        for ef in &self.env_files {
+            cmd.arg("--env-file").arg(ef);
+        }
         for f in &self.compose_files {
             cmd.arg("-f").arg(f);
         }
@@ -116,6 +134,9 @@ impl ComposeCommand {
     ) -> Result<(), CellaComposeError> {
         let mut cmd = self.base_command();
         cmd.arg("up").arg("-d");
+        if let Some(ref policy) = self.pull_policy {
+            cmd.arg("--pull").arg(policy);
+        }
         if build {
             cmd.arg("--build");
         }
@@ -148,6 +169,11 @@ impl ComposeCommand {
     pub async fn build(&self, services: Option<&[String]>) -> Result<(), CellaComposeError> {
         let mut cmd = self.base_command();
         cmd.arg("build");
+        if let Some(ref policy) = self.pull_policy
+            && policy == "always"
+        {
+            cmd.arg("--pull");
+        }
         if let Some(svcs) = services {
             for s in svcs {
                 cmd.arg(s);
@@ -471,6 +497,9 @@ mod tests {
             config_dir: PathBuf::from("/workspace/.devcontainer"),
             workspace_root: PathBuf::from("/workspace"),
             config_hash: "abc123".to_string(),
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         };
 
         let cmd = ComposeCommand::new(&project);
@@ -502,6 +531,9 @@ mod tests {
             config_dir: PathBuf::from("/workspace/.devcontainer"),
             workspace_root: PathBuf::from("/workspace"),
             config_hash: "abc123".to_string(),
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         };
 
         let cmd = ComposeCommand::without_override(&project);
@@ -596,6 +628,9 @@ mod tests {
             config_dir: PathBuf::from("/workspace/.devcontainer"),
             workspace_root: PathBuf::from("/workspace"),
             config_hash: "abc123".to_string(),
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         };
 
         let cmd = ComposeCommand::without_override(&project);
@@ -632,6 +667,9 @@ mod tests {
             config_dir: PathBuf::from("/workspace/.devcontainer"),
             workspace_root: PathBuf::from("/workspace"),
             config_hash: "abc123".to_string(),
+            profiles: Vec::new(),
+            env_files: Vec::new(),
+            pull_policy: None,
         };
 
         let cmd = ComposeCommand::new(&project);
@@ -664,5 +702,109 @@ mod tests {
             parse_compose_version("Docker Compose version v99.99.99"),
             Some((99, 99, 99))
         );
+    }
+
+    #[test]
+    fn base_command_includes_profiles() {
+        let project = ComposeProject {
+            project_name: "cella-test-abc12345".to_string(),
+            compose_files: vec![PathBuf::from("/workspace/docker-compose.yml")],
+            override_file: PathBuf::from("/tmp/override.yml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+            profiles: vec!["debug".to_string(), "monitoring".to_string()],
+            env_files: Vec::new(),
+            pull_policy: None,
+        };
+
+        let cmd = ComposeCommand::new(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+
+        // --profile debug --profile monitoring should appear after --project-name
+        let profile_indices: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == "--profile")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(profile_indices.len(), 2);
+        assert_eq!(args[profile_indices[0] + 1], "debug");
+        assert_eq!(args[profile_indices[1] + 1], "monitoring");
+    }
+
+    #[test]
+    fn base_command_includes_env_files() {
+        let project = ComposeProject {
+            project_name: "cella-test-abc12345".to_string(),
+            compose_files: vec![PathBuf::from("/workspace/docker-compose.yml")],
+            override_file: PathBuf::from("/tmp/override.yml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+            profiles: Vec::new(),
+            env_files: vec![
+                PathBuf::from("/workspace/.env"),
+                PathBuf::from("/workspace/.env.local"),
+            ],
+            pull_policy: None,
+        };
+
+        let cmd = ComposeCommand::new(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+
+        let env_file_indices: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == "--env-file")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(env_file_indices.len(), 2);
+        assert_eq!(args[env_file_indices[0] + 1], "/workspace/.env");
+        assert_eq!(args[env_file_indices[1] + 1], "/workspace/.env.local");
+    }
+
+    #[test]
+    fn profiles_and_env_files_appear_before_compose_files() {
+        let project = ComposeProject {
+            project_name: "cella-order-abc12345".to_string(),
+            compose_files: vec![PathBuf::from("/workspace/docker-compose.yml")],
+            override_file: PathBuf::from("/tmp/override.yml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: crate::project::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspaces/myapp".to_string(),
+            config_dir: PathBuf::from("/workspace"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: "abc123".to_string(),
+            profiles: vec!["dev".to_string()],
+            env_files: vec![PathBuf::from("/workspace/.env")],
+            pull_policy: None,
+        };
+
+        let cmd = ComposeCommand::new(&project);
+        let base = cmd.base_command();
+        let args: Vec<_> = base.as_std().get_args().collect();
+
+        let profile_idx = args.iter().position(|a| *a == "--profile").unwrap();
+        let env_file_idx = args.iter().position(|a| *a == "--env-file").unwrap();
+        let first_f_idx = args.iter().position(|a| *a == "-f").unwrap();
+
+        // --profile and --env-file must appear before -f flags
+        assert!(profile_idx < first_f_idx);
+        assert!(env_file_idx < first_f_idx);
     }
 }
