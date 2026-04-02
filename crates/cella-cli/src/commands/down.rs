@@ -126,6 +126,7 @@ impl DownArgs {
             }
             Err(e) => return Err(e.into()),
         };
+        super::warn_if_missing_backend_label(&container);
 
         // For non-compose containers, honour shutdownAction from label
         if !discovery::is_compose_container(&container.labels) {

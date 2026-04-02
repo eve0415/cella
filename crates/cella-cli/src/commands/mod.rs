@@ -170,6 +170,20 @@ impl Command {
     }
 }
 
+/// Emit a warning if a container lacks the `dev.cella.backend` label.
+///
+/// Pre-existing containers (created before backend labeling) won't have
+/// this label; we assume Docker and nudge the user to rebuild.
+pub fn warn_if_missing_backend_label(container: &cella_backend::ContainerInfo) {
+    if !container.labels.contains_key(cella_backend::BACKEND_LABEL) {
+        warn!(
+            "Container '{}' has no backend label. Assuming Docker. \
+             Run `cella up --rebuild` to add it.",
+            container.name
+        );
+    }
+}
+
 /// Resolve the workspace folder from an optional argument or the current directory.
 ///
 /// # Errors
