@@ -222,7 +222,7 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
     if !mgmt_sock.exists() {
         return;
     }
-    let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+    let req = cella_protocol::ManagementRequest::DeregisterContainer {
         container_name: container.name.clone(),
     };
     if let Err(e) = cella_daemon::management::send_management_request(&mgmt_sock, &req).await {

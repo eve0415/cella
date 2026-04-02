@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cella-port.workspace = true
+cella-protocol.workspace = true
 nix.workspace = true
 portable-pty.workspace = true
 serde_json.workspace = true

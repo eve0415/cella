@@ -1,6 +1,6 @@
 //! Cella daemon health checks.
 
-use cella_port::protocol::{ManagementRequest, ManagementResponse};
+use cella_protocol::{ManagementRequest, ManagementResponse};
 
 use super::{CategoryReport, CheckResult, Severity};
 

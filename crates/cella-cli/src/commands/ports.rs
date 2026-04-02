@@ -22,11 +22,11 @@ impl PortsArgs {
         {
             match cella_daemon::management::send_management_request(
                 &mgmt_sock,
-                &cella_port::protocol::ManagementRequest::QueryPorts,
+                &cella_protocol::ManagementRequest::QueryPorts,
             )
             .await
             {
-                Ok(cella_port::protocol::ManagementResponse::Ports { ports }) => {
+                Ok(cella_protocol::ManagementResponse::Ports { ports }) => {
                     if !ports.is_empty() {
                         print_daemon_ports(&ports);
                         return Ok(());
@@ -47,7 +47,7 @@ impl PortsArgs {
     }
 }
 
-fn print_daemon_ports(ports: &[cella_port::protocol::ForwardedPortDetail]) {
+fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
     use crate::table::{Column, Table};
 
     let mut table = Table::new(vec![

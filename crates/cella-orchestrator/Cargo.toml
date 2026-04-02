@@ -11,6 +11,7 @@ cella-config.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
 cella-port.workspace = true
+cella-protocol.workspace = true
 cella-git.workspace = true
 cella-network.workspace = true
 hex.workspace = true

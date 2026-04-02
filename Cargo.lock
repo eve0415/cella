@@ -303,6 +303,7 @@ version = "0.0.14"
 dependencies = [
  "cella-network",
  "cella-port",
+ "cella-protocol",
  "nix 0.31.2",
  "notify",
  "rcgen",
@@ -347,6 +348,7 @@ dependencies = [
  "cella-network",
  "cella-orchestrator",
  "cella-port",
+ "cella-protocol",
  "cella-templates",
  "chrono",
  "clap",
@@ -428,6 +430,7 @@ name = "cella-daemon"
 version = "0.0.14"
 dependencies = [
  "cella-port",
+ "cella-protocol",
  "nix 0.31.2",
  "portable-pty",
  "serde_json",
@@ -469,6 +472,7 @@ dependencies = [
  "cella-env",
  "cella-orchestrator",
  "cella-port",
+ "cella-protocol",
  "serde",
  "serde_json",
  "tempfile",
@@ -546,6 +550,7 @@ dependencies = [
  "cella-git",
  "cella-network",
  "cella-port",
+ "cella-protocol",
  "hex",
  "serde_json",
  "sha2 0.11.0",

@@ -276,7 +276,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         loop {
             interval.tick().await;
             let uptime = start.elapsed().as_secs();
-            let msg = cella_port::protocol::AgentMessage::Health {
+            let msg = cella_protocol::AgentMessage::Health {
                 uptime_secs: uptime,
                 ports_detected: pd.load(std::sync::atomic::Ordering::Relaxed),
             };

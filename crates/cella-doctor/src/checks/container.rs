@@ -1,7 +1,7 @@
 //! Per-container health checks.
 
 use cella_backend::{ContainerBackend, ContainerTarget, ExecOptions};
-use cella_port::protocol::{ManagementRequest, ManagementResponse};
+use cella_protocol::{ManagementRequest, ManagementResponse};
 
 use super::{CategoryReport, CheckContext, CheckResult, Severity};
 

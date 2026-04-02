@@ -82,11 +82,11 @@ async fn run_status() -> Result<(), Box<dyn std::error::Error>> {
     if socket_path.exists() {
         let result = cella_daemon::management::send_management_request(
             &socket_path,
-            &cella_port::protocol::ManagementRequest::QueryStatus,
+            &cella_protocol::ManagementRequest::QueryStatus,
         )
         .await;
 
-        if let Ok(cella_port::protocol::ManagementResponse::Status {
+        if let Ok(cella_protocol::ManagementResponse::Status {
             container_count,
             containers,
             is_orbstack,

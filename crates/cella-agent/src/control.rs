@@ -1,7 +1,7 @@
 //! TCP client for communicating with the host daemon.
 
 use cella_port::CellaPortError;
-use cella_port::protocol::{
+use cella_protocol::{
     AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

@@ -1,7 +1,7 @@
 //! BROWSER env var handler: sends URLs to the host daemon for opening.
 
 use cella_port::CellaPortError;
-use cella_port::protocol::AgentMessage;
+use cella_protocol::AgentMessage;
 
 use crate::control::ControlClient;
 

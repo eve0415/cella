@@ -282,7 +282,7 @@ async fn check_and_restart_if_stale(pid_path: &std::path::Path, socket_path: &st
 /// Check if the running daemon needs a restart due to version mismatch.
 /// Returns `Some(true)` if restart needed, `Some(false)` if ok, `None` if check failed.
 async fn check_daemon_needs_restart(control_socket_path: &std::path::Path) -> Option<bool> {
-    use cella_port::protocol::{ManagementRequest, ManagementResponse};
+    use cella_protocol::{ManagementRequest, ManagementResponse};
 
     if !control_socket_path.exists() {
         return None;
@@ -353,7 +353,7 @@ async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Pat
 
 /// Send shutdown request and wait for the old daemon to exit.
 async fn graceful_shutdown_daemon(pid_path: &std::path::Path, socket_path: &std::path::Path) {
-    use cella_port::protocol::ManagementRequest;
+    use cella_protocol::ManagementRequest;
 
     if socket_path.exists() {
         let _ = cella_daemon::management::send_management_request(
@@ -390,7 +390,7 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
 async fn re_register_containers(
     socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use cella_port::protocol::ManagementRequest;
+    use cella_protocol::ManagementRequest;
 
     let client =
         crate::backend::resolve_backend(None, None).map_err(|e| e as Box<dyn std::error::Error>)?;

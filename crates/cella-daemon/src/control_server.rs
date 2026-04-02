@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use cella_port::protocol::{
+use cella_protocol::{
     AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -707,7 +707,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     cella_bin: &std::path::Path,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    use cella_port::protocol::WorktreeOperationResult;
+    use cella_protocol::WorktreeOperationResult;
     use tokio::process::Command;
 
     info!(
@@ -801,7 +801,7 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     writer: &mut W,
 ) -> Result<(std::process::ExitStatus, String, String), CellaDaemonError> {
-    use cella_port::protocol::OutputStream;
+    use cella_protocol::OutputStream;
 
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
@@ -857,7 +857,7 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
 }
 
 /// Try to parse the JSON output from `cella branch --output json`.
-fn parse_branch_json_output(stdout: &str) -> Option<cella_port::protocol::WorktreeOperationResult> {
+fn parse_branch_json_output(stdout: &str) -> Option<cella_protocol::WorktreeOperationResult> {
     // The JSON output may contain multiple lines; find the last JSON object
     // which should be the final result.
     for line in stdout.lines().rev() {
@@ -875,7 +875,7 @@ fn parse_branch_json_output(stdout: &str) -> Option<cella_port::protocol::Worktr
                 .unwrap_or("")
                 .to_string();
             if v.get("outcome").is_some() || v.get("containerId").is_some() {
-                return Some(cella_port::protocol::WorktreeOperationResult::Success {
+                return Some(cella_protocol::WorktreeOperationResult::Success {
                     container_name,
                     worktree_path,
                 });
@@ -948,7 +948,7 @@ async fn handle_list_request<W: AsyncWriteExt + Unpin>(
 /// List worktrees by running `git worktree list --porcelain`.
 fn list_worktrees(
     workspace_path: Option<&str>,
-) -> Result<Vec<cella_port::protocol::WorktreeEntry>, String> {
+) -> Result<Vec<cella_protocol::WorktreeEntry>, String> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["worktree", "list", "--porcelain"]);
     if let Some(ws) = workspace_path {
@@ -968,7 +968,7 @@ fn list_worktrees(
 }
 
 /// Parse `git worktree list --porcelain` output.
-fn parse_worktree_porcelain(output: &str) -> Vec<cella_port::protocol::WorktreeEntry> {
+fn parse_worktree_porcelain(output: &str) -> Vec<cella_protocol::WorktreeEntry> {
     let mut entries = Vec::new();
     let mut path: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -978,7 +978,7 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_port::protocol::WorktreeE
     for line in output.lines() {
         if line.is_empty() {
             if let Some(p) = path.take() {
-                entries.push(cella_port::protocol::WorktreeEntry {
+                entries.push(cella_protocol::WorktreeEntry {
                     branch: branch.take(),
                     worktree_path: p,
                     is_main: is_first && !is_bare,
@@ -1001,7 +1001,7 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_port::protocol::WorktreeE
     }
     // Handle last entry without trailing blank line
     if let Some(p) = path {
-        entries.push(cella_port::protocol::WorktreeEntry {
+        entries.push(cella_protocol::WorktreeEntry {
             branch: branch.take(),
             worktree_path: p,
             is_main: is_first && !is_bare,
@@ -1072,7 +1072,7 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
     command: &[String],
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    use cella_port::protocol::OutputStream;
+    use cella_protocol::OutputStream;
 
     // Find the container for this branch via docker ps with label filter.
     let container_name = find_container_for_branch(branch).await;
@@ -1261,7 +1261,7 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
-                    stream: cella_port::protocol::OutputStream::Stderr,
+                    stream: cella_protocol::OutputStream::Stderr,
                     data: format!("{error_msg}\n"),
                 },
             )
@@ -1270,7 +1270,7 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::DownResult {
                     request_id: request_id.to_string(),
-                    result: cella_port::protocol::DownOperationResult::Error { message: error_msg },
+                    result: cella_protocol::DownOperationResult::Error { message: error_msg },
                 },
             )
             .await?;
@@ -1288,7 +1288,7 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
-                    stream: cella_port::protocol::OutputStream::Stderr,
+                    stream: cella_protocol::OutputStream::Stderr,
                     data: stderr.clone(),
                 },
             )
@@ -1299,7 +1299,7 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
         } else {
             stderr.trim().to_string()
         };
-        cella_port::protocol::DownOperationResult::Error { message: error_msg }
+        cella_protocol::DownOperationResult::Error { message: error_msg }
     };
 
     send_message(
@@ -1315,8 +1315,8 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
 }
 
 /// Parse JSON output from `cella down --output json`.
-fn parse_down_json_output(stdout: &str) -> cella_port::protocol::DownOperationResult {
-    use cella_port::protocol::{DownOperationResult, DownOutcome};
+fn parse_down_json_output(stdout: &str) -> cella_protocol::DownOperationResult {
+    use cella_protocol::{DownOperationResult, DownOutcome};
 
     let trimmed = stdout.trim();
     match serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1354,7 +1354,7 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
     cella_bin: &std::path::Path,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    use cella_port::protocol::WorktreeOperationResult;
+    use cella_protocol::WorktreeOperationResult;
 
     info!("Handling UpRequest: branch={branch} rebuild={rebuild}");
 
@@ -1427,8 +1427,8 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
 }
 
 /// Parse JSON output from `cella up --output json`.
-fn parse_up_json_output(stdout: &str) -> cella_port::protocol::WorktreeOperationResult {
-    use cella_port::protocol::WorktreeOperationResult;
+fn parse_up_json_output(stdout: &str) -> cella_protocol::WorktreeOperationResult {
+    use cella_protocol::WorktreeOperationResult;
 
     let trimmed = stdout.trim();
     match serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1501,7 +1501,7 @@ async fn ensure_branch_container<W: AsyncWriteExt + Unpin>(
             writer,
             &DaemonMessage::OperationOutput {
                 request_id: request_id.to_string(),
-                stream: cella_port::protocol::OutputStream::Stderr,
+                stream: cella_protocol::OutputStream::Stderr,
                 data: stderr.to_string(),
             },
         )
@@ -1529,7 +1529,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
-                    stream: cella_port::protocol::OutputStream::Stderr,
+                    stream: cella_protocol::OutputStream::Stderr,
                     data: format!("{error_msg}\n"),
                 },
             )
@@ -1538,7 +1538,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::TaskRunResult {
                     request_id: request_id.to_string(),
-                    result: cella_port::protocol::TaskRunOperationResult::Error {
+                    result: cella_protocol::TaskRunOperationResult::Error {
                         message: error_msg,
                     },
                 },
@@ -1558,7 +1558,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                     writer,
                     &DaemonMessage::OperationOutput {
                         request_id: request_id.to_string(),
-                        stream: cella_port::protocol::OutputStream::Stderr,
+                        stream: cella_protocol::OutputStream::Stderr,
                         data: format!("{e}\n"),
                     },
                 )
@@ -1567,7 +1567,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                     writer,
                     &DaemonMessage::TaskRunResult {
                         request_id: request_id.to_string(),
-                        result: cella_port::protocol::TaskRunOperationResult::Error { message: e },
+                        result: cella_protocol::TaskRunOperationResult::Error { message: e },
                     },
                 )
                 .await?;
@@ -1580,7 +1580,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
         writer,
         &DaemonMessage::TaskRunResult {
             request_id: request_id.to_string(),
-            result: cella_port::protocol::TaskRunOperationResult::Success {
+            result: cella_protocol::TaskRunOperationResult::Success {
                 task_id,
                 container_name,
             },
@@ -1601,18 +1601,18 @@ async fn handle_task_list<W: AsyncWriteExt + Unpin>(
         let infos = task_mgr.lock().await.list_tasks().await;
         infos
             .into_iter()
-            .map(|t| cella_port::protocol::TaskEntry {
+            .map(|t| cella_protocol::TaskEntry {
                 task_id: t.task_id,
                 branch: t.branch,
                 container_name: t.container_name,
                 status: if t.is_done {
                     if t.exit_code == Some(0) {
-                        cella_port::protocol::TaskStatus::Done
+                        cella_protocol::TaskStatus::Done
                     } else {
-                        cella_port::protocol::TaskStatus::Failed
+                        cella_protocol::TaskStatus::Failed
                     }
                 } else {
-                    cella_port::protocol::TaskStatus::Running
+                    cella_protocol::TaskStatus::Running
                 },
                 command: t.command,
                 elapsed_secs: t.elapsed_secs,
@@ -1765,7 +1765,7 @@ async fn handle_task_stop<W: AsyncWriteExt + Unpin>(
             writer,
             &DaemonMessage::OperationOutput {
                 request_id: request_id.to_string(),
-                stream: cella_port::protocol::OutputStream::Stderr,
+                stream: cella_protocol::OutputStream::Stderr,
                 data: format!("No running task found for branch '{branch}'\n"),
             },
         )
@@ -1801,7 +1801,7 @@ async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
             writer,
             &DaemonMessage::OperationOutput {
                 request_id: request_id.to_string(),
-                stream: cella_port::protocol::OutputStream::Stderr,
+                stream: cella_protocol::OutputStream::Stderr,
                 data: format!("No running container found for branch '{branch}'\n"),
             },
         )
@@ -1827,7 +1827,7 @@ async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
-                    stream: cella_port::protocol::OutputStream::Stderr,
+                    stream: cella_protocol::OutputStream::Stderr,
                     data: format!("Failed to start stream bridge: {e}\n"),
                 },
             )
@@ -2055,7 +2055,7 @@ pub use crate::shared::current_time_secs;
 
 #[cfg(test)]
 mod tests {
-    use cella_port::protocol::PortProtocol;
+    use cella_protocol::PortProtocol;
 
     use super::*;
 
@@ -2343,7 +2343,7 @@ branch refs/heads/feat-b
         let json = r#"{"containerId":"my-container","workspaceFolder":"/ws"}"#;
         let result = parse_branch_json_output(json);
         assert!(result.is_some());
-        if let Some(cella_port::protocol::WorktreeOperationResult::Success {
+        if let Some(cella_protocol::WorktreeOperationResult::Success {
             container_name,
             worktree_path,
         }) = result
@@ -2470,17 +2470,17 @@ branch refs/heads/feat-b
         let json = r#"{"outcome":"stopped","containerId":"my-container"}"#;
         let result = parse_down_json_output(json);
         match result {
-            cella_port::protocol::DownOperationResult::Success {
+            cella_protocol::DownOperationResult::Success {
                 outcome,
                 container_name,
             } => {
                 assert!(matches!(
                     outcome,
-                    cella_port::protocol::DownOutcome::Stopped
+                    cella_protocol::DownOutcome::Stopped
                 ));
                 assert_eq!(container_name, "my-container");
             }
-            cella_port::protocol::DownOperationResult::Error { .. } => {
+            cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")
             }
         }
@@ -2491,13 +2491,13 @@ branch refs/heads/feat-b
         let json = r#"{"outcome":"removed","containerId":"c1"}"#;
         let result = parse_down_json_output(json);
         match result {
-            cella_port::protocol::DownOperationResult::Success { outcome, .. } => {
+            cella_protocol::DownOperationResult::Success { outcome, .. } => {
                 assert!(matches!(
                     outcome,
-                    cella_port::protocol::DownOutcome::Removed
+                    cella_protocol::DownOutcome::Removed
                 ));
             }
-            cella_port::protocol::DownOperationResult::Error { .. } => {
+            cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")
             }
         }
@@ -2508,13 +2508,13 @@ branch refs/heads/feat-b
         let json = r#"{"containerId":"c1"}"#;
         let result = parse_down_json_output(json);
         match result {
-            cella_port::protocol::DownOperationResult::Success { outcome, .. } => {
+            cella_protocol::DownOperationResult::Success { outcome, .. } => {
                 assert!(matches!(
                     outcome,
-                    cella_port::protocol::DownOutcome::Stopped
+                    cella_protocol::DownOutcome::Stopped
                 ));
             }
-            cella_port::protocol::DownOperationResult::Error { .. } => {
+            cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")
             }
         }
@@ -2525,7 +2525,7 @@ branch refs/heads/feat-b
         let result = parse_down_json_output("invalid json");
         assert!(matches!(
             result,
-            cella_port::protocol::DownOperationResult::Error { .. }
+            cella_protocol::DownOperationResult::Error { .. }
         ));
     }
 
@@ -2534,7 +2534,7 @@ branch refs/heads/feat-b
         let result = parse_down_json_output("");
         assert!(matches!(
             result,
-            cella_port::protocol::DownOperationResult::Error { .. }
+            cella_protocol::DownOperationResult::Error { .. }
         ));
     }
 
@@ -2543,10 +2543,10 @@ branch refs/heads/feat-b
         let json = r#"{"outcome":"stopped"}"#;
         let result = parse_down_json_output(json);
         match result {
-            cella_port::protocol::DownOperationResult::Success { container_name, .. } => {
+            cella_protocol::DownOperationResult::Success { container_name, .. } => {
                 assert_eq!(container_name, "");
             }
-            cella_port::protocol::DownOperationResult::Error { .. } => {
+            cella_protocol::DownOperationResult::Error { .. } => {
                 panic!("Expected Success")
             }
         }
@@ -2561,14 +2561,14 @@ branch refs/heads/feat-b
         let json = r#"{"containerId":"c1","workspaceFolder":"/workspace"}"#;
         let result = parse_up_json_output(json);
         match result {
-            cella_port::protocol::WorktreeOperationResult::Success {
+            cella_protocol::WorktreeOperationResult::Success {
                 container_name,
                 worktree_path,
             } => {
                 assert_eq!(container_name, "c1");
                 assert_eq!(worktree_path, "/workspace");
             }
-            cella_port::protocol::WorktreeOperationResult::Error { .. } => {
+            cella_protocol::WorktreeOperationResult::Error { .. } => {
                 panic!("Expected Success")
             }
         }
@@ -2579,14 +2579,14 @@ branch refs/heads/feat-b
         let json = r"{}";
         let result = parse_up_json_output(json);
         match result {
-            cella_port::protocol::WorktreeOperationResult::Success {
+            cella_protocol::WorktreeOperationResult::Success {
                 container_name,
                 worktree_path,
             } => {
                 assert_eq!(container_name, "");
                 assert_eq!(worktree_path, "");
             }
-            cella_port::protocol::WorktreeOperationResult::Error { .. } => {
+            cella_protocol::WorktreeOperationResult::Error { .. } => {
                 panic!("Expected Success with empty fields")
             }
         }
@@ -2597,7 +2597,7 @@ branch refs/heads/feat-b
         let result = parse_up_json_output("garbage");
         assert!(matches!(
             result,
-            cella_port::protocol::WorktreeOperationResult::Error { .. }
+            cella_protocol::WorktreeOperationResult::Error { .. }
         ));
     }
 
@@ -2606,7 +2606,7 @@ branch refs/heads/feat-b
         let result = parse_up_json_output("");
         assert!(matches!(
             result,
-            cella_port::protocol::WorktreeOperationResult::Error { .. }
+            cella_protocol::WorktreeOperationResult::Error { .. }
         ));
     }
 
@@ -2844,7 +2844,7 @@ branch refs/heads/feat-b
             port: 3000,
             protocol: PortProtocol::Tcp,
             process: None,
-            bind: cella_port::protocol::BindAddress::All,
+            bind: cella_protocol::BindAddress::All,
             proxy_port: None,
         };
         let result = handle_agent_message(msg, &ctx, &state).await;

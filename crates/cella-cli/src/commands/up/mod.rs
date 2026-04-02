@@ -272,7 +272,7 @@ impl UpContext {
             .get("shutdownAction")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let req = cella_port::protocol::ManagementRequest::RegisterContainer {
+        let req = cella_protocol::ManagementRequest::RegisterContainer {
             container_id: container_id.to_string(),
             container_name: self.container_nm.clone(),
             container_ip,
@@ -527,7 +527,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let req = cella_port::protocol::ManagementRequest::RegisterContainer {
+            let req = cella_protocol::ManagementRequest::RegisterContainer {
                 container_id,
                 container_name,
                 container_ip,
@@ -554,7 +554,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
             }
 
             let req =
-                cella_port::protocol::ManagementRequest::DeregisterContainer { container_name };
+                cella_protocol::ManagementRequest::DeregisterContainer { container_name };
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
     }
@@ -742,11 +742,11 @@ pub async fn query_daemon_env(container_nm: &str, host_gateway: &str) -> Vec<Str
     {
         let status_resp = cella_daemon::management::send_management_request(
             &mgmt_sock,
-            &cella_port::protocol::ManagementRequest::QueryStatus,
+            &cella_protocol::ManagementRequest::QueryStatus,
         )
         .await;
 
-        if let Ok(cella_port::protocol::ManagementResponse::Status {
+        if let Ok(cella_protocol::ManagementResponse::Status {
             control_port,
             control_token,
             ..
@@ -840,13 +840,13 @@ async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
         return;
     }
 
-    let Ok(cella_port::protocol::ManagementResponse::Status {
+    let Ok(cella_protocol::ManagementResponse::Status {
         control_port,
         control_token,
         ..
     }) = cella_daemon::management::send_management_request(
         &mgmt_sock,
-        &cella_port::protocol::ManagementRequest::QueryStatus,
+        &cella_protocol::ManagementRequest::QueryStatus,
     )
     .await
     else {

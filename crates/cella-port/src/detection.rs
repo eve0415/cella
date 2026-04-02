@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::protocol::{BindAddress, PortProtocol};
+use cella_protocol::{BindAddress, PortProtocol};
 
 /// A detected listening socket from /proc/net/tcp or /proc/net/tcp6.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

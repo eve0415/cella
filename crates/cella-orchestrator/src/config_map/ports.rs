@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cella_backend::PortForward;
-use cella_port::protocol::{OnAutoForward, PortAttributes, PortPattern};
+use cella_protocol::{OnAutoForward, PortAttributes, PortPattern};
 
 pub(super) fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, Vec<PortForward>> {
     let Some(ports) = config.get("forwardPorts").and_then(|v| v.as_array()) else {

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cella_port::detection::{DetectedListener, scan_listeners};
-use cella_port::protocol::{AgentMessage, BindAddress, DaemonMessage, PortProtocol};
+use cella_protocol::{AgentMessage, BindAddress, DaemonMessage, PortProtocol};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -330,7 +330,7 @@ pub async fn run_standalone(poll_interval: Duration) {
 mod tests {
     use super::*;
 
-    use cella_port::protocol::BindAddress;
+    use cella_protocol::BindAddress;
     use std::collections::HashSet;
 
     fn make_listener(port: u16, protocol: PortProtocol) -> DetectedListener {
