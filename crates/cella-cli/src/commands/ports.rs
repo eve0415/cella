@@ -78,7 +78,7 @@ async fn print_backend_ports(
     all: bool,
     backend: Option<&crate::backend::BackendChoice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = super::resolve_backend_for_command(backend, None).await?;
     let containers = client.list_cella_containers(true).await?;
 
     // Check if any container is compose-managed and try compose ps

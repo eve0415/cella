@@ -62,7 +62,7 @@ impl ExecArgs {
         self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
 
         let target = ContainerTarget {
             container_id: self.container_id,

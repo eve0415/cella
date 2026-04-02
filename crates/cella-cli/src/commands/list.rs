@@ -27,7 +27,7 @@ impl ListArgs {
         self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
 
         let containers = client.list_cella_containers(self.running).await?;
 

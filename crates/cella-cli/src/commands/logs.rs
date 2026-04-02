@@ -54,7 +54,7 @@ impl LogsArgs {
         &self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
 
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 

@@ -97,7 +97,7 @@ impl DownArgs {
         self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {
             Some(resolve_branch_to_path(branch_name)?)

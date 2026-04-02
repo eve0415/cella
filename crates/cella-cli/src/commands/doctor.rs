@@ -24,7 +24,7 @@ impl DoctorArgs {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_folder = std::env::current_dir().ok();
         let (backend_client, backend_error) =
-            match crate::commands::resolve_backend_for_command(backend, None) {
+            match crate::commands::resolve_backend_for_command(backend, None).await {
                 Ok(client) => (Some(client), None),
                 Err(e) => (None, Some(e.to_string())),
             };

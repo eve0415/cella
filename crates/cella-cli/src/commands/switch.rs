@@ -25,7 +25,7 @@ impl SwitchArgs {
         self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
 
         // Discover repo and list worktrees
         let cwd = std::env::current_dir()?;

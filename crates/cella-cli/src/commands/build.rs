@@ -64,7 +64,7 @@ impl BuildArgs {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
         client.ping().await?;
 
         // Docker Compose path: delegate to orchestrator

@@ -132,7 +132,7 @@ impl UpContext {
         // If Docker's socket exists but the daemon is stopped, auto-detect
         // won't fall through to Apple Container. Users can work around this
         // with `--backend apple-container`.
-        let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref()).await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -198,7 +198,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::resolve_backend_for_command(backend, docker_host)?;
+        let client = super::resolve_backend_for_command(backend, docker_host).await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);

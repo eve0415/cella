@@ -53,7 +53,7 @@ impl PruneArgs {
         let repo_root = &repo_info.root;
 
         // 2. Build candidates via orchestrator
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref()).await?;
         if !self.is_json() {
             eprintln!("Fetching remote refs...");
         }

@@ -177,11 +177,12 @@ impl Command {
 /// # Errors
 ///
 /// Returns error if no backend is available.
-pub fn resolve_backend_for_command(
+pub async fn resolve_backend_for_command(
     backend: Option<&crate::backend::BackendChoice>,
     docker_host: Option<&str>,
 ) -> Result<Box<dyn cella_backend::ContainerBackend>, Box<dyn std::error::Error>> {
     crate::backend::resolve_backend(backend, docker_host)
+        .await
         .map_err(|e| e as Box<dyn std::error::Error>)
 }
 
@@ -390,8 +391,9 @@ async fn re_register_containers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cella_protocol::ManagementRequest;
 
-    let client =
-        crate::backend::resolve_backend(None, None).map_err(|e| e as Box<dyn std::error::Error>)?;
+    let client = crate::backend::resolve_backend(None, None)
+        .await
+        .map_err(|e| e as Box<dyn std::error::Error>)?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {

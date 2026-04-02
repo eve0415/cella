@@ -75,7 +75,7 @@ async fn sync_gh(
     workspace_folder: Option<PathBuf>,
     backend: Option<&crate::backend::BackendChoice>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = super::resolve_backend_for_command(backend, None).await?;
 
     let cwd = super::resolve_workspace_folder(workspace_folder.as_deref())?;
 
@@ -222,7 +222,7 @@ async fn run_status(
     );
 
     // Container section
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = super::resolve_backend_for_command(backend, None).await?;
     let target = ContainerTarget {
         container_id: args.container,
         container_name: None,
