@@ -8,6 +8,8 @@ use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
+use cella_orchestrator::env_cache::probe_and_cache_user_env;
+use cella_orchestrator::shell_detect::detect_shell;
 
 /// Build and container-management flags for an `up` invocation.
 #[derive(Args)]
@@ -349,12 +351,7 @@ impl UpContext {
         }
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
-        let shell = cella_orchestrator::shell_detect::detect_shell(
-            self.client.as_ref(),
-            container_id,
-            remote_user,
-        )
-        .await;
+        let shell = detect_shell(self.client.as_ref(), container_id, remote_user).await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
@@ -362,7 +359,7 @@ impl UpContext {
             .progress
             .run_step(
                 "Running userEnvProbe...",
-                cella_orchestrator::env_cache::probe_and_cache_user_env(
+                probe_and_cache_user_env(
                     self.client.as_ref(),
                     container_id,
                     remote_user,
@@ -411,7 +408,7 @@ impl UpContext {
             self.progress
                 .run_step(
                     "Updating environment cache...",
-                    cella_orchestrator::env_cache::probe_and_cache_user_env(
+                    probe_and_cache_user_env(
                         self.client.as_ref(),
                         container_id,
                         remote_user,

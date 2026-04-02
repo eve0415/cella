@@ -4,6 +4,8 @@ use clap::Args;
 use tracing::warn;
 
 use cella_backend::{ContainerTarget, ExecOptions, InteractiveExecOptions};
+use cella_orchestrator::env_cache::{ensure_ssh_auth_sock, read_probed_env_cache};
+use cella_orchestrator::shell_detect::{detect_shell, wrap_in_login_shell};
 
 use crate::picker;
 
@@ -119,12 +121,8 @@ impl ExecArgs {
         let working_dir = self.workdir.or(label_workdir);
 
         // Build environment: probed env (merged with label env) + --remote-env + terminal env
-        let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
-            client.as_ref(),
-            &container.id,
-            &user,
-        )
-        .await
+        let base_env = if let Some(probed) =
+            read_probed_env_cache(client.as_ref(), &container.id, &user).await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
         } else {
@@ -134,13 +132,7 @@ impl ExecArgs {
         env.extend(self.remote_env);
 
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
-        cella_orchestrator::env_cache::ensure_ssh_auth_sock(
-            client.as_ref(),
-            &container.id,
-            &user,
-            &mut env,
-        )
-        .await;
+        ensure_ssh_auth_sock(client.as_ref(), &container.id, &user, &mut env).await;
 
         // Forward terminal environment variables
         for var in super::TERMINAL_ENV_VARS {
@@ -151,10 +143,8 @@ impl ExecArgs {
 
         // Wrap command in a login shell so that shell profiles are sourced
         // and the full PATH (including ~/.local/bin etc.) is available.
-        let shell =
-            cella_orchestrator::shell_detect::detect_shell(client.as_ref(), &container.id, &user)
-                .await;
-        let cmd = cella_orchestrator::shell_detect::wrap_in_login_shell(&shell, &self.command);
+        let shell = detect_shell(client.as_ref(), &container.id, &user).await;
+        let cmd = wrap_in_login_shell(&shell, &self.command);
 
         if self.detach {
             let exec_id = client
