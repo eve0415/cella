@@ -21,7 +21,6 @@ cella-features.workspace = true
 cella-templates.workspace = true
 cella-network.workspace = true
 cella-git.workspace = true
-cella-port.workspace = true
 cella-protocol.workspace = true
 chrono.workspace = true
 clap.workspace = true

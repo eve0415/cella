@@ -347,7 +347,6 @@ dependencies = [
  "cella-git",
  "cella-network",
  "cella-orchestrator",
- "cella-port",
  "cella-protocol",
  "cella-templates",
  "chrono",
@@ -453,7 +452,6 @@ dependencies = [
  "glob",
  "hex",
  "reqwest 0.13.2",
- "serde_json",
  "sha2 0.11.0",
  "tar",
  "thiserror 2.0.18",
@@ -470,8 +468,6 @@ dependencies = [
  "cella-daemon",
  "cella-docker",
  "cella-env",
- "cella-orchestrator",
- "cella-port",
  "cella-protocol",
  "serde",
  "serde_json",
@@ -528,7 +524,6 @@ name = "cella-network"
 version = "0.0.14"
 dependencies = [
  "base64 0.22.1",
- "insta",
  "rcgen",
  "rustls-native-certs",
  "serde",
@@ -549,12 +544,10 @@ dependencies = [
  "cella-features",
  "cella-git",
  "cella-network",
- "cella-port",
  "cella-protocol",
  "hex",
  "serde_json",
  "sha2 0.11.0",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -576,7 +569,6 @@ version = "0.0.14"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3162,9 +3154,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.1+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "994b95d9e7bae62b34bab0e2a4510b801fa466066a6a8b2b57361fa1eba068ee"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -3186,9 +3178,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.1+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39ca317ebc49f06bd748bfba29533eac9485569dc9bf80b849024b025e814fb9"
+checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]

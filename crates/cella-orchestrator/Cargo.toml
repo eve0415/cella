@@ -10,7 +10,6 @@ cella-compose.workspace = true
 cella-config.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
-cella-port.workspace = true
 cella-protocol.workspace = true
 cella-git.workspace = true
 cella-network.workspace = true
@@ -20,9 +19,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
