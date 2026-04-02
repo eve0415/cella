@@ -1099,7 +1099,9 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
 
     info!("Handling ExecRequest: branch={branch} container={container_name}");
 
-    // Build docker exec command.
+    // TODO: use the backend abstraction instead of shelling out to Docker
+    // directly.  Currently only Docker containers have a managed agent, so
+    // this path is only reachable for Docker backends.
     let mut cmd = tokio::process::Command::new("docker");
     cmd.arg("exec").arg(&container_name);
     for arg in command {
@@ -1368,6 +1370,9 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
     )
     .await?;
 
+    // TODO: forward --backend / --docker-host when backend selection is
+    // stored per-container.  Currently only Docker containers have a managed
+    // agent, so these daemon-spawned subprocesses always target Docker.
     let mut cmd = tokio::process::Command::new(cella_bin);
     cmd.arg("up")
         .arg("--branch")
