@@ -706,7 +706,7 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             handle_task_stop(&request_id, &branch, wt.task_mgr, writer).await?;
         }
         AgentMessage::SwitchRequest { request_id, branch } => {
-            handle_switch_request(&request_id, &branch, writer).await?;
+            handle_switch_request(&request_id, &branch, &wt, writer).await?;
         }
         _ => {}
     }
@@ -1092,8 +1092,8 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), CellaDaemonError> {
     use cella_protocol::OutputStream;
 
-    // Find the container for this branch via docker ps with label filter.
-    let container_name = find_container_for_branch(branch).await;
+    // Find the container for this branch via the appropriate backend CLI.
+    let container_name = find_container_for_branch(branch, wt).await;
     let Some(container_name) = container_name else {
         send_message(
             writer,
@@ -1119,18 +1119,8 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
 
     let mut cmd = tokio::process::Command::new(wt.cella_bin);
     cmd.arg("exec");
-    // Forward --backend / --docker-host from the registered container handle.
-    {
-        let handles = wt.container_handles.lock().await;
-        if let Some(handle) = handles.get(&container_name) {
-            if let Some(ref kind) = handle.backend_kind {
-                cmd.arg("--backend").arg(kind);
-            }
-            if let Some(ref dh) = handle.docker_host {
-                cmd.arg("--docker-host").arg(dh);
-            }
-        }
-    }
+    // Forward --backend / --docker-host from the calling container's handle.
+    forward_backend_flags(&mut cmd, wt).await;
     cmd.arg("--container-name").arg(&container_name);
     cmd.arg("--");
     for arg in command {
@@ -1401,17 +1391,7 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
     let mut cmd = tokio::process::Command::new(wt.cella_bin);
     cmd.arg("up");
     // Forward --backend / --docker-host from the calling container's handle.
-    {
-        let handles = wt.container_handles.lock().await;
-        if let Some(handle) = handles.get(wt.container_name) {
-            if let Some(ref kind) = handle.backend_kind {
-                cmd.arg("--backend").arg(kind);
-            }
-            if let Some(ref dh) = handle.docker_host {
-                cmd.arg("--docker-host").arg(dh);
-            }
-        }
-    }
+    forward_backend_flags(&mut cmd, wt).await;
     cmd.arg("--branch").arg(branch).arg("--output").arg("json");
     if rebuild {
         cmd.arg("--rebuild");
@@ -1508,7 +1488,7 @@ async fn ensure_branch_container<W: AsyncWriteExt + Unpin>(
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<Option<String>, CellaDaemonError> {
-    if let Some(name) = find_container_for_branch(branch).await {
+    if let Some(name) = find_container_for_branch(branch, wt).await {
         return Ok(Some(name));
     }
 
@@ -1523,7 +1503,10 @@ async fn ensure_branch_container<W: AsyncWriteExt + Unpin>(
     .await?;
 
     let mut cmd = tokio::process::Command::new(wt.cella_bin);
-    cmd.arg("branch").arg(branch).arg("--output").arg("json");
+    cmd.arg("branch");
+    // Forward --backend / --docker-host from the calling container's handle.
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg(branch).arg("--output").arg("json");
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
     }
@@ -1548,7 +1531,7 @@ async fn ensure_branch_container<W: AsyncWriteExt + Unpin>(
         return Ok(None);
     }
 
-    Ok(find_container_for_branch(branch).await)
+    Ok(find_container_for_branch(branch, wt).await)
 }
 
 async fn handle_task_run<W: AsyncWriteExt + Unpin>(
@@ -1830,9 +1813,10 @@ async fn handle_task_stop<W: AsyncWriteExt + Unpin>(
 async fn handle_switch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    let container_name = find_container_for_branch(branch).await;
+    let container_name = find_container_for_branch(branch, wt).await;
     let Some(container_name) = container_name else {
         send_message(
             writer,
@@ -1992,9 +1976,14 @@ fn snapshot_binary(source: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(dest)
 }
 
-/// Find a running container for a given branch name via Docker labels.
-async fn find_container_for_branch(branch: &str) -> Option<String> {
-    let output = tokio::process::Command::new("docker")
+/// Find a running container for a given branch name via the appropriate backend CLI.
+///
+/// Uses the calling container's backend metadata to determine which CLI binary
+/// to invoke (`docker` or `container`), avoiding hardcoded Docker assumptions.
+async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) -> Option<String> {
+    let cmd_name = resolve_backend_cli(wt).await;
+
+    let output = tokio::process::Command::new(&cmd_name)
         .args([
             "ps",
             "--filter",
@@ -2016,6 +2005,34 @@ async fn find_container_for_branch(branch: &str) -> Option<String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.lines().next().map(ToString::to_string)
+}
+
+/// Append `--backend` and `--docker-host` flags from the calling container's handle.
+async fn forward_backend_flags(cmd: &mut tokio::process::Command, wt: &WorktreeHandlerCtx<'_>) {
+    let handles = wt.container_handles.lock().await;
+    if let Some(handle) = handles.get(wt.container_name) {
+        if let Some(ref kind) = handle.backend_kind {
+            cmd.arg("--backend").arg(kind);
+        }
+        if let Some(ref dh) = handle.docker_host {
+            cmd.arg("--docker-host").arg(dh);
+        }
+    }
+}
+
+/// Resolve the backend CLI binary name from the calling container's handle.
+async fn resolve_backend_cli(wt: &WorktreeHandlerCtx<'_>) -> String {
+    let handles = wt.container_handles.lock().await;
+    handles
+        .get(wt.container_name)
+        .and_then(|h| h.backend_kind.as_deref())
+        .map_or_else(
+            || "docker".to_string(),
+            |kind| match kind {
+                "apple-container" => "container".to_string(),
+                other => other.to_string(),
+            },
+        )
 }
 
 /// Extract the port number from a URL like `http://localhost:3000/path`.

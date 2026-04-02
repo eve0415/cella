@@ -161,7 +161,7 @@ impl UpContext {
             } else {
                 NetworkRulePolicy::Enforce
             },
-            docker_host: args.backend.docker_host.clone(),
+            docker_host: effective_docker_host(&args.backend),
         })
     }
 
@@ -223,7 +223,7 @@ impl UpContext {
             skip_checksum: false,
             extra_labels,
             network_rules: NetworkRulePolicy::Enforce,
-            docker_host: backend_args.docker_host.clone(),
+            docker_host: effective_docker_host(backend_args),
         })
     }
 
@@ -726,6 +726,17 @@ impl UpArgs {
 
 pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
     cella_orchestrator::container_setup::map_env_object(value)
+}
+
+/// Return the effective Docker host for daemon registration.
+///
+/// Prefers the explicit CLI `--docker-host` flag; falls back to the
+/// `DOCKER_HOST` environment variable so daemon-spawned follow-up
+/// operations target the same engine.
+fn effective_docker_host(args: &crate::backend::BackendArgs) -> Option<String> {
+    args.docker_host
+        .clone()
+        .or_else(|| std::env::var("DOCKER_HOST").ok())
 }
 
 pub fn output_result(

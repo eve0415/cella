@@ -16,13 +16,16 @@ pub struct PortsArgs {
 impl PortsArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info — only when
-        // the selected backend uses daemon-managed port forwarding.
-        let use_daemon = self
+        // the selected backend uses daemon-managed port forwarding and no
+        // custom Docker host is specified (daemon tracks local containers only).
+        let is_docker_backend = self
             .backend
             .backend
             .as_ref()
             .is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
-        if use_daemon
+        let has_custom_host = self.backend.docker_host.is_some();
+        if is_docker_backend
+            && !has_custom_host
             && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
         {
