@@ -152,7 +152,11 @@ impl EnsureUpContext<'_> {
             container_id,
             user: Some(user),
             env,
-            working_dir: self.config.workspace_folder_from_config,
+            working_dir: Some(
+                self.config
+                    .workspace_folder_from_config
+                    .unwrap_or(self.config.default_workspace_folder),
+            ),
             is_text: true,
             on_output: Some(Box::new(move |line| progress.println(line))),
         }

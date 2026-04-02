@@ -60,7 +60,7 @@ pub struct CategoryReport {
 }
 
 impl CategoryReport {
-    fn new(name: impl Into<String>, checks: Vec<CheckResult>) -> Self {
+    pub fn new(name: impl Into<String>, checks: Vec<CheckResult>) -> Self {
         let status = checks
             .iter()
             .map(|c| c.severity)
