@@ -194,10 +194,24 @@ impl ContainerBackend for AppleContainerBackend {
 
     fn find_container_by_label<'a>(
         &'a self,
-        _label: &'a str,
+        label: &'a str,
     ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
-        // Apple Container does not support label-based lookups yet.
-        Box::pin(async { Ok(None) })
+        Box::pin(async move {
+            let (key, value) = label.split_once('=').unwrap_or((label, ""));
+
+            let entries = self.cli.list(None).await?;
+            for entry in entries {
+                if let Some(info) = entry_to_container_info(&entry)
+                    && info
+                        .labels
+                        .get(key)
+                        .is_some_and(|v| value.is_empty() || v == value)
+                {
+                    return Ok(Some(info));
+                }
+            }
+            Ok(None)
+        })
     }
 
     fn container_logs<'a>(

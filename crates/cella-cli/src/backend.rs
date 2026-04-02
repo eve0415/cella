@@ -45,7 +45,10 @@ pub fn resolve_backend(
 fn auto_detect(
     docker_host: Option<&str>,
 ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    // Docker is highest priority
+    // Docker is highest priority.
+    // connect_docker_backend checks socket existence during discovery,
+    // so a successful connect means a socket was found (though the daemon
+    // may not be responding — that's caught later by ping() in commands).
     match connect_docker_backend(docker_host) {
         Ok(client) => return Ok(client),
         Err(e) => {
