@@ -48,12 +48,7 @@ impl CodeArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 1. Reject non-Docker backends — VS Code attach only works with Docker
-        if backend.is_some_and(|b| !matches!(b, crate::backend::BackendChoice::Docker)) {
-            return Err(
-                "cella code requires the Docker backend (VS Code attach is Docker-specific)".into(),
-            );
-        }
+        // 1. Check for remote Docker (unsupported)
         check_local_docker()?;
 
         // 2. Resolve editor binary (fail fast before container work)
@@ -67,6 +62,13 @@ impl CodeArgs {
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
         let ctx = UpContext::new(&up, progress, backend).await?;
+
+        // Reject non-Docker backends — VS Code attach URI is Docker-specific
+        if ctx.client.kind() != cella_backend::BackendKind::Docker {
+            return Err(
+                "cella code requires the Docker backend (VS Code attach is Docker-specific)".into(),
+            );
+        }
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
 
         // 4. Resolve compose service if needed
