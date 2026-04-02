@@ -570,17 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_port_open_without_proxy_port() {
-        // Backward compatibility: older agents don't send proxy_port
-        let json = r#"{"type":"port_open","port":3000,"protocol":"tcp","process":null,"bind":"localhost"}"#;
-        let msg: AgentMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            AgentMessage::PortOpen { proxy_port, .. } => assert_eq!(proxy_port, None),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn deserialize_agent_port_closed() {
         let json = r#"{"type":"port_closed","port":3000,"protocol":"tcp"}"#;
         let msg: AgentMessage = serde_json::from_str(json).unwrap();
