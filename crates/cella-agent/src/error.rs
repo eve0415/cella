@@ -1,14 +1,17 @@
+use miette::Diagnostic;
 use thiserror::Error;
 
 /// Errors that can occur during agent sandbox operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Diagnostic)]
 pub enum CellaAgentError {
     /// Failed to create the agent sandbox.
     #[error("failed to create agent sandbox: {0}")]
+    #[diagnostic(code(cella::agent::sandbox_creation))]
     SandboxCreation(String),
 
     /// The agent sandbox is not running.
     #[error("agent sandbox is not running")]
+    #[diagnostic(code(cella::agent::not_running))]
     NotRunning,
 }
 

@@ -38,9 +38,11 @@ pub enum PickResult<T> {
 }
 
 /// Error returned when the picker cannot be shown or has no candidates.
-#[derive(Debug)]
+#[derive(Debug, miette::Diagnostic)]
 pub enum PickerError {
+    #[diagnostic(code(cella::cli::no_candidates))]
     NoCandidates,
+    #[diagnostic(code(cella::cli::non_interactive))]
     NonInteractive {
         message: String,
         candidates: Vec<String>,

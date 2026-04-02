@@ -1,46 +1,60 @@
+use miette::Diagnostic;
 use thiserror::Error;
 
 /// Errors that can occur during container runtime operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Diagnostic)]
 pub enum CellaDockerError {
     /// The container runtime is not available.
     #[error("container runtime not found: {message}")]
+    #[diagnostic(
+        code(cella::docker::runtime_not_found),
+        help("Is Docker Desktop running? Try `cella doctor`.")
+    )]
     RuntimeNotFound { message: String },
 
     /// Docker API error.
     #[error("Docker API error: {0}")]
+    #[diagnostic(code(cella::docker::docker_api))]
     DockerApi(#[from] bollard::errors::Error),
 
     /// Image not found.
     #[error("image not found: {image}")]
+    #[diagnostic(code(cella::docker::image_not_found))]
     ImageNotFound { image: String },
 
     /// Docker CLI not found.
     #[error("docker CLI not found: {message}")]
+    #[diagnostic(code(cella::docker::docker_cli_not_found))]
     DockerCliNotFound { message: String },
 
     /// Image build failed.
     #[error("build failed: {message}")]
+    #[diagnostic(code(cella::docker::build_failed))]
     BuildFailed { message: String },
 
     /// No container for the given workspace.
     #[error("container not found for workspace: {workspace}")]
+    #[diagnostic(code(cella::docker::container_not_found))]
     ContainerNotFound { workspace: String },
 
     /// Container exists but is not running.
     #[error("{hint}")]
+    #[diagnostic(code(cella::docker::container_not_running))]
     ContainerNotRunning { hint: String },
 
     /// A command executed inside the container failed.
     #[error("exec failed (exit code {exit_code}): {command}")]
+    #[diagnostic(code(cella::docker::exec_failed))]
     ExecFailed { command: String, exit_code: i64 },
 
     /// A lifecycle command phase failed.
     #[error("lifecycle command failed: {phase} — {message}")]
+    #[diagnostic(code(cella::docker::lifecycle_failed))]
     LifecycleFailed { phase: String, message: String },
 
     /// A host-side command failed.
     #[error("host command failed: {command}")]
+    #[diagnostic(code(cella::docker::host_command_failed))]
     HostCommandFailed {
         command: String,
         #[source]
@@ -49,18 +63,22 @@ pub enum CellaDockerError {
 
     /// The container exited immediately after start.
     #[error("container exited immediately (exit code {exit_code}):\n{logs_tail}")]
+    #[diagnostic(code(cella::docker::container_exited_immediately))]
     ContainerExitedImmediately { exit_code: i64, logs_tail: String },
 
     /// Agent volume population error.
     #[error("agent volume error: {message}")]
+    #[diagnostic(code(cella::docker::agent_volume))]
     AgentVolume { message: String },
 
     /// Agent binary checksum verification failed.
     #[error("agent binary checksum mismatch: expected {expected}, got {actual}")]
+    #[diagnostic(code(cella::docker::agent_checksum_mismatch))]
     AgentChecksumMismatch { expected: String, actual: String },
 
     /// Generic I/O error.
     #[error("I/O error: {0}")]
+    #[diagnostic(code(cella::docker::io))]
     Io(#[from] std::io::Error),
 }
 

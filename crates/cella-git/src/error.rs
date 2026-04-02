@@ -1,36 +1,44 @@
 use std::path::PathBuf;
 
+use miette::Diagnostic;
 use thiserror::Error;
 
 /// Errors that can occur during git operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Diagnostic)]
 pub enum CellaGitError {
     /// Git is not installed or not found in PATH.
     #[error("git not found in PATH")]
+    #[diagnostic(code(cella::git::git_not_found))]
     GitNotFound,
 
     /// The current directory is not a git repository.
     #[error("not a git repository: {path}")]
+    #[diagnostic(code(cella::git::not_a_repository))]
     NotARepository { path: PathBuf },
 
     /// A git command failed.
     #[error("git command failed: `git {args}`\n{stderr}")]
+    #[diagnostic(code(cella::git::command_failed))]
     CommandFailed { args: String, stderr: String },
 
     /// Git lock was held and retries were exhausted.
     #[error("git lock held, retries exhausted: {path}")]
+    #[diagnostic(code(cella::git::lock_contention))]
     LockContention { path: PathBuf },
 
     /// A worktree already exists at the given path.
     #[error("worktree already exists: {}", path.display())]
+    #[diagnostic(code(cella::git::worktree_already_exists))]
     WorktreeAlreadyExists { path: PathBuf },
 
     /// No worktree was found at the given path.
     #[error("worktree not found: {}", path.display())]
+    #[diagnostic(code(cella::git::worktree_not_found))]
     WorktreeNotFound { path: PathBuf },
 
     /// The branch is already checked out in another worktree.
     #[error("branch '{branch}' is already checked out at {}", worktree_path.display())]
+    #[diagnostic(code(cella::git::branch_checked_out))]
     BranchCheckedOut {
         branch: String,
         worktree_path: PathBuf,
@@ -38,14 +46,17 @@ pub enum CellaGitError {
 
     /// The specified branch was not found.
     #[error("branch not found: {branch}")]
+    #[diagnostic(code(cella::git::branch_not_found))]
     BranchNotFound { branch: String },
 
     /// Git output could not be parsed.
     #[error("failed to parse git output: {context}")]
+    #[diagnostic(code(cella::git::parse_error))]
     ParseError { context: String },
 
     /// An I/O error occurred.
     #[error(transparent)]
+    #[diagnostic(code(cella::git::io))]
     Io(#[from] std::io::Error),
 }
 

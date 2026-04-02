@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use miette::Diagnostic;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair};
 use thiserror::Error;
 
@@ -15,18 +16,22 @@ const CA_DIR: &str = ".cella/proxy";
 const CA_CERT_FILE: &str = "ca.pem";
 const CA_KEY_FILE: &str = "ca.key";
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Diagnostic)]
 pub enum CaError {
     #[error("failed to generate CA key pair: {0}")]
+    #[diagnostic(code(cella::network::key_generation))]
     KeyGeneration(#[source] rcgen::Error),
 
     #[error("failed to generate CA certificate: {0}")]
+    #[diagnostic(code(cella::network::cert_generation))]
     CertGeneration(#[source] rcgen::Error),
 
     #[error("failed to write CA files: {0}")]
+    #[diagnostic(code(cella::network::io))]
     Io(#[from] std::io::Error),
 
     #[error("failed to read CA certificate: {0}")]
+    #[diagnostic(code(cella::network::read_cert))]
     ReadCert(String),
 }
 
