@@ -37,7 +37,8 @@ impl DoctorArgs {
         let mut report = checks::run_all_checks(&ctx).await;
 
         // Surface backend connection failure when explicitly requested
-        if let Some(err) = backend_error.filter(|_| self.backend.backend.is_some()) {
+        let explicit_backend = self.backend.backend.is_some() || self.backend.docker_host.is_some();
+        if let Some(err) = backend_error.filter(|_| explicit_backend) {
             report.categories.insert(
                 0,
                 CategoryReport::new(
