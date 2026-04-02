@@ -9,8 +9,8 @@ use tracing::debug;
 
 /// Compute a content hash for the workspace.
 ///
-/// For git repos: SHA-256 of `HEAD` commit hash + porcelain status.
-/// For non-git workspaces: SHA-256 of sorted top-level file mtimes.
+/// For git repos: hash of `HEAD` commit hash + porcelain status.
+/// For non-git workspaces: hash of sorted top-level file mtimes.
 ///
 /// Returns a hex-encoded 16-character hash string.
 pub fn compute(workspace_root: &Path) -> String {
@@ -44,7 +44,7 @@ fn git_content_hash(workspace_root: &Path) -> Option<String> {
         .unwrap_or_default();
 
     let input = format!("{head_hash}\n{status}");
-    Some(sha256_short(&input))
+    Some(fast_hash_short(&input))
 }
 
 /// Mtime-based content hash: sorted top-level file modification times.
@@ -76,15 +76,17 @@ fn mtime_content_hash(workspace_root: &Path) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    sha256_short(&input)
+    fast_hash_short(&input)
 }
 
-/// SHA-256 of input, returning first 16 hex characters.
-fn sha256_short(input: &str) -> String {
+/// Fast non-cryptographic hash of input, returning first 16 hex characters.
+///
+/// Uses `DefaultHasher` (`SipHash`) — collision avoidance is sufficient here;
+/// this is NOT a SHA-256 hash despite the original name.
+fn fast_hash_short(input: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    // Use a fast non-cryptographic hash — collision avoidance is sufficient here
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     let h1 = hasher.finish();

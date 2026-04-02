@@ -13,8 +13,9 @@ use cella_backend::{
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
 use crate::error::OrchestratorError;
 use crate::lifecycle::{
-    WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase, run_lifecycle_entries,
-    run_lifecycle_phases_with_wait_for, write_content_hash,
+    LifecycleState, WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase,
+    read_lifecycle_state, run_lifecycle_entries, run_lifecycle_phases_with_wait_for,
+    write_content_hash, write_lifecycle_state,
 };
 use crate::progress::ProgressSender;
 use crate::result::{UpOutcome, UpResult};
@@ -302,6 +303,30 @@ impl EnsureUpContext<'_> {
         (final_probed, lifecycle_env)
     }
 
+    /// For prebuilt images: check lifecycle state and run `onCreateCommand` if
+    /// it hasn't been completed yet. Updates the persisted state on success.
+    async fn run_prebuilt_oncreate_if_needed(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        metadata: &str,
+        lifecycle_env: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let lc_state = read_lifecycle_state(self.client, container_id, remote_user).await;
+        if lc_state.oncreate_done {
+            return Ok(());
+        }
+        let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
+        let entries =
+            lifecycle_entries_for_phase(Some(metadata), self.config_json(), "onCreateCommand");
+        run_lifecycle_entries(&lc_ctx, "onCreateCommand", &entries, &self.progress).await?;
+        let new_state = LifecycleState {
+            oncreate_done: true,
+        };
+        write_lifecycle_state(self.client, container_id, remote_user, &new_state).await;
+        Ok(())
+    }
+
     async fn handle_running(
         &self,
         container: &ContainerInfo,
@@ -374,6 +399,12 @@ impl EnsureUpContext<'_> {
             self.prepare_container_env(&container.id, remote_user).await;
 
         let metadata = container.labels.get("devcontainer.metadata");
+
+        if let Some(meta) = metadata {
+            self.run_prebuilt_oncreate_if_needed(&container.id, remote_user, meta, &lifecycle_env)
+                .await?;
+        }
+
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         check_and_run_content_update(
             &lc_ctx_content,
@@ -399,6 +430,43 @@ impl EnsureUpContext<'_> {
             workspace_folder: self.workspace_folder_str().to_string(),
             outcome: UpOutcome::Running,
         })
+    }
+
+    /// Run the restart lifecycle after a stopped container has been started:
+    /// check prebuilt oncreate, content update, then run postStart + postAttach phases.
+    async fn run_restart_lifecycle(
+        &self,
+        container: &ContainerInfo,
+        remote_user: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_probed_env, lifecycle_env) =
+            self.prepare_container_env(&container.id, remote_user).await;
+        let metadata = container.labels.get("devcontainer.metadata");
+
+        if let Some(meta) = metadata {
+            self.run_prebuilt_oncreate_if_needed(&container.id, remote_user, meta, &lifecycle_env)
+                .await?;
+        }
+
+        let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+        check_and_run_content_update(
+            &lc_ctx,
+            self.config_json(),
+            metadata.map(String::as_str),
+            &self.config.resolved.workspace_root,
+            &self.progress,
+        )
+        .await?;
+
+        for phase in ["postStartCommand", "postAttachCommand"] {
+            let entries = lifecycle_entries_for_phase(
+                metadata.map(String::as_str),
+                self.config_json(),
+                phase,
+            );
+            run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
+        }
+        Ok(())
     }
 
     async fn handle_stopped(
@@ -475,19 +543,7 @@ impl EnsureUpContext<'_> {
                     restart_agent_in_container(self.client, &container.id).await;
                 }
 
-                let (_probed_env, lifecycle_env) =
-                    self.prepare_container_env(&container.id, remote_user).await;
-
-                let metadata = container.labels.get("devcontainer.metadata");
-                let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-                for phase in ["postStartCommand", "postAttachCommand"] {
-                    let entries = lifecycle_entries_for_phase(
-                        metadata.map(String::as_str),
-                        self.config_json(),
-                        phase,
-                    );
-                    run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
-                }
+                self.run_restart_lifecycle(container, remote_user).await?;
 
                 if capabilities.managed_agent {
                     let prune_version = env!("CARGO_PKG_VERSION");
@@ -577,10 +633,17 @@ impl EnsureUpContext<'_> {
                 "devcontainer.metadata".to_string(),
                 rf.metadata_label.clone(),
             );
-        } else if base_metadata.is_some() {
+        } else if let Some(existing) = base_metadata {
+            // The base image already carries a devcontainer.metadata label
+            // (either from a prebuilt image or from the Dockerfile build that
+            // embedded it via --label). Re-use it directly instead of
+            // regenerating, which would duplicate entries.
+            labels.insert("devcontainer.metadata".to_string(), existing.to_string());
+        } else {
+            // No features and no base image metadata -- generate from config.
             labels.insert(
                 "devcontainer.metadata".to_string(),
-                cella_features::generate_metadata_label(&[], config, base_metadata),
+                cella_features::generate_metadata_label(&[], config, None),
             );
         }
 
@@ -1014,6 +1077,51 @@ impl EnsureUpContext<'_> {
         }
     }
 
+    /// Run lifecycle phases and write tracking state after container creation.
+    async fn run_create_lifecycle(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        lifecycle_env: &[String],
+        resolved_features: Option<&cella_features::ResolvedFeatures>,
+        image_metadata: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.config_json();
+        let wait_for = WaitForPhase::from_config(config);
+        let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
+        run_lifecycle_phases_with_wait_for(
+            &lc_ctx,
+            config,
+            resolved_features,
+            image_metadata,
+            &self.progress,
+            wait_for,
+        )
+        .await?;
+
+        write_content_hash(
+            self.client,
+            container_id,
+            remote_user,
+            &self.config.resolved.workspace_root,
+        )
+        .await;
+
+        // Mark onCreateCommand as done only when it actually ran in the
+        // foreground. The phases array is [onCreate, updateContent, postCreate,
+        // postStart, postAttach]. When waitFor is Initialize (ordinal 0), ALL
+        // phases are backgrounded and the background script writes the state
+        // file on completion. For any other waitFor value, onCreateCommand
+        // (index 0) ran synchronously before we got here.
+        let oncreate_foreground = !matches!(wait_for, WaitForPhase::Initialize);
+        let state = LifecycleState {
+            oncreate_done: oncreate_foreground,
+        };
+        write_lifecycle_state(self.client, container_id, remote_user, &state).await;
+
+        Ok(())
+    }
+
     async fn create_and_start(
         &self,
         build_no_cache: bool,
@@ -1036,6 +1144,16 @@ impl EnsureUpContext<'_> {
                 progress: &self.progress,
             })
             .await?;
+
+        // Capture image metadata before base_image_details is consumed.
+        // When resolved_features is None (no local feature build), this
+        // metadata from a prebuilt image supplies lifecycle commands.
+        let image_metadata = if resolved_features.is_none() {
+            base_image_details.metadata.clone()
+        } else {
+            None
+        };
+
         let agent_arch = self.detect_arch().await;
         let ImageConfig {
             image_env,
@@ -1092,33 +1210,23 @@ impl EnsureUpContext<'_> {
             )
             .await;
 
-        let lifecycle_err = {
-            let lc_ctx = self.build_lifecycle_ctx(&container_id, &remote_user, &lifecycle_env);
-            run_lifecycle_phases_with_wait_for(
-                &lc_ctx,
-                config,
+        let lifecycle_err = self
+            .run_create_lifecycle(
+                &container_id,
+                &remote_user,
+                &lifecycle_env,
                 resolved_features.as_ref(),
-                &self.progress,
-                WaitForPhase::from_config(config),
+                image_metadata.as_deref(),
             )
             .await
             .err()
-            .map(|e| e.to_string())
-        };
+            .map(|e| e.to_string());
         if let Some(msg) = lifecycle_err {
-            tracing::warn!("Lifecycle failed, cleaning up container {container_id}");
+            warn!("Lifecycle failed, cleaning up container {container_id}");
             let _ = self.client.stop_container(&container_id).await;
             let _ = self.client.remove_container(&container_id, false).await;
             return Err(msg.into());
         }
-
-        write_content_hash(
-            self.client,
-            &container_id,
-            &remote_user,
-            &self.config.resolved.workspace_root,
-        )
-        .await;
 
         Ok(CreateResult {
             container_id,

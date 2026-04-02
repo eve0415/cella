@@ -128,16 +128,7 @@ pub async fn ensure_image(
         .and_then(|v| v.as_object())
         .is_some_and(|obj| !obj.is_empty());
 
-    let base_image_tag = resolve_base_image(
-        input.client,
-        input.config,
-        input.workspace_root,
-        input.config_name,
-        input.no_cache,
-        input.pull_policy,
-        input.progress,
-    )
-    .await?;
+    let base_image_tag = resolve_base_image(input, has_features).await?;
 
     let base_image_details = input.client.inspect_image_details(&base_image_tag).await?;
 
@@ -162,19 +153,20 @@ pub async fn ensure_image(
 }
 
 /// Pull or build the base image and return its tag.
+///
+/// When `will_build_features` is false and the config has a Dockerfile build,
+/// the devcontainer lifecycle metadata is embedded as a Docker label so that
+/// prebuilt images carry their lifecycle commands. This is skipped when
+/// features will be layered on top, because the features build produces its
+/// own metadata label and including it here would cause duplication.
 async fn resolve_base_image(
-    client: &dyn ContainerBackend,
-    config: &serde_json::Value,
-    workspace_root: &Path,
-    config_name: Option<&str>,
-    no_cache: bool,
-    pull_policy: Option<&str>,
-    progress: &ProgressSender,
+    input: &EnsureImageInput<'_>,
+    will_build_features: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let force_pull = pull_policy == Some("always");
-    let never_pull = pull_policy == Some("never");
-    if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
-        let exists = client.image_exists(image).await?;
+    let force_pull = input.pull_policy == Some("always");
+    let never_pull = input.pull_policy == Some("never");
+    if let Some(image) = input.config.get("image").and_then(|v| v.as_str()) {
+        let exists = input.client.image_exists(image).await?;
         if never_pull {
             if !exists {
                 return Err(format!(
@@ -182,26 +174,45 @@ async fn resolve_base_image(
                 )
                 .into());
             }
-        } else if no_cache || force_pull || !exists {
-            let step = progress.step("Pulling base image...");
-            client.pull_image(image).await?;
+        } else if input.no_cache || force_pull || !exists {
+            let step = input.progress.step("Pulling base image...");
+            input.client.pull_image(image).await?;
             step.finish();
         }
         Ok(image.to_string())
-    } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
-        let img_name = image_name(workspace_root, config_name);
-        let build_opts =
-            parse_build_options(build, &img_name, workspace_root, no_cache, pull_policy);
+    } else if let Some(build) = input.config.get("build").and_then(|v| v.as_object()) {
+        let img_name = image_name(input.workspace_root, input.config_name);
+        let mut build_opts = parse_build_options(
+            build,
+            &img_name,
+            input.workspace_root,
+            input.no_cache,
+            input.pull_policy,
+        );
+
+        if !will_build_features {
+            let metadata_label = cella_features::generate_metadata_label(&[], input.config, None);
+            build_opts
+                .options
+                .push(format!("--label=devcontainer.metadata={metadata_label}"));
+        }
+
         let start = std::time::Instant::now();
-        progress.println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
-        let result = client.build_image(&build_opts).await;
+        input
+            .progress
+            .println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
+        let result = input.client.build_image(&build_opts).await;
         let elapsed_str = format_elapsed(start.elapsed());
         match &result {
             Ok(_) => {
-                progress.println(&format!("  \x1b[32m✓\x1b[0m Built Dockerfile{elapsed_str}"));
+                input
+                    .progress
+                    .println(&format!("  \x1b[32m✓\x1b[0m Built Dockerfile{elapsed_str}"));
             }
             Err(e) => {
-                progress.println(&format!("  \x1b[31m✗\x1b[0m Building Dockerfile: {e}"));
+                input
+                    .progress
+                    .println(&format!("  \x1b[31m✗\x1b[0m Building Dockerfile: {e}"));
             }
         }
         result?;

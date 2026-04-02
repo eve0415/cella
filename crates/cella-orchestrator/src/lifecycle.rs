@@ -3,6 +3,7 @@
 //! Moved from `cella-cli/src/commands/up/lifecycle.rs`. Uses
 //! [`ProgressSender`] instead of the indicatif-coupled `Progress` type.
 
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use cella_backend::{
@@ -10,6 +11,114 @@ use cella_backend::{
 };
 
 use crate::progress::{ProgressSender, format_elapsed};
+
+/// Shell-quote an argv array into a single command string safe for `sh -c`.
+///
+/// Arguments containing only safe characters (alphanumeric plus a small set of
+/// punctuation) are passed through unquoted. Everything else is single-quoted
+/// with embedded single-quotes escaped via the `'\''` idiom.
+fn shell_quote_argv(argv: &[&str]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.chars()
+                .all(|c| c.is_alphanumeric() || "-_/.:=@".contains(c))
+            {
+                (*a).to_string()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle state tracking (persisted inside the container)
+// ---------------------------------------------------------------------------
+
+/// Tracks which lifecycle phases have already run inside a container.
+///
+/// Stored at `/tmp/.cella/lifecycle_state.json` so that restarts of prebuilt
+/// containers can skip phases that already completed.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LifecycleState {
+    /// Whether `onCreateCommand` has already been executed.
+    #[serde(default)]
+    pub oncreate_done: bool,
+}
+
+/// Read the persisted lifecycle state from a running container.
+///
+/// Returns [`LifecycleState::default()`] when the file does not exist or
+/// cannot be parsed (e.g. first run on a fresh container).
+pub async fn read_lifecycle_state(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+) -> LifecycleState {
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "cat".to_string(),
+                    "/tmp/.cella/lifecycle_state.json".to_string(),
+                ],
+                user: Some(user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    result
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .and_then(|r| serde_json::from_str(r.stdout.trim()).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the lifecycle state inside a running container.
+pub async fn write_lifecycle_state(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    state: &LifecycleState,
+) {
+    let json = serde_json::to_string(state).unwrap_or_default();
+    let _ = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "mkdir -p /tmp/.cella && printf '%s' '{json}' > /tmp/.cella/lifecycle_state.json"
+                    ),
+                ],
+                user: Some(user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+}
+
+/// Compute a deterministic hash of lifecycle command entries for a given phase.
+///
+/// Used to detect whether the commands associated with `updateContentCommand`
+/// have changed between container restarts.
+pub fn hash_lifecycle_entries(entries: &[cella_features::LifecycleEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update(entry.origin.as_bytes());
+        hasher.update(b":");
+        hasher.update(entry.command.to_string().as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
 
 /// Resolve lifecycle entries for a phase from feature-resolved config.
 pub fn resolve_phase_entries<'a>(
@@ -105,6 +214,44 @@ pub async fn run_lifecycle_entries(
     Ok(())
 }
 
+/// Resolve lifecycle entries using three-tier priority:
+///
+/// 1. `resolved_features` entries (from local feature build) -- if non-empty
+/// 2. Image metadata entries (from prebuilt image) -- fallback
+/// 3. `config.get(phase)` entries (from `devcontainer.json`) -- final fallback
+fn resolve_entries_with_metadata(
+    resolved_features: Option<&cella_features::ResolvedFeatures>,
+    image_metadata: Option<&str>,
+    config: &serde_json::Value,
+    phase: &str,
+) -> Vec<cella_features::LifecycleEntry> {
+    // Tier 1: feature-resolved entries
+    let feature_entries = resolve_phase_entries(resolved_features, phase);
+    if !feature_entries.is_empty() {
+        return feature_entries.to_vec();
+    }
+
+    // Tier 2: image metadata entries (prebuilt image)
+    if let Some(meta) = image_metadata {
+        let meta_entries = cella_features::lifecycle_from_metadata_label(meta, phase);
+        if !meta_entries.is_empty() {
+            return meta_entries;
+        }
+    }
+
+    // Tier 3: direct devcontainer.json config
+    config
+        .get(phase)
+        .filter(|v| !v.is_null())
+        .map(|cmd| {
+            vec![cella_features::LifecycleEntry {
+                origin: "devcontainer.json".into(),
+                command: cmd.clone(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
 /// Run all lifecycle phases for a first-create scenario.
 ///
 /// # Errors
@@ -114,6 +261,7 @@ pub async fn run_all_lifecycle_phases(
     lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
+    image_metadata: Option<&str>,
     progress: &ProgressSender,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let phases = [
@@ -125,16 +273,9 @@ pub async fn run_all_lifecycle_phases(
     ];
 
     for phase in phases {
-        let entries = resolve_phase_entries(resolved_features, phase);
-
-        run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
-
-        if entries.is_empty()
-            && let Some(cmd) = config.get(phase)
-            && !cmd.is_null()
-        {
-            run_config_phase_with_output(lc_ctx, phase, cmd, progress).await?;
-        }
+        let entries =
+            resolve_entries_with_metadata(resolved_features, image_metadata, config, phase);
+        run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
     }
 
     Ok(())
@@ -190,7 +331,7 @@ impl WaitForPhase {
     }
 
     /// Index into the in-container lifecycle phases array.
-    const fn ordinal(self) -> usize {
+    pub(crate) const fn ordinal(self) -> usize {
         match self {
             Self::Initialize => 0,
             Self::OnCreate => 1,
@@ -213,6 +354,7 @@ pub async fn run_lifecycle_phases_with_wait_for(
     lc_ctx: &LifecycleContext<'_>,
     config: &serde_json::Value,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
+    image_metadata: Option<&str>,
     progress: &ProgressSender,
     wait_for: WaitForPhase,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -234,33 +376,39 @@ pub async fn run_lifecycle_phases_with_wait_for(
 
     for (i, &phase) in phases.iter().enumerate() {
         let is_foreground = i < wait_index;
-        let entries = resolve_phase_entries(resolved_features, phase);
+        let entries =
+            resolve_entries_with_metadata(resolved_features, image_metadata, config, phase);
 
         if is_foreground {
-            run_lifecycle_entries(lc_ctx, phase, entries, progress).await?;
-
-            if entries.is_empty()
-                && let Some(cmd) = config.get(phase)
-                && !cmd.is_null()
-            {
-                run_config_phase_with_output(lc_ctx, phase, cmd, progress).await?;
-            }
+            run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
         } else {
-            for entry in entries {
+            for entry in &entries {
                 if let Some(s) = entry.command.as_str() {
                     background_cmds.push(s.to_string());
                 } else if let Some(arr) = entry.command.as_array() {
                     let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                     if !cmd.is_empty() {
-                        background_cmds.push(cmd.join(" "));
+                        background_cmds.push(shell_quote_argv(&cmd));
+                    }
+                } else if let Some(obj) = entry.command.as_object() {
+                    // Object commands run their values concurrently (& + wait),
+                    // matching the foreground parallel execution semantics.
+                    let mut parallel = Vec::new();
+                    for val in obj.values() {
+                        if let Some(s) = val.as_str() {
+                            parallel.push(s.to_string());
+                        } else if let Some(arr) = val.as_array() {
+                            let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                            if !cmd.is_empty() {
+                                parallel.push(shell_quote_argv(&cmd));
+                            }
+                        }
+                    }
+                    if !parallel.is_empty() {
+                        let bg: Vec<String> = parallel.iter().map(|c| format!("( {c} )")).collect();
+                        background_cmds.push(format!("{} & wait", bg.join(" & ")));
                     }
                 }
-            }
-            if entries.is_empty()
-                && let Some(cmd) = config.get(phase)
-                && let Some(s) = cmd.as_str()
-            {
-                background_cmds.push(s.to_string());
             }
         }
     }
@@ -269,8 +417,13 @@ pub async fn run_lifecycle_phases_with_wait_for(
         let script = background_cmds.join("\n");
         let full_script = format!(
             "mkdir -p /tmp/.cella\n\
-             {script}\n\
-             printf '{{\"status\":\"completed\"}}' > /tmp/.cella/lifecycle_status.json\n"
+             (\n  set -e\n  {script}\n)\n\
+             if [ $? -eq 0 ]; then\n\
+               printf '{{\"status\":\"completed\"}}' > /tmp/.cella/lifecycle_status.json\n\
+               printf '{{\"oncreate_done\":true}}' > /tmp/.cella/lifecycle_state.json\n\
+             else\n\
+               printf '{{\"status\":\"failed\"}}' > /tmp/.cella/lifecycle_status.json\n\
+             fi\n"
         );
 
         debug!(
@@ -647,5 +800,142 @@ mod tests {
             WaitForPhase::from_config(&json!({"waitFor": null})),
             WaitForPhase::UpdateContent
         );
+    }
+
+    // ── LifecycleState serde ────────────────────────────────────────────
+
+    #[test]
+    fn lifecycle_state_default_values() {
+        let state = LifecycleState::default();
+        assert!(!state.oncreate_done);
+    }
+
+    #[test]
+    fn lifecycle_state_roundtrip_serde() {
+        let state = LifecycleState {
+            oncreate_done: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: LifecycleState = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.oncreate_done);
+    }
+
+    #[test]
+    fn lifecycle_state_deserialize_empty_object() {
+        let state: LifecycleState = serde_json::from_str("{}").unwrap();
+        assert!(!state.oncreate_done);
+    }
+
+    #[test]
+    fn lifecycle_state_deserialize_partial() {
+        let state: LifecycleState = serde_json::from_str(r#"{"oncreate_done": true}"#).unwrap();
+        assert!(state.oncreate_done);
+    }
+
+    // ── hash_lifecycle_entries ───────────────────────────────────────────
+
+    #[test]
+    fn hash_lifecycle_entries_deterministic() {
+        let entries = vec![cella_features::LifecycleEntry {
+            origin: "feature-a".into(),
+            command: json!("npm install"),
+        }];
+        let h1 = hash_lifecycle_entries(&entries);
+        let h2 = hash_lifecycle_entries(&entries);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn hash_lifecycle_entries_different_for_different_entries() {
+        let entries_a = vec![cella_features::LifecycleEntry {
+            origin: "a".into(),
+            command: json!("echo a"),
+        }];
+        let entries_b = vec![cella_features::LifecycleEntry {
+            origin: "b".into(),
+            command: json!("echo b"),
+        }];
+        assert_ne!(
+            hash_lifecycle_entries(&entries_a),
+            hash_lifecycle_entries(&entries_b)
+        );
+    }
+
+    #[test]
+    fn hash_lifecycle_entries_empty() {
+        let h = hash_lifecycle_entries(&[]);
+        assert_eq!(h.len(), 64);
+    }
+
+    // ── resolve_entries_with_metadata ────────────────────────────────────
+
+    #[test]
+    fn resolve_entries_tier1_features_take_priority() {
+        let mut lifecycle = cella_features::FeatureLifecycle::default();
+        lifecycle.on_create.push(cella_features::LifecycleEntry {
+            origin: "feature-x".into(),
+            command: json!("from features"),
+        });
+        let rf = make_resolved_features(lifecycle);
+        let metadata = r#"[{"id":"img","onCreateCommand":"from metadata"}]"#;
+        let config = json!({"onCreateCommand": "from config"});
+
+        let entries =
+            resolve_entries_with_metadata(Some(&rf), Some(metadata), &config, "onCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "feature-x");
+    }
+
+    #[test]
+    fn resolve_entries_tier2_metadata_when_no_features() {
+        let metadata = r#"[{"id":"prebuilt","onCreateCommand":"from metadata"}]"#;
+        let config = json!({"onCreateCommand": "from config"});
+
+        let entries =
+            resolve_entries_with_metadata(None, Some(metadata), &config, "onCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "prebuilt");
+        assert_eq!(entries[0].command, json!("from metadata"));
+    }
+
+    #[test]
+    fn resolve_entries_tier3_config_when_no_features_or_metadata() {
+        let config = json!({"onCreateCommand": "from config"});
+
+        let entries = resolve_entries_with_metadata(None, None, &config, "onCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "devcontainer.json");
+        assert_eq!(entries[0].command, json!("from config"));
+    }
+
+    #[test]
+    fn resolve_entries_tier3_config_when_metadata_lacks_phase() {
+        let metadata = r#"[{"id":"prebuilt","postStartCommand":"echo hi"}]"#;
+        let config = json!({"onCreateCommand": "from config"});
+
+        let entries =
+            resolve_entries_with_metadata(None, Some(metadata), &config, "onCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "devcontainer.json");
+    }
+
+    #[test]
+    fn resolve_entries_empty_when_nothing_defined() {
+        let config = json!({});
+        let entries = resolve_entries_with_metadata(None, None, &config, "onCreateCommand");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolve_entries_empty_features_falls_through_to_metadata() {
+        let rf = make_resolved_features(cella_features::FeatureLifecycle::default());
+        let metadata = r#"[{"id":"prebuilt","postCreateCommand":"setup"}]"#;
+        let config = json!({});
+
+        let entries =
+            resolve_entries_with_metadata(Some(&rf), Some(metadata), &config, "postCreateCommand");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "prebuilt");
     }
 }
