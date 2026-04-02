@@ -94,57 +94,69 @@ pub async fn build_features_layer(
     Ok(features_image)
 }
 
+/// Inputs for [`ensure_image`].
+pub struct EnsureImageInput<'a> {
+    pub client: &'a dyn ContainerBackend,
+    pub config: &'a serde_json::Value,
+    pub workspace_root: &'a Path,
+    pub config_name: Option<&'a str>,
+    pub config_path: &'a Path,
+    pub no_cache: bool,
+    pub pull_policy: Option<&'a str>,
+    pub progress: &'a ProgressSender,
+}
+
 /// Ensure the dev container image exists (pull or build), including features layer.
 ///
 /// When `no_cache` is true, `--no-cache` and `--pull` are passed to the base
 /// image build (but only `--no-cache` for the features layer, since its FROM
 /// image is local-only) and image-based configs force re-pull.
 ///
+/// When `pull_policy` is `Some("always")`, the base image is always re-pulled
+/// (for image-based configs) or `--pull` is added to the build command (for
+/// Dockerfile-based configs), even when a cached image exists locally.
+///
 /// # Errors
 ///
 /// Returns an error if the image pull/build or feature resolution fails.
 pub async fn ensure_image(
-    client: &dyn ContainerBackend,
-    config: &serde_json::Value,
-    workspace_root: &Path,
-    config_name: Option<&str>,
-    config_path: &Path,
-    no_cache: bool,
-    progress: &ProgressSender,
+    input: &EnsureImageInput<'_>,
 ) -> Result<(String, Option<ResolvedFeatures>, ImageDetails), Box<dyn std::error::Error>> {
-    let has_features = config
+    let has_features = input
+        .config
         .get("features")
         .and_then(|v| v.as_object())
         .is_some_and(|obj| !obj.is_empty());
 
     let base_image_tag = resolve_base_image(
-        client,
-        config,
-        workspace_root,
-        config_name,
-        no_cache,
-        progress,
+        input.client,
+        input.config,
+        input.workspace_root,
+        input.config_name,
+        input.no_cache,
+        input.pull_policy,
+        input.progress,
     )
     .await?;
 
-    let base_image_details = client.inspect_image_details(&base_image_tag).await?;
+    let base_image_details = input.client.inspect_image_details(&base_image_tag).await?;
 
     if !has_features {
         return Ok((base_image_tag, None, base_image_details));
     }
 
-    let input = FeaturesBuildInput {
-        client,
-        config,
-        config_path,
-        workspace_root,
-        config_name,
+    let features_input = FeaturesBuildInput {
+        client: input.client,
+        config: input.config,
+        config_path: input.config_path,
+        workspace_root: input.workspace_root,
+        config_name: input.config_name,
         base_image_tag: &base_image_tag,
         base_image_details: &base_image_details,
-        no_cache,
-        progress,
+        no_cache: input.no_cache,
+        progress: input.progress,
     };
-    let (features_image, resolved) = resolve_and_build_features(&input).await?;
+    let (features_image, resolved) = resolve_and_build_features(&features_input).await?;
 
     Ok((features_image, Some(resolved), base_image_details))
 }
@@ -156,10 +168,21 @@ async fn resolve_base_image(
     workspace_root: &Path,
     config_name: Option<&str>,
     no_cache: bool,
+    pull_policy: Option<&str>,
     progress: &ProgressSender,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let force_pull = pull_policy == Some("always");
+    let never_pull = pull_policy == Some("never");
     if let Some(image) = config.get("image").and_then(|v| v.as_str()) {
-        if no_cache || !client.image_exists(image).await? {
+        let exists = client.image_exists(image).await?;
+        if never_pull {
+            if !exists {
+                return Err(format!(
+                    "image {image} not found locally and --pull never was specified"
+                )
+                .into());
+            }
+        } else if no_cache || force_pull || !exists {
             let step = progress.step("Pulling base image...");
             client.pull_image(image).await?;
             step.finish();
@@ -167,7 +190,8 @@ async fn resolve_base_image(
         Ok(image.to_string())
     } else if let Some(build) = config.get("build").and_then(|v| v.as_object()) {
         let img_name = image_name(workspace_root, config_name);
-        let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
+        let build_opts =
+            parse_build_options(build, &img_name, workspace_root, no_cache, pull_policy);
         let start = std::time::Instant::now();
         progress.println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
         let result = client.build_image(&build_opts).await;
@@ -272,6 +296,7 @@ pub fn parse_build_options(
     img_name: &str,
     workspace_root: &Path,
     no_cache: bool,
+    pull_policy: Option<&str>,
 ) -> BuildOptions {
     let dockerfile = build
         .get("dockerfile")
@@ -324,7 +349,13 @@ pub fn parse_build_options(
 
     if no_cache {
         options.extend(["--no-cache".to_string(), "--pull".to_string()]);
+    } else if pull_policy == Some("always") {
+        options.push("--pull".to_string());
     }
+    // Note: `--pull never` for Dockerfile builds needs no special handling.
+    // Docker's `build` command does not pull FROM images unless `--pull` is
+    // explicitly passed, so omitting `--pull` is effectively "never" for the
+    // base build.  (buildx also has no `--pull=false`; omission is correct.)
 
     BuildOptions {
         image_name: img_name.to_string(),
@@ -348,7 +379,7 @@ mod tests {
     fn parse_build_options_no_cache_adds_flags() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true);
+        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true, None);
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
     }
@@ -357,7 +388,7 @@ mod tests {
     fn parse_build_options_without_no_cache() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), false, None);
         assert!(!opts.options.contains(&"--no-cache".to_string()));
         assert!(!opts.options.contains(&"--pull".to_string()));
     }
@@ -368,7 +399,7 @@ mod tests {
             r#"{"dockerfile": "Dockerfile", "context": ".", "options": ["--squash"]}"#,
         )
         .unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true);
+        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true, None);
         assert!(opts.options.contains(&"--squash".to_string()));
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
@@ -378,7 +409,7 @@ mod tests {
     fn parse_build_options_defaults() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r"{}").unwrap();
-        let opts = parse_build_options(&build, "img:tag", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img:tag", Path::new("/ws"), false, None);
         assert_eq!(opts.image_name, "img:tag");
         assert_eq!(opts.dockerfile, "Dockerfile");
         assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/."));
@@ -392,7 +423,7 @@ mod tests {
     fn parse_build_options_custom_dockerfile() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile.dev"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.dockerfile, "Dockerfile.dev");
     }
 
@@ -400,7 +431,7 @@ mod tests {
     fn parse_build_options_absolute_context() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"context": "/absolute/path"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.context_path, Path::new("/absolute/path"));
     }
 
@@ -408,7 +439,7 @@ mod tests {
     fn parse_build_options_relative_context() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"context": "../"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/../"));
     }
 
@@ -416,7 +447,7 @@ mod tests {
     fn parse_build_options_with_args() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"args": {"NODE_VERSION": "18", "DEBUG": "true"}}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.args.get("NODE_VERSION").unwrap(), "18");
         assert_eq!(opts.args.get("DEBUG").unwrap(), "true");
     }
@@ -425,7 +456,7 @@ mod tests {
     fn parse_build_options_with_target() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"target": "development"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.target.as_deref(), Some("development"));
     }
 
@@ -433,7 +464,7 @@ mod tests {
     fn parse_build_options_with_cache_from() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"cacheFrom": ["img:cache", "img:latest"]}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.cache_from, vec!["img:cache", "img:latest"]);
     }
 
@@ -441,8 +472,36 @@ mod tests {
     fn parse_build_options_args_non_string_value_becomes_empty() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"args": {"NUM": 42}}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false);
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
         assert_eq!(opts.args.get("NUM").unwrap(), "");
+    }
+
+    #[test]
+    fn parse_build_options_pull_always_adds_pull_flag() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, Some("always"));
+        assert!(opts.options.contains(&"--pull".to_string()));
+        assert!(!opts.options.contains(&"--no-cache".to_string()));
+    }
+
+    #[test]
+    fn parse_build_options_pull_missing_does_not_add_pull_flag() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, Some("missing"));
+        assert!(!opts.options.contains(&"--pull".to_string()));
+    }
+
+    #[test]
+    fn parse_build_options_no_cache_takes_priority_over_pull_policy() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), true, Some("always"));
+        assert!(opts.options.contains(&"--no-cache".to_string()));
+        assert!(opts.options.contains(&"--pull".to_string()));
+        // --pull should only appear once (from no_cache path, not duplicated)
+        assert_eq!(opts.options.iter().filter(|o| *o == "--pull").count(), 1);
     }
 
     // ── compute_features_digest ──────────────────────────────────────────

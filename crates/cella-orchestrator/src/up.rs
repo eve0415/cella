@@ -1024,16 +1024,18 @@ impl EnsureUpContext<'_> {
             crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
         }
 
-        let (img_name, resolved_features, base_image_details) = crate::image::ensure_image(
-            self.client,
-            config,
-            &self.config.resolved.workspace_root,
-            config.get("name").and_then(|v| v.as_str()),
-            &self.config.resolved.config_path,
-            build_no_cache,
-            &self.progress,
-        )
-        .await?;
+        let (img_name, resolved_features, base_image_details) =
+            crate::image::ensure_image(&crate::image::EnsureImageInput {
+                client: self.client,
+                config,
+                workspace_root: &self.config.resolved.workspace_root,
+                config_name: config.get("name").and_then(|v| v.as_str()),
+                config_path: &self.config.resolved.config_path,
+                no_cache: build_no_cache,
+                pull_policy: self.config.pull_policy,
+                progress: &self.progress,
+            })
+            .await?;
         let agent_arch = self.detect_arch().await;
         let ImageConfig {
             image_env,

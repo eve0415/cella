@@ -29,6 +29,8 @@ pub struct UpConfig<'a> {
     pub host_requirement_policy: HostRequirementPolicy,
     /// Whether network rules are enforced.
     pub network_rule_policy: NetworkRulePolicy,
+    /// Image pull policy (e.g. "always", "missing", "never").
+    pub pull_policy: Option<&'a str>,
 }
 
 /// How the up pipeline should handle the container image.

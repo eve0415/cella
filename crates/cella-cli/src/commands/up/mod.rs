@@ -25,6 +25,10 @@ pub struct UpBuildArgs {
     /// Remove existing container before starting.
     #[arg(long)]
     pub(crate) remove_existing_container: bool,
+
+    /// Image pull policy (e.g. "always", "missing", "never").
+    #[arg(long)]
+    pub(crate) pull: Option<String>,
 }
 
 /// Start a dev container for the current workspace.
@@ -96,6 +100,8 @@ pub struct UpContext {
     pub(crate) remove_container: bool,
     pub(crate) build_no_cache: bool,
     pub(crate) skip_checksum: bool,
+    /// Image pull policy (e.g. "always").
+    pub(crate) pull_policy: Option<String>,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
     /// Network rule enforcement policy.
@@ -155,6 +161,7 @@ impl UpContext {
             remove_container,
             build_no_cache: args.build.build_no_cache,
             skip_checksum: args.skip_checksum,
+            pull_policy: args.build.pull.clone(),
             extra_labels: std::collections::HashMap::new(),
             network_rules: if args.no_network_rules {
                 NetworkRulePolicy::Skip
@@ -221,6 +228,7 @@ impl UpContext {
             remove_container: false,
             build_no_cache: false,
             skip_checksum: false,
+            pull_policy: None,
             extra_labels,
             network_rules: NetworkRulePolicy::Enforce,
             docker_host: effective_docker_host(backend_args),
@@ -620,6 +628,7 @@ impl UpContext {
                 cella_orchestrator::HostRequirementPolicy::Warn
             },
             network_rule_policy: self.network_rules,
+            pull_policy: self.pull_policy.as_deref(),
         };
 
         let result =
@@ -676,6 +685,7 @@ impl UpArgs {
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
         ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
+        ctx.pull_policy = self.build.pull.clone();
         ctx.network_rules = if self.no_network_rules {
             NetworkRulePolicy::Skip
         } else {
