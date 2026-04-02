@@ -37,7 +37,7 @@ The host requirements module validates `hostRequirements` from the devcontainer 
 
 ## Crate Dependencies
 
-**Depends on:** [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-port](../cella-port)
+**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port)
 
 **Depended on by:** [cella-cli](../cella-cli)
 

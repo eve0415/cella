@@ -477,11 +477,7 @@ pub fn format_elapsed_pub(elapsed: Duration) -> String {
     format_elapsed(elapsed)
 }
 
-// Re-export the orchestrator's channel-based progress types so callers
-// can bridge between the indicatif Progress and the orchestrator.
-pub use cella_orchestrator::progress::{
-    ProgressEvent, ProgressSender, format_elapsed as orchestrator_format_elapsed,
-};
+use cella_orchestrator::progress::{ProgressEvent, ProgressSender};
 
 /// Create a [`ProgressSender`] and spawn a renderer task that bridges
 /// orchestrator [`ProgressEvent`]s back to this [`Progress`] instance.

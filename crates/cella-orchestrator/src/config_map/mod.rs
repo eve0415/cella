@@ -11,7 +11,7 @@ pub mod run_args;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
+use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
 use cella_features::FeatureContainerConfig;
 
 use env::{map_container_env, map_remote_env};
@@ -170,7 +170,10 @@ fn build_entrypoint_cmd(
 
     let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
 
-    let agent_path = cella_docker::volume::agent_symlink_path();
+    // Stable agent binary path inside containers. This is a devcontainer
+    // convention, not Docker-specific, so we hardcode it here rather than
+    // pulling in a backend-specific crate.
+    let agent_path = "/cella/bin/cella-agent";
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \

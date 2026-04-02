@@ -37,25 +37,31 @@ pub struct LogsArgs {
 }
 
 impl LogsArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if self.daemon {
             return self.show_daemon_logs();
         }
         if self.lifecycle {
             return self.show_lifecycle_logs();
         }
-        self.show_container_logs().await
+        self.show_container_logs(backend).await
     }
 
-    async fn show_container_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    async fn show_container_logs(
+        &self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
-        let container = match client.find_container(&cwd).await? {
+        let container = match client.as_ref().find_container(&cwd).await? {
             Some(c) => c,
             None if self.workspace_folder.is_none() => {
-                let containers = client.list_cella_containers(false).await?;
+                let containers = client.as_ref().list_cella_containers(false).await?;
                 picker::resolve_container_interactive(
                     &containers,
                     None,
@@ -82,7 +88,10 @@ impl LogsArgs {
         }
 
         if self.follow {
-            // Use docker CLI for follow mode (bollard streaming is complex)
+            // Follow mode requires Docker CLI (bollard streaming is complex)
+            if client.kind() != cella_backend::BackendKind::Docker {
+                return Err("logs --follow is only supported with the Docker backend".into());
+            }
             let status = std::process::Command::new("docker")
                 .args([
                     "logs",
@@ -100,7 +109,10 @@ impl LogsArgs {
                 .into());
             }
         } else {
-            let logs = client.container_logs(&container.id, self.tail).await?;
+            let logs = client
+                .as_ref()
+                .container_logs(&container.id, self.tail)
+                .await?;
             print!("{logs}");
         }
         Ok(())

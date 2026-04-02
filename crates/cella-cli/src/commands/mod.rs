@@ -2,14 +2,12 @@ mod branch;
 mod build;
 mod code;
 mod completions;
-pub mod compose_features;
 mod compose_up;
 mod config;
 mod credential;
 mod daemon;
 mod doctor;
 mod down;
-mod env_cache;
 mod exec;
 pub mod features;
 pub mod image;
@@ -22,7 +20,6 @@ mod ports;
 mod prune;
 mod read_configuration;
 mod shell;
-pub mod shell_detect;
 mod tmux;
 
 mod switch;
@@ -137,51 +134,55 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
-    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        progress: Progress,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Up(args) => args.execute(progress).await,
-            Self::Code(args) => args.execute(progress).await,
-            Self::Down(args) => args.execute().await,
-            Self::Shell(args) => args.execute().await,
-            Self::Exec(args) => args.execute().await,
-            Self::Build(args) => args.execute(progress).await,
-            Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute().await,
-            Self::Doctor(args) => args.execute().await,
-            Self::Branch(args) => args.execute(progress).await,
+            Self::Up(args) => args.execute(progress, backend).await,
+            Self::Code(args) => args.execute(progress, backend).await,
+            Self::Down(args) => args.execute(backend).await,
+            Self::Shell(args) => args.execute(backend).await,
+            Self::Exec(args) => args.execute(backend).await,
+            Self::Build(args) => args.execute(progress, backend).await,
+            Self::List(args) => args.execute(backend).await,
+            Self::Logs(args) => args.execute(backend).await,
+            Self::Doctor(args) => args.execute(backend).await,
+            Self::Branch(args) => args.execute(progress, backend).await,
 
-            Self::Switch(args) => args.execute().await,
-            Self::Prune(args) => args.execute().await,
+            Self::Switch(args) => args.execute(backend).await,
+            Self::Prune(args) => args.execute(backend).await,
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
             Self::Init(args) => args.execute(progress).await,
-            Self::Nvim(args) => args.execute(progress).await,
-            Self::Tmux(args) => args.execute(progress).await,
+            Self::Nvim(args) => args.execute(progress, backend).await,
+            Self::Tmux(args) => args.execute(progress, backend).await,
             Self::Completions(args) => {
                 args.execute();
                 Ok(())
             }
-            Self::Credential(args) => args.execute().await,
+            Self::Credential(args) => args.execute(backend).await,
             Self::Network(args) => args.execute(),
-            Self::Ports(args) => args.execute().await,
+            Self::Ports(args) => args.execute(backend).await,
             Self::Daemon(args) => args.execute().await,
         }
     }
 }
 
-/// Connect to the Docker daemon, optionally using an explicit host URL.
+/// Resolve the container backend from user choice, with optional Docker host override.
 ///
 /// # Errors
 ///
-/// Returns error if the Docker client cannot connect.
-pub fn connect_docker(
+/// Returns error if no backend is available.
+pub fn resolve_backend_for_command(
+    backend: Option<&crate::backend::BackendChoice>,
     docker_host: Option<&str>,
-) -> Result<cella_docker::DockerClient, cella_docker::CellaDockerError> {
-    docker_host.map_or_else(cella_docker::DockerClient::connect, |host| {
-        cella_docker::DockerClient::connect_with_host(host)
-    })
+) -> Result<Box<dyn cella_backend::ContainerBackend>, Box<dyn std::error::Error>> {
+    crate::backend::resolve_backend(backend, docker_host)
+        .map_err(|e| e as Box<dyn std::error::Error>)
 }
 
 /// Resolve the workspace folder from an optional argument or the current directory.
@@ -208,10 +209,10 @@ pub fn resolve_workspace_folder(
 ///
 /// Returns error if the container is not compose-based or the service is not found.
 pub async fn resolve_service_container(
-    client: &cella_docker::DockerClient,
-    container: cella_docker::ContainerInfo,
+    client: &dyn cella_backend::ContainerBackend,
+    container: cella_backend::ContainerInfo,
     service: Option<&str>,
-) -> Result<cella_docker::ContainerInfo, Box<dyn std::error::Error>> {
+) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error>> {
     let Some(svc) = service else {
         return Ok(container);
     };
@@ -225,7 +226,7 @@ pub async fn resolve_service_container(
         })?;
 
     client
-        .find_compose_container(project, svc)
+        .find_compose_service(project, svc)
         .await?
         .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
@@ -279,7 +280,7 @@ async fn check_and_restart_if_stale(pid_path: &std::path::Path, socket_path: &st
 /// Check if the running daemon needs a restart due to version mismatch.
 /// Returns `Some(true)` if restart needed, `Some(false)` if ok, `None` if check failed.
 async fn check_daemon_needs_restart(control_socket_path: &std::path::Path) -> Option<bool> {
-    use cella_port::protocol::{ManagementRequest, ManagementResponse};
+    use cella_protocol::{ManagementRequest, ManagementResponse};
 
     if !control_socket_path.exists() {
         return None;
@@ -350,7 +351,7 @@ async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Pat
 
 /// Send shutdown request and wait for the old daemon to exit.
 async fn graceful_shutdown_daemon(pid_path: &std::path::Path, socket_path: &std::path::Path) {
-    use cella_port::protocol::ManagementRequest;
+    use cella_protocol::ManagementRequest;
 
     if socket_path.exists() {
         let _ = cella_daemon::management::send_management_request(
@@ -387,15 +388,14 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
 async fn re_register_containers(
     socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use cella_docker::DockerClient;
-    use cella_port::protocol::ManagementRequest;
+    use cella_protocol::ManagementRequest;
 
-    let client = DockerClient::connect()?;
+    let client =
+        crate::backend::resolve_backend(None, None).map_err(|e| e as Box<dyn std::error::Error>)?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
-        let container_ip =
-            cella_docker::network::get_container_cella_ip(client.inner(), &container.id).await;
+        let container_ip = client.get_container_ip(&container.id).await.unwrap_or(None);
 
         // Read ports_attributes from container label
         let (ports_attrs, other_ports_attrs) = container

@@ -29,13 +29,12 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 |--------|---------|
 | `allocation` | `ForwardedPort`, `PortAllocationTable`, port range management (default range: 1024-65535) |
 | `detection` | `/proc/net/tcp` parser, LISTEN state detection (TCP state code `0A`) |
-| `protocol` | IPC message types (`AgentMessage`, `DaemonMessage`), serialization, state machine for daemon-agent communication |
 
 ## Crate Dependencies
 
-**Depends on:** none (only serde, serde_json, thiserror)
+**Depends on:** [cella-protocol](../cella-protocol)
 
-**Depended on by:** [cella-docker](../cella-docker), [cella-agent](../cella-agent), [cella-daemon](../cella-daemon), [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
+**Depended on by:** [cella-agent](../cella-agent), [cella-cli](../cella-cli), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 
@@ -43,13 +42,6 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 cargo test -p cella-port
 ```
 
-Unit tests cover `/proc/net/tcp` parsing with synthetic data via tempfile, port allocation conflict resolution, and protocol message round-trips.
-
-## Development
-
-This crate is a shared dependency across five consumers (cella-docker, cella-agent, cella-daemon, cella-cli, cella-doctor). The protocol module defines the wire format for daemon-agent communication — any changes to message types must be coordinated across both sides:
-
-- **Host side:** cella-daemon reads `AgentMessage` and sends `DaemonMessage`
-- **Container side:** cella-agent sends `AgentMessage` and reads `DaemonMessage`
+Unit tests cover `/proc/net/tcp` parsing with synthetic data via tempfile and port allocation conflict resolution.
 
 The `/proc/net/tcp` parser handles both IPv4 (`/proc/net/tcp`) and IPv6 (`/proc/net/tcp6`). The LISTEN state is identified by TCP state code `0A` in the hex-encoded state field.

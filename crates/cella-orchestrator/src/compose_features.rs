@@ -10,14 +10,15 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
+use cella_backend::{ContainerBackend, image_name_with_features};
 use cella_compose::{
     ComposeCommand, ComposeProject, FEATURES_TARGET_STAGE, ServiceBuildInfo,
     extract_service_build_info,
 };
-use cella_docker::DockerClient;
 use cella_features::ResolvedFeatures;
 
-use crate::progress::Progress;
+use crate::image::compute_features_digest;
+use crate::progress::ProgressSender;
 
 /// Result of resolving features for a compose service.
 pub struct ComposeFeaturesBuild {
@@ -53,12 +54,11 @@ pub struct ComposeFeaturesBuild {
 /// Returns an error if compose config resolution fails, the Dockerfile
 /// cannot be read, or feature resolution fails.
 pub async fn resolve_compose_features(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     config: &serde_json::Value,
     config_path: &Path,
     project: &ComposeProject,
-    _no_cache: bool,
-    progress: &Progress,
+    progress: &ProgressSender,
 ) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error>> {
     // 1. Check if features are present
     if !has_features(config) {
@@ -70,9 +70,12 @@ pub async fn resolve_compose_features(
     // 2. Resolve compose config via `docker compose config --format json`
     //    Use without_override because the override file hasn't been written yet.
     let compose_cmd = ComposeCommand::without_override(project);
-    let resolved_compose = progress
-        .run_step_result("Resolving compose configuration...", compose_cmd.config())
-        .await?;
+    let resolved_compose = run_step_result(
+        progress,
+        "Resolving compose configuration...",
+        compose_cmd.config(),
+    )
+    .await?;
 
     // 3. Extract primary service build info
     let service_info = extract_service_build_info(&resolved_compose, &project.primary_service)?;
@@ -110,9 +113,12 @@ pub async fn resolve_compose_features(
         ServiceBuildInfo::Image { image } => {
             // Pull image if needed for inspection
             if !client.image_exists(image).await? {
-                progress
-                    .run_step_result("Pulling compose service image...", client.pull_image(image))
-                    .await?;
+                run_step_result(
+                    progress,
+                    "Pulling compose service image...",
+                    client.pull_image(image),
+                )
+                .await?;
             }
 
             let details = client.inspect_image_details(image).await?;
@@ -125,29 +131,30 @@ pub async fn resolve_compose_features(
     };
 
     // 5. Resolve features using stage name as the base image reference
-    let platform = cella_features::oci::detect_platform(client.inner())
+    let backend_platform = ContainerBackend::detect_platform(client)
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
+    let platform =
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
     let cache = cella_features::FeatureCache::new();
 
-    let resolved = progress
-        .run_step_result("Resolving devcontainer features...", async {
-            cella_features::resolve_features(
-                config,
-                config_path,
-                &platform,
-                &cache,
-                &cella_features::BaseImageContext {
-                    base_image: &stage_name,
-                    image_user: &image_user,
-                    metadata: base_image_metadata.as_deref(),
-                },
-                true, // compose builds use named content source via additional_contexts
-            )
-            .await
-            .map_err(|e| format!("feature resolution failed: {e}"))
-        })
-        .await?;
+    let resolved = run_step_result(progress, "Resolving devcontainer features...", async {
+        cella_features::resolve_features(
+            config,
+            config_path,
+            &platform,
+            &cache,
+            &cella_features::BaseImageContext {
+                base_image: &stage_name,
+                image_user: &image_user,
+                metadata: base_image_metadata.as_deref(),
+            },
+            true, // compose builds use named content source via additional_contexts
+        )
+        .await
+        .map_err(|e| format!("feature resolution failed: {e}"))
+    })
+    .await?;
 
     // 6. Generate combined Dockerfile and write to disk.
     let combined_path = write_combined_dockerfile(
@@ -211,12 +218,9 @@ fn assemble_features_build(
             std::fs::create_dir_all(&empty_context)?;
 
             let config_name = config.get("name").and_then(|v| v.as_str());
-            let features_digest = super::image::compute_features_digest(config);
-            let img_name = cella_docker::image_name_with_features(
-                &project.workspace_root,
-                config_name,
-                &features_digest,
-            );
+            let features_digest = compute_features_digest(config);
+            let img_name =
+                image_name_with_features(&project.workspace_root, config_name, &features_digest);
             (Some(empty_context), Some(img_name))
         }
         ServiceBuildInfo::Build { .. } => (None, None),
@@ -261,4 +265,22 @@ fn cella_data_dir() -> PathBuf {
         .ok()
         .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
         .join(".cella")
+}
+
+async fn run_step_result<F, T, E>(progress: &ProgressSender, label: &str, future: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let step = progress.step(label);
+    match future.await {
+        Ok(value) => {
+            step.finish();
+            Ok(value)
+        }
+        Err(error) => {
+            step.fail(&error.to_string());
+            Err(error)
+        }
+    }
 }

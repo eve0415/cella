@@ -28,11 +28,8 @@ Implements the container lifecycle portions of the [Dev Container specification]
 ### Key Types
 
 - `DockerApi` — internal trait wrapping bollard Docker operations (not the extension point for new runtimes — see `ContainerBackend` in [cella-backend](../cella-backend))
-- `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend` and `ComposeBackend`
-- `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend) and re-exported here
-- `ParsedLifecycle` — parsed lifecycle command (string, array, or map form)
-- `ContainerTarget` — resolved container identifier
-- `FileToUpload` — file content for upload into containers
+- `DockerClient` — bollard-backed implementation of `DockerApi`, also implements `ContainerBackend`
+- `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `MountConfig`, `ExecOptions`, `InteractiveExecOptions`, `ExecResult`, `BuildOptions` — shared types defined in [cella-backend](../cella-backend)
 
 ### Modules
 
@@ -41,26 +38,21 @@ Implements the container lifecycle portions of the [Dev Container specification]
 | `client` | `DockerApi` trait definition and `DockerClient` (socket auto-detection, connection) |
 | `docker_api_impl` | `DockerApi` trait implementation for `DockerClient` |
 | `container` | `ContainerInfo`, `ContainerState`, status inspection |
-| `config_map/` | `CreateContainerOptions`, `MountConfig` assembly from devcontainer config |
+| `config_map/` | `CreateContainerOptions`, `MountConfig` assembly from devcontainer config (mounts, ports, run_args consolidated here) |
 | `config_map/env` | Environment variable assembly (`containerEnv`, `remoteEnv`, forwarded vars) |
-| `config_map/mounts` | Mount configuration (`mounts`, `workspaceMount`, bind mounts) |
-| `config_map/ports` | Port binding configuration from `forwardPorts` and `portsAttributes` |
-| `config_map/run_args` | `runArgs` parser — maps 30+ docker create flags to bollard HostConfig (networking, resources, security, devices, GPU) |
+| `discovery` | Docker socket auto-discovery (Colima, Podman, Rancher Desktop, standard paths) |
 | `exec` | Command execution (interactive with PTY and detached) |
 | `image` | Image building via Docker build API |
-| `lifecycle` | Lifecycle command parsing and execution (`postCreate`, `postStart`, `postAttach`) |
-| `names` | Container/image naming conventions and label management |
 | `network` | Network creation and configuration |
 | `volume` | Volume and mount management |
-| `resolve` | Container resolution by ID, name, or label |
 | `uid` | UID remapping for `updateRemoteUserUID` |
 | `upload` | File upload to running containers via tar streaming |
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-port](../cella-port), [cella-features](../cella-features)
+**Depends on:** [cella-backend](../cella-backend)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 
 ## Testing
 

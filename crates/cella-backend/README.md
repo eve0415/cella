@@ -6,9 +6,7 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-backend defines the `ContainerBackend` trait — the extension point for adding new container runtimes to cella. All backend-agnostic code works against this trait, and each runtime (Docker, Apple Container) provides its own implementation. The crate also houses all shared types (`ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.) and the unified error type `BackendError`.
-
-`ComposeBackend` is an extension trait for Docker Compose support. Only the Docker backend implements it — commands that require Compose check for this capability at runtime.
+cella-backend defines the `ContainerBackend` trait — the extension point for adding new container runtimes to cella. All backend-agnostic code works against this trait, and each runtime (Docker, Apple Container) provides its own implementation. The crate also houses all shared types (`ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.), backend capability flags, the unified error type `BackendError`, lifecycle command execution (`ParsedLifecycle`, `LifecycleContext`), agent environment variable generation, and container target resolution.
 
 Container and image naming conventions live here so that all backends use consistent naming and labeling, regardless of the underlying runtime.
 
@@ -16,8 +14,8 @@ Container and image naming conventions live here so that all backends use consis
 
 ### Key Types
 
-- `ContainerBackend` — core trait defining 17 async methods for container lifecycle, exec, image, and file operations. Uses `BoxFuture` for object safety (`dyn ContainerBackend`)
-- `ComposeBackend` — extension trait for Docker Compose support (find/list compose containers)
+- `ContainerBackend` — core trait defining async container lifecycle, exec, image, networking, and agent operations. Uses `BoxFuture` for object safety (`dyn ContainerBackend`)
+- `BackendCapabilities` — backend capability flags (`compose`, `managed_agent`)
 - `BackendKind` — enum (`Docker`, `AppleContainer`) identifying which backend is in use
 - `BackendError` — unified error type with variants for container-not-found, image-not-found, build failures, exec failures, unsupported operations, and runtime-specific errors
 - `ContainerInfo` — full container state including ID, name, state, ports, mounts, labels, image
@@ -30,21 +28,30 @@ Container and image naming conventions live here so that all backends use consis
 - `MountConfig` / `MountInfo` — mount specification and inspection types
 - `PortBinding` / `PortForward` — port mapping types
 - `DeviceSpec` / `UlimitSpec` / `GpuRequest` / `RunArgsOverrides` — container resource configuration
+- `LifecycleContext` — context for lifecycle command execution
+- `OutputCallback` — callback for streaming command output
+- `ParsedLifecycle` — parsed lifecycle command (single command, array, or map)
+- `ContainerTarget` — resolved container identification
+- `Platform` — target platform (architecture)
+- `FileToUpload` — file content for container upload operations
 
 ### Modules
 
 | Module | Purpose |
 |--------|---------|
-| `traits` | `ContainerBackend` and `ComposeBackend` trait definitions, `BoxFuture` type alias |
-| `types` | All shared types (`BackendKind`, `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.) |
+| `traits` | `ContainerBackend`, `BackendCapabilities`, `Platform`, and `BoxFuture` |
+| `types` | All shared types (`BackendKind`, `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `FileToUpload`, etc.) |
 | `names` | Container/image naming conventions and label generation (consistent across all backends) |
 | `error` | `BackendError` unified error type |
+| `agent` | Agent environment variable generation for in-container agent |
+| `lifecycle` | Lifecycle command parsing and execution (`LifecycleContext`, `OutputCallback`, `ParsedLifecycle`) |
+| `resolve` | Container target resolution (`ContainerTarget`) |
 
 ## Crate Dependencies
 
 **Depends on:** none (foundation crate — only `sha2`, `hex`, `chrono`, `thiserror`)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-container](../cella-container), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 
@@ -59,7 +66,7 @@ Unit tests cover naming conventions and container state parsing.
 To add a new container backend:
 1. Create a new crate that depends on `cella-backend`
 2. Implement `ContainerBackend` for your runtime
-3. Optionally implement `ComposeBackend` if compose orchestration is supported
+3. Implement `capabilities()` to advertise optional features like compose and managed agent support
 4. Add backend detection and selection in `cella-cli/src/backend.rs`
 
 The `ContainerBackend` trait uses `BoxFuture` return types for object safety. This means all methods return `Pin<Box<dyn Future>>` rather than using `async fn`, enabling callers to work with `dyn ContainerBackend` trait objects without knowing the concrete backend type.

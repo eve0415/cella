@@ -18,10 +18,39 @@ pub struct DoctorArgs {
 }
 
 impl DoctorArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_folder = std::env::current_dir().ok();
-        let ctx = checks::CheckContext::new(workspace_folder, self.all);
+        let (backend_client, backend_error) =
+            match crate::commands::resolve_backend_for_command(backend, None) {
+                Ok(client) => (Some(client), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+        let backend_kind = backend_client
+            .as_ref()
+            .map(|c| c.kind())
+            .or_else(|| backend.map(crate::backend::BackendChoice::to_kind));
+        let ctx =
+            checks::CheckContext::new(workspace_folder, self.all, backend_kind, backend_client);
         let mut report = checks::run_all_checks(&ctx).await;
+
+        // Surface backend connection failure when explicitly requested
+        if let Some(err) = backend_error.filter(|_| backend.is_some()) {
+            report.categories.insert(
+                0,
+                CategoryReport::new(
+                    "Backend",
+                    vec![CheckResult {
+                        name: "connection".into(),
+                        severity: Severity::Error,
+                        detail: err,
+                        fix_hint: None,
+                    }],
+                ),
+            );
+        }
 
         if !self.no_redact {
             let redactor = Redactor::new();

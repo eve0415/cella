@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    cli.command.execute(progress).await
+    cli.command.execute(progress, cli.backend.as_ref()).await
 }
 
 #[cfg(test)]
@@ -95,7 +95,7 @@ mod tests {
     fn parse_up_with_rebuild() {
         let cli = parse(&["cella", "up", "--rebuild"]).unwrap();
         if let super::commands::Command::Up(args) = &cli.command {
-            assert!(args.rebuild);
+            assert!(args.build.rebuild);
         } else {
             panic!("expected Up command");
         }
@@ -149,9 +149,9 @@ mod tests {
         .unwrap();
         if let super::commands::Command::Up(args) = &cli.command {
             assert!(args.verbose.verbose);
-            assert!(args.rebuild);
-            assert!(args.build_no_cache);
-            assert!(args.remove_existing_container);
+            assert!(args.build.rebuild);
+            assert!(args.build.build_no_cache);
+            assert!(args.build.remove_existing_container);
             assert!(args.skip_checksum);
             assert!(args.no_network_rules);
         } else {

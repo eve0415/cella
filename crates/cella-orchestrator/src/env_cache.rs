@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use cella_docker::{DockerClient, ExecOptions};
+use cella_backend::{ContainerBackend, ExecOptions, FileToUpload};
 use cella_env::platform::DockerRuntime;
 
 /// Compute the per-user cache path for the probed environment.
@@ -17,9 +17,9 @@ fn cache_path(user: &str) -> String {
 /// Read the cached probed environment from a running container.
 ///
 /// Returns `None` if the cache file doesn't exist or can't be parsed
-/// (graceful fallback -- never errors).
+/// (graceful fallback, never errors).
 pub async fn read_probed_env_cache(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
 ) -> Option<HashMap<String, String>> {
@@ -51,7 +51,7 @@ pub async fn read_probed_env_cache(
 ///
 /// Returns the probed environment, or `None` if probing is disabled or fails.
 pub async fn probe_and_cache_user_env(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     probe_type: &str,
@@ -64,7 +64,7 @@ pub async fn probe_and_cache_user_env(
 
 /// Execute the environment probe command and parse the output.
 async fn run_env_probe(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     probe_type: &str,
@@ -104,7 +104,7 @@ async fn run_env_probe(
 ///
 /// Creates the `~/.cella/` directory if it doesn't exist.
 async fn write_env_cache(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     env: &HashMap<String, String>,
@@ -115,7 +115,6 @@ async fn write_env_cache(
 
     let path = cache_path(user);
 
-    // Ensure the parent directory exists
     let home = cella_env::claude_code::container_home(user);
     let dir_path = format!("{home}/.cella");
     let _ = client
@@ -130,7 +129,7 @@ async fn write_env_cache(
         )
         .await;
 
-    let cache_file = cella_docker::FileToUpload {
+    let cache_file = FileToUpload {
         path,
         content: json.into_bytes(),
         mode: 0o644,
@@ -143,11 +142,10 @@ async fn write_env_cache(
     }
 }
 
-/// If `SSH_AUTH_SOCK` is not already present in `env`, detect the runtime and
-/// check whether the well-known socket path exists inside the container.
-/// Appends `SSH_AUTH_SOCK=<path>` if found.
+/// Ensure `SSH_AUTH_SOCK` is present in the target environment when a
+/// well-known runtime-specific socket exists inside the container.
 pub async fn ensure_ssh_auth_sock(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     env: &mut Vec<String>,

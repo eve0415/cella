@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-pub use cella_backend::{ExecOptions, ExecResult, InteractiveExecOptions};
+use cella_backend::{ExecOptions, ExecResult, InteractiveExecOptions};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;

@@ -1,4 +1,4 @@
-use crate::discover;
+use super::discover;
 use thiserror::Error;
 
 /// Errors that can occur during configuration parsing and management.

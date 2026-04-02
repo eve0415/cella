@@ -1,7 +1,7 @@
 //! BROWSER env var handler: sends URLs to the host daemon for opening.
 
 use cella_port::CellaPortError;
-use cella_port::protocol::AgentMessage;
+use cella_protocol::AgentMessage;
 
 use crate::control::ControlClient;
 
@@ -77,17 +77,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_browser_open_produces_error_or_succeeds() {
-        // In test env, daemon may not be running on the resolved address.
-        // This tests the function's error path end-to-end without panicking.
-        let result = send_browser_open("http://localhost:3000").await;
-        // The function should either succeed or return a CellaPortError.
-        match result {
-            Ok(()) => {} // Daemon happened to be running
-            Err(err) => {
-                let msg = err.to_string();
-                assert!(!msg.is_empty());
-            }
+    async fn send_browser_open_without_daemon_returns_error() {
+        // Skip when a real daemon is reachable (e.g. running inside a cella
+        // devcontainer) — the test would open the host browser as a side effect.
+        if resolve_daemon_connection().is_ok() {
+            eprintln!("skipping: real daemon connection available, would open browser");
+            return;
         }
+        let result = send_browser_open("http://localhost:3000").await;
+        assert!(result.is_err(), "expected error when daemon is unreachable");
     }
 }

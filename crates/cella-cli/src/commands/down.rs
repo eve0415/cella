@@ -5,10 +5,11 @@ use serde_json::json;
 use tracing::{debug, info};
 
 use super::up::OutputFormat;
+use cella_backend::ContainerTarget;
+use cella_backend::{ContainerInfo, ContainerState};
 use cella_compose::discovery;
 use cella_daemon::daemon;
 use cella_daemon::shared::running_cella_container_count;
-use cella_docker::{ContainerInfo, ContainerState, ContainerTarget};
 use cella_env::paths::{cella_data_dir, daemon_socket_path};
 
 use crate::picker;
@@ -92,8 +93,11 @@ impl DownArgs {
         matches!(self.output, OutputFormat::Text)
     }
 
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {
             Some(resolve_branch_to_path(branch_name)?)
@@ -113,10 +117,10 @@ impl DownArgs {
             workspace_folder,
         };
 
-        let container = match target.resolve(&client, false).await {
+        let container = match target.resolve(client.as_ref(), false).await {
             Ok(c) => c,
             Err(_) if no_explicit_target => {
-                let containers = client.list_cella_containers(false).await?;
+                let containers = client.as_ref().list_cella_containers(false).await?;
                 picker::resolve_container_interactive(
                     &containers,
                     None,
@@ -182,14 +186,17 @@ impl DownArgs {
         }
 
         if container.state == ContainerState::Running {
-            client.stop_container(&container.id).await?;
+            client.as_ref().stop_container(&container.id).await?;
             info!("Container stopped");
         } else {
             info!("Container already stopped");
         }
 
         let outcome = if self.rm {
-            client.remove_container(&container.id, self.volumes).await?;
+            client
+                .as_ref()
+                .remove_container(&container.id, self.volumes)
+                .await?;
 
             if let Some(ref branch_name) = self.branch {
                 remove_worktree(branch_name)?;
@@ -215,7 +222,7 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
     if !mgmt_sock.exists() {
         return;
     }
-    let req = cella_port::protocol::ManagementRequest::DeregisterContainer {
+    let req = cella_protocol::ManagementRequest::DeregisterContainer {
         container_name: container.name.clone(),
     };
     if let Err(e) = cella_daemon::management::send_management_request(&mgmt_sock, &req).await {

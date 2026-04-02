@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::CellaConfigError;
-use crate::diagnostic::{Diagnostic, Severity};
-use crate::discover;
-use crate::jsonc;
-use crate::merge;
-use crate::parse;
+use super::CellaConfigError;
+use super::diagnostic::{Diagnostic, Severity};
+use super::discover;
+use super::jsonc;
+use super::merge;
+use super::parse;
 
 /// Fully resolved devcontainer configuration.
 pub struct ResolvedConfig {
@@ -95,7 +95,7 @@ pub fn config(
             .to_string_lossy()
             .as_bytes(),
     ));
-    let ctx = crate::subst::SubstitutionContext::new(
+    let ctx = super::subst::SubstitutionContext::new(
         workspace_root,
         container_wf,
         &devcontainer_id,

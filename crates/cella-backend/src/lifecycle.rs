@@ -1,13 +1,16 @@
 //! Lifecycle command parsing and execution.
+//!
+//! Moved from `cella-docker` so that `cella-orchestrator` can use these
+//! types and functions without depending on a concrete backend crate.
 
 use std::io;
 
 use serde_json::Value;
 use tracing::{debug, info};
 
-use crate::CellaDockerError;
-use crate::client::DockerClient;
-use crate::exec::{ExecOptions, ExecResult};
+use crate::error::BackendError;
+use crate::traits::ContainerBackend;
+use crate::types::{ExecOptions, ExecResult};
 
 /// Parsed lifecycle command.
 pub enum ParsedLifecycle {
@@ -60,8 +63,8 @@ pub type OutputCallback<'a> = Box<dyn Fn(&str) + Send + Sync + 'a>;
 
 /// Shared container context for lifecycle phase execution.
 pub struct LifecycleContext<'a> {
-    /// Docker client.
-    pub client: &'a DockerClient,
+    /// Container backend (trait object).
+    pub client: &'a dyn ContainerBackend,
     /// Container to run commands in.
     pub container_id: &'a str,
     /// User to run commands as.
@@ -139,7 +142,7 @@ async fn run_sequential(
     ctx: &LifecycleContext<'_>,
     phase: &str,
     commands: Vec<Vec<String>>,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     for cmd in commands {
         if cmd.is_empty() {
             continue;
@@ -158,14 +161,19 @@ async fn run_sequential(
                     .exec_stream(
                         ctx.container_id,
                         &opts,
-                        CallbackWriter::new(on_output.as_ref()),
-                        CallbackWriter::new(on_output.as_ref()),
+                        Box::new(CallbackWriter::new(on_output.as_ref())),
+                        Box::new(CallbackWriter::new(on_output.as_ref())),
                     )
                     .await?
             } else {
                 // Fallback: stream directly to stderr
                 ctx.client
-                    .exec_stream(ctx.container_id, &opts, io::stderr(), io::stderr())
+                    .exec_stream(
+                        ctx.container_id,
+                        &opts,
+                        Box::new(io::stderr()),
+                        Box::new(io::stderr()),
+                    )
                     .await?
             }
         } else {
@@ -182,7 +190,7 @@ async fn run_parallel(
     ctx: &LifecycleContext<'_>,
     phase: &str,
     commands: Vec<(String, Vec<String>)>,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     let mut futures = Vec::new();
     for (name, cmd) in commands {
         let user = ctx.user.map(String::from);
@@ -207,7 +215,7 @@ async fn run_parallel(
                 .await?;
 
             check_exit_code(&result, &phase, Some(&name))?;
-            Ok::<ExecResult, CellaDockerError>(result)
+            Ok::<ExecResult, BackendError>(result)
         });
     }
 
@@ -228,10 +236,10 @@ fn check_exit_code(
     result: &ExecResult,
     phase: &str,
     name: Option<&str>,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     if result.exit_code != 0 {
         let prefix = name.map_or(String::new(), |n| format!("[{n}] "));
-        return Err(CellaDockerError::LifecycleFailed {
+        return Err(BackendError::LifecycleFailed {
             phase: phase.to_string(),
             message: format!(
                 "{prefix}exit code {}: {}",
@@ -244,7 +252,7 @@ fn check_exit_code(
 }
 
 /// Print stdout/stderr from parallel exec results to stderr.
-fn print_parallel_output(results: &[Result<ExecResult, CellaDockerError>]) {
+fn print_parallel_output(results: &[Result<ExecResult, BackendError>]) {
     for exec_result in results.iter().flatten() {
         if !exec_result.stdout.is_empty() {
             eprint!("{}", exec_result.stdout);
@@ -262,13 +270,13 @@ fn print_parallel_output(results: &[Result<ExecResult, CellaDockerError>]) {
 ///
 /// # Errors
 ///
-/// Returns `CellaDockerError::LifecycleFailed` if any command fails.
+/// Returns `BackendError::LifecycleFailed` if any command fails.
 pub async fn run_lifecycle_phase(
     ctx: &LifecycleContext<'_>,
     phase: &str,
     value: &Value,
     origin: &str,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     info!("Running the {phase} from {origin}...");
     debug!("Running {phase} from {origin}");
 
@@ -369,9 +377,6 @@ mod tests {
         assert_eq!(lines[0], "      content");
         assert_eq!(lines[1], "      another");
     }
-
-    // --- Spec compliance tests ---
-    // Reference: https://containers.dev/implementors/spec/#lifecycle-scripts
 
     #[test]
     fn spec_string_command_wrapped_in_sh() {
@@ -480,10 +485,6 @@ mod tests {
             assert!(!resume_phases.contains(phase));
         }
     }
-
-    // -----------------------------------------------------------------------
-    // check_exit_code tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn check_exit_code_zero_is_ok() {
@@ -596,10 +597,6 @@ mod tests {
         assert!(!msg.ends_with('\n'), "stderr should be trimmed, got: {msg}");
     }
 
-    // -----------------------------------------------------------------------
-    // parse_lifecycle_command edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn parse_object_with_non_string_non_array_value() {
         let value = json!({"check": 42});
@@ -608,7 +605,6 @@ mod tests {
                 assert_eq!(cmds.len(), 1);
                 assert_eq!(cmds[0].1[0], "sh");
                 assert_eq!(cmds[0].1[1], "-c");
-                // Non-string/array fallback serializes with to_string()
                 assert_eq!(cmds[0].1[2], "42");
             }
             ParsedLifecycle::Sequential(_) => panic!("expected Parallel"),
@@ -617,7 +613,6 @@ mod tests {
 
     #[test]
     fn parse_boolean_value() {
-        // Booleans are not string/array/object, should produce empty Sequential
         let value = json!(true);
         match parse_lifecycle_command(&value) {
             ParsedLifecycle::Sequential(cmds) => assert!(cmds.is_empty()),
@@ -640,7 +635,6 @@ mod tests {
         match parse_lifecycle_command(&value) {
             ParsedLifecycle::Sequential(cmds) => {
                 assert_eq!(cmds.len(), 1);
-                // Non-string elements should be filtered out
                 assert_eq!(cmds[0], vec!["echo", "hello"]);
             }
             ParsedLifecycle::Parallel(_) => panic!("expected Sequential"),
@@ -659,10 +653,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // CallbackWriter additional tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn callback_writer_handles_multiple_writes_for_one_line() {
         use std::sync::Mutex;
@@ -673,7 +663,6 @@ mod tests {
         };
 
         let mut writer = CallbackWriter::new(&callback);
-        // Write a line in two separate write calls
         io::Write::write_all(&mut writer, b"hello ").unwrap();
         io::Write::write_all(&mut writer, b"world\n").unwrap();
         drop(writer);

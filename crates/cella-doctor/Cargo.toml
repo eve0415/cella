@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-backend.workspace = true
 cella-config.workspace = true
 cella-daemon.workspace = true
 cella-docker.workspace = true
 cella-orchestrator.workspace = true
 cella-env.workspace = true
 cella-port.workspace = true
+cella-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

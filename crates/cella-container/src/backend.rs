@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cella_backend::{
-    BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend, ContainerInfo,
-    ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
-    InteractiveExecOptions, MountInfo, PortBinding,
+    BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
+    ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
+    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding,
 };
 use tracing::{debug, warn};
 
@@ -18,6 +18,23 @@ use crate::sdk::types::ContainerListEntry;
 pub struct AppleContainerBackend {
     cli: ContainerCli,
     staging_base: PathBuf,
+}
+
+impl AppleContainerBackend {
+    /// Resolve the staging directory for a container by looking up its name.
+    ///
+    /// The staging directory is mounted at create time using the container name,
+    /// but subsequent operations receive the container ID. This helper bridges
+    /// the gap by inspecting the container to retrieve its name.
+    async fn staging_dir_for(&self, container_id: &str) -> Result<PathBuf, BackendError> {
+        let entry = self.cli.inspect(container_id).await?;
+        let name = entry
+            .configuration
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+            .unwrap_or(container_id);
+        Ok(self.staging_base.join(name))
+    }
 }
 
 impl AppleContainerBackend {
@@ -52,6 +69,13 @@ fn default_staging_base() -> PathBuf {
 impl ContainerBackend for AppleContainerBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::AppleContainer
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            compose: false,
+            managed_agent: false,
+        }
     }
 
     // -- Container operations --
@@ -112,9 +136,10 @@ impl ContainerBackend for AppleContainerBackend {
         remove_volumes: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
+            let staging_dir = self.staging_dir_for(id).await.ok();
             self.cli.rm(id).await?;
             if remove_volumes {
-                let staging_dir = self.staging_base.join(id);
+                let staging_dir = staging_dir.unwrap_or_else(|| self.staging_base.join(id));
                 if staging_dir.exists() {
                     debug!(path = %staging_dir.display(), "removing staging directory");
                     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -155,6 +180,37 @@ impl ContainerBackend for AppleContainerBackend {
                 }
             }
             Ok(results)
+        })
+    }
+
+    fn find_compose_service<'a>(
+        &'a self,
+        _project: &'a str,
+        _service: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        // Apple Container does not support Docker Compose.
+        Box::pin(async { Ok(None) })
+    }
+
+    fn find_container_by_label<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            let (key, value) = label.split_once('=').unwrap_or((label, ""));
+
+            let entries = self.cli.list(None).await?;
+            for entry in entries {
+                if let Some(info) = entry_to_container_info(&entry)
+                    && info
+                        .labels
+                        .get(key)
+                        .is_some_and(|v| value.is_empty() || v == value)
+                {
+                    return Ok(Some(info));
+                }
+            }
+            Ok(None)
         })
     }
 
@@ -320,17 +376,31 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a BuildOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            let mut extra_args = Vec::new();
+            if let Some(ref target) = opts.target {
+                extra_args.push("--target".to_string());
+                extra_args.push(target.clone());
+            }
+            for cache in &opts.cache_from {
+                extra_args.push("--cache-from".to_string());
+                extra_args.push(cache.clone());
+            }
+            for opt in &opts.options {
+                extra_args.push(opt.clone());
+            }
+
             let build_args: Vec<(String, String)> = opts
                 .args
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             self.cli
-                .build(
+                .build_with_extra_args(
                     &opts.context_path,
                     &opts.dockerfile,
                     &opts.image_name,
                     &build_args,
+                    &extra_args,
                 )
                 .await
         })
@@ -372,7 +442,7 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_base.join(container_id);
+            let staging_dir = self.staging_dir_for(container_id).await?;
             tokio::fs::create_dir_all(&staging_dir).await?;
 
             let staging_mount = "/tmp/.cella-staging";
@@ -434,6 +504,155 @@ impl ContainerBackend for AppleContainerBackend {
 
             Ok(())
         })
+    }
+
+    // -- Connectivity --
+
+    fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            // Verify the container CLI is reachable by running `container list`.
+            let _ = self.cli.list(None).await?;
+            Ok(())
+        })
+    }
+
+    fn host_gateway(&self) -> &'static str {
+        // Apple Container uses the standard macOS localhost; containers
+        // can reach the host via this address when networking is enabled.
+        "host.local"
+    }
+
+    // -- Platform detection --
+
+    fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
+        Box::pin(async move {
+            Ok(Platform {
+                os: "linux".to_string(),
+                arch: if cfg!(target_arch = "aarch64") {
+                    "arm64".to_string()
+                } else {
+                    "amd64".to_string()
+                },
+            })
+        })
+    }
+
+    fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+        Box::pin(async move {
+            Ok(if cfg!(target_arch = "aarch64") {
+                "aarch64".to_string()
+            } else {
+                "x86_64".to_string()
+            })
+        })
+    }
+
+    // -- Extended image inspection --
+
+    fn inspect_image_env<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+        Box::pin(async move {
+            let details = self.inspect_image_details(image).await?;
+            Ok(details.env)
+        })
+    }
+
+    fn inspect_image_user<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<String, BackendError>> {
+        Box::pin(async move {
+            let details = self.inspect_image_details(image).await?;
+            Ok(details.user)
+        })
+    }
+
+    // -- Network operations --
+
+    fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_network".to_string(),
+            })
+        })
+    }
+
+    fn ensure_container_network<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _repo_path: &'a Path,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_container_network".to_string(),
+            })
+        })
+    }
+
+    fn get_container_ip<'a>(
+        &'a self,
+        _container_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    // -- Agent provisioning --
+
+    fn ensure_agent_provisioned<'a>(
+        &'a self,
+        _version: &'a str,
+        _arch: &'a str,
+        _skip_checksum: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "ensure_agent_provisioned".to_string(),
+            })
+        })
+    }
+
+    fn write_agent_addr<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _addr: &'a str,
+        _token: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: "apple-container".to_string(),
+                operation: "write_agent_addr".to_string(),
+            })
+        })
+    }
+
+    fn agent_volume_mount(&self) -> (String, String, bool) {
+        // Apple Container doesn't use Docker volumes; return a
+        // placeholder that the CLI can detect and skip.
+        (String::new(), "/cella".to_string(), true)
+    }
+
+    fn prune_old_agent_versions<'a>(
+        &'a self,
+        _current_version: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    // -- UID remapping --
+
+    fn update_remote_user_uid<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _remote_user: &'a str,
+        _workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        // Apple Container runs as the user; UID remapping is not needed.
+        Box::pin(async move { Ok(()) })
     }
 }
 

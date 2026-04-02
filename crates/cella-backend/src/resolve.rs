@@ -1,14 +1,15 @@
-//! Shared container resolution logic for exec, shell, list, and down.
+//! Container target resolution logic.
+//!
+//! [`ContainerTarget`] specifies how to find a container (by ID, name, label,
+//! or workspace folder) and resolves it against any [`ContainerBackend`].
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use bollard::query_parameters::ListContainersOptions;
 use tracing::debug;
 
-use crate::client::DockerClient;
-use crate::container::{ContainerInfo, ContainerState};
-use crate::error::CellaDockerError;
+use crate::error::BackendError;
+use crate::traits::ContainerBackend;
+use crate::types::{ContainerInfo, ContainerState};
 
 /// Specifies how to find a target container.
 pub struct ContainerTarget {
@@ -23,28 +24,25 @@ impl ContainerTarget {
     ///
     /// Resolution priority (first match wins):
     /// 1. `container_id` — direct inspect
-    /// 2. `container_name` — Docker resolves names via inspect
-    /// 3. `id_label` — query by arbitrary label filter
-    /// 4. `workspace_folder` — query by `dev.cella.workspace_path` label
+    /// 2. `container_name` — backend resolves names via inspect
+    /// 3. `id_label` — search containers by label
+    /// 4. `workspace_folder` — search by `dev.cella.workspace_path` label
     /// 5. CWD fallback — `std::env::current_dir()` as `workspace_folder`
-    ///
-    /// If `require_running` is true, returns an error when the container exists
-    /// but is not running, with a helpful hint.
     ///
     /// # Errors
     ///
-    /// Returns `CellaDockerError::ContainerNotFound` if no container matches.
-    /// Returns `CellaDockerError::ContainerNotRunning` if the container exists
+    /// Returns `BackendError::ContainerNotFound` if no container matches.
+    /// Returns `BackendError::ContainerNotRunning` if the container exists
     /// but is not running and `require_running` is true.
     pub async fn resolve(
         &self,
-        client: &DockerClient,
+        client: &dyn ContainerBackend,
         require_running: bool,
-    ) -> Result<ContainerInfo, CellaDockerError> {
+    ) -> Result<ContainerInfo, BackendError> {
         let info = self.find(client).await?;
 
         if require_running && info.state != ContainerState::Running {
-            return Err(CellaDockerError::ContainerNotRunning {
+            return Err(BackendError::ContainerNotRunning {
                 hint: format!(
                     "Container '{}' exists but is not running. Run `cella up` to start it.",
                     info.name
@@ -55,7 +53,7 @@ impl ContainerTarget {
         Ok(info)
     }
 
-    async fn find(&self, client: &DockerClient) -> Result<ContainerInfo, CellaDockerError> {
+    async fn find(&self, client: &dyn ContainerBackend) -> Result<ContainerInfo, BackendError> {
         if let Some(ref id) = self.container_id {
             return self.find_by_id(client, id).await;
         }
@@ -70,33 +68,33 @@ impl ContainerTarget {
 
     async fn find_by_id(
         &self,
-        client: &DockerClient,
+        client: &dyn ContainerBackend,
         id: &str,
-    ) -> Result<ContainerInfo, CellaDockerError> {
+    ) -> Result<ContainerInfo, BackendError> {
         debug!("Resolving container by ID: {id}");
         client.inspect_container(id).await
     }
 
     async fn find_by_name(
         &self,
-        client: &DockerClient,
+        client: &dyn ContainerBackend,
         name: &str,
-    ) -> Result<ContainerInfo, CellaDockerError> {
+    ) -> Result<ContainerInfo, BackendError> {
         debug!("Resolving container by name: {name}");
         client.inspect_container(name).await
     }
 
     async fn find_by_workspace_or_cwd(
         &self,
-        client: &DockerClient,
-    ) -> Result<ContainerInfo, CellaDockerError> {
+        client: &dyn ContainerBackend,
+    ) -> Result<ContainerInfo, BackendError> {
         let folder = self
             .workspace_folder
             .as_deref()
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| CellaDockerError::ContainerNotFound {
-                workspace: "(unable to determine current directory)".to_string(),
+            .ok_or_else(|| BackendError::ContainerNotFound {
+                identifier: "(unable to determine current directory)".to_string(),
             })?;
         debug!(
             "Resolving container by workspace folder: {}",
@@ -107,40 +105,28 @@ impl ContainerTarget {
 
     async fn find_by_label(
         &self,
-        client: &DockerClient,
+        client: &dyn ContainerBackend,
         label: &str,
-    ) -> Result<ContainerInfo, CellaDockerError> {
-        let filters: HashMap<String, Vec<String>> =
-            HashMap::from([("label".to_string(), vec![label.to_string()])]);
-
-        let options = ListContainersOptions {
-            all: true,
-            filters: Some(filters),
-            ..Default::default()
-        };
-
-        let containers = client.inner().list_containers(Some(options)).await?;
-
-        if let Some(summary) = containers.into_iter().next() {
-            let id = summary.id.as_deref().unwrap_or_default();
-            client.inspect_container(id).await
-        } else {
-            Err(CellaDockerError::ContainerNotFound {
-                workspace: format!("label={label}"),
-            })
-        }
+    ) -> Result<ContainerInfo, BackendError> {
+        debug!("Resolving container by label: {label}");
+        // Search all runtime containers (not just cella-managed ones).
+        client.find_container_by_label(label).await?.ok_or_else(|| {
+            BackendError::ContainerNotFound {
+                identifier: format!("label={label}"),
+            }
+        })
     }
 
     async fn find_by_workspace(
         &self,
-        client: &DockerClient,
+        client: &dyn ContainerBackend,
         folder: &Path,
-    ) -> Result<ContainerInfo, CellaDockerError> {
+    ) -> Result<ContainerInfo, BackendError> {
         client
             .find_container(folder)
             .await?
-            .ok_or_else(|| CellaDockerError::ContainerNotFound {
-                workspace: folder.display().to_string(),
+            .ok_or_else(|| BackendError::ContainerNotFound {
+                identifier: folder.display().to_string(),
             })
     }
 }
@@ -148,10 +134,6 @@ impl ContainerTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // ContainerTarget construction tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn container_target_default_fields_are_none() {

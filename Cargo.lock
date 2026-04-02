@@ -303,6 +303,7 @@ version = "0.0.14"
 dependencies = [
  "cella-network",
  "cella-port",
+ "cella-protocol",
  "nix 0.31.2",
  "notify",
  "rcgen",
@@ -322,9 +323,12 @@ name = "cella-backend"
 version = "0.0.14"
 dependencies = [
  "chrono",
+ "futures-util",
  "hex",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -344,6 +348,7 @@ dependencies = [
  "cella-network",
  "cella-orchestrator",
  "cella-port",
+ "cella-protocol",
  "cella-templates",
  "chrono",
  "clap",
@@ -425,6 +430,7 @@ name = "cella-daemon"
 version = "0.0.14"
 dependencies = [
  "cella-port",
+ "cella-protocol",
  "nix 0.31.2",
  "portable-pty",
  "serde_json",
@@ -459,12 +465,14 @@ dependencies = [
 name = "cella-doctor"
 version = "0.0.14"
 dependencies = [
+ "cella-backend",
  "cella-config",
  "cella-daemon",
  "cella-docker",
  "cella-env",
  "cella-orchestrator",
  "cella-port",
+ "cella-protocol",
  "serde",
  "serde_json",
  "tempfile",
@@ -487,7 +495,6 @@ name = "cella-features"
 version = "0.0.14"
 dependencies = [
  "base64 0.22.1",
- "bollard",
  "dirs",
  "flate2",
  "futures-util",
@@ -536,14 +543,14 @@ name = "cella-orchestrator"
 version = "0.0.14"
 dependencies = [
  "cella-backend",
+ "cella-compose",
  "cella-config",
- "cella-daemon",
- "cella-docker",
  "cella-env",
  "cella-features",
  "cella-git",
  "cella-network",
  "cella-port",
+ "cella-protocol",
  "hex",
  "serde_json",
  "sha2 0.11.0",

@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use cella_port::protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
+use cella_protocol::{AgentMessage, DaemonMessage, OutputStream, WorktreeOperationResult};
 use tokio::time::timeout;
 
 use crate::control::ControlClient;
@@ -386,7 +386,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  \u{2713} daemon reachable at {addr}");
             eprintln!(
                 "  \u{2713} protocol version: {} (matches)",
-                cella_port::protocol::PROTOCOL_VERSION
+                cella_protocol::PROTOCOL_VERSION
             );
 
             // 4. Version comparison
@@ -570,13 +570,13 @@ async fn run_down(
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::DownResult { result, .. } => match result {
-                cella_port::protocol::DownOperationResult::Success {
+                cella_protocol::DownOperationResult::Success {
                     outcome,
                     container_name,
                 } => {
                     let action = match outcome {
-                        cella_port::protocol::DownOutcome::Removed => "Removed",
-                        cella_port::protocol::DownOutcome::Stopped => "Stopped",
+                        cella_protocol::DownOutcome::Removed => "Removed",
+                        cella_protocol::DownOutcome::Stopped => "Stopped",
                     };
                     if container_name.is_empty() {
                         eprintln!("{action} branch '{branch}'");
@@ -585,7 +585,7 @@ async fn run_down(
                     }
                     return Ok(());
                 }
-                cella_port::protocol::DownOperationResult::Error { message } => {
+                cella_protocol::DownOperationResult::Error { message } => {
                     return Err(format!("Failed to stop branch '{branch}': {message}").into());
                 }
             },
@@ -694,14 +694,14 @@ async fn run_task_run(
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::TaskRunResult { result, .. } => match result {
-                cella_port::protocol::TaskRunOperationResult::Success {
+                cella_protocol::TaskRunOperationResult::Success {
                     task_id,
                     container_name,
                 } => {
                     eprintln!("Task '{task_id}' started in container {container_name}");
                     return Ok(());
                 }
-                cella_port::protocol::TaskRunOperationResult::Error { message } => {
+                cella_protocol::TaskRunOperationResult::Error { message } => {
                     return Err(format!("Failed to start task: {message}").into());
                 }
             },
@@ -729,9 +729,9 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{HEADER}");
                 for t in &tasks {
                     let status = match t.status {
-                        cella_port::protocol::TaskStatus::Running => "running",
-                        cella_port::protocol::TaskStatus::Done => "done",
-                        cella_port::protocol::TaskStatus::Failed => "failed",
+                        cella_protocol::TaskStatus::Running => "running",
+                        cella_protocol::TaskStatus::Done => "done",
+                        cella_protocol::TaskStatus::Failed => "failed",
                     };
                     let time = format!("{}s", t.elapsed_secs);
                     let cmd = t.command.join(" ");
@@ -919,7 +919,7 @@ fn restore_terminal(termios: &nix::sys::termios::Termios) {
     let _ = t::tcsetattr(&stdin, t::SetArg::TCSANOW, termios);
 }
 
-fn print_worktree_table(worktrees: &[cella_port::protocol::WorktreeEntry]) {
+fn print_worktree_table(worktrees: &[cella_protocol::WorktreeEntry]) {
     const HEADER: &str = "BRANCH               STATE      CONTAINER                      PATH";
     println!("{HEADER}");
     for wt in worktrees {
@@ -1446,21 +1446,21 @@ mod tests {
     #[test]
     fn print_worktree_table_does_not_panic() {
         let worktrees = vec![
-            cella_port::protocol::WorktreeEntry {
+            cella_protocol::WorktreeEntry {
                 branch: Some("main".to_string()),
                 worktree_path: "/home/user/project".to_string(),
                 is_main: true,
                 container_name: Some("project-main".to_string()),
                 container_state: Some("running".to_string()),
             },
-            cella_port::protocol::WorktreeEntry {
+            cella_protocol::WorktreeEntry {
                 branch: Some("feat/auth".to_string()),
                 worktree_path: "/home/user/project-auth".to_string(),
                 is_main: false,
                 container_name: None,
                 container_state: None,
             },
-            cella_port::protocol::WorktreeEntry {
+            cella_protocol::WorktreeEntry {
                 branch: None,
                 worktree_path: "/home/user/project-detached".to_string(),
                 is_main: false,

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use cella_docker::{
-    BuildOptions, DockerClient, ImageDetails, image_name, image_name_with_features,
+use cella_backend::{
+    BuildOptions, ContainerBackend, ImageDetails, image_name, image_name_with_features,
 };
 use cella_features::ResolvedFeatures;
 
@@ -25,7 +25,7 @@ pub fn compute_features_digest(config: &serde_json::Value) -> String {
 
 /// Context for building a features layer image.
 pub struct FeaturesLayerContext<'a> {
-    pub client: &'a DockerClient,
+    pub client: &'a dyn ContainerBackend,
     pub config: &'a serde_json::Value,
     pub workspace_root: &'a Path,
     pub config_name: Option<&'a str>,
@@ -78,17 +78,9 @@ pub async fn build_features_layer(
         ctx.resolved.build_context.display()
     );
     let start = std::time::Instant::now();
-    let progress = ctx.progress.clone();
     ctx.progress
         .println("  \x1b[36m▸\x1b[0m Building features layer...");
-    let result = ctx
-        .client
-        .build_image(&build_opts, |line| {
-            if !line.trim().is_empty() {
-                progress.println(&format!("      {line}"));
-            }
-        })
-        .await;
+    let result = ctx.client.build_image(&build_opts).await;
     let elapsed_str = format_elapsed(start.elapsed());
     match &result {
         Ok(_) => ctx.progress.println(&format!(
@@ -112,7 +104,7 @@ pub async fn build_features_layer(
 ///
 /// Returns an error if the image pull/build or feature resolution fails.
 pub async fn ensure_image(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     config: &serde_json::Value,
     workspace_root: &Path,
     config_name: Option<&str>,
@@ -159,7 +151,7 @@ pub async fn ensure_image(
 
 /// Pull or build the base image and return its tag.
 async fn resolve_base_image(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     config: &serde_json::Value,
     workspace_root: &Path,
     config_name: Option<&str>,
@@ -177,15 +169,8 @@ async fn resolve_base_image(
         let img_name = image_name(workspace_root, config_name);
         let build_opts = parse_build_options(build, &img_name, workspace_root, no_cache);
         let start = std::time::Instant::now();
-        let progress_clone = progress.clone();
         progress.println("  \x1b[36m▸\x1b[0m Building Dockerfile...");
-        let result = client
-            .build_image(&build_opts, |line| {
-                if !line.trim().is_empty() {
-                    progress_clone.println(&format!("      {line}"));
-                }
-            })
-            .await;
+        let result = client.build_image(&build_opts).await;
         let elapsed_str = format_elapsed(start.elapsed());
         match &result {
             Ok(_) => {
@@ -204,7 +189,7 @@ async fn resolve_base_image(
 
 /// Inputs for resolving and building the features layer image.
 struct FeaturesBuildInput<'a> {
-    client: &'a DockerClient,
+    client: &'a dyn ContainerBackend,
     config: &'a serde_json::Value,
     config_path: &'a Path,
     workspace_root: &'a Path,
@@ -220,9 +205,13 @@ async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
     info!("Resolving devcontainer features...");
-    let platform = cella_features::oci::detect_platform(input.client.inner())
+    let backend_platform = input
+        .client
+        .detect_platform()
         .await
         .map_err(|e| format!("platform detection failed: {e}"))?;
+    let platform =
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
     let cache = cella_features::FeatureCache::new();
 
     let resolved = cella_features::resolve_features(

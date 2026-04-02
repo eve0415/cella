@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::debug;
 
-use cella_docker::{ContainerTarget, InteractiveExecOptions};
+use cella_backend::{ContainerTarget, InteractiveExecOptions};
 
 use crate::picker;
 
@@ -36,8 +36,11 @@ pub struct ShellArgs {
 }
 
 impl ShellArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let target = ContainerTarget {
             container_id: self.container_id,
@@ -47,11 +50,12 @@ impl ShellArgs {
         };
 
         let has_explicit = picker::has_explicit_target(&target);
-        let container = match target.resolve(&client, true).await {
+        let container = match target.resolve(client.as_ref(), true).await {
             Ok(c) => c,
             Err(_) if !has_explicit => {
-                let containers = client.list_cella_containers(true).await?;
+                let containers = client.as_ref().list_cella_containers(true).await?;
                 let cwd_container = client
+                    .as_ref()
                     .find_container(&std::env::current_dir()?)
                     .await
                     .ok()
@@ -66,7 +70,8 @@ impl ShellArgs {
             Err(e) => return Err(e.into()),
         };
         let container =
-            super::resolve_service_container(&client, container, self.service.as_deref()).await?;
+            super::resolve_service_container(client.as_ref(), container, self.service.as_deref())
+                .await?;
 
         super::ensure_cella_daemon().await;
 
@@ -90,14 +95,19 @@ impl ShellArgs {
         let shell = if let Some(s) = self.shell {
             s
         } else {
-            super::shell_detect::detect_shell(&client, &container.id, &user).await
+            cella_orchestrator::shell_detect::detect_shell(client.as_ref(), &container.id, &user)
+                .await
         };
 
         debug!("Using shell: {shell}");
 
         // Build environment: probed env (merged with label env) + terminal env
-        let base_env = if let Some(probed) =
-            super::env_cache::read_probed_env_cache(&client, &container.id, &user).await
+        let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
+            client.as_ref(),
+            &container.id,
+            &user,
+        )
+        .await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
         } else {
@@ -106,7 +116,13 @@ impl ShellArgs {
         let mut env = base_env;
 
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
-        super::env_cache::ensure_ssh_auth_sock(&client, &container.id, &user, &mut env).await;
+        cella_orchestrator::env_cache::ensure_ssh_auth_sock(
+            client.as_ref(),
+            &container.id,
+            &user,
+            &mut env,
+        )
+        .await;
 
         for var in super::TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
@@ -115,6 +131,7 @@ impl ShellArgs {
         }
 
         let exit_code = client
+            .as_ref()
             .exec_interactive(
                 &container.id,
                 &InteractiveExecOptions {

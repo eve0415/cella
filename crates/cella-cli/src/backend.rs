@@ -33,7 +33,7 @@ impl BackendChoice {
 pub fn resolve_backend(
     choice: Option<&BackendChoice>,
     docker_host: Option<&str>,
-) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
+) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
     match choice {
         Some(BackendChoice::Docker) => connect_docker_backend(docker_host),
         #[cfg(target_os = "macos")]
@@ -44,10 +44,20 @@ pub fn resolve_backend(
 
 fn auto_detect(
     docker_host: Option<&str>,
-) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
-    // Docker is highest priority
-    if let Ok(client) = connect_docker_backend(docker_host) {
-        return Ok(client);
+) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    // Docker is highest priority.
+    // connect_docker_backend checks socket existence during discovery,
+    // so a successful connect means a socket was found (though the daemon
+    // may not be responding — that's caught later by ping() in commands).
+    match connect_docker_backend(docker_host) {
+        Ok(client) => return Ok(client),
+        Err(e) => {
+            // If the user explicitly targeted a Docker host, don't silently
+            // fall back to a different backend — fail with the Docker error.
+            if docker_host.is_some() {
+                return Err(e);
+            }
+        }
     }
 
     // Apple Container is lowest priority fallback (macOS only)
@@ -64,7 +74,7 @@ fn auto_detect(
 
 fn connect_docker_backend(
     docker_host: Option<&str>,
-) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
+) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
     let client = docker_host.map_or_else(DockerClient::connect, |host| {
         DockerClient::connect_with_host(host)
     })?;
@@ -126,8 +136,8 @@ mod tests {
 }
 
 #[cfg(target_os = "macos")]
-fn connect_apple_container_backend() -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>>
-{
+fn connect_apple_container_backend()
+-> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
     let cli = cella_container::discovery::discover()
         .ok_or("Apple Container CLI not found. Install from https://github.com/apple/container")?;
 

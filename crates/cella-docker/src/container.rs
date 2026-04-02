@@ -11,7 +11,7 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
-pub use cella_backend::{BackendKind, ContainerInfo, ContainerState, MountInfo, PortBinding};
+use cella_backend::{BackendKind, ContainerInfo, ContainerState, MountInfo, PortBinding};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
@@ -420,7 +420,7 @@ mod tests {
     use bollard::models::{
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
-    use cella_backend::{ComposeBackend, ContainerBackend};
+    use cella_backend::ContainerBackend;
 
     use super::*;
     use crate::client::mock::{MockCall, MockDockerClient};
@@ -1232,10 +1232,7 @@ mod tests {
             .unwrap()
             .push_back(Ok(None));
 
-        let result = mock
-            .find_compose_container("my-project", "web")
-            .await
-            .unwrap();
+        let result = mock.find_compose_container("my-project", "web").unwrap();
         assert!(result.is_none());
 
         let calls = mock.get_calls();
@@ -1253,7 +1250,6 @@ mod tests {
 
         let result = mock
             .find_compose_container("my-project", "web")
-            .await
             .unwrap()
             .unwrap();
         assert_eq!(result.id, "comp-1");
@@ -1268,7 +1264,7 @@ mod tests {
             .unwrap()
             .push_back(Ok(Vec::new()));
 
-        let result = mock.list_compose_containers("my-project").await.unwrap();
+        let result = mock.list_compose_containers("my-project").unwrap();
         assert!(result.is_empty());
     }
 
@@ -1284,7 +1280,7 @@ mod tests {
             .unwrap()
             .push_back(Ok(containers));
 
-        let result = mock.list_compose_containers("proj").await.unwrap();
+        let result = mock.list_compose_containers("proj").unwrap();
         assert_eq!(result.len(), 2);
     }
 

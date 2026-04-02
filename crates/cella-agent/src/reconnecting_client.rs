@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use cella_port::CellaPortError;
-use cella_port::protocol::{AgentMessage, DaemonHello, DaemonMessage};
+use cella_protocol::{AgentMessage, DaemonHello, DaemonMessage};
 use tracing::{debug, info, warn};
 
 use crate::control::ControlClient;

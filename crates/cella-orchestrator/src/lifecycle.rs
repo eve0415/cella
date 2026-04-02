@@ -5,8 +5,8 @@
 
 use tracing::debug;
 
-use cella_docker::{
-    CellaDockerError, DockerClient, ExecOptions, LifecycleContext, run_lifecycle_phase,
+use cella_backend::{
+    BackendError, ContainerBackend, ExecOptions, LifecycleContext, run_lifecycle_phase,
 };
 
 use crate::progress::{ProgressSender, format_elapsed};
@@ -63,7 +63,7 @@ pub async fn run_config_phase_with_output(
     phase: &str,
     cmd: &serde_json::Value,
     progress: &ProgressSender,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     let label = format!("Running the {phase} from devcontainer.json...");
     let start = std::time::Instant::now();
     progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
@@ -89,7 +89,7 @@ pub async fn run_lifecycle_entries(
     phase: &str,
     entries: &[cella_features::LifecycleEntry],
     progress: &ProgressSender,
-) -> Result<(), CellaDockerError> {
+) -> Result<(), BackendError> {
     for entry in entries {
         let label = format!("Running the {phase} from {}...", entry.origin);
         let start = std::time::Instant::now();
@@ -142,7 +142,7 @@ pub async fn run_all_lifecycle_phases(
 
 /// Store the workspace content hash inside the container for future change detection.
 pub async fn write_content_hash(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
     workspace_root: &std::path::Path,

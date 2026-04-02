@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use clap::Args;
 use serde_json::json;
 
+use cella_backend::{ContainerInfo, ContainerState};
 use cella_compose::discovery;
-use cella_docker::{ContainerInfo, ContainerState};
 
 /// List all dev containers managed by cella.
 #[derive(Args)]
@@ -23,8 +23,11 @@ pub struct ListArgs {
 }
 
 impl ListArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         let containers = client.list_cella_containers(self.running).await?;
 
@@ -216,6 +219,8 @@ fn print_json(containers: &[ContainerInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use cella_backend::{BackendKind, PortBinding};
+
     use super::*;
 
     #[test]
@@ -308,7 +313,7 @@ mod tests {
 
     // ── format_ports ────────────────────────────────────────────────
 
-    fn make_container(ports: Vec<cella_docker::PortBinding>) -> ContainerInfo {
+    fn make_container(ports: Vec<PortBinding>) -> ContainerInfo {
         ContainerInfo {
             id: "abc".into(),
             name: "test".into(),
@@ -321,7 +326,7 @@ mod tests {
             image: None,
             mounts: vec![],
             exit_code: None,
-            backend: cella_docker::BackendKind::Docker,
+            backend: BackendKind::Docker,
         }
     }
 
@@ -333,7 +338,7 @@ mod tests {
 
     #[test]
     fn format_ports_with_host_port() {
-        let info = make_container(vec![cella_docker::PortBinding {
+        let info = make_container(vec![PortBinding {
             container_port: 8080,
             host_port: Some(3000),
             protocol: "tcp".into(),
@@ -343,7 +348,7 @@ mod tests {
 
     #[test]
     fn format_ports_without_host_port() {
-        let info = make_container(vec![cella_docker::PortBinding {
+        let info = make_container(vec![PortBinding {
             container_port: 5432,
             host_port: None,
             protocol: "tcp".into(),
@@ -354,12 +359,12 @@ mod tests {
     #[test]
     fn format_ports_multiple() {
         let info = make_container(vec![
-            cella_docker::PortBinding {
+            PortBinding {
                 container_port: 80,
                 host_port: Some(8080),
                 protocol: "tcp".into(),
             },
-            cella_docker::PortBinding {
+            PortBinding {
                 container_port: 443,
                 host_port: Some(8443),
                 protocol: "tcp".into(),
@@ -431,12 +436,12 @@ mod tests {
     #[test]
     fn format_ports_mixed_host_ports() {
         let info = make_container(vec![
-            cella_docker::PortBinding {
+            PortBinding {
                 container_port: 80,
                 host_port: Some(8080),
                 protocol: "tcp".into(),
             },
-            cella_docker::PortBinding {
+            PortBinding {
                 container_port: 443,
                 host_port: None,
                 protocol: "tcp".into(),

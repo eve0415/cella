@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use cella_port::allocation::PortAllocationTable;
-use cella_port::protocol::{OnAutoForward, PortAttributes, PortProtocol};
+use cella_protocol::{OnAutoForward, PortAttributes, PortProtocol};
 use tracing::{info, warn};
 
 use crate::proxy::ProxyHandle;
@@ -306,7 +306,7 @@ impl ForwardedPortInfo {
 
 #[cfg(test)]
 mod tests {
-    use cella_port::protocol::PortPattern;
+    use cella_protocol::PortPattern;
 
     use super::*;
 

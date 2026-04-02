@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cella_port::protocol::{
+use cella_protocol::{
     ContainerSummary, ForwardedPortDetail, ManagementRequest, ManagementResponse, PortAttributes,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -274,7 +274,7 @@ async fn handle_register(
             pm.handle_port_open(
                 &reg.container_id,
                 fwd_port,
-                cella_port::protocol::PortProtocol::Tcp,
+                cella_protocol::PortProtocol::Tcp,
                 None,
             );
         }

@@ -232,7 +232,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_git(&ctx).await;
         assert_eq!(report.name, "Git & Credentials");
@@ -243,7 +244,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_git(&ctx).await;
         let has_ssh = report.checks.iter().any(|c| c.name == "SSH agent");
@@ -255,7 +257,8 @@ mod tests {
         let ctx = CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         };
         let report = check_git(&ctx).await;
         let has_git = report.checks.iter().any(|c| c.name == "git");

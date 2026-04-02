@@ -100,7 +100,7 @@ pub mod mock {
     use std::sync::Mutex;
 
     use cella_backend::{
-        BackendError, BackendKind, BoxFuture, BuildOptions, ComposeBackend, ContainerBackend,
+        BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
         ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
         InteractiveExecOptions,
     };
@@ -225,6 +225,13 @@ pub mod mock {
             BackendKind::Docker
         }
 
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                compose: true,
+                managed_agent: true,
+            }
+        }
+
         fn find_container<'a>(
             &'a self,
             workspace_root: &'a Path,
@@ -323,6 +330,21 @@ pub mod mock {
                 .pop_front()
                 .expect("MockDockerClient: no list_cella_containers response configured");
             Box::pin(async move { result })
+        }
+
+        fn find_compose_service<'a>(
+            &'a self,
+            project: &'a str,
+            service: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async move { self.find_compose_container(project, service) })
+        }
+
+        fn find_container_by_label<'a>(
+            &'a self,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
         }
 
         fn container_logs<'a>(
@@ -492,41 +514,147 @@ pub mod mock {
                 .expect("MockDockerClient: no upload_files response configured");
             Box::pin(async move { result })
         }
+
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn host_gateway(&self) -> &'static str {
+            "host.docker.internal"
+        }
+
+        fn detect_platform(&self) -> BoxFuture<'_, Result<cella_backend::Platform, BackendError>> {
+            Box::pin(async {
+                Ok(cella_backend::Platform {
+                    os: "linux".to_string(),
+                    arch: "amd64".to_string(),
+                })
+            })
+        }
+
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            Box::pin(async { Ok("x86_64".to_string()) })
+        }
+
+        fn inspect_image_env<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn inspect_image_user<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            Box::pin(async { Ok("root".to_string()) })
+        }
+
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn ensure_container_network<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _repo_path: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_container_ip<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _version: &'a str,
+            _arch: &'a str,
+            _skip_checksum: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn write_agent_addr<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _addr: &'a str,
+            _token: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            ("cella-agent".to_string(), "/cella".to_string(), true)
+        }
+
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _current_version: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_remote_user_uid<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _remote_user: &'a str,
+            _workspace_root: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
-    impl ComposeBackend for MockDockerClient {
-        fn find_compose_container<'a>(
-            &'a self,
-            project_name: &'a str,
-            service_name: &'a str,
-        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+    impl MockDockerClient {
+        /// Find a compose container by project and service name.
+        ///
+        /// # Errors
+        ///
+        /// Returns `BackendError` from the pre-configured response queue.
+        ///
+        /// # Panics
+        ///
+        /// Panics if no response has been configured for this call.
+        pub fn find_compose_container(
+            &self,
+            project_name: &str,
+            service_name: &str,
+        ) -> Result<Option<ContainerInfo>, BackendError> {
             self.record(MockCall::FindComposeContainer {
                 project_name: project_name.to_string(),
                 service_name: service_name.to_string(),
             });
-            let result = self
-                .find_compose_container_responses
+            self.find_compose_container_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("MockDockerClient: no find_compose_container response configured");
-            Box::pin(async move { result })
+                .expect("MockDockerClient: no find_compose_container response configured")
         }
 
-        fn list_compose_containers<'a>(
-            &'a self,
-            project_name: &'a str,
-        ) -> BoxFuture<'a, Result<Vec<ContainerInfo>, BackendError>> {
+        /// List compose containers by project name.
+        ///
+        /// # Errors
+        ///
+        /// Returns `BackendError` from the pre-configured response queue.
+        ///
+        /// # Panics
+        ///
+        /// Panics if no response has been configured for this call.
+        pub fn list_compose_containers(
+            &self,
+            project_name: &str,
+        ) -> Result<Vec<ContainerInfo>, BackendError> {
             self.record(MockCall::ListComposeContainers {
                 project_name: project_name.to_string(),
             });
-            let result = self
-                .list_compose_containers_responses
+            self.list_compose_containers_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("MockDockerClient: no list_compose_containers response configured");
-            Box::pin(async move { result })
+                .expect("MockDockerClient: no list_compose_containers response configured")
         }
     }
 }

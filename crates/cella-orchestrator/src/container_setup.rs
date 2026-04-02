@@ -1,11 +1,11 @@
 //! Container setup helpers extracted from the CLI `up` command.
 //!
-//! These are pure business-logic functions that operate on a [`DockerClient`]
+//! These are pure business-logic functions that operate on a [`ContainerBackend`]
 //! and devcontainer config values. They have no CLI or progress-reporting
 //! dependencies.
 
-use cella_docker::{
-    CellaDockerError, ContainerState, DockerClient, ExecOptions, ExecResult, FileToUpload,
+use cella_backend::{
+    BackendError, ContainerBackend, ContainerState, ExecOptions, ExecResult, FileToUpload,
 };
 use tracing::{debug, info, warn};
 
@@ -100,7 +100,7 @@ pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Convert [`cella_env::FileUpload`] items to [`cella_docker::FileToUpload`].
+/// Convert [`cella_env::FileUpload`] items to [`cella_backend::FileToUpload`].
 pub fn convert_uploads(uploads: &[cella_env::FileUpload]) -> Vec<FileToUpload> {
     uploads
         .iter()
@@ -134,56 +134,26 @@ pub fn resolve_remote_user(
 
 // ── Container verification ────────────────────────────────────────────────
 
-/// Verify that a container is in the `Running` state. Returns the Docker
+/// Verify that a container is in the `Running` state. Returns a backend
 /// error (with log tail) if it has already exited.
 ///
 /// # Errors
 ///
 /// Returns an error if the container is not running.
 pub async fn verify_container_running(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = client.inspect_container(container_id).await?;
     if info.state != ContainerState::Running {
         let logs = client.container_logs(container_id, 20).await?;
-        return Err(CellaDockerError::ContainerExitedImmediately {
+        return Err(BackendError::ContainerExitedImmediately {
             exit_code: info.exit_code.unwrap_or(-1),
             logs_tail: logs,
         }
         .into());
     }
     Ok(())
-}
-
-// ── Daemon env query ──────────────────────────────────────────────────────
-
-/// Query the daemon for control port and auth token, returning env vars to
-/// inject into the container.
-pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
-    if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
-        && mgmt_sock.exists()
-    {
-        let status_resp = cella_daemon::management::send_management_request(
-            &mgmt_sock,
-            &cella_port::protocol::ManagementRequest::QueryStatus,
-        )
-        .await;
-
-        if let Ok(cella_port::protocol::ManagementResponse::Status {
-            control_port,
-            control_token,
-            ..
-        }) = &status_resp
-        {
-            return vec![
-                format!("CELLA_DAEMON_ADDR=host.docker.internal:{control_port}"),
-                format!("CELLA_DAEMON_TOKEN={control_token}"),
-                format!("CELLA_CONTAINER_NAME={container_nm}"),
-            ];
-        }
-    }
-    vec![]
 }
 
 // ── In-container operation helpers ────────────────────────────────────────
@@ -194,11 +164,11 @@ pub async fn query_daemon_env(container_nm: &str) -> Vec<String> {
 ///
 /// Returns an error if the exec fails.
 pub async fn mkdir_in_container(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     dir: &str,
     mode: u32,
-) -> Result<ExecResult, CellaDockerError> {
+) -> Result<ExecResult, BackendError> {
     client
         .exec_command(
             container_id,
@@ -218,7 +188,7 @@ pub async fn mkdir_in_container(
 
 /// Recursively chown a directory inside the container.
 pub async fn chown_in_container(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     dir: &str,
@@ -245,7 +215,7 @@ pub async fn chown_in_container(
 ///
 /// Returns `true` on success, `false` on any step failure.
 pub async fn upload_to_container(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     dir: &str,
@@ -268,7 +238,7 @@ pub async fn upload_to_container(
 
 /// Check if a config already exists in the container (runs a test command).
 pub async fn config_exists_in_container(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     check_cmd: &[String],
@@ -295,7 +265,7 @@ pub async fn config_exists_in_container(
 /// commands. Never fails -- individual steps log warnings and are skipped
 /// on error.
 pub async fn inject_post_start(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     post_start: &cella_env::PostStartInjection,
     remote_user: &str,
@@ -340,7 +310,7 @@ pub async fn inject_post_start(
 
 /// Upload SSH config files to the container's `.ssh` directory.
 async fn upload_ssh_files(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     uploads: &[cella_env::FileUpload],
     remote_user: &str,
@@ -365,7 +335,7 @@ async fn upload_ssh_files(
 
 /// Apply git config commands inside the container.
 async fn apply_git_config(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     commands: &[Vec<String>],
     remote_user: &str,
@@ -404,7 +374,11 @@ async fn apply_git_config(
 ///
 /// This makes the `cella` CLI (symlinked to the agent binary) discoverable
 /// by users and AI agents running inside the container.
-pub async fn inject_cella_path(client: &DockerClient, container_id: &str, remote_user: &str) {
+pub async fn inject_cella_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
     let snippet = r#"
 # cella CLI (in-container worktree commands)
 if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then
@@ -445,7 +419,7 @@ fi
 /// `config.yml` into the container. Skips silently if gh is not
 /// installed/authenticated or if credentials already exist in the container.
 pub async fn seed_gh_credentials(
-    client: &DockerClient,
+    client: &dyn ContainerBackend,
     container_id: &str,
     workspace_root: &std::path::Path,
     remote_user: &str,

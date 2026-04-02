@@ -43,8 +43,8 @@ pub fn discover_config(flags: &CommonFeatureFlags) -> Result<PathBuf, Box<dyn st
         return Ok(file.clone());
     }
 
-    cella_config::discover::config(&workspace).map_err(|e| {
-        if matches!(e, cella_config::discover::Error::NotFound) {
+    cella_config::devcontainer::discover::config(&workspace).map_err(|e| {
+        if matches!(e, cella_config::devcontainer::discover::Error::NotFound) {
             format!("{e}\nhint: run 'cella init' to create a devcontainer configuration").into()
         } else {
             Box::new(e) as Box<dyn std::error::Error>

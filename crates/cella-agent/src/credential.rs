@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 
 use cella_port::CellaPortError;
-use cella_port::protocol::{AgentMessage, DaemonMessage};
+use cella_protocol::{AgentMessage, DaemonMessage};
 
 use crate::control::ControlClient;
 

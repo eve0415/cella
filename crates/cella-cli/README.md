@@ -34,6 +34,8 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `ports` | View port forwarding status for dev containers |
 | `credential` | Manage credential forwarding for dev containers |
 | `network` | Manage network proxy settings for dev containers |
+| `features` | Manage devcontainer features (edit, list, update) |
+| `completions` | Generate shell completions |
 | `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
 
 Hidden internal commands: `daemon`.
@@ -81,13 +83,19 @@ Hidden internal commands: `daemon`.
 | `commands/network.rs` | Network proxy management |
 | `commands/env_cache.rs` | Environment cache management (internal helper) |
 | `commands/image.rs` | Image inspection (internal helper) |
+| `commands/completions.rs` | Shell completion generation |
+| `commands/features/` | Feature management (mod.rs, edit.rs, jsonc_edit.rs, list.rs, prompts.rs, resolve.rs, update.rs) |
 | `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
+| `picker.rs` | Interactive selection picker |
+| `progress.rs` | Progress reporting (indicatif spinners, verbosity) |
+| `style.rs` | Output styling and colors |
+| `table.rs` | Table formatting for list output |
 
 Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container) (macOS), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port), [cella-templates](../cella-templates)
 
 **Depended on by:** none (top of the dependency tree)
 

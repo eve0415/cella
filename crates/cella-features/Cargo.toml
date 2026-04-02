@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
-bollard.workspace = true
 dirs = "6.0.0"
 futures-util.workspace = true
 flate2 = "1.1.9"

@@ -30,30 +30,36 @@ pub async fn check_system(ctx: &CheckContext) -> CategoryReport {
         fix_hint: None,
     });
 
-    // Docker runtime
-    let runtime = cella_env::platform::detect_runtime();
-    checks.push(CheckResult {
-        name: "docker runtime".into(),
-        severity: Severity::Info,
-        detail: format!("{runtime}"),
-        fix_hint: None,
-    });
+    // Backend info — only show Docker runtime/version for Docker backend
+    let is_docker = ctx
+        .backend_kind
+        .as_ref()
+        .is_none_or(|k| *k == cella_backend::BackendKind::Docker);
 
-    // Docker version
-    let docker_version = if let Some(ref client) = ctx.docker_client {
-        match client.inner().version().await {
-            Ok(ver) => ver.version.unwrap_or_else(|| "unknown".into()),
-            Err(_) => docker_cli_version().await,
-        }
-    } else {
-        docker_cli_version().await
-    };
-    checks.push(CheckResult {
-        name: "docker version".into(),
-        severity: Severity::Info,
-        detail: docker_version,
-        fix_hint: None,
-    });
+    if is_docker {
+        let runtime = cella_env::platform::detect_runtime();
+        checks.push(CheckResult {
+            name: "docker runtime".into(),
+            severity: Severity::Info,
+            detail: format!("{runtime}"),
+            fix_hint: None,
+        });
+
+        let docker_version = docker_cli_version().await;
+        checks.push(CheckResult {
+            name: "docker version".into(),
+            severity: Severity::Info,
+            detail: docker_version,
+            fix_hint: None,
+        });
+    } else if let Some(ref kind) = ctx.backend_kind {
+        checks.push(CheckResult {
+            name: "backend".into(),
+            severity: Severity::Info,
+            detail: format!("{kind}"),
+            fix_hint: None,
+        });
+    }
 
     // Shell
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
@@ -111,7 +117,8 @@ mod tests {
         CheckContext {
             workspace_folder: None,
             all: false,
-            docker_client: None,
+            backend_kind: None,
+            backend_client: None,
         }
     }
 

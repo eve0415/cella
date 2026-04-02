@@ -1,0 +1,574 @@
+//! Docker Compose orchestration for `cella up` when `dockerComposeFile` is present.
+//!
+//! This module contains the core compose pipeline logic. CLI-specific operations
+//! (daemon management, agent launch, output formatting) are injected via the
+//! [`ComposeUpHooks`] trait.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+
+use tracing::{debug, info, warn};
+
+use cella_backend::{
+    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, run_lifecycle_phase,
+};
+use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig};
+
+use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
+use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
+use crate::progress::ProgressSender;
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for a compose up invocation.
+pub struct ComposeUpConfig<'a> {
+    /// Parsed devcontainer JSON.
+    pub config: &'a serde_json::Value,
+    /// Path to devcontainer.json.
+    pub config_path: &'a Path,
+    /// Workspace root on the host.
+    pub workspace_root: &'a Path,
+    /// Container name for daemon registration.
+    pub container_name: &'a str,
+    /// Extra environment variables to inject (`KEY=VALUE` format).
+    pub remote_env: &'a [String],
+    /// Whether to tear down and recreate existing containers.
+    pub remove_container: bool,
+    /// Whether to rebuild with `--no-cache`.
+    pub build_no_cache: bool,
+    /// Skip agent checksum verification.
+    pub skip_checksum: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Result
+// ---------------------------------------------------------------------------
+
+/// Result of a compose up operation.
+pub struct ComposeUpResult {
+    /// Container ID of the primary service.
+    pub container_id: String,
+    /// Remote user for the container.
+    pub remote_user: String,
+    /// Workspace folder path inside the container.
+    pub workspace_folder: String,
+    /// Whether the container was freshly created or already running.
+    pub outcome: ComposeUpOutcome,
+}
+
+/// Whether the compose container was created fresh or was already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeUpOutcome {
+    /// Container was freshly created via compose up.
+    Created,
+    /// Container was already running; only postAttachCommand ran.
+    Running,
+}
+
+// ---------------------------------------------------------------------------
+// Hooks for CLI-specific operations
+// ---------------------------------------------------------------------------
+
+/// Callbacks for operations that live outside the orchestrator's dependency
+/// graph (daemon management, agent launch, etc.).
+pub trait ComposeUpHooks: Send + Sync {
+    /// Ensure the daemon is running and return env vars to inject.
+    fn daemon_env<'a>(
+        &'a self,
+        container_name: &'a str,
+        host_gateway: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
+
+    /// Register a container with the daemon for port management.
+    fn register_container<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        config: &'a serde_json::Value,
+        container_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Launch the cella-agent as a background process in the container.
+    fn launch_agent<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        agent_arch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Run container setup after creation (UID update, env injection,
+    /// credentials, tool installation, userEnvProbe).
+    fn post_create_setup<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        remote_user: &'a str,
+        config: &'a serde_json::Value,
+        workspace_root: &'a Path,
+        remote_env: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
+}
+
+// ---------------------------------------------------------------------------
+// Internal context — bundles repeated arguments for sub-functions
+// ---------------------------------------------------------------------------
+
+struct Ctx<'a> {
+    client: &'a dyn ContainerBackend,
+    cfg: &'a ComposeUpConfig<'a>,
+    hooks: &'a dyn ComposeUpHooks,
+    progress: &'a ProgressSender,
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
+/// Run the Docker Compose orchestration flow.
+///
+/// # Errors
+///
+/// Returns an error if any step of the compose pipeline fails.
+pub async fn compose_up(
+    client: &dyn ContainerBackend,
+    cfg: &ComposeUpConfig<'_>,
+    hooks: &dyn ComposeUpHooks,
+    progress: ProgressSender,
+) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+    let ctx = Ctx {
+        client,
+        cfg,
+        hooks,
+        progress: &progress,
+    };
+    let config = cfg.config;
+
+    // 1. Build ComposeProject from resolved config
+    let project = ComposeProject::from_resolved(config, cfg.config_path, cfg.workspace_root)?;
+
+    info!(
+        "Compose project: {} (primary service: {})",
+        project.project_name, project.primary_service
+    );
+
+    // 2. Validate primary service exists in compose files
+    run_step_result(&progress, "Validating compose configuration...", async {
+        cella_compose::parse::validate_primary_service(
+            &project.compose_files,
+            &project.primary_service,
+        )?;
+        if let Some(ref run_services) = project.run_services {
+            cella_compose::parse::validate_run_services(&project.compose_files, run_services)?;
+        }
+        Ok::<(), cella_compose::CellaComposeError>(())
+    })
+    .await?;
+
+    // 3. Run initializeCommand on host (runs every invocation per spec)
+    if let Some(init_cmd) = config.get("initializeCommand") {
+        run_host_command("initializeCommand", init_cmd)?;
+    }
+
+    // 4. Check for existing compose project
+    let existing =
+        find_compose_container(client, &project.project_name, &project.primary_service).await?;
+
+    if let Some(ref container) = existing {
+        if let Some(old_hash) = &container.config_hash
+            && *old_hash != project.config_hash
+            && !cfg.remove_container
+        {
+            progress.warn("Config or compose files changed since last up.");
+            progress.hint("Run `cella up --rebuild` to recreate.");
+        }
+
+        if container.state == ContainerState::Running
+            && !cfg.remove_container
+            && !cfg.build_no_cache
+        {
+            info!("Compose project already running, running postAttachCommand only");
+            return handle_compose_running(&ctx, &project, container).await;
+        }
+
+        if cfg.remove_container || cfg.build_no_cache {
+            run_step_result(&progress, "Stopping existing compose project...", async {
+                let compose_cmd = ComposeCommand::from_project_name(&project.project_name);
+                compose_cmd.down().await
+            })
+            .await?;
+        }
+    }
+
+    // 5-13. Prepare environment, write override, start services
+    let (remote_user, resolved_features, agent_arch) = prepare_and_start(&ctx, &project).await?;
+
+    // 14-20. Post-start: find container, setup, lifecycle, output
+    finalize_compose(
+        &ctx,
+        &project,
+        &remote_user,
+        resolved_features.as_ref(),
+        &agent_arch,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Prepare and start (steps 5-13)
+// ---------------------------------------------------------------------------
+
+/// Prepare environment, write override YAML, and start compose services.
+async fn prepare_and_start(
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
+{
+    let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
+    let config = cfg.config;
+
+    if !client.capabilities().compose {
+        return Err(format!(
+            "selected backend '{}' does not support Docker Compose devcontainers",
+            client.kind()
+        )
+        .into());
+    }
+
+    // 5. Check Docker Compose version supports additional_contexts (>= 2.17.0)
+    cella_compose::check_compose_features_support().await?;
+
+    // 6. Resolve features via combined-Dockerfile approach (if features configured)
+    let features_build = crate::compose_features::resolve_compose_features(
+        client,
+        config,
+        cfg.config_path,
+        project,
+        progress,
+    )
+    .await?;
+
+    // 6b. Get daemon env vars via hook
+    let daemon_env = hooks
+        .daemon_env(cfg.container_name, client.host_gateway())
+        .await;
+
+    // 7. Detect container architecture and ensure agent volume is populated
+    let agent_arch = client.detect_container_arch().await.unwrap_or_else(|e| {
+        warn!("Failed to detect container arch, defaulting to x86_64: {e}");
+        "x86_64".to_string()
+    });
+
+    let (agent_vol_name, agent_vol_target, _) = if client.capabilities().managed_agent {
+        let version = env!("CARGO_PKG_VERSION");
+        run_step_result(progress, "Preparing agent volume...", async {
+            client
+                .ensure_agent_provisioned(version, &agent_arch, cfg.skip_checksum)
+                .await
+        })
+        .await?;
+        client.agent_volume_mount()
+    } else {
+        (String::new(), String::new(), true)
+    };
+
+    // 8. Resolve remote user from config
+    let remote_user = resolve_remote_user(config, None, "root");
+    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+
+    // 9. Build extra environment variables
+    let mut extra_env = daemon_env;
+    for e in &env_fwd.env {
+        extra_env.push(format!("{}={}", e.key, e.value));
+    }
+    for e in cfg.remote_env {
+        extra_env.push(e.clone());
+    }
+
+    // 10. Build labels for the primary service
+    let labels = build_compose_labels(cfg, project, &remote_user);
+
+    // 11. Generate and write override YAML
+    let override_config = OverrideConfig {
+        primary_service: project.primary_service.clone(),
+        image_override: features_build
+            .as_ref()
+            .and_then(|b| b.image_name_override.clone()),
+        override_command: project.override_command,
+        agent_volume_name: agent_vol_name,
+        agent_volume_target: agent_vol_target,
+        extra_env,
+        extra_labels: labels,
+        build_dockerfile: features_build
+            .as_ref()
+            .map(|b| b.combined_dockerfile.clone()),
+        build_target: features_build.as_ref().map(|b| b.build_target.clone()),
+        build_context: features_build
+            .as_ref()
+            .and_then(|b| b.build_context.clone()),
+        additional_contexts: features_build
+            .as_ref()
+            .map(|b| b.additional_contexts.clone())
+            .unwrap_or_default(),
+    };
+    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
+    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    debug!(
+        "Override file written to: {}",
+        project.override_file.display()
+    );
+
+    // 12. Run docker compose build (always when features present, or if --build-no-cache)
+    let compose_cmd = ComposeCommand::new(project);
+    if features_build.is_some() || cfg.build_no_cache {
+        run_step_result(
+            progress,
+            "Building compose services...",
+            compose_cmd.build(None),
+        )
+        .await?;
+    }
+
+    // 13. docker compose up -d (idempotent)
+    run_step_result(progress, "Starting compose services...", async {
+        compose_cmd.up(project.run_services.as_deref(), false).await
+    })
+    .await?;
+
+    let resolved_features = features_build.map(|b| b.resolved_features);
+    Ok((remote_user, resolved_features, agent_arch))
+}
+
+// ---------------------------------------------------------------------------
+// Finalize (steps 14-20)
+// ---------------------------------------------------------------------------
+
+/// Find primary container, run post-create setup, lifecycle phases, and
+/// return the result.
+async fn finalize_compose(
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+    remote_user: &str,
+    resolved_features: Option<&cella_features::ResolvedFeatures>,
+    agent_arch: &str,
+) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+    let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
+    let config = cfg.config;
+
+    // 14. Find primary container via compose labels
+    let primary = find_compose_container(client, &project.project_name, &project.primary_service)
+        .await?
+        .ok_or("Primary service container not found after docker compose up")?;
+
+    info!(
+        "Primary container: {} ({})",
+        primary.name,
+        &primary.id[..12.min(primary.id.len())]
+    );
+
+    // 15. Verify primary container is running
+    verify_container_running(client, &primary.id).await?;
+
+    // 16. Register with daemon (primary container only)
+    hooks
+        .register_container(client, &primary.id, config, cfg.container_name)
+        .await;
+
+    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe)
+    let lifecycle_env = hooks
+        .post_create_setup(
+            client,
+            &primary.id,
+            remote_user,
+            config,
+            cfg.workspace_root,
+            cfg.remote_env,
+        )
+        .await;
+
+    // 18. Launch agent as background process via exec
+    hooks.launch_agent(client, &primary.id, agent_arch).await;
+
+    // 19. Run lifecycle phases (primary service only)
+    let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
+    for phase in [
+        "onCreateCommand",
+        "updateContentCommand",
+        "postCreateCommand",
+        "postStartCommand",
+        "postAttachCommand",
+    ] {
+        let entries = lifecycle_entries_for_phase(metadata, config, phase);
+        let lc_ctx = build_lifecycle_ctx(
+            client,
+            &primary.id,
+            remote_user,
+            &lifecycle_env,
+            Some(&project.workspace_folder),
+            progress,
+        );
+        run_lifecycle_entries(&lc_ctx, phase, &entries, progress).await?;
+    }
+
+    Ok(ComposeUpResult {
+        container_id: primary.id,
+        remote_user: remote_user.to_string(),
+        workspace_folder: project.workspace_folder.clone(),
+        outcome: ComposeUpOutcome::Created,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Handle already-running
+// ---------------------------------------------------------------------------
+
+/// Handle a compose project that's already running — just run postAttachCommand.
+async fn handle_compose_running(
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+    container: &ContainerInfo,
+) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+    let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
+    let config = cfg.config;
+    let remote_user = resolve_remote_user(config, None, "root");
+
+    // Re-register with daemon in case it restarted
+    hooks
+        .register_container(client, &container.id, config, cfg.container_name)
+        .await;
+
+    if let Some(cmd) = config.get("postAttachCommand")
+        && !cmd.is_null()
+    {
+        let lifecycle_env: Vec<String> = cfg.remote_env.to_vec();
+        let lc_ctx = build_lifecycle_ctx(
+            client,
+            &container.id,
+            &remote_user,
+            &lifecycle_env,
+            Some(project.workspace_folder.as_str()),
+            progress,
+        );
+
+        let label = "Running the postAttachCommand from devcontainer.json...";
+        progress.println(&format!("  \x1b[36m\u{25b8}\x1b[0m {label}"));
+        let result =
+            run_lifecycle_phase(&lc_ctx, "postAttachCommand", cmd, "devcontainer.json").await;
+        match &result {
+            Ok(()) => progress.println(&format!("  \x1b[32m\u{2713}\x1b[0m {label}")),
+            Err(e) => progress.println(&format!("  \x1b[31m\u{2717}\x1b[0m {label}: {e}")),
+        }
+        result?;
+    }
+
+    Ok(ComposeUpResult {
+        container_id: container.id.clone(),
+        remote_user,
+        workspace_folder: project.workspace_folder.clone(),
+        outcome: ComposeUpOutcome::Running,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+
+/// Build cella labels for the compose override file.
+fn build_compose_labels(
+    cfg: &ComposeUpConfig<'_>,
+    project: &ComposeProject,
+    remote_user: &str,
+) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("dev.cella.tool".to_string(), "cella".to_string());
+    labels.insert(
+        "dev.cella.workspace_path".to_string(),
+        cfg.workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.workspace_root.to_path_buf())
+            .to_string_lossy()
+            .to_string(),
+    );
+    labels.insert(
+        "dev.cella.config_path".to_string(),
+        cfg.config_path
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.config_path.to_path_buf())
+            .to_string_lossy()
+            .to_string(),
+    );
+    labels.insert(
+        "dev.cella.config_hash".to_string(),
+        project.config_hash.clone(),
+    );
+    labels.insert(
+        "dev.cella.compose_project".to_string(),
+        project.project_name.clone(),
+    );
+    labels.insert(
+        "dev.cella.primary_service".to_string(),
+        project.primary_service.clone(),
+    );
+    labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
+    labels.insert(
+        "dev.cella.workspace_folder".to_string(),
+        project.workspace_folder.clone(),
+    );
+    labels
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Find a compose container by project and service name.
+async fn find_compose_container(
+    client: &dyn ContainerBackend,
+    project_name: &str,
+    service_name: &str,
+) -> Result<Option<ContainerInfo>, Box<dyn std::error::Error>> {
+    Ok(client
+        .find_compose_service(project_name, service_name)
+        .await?)
+}
+
+fn build_lifecycle_ctx<'a>(
+    client: &'a dyn ContainerBackend,
+    container_id: &'a str,
+    user: &'a str,
+    env: &'a [String],
+    working_dir: Option<&'a str>,
+    progress: &ProgressSender,
+) -> LifecycleContext<'a> {
+    let p = progress.clone();
+    LifecycleContext {
+        client,
+        container_id,
+        user: Some(user),
+        env,
+        working_dir,
+        is_text: true,
+        on_output: Some(Box::new(move |line| p.println(line))),
+    }
+}
+
+async fn run_step_result<F, T, E>(progress: &ProgressSender, label: &str, future: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let step = progress.step(label);
+    match future.await {
+        Ok(value) => {
+            step.finish();
+            Ok(value)
+        }
+        Err(error) => {
+            step.fail(&error.to_string());
+            Err(error)
+        }
+    }
+}

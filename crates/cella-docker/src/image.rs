@@ -7,7 +7,7 @@ use bollard::query_parameters::CreateImageOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
-pub use cella_backend::{BuildOptions, ImageDetails};
+use cella_backend::{BuildOptions, ImageDetails};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;

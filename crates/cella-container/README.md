@@ -18,7 +18,7 @@ The backend discovers the `container` binary via `CELLA_CONTAINER_PATH` or `PATH
 
 ### Known Limitations
 
-- **No Docker Compose support** — `ComposeBackend` is not implemented
+- **No Docker Compose support** — `capabilities().compose` is `false`
 - **No bridge networking** — only port forwarding is available
 - **File injection via bind mount** — uses a host-side staging directory instead of native `cp` (Apple's CLI lacks container file copy)
 - **Unsupported flags warn gracefully** — `--gpus`, `--privileged`, `--cap-add`, and similar Docker-specific flags emit warnings and are skipped

@@ -5,7 +5,7 @@ use std::path::Path;
 use bollard::query_parameters::UploadToContainerOptions;
 use tracing::debug;
 
-pub use cella_backend::FileToUpload;
+use cella_backend::FileToUpload;
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;

@@ -1,7 +1,7 @@
 use clap::Args;
 use tracing::debug;
 
-use cella_docker::{ContainerTarget, InteractiveExecOptions};
+use cella_backend::{ContainerTarget, InteractiveExecOptions};
 
 use crate::picker;
 
@@ -21,8 +21,11 @@ pub struct SwitchArgs {
 }
 
 impl SwitchArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::connect_docker(self.docker_host.as_deref())?;
+    pub async fn execute(
+        self,
+        backend: Option<&crate::backend::BackendChoice>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
 
         // Discover repo and list worktrees
         let cwd = std::env::current_dir()?;
@@ -30,7 +33,7 @@ impl SwitchArgs {
         let worktrees = cella_git::list(&repo_info.root)?;
 
         // Build branch → container state map for picker display
-        let containers = client.list_cella_containers(false).await?;
+        let containers = client.as_ref().list_cella_containers(false).await?;
         let container_states = picker::branch_container_states(&containers);
 
         // Resolve branch interactively (exact match, picker, or pre-filtered)
@@ -50,7 +53,7 @@ impl SwitchArgs {
             workspace_folder: Some(workspace_folder),
         };
 
-        let container = target.resolve(&client, true).await?;
+        let container = target.resolve(client.as_ref(), true).await?;
 
         super::ensure_cella_daemon().await;
 
@@ -74,14 +77,19 @@ impl SwitchArgs {
         let shell = if let Some(s) = self.shell {
             s
         } else {
-            super::shell_detect::detect_shell(&client, &container.id, &user).await
+            cella_orchestrator::shell_detect::detect_shell(client.as_ref(), &container.id, &user)
+                .await
         };
 
         debug!("Using shell: {shell}");
 
         // Build environment: probed env (merged with label env) + terminal env
-        let base_env = if let Some(probed) =
-            super::env_cache::read_probed_env_cache(&client, &container.id, &user).await
+        let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
+            client.as_ref(),
+            &container.id,
+            &user,
+        )
+        .await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
         } else {
@@ -90,7 +98,13 @@ impl SwitchArgs {
         let mut env = base_env;
 
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
-        super::env_cache::ensure_ssh_auth_sock(&client, &container.id, &user, &mut env).await;
+        cella_orchestrator::env_cache::ensure_ssh_auth_sock(
+            client.as_ref(),
+            &container.id,
+            &user,
+            &mut env,
+        )
+        .await;
 
         for var in super::TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
@@ -99,6 +113,7 @@ impl SwitchArgs {
         }
 
         let exit_code = client
+            .as_ref()
             .exec_interactive(
                 &container.id,
                 &InteractiveExecOptions {
