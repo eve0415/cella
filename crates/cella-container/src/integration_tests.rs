@@ -25,7 +25,7 @@ struct ContainerGuard {
 }
 
 impl ContainerGuard {
-    fn new(cli_path: PathBuf) -> Self {
+    const fn new(cli_path: PathBuf) -> Self {
         Self {
             cli_path,
             container_id: None,
