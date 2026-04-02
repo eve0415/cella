@@ -6,7 +6,7 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-backend defines the `ContainerBackend` trait — the extension point for adding new container runtimes to cella. All backend-agnostic code works against this trait, and each runtime (Docker, Apple Container) provides its own implementation. The crate also houses all shared types (`ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.), backend capability flags, and the unified error type `BackendError`.
+cella-backend defines the `ContainerBackend` trait — the extension point for adding new container runtimes to cella. All backend-agnostic code works against this trait, and each runtime (Docker, Apple Container) provides its own implementation. The crate also houses all shared types (`ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.), backend capability flags, the unified error type `BackendError`, lifecycle command execution (`ParsedLifecycle`, `LifecycleContext`), agent environment variable generation, and container target resolution.
 
 Container and image naming conventions live here so that all backends use consistent naming and labeling, regardless of the underlying runtime.
 
@@ -28,21 +28,30 @@ Container and image naming conventions live here so that all backends use consis
 - `MountConfig` / `MountInfo` — mount specification and inspection types
 - `PortBinding` / `PortForward` — port mapping types
 - `DeviceSpec` / `UlimitSpec` / `GpuRequest` / `RunArgsOverrides` — container resource configuration
+- `LifecycleContext` — context for lifecycle command execution
+- `OutputCallback` — callback for streaming command output
+- `ParsedLifecycle` — parsed lifecycle command (single command, array, or map)
+- `ContainerTarget` — resolved container identification
+- `Platform` — target platform (architecture)
+- `FileToUpload` — file content for container upload operations
 
 ### Modules
 
 | Module | Purpose |
 |--------|---------|
-| `traits` | `ContainerBackend`, `BackendCapabilities`, and `BoxFuture` |
-| `types` | All shared types (`BackendKind`, `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, etc.) |
+| `traits` | `ContainerBackend`, `BackendCapabilities`, `Platform`, and `BoxFuture` |
+| `types` | All shared types (`BackendKind`, `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `FileToUpload`, etc.) |
 | `names` | Container/image naming conventions and label generation (consistent across all backends) |
 | `error` | `BackendError` unified error type |
+| `agent` | Agent environment variable generation for in-container agent |
+| `lifecycle` | Lifecycle command parsing and execution (`LifecycleContext`, `OutputCallback`, `ParsedLifecycle`) |
+| `resolve` | Container target resolution (`ContainerTarget`) |
 
 ## Crate Dependencies
 
 **Depends on:** none (foundation crate — only `sha2`, `hex`, `chrono`, `thiserror`)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-container](../cella-container), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

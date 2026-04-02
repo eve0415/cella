@@ -16,10 +16,11 @@ graph TD
         env[cella-env<br><i>env forwarding</i>]
         daemon[cella-daemon<br><i>host daemon</i>]
         doctor[cella-doctor<br><i>health checks</i>]
-        orchestrator[cella-orchestrator<br><i>worktree orchestration</i>]
+        orchestrator[cella-orchestrator<br><i>container orchestration</i>]
         agent[cella-agent<br><i>in-container agent</i>]
         config[cella-config<br><i>devcontainer parsing</i>]
         features[cella-features<br><i>OCI feature resolution</i>]
+        templates[cella-templates<br><i>template resolution</i>]
     end
 
     subgraph "Tier 3 — Foundation"
@@ -27,11 +28,14 @@ graph TD
         port[cella-port<br><i>IPC protocol</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
+        protocol[cella-protocol<br><i>wire format</i>]
     end
 
-    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
+    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
     docker & container --> backend
+    templates --> features
     agent & daemon --> port
+    port --> protocol
     config --> codegen
     agent & config & env & orchestrator --> network
 ```
@@ -84,13 +88,17 @@ Devcontainer configuration parsing, validation, and layer merging. Handles JSONC
 
 Dev Container Features resolution. Parses feature references (OCI, local path, HTTP URL), fetches artifacts from OCI registries with authentication, reads feature metadata, computes install ordering via topological sort, generates multi-stage Dockerfiles, caches artifacts locally, and merges feature configuration back into the devcontainer config.
 
+### cella-templates
+
+Devcontainer template lifecycle. Discovers templates from OCI registries (default: `ghcr.io/devcontainers/templates`), fetches and caches artifacts with a 24-hour TTL, reads template metadata (`devcontainer-template.json`), validates and substitutes template options, merges selected features, and generates the final `devcontainer.json` in JSONC or JSON format. Powers `cella init`.
+
 ### cella-port
 
-Port allocation, detection, and IPC protocol. Defines the wire format for daemon-agent communication (`AgentMessage`, `DaemonMessage`), provides `/proc/net/tcp` parsing for port detection, and manages host port allocation to avoid conflicts across concurrent containers.
+Port allocation, detection, and IPC protocol re-exports. Provides `/proc/net/tcp` parsing for port detection, manages host port allocation to avoid conflicts across concurrent containers, and re-exports wire format types from cella-protocol for convenience.
 
 ### cella-orchestrator
 
-Container lifecycle orchestration shared by both the CLI and daemon. Extracts the common container management logic (branch creation, image builds, lifecycle execution, pruning) so that the daemon can call the same Rust functions as the CLI instead of shelling out to subprocesses.
+Container lifecycle orchestration shared by both the CLI and daemon. Owns the full container-up pipeline for both single-container and Docker Compose workflows, image resolution, lifecycle phase execution, host requirements validation, shell detection, tool installation (Claude Code, Codex, Gemini), environment caching, config-to-container mapping, worktree branch helpers, and pruning. All operations go through the `cella-backend` abstraction — no direct Docker dependency. Reports progress through a channel-based `ProgressSender` that consumers render however they choose.
 
 ### cella-network
 
@@ -99,6 +107,10 @@ Network proxy configuration, blocking rules, and CA certificate management. Prov
 ### cella-codegen
 
 Build-time code generator. Transforms the devcontainer JSON Schema into typed Rust structs and validators. Runs during `cargo build` via cella-config's `build.rs` and produces formatted Rust source for `include!()`. Not a runtime dependency.
+
+### cella-protocol
+
+IPC wire format definitions for agent<->daemon and CLI<->daemon communication. Defines the newline-delimited JSON message types (`AgentMessage`, `DaemonMessage`, `ManagementRequest`, `ManagementResponse`), connection handshake (`AgentHello`, `DaemonHello`), and git credential helper format. Not a runtime logic crate — it only defines types and serialization.
 
 ## Dependency Graph
 

@@ -29,6 +29,7 @@ Implements the environment-related portions of the [Dev Container specification]
 - `FileUpload` — file content to upload into the container (path, content, permissions)
 - `DockerRuntime` — detected container runtime (DockerDesktop, OrbStack, LinuxNative, Colima, Unknown)
 - `GitConfigEntry` — a git config key-value pair to forward
+- `ProxyForwardingConfig` — proxy configuration for container environment
 
 ### Key Function
 
@@ -42,11 +43,13 @@ This is the main entry point. It detects the runtime, probes the host environmen
 
 | Module | Purpose |
 |--------|---------|
+| `ca_bundle` | CA certificate bundle management for containers |
+| `paths` | Path resolution for environment forwarding |
 | `platform` | Runtime detection from `DOCKER_HOST`, `DOCKER_CONTEXT`, and `docker context inspect` |
+| `proxy` | Network proxy environment forwarding |
 | `ssh_agent` | SSH agent socket detection and mount configuration (platform-aware) |
 | `ssh_config` | SSH config file reading (`~/.ssh/config`, `~/.ssh/known_hosts`) for upload into container |
 | `git_config` | Host git config reading (safe subset of `user.name`, `user.email`, etc.) |
-| `git_credential` | Credential proxy socket/TCP detection and helper script generation |
 | `gh_credential` | gh CLI credential forwarding (auto-on when gh is installed) |
 | `user_env_probe` | Host environment variable probing for `userEnvProbe` spec support |
 | `claude_code` | Claude Code config detection, path rewriting, and container injection |
@@ -59,7 +62,7 @@ This is the main entry point. It detects the runtime, probes the host environmen
 
 **Depends on:** [cella-network](../cella-network)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

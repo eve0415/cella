@@ -6,12 +6,16 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-agent is a binary that runs inside dev containers started by cella. It is automatically uploaded into containers during `cella up` and handles four responsibilities:
+cella-agent is a binary that runs inside dev containers started by cella. It is automatically uploaded into containers during `cella up` and handles these responsibilities:
 
 1. **Port detection** — polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding
-2. **Port proxying** — proxies localhost-bound applications to `0.0.0.0` so they are reachable from outside the container
-3. **Browser interception** — handles `BROWSER` environment variable calls, forwarding URL open requests to the host (enables OAuth callbacks)
-4. **Credential forwarding** — forwards git credential requests to the host daemon for transparent authentication
+2. **Port proxying** — rebinds localhost-bound listeners to `0.0.0.0` via `port_proxy` so they are reachable from outside the container
+3. **Forward proxy** — outbound HTTP/CONNECT proxy on `127.0.0.1` for egress filtering, enforcing network blocking rules via `forward_proxy`
+4. **MITM proxy** — HTTPS interception proxy for path-level blocking rules (works alongside the forward proxy via `mitm`)
+5. **Browser interception** — handles `BROWSER` environment variable calls, forwarding URL open requests to the host (enables OAuth callbacks)
+6. **Credential forwarding** — forwards git credential requests to the host daemon for transparent authentication
+7. **Plugin synchronization** — synchronizes editor plugin/extension manifests between host and container
+8. **CLI mode** — when invoked as `cella` (via symlink, `cella` -> `cella-agent`), provides in-container CLI commands that delegate to the host daemon
 
 The agent communicates with the host-side cella-daemon over a TCP control connection. If the daemon is unavailable, it falls back to standalone mode (port watching only, no forwarding).
 
@@ -41,6 +45,11 @@ cella-agent credential <operation>           # Handle git credential request (ge
 | `browser` | Sends browser-open requests to the host daemon via the control connection |
 | `credential` | Handles git credential protocol (get/store/erase) by forwarding to host |
 | `control` | Host daemon communication — sends/receives messages over the control TCP connection |
+| `cli` | CLI mode for in-container `cella` commands (when agent binary is symlinked as `cella`) |
+| `forward_proxy` | Forward proxy for localhost-bound applications |
+| `mitm` | MITM proxy for HTTPS interception and path-level blocking |
+| `plugin_sync` | Plugin/extension synchronization for editors |
+| `proxy_config` | Network proxy configuration parsing and rule matching |
 | `reconnecting_client` | Resilient connection management with retry logic and automatic reconnection |
 
 ## Crate Dependencies

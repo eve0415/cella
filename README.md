@@ -106,9 +106,12 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Docker Compose support (`dockerComposeFile`)
 - [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/worktrees.md)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
+- [x] Feature management (`cella features edit`, `cella features list`, `cella features update`)
+- [x] Project initialization (`cella init`) — interactive wizard with OCI template/feature selection
 - [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
-- [x] Config validation with source-positioned diagnostics
+- [x] Config validation with source-positioned diagnostics (`cella config validate`)
+- [x] Shell completions (`cella completions`)
 
 ### Environment & Credentials
 
@@ -163,8 +166,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
-- [ ] Project initialization (`cella init`)
-- [ ] Templates (`cella template`)
+- [ ] Template management (`cella template new/list/edit`)
 - [ ] Global config management (`cella config show/global/dotfiles/agent`)
 - [ ] Podman backend
 - [ ] Colima / Lima support
@@ -182,6 +184,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `cella build` | Build the dev container image without starting it |
 | `cella list` | List all dev containers with status and ports |
 | `cella logs` | View container logs (`--follow` for streaming) |
+| `cella init` | Initialize a devcontainer configuration (interactive wizard) |
 
 ### Git Worktrees
 
@@ -195,15 +198,23 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 See the [worktree guide](docs/worktrees.md) for the full workflow, in-container commands, and background task system.
 
+### Features & Templates
+
+| Command | Description |
+|---------|-------------|
+| `cella features list` | List installed and available devcontainer features |
+| `cella features edit` | Add, remove, or modify features in devcontainer.json |
+| `cella features update` | Update features to latest versions |
+
 ### Configuration & Diagnostics
 
 | Command | Description |
 |---------|-------------|
-| `cella config` | View and manage cella configuration |
+| `cella config validate` | Validate a devcontainer.json file |
 | `cella read-configuration` | Output resolved devcontainer config as JSON |
 | `cella doctor` | Check system dependencies and configuration |
 | `cella network` | Inspect network proxy and blocking configuration |
-| `cella init` | Initialize cella in the current repository |
+| `cella completions` | Generate shell completions (bash, zsh, fish, etc.) |
 
 ### Port & Credential Management
 
@@ -222,7 +233,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 
 ## Architecture
 
-cella is a Rust workspace with 16 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 18 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```mermaid
 graph TD
@@ -238,10 +249,11 @@ graph TD
         env[cella-env<br><i>env forwarding</i>]
         daemon[cella-daemon<br><i>host daemon</i>]
         doctor[cella-doctor<br><i>health checks</i>]
-        orchestrator[cella-orchestrator<br><i>worktree orchestration</i>]
+        orchestrator[cella-orchestrator<br><i>container orchestration</i>]
         agent[cella-agent<br><i>in-container agent</i>]
         config[cella-config<br><i>devcontainer parsing</i>]
         features[cella-features<br><i>OCI feature resolution</i>]
+        templates[cella-templates<br><i>template resolution</i>]
     end
 
     subgraph "Tier 3 — Foundation"
@@ -249,13 +261,16 @@ graph TD
         port[cella-port<br><i>IPC protocol</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
+        protocol[cella-protocol<br><i>wire format</i>]
     end
 
-    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator
+    cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
     agent & config & env & orchestrator --> network
+    templates --> features
+    port --> protocol
 ```
 
 See [docs/architecture.md](docs/architecture.md) for details.

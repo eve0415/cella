@@ -41,6 +41,8 @@ Implements the Docker Compose portions of the [Dev Container specification](http
 | `error` | `CellaComposeError` enum |
 | `hash` | Multi-file SHA-256 hashing for compose config change detection |
 | `override_file` | Generates cella override YAML (mounts, env vars, labels, entrypoint, capabilities) |
+| `config` | Typed resolution of `docker compose config` output (variable substitution, service build/image info) |
+| `dockerfile` | Dockerfile reading, stage naming, and combined Dockerfile generation for compose + features support |
 | `parse` | Minimal YAML parsing — validates structure, extracts service names and primary service |
 | `project` | `ComposeProject` lifecycle — initialization, startup, container resolution, shutdown |
 
@@ -48,7 +50,7 @@ Implements the Docker Compose portions of the [Dev Container specification](http
 
 **Depends on:** none
 
-**Depended on by:** [cella-cli](../cella-cli)
+**Depended on by:** [cella-cli](../cella-cli), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

@@ -50,7 +50,7 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 **Depends on:** [cella-codegen](../cella-codegen) (build-time), [cella-network](../cella-network)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

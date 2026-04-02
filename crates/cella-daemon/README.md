@@ -35,7 +35,9 @@ The daemon has special handling for OrbStack, which provides its own port forwar
 | `proxy` | Credential proxy forwarding logic |
 | `health` | Monitors agent connections, detects stale/dead connections |
 | `orbstack` | OrbStack-specific port handling (coordinates with OrbStack's built-in forwarding) |
-| `client` | Client connection types and session management |
+| `shared` | Shared daemon primitives — PID management, process checks, socket helpers |
+| `stream_bridge` | Per-exec TCP stream bridge for TTY forwarding (interactive shell sessions through the daemon) |
+| `task_manager` | Background task manager for in-container worktree operations (tracks exec handles, output, lifecycle state) |
 | `logging` | File-based tracing to `~/.cella/daemon.log` with size rotation |
 
 ## Crate Dependencies

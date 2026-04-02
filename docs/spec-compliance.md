@@ -2,7 +2,7 @@
 
 Audit of cella against the official devcontainer specification (containers.dev) and reference CLI (devcontainers/cli).
 
-Date: 2026-03-28
+Date: 2026-04-01
 
 ## Legend
 
@@ -31,13 +31,13 @@ Date: 2026-03-28
 | `features info` | Feature metadata | Not implemented | MISSING |
 | `features resolve-dependencies` | Resolve deps | Not implemented | MISSING |
 | `features generate-docs` | Generate docs | Not implemented | MISSING |
-| `templates apply` | Apply template | Partially via `init` | PARTIAL |
+| `templates apply` | Apply template | Implemented via `init` | PARTIAL (unknown template options silently accepted) |
 | `templates publish` | Publish templates | Not implemented | MISSING |
 | `templates metadata` | Template metadata | Not implemented | MISSING |
 | `templates generate-docs` | Generate docs | Not implemented | MISSING |
 
 ### Cella-Specific Commands (beyond spec, keep as-is)
-`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config`, `down`, `daemon`
+`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completions`
 
 ---
 
@@ -107,15 +107,15 @@ Date: 2026-03-28
 
 ### 3.1 devcontainerId Computation
 - **Spec**: SHA-256 of sorted JSON label object, base-32 encoded, left-padded to 52 chars
-- **Cella**: SHA-256 of workspace path
-- **Status**: FAIL
+- **Cella**: SHA-256 of workspace path (hex-encoded, 64 chars). A spec-compliant `spec_devcontainer_id()` function exists in `cella-config/src/devcontainer/resolve.rs` but is not yet used in the main path
+- **Status**: FAIL (spec-compliant function exists but unused)
 - **Impact**: Variable substitution `${devcontainerId}` produces wrong value; container identity differs
 
 ### 3.2 Docker Compose Defaults
 - **Spec**: `overrideCommand` defaults `false`, `shutdownAction` defaults `stopCompose`, `workspaceFolder` defaults `"/"`
-- **Cella**: Needs audit -- may use image/Dockerfile defaults for compose mode
-- **Status**: NEEDS AUDIT
-- **Impact**: Compose containers may have wrong command override and shutdown behavior
+- **Cella**: `overrideCommand` defaults `false` (correct), `shutdownAction` defaults `StopCompose` (correct), `workspaceFolder` is required instead of defaulting to `"/"`
+- **Status**: PARTIAL
+- **Impact**: Missing `workspaceFolder` default may cause errors when config omits it in compose mode
 
 ### 3.3 updateRemoteUserUID Timing
 - **Spec**: Build-time (Dockerfile layer before container creation)
@@ -125,15 +125,15 @@ Date: 2026-03-28
 
 ### 3.4 Lifecycle Failure Cascading
 - **Spec**: If any phase fails, ALL subsequent phases are skipped
-- **Cella**: Needs verification
-- **Status**: NEEDS AUDIT
-- **Impact**: Subsequent lifecycle commands may run after a failure
+- **Cella**: `run_all_lifecycle_phases` propagates errors via `?`, but the default `up` path uses `run_lifecycle_phases_with_wait_for` which backgrounds later phases as a detached shell script. Two problems: (1) failures in backgrounded phases are not propagated or surfaced to the caller, and (2) the background path only handles string-valued lifecycle commands — array/object `postCreateCommand`/`postStartCommand`/`postAttachCommand` forms are silently skipped in background mode.
+- **Status**: FAIL
+- **Impact**: Default `waitFor` path swallows failures and silently skips non-string lifecycle command shapes
 
 ### 3.5 Parallel Command Failure
 - **Spec**: All parallel commands must succeed; implementations should cancel siblings on failure
-- **Cella**: Needs verification
-- **Status**: NEEDS AUDIT
-- **Impact**: Sibling commands may continue running after one fails
+- **Cella**: Object-form lifecycle commands are parsed into `ParsedLifecycle::Parallel` and executed with `join_all`. When one sibling fails, the others are not cancelled — they continue running before the phase is reported as failed.
+- **Status**: PARTIAL
+- **Impact**: Parallel lifecycle commands (object-form) can leave partial side effects from siblings that continue after a failure
 
 ### 3.6 JSON Output Format
 - **Spec**: stdout = JSON only, stderr = logs only
@@ -143,9 +143,9 @@ Date: 2026-03-28
 
 ### 3.7 containerEnv vs remoteEnv
 - **Spec**: `containerEnv` at Docker create (immutable), `remoteEnv` per-process
-- **Cella**: Needs audit for correct separation
-- **Status**: NEEDS AUDIT
-- **Impact**: Environment variable lifecycle may be incorrect
+- **Cella**: `containerEnv` mapped to `CreateContainerOptions.env` (Docker create time), `remoteEnv` kept separate for per-process injection via `map_remote_env()`
+- **Status**: PASS
+- **Impact**: None — matches spec
 
 ### 3.8 Feature dependsOn
 - **Spec**: Hard recursive dependency resolution with auto-pull
@@ -155,9 +155,9 @@ Date: 2026-03-28
 
 ### 3.9 Feature Option Validation
 - **Spec**: Unknown options rejected, enum values validated
-- **Cella**: Needs audit
-- **Status**: NEEDS AUDIT
-- **Impact**: Typos in feature options silently ignored
+- **Cella**: `merge/validation.rs` detects unknown options, type mismatches, and invalid enum values but only emits warnings — invalid options are passed through and never rejected
+- **Status**: PARTIAL
+- **Impact**: Typos in feature options are logged but silently accepted; spec requires rejection
 
 ### 3.10 Container Labels
 - **Spec**: `devcontainer.local_folder`, `devcontainer.config_file`, etc.
@@ -173,7 +173,7 @@ Date: 2026-03-28
 
 ### 3.12 hostRequirements Merge
 - **Spec**: Maximum value wins across metadata layers
-- **Cella**: Needs audit
+- **Cella**: Validation exists in `host_requirements.rs` but merge strategy across layers not confirmed
 - **Status**: NEEDS AUDIT
 
 ### 3.13 Port String Format
@@ -183,8 +183,9 @@ Date: 2026-03-28
 
 ### 3.14 initializeCommand Re-run
 - **Spec**: Runs during initialization including subsequent starts
-- **Cella**: Needs verification for restart behavior
-- **Status**: NEEDS AUDIT
+- **Cella**: Runs on container creation and rebuild. Skipped when the container is already running (fast path returns before `create_and_start()`). Compose mode runs it on every invocation.
+- **Status**: PARTIAL
+- **Impact**: Repeated `cella up` on a running container skips host-side initialization; spec requires it on every start
 
 ---
 

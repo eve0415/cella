@@ -41,11 +41,9 @@ Implements the container lifecycle portions of the [Dev Container specification]
 | `client` | `DockerApi` trait definition and `DockerClient` (socket auto-detection, connection) |
 | `docker_api_impl` | `DockerApi` trait implementation for `DockerClient` |
 | `container` | `ContainerInfo`, `ContainerState`, status inspection |
-| `config_map/` | `CreateContainerOptions`, `MountConfig` assembly from devcontainer config |
+| `config_map/` | `CreateContainerOptions`, `MountConfig` assembly from devcontainer config (mounts, ports, run_args consolidated here) |
 | `config_map/env` | Environment variable assembly (`containerEnv`, `remoteEnv`, forwarded vars) |
-| `config_map/mounts` | Mount configuration (`mounts`, `workspaceMount`, bind mounts) |
-| `config_map/ports` | Port binding configuration from `forwardPorts` and `portsAttributes` |
-| `config_map/run_args` | `runArgs` parser — maps 30+ docker create flags to bollard HostConfig (networking, resources, security, devices, GPU) |
+| `discovery` | Docker socket auto-discovery (Colima, Podman, Rancher Desktop, standard paths) |
 | `exec` | Command execution (interactive with PTY and detached) |
 | `image` | Image building via Docker build API |
 | `lifecycle` | Lifecycle command parsing and execution (`postCreate`, `postStart`, `postAttach`) |
@@ -58,9 +56,9 @@ Implements the container lifecycle portions of the [Dev Container specification]
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-port](../cella-port), [cella-features](../cella-features)
+**Depends on:** [cella-backend](../cella-backend)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 
 ## Testing
 
