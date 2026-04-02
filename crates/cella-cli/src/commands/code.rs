@@ -48,12 +48,13 @@ impl CodeArgs {
         progress: crate::progress::Progress,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 1. Check for remote Docker (unsupported) — only when using Docker backend
-        let is_docker =
-            backend.is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
-        if is_docker {
-            check_local_docker()?;
+        // 1. Reject non-Docker backends — VS Code attach only works with Docker
+        if backend.is_some_and(|b| !matches!(b, crate::backend::BackendChoice::Docker)) {
+            return Err(
+                "cella code requires the Docker backend (VS Code attach is Docker-specific)".into(),
+            );
         }
+        check_local_docker()?;
 
         // 2. Resolve editor binary (fail fast before container work)
         let editor = resolve_editor_binary(self.insider, self.cursor, self.binary.as_deref())?;

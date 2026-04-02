@@ -88,7 +88,10 @@ impl LogsArgs {
         }
 
         if self.follow {
-            // Use docker CLI for follow mode (bollard streaming is complex)
+            // Follow mode requires Docker CLI (bollard streaming is complex)
+            if client.kind() != cella_backend::BackendKind::Docker {
+                return Err("logs --follow is only supported with the Docker backend".into());
+            }
             let status = std::process::Command::new("docker")
                 .args([
                     "logs",
