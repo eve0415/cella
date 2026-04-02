@@ -8,6 +8,8 @@ use cella_backend::{ContainerTarget, ExecOptions, FileToUpload};
 /// Manage credential forwarding for dev containers.
 #[derive(Args)]
 pub struct CredentialArgs {
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
     #[command(subcommand)]
     command: CredentialCommand,
 }
@@ -51,10 +53,9 @@ enum CredentialTool {
 
 impl CredentialArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        let backend = crate::backend::BackendArgs::default();
         match self.command {
-            CredentialCommand::Sync(args) => run_sync(args, &backend).await,
-            CredentialCommand::Status(args) => run_status(args, &backend).await,
+            CredentialCommand::Sync(args) => run_sync(args, &self.backend).await,
+            CredentialCommand::Status(args) => run_status(args, &self.backend).await,
         }
     }
 }

@@ -100,6 +100,8 @@ pub struct UpContext {
     extra_labels: std::collections::HashMap<String, String>,
     /// Network rule enforcement policy.
     network_rules: NetworkRulePolicy,
+    /// Docker host override (forwarded to daemon registration).
+    docker_host: Option<String>,
 }
 
 impl UpContext {
@@ -159,6 +161,7 @@ impl UpContext {
             } else {
                 NetworkRulePolicy::Enforce
             },
+            docker_host: args.backend.docker_host.clone(),
         })
     }
 
@@ -220,6 +223,7 @@ impl UpContext {
             skip_checksum: false,
             extra_labels,
             network_rules: NetworkRulePolicy::Enforce,
+            docker_host: backend_args.docker_host.clone(),
         })
     }
 
@@ -281,7 +285,7 @@ impl UpContext {
                 forward_ports,
                 shutdown_action,
                 backend_kind: Some(self.client.kind().to_string()),
-                docker_host: None,
+                docker_host: self.docker_host.clone(),
             },
         ));
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
@@ -468,6 +472,7 @@ struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
     managed_agent: bool,
     backend_kind: String,
+    docker_host: Option<String>,
 }
 
 impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
@@ -504,6 +509,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         let container_ip = container_ip.map(str::to_string);
         let managed_agent = self.managed_agent;
         let backend_kind = self.backend_kind.clone();
+        let docker_host = self.docker_host.clone();
         Box::pin(async move {
             if !managed_agent {
                 return;
@@ -546,7 +552,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                     forward_ports,
                     shutdown_action,
                     backend_kind: Some(backend_kind),
-                    docker_host: None,
+                    docker_host,
                 },
             ));
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
@@ -587,6 +593,7 @@ impl UpContext {
             config: self.config(),
             managed_agent: self.client.capabilities().managed_agent,
             backend_kind: self.client.kind().to_string(),
+            docker_host: self.docker_host.clone(),
         };
         let config = cella_orchestrator::UpConfig {
             resolved: &self.resolved,

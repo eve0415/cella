@@ -316,6 +316,7 @@ async fn handle_agent_connection(
                     cella_bin: &ctx.cella_bin,
                     task_mgr: &ctx.task_manager,
                     container_handles: &ctx.container_handles,
+                    container_name: &hs.container_name,
                 },
                 &mut writer,
             )
@@ -615,6 +616,8 @@ struct WorktreeHandlerCtx<'a> {
     cella_bin: &'a std::path::Path,
     task_mgr: &'a crate::task_manager::SharedTaskManager,
     container_handles: &'a Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    /// Name of the container that initiated this request (from agent handshake).
+    container_name: &'a str,
 }
 
 /// Handle worktree/exec/task messages that need writer access for multi-message responses.
@@ -1397,10 +1400,10 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
 
     let mut cmd = tokio::process::Command::new(wt.cella_bin);
     cmd.arg("up");
-    // Forward --backend / --docker-host from the registered container handle.
+    // Forward --backend / --docker-host from the calling container's handle.
     {
         let handles = wt.container_handles.lock().await;
-        if let Some(handle) = handles.values().next() {
+        if let Some(handle) = handles.get(wt.container_name) {
             if let Some(ref kind) = handle.backend_kind {
                 cmd.arg("--backend").arg(kind);
             }

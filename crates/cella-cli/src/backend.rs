@@ -94,6 +94,12 @@ pub async fn resolve_backend(
 async fn auto_detect(
     docker_host: Option<&str>,
 ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    // Treat DOCKER_HOST env var the same as an explicit --docker-host: if the
+    // user configured a specific Docker endpoint, don't silently fall through
+    // to a different backend when it's unreachable.
+    let has_explicit_docker_target =
+        docker_host.is_some() || std::env::var_os("DOCKER_HOST").is_some();
+
     // Docker is highest priority.
     match connect_docker_backend(docker_host) {
         Ok(client) => {
@@ -103,7 +109,7 @@ async fn auto_detect(
             match client.ping().await {
                 Ok(()) => return Ok(client),
                 Err(e) => {
-                    if docker_host.is_some() {
+                    if has_explicit_docker_target {
                         return Err(e.into());
                     }
                     // Socket exists but daemon not responding — try next backend
@@ -113,7 +119,7 @@ async fn auto_detect(
         Err(e) => {
             // If the user explicitly targeted a Docker host, don't silently
             // fall back to a different backend — fail with the Docker error.
-            if docker_host.is_some() {
+            if has_explicit_docker_target {
                 return Err(e);
             }
         }
