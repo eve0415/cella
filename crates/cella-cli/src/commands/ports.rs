@@ -16,8 +16,12 @@ impl PortsArgs {
         self,
         backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Try querying the daemon first for dynamic port info
-        if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
+        // Try querying the daemon first for dynamic port info — only when
+        // the selected backend uses daemon-managed port forwarding.
+        let use_daemon =
+            backend.is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
+        if use_daemon
+            && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
         {
             match cella_daemon::management::send_management_request(

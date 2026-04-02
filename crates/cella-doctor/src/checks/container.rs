@@ -10,7 +10,15 @@ use super::{CategoryReport, CheckContext, CheckResult, Severity};
 /// Returns one `CategoryReport` per container, or a single report
 /// explaining why container checks were skipped.
 pub async fn check_containers(ctx: &CheckContext, daemon_running: bool) -> Vec<CategoryReport> {
-    if !daemon_running {
+    // Only require a running daemon for backends with managed agents.
+    // Unmanaged backends (e.g. Apple Container) can still run basic
+    // container checks (running state, version skew) without the daemon.
+    let needs_daemon = ctx
+        .backend_client
+        .as_ref()
+        .is_none_or(|c| c.capabilities().managed_agent);
+
+    if !daemon_running && needs_daemon {
         return vec![CategoryReport::new(
             "Containers",
             vec![CheckResult {

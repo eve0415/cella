@@ -100,6 +100,7 @@ impl BranchArgs {
         // ensure_up always runs the full first-create path (lifecycle hooks,
         // tool setup, etc.) rather than reusing a half-initialized container.
         if let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
+            let _ = ctx.client.stop_container(&existing.id).await;
             let _ = ctx.client.remove_container(&existing.id, false).await;
         }
 
