@@ -11,7 +11,7 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
-pub use cella_backend::{BackendKind, ContainerInfo, ContainerState, MountInfo, PortBinding};
+use cella_backend::{BackendKind, ContainerInfo, ContainerState, MountInfo, PortBinding};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;

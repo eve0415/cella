@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::CellaDockerError;
 use crate::client::DockerClient;
-use crate::exec::ExecOptions;
+use cella_backend::{ExecOptions, ExecResult};
 
 /// Build the shell script that updates UID/GID in `/etc/passwd` and `/etc/group`.
 ///
@@ -82,7 +82,7 @@ async fn get_container_uid(
 }
 
 /// Log the output of a successful UID update script execution.
-fn log_uid_update_result(result: &crate::exec::ExecResult) {
+fn log_uid_update_result(result: &ExecResult) {
     for line in result.stdout.lines() {
         let line = line.trim();
         if !line.is_empty() {
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn log_uid_update_result_success_does_not_panic() {
-        let result = crate::exec::ExecResult {
+        let result = ExecResult {
             exit_code: 0,
             stdout: "Updating UID:GID from 1000:1000 to 501:501.\n".to_string(),
             stderr: String::new(),
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn log_uid_update_result_empty_stdout_does_not_panic() {
-        let result = crate::exec::ExecResult {
+        let result = ExecResult {
             exit_code: 0,
             stdout: String::new(),
             stderr: String::new(),
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn log_uid_update_result_with_nonzero_exit_code_does_not_panic() {
-        let result = crate::exec::ExecResult {
+        let result = ExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: "permission denied\n".to_string(),
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn log_uid_update_result_multiline_stdout() {
-        let result = crate::exec::ExecResult {
+        let result = ExecResult {
             exit_code: 0,
             stdout: "line one\nline two\n  \nline four\n".to_string(),
             stderr: String::new(),
@@ -285,7 +285,7 @@ mod tests {
     fn log_uid_update_result_nonzero_with_empty_stderr_does_not_warn() {
         // When exit_code != 0 but stderr is empty, the condition
         // `result.exit_code != 0 && !result.stderr.is_empty()` is false
-        let result = crate::exec::ExecResult {
+        let result = ExecResult {
             exit_code: 1,
             stdout: String::new(),
             stderr: String::new(),
