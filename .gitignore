@@ -4,6 +4,7 @@
 
 # Claude
 .claude/*.local.*
+.claude/worktrees/
 docs/superpowers/
 
 # Worktrees
