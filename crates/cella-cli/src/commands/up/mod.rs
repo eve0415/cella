@@ -350,7 +350,7 @@ impl UpContext {
 
         // Detect user's shell for probing (use their actual shell, not /bin/sh)
         let shell =
-            super::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
+            cella_orchestrator::shell_detect::detect_shell(self.client.as_ref(), container_id, remote_user)
                 .await;
 
         // Probe user environment first so tool installs can use feature-provided PATH
@@ -359,7 +359,7 @@ impl UpContext {
             .progress
             .run_step(
                 "Running userEnvProbe...",
-                super::env_cache::probe_and_cache_user_env(
+                cella_orchestrator::env_cache::probe_and_cache_user_env(
                     self.client.as_ref(),
                     container_id,
                     remote_user,
@@ -408,7 +408,7 @@ impl UpContext {
             self.progress
                 .run_step(
                     "Updating environment cache...",
-                    super::env_cache::probe_and_cache_user_env(
+                    cella_orchestrator::env_cache::probe_and_cache_user_env(
                         self.client.as_ref(),
                         container_id,
                         remote_user,

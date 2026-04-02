@@ -87,7 +87,7 @@ impl NvimArgs {
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
 
-        let base_env = if let Some(probed) = super::env_cache::read_probed_env_cache(
+        let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
             ctx.client.as_ref(),
             &container_id,
             &result.remote_user,
@@ -100,7 +100,7 @@ impl NvimArgs {
         };
         let mut env = base_env;
 
-        super::env_cache::ensure_ssh_auth_sock(
+        cella_orchestrator::env_cache::ensure_ssh_auth_sock(
             ctx.client.as_ref(),
             &container_id,
             &result.remote_user,

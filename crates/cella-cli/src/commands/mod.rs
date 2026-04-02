@@ -8,7 +8,6 @@ mod credential;
 mod daemon;
 mod doctor;
 mod down;
-mod env_cache;
 mod exec;
 pub mod features;
 pub mod image;
@@ -21,7 +20,6 @@ mod ports;
 mod prune;
 mod read_configuration;
 mod shell;
-pub mod shell_detect;
 mod tmux;
 
 mod switch;

@@ -95,14 +95,14 @@ impl ShellArgs {
         let shell = if let Some(s) = self.shell {
             s
         } else {
-            super::shell_detect::detect_shell(client.as_ref(), &container.id, &user).await
+            cella_orchestrator::shell_detect::detect_shell(client.as_ref(), &container.id, &user).await
         };
 
         debug!("Using shell: {shell}");
 
         // Build environment: probed env (merged with label env) + terminal env
         let base_env = if let Some(probed) =
-            super::env_cache::read_probed_env_cache(client.as_ref(), &container.id, &user).await
+            cella_orchestrator::env_cache::read_probed_env_cache(client.as_ref(), &container.id, &user).await
         {
             cella_env::user_env_probe::merge_env(&probed, &label_env)
         } else {
@@ -111,7 +111,7 @@ impl ShellArgs {
         let mut env = base_env;
 
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
-        super::env_cache::ensure_ssh_auth_sock(client.as_ref(), &container.id, &user, &mut env)
+        cella_orchestrator::env_cache::ensure_ssh_auth_sock(client.as_ref(), &container.id, &user, &mut env)
             .await;
 
         for var in super::TERMINAL_ENV_VARS {
