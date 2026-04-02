@@ -81,6 +81,20 @@ fn connect_docker_backend(
     Ok(Box::new(client))
 }
 
+#[cfg(target_os = "macos")]
+fn connect_apple_container_backend()
+-> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    let cli = cella_container::discovery::discover()
+        .ok_or("Apple Container CLI not found. Install from https://github.com/apple/container")?;
+
+    eprintln!(
+        "warning: Apple Container backend is experimental. \
+         Report issues at https://github.com/eve0415/cella/issues"
+    );
+
+    Ok(Box::new(cella_container::AppleContainerBackend::new(cli)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,18 +147,4 @@ mod tests {
         // Either connect succeeds (unlikely) or fails - we just exercise the path
         let _ = result;
     }
-}
-
-#[cfg(target_os = "macos")]
-fn connect_apple_container_backend()
--> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    let cli = cella_container::discovery::discover()
-        .ok_or("Apple Container CLI not found. Install from https://github.com/apple/container")?;
-
-    eprintln!(
-        "warning: Apple Container backend is experimental. \
-         Report issues at https://github.com/eve0415/cella/issues"
-    );
-
-    Ok(Box::new(cella_container::AppleContainerBackend::new(cli)))
 }
