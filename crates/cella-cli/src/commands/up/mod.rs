@@ -128,6 +128,10 @@ impl UpContext {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to backend
+        // NOTE: auto-detect picks the first backend whose socket exists.
+        // If Docker's socket exists but the daemon is stopped, auto-detect
+        // won't fall through to Apple Container. Users can work around this
+        // with `--backend apple-container`.
         let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref())?;
         client.ping().await?;
 

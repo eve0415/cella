@@ -939,13 +939,32 @@ impl EnsureUpContext<'_> {
         };
         let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
         let has_rules = net_config.has_rules() && !skip_rules;
-        let proxy_fwd = cella_env::ProxyForwardingConfig {
-            proxy: net_config.proxy.clone(),
-            has_blocking_rules: has_rules,
-            full_config: if has_rules { Some(net_config) } else { None },
-            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+
+        // Only configure proxy forwarding for backends with a managed agent —
+        // the agent runs the local proxy that HTTP_PROXY/HTTPS_PROXY point to.
+        let managed_agent = self.client.capabilities().managed_agent;
+        let proxy_fwd = if managed_agent {
+            Some(cella_env::ProxyForwardingConfig {
+                proxy: net_config.proxy.clone(),
+                has_blocking_rules: has_rules,
+                full_config: if has_rules { Some(net_config) } else { None },
+                container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+            })
+        } else {
+            None
         };
-        let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, Some(&proxy_fwd));
+        let mut env_fwd =
+            cella_env::prepare_env_forwarding(config, &remote_user, proxy_fwd.as_ref());
+
+        // Strip agent-dependent credential helper for unmanaged backends —
+        // the cella-agent binary won't be provisioned, so the helper would
+        // fail with "not found" on every git credential request.
+        if !managed_agent {
+            env_fwd
+                .post_start
+                .git_config_commands
+                .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
+        }
 
         let labels = self.build_labels(
             resolved_features,
