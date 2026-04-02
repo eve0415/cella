@@ -60,6 +60,10 @@ impl Default for AgentConnectionState {
 pub struct ContainerHandle {
     pub container_id: String,
     pub agent_state: Arc<AgentConnectionState>,
+    /// Which backend created this container (e.g. `"docker"`, `"apple-container"`).
+    pub backend_kind: Option<String>,
+    /// Docker host override used when the container was created.
+    pub docker_host: Option<String>,
 }
 
 /// Spawn a handler task for a new agent TCP connection.
@@ -2164,6 +2168,8 @@ mod tests {
         let handle = ContainerHandle {
             container_id: "abc123".into(),
             agent_state: Arc::new(AgentConnectionState::new()),
+            backend_kind: Some("docker".into()),
+            docker_host: None,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));

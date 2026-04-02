@@ -279,6 +279,8 @@ impl UpContext {
             other_ports_attributes: other_ports_attrs,
             forward_ports,
             shutdown_action,
+            backend_kind: Some(self.client.kind().to_string()),
+            docker_host: None,
         };
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
@@ -463,6 +465,7 @@ pub struct UpResult {
 struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
     managed_agent: bool,
+    backend_kind: String,
 }
 
 impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
@@ -498,6 +501,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         let container_name = container_name.to_string();
         let container_ip = container_ip.map(str::to_string);
         let managed_agent = self.managed_agent;
+        let backend_kind = self.backend_kind.clone();
         Box::pin(async move {
             if !managed_agent {
                 return;
@@ -538,6 +542,8 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 other_ports_attributes: other_ports_attrs,
                 forward_ports,
                 shutdown_action,
+                backend_kind: Some(backend_kind),
+                docker_host: None,
             };
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
@@ -576,6 +582,7 @@ impl UpContext {
         let hooks = CliUpHooks {
             config: self.config(),
             managed_agent: self.client.capabilities().managed_agent,
+            backend_kind: self.client.kind().to_string(),
         };
         let config = cella_orchestrator::UpConfig {
             resolved: &self.resolved,

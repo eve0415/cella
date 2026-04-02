@@ -205,6 +205,8 @@ async fn handle_management_request(
             other_ports_attributes,
             forward_ports,
             shutdown_action: _,
+            backend_kind,
+            docker_host,
         } => {
             let reg = ContainerRegistration {
                 container_id,
@@ -213,6 +215,8 @@ async fn handle_management_request(
                 ports_attributes,
                 other_ports_attributes,
                 forward_ports,
+                backend_kind,
+                docker_host,
             };
             handle_register(reg, &ctx.port_manager, container_handles).await
         }
@@ -250,6 +254,8 @@ struct ContainerRegistration {
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
     forward_ports: Vec<u16>,
+    backend_kind: Option<String>,
+    docker_host: Option<String>,
 }
 
 /// Handle container registration.
@@ -288,6 +294,8 @@ async fn handle_register(
             ContainerHandle {
                 container_id: reg.container_id,
                 agent_state: Arc::new(AgentConnectionState::new()),
+                backend_kind: reg.backend_kind,
+                docker_host: reg.docker_host,
             },
         );
     }
@@ -539,6 +547,8 @@ mod tests {
                 other_ports_attributes: None,
                 forward_ports: vec![],
                 shutdown_action: None,
+                backend_kind: Some("docker".to_string()),
+                docker_host: None,
             },
         )
         .await

@@ -172,6 +172,12 @@ pub enum ManagementRequest {
         /// The `shutdownAction` from devcontainer.json (`"none"` or `"stopContainer"`).
         #[serde(default)]
         shutdown_action: Option<String>,
+        /// Which backend created this container (e.g. `"docker"`, `"apple-container"`).
+        #[serde(default)]
+        backend_kind: Option<String>,
+        /// Docker host override used when the container was created.
+        #[serde(default)]
+        docker_host: Option<String>,
     },
     /// Deregister a container (stop proxies, release ports).
     DeregisterContainer { container_name: String },
@@ -677,6 +683,8 @@ mod tests {
             other_ports_attributes: None,
             forward_ports: vec![],
             shutdown_action: None,
+            backend_kind: Some("docker".to_string()),
+            docker_host: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"register_container\""));

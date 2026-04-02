@@ -402,6 +402,11 @@ async fn re_register_containers(
             other_ports_attributes: other_ports_attrs,
             forward_ports: vec![],
             shutdown_action,
+            backend_kind: container
+                .labels
+                .get(cella_backend::BACKEND_LABEL)
+                .cloned(),
+            docker_host: None,
         };
 
         match cella_daemon::management::send_management_request(socket_path, &req).await {
