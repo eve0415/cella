@@ -136,6 +136,9 @@ impl PruneArgs {
             let names: Vec<&str> = result.pruned.iter().map(|e| e.branch.as_str()).collect();
             print_json_result(&names, &result.errors);
         } else {
+            for err in &result.errors {
+                eprintln!("error: {err}");
+            }
             let count = result.pruned.len();
             eprintln!(
                 "\nPruned {count} worktree{}",

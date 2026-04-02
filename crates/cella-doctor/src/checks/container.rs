@@ -138,14 +138,17 @@ async fn check_single_container(
     // Version skew check
     check_version_skew(client, container_id, &mut checks).await;
 
-    // Agent connectivity via daemon
-    check_agent_connectivity(&mut checks, container_name).await;
+    // Agent/port checks only apply to backends with managed agents
+    if client.capabilities().managed_agent {
+        // Agent connectivity via daemon
+        check_agent_connectivity(&mut checks, container_name).await;
 
-    // Credential forwarding
-    check_credentials(client, container_id, &mut checks).await;
+        // Credential forwarding
+        check_credentials(client, container_id, &mut checks).await;
 
-    // Port forwarding
-    check_ports(&mut checks, container_name).await;
+        // Port forwarding
+        check_ports(&mut checks, container_name).await;
+    }
 
     checks
 }

@@ -46,8 +46,15 @@ fn auto_detect(
     docker_host: Option<&str>,
 ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
     // Docker is highest priority
-    if let Ok(client) = connect_docker_backend(docker_host) {
-        return Ok(client);
+    match connect_docker_backend(docker_host) {
+        Ok(client) => return Ok(client),
+        Err(e) => {
+            // If the user explicitly targeted a Docker host, don't silently
+            // fall back to a different backend — fail with the Docker error.
+            if docker_host.is_some() {
+                return Err(e);
+            }
+        }
     }
 
     // Apple Container is lowest priority fallback (macOS only)
