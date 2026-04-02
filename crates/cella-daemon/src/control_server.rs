@@ -2013,10 +2013,9 @@ async fn forward_backend_flags(cmd: &mut tokio::process::Command, wt: &WorktreeH
 /// Resolve the backend CLI binary name and Docker host from the calling container's handle.
 async fn resolve_backend_cli_and_host(wt: &WorktreeHandlerCtx<'_>) -> (String, Option<String>) {
     let handles = wt.container_handles.lock().await;
-    let (kind, host) = handles.get(wt.container_name).map_or(
-        (None, None),
-        |h| (h.backend_kind.clone(), h.docker_host.clone()),
-    );
+    let (kind, host) = handles.get(wt.container_name).map_or((None, None), |h| {
+        (h.backend_kind.clone(), h.docker_host.clone())
+    });
     drop(handles);
     let cmd_name = match kind.as_deref() {
         Some("apple-container") => "container".to_string(),

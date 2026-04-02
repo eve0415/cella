@@ -415,7 +415,7 @@ async fn re_register_containers(
                 forward_ports: vec![],
                 shutdown_action,
                 backend_kind: container.labels.get(cella_backend::BACKEND_LABEL).cloned(),
-                docker_host: None,
+                docker_host: std::env::var("DOCKER_HOST").ok(),
             },
         ));
 
