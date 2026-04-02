@@ -215,7 +215,13 @@ impl EnsureUpContext<'_> {
     ) {
         let config = self.config_json();
 
-        let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
+        let mut env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
+        if !self.client.capabilities().managed_agent {
+            env_fwd
+                .post_start
+                .git_config_commands
+                .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
+        }
         let _ = run_step_result(&self.progress, "Configuring environment...", async {
             crate::container_setup::inject_post_start(
                 self.client,
@@ -940,19 +946,20 @@ impl EnsureUpContext<'_> {
         let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
         let has_rules = net_config.has_rules() && !skip_rules;
 
-        // Only configure proxy forwarding for backends with a managed agent —
-        // the agent runs the local proxy that HTTP_PROXY/HTTPS_PROXY point to.
+        // For unmanaged backends, still forward upstream proxy env vars for
+        // direct passthrough, but disable blocking rules (which require the
+        // agent-side proxy that won't be provisioned).
         let managed_agent = self.client.capabilities().managed_agent;
-        let proxy_fwd = if managed_agent {
-            Some(cella_env::ProxyForwardingConfig {
-                proxy: net_config.proxy.clone(),
-                has_blocking_rules: has_rules,
-                full_config: if has_rules { Some(net_config) } else { None },
-                container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
-            })
-        } else {
-            None
-        };
+        let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
+            proxy: net_config.proxy.clone(),
+            has_blocking_rules: has_rules && managed_agent,
+            full_config: if has_rules && managed_agent {
+                Some(net_config)
+            } else {
+                None
+            },
+            container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+        });
         let mut env_fwd =
             cella_env::prepare_env_forwarding(config, &remote_user, proxy_fwd.as_ref());
 
