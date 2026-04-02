@@ -191,8 +191,7 @@ async fn resolve_base_image(
         );
 
         if !will_build_features {
-            let metadata_label =
-                cella_features::generate_metadata_label(&[], input.config, None);
+            let metadata_label = cella_features::generate_metadata_label(&[], input.config, None);
             build_opts
                 .options
                 .push(format!("--label=devcontainer.metadata={metadata_label}"));
@@ -206,9 +205,9 @@ async fn resolve_base_image(
         let elapsed_str = format_elapsed(start.elapsed());
         match &result {
             Ok(_) => {
-                input.progress.println(&format!(
-                    "  \x1b[32m✓\x1b[0m Built Dockerfile{elapsed_str}"
-                ));
+                input
+                    .progress
+                    .println(&format!("  \x1b[32m✓\x1b[0m Built Dockerfile{elapsed_str}"));
             }
             Err(e) => {
                 input
