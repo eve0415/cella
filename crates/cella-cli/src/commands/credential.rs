@@ -8,6 +8,8 @@ use cella_backend::{ContainerTarget, ExecOptions, FileToUpload};
 /// Manage credential forwarding for dev containers.
 #[derive(Args)]
 pub struct CredentialArgs {
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
     #[command(subcommand)]
     command: CredentialCommand,
 }
@@ -50,20 +52,17 @@ enum CredentialTool {
 }
 
 impl CredentialArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         match self.command {
-            CredentialCommand::Sync(args) => run_sync(args, backend).await,
-            CredentialCommand::Status(args) => run_status(args, backend).await,
+            CredentialCommand::Sync(args) => run_sync(args, &self.backend).await,
+            CredentialCommand::Status(args) => run_status(args, &self.backend).await,
         }
     }
 }
 
 async fn run_sync(
     args: SyncArgs,
-    backend: Option<&crate::backend::BackendChoice>,
+    backend: &crate::backend::BackendArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match args.tool {
         CredentialTool::Gh => sync_gh(args.container, args.workspace_folder, backend).await,
@@ -73,9 +72,9 @@ async fn run_sync(
 async fn sync_gh(
     container_id_override: Option<String>,
     workspace_folder: Option<PathBuf>,
-    backend: Option<&crate::backend::BackendChoice>,
+    backend: &crate::backend::BackendArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = backend.resolve_client().await?;
 
     let cwd = super::resolve_workspace_folder(workspace_folder.as_deref())?;
 
@@ -178,7 +177,7 @@ async fn sync_gh(
 
 async fn run_status(
     args: StatusArgs,
-    backend: Option<&crate::backend::BackendChoice>,
+    backend: &crate::backend::BackendArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let redactor = cella_doctor::redact::Redactor::new();
 
@@ -222,7 +221,7 @@ async fn run_status(
     );
 
     // Container section
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = backend.resolve_client().await?;
     let target = ContainerTarget {
         container_id: args.container,
         container_name: None,

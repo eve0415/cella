@@ -40,9 +40,8 @@ pub struct UpArgs {
     #[arg(long)]
     pub(crate) workspace_folder: Option<PathBuf>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    pub(crate) docker_host: Option<String>,
+    #[command(flatten)]
+    pub(crate) backend: crate::backend::BackendArgs,
 
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
@@ -101,13 +100,14 @@ pub struct UpContext {
     extra_labels: std::collections::HashMap<String, String>,
     /// Network rule enforcement policy.
     network_rules: NetworkRulePolicy,
+    /// Docker host override (forwarded to daemon registration).
+    docker_host: Option<String>,
 }
 
 impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
@@ -128,11 +128,7 @@ impl UpContext {
         let config_name = config.get("name").and_then(|v| v.as_str());
 
         // 2. Connect to backend
-        // NOTE: auto-detect picks the first backend whose socket exists.
-        // If Docker's socket exists but the daemon is stopped, auto-detect
-        // won't fall through to Apple Container. Users can work around this
-        // with `--backend apple-container`.
-        let client = super::resolve_backend_for_command(backend, args.docker_host.as_deref())?;
+        let client = args.backend.resolve_client().await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -165,6 +161,7 @@ impl UpContext {
             } else {
                 NetworkRulePolicy::Enforce
             },
+            docker_host: effective_docker_host(&args.backend),
         })
     }
 
@@ -175,11 +172,10 @@ impl UpContext {
     /// `build_no_cache` to false.
     pub async fn for_workspace(
         workspace_path: &std::path::Path,
-        docker_host: Option<&str>,
+        backend_args: &crate::backend::BackendArgs,
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = workspace_path
             .canonicalize()
@@ -198,7 +194,7 @@ impl UpContext {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::resolve_backend_for_command(backend, docker_host)?;
+        let client = backend_args.resolve_client().await?;
         client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
@@ -227,6 +223,7 @@ impl UpContext {
             skip_checksum: false,
             extra_labels,
             network_rules: NetworkRulePolicy::Enforce,
+            docker_host: effective_docker_host(backend_args),
         })
     }
 
@@ -278,15 +275,19 @@ impl UpContext {
             .get("shutdownAction")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let req = cella_protocol::ManagementRequest::RegisterContainer {
-            container_id: container_id.to_string(),
-            container_name: self.container_nm.clone(),
-            container_ip,
-            ports_attributes: ports_attrs,
-            other_ports_attributes: other_ports_attrs,
-            forward_ports,
-            shutdown_action,
-        };
+        let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
+            cella_protocol::ContainerRegistrationData {
+                container_id: container_id.to_string(),
+                container_name: self.container_nm.clone(),
+                container_ip,
+                ports_attributes: ports_attrs,
+                other_ports_attributes: other_ports_attrs,
+                forward_ports,
+                shutdown_action,
+                backend_kind: Some(self.client.kind().to_string()),
+                docker_host: self.docker_host.clone(),
+            },
+        ));
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
                 debug!("Container registered with daemon: {resp:?}");
@@ -470,6 +471,8 @@ pub struct UpResult {
 struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
     managed_agent: bool,
+    backend_kind: String,
+    docker_host: Option<String>,
 }
 
 impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
@@ -505,6 +508,8 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         let container_name = container_name.to_string();
         let container_ip = container_ip.map(str::to_string);
         let managed_agent = self.managed_agent;
+        let backend_kind = self.backend_kind.clone();
+        let docker_host = self.docker_host.clone();
         Box::pin(async move {
             if !managed_agent {
                 return;
@@ -537,15 +542,19 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let req = cella_protocol::ManagementRequest::RegisterContainer {
-                container_id,
-                container_name,
-                container_ip,
-                ports_attributes: ports_attrs,
-                other_ports_attributes: other_ports_attrs,
-                forward_ports,
-                shutdown_action,
-            };
+            let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
+                cella_protocol::ContainerRegistrationData {
+                    container_id,
+                    container_name,
+                    container_ip,
+                    ports_attributes: ports_attrs,
+                    other_ports_attributes: other_ports_attrs,
+                    forward_ports,
+                    shutdown_action,
+                    backend_kind: Some(backend_kind),
+                    docker_host,
+                },
+            ));
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
     }
@@ -583,6 +592,8 @@ impl UpContext {
         let hooks = CliUpHooks {
             config: self.config(),
             managed_agent: self.client.capabilities().managed_agent,
+            backend_kind: self.client.kind().to_string(),
+            docker_host: self.docker_host.clone(),
         };
         let config = cella_orchestrator::UpConfig {
             resolved: &self.resolved,
@@ -639,7 +650,6 @@ impl UpArgs {
         &self,
         branch_name: &str,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
@@ -657,11 +667,10 @@ impl UpArgs {
         let extra_labels = cella_backend::worktree_labels(branch_name, &repo_info.root);
         let mut ctx = UpContext::for_workspace(
             &wt.path,
-            self.docker_host.as_deref(),
+            &self.backend,
             extra_labels,
             progress,
             self.output.clone(),
-            backend,
         )
         .await?;
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
@@ -689,13 +698,12 @@ impl UpArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref branch_name) = self.branch {
-            return self.execute_branch(branch_name, progress, backend).await;
+            return self.execute_branch(branch_name, progress).await;
         }
 
-        let ctx = UpContext::new(&self, progress, backend).await?;
+        let ctx = UpContext::new(&self, progress).await?;
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {
@@ -718,6 +726,17 @@ impl UpArgs {
 
 pub fn map_env_object(value: Option<&serde_json::Value>) -> Vec<String> {
     cella_orchestrator::container_setup::map_env_object(value)
+}
+
+/// Return the effective Docker host for daemon registration.
+///
+/// Prefers the explicit CLI `--docker-host` flag; falls back to the
+/// `DOCKER_HOST` environment variable so daemon-spawned follow-up
+/// operations target the same engine.
+fn effective_docker_host(args: &crate::backend::BackendArgs) -> Option<String> {
+    args.docker_host
+        .clone()
+        .or_else(|| std::env::var("DOCKER_HOST").ok())
 }
 
 pub fn output_result(

@@ -197,22 +197,16 @@ async fn handle_management_request(
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
 ) -> ManagementResponse {
     match req {
-        ManagementRequest::RegisterContainer {
-            container_id,
-            container_name,
-            container_ip,
-            ports_attributes,
-            other_ports_attributes,
-            forward_ports,
-            shutdown_action: _,
-        } => {
+        ManagementRequest::RegisterContainer(data) => {
             let reg = ContainerRegistration {
-                container_id,
-                container_name,
-                container_ip,
-                ports_attributes,
-                other_ports_attributes,
-                forward_ports,
+                container_id: data.container_id,
+                container_name: data.container_name,
+                container_ip: data.container_ip,
+                ports_attributes: data.ports_attributes,
+                other_ports_attributes: data.other_ports_attributes,
+                forward_ports: data.forward_ports,
+                backend_kind: data.backend_kind,
+                docker_host: data.docker_host,
             };
             handle_register(reg, &ctx.port_manager, container_handles).await
         }
@@ -250,6 +244,8 @@ struct ContainerRegistration {
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
     forward_ports: Vec<u16>,
+    backend_kind: Option<String>,
+    docker_host: Option<String>,
 }
 
 /// Handle container registration.
@@ -288,6 +284,8 @@ async fn handle_register(
             ContainerHandle {
                 container_id: reg.container_id,
                 agent_state: Arc::new(AgentConnectionState::new()),
+                backend_kind: reg.backend_kind,
+                docker_host: reg.docker_host,
             },
         );
     }
@@ -531,15 +529,19 @@ mod tests {
         // Register container
         let resp = send_management_request(
             &socket_path,
-            &ManagementRequest::RegisterContainer {
-                container_id: "abc123".to_string(),
-                container_name: "test-container".to_string(),
-                container_ip: Some("172.20.0.5".to_string()),
-                ports_attributes: vec![],
-                other_ports_attributes: None,
-                forward_ports: vec![],
-                shutdown_action: None,
-            },
+            &ManagementRequest::RegisterContainer(Box::new(
+                cella_protocol::ContainerRegistrationData {
+                    container_id: "abc123".to_string(),
+                    container_name: "test-container".to_string(),
+                    container_ip: Some("172.20.0.5".to_string()),
+                    ports_attributes: vec![],
+                    other_ports_attributes: None,
+                    forward_ports: vec![],
+                    shutdown_action: None,
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            )),
         )
         .await
         .unwrap();

@@ -41,13 +41,12 @@ impl TmuxArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (build_no_cache, force) = (self.up.build.build_no_cache, self.force);
         let (strict, output_format) = (self.up.strict.clone(), self.up.output.clone());
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress, backend).await?;
+        let ctx = UpContext::new(&up, progress).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
         let container_id = if self.service.is_some() {
             let container = ctx.client.inspect_container(&result.container_id).await?;

@@ -9,17 +9,28 @@ pub struct PortsArgs {
     /// Show ports across all worktrees/containers.
     #[arg(long)]
     all: bool,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 }
 
 impl PortsArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         // Try querying the daemon first for dynamic port info — only when
-        // the selected backend uses daemon-managed port forwarding.
-        let use_daemon = backend.is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
-        if use_daemon
+        // the selected backend uses daemon-managed port forwarding and no
+        // custom Docker host is specified (daemon tracks local containers only).
+        let is_docker_backend = self
+            .backend
+            .backend
+            .as_ref()
+            .is_none_or(|b| matches!(b, crate::backend::BackendChoice::Docker));
+        let effective_host = self
+            .backend
+            .docker_host
+            .clone()
+            .or_else(|| std::env::var("DOCKER_HOST").ok());
+        let has_remote_host = effective_host.as_deref().is_some_and(is_remote_docker_host);
+        if is_docker_backend
+            && !has_remote_host
             && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
         {
@@ -46,8 +57,26 @@ impl PortsArgs {
         }
 
         // Fall back to the selected backend for static port bindings
-        print_backend_ports(self.all, backend).await
+        print_backend_ports(self.all, &self.backend).await
     }
+}
+
+/// Returns `true` when the Docker host points to a non-local engine.
+///
+/// Local aliases (`unix://` sockets, `tcp://localhost`, `tcp://127.0.0.1`)
+/// still target the same daemon the cella daemon manages, so the daemon
+/// fast-path should remain active for those.
+fn is_remote_docker_host(host: &str) -> bool {
+    if host.starts_with("unix://") || host.starts_with("npipe://") {
+        return false;
+    }
+    if let Some(rest) = host.strip_prefix("tcp://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let hostname = authority.split(':').next().unwrap_or(authority);
+        return !matches!(hostname, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    }
+    // Unknown scheme — assume remote to be safe
+    true
 }
 
 fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
@@ -76,9 +105,9 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
 
 async fn print_backend_ports(
     all: bool,
-    backend: Option<&crate::backend::BackendChoice>,
+    backend_args: &crate::backend::BackendArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = super::resolve_backend_for_command(backend, None)?;
+    let client = backend_args.resolve_client().await?;
     let containers = client.list_cella_containers(true).await?;
 
     // Check if any container is compose-managed and try compose ps

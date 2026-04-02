@@ -89,6 +89,9 @@ pub fn image_name_with_features(
     format!("cella-img-{identifier}-{path_hash}-{feat_hash}")
 }
 
+/// Label key for the container backend kind.
+pub const BACKEND_LABEL: &str = "dev.cella.backend";
+
 /// Standard labels for cella containers.
 pub fn container_labels(
     workspace_root: &Path,

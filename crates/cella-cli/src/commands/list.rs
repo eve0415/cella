@@ -17,17 +17,13 @@ pub struct ListArgs {
     #[arg(long)]
     json: bool,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 }
 
 impl ListArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.backend.resolve_client().await?;
 
         let containers = client.list_cella_containers(self.running).await?;
 

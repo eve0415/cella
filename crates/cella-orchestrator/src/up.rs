@@ -547,6 +547,10 @@ impl EnsureUpContext<'_> {
             runtime.as_label(),
         );
 
+        labels.insert(
+            cella_backend::BACKEND_LABEL.to_string(),
+            self.client.kind().to_string(),
+        );
         labels.insert("dev.cella.remote_user".to_string(), remote_user.to_string());
         labels.insert(
             "dev.cella.version".to_string(),

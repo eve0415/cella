@@ -20,9 +20,8 @@ pub struct BranchArgs {
     #[arg(long = "exec")]
     pub exec_cmd: Option<String>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
@@ -33,7 +32,6 @@ impl BranchArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
@@ -57,7 +55,7 @@ impl BranchArgs {
 
         // 3. Run container pipeline (with rollback on failure)
         let result = self
-            .run_container_pipeline(&wt_path, repo_root, &progress, backend)
+            .run_container_pipeline(&wt_path, repo_root, &progress)
             .await;
 
         if let Err(e) = &result {
@@ -80,7 +78,6 @@ impl BranchArgs {
         wt_path: &std::path::Path,
         repo_root: &std::path::Path,
         progress: &crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Prepare worktree-specific labels
         let extra_labels = worktree_labels(&self.name, repo_root);
@@ -88,11 +85,10 @@ impl BranchArgs {
         // Create the container using the up pipeline
         let ctx = UpContext::for_workspace(
             wt_path,
-            self.docker_host.as_deref(),
+            &self.backend,
             extra_labels,
             progress.clone(),
             self.output.clone(),
-            backend,
         )
         .await?;
 

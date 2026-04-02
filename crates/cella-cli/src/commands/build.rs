@@ -26,9 +26,8 @@ pub struct BuildArgs {
     #[arg(long)]
     file: Option<PathBuf>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
@@ -50,7 +49,6 @@ impl BuildArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-        backend: Option<&crate::backend::BackendChoice>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
@@ -64,7 +62,7 @@ impl BuildArgs {
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
 
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+        let client = self.backend.resolve_client().await?;
         client.ping().await?;
 
         // Docker Compose path: delegate to orchestrator

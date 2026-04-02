@@ -134,55 +134,51 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
-    pub async fn execute(
-        self,
-        progress: Progress,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::Up(args) => args.execute(progress, backend).await,
-            Self::Code(args) => args.execute(progress, backend).await,
-            Self::Down(args) => args.execute(backend).await,
-            Self::Shell(args) => args.execute(backend).await,
-            Self::Exec(args) => args.execute(backend).await,
-            Self::Build(args) => args.execute(progress, backend).await,
-            Self::List(args) => args.execute(backend).await,
-            Self::Logs(args) => args.execute(backend).await,
-            Self::Doctor(args) => args.execute(backend).await,
-            Self::Branch(args) => args.execute(progress, backend).await,
-
-            Self::Switch(args) => args.execute(backend).await,
-            Self::Prune(args) => args.execute(backend).await,
+            Self::Up(args) => args.execute(progress).await,
+            Self::Code(args) => args.execute(progress).await,
+            Self::Down(args) => args.execute().await,
+            Self::Shell(args) => args.execute().await,
+            Self::Exec(args) => args.execute().await,
+            Self::Build(args) => args.execute(progress).await,
+            Self::List(args) => args.execute().await,
+            Self::Logs(args) => args.execute().await,
+            Self::Doctor(args) => args.execute().await,
+            Self::Branch(args) => args.execute(progress).await,
+            Self::Switch(args) => args.execute().await,
+            Self::Prune(args) => args.execute().await,
             Self::ReadConfiguration(args) => args.execute(),
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
             Self::Init(args) => args.execute(progress).await,
-            Self::Nvim(args) => args.execute(progress, backend).await,
-            Self::Tmux(args) => args.execute(progress, backend).await,
+            Self::Nvim(args) => args.execute(progress).await,
+            Self::Tmux(args) => args.execute(progress).await,
             Self::Completions(args) => {
                 args.execute();
                 Ok(())
             }
-            Self::Credential(args) => args.execute(backend).await,
+            Self::Credential(args) => args.execute().await,
             Self::Network(args) => args.execute(),
-            Self::Ports(args) => args.execute(backend).await,
+            Self::Ports(args) => args.execute().await,
             Self::Daemon(args) => args.execute().await,
         }
     }
 }
 
-/// Resolve the container backend from user choice, with optional Docker host override.
+/// Emit a warning if a container lacks the `dev.cella.backend` label.
 ///
-/// # Errors
-///
-/// Returns error if no backend is available.
-pub fn resolve_backend_for_command(
-    backend: Option<&crate::backend::BackendChoice>,
-    docker_host: Option<&str>,
-) -> Result<Box<dyn cella_backend::ContainerBackend>, Box<dyn std::error::Error>> {
-    crate::backend::resolve_backend(backend, docker_host)
-        .map_err(|e| e as Box<dyn std::error::Error>)
+/// Pre-existing containers (created before backend labeling) won't have
+/// this label; we assume Docker and nudge the user to rebuild.
+pub fn warn_if_missing_backend_label(container: &cella_backend::ContainerInfo) {
+    if !container.labels.contains_key(cella_backend::BACKEND_LABEL) {
+        warn!(
+            "Container '{}' has no backend label. Assuming Docker. \
+             Run `cella up --rebuild` to add it.",
+            container.name
+        );
+    }
 }
 
 /// Resolve the workspace folder from an optional argument or the current directory.
@@ -390,8 +386,9 @@ async fn re_register_containers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use cella_protocol::ManagementRequest;
 
-    let client =
-        crate::backend::resolve_backend(None, None).map_err(|e| e as Box<dyn std::error::Error>)?;
+    let client = crate::backend::BackendArgs::default()
+        .resolve_client()
+        .await?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
@@ -408,15 +405,19 @@ async fn re_register_containers(
 
         let shutdown_action = container.labels.get("dev.cella.shutdown_action").cloned();
 
-        let req = ManagementRequest::RegisterContainer {
-            container_id: container.id.clone(),
-            container_name: container.name.clone(),
-            container_ip,
-            ports_attributes: ports_attrs,
-            other_ports_attributes: other_ports_attrs,
-            forward_ports: vec![],
-            shutdown_action,
-        };
+        let req = ManagementRequest::RegisterContainer(Box::new(
+            cella_protocol::ContainerRegistrationData {
+                container_id: container.id.clone(),
+                container_name: container.name.clone(),
+                container_ip,
+                ports_attributes: ports_attrs,
+                other_ports_attributes: other_ports_attrs,
+                forward_ports: vec![],
+                shutdown_action,
+                backend_kind: container.labels.get(cella_backend::BACKEND_LABEL).cloned(),
+                docker_host: std::env::var("DOCKER_HOST").ok(),
+            },
+        ));
 
         match cella_daemon::management::send_management_request(socket_path, &req).await {
             Ok(resp) => {

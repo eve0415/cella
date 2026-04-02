@@ -27,9 +27,8 @@ pub struct LogsArgs {
     #[arg(long)]
     workspace_folder: Option<PathBuf>,
 
-    /// Explicit Docker host URL (overrides `DOCKER_HOST`).
-    #[arg(long)]
-    docker_host: Option<String>,
+    #[command(flatten)]
+    backend: crate::backend::BackendArgs,
 
     /// Filter logs to a specific compose service (compose only).
     #[arg(long)]
@@ -37,24 +36,18 @@ pub struct LogsArgs {
 }
 
 impl LogsArgs {
-    pub async fn execute(
-        self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         if self.daemon {
             return self.show_daemon_logs();
         }
         if self.lifecycle {
             return self.show_lifecycle_logs();
         }
-        self.show_container_logs(backend).await
+        self.show_container_logs().await
     }
 
-    async fn show_container_logs(
-        &self,
-        backend: Option<&crate::backend::BackendChoice>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = super::resolve_backend_for_command(backend, self.docker_host.as_deref())?;
+    async fn show_container_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let client = self.backend.resolve_client().await?;
 
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
