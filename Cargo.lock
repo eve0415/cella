@@ -304,6 +304,7 @@ dependencies = [
  "cella-network",
  "cella-port",
  "cella-protocol",
+ "miette",
  "nix 0.31.2",
  "notify",
  "rcgen",
@@ -325,6 +326,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "miette",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -373,6 +375,7 @@ dependencies = [
  "heck",
  "indexmap",
  "insta",
+ "miette",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -387,6 +390,7 @@ version = "0.0.15"
 dependencies = [
  "hex",
  "insta",
+ "miette",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -431,6 +435,7 @@ version = "0.0.15"
 dependencies = [
  "cella-port",
  "cella-protocol",
+ "miette",
  "nix 0.31.2",
  "portable-pty",
  "serde_json",
@@ -452,6 +457,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "miette",
  "reqwest 0.13.2",
  "sha2 0.11.0",
  "tar",
@@ -481,6 +487,7 @@ name = "cella-env"
 version = "0.0.15"
 dependencies = [
  "cella-network",
+ "miette",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -515,6 +522,7 @@ name = "cella-git"
 version = "0.0.15"
 dependencies = [
  "insta",
+ "miette",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -525,6 +533,7 @@ name = "cella-network"
 version = "0.0.15"
 dependencies = [
  "base64 0.22.1",
+ "miette",
  "rcgen",
  "rustls-native-certs",
  "serde",
@@ -547,6 +556,8 @@ dependencies = [
  "cella-network",
  "cella-protocol",
  "hex",
+ "miette",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
@@ -559,6 +570,7 @@ name = "cella-port"
 version = "0.0.15"
 dependencies = [
  "cella-protocol",
+ "miette",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
