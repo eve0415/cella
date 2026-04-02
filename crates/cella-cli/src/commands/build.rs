@@ -5,8 +5,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use cella_config::devcontainer::resolve;
-
-use super::image::ensure_image;
+use cella_orchestrator::image::EnsureImageInput;
 
 /// Build the dev container image without starting it.
 #[derive(Args)]
@@ -17,6 +16,10 @@ pub struct BuildArgs {
     /// Do not use cache when building the image.
     #[arg(long)]
     no_cache: bool,
+
+    /// Image pull policy (e.g. "always", "missing", "never").
+    #[arg(long)]
+    pull: Option<String>,
 
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
@@ -122,16 +125,21 @@ impl BuildArgs {
         }
 
         // Non-compose path
-        let (img_name, _resolved_features, _image_details) = ensure_image(
-            client.as_ref(),
+        let (sender, renderer) = crate::progress::bridge(&progress);
+        let input = EnsureImageInput {
+            client: client.as_ref(),
             config,
-            &resolved.workspace_root,
+            workspace_root: &resolved.workspace_root,
             config_name,
-            &resolved.config_path,
-            self.no_cache,
-            &progress,
-        )
-        .await?;
+            config_path: &resolved.config_path,
+            no_cache: self.no_cache,
+            pull_policy: self.pull.as_deref(),
+            progress: &sender,
+        };
+        let result = cella_orchestrator::image::ensure_image(&input).await;
+        drop(sender);
+        let (img_name, _resolved_features, _image_details) = result?;
+        let _ = renderer.await;
 
         if let Some(container) = client.find_container(&resolved.workspace_root).await?
             && let Some(old_hash) = &container.config_hash
