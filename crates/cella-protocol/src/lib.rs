@@ -696,6 +696,19 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_register_without_backend_fields() {
+        // Backward compatibility: old CLI versions may omit backend_kind/docker_host.
+        let json = r#"{"type":"register_container","container_id":"abc","container_name":"test","container_ip":null,"ports_attributes":[],"other_ports_attributes":null,"forward_ports":[],"shutdown_action":null}"#;
+        let req: ManagementRequest = serde_json::from_str(json).unwrap();
+        if let ManagementRequest::RegisterContainer(data) = req {
+            assert!(data.backend_kind.is_none());
+            assert!(data.docker_host.is_none());
+        } else {
+            panic!("expected RegisterContainer");
+        }
+    }
+
+    #[test]
     fn serialize_management_deregister() {
         let req = ManagementRequest::DeregisterContainer {
             container_name: "cella-myapp-main".to_string(),

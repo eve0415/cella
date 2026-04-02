@@ -214,4 +214,24 @@ mod tests {
         // Auto-detect: exercises the full path regardless of Docker availability
         let _ = args.resolve().await;
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn backend_args_conflict_apple_container_docker_host() {
+        let args = BackendArgs {
+            backend: Some(BackendChoice::AppleContainer),
+            docker_host: Some("tcp://localhost:2375".to_string()),
+        };
+        let result = args.resolve().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--docker-host cannot be used"));
+    }
+
+    #[test]
+    fn backend_args_default_is_none() {
+        let args = BackendArgs::default();
+        assert!(args.backend.is_none());
+        assert!(args.docker_host.is_none());
+    }
 }
