@@ -243,7 +243,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let custom_path = tmp.path().join("custom").join("my-devcontainer.json");
         create_file(&custom_path);
-        let resolved = crate::resolve::config(tmp.path(), Some(&custom_path)).unwrap();
+        let resolved = crate::devcontainer::resolve::config(tmp.path(), Some(&custom_path)).unwrap();
         assert_eq!(resolved.config_path, custom_path);
     }
 

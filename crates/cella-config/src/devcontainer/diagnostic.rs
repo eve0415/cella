@@ -120,7 +120,7 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::span::SourceText;
+    use crate::devcontainer::span::SourceText;
 
     fn dummy_source() -> SourceText {
         let text = r#"{"image": "ubuntu"}"#.to_string();

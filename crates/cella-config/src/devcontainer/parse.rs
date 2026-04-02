@@ -113,7 +113,7 @@ pub fn devcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::diagnostic::Severity;
+    use crate::devcontainer::diagnostic::Severity;
 
     /// Helper: unwrap Ok or panic with rendered diagnostics.
     fn unwrap_ok(
