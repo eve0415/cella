@@ -271,17 +271,19 @@ impl UpContext {
             .get("shutdownAction")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let req = cella_protocol::ManagementRequest::RegisterContainer {
-            container_id: container_id.to_string(),
-            container_name: self.container_nm.clone(),
-            container_ip,
-            ports_attributes: ports_attrs,
-            other_ports_attributes: other_ports_attrs,
-            forward_ports,
-            shutdown_action,
-            backend_kind: Some(self.client.kind().to_string()),
-            docker_host: None,
-        };
+        let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
+            cella_protocol::ContainerRegistrationData {
+                container_id: container_id.to_string(),
+                container_name: self.container_nm.clone(),
+                container_ip,
+                ports_attributes: ports_attrs,
+                other_ports_attributes: other_ports_attrs,
+                forward_ports,
+                shutdown_action,
+                backend_kind: Some(self.client.kind().to_string()),
+                docker_host: None,
+            },
+        ));
         match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
                 debug!("Container registered with daemon: {resp:?}");
@@ -534,17 +536,19 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let req = cella_protocol::ManagementRequest::RegisterContainer {
-                container_id,
-                container_name,
-                container_ip,
-                ports_attributes: ports_attrs,
-                other_ports_attributes: other_ports_attrs,
-                forward_ports,
-                shutdown_action,
-                backend_kind: Some(backend_kind),
-                docker_host: None,
-            };
+            let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
+                cella_protocol::ContainerRegistrationData {
+                    container_id,
+                    container_name,
+                    container_ip,
+                    ports_attributes: ports_attrs,
+                    other_ports_attributes: other_ports_attrs,
+                    forward_ports,
+                    shutdown_action,
+                    backend_kind: Some(backend_kind),
+                    docker_host: None,
+                },
+            ));
             let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
         })
     }

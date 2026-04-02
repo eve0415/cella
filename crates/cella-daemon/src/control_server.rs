@@ -217,7 +217,7 @@ where
     }
 
     // Send DaemonHello success with workspace metadata from container labels.
-    let labels = lookup_container_labels(&container_id).await;
+    let labels = lookup_container_labels(&container_id, &ctx.container_handles).await;
     let hello = DaemonHello {
         protocol_version: PROTOCOL_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -315,6 +315,7 @@ async fn handle_agent_connection(
                     workspace_path: hs.workspace_path.as_deref(),
                     cella_bin: &ctx.cella_bin,
                     task_mgr: &ctx.task_manager,
+                    container_handles: &ctx.container_handles,
                 },
                 &mut writer,
             )
@@ -555,15 +556,33 @@ async fn send_message<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// Docker label lookup
+// Container label lookup
 // ---------------------------------------------------------------------------
 
-/// Look up container labels via `docker inspect`.
+/// Look up container labels via the appropriate backend CLI.
 ///
-/// Returns an empty map on any failure (Docker not running, container not found, etc.)
-/// so callers can proceed with defaults.
-async fn lookup_container_labels(container_id: &str) -> HashMap<String, String> {
-    let output = tokio::process::Command::new("docker")
+/// Uses the registered `backend_kind` to decide between `docker inspect`
+/// and `container inspect`. Returns an empty map on any failure so callers
+/// can proceed with defaults.
+async fn lookup_container_labels(
+    container_id: &str,
+    container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+) -> HashMap<String, String> {
+    // Determine which CLI binary to use from the registered backend kind.
+    let backend_kind = {
+        let handles = container_handles.lock().await;
+        handles
+            .values()
+            .find(|h| h.container_id == container_id)
+            .and_then(|h| h.backend_kind.clone())
+    };
+
+    let cmd_name = match backend_kind.as_deref() {
+        Some("apple-container") => "container",
+        _ => "docker",
+    };
+
+    let output = tokio::process::Command::new(cmd_name)
         .args([
             "inspect",
             "--format",
@@ -595,6 +614,7 @@ struct WorktreeHandlerCtx<'a> {
     workspace_path: Option<&'a str>,
     cella_bin: &'a std::path::Path,
     task_mgr: &'a crate::task_manager::SharedTaskManager,
+    container_handles: &'a Arc<Mutex<HashMap<String, ContainerHandle>>>,
 }
 
 /// Handle worktree/exec/task messages that need writer access for multi-message responses.
@@ -626,9 +646,7 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             branch,
             command,
-        } => {
-            handle_exec_request(&request_id, &branch, &command, writer).await?;
-        }
+        } => handle_exec_request(&request_id, &branch, &command, &wt, writer).await?,
         AgentMessage::PruneRequest {
             request_id,
             dry_run,
@@ -658,15 +676,7 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             branch,
             rebuild,
         } => {
-            handle_up_request(
-                &request_id,
-                &branch,
-                rebuild,
-                wt.workspace_path,
-                wt.cella_bin,
-                writer,
-            )
-            .await?;
+            handle_up_request(&request_id, &branch, rebuild, &wt, writer).await?;
         }
         AgentMessage::TaskRunRequest {
             request_id,
@@ -1069,11 +1079,12 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
         .collect()
 }
 
-/// Handle an `ExecRequest` by finding the branch's container and running docker exec.
+/// Handle an `ExecRequest` by finding the branch's container and running `cella exec`.
 async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     command: &[String],
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     use cella_protocol::OutputStream;
@@ -1103,11 +1114,22 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
 
     info!("Handling ExecRequest: branch={branch} container={container_name}");
 
-    // TODO: use the backend abstraction instead of shelling out to Docker
-    // directly.  Currently only Docker containers have a managed agent, so
-    // this path is only reachable for Docker backends.
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.arg("exec").arg(&container_name);
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("exec");
+    // Forward --backend / --docker-host from the registered container handle.
+    {
+        let handles = wt.container_handles.lock().await;
+        if let Some(handle) = handles.get(&container_name) {
+            if let Some(ref kind) = handle.backend_kind {
+                cmd.arg("--backend").arg(kind);
+            }
+            if let Some(ref dh) = handle.docker_host {
+                cmd.arg("--docker-host").arg(dh);
+            }
+        }
+    }
+    cmd.arg("--container-name").arg(&container_name);
+    cmd.arg("--");
     for arg in command {
         cmd.arg(arg);
     }
@@ -1122,7 +1144,7 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
                 &DaemonMessage::OperationOutput {
                     request_id: request_id.to_string(),
                     stream: OutputStream::Stderr,
-                    data: format!("failed to spawn docker exec: {e}\n"),
+                    data: format!("failed to spawn cella exec: {e}\n"),
                 },
             )
             .await?;
@@ -1356,8 +1378,7 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     rebuild: bool,
-    workspace_path: Option<&str>,
-    cella_bin: &std::path::Path,
+    wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     use cella_protocol::WorktreeOperationResult;
@@ -1374,19 +1395,28 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
     )
     .await?;
 
-    // TODO: forward --backend / --docker-host when backend selection is
-    // stored per-container.  Currently only Docker containers have a managed
-    // agent, so these daemon-spawned subprocesses always target Docker.
-    let mut cmd = tokio::process::Command::new(cella_bin);
-    cmd.arg("up")
-        .arg("--branch")
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("up");
+    // Forward --backend / --docker-host from the registered container handle.
+    {
+        let handles = wt.container_handles.lock().await;
+        if let Some(handle) = handles.values().next() {
+            if let Some(ref kind) = handle.backend_kind {
+                cmd.arg("--backend").arg(kind);
+            }
+            if let Some(ref dh) = handle.docker_host {
+                cmd.arg("--docker-host").arg(dh);
+            }
+        }
+    }
+    cmd.arg("--branch")
         .arg(branch)
         .arg("--output")
         .arg("json");
     if rebuild {
         cmd.arg("--rebuild");
     }
-    if let Some(ws) = workspace_path {
+    if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
     }
     cmd.stdout(std::process::Stdio::piped());

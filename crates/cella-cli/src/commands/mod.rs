@@ -408,20 +408,22 @@ async fn re_register_containers(
 
         let shutdown_action = container.labels.get("dev.cella.shutdown_action").cloned();
 
-        let req = ManagementRequest::RegisterContainer {
-            container_id: container.id.clone(),
-            container_name: container.name.clone(),
-            container_ip,
-            ports_attributes: ports_attrs,
-            other_ports_attributes: other_ports_attrs,
-            forward_ports: vec![],
-            shutdown_action,
-            backend_kind: container
-                .labels
-                .get(cella_backend::BACKEND_LABEL)
-                .cloned(),
-            docker_host: None,
-        };
+        let req = ManagementRequest::RegisterContainer(Box::new(
+            cella_protocol::ContainerRegistrationData {
+                container_id: container.id.clone(),
+                container_name: container.name.clone(),
+                container_ip,
+                ports_attributes: ports_attrs,
+                other_ports_attributes: other_ports_attrs,
+                forward_ports: vec![],
+                shutdown_action,
+                backend_kind: container
+                    .labels
+                    .get(cella_backend::BACKEND_LABEL)
+                    .cloned(),
+                docker_host: None,
+            },
+        ));
 
         match cella_daemon::management::send_management_request(socket_path, &req).await {
             Ok(resp) => {

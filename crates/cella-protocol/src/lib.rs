@@ -155,30 +155,34 @@ pub enum AgentMessage {
 // Management protocol (CLI ↔ daemon via ~/.cella/daemon.sock)
 // ---------------------------------------------------------------------------
 
+/// Data for a container registration request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerRegistrationData {
+    pub container_id: String,
+    pub container_name: String,
+    pub container_ip: Option<String>,
+    pub ports_attributes: Vec<PortAttributes>,
+    pub other_ports_attributes: Option<PortAttributes>,
+    /// Ports from `forwardPorts` in devcontainer.json (pre-allocate on registration).
+    #[serde(default)]
+    pub forward_ports: Vec<u16>,
+    /// The `shutdownAction` from devcontainer.json (`"none"` or `"stopContainer"`).
+    #[serde(default)]
+    pub shutdown_action: Option<String>,
+    /// Which backend created this container (e.g. `"docker"`, `"apple-container"`).
+    #[serde(default)]
+    pub backend_kind: Option<String>,
+    /// Docker host override used when the container was created.
+    #[serde(default)]
+    pub docker_host: Option<String>,
+}
+
 /// Requests from CLI tools to the daemon management socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ManagementRequest {
     /// Register a new container for port management.
-    RegisterContainer {
-        container_id: String,
-        container_name: String,
-        container_ip: Option<String>,
-        ports_attributes: Vec<PortAttributes>,
-        other_ports_attributes: Option<PortAttributes>,
-        /// Ports from `forwardPorts` in devcontainer.json (pre-allocate on registration).
-        #[serde(default)]
-        forward_ports: Vec<u16>,
-        /// The `shutdownAction` from devcontainer.json (`"none"` or `"stopContainer"`).
-        #[serde(default)]
-        shutdown_action: Option<String>,
-        /// Which backend created this container (e.g. `"docker"`, `"apple-container"`).
-        #[serde(default)]
-        backend_kind: Option<String>,
-        /// Docker host override used when the container was created.
-        #[serde(default)]
-        docker_host: Option<String>,
-    },
+    RegisterContainer(Box<ContainerRegistrationData>),
     /// Deregister a container (stop proxies, release ports).
     DeregisterContainer { container_name: String },
     /// Query all forwarded ports across containers.
@@ -675,7 +679,7 @@ mod tests {
 
     #[test]
     fn serialize_management_register() {
-        let req = ManagementRequest::RegisterContainer {
+        let req = ManagementRequest::RegisterContainer(Box::new(ContainerRegistrationData {
             container_id: "abc123".to_string(),
             container_name: "cella-myapp-main".to_string(),
             container_ip: Some("172.20.0.5".to_string()),
@@ -685,7 +689,7 @@ mod tests {
             shutdown_action: None,
             backend_kind: Some("docker".to_string()),
             docker_host: None,
-        };
+        }));
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"register_container\""));
         assert!(json.contains("\"container_ip\":\"172.20.0.5\""));
