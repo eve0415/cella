@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use cella_backend::{
-    BuildOptions, ContainerBackend, ImageDetails, image_name, image_name_with_features,
+    BuildOptions, BuildSecret, ContainerBackend, ImageDetails, image_name, image_name_with_features,
 };
 use cella_features::ResolvedFeatures;
 
@@ -71,6 +71,7 @@ pub async fn build_features_layer(
         target: None,
         cache_from: vec![],
         options,
+        secrets: vec![],
     };
 
     info!(
@@ -103,6 +104,8 @@ pub struct EnsureImageInput<'a> {
     pub config_path: &'a Path,
     pub no_cache: bool,
     pub pull_policy: Option<&'a str>,
+    /// `BuildKit` secrets forwarded to every `docker build` as `--secret` flags.
+    pub secrets: &'a [BuildSecret],
     pub progress: &'a ProgressSender,
 }
 
@@ -189,6 +192,7 @@ async fn resolve_base_image(
             input.no_cache,
             input.pull_policy,
         );
+        build_opts.secrets = input.secrets.to_vec();
 
         if !will_build_features {
             let metadata_label = cella_features::generate_metadata_label(&[], input.config, None);
@@ -376,6 +380,7 @@ pub fn parse_build_options(
         target,
         cache_from,
         options,
+        secrets: vec![],
     }
 }
 
@@ -563,6 +568,7 @@ mod tests {
             target: None,
             cache_from: vec![],
             options: vec![],
+            secrets: vec![],
         };
         inject_proxy_build_args(&mut opts, &proxy);
         // With no proxy env vars set and default config, args should remain empty
@@ -580,6 +586,7 @@ mod tests {
             target: None,
             cache_from: vec![],
             options: vec![],
+            secrets: vec![],
         };
         inject_proxy_build_args(&mut opts, &proxy);
         // Existing value must not be overwritten

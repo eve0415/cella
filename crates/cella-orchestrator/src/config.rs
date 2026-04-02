@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve::ResolvedConfig;
 
 /// Configuration for the full container-up pipeline.
@@ -31,6 +32,8 @@ pub struct UpConfig<'a> {
     pub network_rule_policy: NetworkRulePolicy,
     /// Image pull policy (e.g. "always", "missing", "never").
     pub pull_policy: Option<&'a str>,
+    /// `BuildKit` secrets to inject during image builds.
+    pub build_secrets: Vec<BuildSecret>,
 }
 
 /// How the up pipeline should handle the container image.

@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cella_backend::ContainerBackend;
+use cella_backend::{BuildSecret, ContainerBackend};
 use cella_compose::ComposeProject;
 
 use crate::progress::ProgressSender;
@@ -33,6 +33,8 @@ pub struct ComposeBuildConfig<'a> {
     pub env_files: Vec<PathBuf>,
     /// Pull policy for docker compose build (`--pull` flag).
     pub pull_policy: Option<String>,
+    /// `BuildKit` secrets forwarded to compose builds.
+    pub secrets: Vec<BuildSecret>,
 }
 
 /// Run the compose build pipeline: resolve features, write override, build.
@@ -81,6 +83,15 @@ pub async fn compose_build(
         } else {
             (String::new(), String::new(), true)
         };
+        let compose_secrets: Vec<cella_compose::ComposeSecret> = cfg
+            .secrets
+            .iter()
+            .map(|s| cella_compose::ComposeSecret {
+                id: s.id.clone(),
+                file: s.src.clone(),
+                environment: s.env.clone(),
+            })
+            .collect();
         let override_config = cella_compose::OverrideConfig {
             primary_service: project.primary_service.clone(),
             image_override: fb.image_name_override.clone(),
@@ -93,6 +104,7 @@ pub async fn compose_build(
             build_target: Some(fb.build_target.clone()),
             build_context: fb.build_context.clone(),
             additional_contexts: fb.additional_contexts.clone(),
+            build_secrets: compose_secrets,
         };
         let yaml = cella_compose::override_file::generate_override_yaml(&override_config);
         cella_compose::override_file::write_override_file(&project.override_file, &yaml)?;

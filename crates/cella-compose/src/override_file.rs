@@ -10,6 +10,17 @@ use std::path::{Path, PathBuf};
 
 use crate::error::CellaComposeError;
 
+/// A `BuildKit` secret to forward to compose builds.
+#[derive(Debug, Clone)]
+pub struct ComposeSecret {
+    /// Secret identifier (matches `--mount=type=secret,id=<id>` in Dockerfile).
+    pub id: String,
+    /// Host file path containing the secret value.
+    pub file: Option<PathBuf>,
+    /// Environment variable containing the secret value.
+    pub environment: Option<String>,
+}
+
 /// Configuration for generating the override compose file.
 pub struct OverrideConfig {
     /// The primary service name (must match a service in the user's compose file).
@@ -37,6 +48,8 @@ pub struct OverrideConfig {
     /// Emitted as `build.additional_contexts` in the compose override YAML.
     /// Requires Docker Compose >= 2.17.0.
     pub additional_contexts: BTreeMap<String, PathBuf>,
+    /// `BuildKit` secrets forwarded to compose builds via the override YAML.
+    pub build_secrets: Vec<ComposeSecret>,
 }
 
 /// Generate the override compose YAML as a string.
@@ -57,19 +70,28 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     }
 
     // Build override (combined Dockerfile for compose + features)
-    if let Some(ref dockerfile) = config.build_dockerfile {
+    let has_build_section = config.build_dockerfile.is_some() || !config.build_secrets.is_empty();
+    if has_build_section {
         yaml.push_str("    build:\n");
-        let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
-        if let Some(ref target) = config.build_target {
-            let _ = writeln!(yaml, "      target: \"{target}\"");
+        if let Some(ref dockerfile) = config.build_dockerfile {
+            let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
+            if let Some(ref target) = config.build_target {
+                let _ = writeln!(yaml, "      target: \"{target}\"");
+            }
+            if let Some(ref context) = config.build_context {
+                let _ = writeln!(yaml, "      context: \"{}\"", context.display());
+            }
+            if !config.additional_contexts.is_empty() {
+                yaml.push_str("      additional_contexts:\n");
+                for (name, path) in &config.additional_contexts {
+                    let _ = writeln!(yaml, "        - {name}={}", path.display());
+                }
+            }
         }
-        if let Some(ref context) = config.build_context {
-            let _ = writeln!(yaml, "      context: \"{}\"", context.display());
-        }
-        if !config.additional_contexts.is_empty() {
-            yaml.push_str("      additional_contexts:\n");
-            for (name, path) in &config.additional_contexts {
-                let _ = writeln!(yaml, "        - {name}={}", path.display());
+        if !config.build_secrets.is_empty() {
+            yaml.push_str("      secrets:\n");
+            for secret in &config.build_secrets {
+                let _ = writeln!(yaml, "        - {}", secret.id);
             }
         }
     }
@@ -103,6 +125,20 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         "      - {}:{}:ro",
         config.agent_volume_name, config.agent_volume_target
     );
+
+    // Top-level secrets declarations (file/environment sources)
+    if !config.build_secrets.is_empty() {
+        yaml.push_str("secrets:\n");
+        for secret in &config.build_secrets {
+            let _ = writeln!(yaml, "  {}:", secret.id);
+            if let Some(ref file) = secret.file {
+                let _ = writeln!(yaml, "    file: \"{}\"", file.display());
+            }
+            if let Some(ref env) = secret.environment {
+                let _ = writeln!(yaml, "    environment: \"{env}\"");
+            }
+        }
+    }
 
     // Top-level volumes declaration (external volume)
     yaml.push_str("volumes:\n");
@@ -151,6 +187,7 @@ mod tests {
             build_target: None,
             build_context: None,
             additional_contexts: BTreeMap::new(),
+            build_secrets: Vec::new(),
         }
     }
 

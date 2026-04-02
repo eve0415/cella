@@ -324,6 +324,7 @@ async fn prepare_and_start(
             .as_ref()
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
+        build_secrets: Vec::new(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
