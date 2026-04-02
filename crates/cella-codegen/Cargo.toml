@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+miette.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 syn = { version = "2.0.117", features = ["full"] }

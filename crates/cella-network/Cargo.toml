@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+miette.workspace = true
 rcgen.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
