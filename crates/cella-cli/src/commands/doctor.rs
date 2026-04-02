@@ -20,19 +20,18 @@ pub struct DoctorArgs {
 }
 
 impl DoctorArgs {
-    pub async fn execute(
-        self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
         let workspace_folder = std::env::current_dir().ok();
-        let (backend_client, backend_error) =
-            match self.backend.resolve_client().await {
-                Ok(client) => (Some(client), None),
-                Err(e) => (None, Some(e.to_string())),
-            };
-        let backend_kind = backend_client
-            .as_ref()
-            .map(|c| c.kind())
-            .or_else(|| self.backend.backend.as_ref().map(crate::backend::BackendChoice::to_kind));
+        let (backend_client, backend_error) = match self.backend.resolve_client().await {
+            Ok(client) => (Some(client), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let backend_kind = backend_client.as_ref().map(|c| c.kind()).or_else(|| {
+            self.backend
+                .backend
+                .as_ref()
+                .map(crate::backend::BackendChoice::to_kind)
+        });
         let ctx =
             checks::CheckContext::new(workspace_folder, self.all, backend_kind, backend_client);
         let mut report = checks::run_all_checks(&ctx).await;

@@ -497,9 +497,15 @@ mod tests {
 
     #[test]
     fn parse_list_with_backend_and_docker_host() {
-        let cli =
-            parse(&["cella", "list", "--backend", "docker", "--docker-host", "tcp://host:2375"])
-                .unwrap();
+        let cli = parse(&[
+            "cella",
+            "list",
+            "--backend",
+            "docker",
+            "--docker-host",
+            "tcp://host:2375",
+        ])
+        .unwrap();
         assert!(matches!(cli.command, super::commands::Command::List(_)));
     }
 

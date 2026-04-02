@@ -1409,10 +1409,7 @@ async fn handle_up_request<W: AsyncWriteExt + Unpin>(
             }
         }
     }
-    cmd.arg("--branch")
-        .arg(branch)
-        .arg("--output")
-        .arg("json");
+    cmd.arg("--branch").arg(branch).arg("--output").arg("json");
     if rebuild {
         cmd.arg("--rebuild");
     }

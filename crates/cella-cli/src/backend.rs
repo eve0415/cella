@@ -222,10 +222,10 @@ mod tests {
             backend: Some(BackendChoice::AppleContainer),
             docker_host: Some("tcp://localhost:2375".to_string()),
         };
-        let result = args.resolve().await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("--docker-host cannot be used"));
+        match args.resolve().await {
+            Err(e) => assert!(e.to_string().contains("--docker-host cannot be used")),
+            Ok(_) => panic!("expected conflict error"),
+        }
     }
 
     #[test]

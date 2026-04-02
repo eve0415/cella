@@ -278,12 +278,18 @@ mod tests {
 
     #[test]
     fn from_str_docker() {
-        assert_eq!("docker".parse::<BackendKind>().unwrap(), BackendKind::Docker);
+        assert_eq!(
+            "docker".parse::<BackendKind>().unwrap(),
+            BackendKind::Docker
+        );
     }
 
     #[test]
     fn from_str_podman() {
-        assert_eq!("podman".parse::<BackendKind>().unwrap(), BackendKind::Podman);
+        assert_eq!(
+            "podman".parse::<BackendKind>().unwrap(),
+            BackendKind::Podman
+        );
     }
 
     #[test]

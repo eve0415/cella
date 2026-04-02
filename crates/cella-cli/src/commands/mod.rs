@@ -134,10 +134,7 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
-    pub async fn execute(
-        self,
-        progress: Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Up(args) => args.execute(progress).await,
             Self::Code(args) => args.execute(progress).await,
@@ -417,10 +414,7 @@ async fn re_register_containers(
                 other_ports_attributes: other_ports_attrs,
                 forward_ports: vec![],
                 shutdown_action,
-                backend_kind: container
-                    .labels
-                    .get(cella_backend::BACKEND_LABEL)
-                    .cloned(),
+                backend_kind: container.labels.get(cella_backend::BACKEND_LABEL).cloned(),
                 docker_host: None,
             },
         ));
