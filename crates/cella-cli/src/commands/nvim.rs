@@ -212,6 +212,18 @@ async fn get_nvim_version(
     }
 }
 
+/// Normalize a version string into a GitHub release tag.
+///
+/// Bare semver versions (e.g. `"0.10.3"`) get a `v` prefix (`"v0.10.3"`).
+/// Special tags like `"stable"` and `"nightly"` are returned as-is.
+fn normalize_version_tag(version: &str) -> String {
+    if version.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    }
+}
+
 /// Install nvim from GitHub releases into the container.
 async fn install_nvim(
     ctx: &UpContext,
@@ -240,7 +252,7 @@ async fn install_nvim(
         cella_config::settings::Settings::load(&std::env::current_dir().unwrap_or_default());
     let version = &settings.tools.nvim.version;
 
-    let version_tag = version.as_str();
+    let version_tag = normalize_version_tag(version);
 
     // Build download URL based on arch
     let (url, extract_cmd) = match arch.as_str() {
@@ -253,7 +265,7 @@ async fn install_nvim(
         }
         "aarch64" | "arm64" => {
             let url = format!(
-                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-aarch64.tar.gz"
+                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-arm64.tar.gz"
             );
             let extract = "tar xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1";
             (url, extract)
@@ -289,8 +301,10 @@ async fn install_nvim(
 
     if install_result.exit_code != 0 {
         return Err(format!(
-            "Failed to install nvim (exit {}): {}",
+            "Failed to install nvim (exit {}): tried {} (arch: {}). {}",
             install_result.exit_code,
+            url,
+            arch,
             install_result.stderr.trim()
         )
         .into());
@@ -319,6 +333,27 @@ async fn install_nvim(
 
 #[cfg(test)]
 mod tests {
+    use super::normalize_version_tag;
+
+    #[test]
+    fn normalize_bare_semver_gets_v_prefix() {
+        assert_eq!(normalize_version_tag("0.10.3"), "v0.10.3");
+        assert_eq!(normalize_version_tag("0.11.0"), "v0.11.0");
+        assert_eq!(normalize_version_tag("1.0.0"), "v1.0.0");
+    }
+
+    #[test]
+    fn normalize_already_prefixed_unchanged() {
+        assert_eq!(normalize_version_tag("v0.10.3"), "v0.10.3");
+        assert_eq!(normalize_version_tag("v0.11.0"), "v0.11.0");
+    }
+
+    #[test]
+    fn normalize_special_tags_unchanged() {
+        assert_eq!(normalize_version_tag("stable"), "stable");
+        assert_eq!(normalize_version_tag("nightly"), "nightly");
+    }
+
     #[test]
     fn nvim_version_parse() {
         let output = "NVIM v0.10.3\nBuild type: Release\nLuaJIT 2.1";
