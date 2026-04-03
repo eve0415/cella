@@ -39,6 +39,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -64,11 +66,30 @@ jobs:
       - name: Build agent
         run: cargo build --package cella-agent --target ${{ matrix.target }} --release
 
+      - name: Prepare agent binary
+        run: cp "target/${{ matrix.target }}/release/cella-agent" "cella-agent-${{ matrix.arch }}"
+
+      - name: Generate SBOM
+        run: |
+          cargo install cargo-sbom --version 0.10.0
+          cargo sbom --cargo-package cella-agent --output-format spdx_json_2_3 > cella-agent-${{ matrix.arch }}.sbom.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: cella-agent-${{ matrix.arch }}
+
+      - name: Attest SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: cella-agent-${{ matrix.arch }}
+          sbom-path: cella-agent-${{ matrix.arch }}.sbom.spdx.json
+
       - name: Upload agent binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: cella-agent-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/cella-agent
+          path: cella-agent-${{ matrix.arch }}
           if-no-files-found: error
 
   build-cli:
@@ -77,6 +98,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -116,6 +139,22 @@ jobs:
           cp "target/${TARGET}/release/cella" "$STAGING/"
           tar czf "cella-v${VERSION}-${TARGET}.tar.gz" -C "$STAGING" .
 
+      - name: Generate SBOM
+        run: |
+          cargo install cargo-sbom --version 0.10.0
+          cargo sbom --cargo-package cella-cli --output-format spdx_json_2_3 > cella-cli.sbom.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+
+      - name: Attest SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: cella-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          sbom-path: cella-cli.sbom.spdx.json
+
       - name: Upload archive
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -151,9 +190,9 @@ jobs:
             cp "$dir"/*.tar.gz release/
           done
 
-          # Move agent binaries
-          cp artifacts/cella-agent-x86_64/cella-agent release/cella-agent-x86_64
-          cp artifacts/cella-agent-aarch64/cella-agent release/cella-agent-aarch64
+          # Move agent binaries (already renamed to cella-agent-{arch} during build)
+          cp artifacts/cella-agent-x86_64/cella-agent-x86_64 release/cella-agent-x86_64
+          cp artifacts/cella-agent-aarch64/cella-agent-aarch64 release/cella-agent-aarch64
 
           # Generate checksums
           cd release
