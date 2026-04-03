@@ -25,7 +25,6 @@ cella-features.workspace = true
 
 [dev-dependencies]
 filetime.workspace = true
-insta.workspace = true
 tempfile.workspace = true
 
 [features]

@@ -13,7 +13,7 @@ quote = "1.0.45"
 proc-macro2 = "1.0.106"
 prettyplease = "0.2.37"
 heck = "0.5.0"
-indexmap = { version = "2.13.0", features = ["serde"] }
+indexmap = { version = "2.13.1", features = ["serde"] }
 
 [dev-dependencies]
 insta.workspace = true
