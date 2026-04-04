@@ -54,7 +54,7 @@ pub struct UpArgs {
 
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
-    pub(crate) file: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
@@ -147,7 +147,7 @@ impl UpContext {
         // 1. Resolve config
         let resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
-                resolve::config(&cwd, args.file.as_deref())
+                resolve::config(&cwd, args.config.as_deref())
             })
             .await?;
 
