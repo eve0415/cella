@@ -25,7 +25,7 @@ mod switch;
 mod template;
 pub mod up;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use tracing::warn;
 
 use crate::progress::{Progress, Verbosity};
@@ -36,6 +36,13 @@ pub struct VerboseArgs {
     /// Show expanded step details (container names, feature resolution, etc.).
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+/// Output format for container commands.
+#[derive(Clone, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
 }
 
 /// Top-level CLI commands.

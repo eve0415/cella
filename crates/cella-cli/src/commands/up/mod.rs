@@ -2,9 +2,11 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
+
+use super::OutputFormat;
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -87,13 +89,6 @@ pub struct UpArgs {
     /// Pull policy for Docker Compose services (always, missing, never).
     #[arg(long = "pull-policy")]
     pub(crate) pull_policy: Option<String>,
-}
-
-/// Output format for container commands.
-#[derive(Clone, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Json,
 }
 
 impl UpArgs {

@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::json;
 use tracing::{info, warn};
+
+use super::OutputFormat;
 
 use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve;
@@ -53,13 +55,6 @@ pub struct BuildArgs {
     /// Pull policy for Docker Compose services (always, missing, never).
     #[arg(long = "pull-policy")]
     pull_policy: Option<String>,
-}
-
-/// Output format for build command.
-#[derive(Clone, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
 }
 
 impl BuildArgs {

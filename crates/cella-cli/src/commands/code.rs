@@ -7,7 +7,8 @@ use tracing::debug;
 
 use cella_backend::ExecOptions;
 
-use super::up::{OutputFormat, UpArgs, UpContext, output_result};
+use super::OutputFormat;
+use super::up::{UpArgs, UpContext, output_result};
 
 use crate::picker;
 
