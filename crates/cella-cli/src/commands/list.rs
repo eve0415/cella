@@ -6,6 +6,8 @@ use serde_json::json;
 use cella_backend::{ContainerInfo, ContainerState};
 use cella_compose::discovery;
 
+use super::OutputFormat;
+
 /// List all dev containers managed by cella.
 #[derive(Args)]
 pub struct ListArgs {
@@ -13,9 +15,9 @@ pub struct ListArgs {
     #[arg(long)]
     running: bool,
 
-    /// Output as JSON.
-    #[arg(long)]
-    json: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    output: OutputFormat,
 
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
@@ -27,7 +29,7 @@ impl ListArgs {
 
         let containers = client.list_cella_containers(self.running).await?;
 
-        if self.json {
+        if matches!(self.output, OutputFormat::Json) {
             print_json(&containers);
         } else {
             print_table(&containers);
