@@ -597,15 +597,6 @@ pub mod mock {
         ) -> BoxFuture<'a, Result<(), BackendError>> {
             Box::pin(async { Ok(()) })
         }
-
-        fn update_remote_user_uid<'a>(
-            &'a self,
-            _container_id: &'a str,
-            _remote_user: &'a str,
-            _workspace_root: &'a Path,
-        ) -> BoxFuture<'a, Result<(), BackendError>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     impl MockDockerClient {

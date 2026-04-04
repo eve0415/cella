@@ -34,6 +34,8 @@ pub struct ComposeFeaturesBuild {
     pub resolved_features: ResolvedFeatures,
     /// Image name override (for image-only services, to avoid retagging).
     pub image_name_override: Option<String>,
+    /// The base image USER directive (for UID remap image layer).
+    pub image_user: String,
 }
 
 /// Resolve features for a compose service and generate the combined Dockerfile.
@@ -171,6 +173,7 @@ pub async fn resolve_compose_features(
         project,
         combined_path,
         resolved,
+        image_user,
     )?))
 }
 
@@ -205,6 +208,7 @@ fn assemble_features_build(
     project: &ComposeProject,
     combined_dockerfile: PathBuf,
     resolved: ResolvedFeatures,
+    image_user: String,
 ) -> Result<ComposeFeaturesBuild, Box<dyn std::error::Error>> {
     let mut additional_contexts = BTreeMap::new();
     additional_contexts.insert(
@@ -233,6 +237,7 @@ fn assemble_features_build(
         additional_contexts,
         resolved_features: resolved,
         image_name_override,
+        image_user,
     })
 }
 

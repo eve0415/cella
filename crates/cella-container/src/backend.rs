@@ -642,18 +642,6 @@ impl ContainerBackend for AppleContainerBackend {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move { Ok(()) })
     }
-
-    // -- UID remapping --
-
-    fn update_remote_user_uid<'a>(
-        &'a self,
-        _container_id: &'a str,
-        _remote_user: &'a str,
-        _workspace_root: &'a Path,
-    ) -> BoxFuture<'a, Result<(), BackendError>> {
-        // Apple Container runs as the user; UID remapping is not needed.
-        Box::pin(async move { Ok(()) })
-    }
 }
 
 // ---------------------------------------------------------------------------

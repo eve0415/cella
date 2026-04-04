@@ -54,7 +54,7 @@ The binary entry point. Handles argument parsing via clap, initializes tracing, 
 
 ### cella-docker
 
-Abstracts container runtime operations. Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Wraps the bollard Docker API client behind a `DockerApi` trait for testability and future runtime support (Podman). Handles `runArgs` parsing (30+ docker create flags), lifecycle command execution, UID remapping, file uploads, and spec compliance features like `shutdownAction`, `waitFor`, and `appPort` deprecation.
+Abstracts container runtime operations. Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Wraps the bollard Docker API client behind a `DockerApi` trait for testability and future runtime support (Podman). Handles `runArgs` parsing (30+ docker create flags), lifecycle command execution, file uploads, and spec compliance features like `shutdownAction`, `waitFor`, and `appPort` deprecation.
 
 ### cella-compose
 

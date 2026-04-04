@@ -556,6 +556,7 @@ dependencies = [
  "cella-protocol",
  "hex",
  "miette",
+ "nix 0.31.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",

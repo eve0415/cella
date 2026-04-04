@@ -119,9 +119,8 @@ Date: 2026-04-01
 
 ### 3.3 updateRemoteUserUID Timing
 - **Spec**: Build-time (Dockerfile layer before container creation)
-- **Cella**: Runtime (exec after container creation)
-- **Status**: FAIL
-- **Impact**: First container start has wrong UID until exec completes; image not cached with correct UID
+- **Cella**: Build-time (separate `Dockerfile.uid-remap` layer, matching devcontainer CLI's `updateUID.Dockerfile`)
+- **Status**: PASS
 
 ### 3.4 Lifecycle Failure Cascading
 - **Spec**: If any phase fails, ALL subsequent phases are skipped

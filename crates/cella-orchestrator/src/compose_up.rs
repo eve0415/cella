@@ -106,7 +106,7 @@ pub trait ComposeUpHooks: Send + Sync {
         agent_arch: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-    /// Run container setup after creation (UID update, env injection,
+    /// Run container setup after creation (env injection,
     /// credentials, tool installation, userEnvProbe).
     fn post_create_setup<'a>(
         &'a self,
@@ -302,36 +302,15 @@ async fn prepare_and_start(
     // 10. Build labels for the primary service
     let labels = build_compose_labels(cfg, project, &remote_user);
 
-    // 11. Generate and write override YAML
-    let override_config = OverrideConfig {
-        primary_service: project.primary_service.clone(),
-        image_override: features_build
-            .as_ref()
-            .and_then(|b| b.image_name_override.clone()),
-        override_command: project.override_command,
-        agent_volume_name: agent_vol_name,
-        agent_volume_target: agent_vol_target,
+    let ov_ctx = OverrideContext {
+        agent_vol_name,
+        agent_vol_target,
         extra_env,
-        extra_labels: labels,
-        build_dockerfile: features_build
-            .as_ref()
-            .map(|b| b.combined_dockerfile.clone()),
-        build_target: features_build.as_ref().map(|b| b.build_target.clone()),
-        build_context: features_build
-            .as_ref()
-            .and_then(|b| b.build_context.clone()),
-        additional_contexts: features_build
-            .as_ref()
-            .map(|b| b.additional_contexts.clone())
-            .unwrap_or_default(),
-        build_secrets: Vec::new(),
+        labels,
     };
-    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
-    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
-    debug!(
-        "Override file written to: {}",
-        project.override_file.display()
-    );
+
+    // 11. Generate and write override YAML
+    write_build_override(project, features_build.as_ref(), &ov_ctx)?;
 
     // 12. Run docker compose build (always when features present, or if --build-no-cache)
     let compose_cmd = ComposeCommand::new(project);
@@ -343,6 +322,9 @@ async fn prepare_and_start(
         )
         .await?;
     }
+
+    // 12b. Build-time UID remap: build a thin image layer with correct UID/GID.
+    build_uid_remap_override(ctx, project, features_build.as_ref(), &remote_user, &ov_ctx).await?;
 
     // 13. docker compose up -d (idempotent)
     run_step_result(progress, "Starting compose services...", async {
@@ -482,6 +464,110 @@ async fn handle_compose_running(
         workspace_folder: project.workspace_folder.clone(),
         outcome: ComposeUpOutcome::Running,
     })
+}
+
+/// Compose override context shared between build and UID remap override writes.
+struct OverrideContext {
+    agent_vol_name: String,
+    agent_vol_target: String,
+    extra_env: Vec<String>,
+    labels: BTreeMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Override helpers
+// ---------------------------------------------------------------------------
+
+/// Write the initial compose override YAML for building with features.
+fn write_build_override(
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    ov: &OverrideContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let override_config = OverrideConfig {
+        primary_service: project.primary_service.clone(),
+        image_override: features_build.and_then(|b| b.image_name_override.clone()),
+        override_command: project.override_command,
+        agent_volume_name: ov.agent_vol_name.clone(),
+        agent_volume_target: ov.agent_vol_target.clone(),
+        extra_env: ov.extra_env.clone(),
+        extra_labels: ov.labels.clone(),
+        build_dockerfile: features_build.map(|b| b.combined_dockerfile.clone()),
+        build_target: features_build.map(|b| b.build_target.clone()),
+        build_context: features_build.and_then(|b| b.build_context.clone()),
+        additional_contexts: features_build
+            .map(|b| b.additional_contexts.clone())
+            .unwrap_or_default(),
+        build_secrets: Vec::new(),
+    };
+    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
+    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    debug!(
+        "Override file written to: {}",
+        project.override_file.display()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UID remap
+// ---------------------------------------------------------------------------
+
+/// Build a UID-remapped image and rewrite the compose override if needed.
+async fn build_uid_remap_override(
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    remote_user: &str,
+    ov: &OverrideContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let update_uid = ctx
+        .cfg
+        .config
+        .get("updateRemoteUserUID")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    if !update_uid {
+        return Ok(());
+    }
+
+    let compose_image = features_build
+        .and_then(|b| b.image_name_override.clone())
+        .unwrap_or_else(|| format!("{}-{}", project.project_name, project.primary_service));
+    let image_user = features_build.map_or("root", |b| &b.image_user);
+
+    let Some(uid_img) = crate::uid_image::build_uid_remap_image(
+        ctx.client,
+        &compose_image,
+        image_user,
+        remote_user,
+        ctx.progress,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let override_config = OverrideConfig {
+        primary_service: project.primary_service.clone(),
+        image_override: Some(uid_img),
+        override_command: project.override_command,
+        agent_volume_name: ov.agent_vol_name.clone(),
+        agent_volume_target: ov.agent_vol_target.clone(),
+        extra_env: ov.extra_env.clone(),
+        extra_labels: ov.labels.clone(),
+        build_dockerfile: features_build.map(|b| b.combined_dockerfile.clone()),
+        build_target: features_build.map(|b| b.build_target.clone()),
+        build_context: features_build.and_then(|b| b.build_context.clone()),
+        additional_contexts: features_build
+            .map(|b| b.additional_contexts.clone())
+            .unwrap_or_default(),
+        build_secrets: Vec::new(),
+    };
+    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
+    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

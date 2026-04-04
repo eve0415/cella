@@ -22,6 +22,7 @@ pub mod prune;
 pub mod result;
 pub mod shell_detect;
 pub mod tool_install;
+pub mod uid_image;
 pub mod up;
 
 pub use config::{

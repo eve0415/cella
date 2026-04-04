@@ -234,15 +234,4 @@ pub trait ContainerBackend: Send + Sync {
         &'a self,
         current_version: &'a str,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
-
-    // -- UID remapping --
-
-    /// Remap the remote user's UID/GID inside the container to match the
-    /// host user, ensuring file-permission parity on bind mounts.
-    fn update_remote_user_uid<'a>(
-        &'a self,
-        container_id: &'a str,
-        remote_user: &'a str,
-        workspace_root: &'a Path,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
 }

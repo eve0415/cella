@@ -347,7 +347,7 @@ impl UpContext {
         }
     }
 
-    /// Run post-create setup: UID update, env injection, credentials, Claude Code, userEnvProbe.
+    /// Run post-create setup: env injection, credentials, Claude Code, userEnvProbe.
     pub(crate) async fn post_create_setup(
         &self,
         container_id: &str,
@@ -359,24 +359,6 @@ impl UpContext {
         Option<std::collections::HashMap<String, String>>,
         Vec<String>,
     ) {
-        let config = self.config();
-
-        // updateRemoteUserUID
-        let update_uid = config
-            .get("updateRemoteUserUID")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-
-        if update_uid
-            && remote_user != "root"
-            && let Err(e) = self
-                .client
-                .update_remote_user_uid(container_id, remote_user, &self.resolved.workspace_root)
-                .await
-        {
-            warn!("Failed to update remote user UID: {e}");
-        }
-
         // Inject post-start environment forwarding
         self.progress
             .run_step(

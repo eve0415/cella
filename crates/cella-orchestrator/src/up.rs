@@ -822,27 +822,6 @@ impl EnsureUpContext<'_> {
         Option<std::collections::HashMap<String, String>>,
         Vec<String>,
     ) {
-        let config = self.config_json();
-
-        let update_uid = config
-            .get("updateRemoteUserUID")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-
-        if update_uid
-            && remote_user != "root"
-            && let Err(e) = self
-                .client
-                .update_remote_user_uid(
-                    container_id,
-                    remote_user,
-                    &self.config.resolved.workspace_root,
-                )
-                .await
-        {
-            warn!("Failed to update remote user UID: {e}");
-        }
-
         let _ = run_step_result(&self.progress, "Configuring environment...", async {
             crate::container_setup::inject_post_start(
                 self.client,
@@ -1122,6 +1101,61 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
+    /// Create a container with progress reporting.
+    async fn create_container(
+        &self,
+        create_opts: &cella_backend::CreateContainerOptions,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if self.progress.is_verbose() {
+            let step = self.progress.step(&format!(
+                "Creating container: {}...",
+                self.config.container_name
+            ));
+            let result = self.client.create_container(create_opts).await;
+            match &result {
+                Ok(_) => step.finish(),
+                Err(e) => step.fail(&e.to_string()),
+            }
+            Ok(result?)
+        } else {
+            Ok(run_step_result(
+                &self.progress,
+                "Creating container...",
+                self.client.create_container(create_opts),
+            )
+            .await?)
+        }
+    }
+
+    /// Build a UID-remapped image and update `create_opts.image` if needed.
+    async fn maybe_remap_uid(
+        &self,
+        config: &serde_json::Value,
+        img_name: &str,
+        image_user: &str,
+        remote_user: &str,
+        create_opts: &mut cella_backend::CreateContainerOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let update_uid = config
+            .get("updateRemoteUserUID")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+
+        if update_uid
+            && let Some(uid_img) = crate::uid_image::build_uid_remap_image(
+                self.client,
+                img_name,
+                image_user,
+                remote_user,
+                &self.progress,
+            )
+            .await?
+        {
+            create_opts.image = uid_img;
+        }
+        Ok(())
+    }
+
     async fn create_and_start(
         &self,
         build_no_cache: bool,
@@ -1146,9 +1180,7 @@ impl EnsureUpContext<'_> {
             })
             .await?;
 
-        // Capture image metadata before base_image_details is consumed.
-        // When resolved_features is None (no local feature build), this
-        // metadata from a prebuilt image supplies lifecycle commands.
+        let image_user = base_image_details.user.clone();
         let image_metadata = if resolved_features.is_none() {
             base_image_details.metadata.clone()
         } else {
@@ -1168,6 +1200,15 @@ impl EnsureUpContext<'_> {
             &agent_arch,
         );
 
+        self.maybe_remap_uid(
+            config,
+            &img_name,
+            &image_user,
+            &remote_user,
+            &mut create_opts,
+        )
+        .await?;
+
         let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
         self.apply_env_and_mounts(
             &mut create_opts,
@@ -1179,25 +1220,7 @@ impl EnsureUpContext<'_> {
         )
         .await?;
 
-        let container_id = if self.progress.is_verbose() {
-            let step = self.progress.step(&format!(
-                "Creating container: {}...",
-                self.config.container_name
-            ));
-            let result = self.client.create_container(&create_opts).await;
-            match &result {
-                Ok(_) => step.finish(),
-                Err(e) => step.fail(&e.to_string()),
-            }
-            result?
-        } else {
-            run_step_result(
-                &self.progress,
-                "Creating container...",
-                self.client.create_container(&create_opts),
-            )
-            .await?
-        };
+        let container_id = self.create_container(&create_opts).await?;
 
         self.start_and_notify(&container_id).await?;
 

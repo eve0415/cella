@@ -392,19 +392,4 @@ impl ContainerBackend for DockerClient {
                 .map_err(BackendError::from)
         })
     }
-
-    // -- UID remapping --
-
-    fn update_remote_user_uid<'a>(
-        &'a self,
-        container_id: &'a str,
-        remote_user: &'a str,
-        workspace_root: &'a Path,
-    ) -> BoxFuture<'a, Result<(), BackendError>> {
-        Box::pin(async move {
-            crate::uid::update_remote_user_uid(self, container_id, remote_user, workspace_root)
-                .await
-                .map_err(BackendError::from)
-        })
-    }
 }
