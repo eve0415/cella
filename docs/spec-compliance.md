@@ -107,9 +107,8 @@ Date: 2026-04-01
 
 ### 3.1 devcontainerId Computation
 - **Spec**: SHA-256 of sorted JSON label object, base-32 encoded, left-padded to 52 chars
-- **Cella**: SHA-256 of workspace path (hex-encoded, 64 chars). A spec-compliant `spec_devcontainer_id()` function exists in `cella-config/src/devcontainer/resolve.rs` but is not yet used in the main path
-- **Status**: FAIL (spec-compliant function exists but unused)
-- **Impact**: Variable substitution `${devcontainerId}` produces wrong value; container identity differs
+- **Cella**: SHA-256 of sorted JSON label object (`devcontainer.local_folder`, `devcontainer.config_file`), base-32 encoded, 52 chars
+- **Status**: PASS
 
 ### 3.2 Docker Compose Defaults
 - **Spec**: `overrideCommand` defaults `false`, `shutdownAction` defaults `stopCompose`, `workspaceFolder` defaults `"/"`
@@ -124,21 +123,18 @@ Date: 2026-04-01
 
 ### 3.4 Lifecycle Failure Cascading
 - **Spec**: If any phase fails, ALL subsequent phases are skipped
-- **Cella**: `run_all_lifecycle_phases` propagates errors via `?`, but the default `up` path uses `run_lifecycle_phases_with_wait_for` which backgrounds later phases as a detached shell script. Two problems: (1) failures in backgrounded phases are not propagated or surfaced to the caller, and (2) the background path only handles string-valued lifecycle commands — array/object `postCreateCommand`/`postStartCommand`/`postAttachCommand` forms are silently skipped in background mode.
-- **Status**: FAIL
-- **Impact**: Default `waitFor` path swallows failures and silently skips non-string lifecycle command shapes
+- **Cella**: `run_all_lifecycle_phases` propagates errors via `?`. The `run_lifecycle_phases_with_wait_for` background path uses `set -e` and `entry_to_shell_command` to handle all command forms (string, array, object). Parallel commands in the background script track PIDs individually and fail if any process exits non-zero. Status written to `/tmp/.cella/lifecycle_status.json`.
+- **Status**: PASS
 
 ### 3.5 Parallel Command Failure
 - **Spec**: All parallel commands must succeed; implementations should cancel siblings on failure
-- **Cella**: Object-form lifecycle commands are parsed into `ParsedLifecycle::Parallel` and executed with `join_all`. When one sibling fails, the others are not cancelled — they continue running before the phase is reported as failed.
-- **Status**: PARTIAL
-- **Impact**: Parallel lifecycle commands (object-form) can leave partial side effects from siblings that continue after a failure
+- **Cella**: Object-form lifecycle commands use `try_join_all` which cancels remaining futures on first failure by dropping them.
+- **Status**: PASS
 
 ### 3.6 JSON Output Format
 - **Spec**: stdout = JSON only, stderr = logs only
-- **Cella**: `--output text|json` flag controls format
-- **Status**: FAIL
-- **Impact**: Tools parsing stdout may get logs mixed with JSON
+- **Cella**: `--output json` routes tracing to stderr; JSON result to stdout via `println!`
+- **Status**: PASS
 
 ### 3.7 containerEnv vs remoteEnv
 - **Spec**: `containerEnv` at Docker create (immutable), `remoteEnv` per-process
@@ -160,15 +156,13 @@ Date: 2026-04-01
 
 ### 3.10 Container Labels
 - **Spec**: `devcontainer.local_folder`, `devcontainer.config_file`, etc.
-- **Cella**: `dev.cella.*` labels
-- **Status**: FAIL
-- **Impact**: VS Code cannot discover cella-created containers
+- **Cella**: Emits both `dev.cella.*` and spec-standard `devcontainer.*` labels
+- **Status**: PASS
 
 ### 3.11 Config Discovery Flag
 - **Spec**: `--config`
-- **Cella**: `--file`
-- **Status**: FAIL
-- **Impact**: Tools using `--config` flag fail
+- **Cella**: `--config` on `up`, `build`, and `read-configuration`
+- **Status**: PASS
 
 ### 3.12 hostRequirements Merge
 - **Spec**: Maximum value wins across metadata layers
@@ -182,9 +176,8 @@ Date: 2026-04-01
 
 ### 3.14 initializeCommand Re-run
 - **Spec**: Runs during initialization including subsequent starts
-- **Cella**: Runs on container creation and rebuild. Skipped when the container is already running (fast path returns before `create_and_start()`). Compose mode runs it on every invocation.
-- **Status**: PARTIAL
-- **Impact**: Repeated `cella up` on a running container skips host-side initialization; spec requires it on every start
+- **Cella**: Runs on container creation, rebuild, and when the container is already running (`handle_running` fast path)
+- **Status**: PASS
 
 ---
 
