@@ -6,7 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::OutputFormat;
+use super::{ImagePullPolicy, OutputFormat};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -28,9 +28,9 @@ pub struct UpBuildArgs {
     #[arg(long)]
     pub(crate) remove_existing_container: bool,
 
-    /// Image pull policy (e.g. "always", "missing", "never").
-    #[arg(long)]
-    pub(crate) pull: Option<String>,
+    /// Image pull policy.
+    #[arg(long, value_enum)]
+    pub(crate) pull: Option<ImagePullPolicy>,
 
     /// `BuildKit` secret to pass to the build (format: `id=X[,src=Y][,env=Z]`).
     /// Can be specified multiple times.
@@ -189,7 +189,7 @@ impl UpContext {
             remove_container,
             build_no_cache: args.build.build_no_cache,
             skip_checksum: args.skip_checksum,
-            pull_policy: args.build.pull.clone(),
+            pull_policy: args.build.pull.as_ref().map(ImagePullPolicy::as_str).map(String::from),
             extra_labels: std::collections::HashMap::new(),
             network_rules: if args.no_network_rules {
                 NetworkRulePolicy::Skip
@@ -704,7 +704,7 @@ impl UpArgs {
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
         ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
-        ctx.pull_policy = self.build.pull.clone();
+        ctx.pull_policy = self.build.pull.as_ref().map(ImagePullPolicy::as_str).map(String::from);
         ctx.network_rules = if self.no_network_rules {
             NetworkRulePolicy::Skip
         } else {

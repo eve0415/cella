@@ -45,6 +45,24 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Image pull policy for container builds.
+#[derive(Clone, ValueEnum)]
+pub enum ImagePullPolicy {
+    Always,
+    Missing,
+    Never,
+}
+
+impl ImagePullPolicy {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Always => "always",
+            Self::Missing => "missing",
+            Self::Never => "never",
+        }
+    }
+}
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {

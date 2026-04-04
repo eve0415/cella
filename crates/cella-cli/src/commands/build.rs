@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::OutputFormat;
+use super::{ImagePullPolicy, OutputFormat};
 
 use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve;
@@ -20,9 +20,9 @@ pub struct BuildArgs {
     #[arg(long)]
     no_cache: bool,
 
-    /// Image pull policy (e.g. "always", "missing", "never").
-    #[arg(long)]
-    pull: Option<String>,
+    /// Image pull policy.
+    #[arg(long, value_enum)]
+    pull: Option<ImagePullPolicy>,
 
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
@@ -123,7 +123,7 @@ impl BuildArgs {
             config_name,
             config_path: &resolved.config_path,
             no_cache: self.no_cache,
-            pull_policy: self.pull.as_deref(),
+            pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
             progress: &sender,
         };
