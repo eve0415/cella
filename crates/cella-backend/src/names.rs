@@ -116,7 +116,10 @@ pub fn container_labels(
 
     // Cella-specific labels.
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
-    labels.insert("dev.cella.workspace_path".to_string(), workspace_str.clone());
+    labels.insert(
+        "dev.cella.workspace_path".to_string(),
+        workspace_str.clone(),
+    );
     labels.insert("dev.cella.config_path".to_string(), config_str.clone());
     labels.insert("dev.cella.config_hash".to_string(), config_hash.to_string());
     labels.insert(
