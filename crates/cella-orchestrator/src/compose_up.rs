@@ -575,29 +575,32 @@ async fn build_uid_remap_override(
 // ---------------------------------------------------------------------------
 
 /// Build cella labels for the compose override file.
+///
+/// Includes both cella-specific and spec-standard labels for VS Code interop.
 fn build_compose_labels(
     cfg: &ComposeUpConfig<'_>,
     project: &ComposeProject,
     remote_user: &str,
 ) -> BTreeMap<String, String> {
+    let workspace_str = cfg
+        .workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.workspace_root.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let config_str = cfg
+        .config_path
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.config_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
     let mut labels = BTreeMap::new();
+
+    // Cella-specific labels.
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
-    labels.insert(
-        "dev.cella.workspace_path".to_string(),
-        cfg.workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| cfg.workspace_root.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
-    labels.insert(
-        "dev.cella.config_path".to_string(),
-        cfg.config_path
-            .canonicalize()
-            .unwrap_or_else(|_| cfg.config_path.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
+    labels.insert("dev.cella.workspace_path".to_string(), workspace_str.clone());
+    labels.insert("dev.cella.config_path".to_string(), config_str.clone());
     labels.insert(
         "dev.cella.config_hash".to_string(),
         project.config_hash.clone(),
@@ -615,6 +618,11 @@ fn build_compose_labels(
         "dev.cella.workspace_folder".to_string(),
         project.workspace_folder.clone(),
     );
+
+    // Spec-standard labels for VS Code / tooling interop.
+    labels.insert("devcontainer.local_folder".to_string(), workspace_str);
+    labels.insert("devcontainer.config_file".to_string(), config_str);
+
     labels
 }
 

@@ -93,36 +93,42 @@ pub fn image_name_with_features(
 pub const BACKEND_LABEL: &str = "dev.cella.backend";
 
 /// Standard labels for cella containers.
+///
+/// Emits both cella-specific (`dev.cella.*`) and spec-standard
+/// (`devcontainer.*`) labels so that VS Code and other tools can discover
+/// cella-created containers.
 pub fn container_labels(
     workspace_root: &Path,
     config_path: &Path,
     config_hash: &str,
     runtime_label: &str,
 ) -> HashMap<String, String> {
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_config = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let workspace_str = canonical_workspace.to_string_lossy().to_string();
+    let config_str = canonical_config.to_string_lossy().to_string();
+
     let mut labels = HashMap::new();
+
+    // Cella-specific labels.
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
-    labels.insert(
-        "dev.cella.workspace_path".to_string(),
-        workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
-    labels.insert(
-        "dev.cella.config_path".to_string(),
-        config_path
-            .canonicalize()
-            .unwrap_or_else(|_| config_path.to_path_buf())
-            .to_string_lossy()
-            .to_string(),
-    );
+    labels.insert("dev.cella.workspace_path".to_string(), workspace_str.clone());
+    labels.insert("dev.cella.config_path".to_string(), config_str.clone());
     labels.insert("dev.cella.config_hash".to_string(), config_hash.to_string());
     labels.insert(
         "dev.cella.docker_runtime".to_string(),
         runtime_label.to_string(),
     );
     labels.insert("dev.cella.created_at".to_string(), Utc::now().to_rfc3339());
+
+    // Spec-standard labels for VS Code / tooling interop.
+    labels.insert("devcontainer.local_folder".to_string(), workspace_str);
+    labels.insert("devcontainer.config_file".to_string(), config_str);
+
     labels
 }
 
@@ -278,6 +284,27 @@ mod tests {
         assert!(labels.contains_key("dev.cella.workspace_path"));
         assert!(labels.contains_key("dev.cella.config_path"));
         assert!(labels.contains_key("dev.cella.created_at"));
+    }
+
+    #[test]
+    fn labels_contain_spec_standard_keys() {
+        let labels = container_labels(
+            &PathBuf::from("/tmp/test"),
+            &PathBuf::from("/tmp/test/.devcontainer/devcontainer.json"),
+            "abc123",
+            "linux-native",
+        );
+        assert!(labels.contains_key("devcontainer.local_folder"));
+        assert!(labels.contains_key("devcontainer.config_file"));
+        // Spec labels must match cella equivalents.
+        assert_eq!(
+            labels["devcontainer.local_folder"],
+            labels["dev.cella.workspace_path"]
+        );
+        assert_eq!(
+            labels["devcontainer.config_file"],
+            labels["dev.cella.config_path"]
+        );
     }
 
     #[test]
