@@ -1,15 +1,19 @@
 {
-  "env": {
-    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1",
-    "ENABLE_TOOL_SEARCH": "true",
-    "ENABLE_EXPERIMENTAL_MCP_CLI": "false",
-    "CLAUDE_CODE_HIDE_ACCOUNT_INFO": "true",
-    "CLAUDE_CODE_NEW_INIT": "1"
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath' | { read -r f; echo \"$f\" | grep -qE '\\.rs$' && cargo fmt -- \"$f\"; } 2>/dev/null || true",
+            "timeout": 30,
+            "statusMessage": "Formatting..."
+          }
+        ]
+      }
+    ]
   },
-  "permissions": {
-    "defaultMode": "auto"
-  },
-  "enableAllProjectMcpServers": true,
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": true,
     "feature-dev@claude-plugins-official": true,

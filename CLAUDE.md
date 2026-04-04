@@ -2,51 +2,69 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Compatibility
-
-- **Drop-in replacement** for the devcontainer CLI and VS Code devcontainer extension — spec compatibility is non-negotiable, must behave identically
-- No backward compatibility needed: cella has no prior releases or users; do not add compat shims, feature flags, or deprecation paths
-- Check original devcontainer docs/specs before asking design questions
-
-## Commands
+## Build & Test
 
 ```sh
-cargo check --workspace                   # type-check
-cargo build                               # build
-cargo test --workspace                    # all tests
-cargo test -p <crate>                     # single crate tests
-cargo test -p <crate> -- <name>           # single test
-cargo clippy --workspace --all-targets -- -D warnings -D clippy::all  # lint
-cargo fmt --all                           # format
-cargo insta review                        # accept/reject snapshot changes
+cargo fmt --all -- --check                                            # format check
+cargo clippy --workspace --all-targets -- -D warnings -D clippy::all  # lint (all warnings are errors)
+cargo test --workspace                                                # unit tests
+cargo insta test --workspace --check --unreferenced=reject            # snapshot tests
 ```
 
-Integration tests (requires Docker): `cargo test --workspace -- --ignored`
+Integration tests require Docker and are feature-gated:
 
-## Conventions
+```sh
+cargo test -p cella-features -p cella-daemon -p cella-compose --features integration-tests
+```
 
-- Edition 2024, resolver v2
-- Clippy pedantic + nursery (warn), `unsafe_code` denied
-- Clippy allows: `must_use_candidate`, `similar_names`
-- Dependencies pinned to exact versions (x.y.z) in `[workspace.dependencies]`
-- Conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`), signed commits required
-- Error types: `thiserror`; user-facing diagnostics: `miette`
+Update snapshots with `cargo insta review`.
 
 ## Testing
 
-- Unit tests inline with `#[cfg(test)]` modules
-- `#[tokio::test]` for async tests
-- `#[ignore]` for Docker-dependent integration tests
-- Snapshot tests use `insta` — run `cargo insta review` after changes
+- Unit tests colocated in source files (`#[cfg(test)] mod tests`) — not separate test directories
+- Add unit tests when implementing new code
+- Add regression tests when fixing bugs
+- Use `test_platform()` (not hardcoded arch strings) in OCI/architecture-aware tests
 
-## Build-time codegen
+## Spec Compliance
 
-`cella-config/build.rs` generates typed Rust structs from the devcontainer JSON Schema (`cella-config/schemas/devContainer.base.schema.json`) via `cella-codegen`. After any schema or codegen changes, run `cargo insta review` to update snapshots.
+cella is a drop-in replacement for the devcontainer CLI and VS Code devcontainer extension. All commands, options, and behaviors must match the original tools. Before making design decisions or asking questions:
 
-## Cross-compilation
+1. Research the devcontainer spec at containers.dev
+2. Check the official CLI source and its GitHub issues
+3. Check VS Code devcontainer extension behavior and its issues
+4. Look for known bugs to fix proactively rather than replicate
 
-cella-agent is cross-compiled to static musl binaries (x86_64 and aarch64) for container portability. Requires musl-tools.
+Always research before suggesting changes or asking the user questions. Use `/spec-research` for systematic investigation.
 
-## Per-crate instructions
+## Code Conventions
 
-`crates/cella-config/CLAUDE.md` and `crates/cella-codegen/CLAUDE.md` contain crate-specific guidance.
+- No `#[allow(clippy::...)]` annotations — fix the warning or restructure the code
+- No `_`-prefixed unused variables — delete dead code entirely
+- Workspace lints: clippy::pedantic + clippy::nursery (warn), unsafe_code (deny), unused_qualifications (deny)
+- Error types: thiserror for custom errors, miette for user-facing diagnostics
+- Async: tokio runtime, bollard for Docker API, gix for git operations
+- No backward compatibility constraints — refactor freely when improving code
+- Create new crates when needed to maintain clean boundaries between concerns
+- Research the codebase, crate READMEs, and existing patterns before proposing changes
+
+## Architecture
+
+Rust workspace (edition 2024, MSRV 1.94.0) with 19 crates in `crates/`. Three-tier structure:
+
+- **Tier 1 (CLI):** cella-cli — binary entry point, delegates to library crates
+- **Tier 2 (Domain):** cella-docker, cella-compose, cella-orchestrator, cella-config, cella-features, cella-git, cella-daemon, cella-agent, cella-env, cella-doctor, cella-container, cella-templates
+- **Tier 3 (Foundation):** cella-backend, cella-port, cella-codegen, cella-network, cella-protocol, cella-jsonc
+
+Backend-agnostic design: cella-backend defines traits, cella-docker and cella-container implement them. Hooks pattern (PruneHooks, ComposeUpHooks, UpHooks) bridges CLI-owned operations into the orchestrator without circular dependencies.
+
+## Commits & PRs
+
+- Conventional commits: `feat:`, `fix:`, `refactor:`, `chore:`, etc.
+- Tiny atomic commits, one concern per commit
+- Independent branches per feature, rebase before PR, no merge commits on main
+- Breaking changes are acceptable
+
+## CI Workflows
+
+GitHub Actions in `.github/workflows/`. Every workflow step must have a `name` field with blank lines between steps.
