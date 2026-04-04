@@ -25,7 +25,7 @@ mod switch;
 mod template;
 pub mod up;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use tracing::warn;
 
 use crate::progress::{Progress, Verbosity};
@@ -36,6 +36,61 @@ pub struct VerboseArgs {
     /// Show expanded step details (container names, feature resolution, etc.).
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+/// Output format for container commands.
+#[derive(Clone, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// Image pull policy for container builds.
+#[derive(Clone, ValueEnum)]
+pub enum ImagePullPolicy {
+    Always,
+    Missing,
+    Never,
+}
+
+impl ImagePullPolicy {
+    pub const fn as_str(&self) -> &str {
+        match self {
+            Self::Always => "always",
+            Self::Missing => "missing",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// Strictness level for validation.
+#[derive(Clone, ValueEnum)]
+pub enum StrictnessLevel {
+    /// Fail on unmet host requirements.
+    #[value(name = "host-requirements")]
+    HostRequirements,
+    /// Enable all strictness checks.
+    All,
+}
+
+/// Pull policy for Docker Compose services.
+#[derive(Clone, ValueEnum)]
+pub enum ComposePullPolicy {
+    Always,
+    Missing,
+    Never,
+    Build,
+}
+
+impl ComposePullPolicy {
+    pub const fn as_str(&self) -> &str {
+        match self {
+            Self::Always => "always",
+            Self::Missing => "missing",
+            Self::Never => "never",
+            Self::Build => "build",
+        }
+    }
 }
 
 /// Top-level CLI commands.

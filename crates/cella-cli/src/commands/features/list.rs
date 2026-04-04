@@ -6,6 +6,7 @@ use cella_templates::cache::TemplateCache;
 use cella_templates::collection::{self, DEFAULT_FEATURE_COLLECTION};
 
 use super::resolve::{self, CommonFeatureFlags};
+use crate::commands::OutputFormat;
 
 /// List configured or available devcontainer features.
 #[derive(Args)]
@@ -13,9 +14,9 @@ pub struct ListArgs {
     #[command(flatten)]
     pub common: CommonFeatureFlags,
 
-    /// Output as JSON for machine consumption.
-    #[arg(long)]
-    pub json: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub output: OutputFormat,
 
     /// Show available features from the registry instead of configured ones.
     #[arg(long)]
@@ -50,7 +51,7 @@ impl ListArgs {
         let features = resolve::extract_features(&config);
 
         if features.is_empty() {
-            if self.json {
+            if matches!(self.output, OutputFormat::Json) {
                 println!("[]");
             } else {
                 eprintln!("No features configured.");
@@ -58,7 +59,7 @@ impl ListArgs {
             return Ok(());
         }
 
-        if self.json {
+        if matches!(self.output, OutputFormat::Json) {
             let json_features: Vec<serde_json::Value> = features
                 .iter()
                 .map(|(reference, options)| {
@@ -104,7 +105,7 @@ impl ListArgs {
             collection::fetch_feature_collection(registry, &cache, self.refresh).await?;
 
         if collection.features.is_empty() {
-            if self.json {
+            if matches!(self.output, OutputFormat::Json) {
                 println!("[]");
             } else {
                 eprintln!("No features found in {registry}.");
@@ -112,7 +113,7 @@ impl ListArgs {
             return Ok(());
         }
 
-        if self.json {
+        if matches!(self.output, OutputFormat::Json) {
             let json_features: Vec<serde_json::Value> = collection
                 .features
                 .iter()

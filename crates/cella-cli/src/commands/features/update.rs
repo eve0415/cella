@@ -7,6 +7,7 @@ use cella_templates::cache::TemplateCache;
 
 use super::jsonc_edit::{self, FeatureEdit};
 use super::resolve::{self, CommonFeatureFlags};
+use crate::commands::OutputFormat;
 
 /// Check for and apply feature version updates.
 #[derive(Args)]
@@ -22,9 +23,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub check: bool,
 
-    /// Output as JSON (implies --check).
-    #[arg(long)]
-    pub json: bool,
+    /// Output format (json implies --check).
+    #[arg(long, value_enum, default_value = "text")]
+    pub output: OutputFormat,
 }
 
 /// A feature with an available update.
@@ -56,7 +57,10 @@ impl UpdateArgs {
         let features = resolve::extract_features(&config);
 
         if features.is_empty() {
-            print_empty_message(self.json, "No features configured.");
+            print_empty_message(
+                matches!(self.output, OutputFormat::Json),
+                "No features configured.",
+            );
             return Ok(());
         }
 
@@ -72,11 +76,14 @@ impl UpdateArgs {
         let candidates = find_update_candidates(&features, &collection, &cache).await;
 
         if candidates.is_empty() {
-            print_empty_message(self.json, "All features are up to date.");
+            print_empty_message(
+                matches!(self.output, OutputFormat::Json),
+                "All features are up to date.",
+            );
             return Ok(());
         }
 
-        if self.json {
+        if matches!(self.output, OutputFormat::Json) {
             print_candidates_json(&candidates)?;
             return Ok(());
         }

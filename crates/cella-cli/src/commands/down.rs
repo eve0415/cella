@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, info};
 
-use super::up::OutputFormat;
+use super::OutputFormat;
 use cella_backend::ContainerTarget;
 use cella_backend::{ContainerInfo, ContainerState};
 use cella_compose::discovery;

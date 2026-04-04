@@ -3,15 +3,17 @@ use clap::Args;
 use cella_doctor::checks::{self, CategoryReport, CheckResult, Report, Severity};
 use cella_doctor::redact::Redactor;
 
+use super::OutputFormat;
+
 /// Check system dependencies and configuration.
 #[derive(Args)]
 pub struct DoctorArgs {
     /// Check all running cella containers (not just current workspace).
     #[arg(long)]
     all: bool,
-    /// Output as JSON (machine-readable).
-    #[arg(long)]
-    json: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    output: OutputFormat,
     /// Disable redaction of sensitive information (home paths, tokens).
     #[arg(long)]
     no_redact: bool,
@@ -58,7 +60,7 @@ impl DoctorArgs {
             report.redact(&redactor);
         }
 
-        if self.json {
+        if matches!(self.output, OutputFormat::Json) {
             let json = report.to_json();
             println!(
                 "{}",

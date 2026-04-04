@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::json;
 use tracing::{info, warn};
+
+use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
 
 use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve;
@@ -18,9 +20,9 @@ pub struct BuildArgs {
     #[arg(long)]
     no_cache: bool,
 
-    /// Image pull policy (e.g. "always", "missing", "never").
-    #[arg(long)]
-    pull: Option<String>,
+    /// Image pull policy.
+    #[arg(long, value_enum)]
+    pull: Option<ImagePullPolicy>,
 
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
@@ -50,16 +52,9 @@ pub struct BuildArgs {
     #[arg(long = "env-file")]
     env_file: Vec<PathBuf>,
 
-    /// Pull policy for Docker Compose services (always, missing, never).
-    #[arg(long = "pull-policy")]
-    pull_policy: Option<String>,
-}
-
-/// Output format for build command.
-#[derive(Clone, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
+    /// Pull policy for Docker Compose services.
+    #[arg(long = "pull-policy", value_enum)]
+    pull_policy: Option<ComposePullPolicy>,
 }
 
 impl BuildArgs {
@@ -101,7 +96,7 @@ impl BuildArgs {
                 workspace_root: &resolved.workspace_root,
                 profiles: self.profile.clone(),
                 env_files: self.env_file.clone(),
-                pull_policy: self.pull_policy.clone(),
+                pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
                 secrets: secrets.clone(),
             };
             let result = cella_orchestrator::compose_build::compose_build(
@@ -128,7 +123,7 @@ impl BuildArgs {
             config_name,
             config_path: &resolved.config_path,
             no_cache: self.no_cache,
-            pull_policy: self.pull.as_deref(),
+            pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
             progress: &sender,
         };

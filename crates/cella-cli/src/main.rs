@@ -260,8 +260,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_json() {
-        let cli = parse(&["cella", "list", "--json"]).unwrap();
+    fn parse_list_output_json() {
+        let cli = parse(&["cella", "list", "--output", "json"]).unwrap();
         assert!(matches!(cli.command, super::commands::Command::List(_)));
     }
 
@@ -280,8 +280,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_doctor_json() {
-        let cli = parse(&["cella", "doctor", "--json"]).unwrap();
+    fn parse_doctor_output_json() {
+        let cli = parse(&["cella", "doctor", "--output", "json"]).unwrap();
         assert!(matches!(cli.command, super::commands::Command::Doctor(_)));
     }
 
@@ -293,7 +293,15 @@ mod tests {
 
     #[test]
     fn parse_doctor_all_flags() {
-        let cli = parse(&["cella", "doctor", "--all", "--json", "--no-redact"]).unwrap();
+        let cli = parse(&[
+            "cella",
+            "doctor",
+            "--all",
+            "--output",
+            "json",
+            "--no-redact",
+        ])
+        .unwrap();
         assert!(matches!(cli.command, super::commands::Command::Doctor(_)));
     }
 
@@ -389,6 +397,38 @@ mod tests {
         assert!(matches!(cli.command, super::commands::Command::Build(_)));
     }
 
+    // ── pull policy enums ────────────────────────────────────────────
+
+    #[test]
+    fn parse_up_pull_always() {
+        let cli = parse(&["cella", "up", "--pull", "always"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+
+    #[test]
+    fn parse_up_pull_invalid() {
+        let result = parse(&["cella", "up", "--pull", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_up_pull_policy_build() {
+        let cli = parse(&["cella", "up", "--pull-policy", "build"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+
+    #[test]
+    fn parse_up_strict_host_requirements() {
+        let cli = parse(&["cella", "up", "--strict", "host-requirements"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+
+    #[test]
+    fn parse_up_strict_invalid() {
+        let result = parse(&["cella", "up", "--strict", "invalid"]);
+        assert!(result.is_err());
+    }
+
     // ── code command ────────────────────────────────────────────────
 
     #[test]
@@ -398,28 +438,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_code_insider() {
-        let cli = parse(&["cella", "code", "--insider"]).unwrap();
-        if let super::commands::Command::Code(args) = cli.command {
-            assert!(args.insider);
-        } else {
-            panic!("expected Code command");
-        }
+    fn parse_code_editor_insiders() {
+        let cli = parse(&["cella", "code", "--editor", "insiders"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Code(_)));
     }
 
     #[test]
-    fn parse_code_cursor() {
-        let cli = parse(&["cella", "code", "--cursor"]).unwrap();
-        if let super::commands::Command::Code(args) = cli.command {
-            assert!(args.cursor);
-        } else {
-            panic!("expected Code command");
-        }
+    fn parse_code_editor_cursor() {
+        let cli = parse(&["cella", "code", "--editor", "cursor"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Code(_)));
     }
 
     #[test]
-    fn parse_code_insider_and_cursor_conflict() {
-        let result = parse(&["cella", "code", "--insider", "--cursor"]);
+    fn parse_code_editor_invalid() {
+        let result = parse(&["cella", "code", "--editor", "vim"]);
         assert!(result.is_err());
     }
 
@@ -434,8 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_code_binary_and_insider_conflict() {
-        let result = parse(&["cella", "code", "--binary", "x", "--insider"]);
+    fn parse_code_binary_conflicts_with_editor() {
+        let result = parse(&["cella", "code", "--binary", "x", "--editor", "cursor"]);
         assert!(result.is_err());
     }
 

@@ -1,13 +1,25 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::debug;
 
 use cella_backend::ExecOptions;
 
-use super::up::{OutputFormat, UpArgs, UpContext, output_result};
+use super::OutputFormat;
+use super::up::{UpArgs, UpContext, output_result};
+
+/// Editor to open for the dev container.
+#[derive(Clone, ValueEnum)]
+pub enum EditorChoice {
+    /// VS Code (stable).
+    Code,
+    /// VS Code Insiders.
+    Insiders,
+    /// Cursor.
+    Cursor,
+}
 
 use crate::picker;
 
@@ -16,21 +28,16 @@ use crate::picker;
 /// Ensures the container is running (auto-up if needed), runs `postAttachCommand`,
 /// then opens VS Code using the `attached-container` remote URI scheme.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct CodeArgs {
     #[command(flatten)]
     pub up: UpArgs,
 
-    /// Open VS Code Insiders instead of stable.
-    #[arg(long, conflicts_with_all = ["cursor", "binary"])]
-    pub insider: bool,
-
-    /// Open Cursor instead of VS Code.
-    #[arg(long, conflicts_with_all = ["insider", "binary"])]
-    pub cursor: bool,
+    /// Editor to open (defaults to code).
+    #[arg(long, value_enum, default_value = "code", conflicts_with = "binary")]
+    pub editor: EditorChoice,
 
     /// Custom editor binary name or path.
-    #[arg(long, conflicts_with_all = ["insider", "cursor"])]
+    #[arg(long)]
     pub binary: Option<String>,
 
     /// Target a specific compose service (defaults to primary service).
@@ -51,7 +58,7 @@ impl CodeArgs {
         check_local_docker()?;
 
         // 2. Resolve editor binary (fail fast before container work)
-        let editor = resolve_editor_binary(self.insider, self.cursor, self.binary.as_deref())?;
+        let editor = resolve_editor_binary(&self.editor, self.binary.as_deref())?;
         debug!("Resolved editor binary: {}", editor.display());
 
         // 3. Ensure container is up
@@ -178,8 +185,7 @@ fn build_vscode_uri(container_id: &str, workspace_folder: &str) -> String {
 /// Returns the path to the editor binary. If the binary is not found, returns
 /// an error with platform-specific installation instructions.
 fn resolve_editor_binary(
-    insider: bool,
-    cursor: bool,
+    editor: &EditorChoice,
     binary: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let name = if let Some(b) = binary {
@@ -192,12 +198,12 @@ fn resolve_editor_binary(
             return Err(format!("Editor binary not found: {b}").into());
         }
         b.to_string()
-    } else if insider {
-        "code-insiders".to_string()
-    } else if cursor {
-        "cursor".to_string()
     } else {
-        "code".to_string()
+        match editor {
+            EditorChoice::Code => "code".to_string(),
+            EditorChoice::Insiders => "code-insiders".to_string(),
+            EditorChoice::Cursor => "cursor".to_string(),
+        }
     };
 
     which_binary(&name)
@@ -469,13 +475,14 @@ mod tests {
     #[test]
     fn resolve_editor_binary_missing_custom() {
         // A binary that doesn't exist should error
-        let result = resolve_editor_binary(false, false, Some("/nonexistent/editor"));
+        let result = resolve_editor_binary(&EditorChoice::Code, Some("/nonexistent/editor"));
         assert!(result.is_err());
     }
 
     #[test]
     fn resolve_editor_binary_name_not_in_path() {
-        let result = resolve_editor_binary(false, false, Some("totally-nonexistent-editor-xyz"));
+        let result =
+            resolve_editor_binary(&EditorChoice::Code, Some("totally-nonexistent-editor-xyz"));
         assert!(result.is_err());
     }
 

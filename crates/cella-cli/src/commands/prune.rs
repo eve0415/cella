@@ -7,7 +7,7 @@ use std::pin::Pin;
 
 use cella_orchestrator::prune::{PruneCandidate, PruneHooks};
 
-use super::up::OutputFormat;
+use super::OutputFormat;
 
 /// Remove stale worktrees and their associated containers.
 ///
@@ -33,7 +33,7 @@ pub struct PruneArgs {
     backend: crate::backend::BackendArgs,
 
     /// Output format (text or json).
-    #[arg(long, default_value = "text")]
+    #[arg(long, value_enum, default_value = "text")]
     output: OutputFormat,
 }
 

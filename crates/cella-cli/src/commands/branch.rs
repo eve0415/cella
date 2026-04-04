@@ -1,6 +1,7 @@
 use clap::Args;
 
-use super::up::{OutputFormat, UpContext};
+use super::OutputFormat;
+use super::up::UpContext;
 use cella_backend::{ExecOptions, worktree_labels};
 
 /// Create a new worktree-backed branch with its own dev container.

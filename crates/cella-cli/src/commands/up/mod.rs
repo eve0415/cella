@@ -2,9 +2,11 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
+
+use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat, StrictnessLevel};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -26,9 +28,9 @@ pub struct UpBuildArgs {
     #[arg(long)]
     pub(crate) remove_existing_container: bool,
 
-    /// Image pull policy (e.g. "always", "missing", "never").
-    #[arg(long)]
-    pub(crate) pull: Option<String>,
+    /// Image pull policy.
+    #[arg(long, value_enum)]
+    pub(crate) pull: Option<ImagePullPolicy>,
 
     /// `BuildKit` secret to pass to the build (format: `id=X[,src=Y][,env=Z]`).
     /// Can be specified multiple times.
@@ -60,9 +62,9 @@ pub struct UpArgs {
     #[arg(long, value_enum, default_value = "text")]
     pub(crate) output: OutputFormat,
 
-    /// Strictness level for validation ("host-requirements" to fail on unmet requirements).
-    #[arg(long)]
-    pub(crate) strict: Vec<String>,
+    /// Strictness level for validation.
+    #[arg(long, value_enum)]
+    pub(crate) strict: Vec<StrictnessLevel>,
 
     /// Skip SHA256 checksum verification for agent binary download.
     #[arg(long)]
@@ -84,16 +86,9 @@ pub struct UpArgs {
     #[arg(long = "env-file")]
     pub(crate) env_file: Vec<PathBuf>,
 
-    /// Pull policy for Docker Compose services (always, missing, never).
-    #[arg(long = "pull-policy")]
-    pub(crate) pull_policy: Option<String>,
-}
-
-/// Output format for container commands.
-#[derive(Clone, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Json,
+    /// Pull policy for Docker Compose services.
+    #[arg(long = "pull-policy", value_enum)]
+    pub(crate) pull_policy: Option<ComposePullPolicy>,
 }
 
 impl UpArgs {
@@ -194,7 +189,12 @@ impl UpContext {
             remove_container,
             build_no_cache: args.build.build_no_cache,
             skip_checksum: args.skip_checksum,
-            pull_policy: args.build.pull.clone(),
+            pull_policy: args
+                .build
+                .pull
+                .as_ref()
+                .map(ImagePullPolicy::as_str)
+                .map(String::from),
             extra_labels: std::collections::HashMap::new(),
             network_rules: if args.no_network_rules {
                 NetworkRulePolicy::Skip
@@ -204,7 +204,7 @@ impl UpContext {
             docker_host: effective_docker_host(&args.backend),
             compose_profiles: args.profile.clone(),
             compose_env_files: args.env_file.clone(),
-            compose_pull_policy: args.pull_policy.clone(),
+            compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
         })
     }
@@ -617,7 +617,7 @@ impl UpContext {
     pub async fn ensure_up(
         &self,
         build_no_cache: bool,
-        strict: &[String],
+        strict: &[StrictnessLevel],
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         let hooks = CliUpHooks {
@@ -644,7 +644,7 @@ impl UpContext {
             skip_checksum: self.skip_checksum,
             host_requirement_policy: if strict
                 .iter()
-                .any(|s| s == "host-requirements" || s == "all")
+                .any(|s| matches!(s, StrictnessLevel::HostRequirements | StrictnessLevel::All))
             {
                 cella_orchestrator::HostRequirementPolicy::Error
             } else {
@@ -709,7 +709,12 @@ impl UpArgs {
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
         ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
-        ctx.pull_policy = self.build.pull.clone();
+        ctx.pull_policy = self
+            .build
+            .pull
+            .as_ref()
+            .map(ImagePullPolicy::as_str)
+            .map(String::from);
         ctx.network_rules = if self.no_network_rules {
             NetworkRulePolicy::Skip
         } else {
