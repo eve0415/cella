@@ -57,6 +57,8 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         &[],
     )?;
 
+    super::verify_generated_config(&written_path);
+
     eprintln!("\u{2713} Created {}", written_path.display());
 
     Ok(())

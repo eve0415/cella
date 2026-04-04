@@ -130,7 +130,10 @@ pub async fn run(args: InitArgs, progress: Progress) -> Result<(), Box<dyn std::
         &excluded_paths,
     )?;
 
-    // Step 9: Success + next steps
+    // Step 9: Verify the generated config is parseable
+    super::verify_generated_config(&written_path);
+
+    // Step 10: Success + next steps
     eprintln!();
     eprintln!(
         "{} Created {}",

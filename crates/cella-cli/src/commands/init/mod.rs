@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum};
 
 use crate::progress::Progress;
+use crate::style;
 
 /// Output format for generated devcontainer configuration.
 #[derive(Clone, ValueEnum)]
@@ -78,6 +79,27 @@ impl InitArgs {
             noninteractive::run(self).await
         } else {
             wizard::run(self, progress).await
+        }
+    }
+}
+
+/// Verify that the generated devcontainer.json can be parsed by our config
+/// parser. Logs a warning on parse failure but does not abort — the template
+/// may use fields that our schema does not yet recognize.
+fn verify_generated_config(config_path: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return;
+    };
+    let source_name = config_path.display().to_string();
+    if let Err(diags) = cella_config::devcontainer::parse::devcontainer(&source_name, &content, false) {
+        for d in diags.diagnostics() {
+            if d.severity == cella_config::devcontainer::diagnostic::Severity::Error {
+                eprintln!(
+                    "  {} generated config warning: {}",
+                    style::dim("(note)"),
+                    d.message,
+                );
+            }
         }
     }
 }
