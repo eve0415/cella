@@ -213,10 +213,12 @@ pub fn apply_template<S: std::hash::BuildHasher>(
         &compiled_excludes,
     )?;
 
-    // Process the devcontainer.json specifically: merge features and format
+    // Process devcontainer.json separately: substitute, parse, merge features, format.
+    // Read from the source template (copy_and_substitute skips devcontainer.json).
     let config_path = devcontainer_dir.join("devcontainer.json");
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
+    let source_config = source_dir.join("devcontainer.json");
+    if source_config.exists() {
+        let content = std::fs::read_to_string(&source_config)?;
         let substituted = substitute_template_options(&content, options);
         let mut config: serde_json::Value =
             serde_json::from_str(&substituted).map_err(|e| TemplateError::InvalidArtifact {
@@ -256,6 +258,11 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
             if excluded_paths.iter().any(|pat| pat.matches(&relative_str)) {
                 continue;
             }
+        }
+
+        // devcontainer.json is handled separately in apply_template()
+        if file_name == "devcontainer.json" {
+            continue;
         }
 
         if file_type.is_dir() {
