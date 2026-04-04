@@ -10,6 +10,18 @@ use crate::error::TemplateError;
 use crate::types::{OutputFormat, SelectedFeature};
 
 // ---------------------------------------------------------------------------
+// JSONC stripping
+// ---------------------------------------------------------------------------
+
+/// Strip JSONC comments and trailing commas, mapping errors to [`TemplateError`].
+fn strip_jsonc(content: &str, file_name: &str) -> Result<String, TemplateError> {
+    cella_jsonc::strip(content).map_err(|e| TemplateError::InvalidArtifact {
+        template_id: file_name.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Template option substitution
 // ---------------------------------------------------------------------------
 
@@ -218,8 +230,9 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     let config_path = devcontainer_dir.join("devcontainer.json");
     let source_config = source_dir.join("devcontainer.json");
     if source_config.exists() {
-        let content = std::fs::read_to_string(&source_config)?;
-        let substituted = substitute_template_options(&content, options);
+        let raw = std::fs::read_to_string(&source_config)?;
+        let stripped = strip_jsonc(&raw, "devcontainer.json")?;
+        let substituted = substitute_template_options(&stripped, options);
         let mut config: serde_json::Value =
             serde_json::from_str(&substituted).map_err(|e| TemplateError::InvalidArtifact {
                 template_id: "devcontainer.json".to_owned(),
@@ -278,7 +291,17 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
             // Try to read as text and substitute; if it fails, copy as binary
             match std::fs::read_to_string(&src_path) {
                 Ok(content) => {
-                    let substituted = substitute_template_options(&content, options);
+                    // Strip JSONC from .json files before substitution so that
+                    // user-provided option values containing '//' are not eaten.
+                    let is_json = src_path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+                    let stripped = if is_json {
+                        strip_jsonc(&content, &file_name.to_string_lossy())?
+                    } else {
+                        content
+                    };
+                    let substituted = substitute_template_options(&stripped, options);
                     std::fs::write(&dest_path, substituted)?;
                 }
                 Err(_) => {
