@@ -60,7 +60,7 @@ impl EditArgs {
     fn run_non_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
-        let stripped = cella_config::devcontainer::jsonc::strip(&raw)?;
+        let stripped = cella_jsonc::strip(&raw)?;
         let config: serde_json::Value = serde_json::from_str(&stripped)?;
         let features = resolve::extract_features(&config);
 
@@ -111,7 +111,7 @@ impl EditArgs {
     async fn run_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
-        let stripped = cella_config::devcontainer::jsonc::strip(&raw)?;
+        let stripped = cella_jsonc::strip(&raw)?;
         let config: serde_json::Value = serde_json::from_str(&stripped)?;
         let cache = TemplateCache::new();
 

@@ -48,6 +48,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply template (include all optional paths in non-interactive mode)
     let written_path = cella_templates::apply::apply_template(
+        &metadata.id,
         &template_dir,
         &workspace,
         &resolved_opts,

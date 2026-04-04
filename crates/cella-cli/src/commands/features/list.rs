@@ -46,7 +46,7 @@ impl ListArgs {
         let raw = resolve::read_raw_config(&config_path)?;
 
         // Strip JSONC comments and parse
-        let stripped = cella_config::devcontainer::jsonc::strip(&raw)?;
+        let stripped = cella_jsonc::strip(&raw)?;
         let config: serde_json::Value = serde_json::from_str(&stripped)?;
         let features = resolve::extract_features(&config);
 

@@ -191,6 +191,7 @@ pub fn format_config(config: &serde_json::Value, format: OutputFormat) -> String
 ///
 /// Returns [`TemplateError`] on I/O errors or invalid template structure.
 pub fn apply_template<S: std::hash::BuildHasher>(
+    template_id: &str,
     template_dir: &Path,
     output_dir: &Path,
     options: &HashMap<String, serde_json::Value, S>,
@@ -231,12 +232,15 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     let source_config = source_dir.join("devcontainer.json");
     if source_config.exists() {
         let raw = std::fs::read_to_string(&source_config)?;
-        let stripped = strip_jsonc(&raw, "devcontainer.json")?;
+        let stripped = strip_jsonc(&raw, template_id)?;
         let substituted = substitute_template_options(&stripped, options);
         let mut config: serde_json::Value =
-            serde_json::from_str(&substituted).map_err(|e| TemplateError::InvalidArtifact {
-                template_id: "devcontainer.json".to_owned(),
-                reason: format!("invalid JSON after substitution: {e}"),
+            serde_json::from_str(&substituted).map_err(|e| {
+                let snippet: String = substituted.chars().take(80).collect();
+                TemplateError::InvalidArtifact {
+                    template_id: template_id.to_owned(),
+                    reason: format!("invalid JSON after substitution: {e}\n  content: {snippet:?}"),
+                }
             })?;
 
         merge_features(&mut config, features);
@@ -485,6 +489,7 @@ mod tests {
         options.insert("variant".to_owned(), serde_json::json!("noble"));
 
         let config_path = apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &options,
@@ -519,6 +524,7 @@ mod tests {
         }];
 
         let config_path = apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &HashMap::new(),
@@ -556,6 +562,7 @@ mod tests {
         options.insert("variant".to_owned(), serde_json::json!("noble"));
 
         apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &options,
@@ -589,6 +596,7 @@ mod tests {
         std::fs::write(dc_dir.join("Dockerfile"), "FROM ubuntu").unwrap();
 
         apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &HashMap::new(),

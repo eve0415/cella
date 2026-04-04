@@ -121,6 +121,7 @@ pub async fn run(args: InitArgs, progress: Progress) -> Result<(), Box<dyn std::
 
     // Step 8: Apply
     let written_path = cella_templates::apply::apply_template(
+        &metadata.id,
         &template_dir,
         &workspace,
         &template_opts,
