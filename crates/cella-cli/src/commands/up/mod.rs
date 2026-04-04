@@ -6,7 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::{ImagePullPolicy, OutputFormat};
+use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -86,9 +86,9 @@ pub struct UpArgs {
     #[arg(long = "env-file")]
     pub(crate) env_file: Vec<PathBuf>,
 
-    /// Pull policy for Docker Compose services (always, missing, never).
-    #[arg(long = "pull-policy")]
-    pub(crate) pull_policy: Option<String>,
+    /// Pull policy for Docker Compose services.
+    #[arg(long = "pull-policy", value_enum)]
+    pub(crate) pull_policy: Option<ComposePullPolicy>,
 }
 
 impl UpArgs {
@@ -199,7 +199,7 @@ impl UpContext {
             docker_host: effective_docker_host(&args.backend),
             compose_profiles: args.profile.clone(),
             compose_env_files: args.env_file.clone(),
-            compose_pull_policy: args.pull_policy.clone(),
+            compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
         })
     }

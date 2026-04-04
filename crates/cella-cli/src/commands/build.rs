@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::{ImagePullPolicy, OutputFormat};
+use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
 
 use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve;
@@ -52,9 +52,9 @@ pub struct BuildArgs {
     #[arg(long = "env-file")]
     env_file: Vec<PathBuf>,
 
-    /// Pull policy for Docker Compose services (always, missing, never).
-    #[arg(long = "pull-policy")]
-    pull_policy: Option<String>,
+    /// Pull policy for Docker Compose services.
+    #[arg(long = "pull-policy", value_enum)]
+    pull_policy: Option<ComposePullPolicy>,
 }
 
 impl BuildArgs {
@@ -96,7 +96,7 @@ impl BuildArgs {
                 workspace_root: &resolved.workspace_root,
                 profiles: self.profile.clone(),
                 env_files: self.env_file.clone(),
-                pull_policy: self.pull_policy.clone(),
+                pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
                 secrets: secrets.clone(),
             };
             let result = cella_orchestrator::compose_build::compose_build(

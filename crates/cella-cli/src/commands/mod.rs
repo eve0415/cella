@@ -63,6 +63,26 @@ impl ImagePullPolicy {
     }
 }
 
+/// Pull policy for Docker Compose services.
+#[derive(Clone, ValueEnum)]
+pub enum ComposePullPolicy {
+    Always,
+    Missing,
+    Never,
+    Build,
+}
+
+impl ComposePullPolicy {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Always => "always",
+            Self::Missing => "missing",
+            Self::Never => "never",
+            Self::Build => "build",
+        }
+    }
+}
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {
