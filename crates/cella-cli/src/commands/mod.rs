@@ -63,6 +63,16 @@ impl ImagePullPolicy {
     }
 }
 
+/// Strictness level for validation.
+#[derive(Clone, ValueEnum)]
+pub enum StrictnessLevel {
+    /// Fail on unmet host requirements.
+    #[value(name = "host-requirements")]
+    HostRequirements,
+    /// Enable all strictness checks.
+    All,
+}
+
 /// Pull policy for Docker Compose services.
 #[derive(Clone, ValueEnum)]
 pub enum ComposePullPolicy {

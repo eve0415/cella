@@ -6,7 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
+use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat, StrictnessLevel};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -62,9 +62,9 @@ pub struct UpArgs {
     #[arg(long, value_enum, default_value = "text")]
     pub(crate) output: OutputFormat,
 
-    /// Strictness level for validation ("host-requirements" to fail on unmet requirements).
-    #[arg(long)]
-    pub(crate) strict: Vec<String>,
+    /// Strictness level for validation.
+    #[arg(long, value_enum)]
+    pub(crate) strict: Vec<StrictnessLevel>,
 
     /// Skip SHA256 checksum verification for agent binary download.
     #[arg(long)]
@@ -612,7 +612,7 @@ impl UpContext {
     pub async fn ensure_up(
         &self,
         build_no_cache: bool,
-        strict: &[String],
+        strict: &[StrictnessLevel],
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         let hooks = CliUpHooks {
@@ -637,10 +637,9 @@ impl UpContext {
             },
             remove_existing_container: self.remove_container,
             skip_checksum: self.skip_checksum,
-            host_requirement_policy: if strict
-                .iter()
-                .any(|s| s == "host-requirements" || s == "all")
-            {
+            host_requirement_policy: if strict.iter().any(|s| {
+                matches!(s, StrictnessLevel::HostRequirements | StrictnessLevel::All)
+            }) {
                 cella_orchestrator::HostRequirementPolicy::Error
             } else {
                 cella_orchestrator::HostRequirementPolicy::Warn
