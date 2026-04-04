@@ -332,6 +332,12 @@ impl EnsureUpContext<'_> {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<UpResult, Box<dyn std::error::Error>> {
+        // Spec: initializeCommand runs on the host during every start, including reconnects.
+        let config = self.config_json();
+        if let Some(init_cmd) = config.get("initializeCommand") {
+            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
+        }
+
         let capabilities = self.client.capabilities();
 
         if let Ok(result) = self
