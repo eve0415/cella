@@ -1,5 +1,6 @@
 //! Config resolution: discover, parse, merge layers, compute hash.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -24,6 +25,66 @@ pub struct ResolvedConfig {
     pub config_hash: String,
     /// Diagnostics (warnings) from parsing.
     pub warnings: Vec<Diagnostic>,
+}
+
+/// Compute the spec-compliant `devcontainerId`.
+///
+/// Per <https://containers.dev/implementors/spec/#devcontainerid>:
+/// SHA-256 of the sorted JSON label object, base-32 encoded, left-padded to 52 chars.
+pub fn devcontainer_id(workspace_root: &Path, config_path: &Path) -> String {
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_config = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "devcontainer.local_folder".to_string(),
+        canonical_workspace.to_string_lossy().to_string(),
+    );
+    labels.insert(
+        "devcontainer.config_file".to_string(),
+        canonical_config.to_string_lossy().to_string(),
+    );
+    spec_devcontainer_id(&labels)
+}
+
+fn spec_devcontainer_id(labels: &BTreeMap<String, String>) -> String {
+    let json = serde_json::to_string(labels).expect("serialize labels");
+    let hash = Sha256::digest(json.as_bytes());
+    let base32 = bigint_to_base32(&hash);
+    format!("{base32:0>52}")
+}
+
+fn bigint_to_base32(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "0".to_string();
+    }
+    let mut digits: Vec<u8> = bytes.to_vec();
+    let mut result = Vec::new();
+    while !(digits.is_empty() || digits.len() == 1 && digits[0] == 0) {
+        let mut remainder = 0u16;
+        let mut new_digits = Vec::new();
+        for &d in &digits {
+            let current = (remainder << 8) | u16::from(d);
+            let quotient = current / 32;
+            remainder = current % 32;
+            if !new_digits.is_empty() || quotient > 0 {
+                new_digits.push(u8::try_from(quotient).expect("quotient fits in u8"));
+            }
+        }
+        let r = u8::try_from(remainder).expect("remainder fits in u8");
+        result.push(if r < 10 { b'0' + r } else { b'a' + r - 10 });
+        digits = new_digits;
+    }
+    if result.is_empty() {
+        "0".to_string()
+    } else {
+        result.reverse();
+        String::from_utf8(result).expect("valid utf-8")
+    }
 }
 
 /// Resolve devcontainer configuration from a workspace root.
@@ -88,13 +149,7 @@ pub fn config(
 
     // Substitute variables after merge, before hash
     let container_wf = config.get("workspaceFolder").and_then(|v| v.as_str());
-    let devcontainer_id = hex::encode(Sha256::digest(
-        workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf())
-            .to_string_lossy()
-            .as_bytes(),
-    ));
+    let devcontainer_id = devcontainer_id(workspace_root, &config_path);
     let ctx = super::subst::SubstitutionContext::new(
         workspace_root,
         container_wf,
@@ -299,116 +354,65 @@ mod tests {
     // --- Spec: devcontainerId computation ---
     // Reference: https://containers.dev/implementors/spec/#devcontainerid
 
-    fn bytes_to_bigint(bytes: &[u8]) -> Vec<u8> {
-        bytes.to_vec()
-    }
-
-    fn bigint_to_base32(bytes: &[u8]) -> String {
-        if bytes.is_empty() {
-            return "0".to_string();
-        }
-        let mut digits: Vec<u8> = bytes.to_vec();
-        let mut result = Vec::new();
-        while !(digits.is_empty() || digits.len() == 1 && digits[0] == 0) {
-            let mut remainder = 0u16;
-            let mut new_digits = Vec::new();
-            for &d in &digits {
-                let current = (remainder << 8) | u16::from(d);
-                let quotient = current / 32;
-                remainder = current % 32;
-                if !new_digits.is_empty() || quotient > 0 {
-                    new_digits.push(u8::try_from(quotient).expect("quotient fits in u8"));
-                }
-            }
-            let r = u8::try_from(remainder).expect("remainder fits in u8");
-            result.push(if r < 10 { b'0' + r } else { b'a' + r - 10 });
-            digits = new_digits;
-        }
-        if result.is_empty() {
-            "0".to_string()
-        } else {
-            result.reverse();
-            String::from_utf8(result).expect("valid utf-8")
-        }
-    }
-
-    fn spec_devcontainer_id(labels: &std::collections::BTreeMap<String, String>) -> String {
-        let json = serde_json::to_string(labels).expect("serialize");
-        let hash = Sha256::digest(json.as_bytes());
-        let num = bytes_to_bigint(&hash);
-        let base32 = bigint_to_base32(&num);
-        format!("{base32:0>52}")
-    }
-
     #[test]
-    fn spec_devcontainer_id_is_52_chars() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert(
-            "devcontainer.local_folder".to_string(),
-            "/home/user/project".to_string(),
-        );
-        let id = spec_devcontainer_id(&labels);
+    fn devcontainer_id_is_52_chars() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let config_path = tmp.path().join(".devcontainer/devcontainer.json");
+        let id = devcontainer_id(tmp.path(), &config_path);
         assert_eq!(id.len(), 52);
     }
 
     #[test]
-    fn spec_devcontainer_id_is_alphanumeric() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert(
-            "devcontainer.local_folder".to_string(),
-            "/home/user/project".to_string(),
-        );
-        let id = spec_devcontainer_id(&labels);
+    fn devcontainer_id_is_alphanumeric() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let config_path = tmp.path().join(".devcontainer/devcontainer.json");
+        let id = devcontainer_id(tmp.path(), &config_path);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]
-    fn spec_devcontainer_id_stable_across_calls() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert(
-            "devcontainer.local_folder".to_string(),
-            "/home/user/project".to_string(),
+    fn devcontainer_id_stable_across_calls() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let config_path = tmp.path().join(".devcontainer/devcontainer.json");
+        assert_eq!(
+            devcontainer_id(tmp.path(), &config_path),
+            devcontainer_id(tmp.path(), &config_path)
         );
-        assert_eq!(spec_devcontainer_id(&labels), spec_devcontainer_id(&labels));
     }
 
     #[test]
-    fn spec_devcontainer_id_differs_for_different_labels() {
-        let mut l1 = std::collections::BTreeMap::new();
-        l1.insert(
-            "devcontainer.local_folder".to_string(),
-            "/project-a".to_string(),
+    fn devcontainer_id_differs_for_different_workspaces() {
+        let tmp1 = TempDir::new().unwrap();
+        create_devcontainer(tmp1.path(), r#"{"image": "ubuntu"}"#);
+        let cfg1 = tmp1.path().join(".devcontainer/devcontainer.json");
+
+        let tmp2 = TempDir::new().unwrap();
+        create_devcontainer(tmp2.path(), r#"{"image": "ubuntu"}"#);
+        let cfg2 = tmp2.path().join(".devcontainer/devcontainer.json");
+
+        assert_ne!(
+            devcontainer_id(tmp1.path(), &cfg1),
+            devcontainer_id(tmp2.path(), &cfg2)
         );
-        let mut l2 = std::collections::BTreeMap::new();
-        l2.insert(
-            "devcontainer.local_folder".to_string(),
-            "/project-b".to_string(),
-        );
-        assert_ne!(spec_devcontainer_id(&l1), spec_devcontainer_id(&l2));
     }
 
     #[test]
     fn spec_devcontainer_id_independent_of_insertion_order() {
-        let mut l1 = std::collections::BTreeMap::new();
+        let mut l1 = BTreeMap::new();
         l1.insert("a".to_string(), "1".to_string());
         l1.insert("b".to_string(), "2".to_string());
-        let mut l2 = std::collections::BTreeMap::new();
+        let mut l2 = BTreeMap::new();
         l2.insert("b".to_string(), "2".to_string());
         l2.insert("a".to_string(), "1".to_string());
         assert_eq!(spec_devcontainer_id(&l1), spec_devcontainer_id(&l2));
     }
 
     #[test]
-    fn spec_cella_devcontainer_id_uses_wrong_algorithm() {
-        let workspace_path = "/home/user/project";
-        let cella_id = hex::encode(Sha256::digest(workspace_path.as_bytes()));
-        assert_eq!(cella_id.len(), 64, "cella produces 64-char hex (wrong)");
-        assert_ne!(cella_id.len(), 52, "spec requires 52 chars");
-    }
-
-    #[test]
     fn spec_empty_labels_produce_valid_id() {
-        let labels = std::collections::BTreeMap::new();
+        let labels = BTreeMap::new();
         let id = spec_devcontainer_id(&labels);
         assert_eq!(id.len(), 52);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
