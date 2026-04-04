@@ -18,6 +18,7 @@ members = [
     "crates/cella-network",
     "crates/cella-orchestrator",
     "crates/cella-protocol",
+    "crates/cella-jsonc",
     "crates/cella-templates",
 ]
 
@@ -147,6 +148,7 @@ cella-codegen = { path = "crates/cella-codegen" }
 cella-compose = { path = "crates/cella-compose" }
 cella-doctor = { path = "crates/cella-doctor" }
 cella-config = { path = "crates/cella-config" }
+cella-jsonc = { path = "crates/cella-jsonc" }
 cella-container = { path = "crates/cella-container" }
 cella-daemon = { path = "crates/cella-daemon" }
 cella-docker = { path = "crates/cella-docker" }
