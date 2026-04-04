@@ -91,7 +91,9 @@ fn verify_generated_config(config_path: &std::path::Path) {
         return;
     };
     let source_name = config_path.display().to_string();
-    if let Err(diags) = cella_config::devcontainer::parse::devcontainer(&source_name, &content, false) {
+    if let Err(diags) =
+        cella_config::devcontainer::parse::devcontainer(&source_name, &content, false)
+    {
         for d in diags.diagnostics() {
             if d.severity == cella_config::devcontainer::diagnostic::Severity::Error {
                 eprintln!(

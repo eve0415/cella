@@ -234,14 +234,13 @@ pub fn apply_template<S: std::hash::BuildHasher>(
         let raw = std::fs::read_to_string(&source_config)?;
         let stripped = strip_jsonc(&raw, template_id)?;
         let substituted = substitute_template_options(&stripped, options);
-        let mut config: serde_json::Value =
-            serde_json::from_str(&substituted).map_err(|e| {
-                let snippet: String = substituted.chars().take(80).collect();
-                TemplateError::InvalidArtifact {
-                    template_id: template_id.to_owned(),
-                    reason: format!("invalid JSON after substitution: {e}\n  content: {snippet:?}"),
-                }
-            })?;
+        let mut config: serde_json::Value = serde_json::from_str(&substituted).map_err(|e| {
+            let snippet: String = substituted.chars().take(80).collect();
+            TemplateError::InvalidArtifact {
+                template_id: template_id.to_owned(),
+                reason: format!("invalid JSON after substitution: {e}\n  content: {snippet:?}"),
+            }
+        })?;
 
         merge_features(&mut config, features);
 
@@ -809,10 +808,8 @@ mod tests {
         )
         .unwrap();
 
-        let settings = std::fs::read_to_string(
-            output_dir.path().join(".devcontainer/settings.json"),
-        )
-        .unwrap();
+        let settings =
+            std::fs::read_to_string(output_dir.path().join(".devcontainer/settings.json")).unwrap();
         // Comments should be stripped, trailing comma removed
         assert!(!settings.contains("//"));
         // Should still contain the actual data
@@ -831,11 +828,7 @@ mod tests {
             r#"{"name": "${templateOption:name}"}"#,
         )
         .unwrap();
-        std::fs::write(
-            dc_dir.join("Dockerfile"),
-            "FROM ${templateOption:image}",
-        )
-        .unwrap();
+        std::fs::write(dc_dir.join("Dockerfile"), "FROM ${templateOption:image}").unwrap();
 
         let dest_dc = output_dir.path().join(".devcontainer");
         std::fs::create_dir_all(&dest_dc).unwrap();

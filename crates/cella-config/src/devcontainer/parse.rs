@@ -1,8 +1,8 @@
 /// Parse orchestrator: JSONC → `serde_json::Value` → validate → typed config.
 use super::diagnostic::{Diagnostic, Diagnostics, Severity};
-use cella_jsonc as jsonc;
 use super::span::SourceText;
 use crate::schema;
+use cella_jsonc as jsonc;
 
 /// Parse and validate a devcontainer.json file.
 ///
