@@ -345,7 +345,8 @@ impl WaitForPhase {
 /// Run lifecycle phases up to `wait_for`, then spawn remaining phases in background.
 ///
 /// Returns after the `wait_for` phase completes. Remaining phases run as a detached
-/// exec inside the container.
+/// exec inside the container. Failures in background phases are recorded in
+/// `/tmp/.cella/lifecycle_status.json`.
 ///
 /// # Errors
 ///
@@ -383,32 +384,7 @@ pub async fn run_lifecycle_phases_with_wait_for(
             run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
         } else {
             for entry in &entries {
-                if let Some(s) = entry.command.as_str() {
-                    background_cmds.push(s.to_string());
-                } else if let Some(arr) = entry.command.as_array() {
-                    let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    if !cmd.is_empty() {
-                        background_cmds.push(shell_quote_argv(&cmd));
-                    }
-                } else if let Some(obj) = entry.command.as_object() {
-                    // Object commands run their values concurrently (& + wait),
-                    // matching the foreground parallel execution semantics.
-                    let mut parallel = Vec::new();
-                    for val in obj.values() {
-                        if let Some(s) = val.as_str() {
-                            parallel.push(s.to_string());
-                        } else if let Some(arr) = val.as_array() {
-                            let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                            if !cmd.is_empty() {
-                                parallel.push(shell_quote_argv(&cmd));
-                            }
-                        }
-                    }
-                    if !parallel.is_empty() {
-                        let bg: Vec<String> = parallel.iter().map(|c| format!("( {c} )")).collect();
-                        background_cmds.push(format!("{} & wait", bg.join(" & ")));
-                    }
-                }
+                background_cmds.push(entry_to_shell_command(entry));
             }
         }
     }
@@ -445,6 +421,53 @@ pub async fn run_lifecycle_phases_with_wait_for(
     }
 
     Ok(())
+}
+
+/// Convert a lifecycle entry into a shell command string for background execution.
+///
+/// Handles all three command forms (string, array, object/parallel) and
+/// generates proper failure propagation for parallel commands.
+fn entry_to_shell_command(entry: &cella_features::LifecycleEntry) -> String {
+    if let Some(s) = entry.command.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = entry.command.as_array() {
+        let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        if !cmd.is_empty() {
+            return shell_quote_argv(&cmd);
+        }
+        return "true".to_string();
+    }
+    if let Some(obj) = entry.command.as_object() {
+        let mut parallel = Vec::new();
+        for val in obj.values() {
+            if let Some(s) = val.as_str() {
+                parallel.push(s.to_string());
+            } else if let Some(arr) = val.as_array() {
+                let cmd: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                if !cmd.is_empty() {
+                    parallel.push(shell_quote_argv(&cmd));
+                }
+            }
+        }
+        if parallel.is_empty() {
+            return "true".to_string();
+        }
+        // Spawn each command in background, track PIDs, wait and fail if any failed.
+        let mut lines = Vec::new();
+        lines.push("_cella_pids=\"\"".to_string());
+        for cmd in &parallel {
+            lines.push(format!("( {cmd} ) & _cella_pids=\"$_cella_pids $!\""));
+        }
+        lines.push("_cella_rc=0".to_string());
+        lines.push(
+            "for _cella_pid in $_cella_pids; do wait \"$_cella_pid\" || _cella_rc=1; done"
+                .to_string(),
+        );
+        lines.push("[ \"$_cella_rc\" -eq 0 ] || exit 1".to_string());
+        return lines.join("\n");
+    }
+    "true".to_string()
 }
 
 /// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
@@ -937,5 +960,47 @@ mod tests {
             resolve_entries_with_metadata(Some(&rf), Some(metadata), &config, "postCreateCommand");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].origin, "prebuilt");
+    }
+
+    // ── entry_to_shell_command ─────────────────────────────────────────
+
+    #[test]
+    fn entry_to_shell_command_string() {
+        let entry = cella_features::LifecycleEntry {
+            origin: "test".into(),
+            command: json!("npm install"),
+        };
+        assert_eq!(entry_to_shell_command(&entry), "npm install");
+    }
+
+    #[test]
+    fn entry_to_shell_command_array() {
+        let entry = cella_features::LifecycleEntry {
+            origin: "test".into(),
+            command: json!(["echo", "hello world"]),
+        };
+        assert_eq!(entry_to_shell_command(&entry), "echo 'hello world'");
+    }
+
+    #[test]
+    fn entry_to_shell_command_object_tracks_pids() {
+        let entry = cella_features::LifecycleEntry {
+            origin: "test".into(),
+            command: json!({"build": "npm run build", "lint": "npm run lint"}),
+        };
+        let cmd = entry_to_shell_command(&entry);
+        // Must track PIDs and check exit codes
+        assert!(cmd.contains("_cella_pids"));
+        assert!(cmd.contains("wait"));
+        assert!(cmd.contains("exit 1"));
+    }
+
+    #[test]
+    fn entry_to_shell_command_null_is_noop() {
+        let entry = cella_features::LifecycleEntry {
+            origin: "test".into(),
+            command: json!(null),
+        };
+        assert_eq!(entry_to_shell_command(&entry), "true");
     }
 }

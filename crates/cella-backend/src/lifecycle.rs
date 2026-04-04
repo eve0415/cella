@@ -185,7 +185,10 @@ async fn run_sequential(
     Ok(())
 }
 
-/// Run named lifecycle commands in parallel, collecting and printing output.
+/// Run named lifecycle commands in parallel, cancelling siblings on first failure.
+///
+/// Uses `try_join_all` so that when any command fails, remaining in-flight
+/// commands are cancelled (their futures are dropped) per the spec requirement.
 async fn run_parallel(
     ctx: &LifecycleContext<'_>,
     phase: &str,
@@ -219,15 +222,12 @@ async fn run_parallel(
         });
     }
 
-    let results = futures_util::future::join_all(futures).await;
+    let results = futures_util::future::try_join_all(futures).await?;
 
     if ctx.is_text {
-        print_parallel_output(&results);
+        print_completed_output(&results);
     }
 
-    for result in results {
-        let _ = result?;
-    }
     Ok(())
 }
 
@@ -251,9 +251,9 @@ fn check_exit_code(
     Ok(())
 }
 
-/// Print stdout/stderr from parallel exec results to stderr.
-fn print_parallel_output(results: &[Result<ExecResult, BackendError>]) {
-    for exec_result in results.iter().flatten() {
+/// Print stdout/stderr from completed parallel exec results to stderr.
+fn print_completed_output(results: &[ExecResult]) {
+    for exec_result in results {
         if !exec_result.stdout.is_empty() {
             eprint!("{}", exec_result.stdout);
         }

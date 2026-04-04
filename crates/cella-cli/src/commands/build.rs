@@ -28,7 +28,7 @@ pub struct BuildArgs {
 
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
-    file: Option<PathBuf>,
+    config: Option<PathBuf>,
 
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
@@ -74,7 +74,7 @@ impl BuildArgs {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         info!("Resolving devcontainer config...");
-        let resolved = resolve::config(&cwd, self.file.as_deref())?;
+        let resolved = resolve::config(&cwd, self.config.as_deref())?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);

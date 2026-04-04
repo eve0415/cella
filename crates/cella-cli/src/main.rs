@@ -49,10 +49,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The daemon subprocess initializes its own file-based tracing.
     // Skip the normal indicatif-based tracing for daemon start.
     if !cli.command.is_daemon_start() {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
-            .init();
+        if spinners_enabled {
+            // Route tracing through indicatif so log lines don't corrupt spinners.
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
+                .init();
+        } else {
+            // No spinners (JSON mode, RUST_LOG set, non-TTY): write directly to stderr.
+            // Spec requires stdout = JSON only, stderr = logs only.
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .init();
+        }
     }
 
     cli.command.execute(progress).await
@@ -366,13 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_build_with_workspace_and_file() {
+    fn parse_build_with_workspace_and_config() {
         let cli = parse(&[
             "cella",
             "build",
             "--workspace-folder",
             "/tmp",
-            "--file",
+            "--config",
             "/tmp/.devcontainer/devcontainer.json",
         ])
         .unwrap();
