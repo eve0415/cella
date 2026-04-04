@@ -1,7 +1,6 @@
 pub mod diagnostic;
 pub mod discover;
 mod error;
-pub mod jsonc;
 pub mod merge;
 pub mod parse;
 pub mod resolve;

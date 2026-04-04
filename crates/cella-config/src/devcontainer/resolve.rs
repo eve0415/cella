@@ -9,7 +9,7 @@ use tracing::debug;
 use super::CellaConfigError;
 use super::diagnostic::{Diagnostic, Severity};
 use super::discover;
-use super::jsonc;
+use cella_jsonc as jsonc;
 use super::merge;
 use super::parse;
 
