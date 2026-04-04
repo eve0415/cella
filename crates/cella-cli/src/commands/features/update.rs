@@ -57,7 +57,10 @@ impl UpdateArgs {
         let features = resolve::extract_features(&config);
 
         if features.is_empty() {
-            print_empty_message(matches!(self.output, OutputFormat::Json), "No features configured.");
+            print_empty_message(
+                matches!(self.output, OutputFormat::Json),
+                "No features configured.",
+            );
             return Ok(());
         }
 
@@ -73,7 +76,10 @@ impl UpdateArgs {
         let candidates = find_update_candidates(&features, &collection, &cache).await;
 
         if candidates.is_empty() {
-            print_empty_message(matches!(self.output, OutputFormat::Json), "All features are up to date.");
+            print_empty_message(
+                matches!(self.output, OutputFormat::Json),
+                "All features are up to date.",
+            );
             return Ok(());
         }
 

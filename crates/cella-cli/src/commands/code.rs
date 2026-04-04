@@ -481,7 +481,8 @@ mod tests {
 
     #[test]
     fn resolve_editor_binary_name_not_in_path() {
-        let result = resolve_editor_binary(&EditorChoice::Code, Some("totally-nonexistent-editor-xyz"));
+        let result =
+            resolve_editor_binary(&EditorChoice::Code, Some("totally-nonexistent-editor-xyz"));
         assert!(result.is_err());
     }
 

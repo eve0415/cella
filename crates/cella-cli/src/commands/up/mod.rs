@@ -189,7 +189,12 @@ impl UpContext {
             remove_container,
             build_no_cache: args.build.build_no_cache,
             skip_checksum: args.skip_checksum,
-            pull_policy: args.build.pull.as_ref().map(ImagePullPolicy::as_str).map(String::from),
+            pull_policy: args
+                .build
+                .pull
+                .as_ref()
+                .map(ImagePullPolicy::as_str)
+                .map(String::from),
             extra_labels: std::collections::HashMap::new(),
             network_rules: if args.no_network_rules {
                 NetworkRulePolicy::Skip
@@ -637,9 +642,10 @@ impl UpContext {
             },
             remove_existing_container: self.remove_container,
             skip_checksum: self.skip_checksum,
-            host_requirement_policy: if strict.iter().any(|s| {
-                matches!(s, StrictnessLevel::HostRequirements | StrictnessLevel::All)
-            }) {
+            host_requirement_policy: if strict
+                .iter()
+                .any(|s| matches!(s, StrictnessLevel::HostRequirements | StrictnessLevel::All))
+            {
                 cella_orchestrator::HostRequirementPolicy::Error
             } else {
                 cella_orchestrator::HostRequirementPolicy::Warn
@@ -703,7 +709,12 @@ impl UpArgs {
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
         ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
-        ctx.pull_policy = self.build.pull.as_ref().map(ImagePullPolicy::as_str).map(String::from);
+        ctx.pull_policy = self
+            .build
+            .pull
+            .as_ref()
+            .map(ImagePullPolicy::as_str)
+            .map(String::from);
         ctx.network_rules = if self.no_network_rules {
             NetworkRulePolicy::Skip
         } else {
