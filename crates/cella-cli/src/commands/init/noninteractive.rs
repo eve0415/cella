@@ -48,6 +48,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply template (include all optional paths in non-interactive mode)
     let written_path = cella_templates::apply::apply_template(
+        &metadata.id,
         &template_dir,
         &workspace,
         &resolved_opts,
@@ -55,6 +56,8 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.output_format.to_template_format(),
         &[],
     )?;
+
+    super::verify_generated_config(&written_path);
 
     eprintln!("\u{2713} Created {}", written_path.display());
 

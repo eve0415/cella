@@ -10,6 +10,18 @@ use crate::error::TemplateError;
 use crate::types::{OutputFormat, SelectedFeature};
 
 // ---------------------------------------------------------------------------
+// JSONC stripping
+// ---------------------------------------------------------------------------
+
+/// Strip JSONC comments and trailing commas, mapping errors to [`TemplateError`].
+fn strip_jsonc(content: &str, file_name: &str) -> Result<String, TemplateError> {
+    cella_jsonc::strip(content).map_err(|e| TemplateError::InvalidArtifact {
+        template_id: file_name.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Template option substitution
 // ---------------------------------------------------------------------------
 
@@ -179,6 +191,7 @@ pub fn format_config(config: &serde_json::Value, format: OutputFormat) -> String
 ///
 /// Returns [`TemplateError`] on I/O errors or invalid template structure.
 pub fn apply_template<S: std::hash::BuildHasher>(
+    template_id: &str,
     template_dir: &Path,
     output_dir: &Path,
     options: &HashMap<String, serde_json::Value, S>,
@@ -213,16 +226,21 @@ pub fn apply_template<S: std::hash::BuildHasher>(
         &compiled_excludes,
     )?;
 
-    // Process the devcontainer.json specifically: merge features and format
+    // Process devcontainer.json separately: substitute, parse, merge features, format.
+    // Read from the source template (copy_and_substitute skips devcontainer.json).
     let config_path = devcontainer_dir.join("devcontainer.json");
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let substituted = substitute_template_options(&content, options);
-        let mut config: serde_json::Value =
-            serde_json::from_str(&substituted).map_err(|e| TemplateError::InvalidArtifact {
-                template_id: "devcontainer.json".to_owned(),
-                reason: format!("invalid JSON after substitution: {e}"),
-            })?;
+    let source_config = source_dir.join("devcontainer.json");
+    if source_config.exists() {
+        let raw = std::fs::read_to_string(&source_config)?;
+        let stripped = strip_jsonc(&raw, template_id)?;
+        let substituted = substitute_template_options(&stripped, options);
+        let mut config: serde_json::Value = serde_json::from_str(&substituted).map_err(|e| {
+            let snippet: String = substituted.chars().take(80).collect();
+            TemplateError::InvalidArtifact {
+                template_id: template_id.to_owned(),
+                reason: format!("invalid JSON after substitution: {e}\n  content: {snippet:?}"),
+            }
+        })?;
 
         merge_features(&mut config, features);
 
@@ -258,6 +276,11 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
             }
         }
 
+        // devcontainer.json is handled separately in apply_template()
+        if file_name == "devcontainer.json" {
+            continue;
+        }
+
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
             copy_and_substitute(
@@ -271,7 +294,17 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
             // Try to read as text and substitute; if it fails, copy as binary
             match std::fs::read_to_string(&src_path) {
                 Ok(content) => {
-                    let substituted = substitute_template_options(&content, options);
+                    // Strip JSONC from .json files before substitution so that
+                    // user-provided option values containing '//' are not eaten.
+                    let is_json = src_path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+                    let stripped = if is_json {
+                        strip_jsonc(&content, &file_name.to_string_lossy())?
+                    } else {
+                        content
+                    };
+                    let substituted = substitute_template_options(&stripped, options);
                     std::fs::write(&dest_path, substituted)?;
                 }
                 Err(_) => {
@@ -455,6 +488,7 @@ mod tests {
         options.insert("variant".to_owned(), serde_json::json!("noble"));
 
         let config_path = apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &options,
@@ -489,6 +523,7 @@ mod tests {
         }];
 
         let config_path = apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &HashMap::new(),
@@ -526,6 +561,7 @@ mod tests {
         options.insert("variant".to_owned(), serde_json::json!("noble"));
 
         apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &options,
@@ -559,6 +595,7 @@ mod tests {
         std::fs::write(dc_dir.join("Dockerfile"), "FROM ubuntu").unwrap();
 
         apply_template(
+            "test",
             template_dir.path(),
             output_dir.path(),
             &HashMap::new(),
@@ -584,5 +621,229 @@ mod tests {
                 .join(".devcontainer/.github/workflow.yml")
                 .exists()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JSONC template regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_template_jsonc_with_line_comments() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "// For format details, see https://aka.ms/devcontainer.json.\n\
+             {\n  \"name\": \"Test\",\n  \"image\": \"ubuntu\"\n}\n",
+        )
+        .unwrap();
+
+        let config_path = apply_template(
+            "test",
+            template_dir.path(),
+            output_dir.path(),
+            &HashMap::new(),
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["name"], "Test");
+    }
+
+    #[test]
+    fn apply_template_jsonc_with_block_comments() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "{\n  /* block comment */\n  \"name\": \"Test\",\n  \"image\": \"ubuntu\"\n}\n",
+        )
+        .unwrap();
+
+        let config_path = apply_template(
+            "test",
+            template_dir.path(),
+            output_dir.path(),
+            &HashMap::new(),
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["name"], "Test");
+    }
+
+    #[test]
+    fn apply_template_jsonc_with_trailing_commas() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "{\n  \"name\": \"Test\",\n  \"image\": \"ubuntu\",\n}\n",
+        )
+        .unwrap();
+
+        let config_path = apply_template(
+            "test",
+            template_dir.path(),
+            output_dir.path(),
+            &HashMap::new(),
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["name"], "Test");
+    }
+
+    #[test]
+    fn apply_template_jsonc_comments_and_substitution() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "// Template: Node.js\n\
+             {\n  \"name\": \"Node\",\n  \
+             \"image\": \"mcr.microsoft.com/devcontainers/javascript-node:1-${templateOption:imageVariant}\"\n}\n",
+        )
+        .unwrap();
+
+        let mut options = HashMap::new();
+        options.insert("imageVariant".to_owned(), serde_json::json!("24-trixie"));
+
+        let config_path = apply_template(
+            "javascript-node",
+            template_dir.path(),
+            output_dir.path(),
+            &options,
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("javascript-node:1-24-trixie"));
+        assert!(!content.contains("${templateOption:"));
+        assert!(!content.contains("//"));
+    }
+
+    #[test]
+    fn apply_template_option_with_slashes_not_stripped() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            "// comment\n{\"url\": \"${templateOption:url}\"}",
+        )
+        .unwrap();
+
+        let mut options = HashMap::new();
+        options.insert("url".to_owned(), serde_json::json!("http://example.com"));
+
+        let config_path = apply_template(
+            "test",
+            template_dir.path(),
+            output_dir.path(),
+            &options,
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("http://example.com"));
+    }
+
+    #[test]
+    fn apply_template_non_devcontainer_json_stripped() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(dc_dir.join("devcontainer.json"), r#"{"name": "Test"}"#).unwrap();
+
+        // Create a .json file with JSONC comments
+        std::fs::write(
+            dc_dir.join("settings.json"),
+            "// VS Code settings\n{\"editor.fontSize\": 14, }",
+        )
+        .unwrap();
+
+        apply_template(
+            "test",
+            template_dir.path(),
+            output_dir.path(),
+            &HashMap::new(),
+            &[],
+            OutputFormat::Json,
+            &[],
+        )
+        .unwrap();
+
+        let settings =
+            std::fs::read_to_string(output_dir.path().join(".devcontainer/settings.json")).unwrap();
+        // Comments should be stripped, trailing comma removed
+        assert!(!settings.contains("//"));
+        // Should still contain the actual data
+        assert!(settings.contains("\"editor.fontSize\": 14"));
+    }
+
+    #[test]
+    fn copy_substitution_skips_devcontainer_json() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            r#"{"name": "${templateOption:name}"}"#,
+        )
+        .unwrap();
+        std::fs::write(dc_dir.join("Dockerfile"), "FROM ${templateOption:image}").unwrap();
+
+        let dest_dc = output_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dest_dc).unwrap();
+
+        let mut options = HashMap::new();
+        options.insert("name".to_owned(), serde_json::json!("Test"));
+        options.insert("image".to_owned(), serde_json::json!("ubuntu"));
+
+        copy_and_substitute(&dc_dir, &dest_dc, &options, &dc_dir, &[]).unwrap();
+
+        // Dockerfile should be copied and substituted
+        let dockerfile = std::fs::read_to_string(dest_dc.join("Dockerfile")).unwrap();
+        assert_eq!(dockerfile, "FROM ubuntu");
+
+        // devcontainer.json should NOT be copied by copy_and_substitute
+        assert!(!dest_dc.join("devcontainer.json").exists());
     }
 }
