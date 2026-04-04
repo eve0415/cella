@@ -347,6 +347,7 @@ dependencies = [
  "cella-doctor",
  "cella-env",
  "cella-git",
+ "cella-jsonc",
  "cella-network",
  "cella-orchestrator",
  "cella-protocol",
@@ -405,6 +406,7 @@ name = "cella-config"
 version = "0.0.17"
 dependencies = [
  "cella-codegen",
+ "cella-jsonc",
  "cella-network",
  "hex",
  "miette",
@@ -528,6 +530,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-jsonc"
+version = "0.0.17"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "cella-network"
 version = "0.0.17"
 dependencies = [
@@ -589,6 +598,7 @@ name = "cella-templates"
 version = "0.0.17"
 dependencies = [
  "cella-features",
+ "cella-jsonc",
  "dirs",
  "filetime",
  "flate2",
