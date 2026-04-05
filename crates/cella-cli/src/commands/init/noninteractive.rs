@@ -46,9 +46,29 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
     // Parse feature options from --option flags
     let features = parse_features(&args.feature, &args.option)?;
 
+    // Construct pinned image if --pin-image was provided
+    let pinned_image = args.pin_image.map(|tag| {
+        // Read template config to get base image
+        let config_content =
+            std::fs::read_to_string(template_dir.join(".devcontainer").join("devcontainer.json"))
+                .ok()
+                .or_else(|| std::fs::read_to_string(template_dir.join("devcontainer.json")).ok());
+
+        if let Some(info) = config_content
+            .as_deref()
+            .and_then(cella_templates::tags::detect_image_variant_option)
+        {
+            format!("{}:{tag}", info.base_image)
+        } else {
+            // No variant detected; use tag as-is (user knows what they're doing)
+            tag
+        }
+    });
+
     // Apply template (include all optional paths in non-interactive mode)
     let overrides = cella_templates::apply::ConfigOverrides {
         name: args.name,
+        pinned_image,
         ..Default::default()
     };
     let written_path = cella_templates::apply::apply_template(
