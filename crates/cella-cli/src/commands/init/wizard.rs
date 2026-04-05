@@ -14,8 +14,8 @@ use cella_templates::collection::{self, DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMP
 use cella_templates::fetcher;
 use cella_templates::index::{self, is_official_collection};
 use cella_templates::types::{
-    DevcontainerIndex, FeatureSummary, IndexCollection, OutputFormat, SelectedFeature,
-    TemplateMetadata, TemplateSummary,
+    DevcontainerIndex, FeatureSummary, IndexCollection, IndexFeatureSummary, IndexTemplateSummary,
+    OutputFormat, SelectedFeature, TemplateMetadata, TemplateSummary,
 };
 
 use crate::commands::features::prompts::{prompt_feature_options, prompt_single_option};
@@ -246,7 +246,10 @@ enum TemplateChoice {
 fn prompt_official_templates(
     templates: &[TemplateSummary],
 ) -> Result<TemplateChoice, Box<dyn std::error::Error + Send + Sync>> {
-    let entries = templates
+    let mut sorted: Vec<&TemplateSummary> = templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -268,7 +271,7 @@ fn prompt_official_templates(
     }
 
     let idx = resolve_selection(&index_map, &selection)?;
-    Ok(TemplateChoice::Selected(templates[idx].clone()))
+    Ok(TemplateChoice::Selected((*sorted[idx]).clone()))
 }
 
 /// Browse all template sources via the aggregated index.
@@ -317,8 +320,10 @@ async fn browse_custom_registry(
         return Ok(None);
     }
 
-    let entries = custom_collection
-        .templates
+    let mut sorted: Vec<&TemplateSummary> = custom_collection.templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -337,7 +342,7 @@ async fn browse_custom_registry(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let t = &custom_collection.templates[idx];
+    let t = sorted[idx];
     let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{registry}/{}:{}", t.id, t.version);
     let template_dir = progress
@@ -372,7 +377,7 @@ fn prompt_collection_picker(
         CollectionKind::Features => BACK_TO_OFFICIAL_FEATURES,
     };
 
-    let relevant: Vec<&IndexCollection> = index
+    let mut relevant: Vec<&IndexCollection> = index
         .collections
         .iter()
         .filter(|c| match kind {
@@ -380,6 +385,11 @@ fn prompt_collection_picker(
             CollectionKind::Features => !c.features.is_empty(),
         })
         .collect();
+    sort_by_display_name(
+        &mut relevant,
+        |c| c.source_information.name.as_deref(),
+        |c| c.source_information.oci_reference.as_deref().unwrap_or(""),
+    );
 
     let kind_label = match kind {
         CollectionKind::Templates => "templates",
@@ -447,8 +457,11 @@ async fn prompt_index_templates(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let entries = collection
-        .templates
+
+    let mut sorted: Vec<&IndexTemplateSummary> = collection.templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -467,7 +480,7 @@ async fn prompt_index_templates(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let t = &collection.templates[idx];
+    let t = sorted[idx];
     let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{}:{}", t.id, t.version);
     let template_dir = progress
@@ -534,9 +547,18 @@ enum FeatureChoice {
 fn prompt_feature_list(
     available: &[FeatureSummary],
 ) -> Result<FeatureChoice, Box<dyn std::error::Error + Send + Sync>> {
-    let entries = available
-        .iter()
-        .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
+    // Build sorted indices so we can map back to original positions.
+    let mut sorted_indices: Vec<usize> = (0..available.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        let a_name = available[a].name.as_deref().unwrap_or(&available[a].id);
+        let b_name = available[b].name.as_deref().unwrap_or(&available[b].id);
+        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+    });
+
+    let entries = sorted_indices.iter().map(|&i| {
+        let f = &available[i];
+        format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref())
+    });
     let (entry_choices, index_map) = build_choices_with_index(entries);
 
     let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 2);
@@ -555,8 +577,8 @@ fn prompt_feature_list(
         return Ok(FeatureChoice::ShowAllSources);
     }
 
-    let idx = resolve_selection(&index_map, &selection)?;
-    Ok(FeatureChoice::Selected(idx))
+    let sorted_idx = resolve_selection(&index_map, &selection)?;
+    Ok(FeatureChoice::Selected(sorted_indices[sorted_idx]))
 }
 
 /// Configure an official feature (fetch metadata + prompt options).
@@ -628,8 +650,11 @@ async fn prompt_index_features(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let entries = collection
-        .features
+
+    let mut sorted: Vec<&IndexFeatureSummary> = collection.features.iter().collect();
+    sort_by_display_name(&mut sorted, |f| f.name.as_deref(), |f| &f.id);
+
+    let entries = sorted
         .iter()
         .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -648,7 +673,7 @@ async fn prompt_index_features(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let f = &collection.features[idx];
+    let f = sorted[idx];
     let feature_ref = format!("{}:{}", f.id, f.version);
     let short_id = f.id.rsplit('/').next().unwrap_or(&f.id);
     let feature_options =
@@ -803,4 +828,17 @@ fn resolve_selection(
         .get(selection)
         .copied()
         .ok_or_else(|| "item not found in selection".into())
+}
+
+/// Sort a slice of items by display name (case-insensitive), falling back to id.
+fn sort_by_display_name<T>(
+    items: &mut [T],
+    get_name: fn(&T) -> Option<&str>,
+    get_id: fn(&T) -> &str,
+) {
+    items.sort_by(|a, b| {
+        let a_name = get_name(a).unwrap_or_else(|| get_id(a));
+        let b_name = get_name(b).unwrap_or_else(|| get_id(b));
+        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+    });
 }
