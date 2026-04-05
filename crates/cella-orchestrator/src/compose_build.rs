@@ -47,7 +47,7 @@ pub async fn compose_build(
     client: &dyn ContainerBackend,
     cfg: &ComposeBuildConfig<'_>,
     progress: &ProgressSender,
-) -> Result<ComposeBuildResult, Box<dyn std::error::Error>> {
+) -> Result<ComposeBuildResult, Box<dyn std::error::Error + Send + Sync>> {
     if !client.capabilities().compose {
         return Err(format!(
             "selected backend '{}' does not support Docker Compose devcontainers",
@@ -115,7 +115,7 @@ pub async fn compose_build(
     compose_cmd
         .build(None)
         .await
-        .map_err(|e| -> Box<dyn std::error::Error> {
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("docker compose build failed: {e}").into()
         })?;
 

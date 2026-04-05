@@ -144,7 +144,7 @@ pub async fn compose_up(
     cfg: &ComposeUpConfig<'_>,
     hooks: &dyn ComposeUpHooks,
     progress: ProgressSender,
-) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Ctx {
         client,
         cfg,
@@ -236,8 +236,10 @@ pub async fn compose_up(
 async fn prepare_and_start(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
-) -> Result<(String, Option<cella_features::ResolvedFeatures>, String), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (String, Option<cella_features::ResolvedFeatures>, String),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
 
@@ -348,7 +350,7 @@ async fn finalize_compose(
     remote_user: &str,
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     agent_arch: &str,
-) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
 
@@ -424,7 +426,7 @@ async fn handle_compose_running(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
     container: &ContainerInfo,
-) -> Result<ComposeUpResult, Box<dyn std::error::Error>> {
+) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
     let remote_user = resolve_remote_user(config, None, "root");
@@ -483,7 +485,7 @@ fn write_build_override(
     project: &ComposeProject,
     features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
     ov: &OverrideContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let override_config = OverrideConfig {
         primary_service: project.primary_service.clone(),
         image_override: features_build.and_then(|b| b.image_name_override.clone()),
@@ -520,7 +522,7 @@ async fn build_uid_remap_override(
     features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
     remote_user: &str,
     ov: &OverrideContext,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let update_uid = ctx
         .cfg
         .config
@@ -638,7 +640,7 @@ async fn find_compose_container(
     client: &dyn ContainerBackend,
     project_name: &str,
     service_name: &str,
-) -> Result<Option<ContainerInfo>, Box<dyn std::error::Error>> {
+) -> Result<Option<ContainerInfo>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(client
         .find_compose_service(project_name, service_name)
         .await?)

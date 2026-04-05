@@ -63,7 +63,7 @@ pub async fn build_uid_remap_image(
     image_user: &str,
     remote_user: &str,
     progress: &ProgressSender,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     if remote_user == "root" {
         debug!("Skipping UID remap: remote user is root");
         return Ok(None);

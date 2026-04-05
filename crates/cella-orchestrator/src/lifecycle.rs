@@ -263,7 +263,7 @@ pub async fn run_all_lifecycle_phases(
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     image_metadata: Option<&str>,
     progress: &ProgressSender,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases = [
         "onCreateCommand",
         "updateContentCommand",
@@ -358,7 +358,7 @@ pub async fn run_lifecycle_phases_with_wait_for(
     image_metadata: Option<&str>,
     progress: &ProgressSender,
     wait_for: WaitForPhase,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases: &[&str] = &[
         "onCreateCommand",
         "updateContentCommand",
@@ -485,7 +485,7 @@ pub async fn check_and_run_content_update(
     metadata: Option<&str>,
     workspace_root: &std::path::Path,
     progress: &ProgressSender,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current_hash = cella_git::content_hash::compute(workspace_root);
 
     let read_result = lc_ctx
