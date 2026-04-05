@@ -18,6 +18,9 @@ use crate::{FeatureCollectionIndex, TemplateCollectionIndex};
 /// How long a cached collection index is considered fresh.
 const COLLECTION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long cached image tags are considered fresh.
+const IMAGE_TAG_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// On-disk cache for template collections and artifacts.
 #[derive(Debug, Clone)]
 pub struct TemplateCache {
@@ -203,6 +206,63 @@ impl TemplateCache {
             path.display()
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Template artifact cache
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Image tag cache (1-hour TTL)
+    // -----------------------------------------------------------------------
+
+    /// Get cached image tags if they exist and are fresh (< 1h old).
+    pub fn get_image_tags(&self, image_ref: &str) -> Option<Vec<String>> {
+        let path = self.image_tags_path(image_ref);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age > IMAGE_TAG_TTL {
+            debug!("image tag cache expired for {image_ref} (age: {age:?})");
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let tags: Vec<String> = serde_json::from_str(&content).ok()?;
+        debug!("image tag cache hit for {image_ref}");
+        Some(tags)
+    }
+
+    /// Write image tags to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::CacheError`] if the write fails.
+    pub fn put_image_tags(&self, image_ref: &str, tags: &[String]) -> Result<(), TemplateError> {
+        let path = self.image_tags_path(image_ref);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| TemplateError::CacheError {
+                message: format!("failed to create cache directory: {e}"),
+            })?;
+        }
+        let json = serde_json::to_string(tags).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to serialize image tags: {e}"),
+        })?;
+        std::fs::write(&path, json).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to write image tag cache: {e}"),
+        })?;
+        debug!("cached image tags for {image_ref} at {}", path.display());
+        Ok(())
+    }
+
+    /// Compute the cache file path for image tags.
+    fn image_tags_path(&self, image_ref: &str) -> PathBuf {
+        let prefixed = format!("tags::{image_ref}");
+        let hash = hex::encode(&Sha256::digest(prefixed.as_bytes())[..8]);
+        self.root.join("tags").join(format!("{hash}.json"))
     }
 
     // -----------------------------------------------------------------------

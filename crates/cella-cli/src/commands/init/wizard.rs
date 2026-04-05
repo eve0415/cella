@@ -14,8 +14,8 @@ use cella_templates::collection::{self, DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMP
 use cella_templates::fetcher;
 use cella_templates::index::{self, is_official_collection};
 use cella_templates::types::{
-    DevcontainerIndex, FeatureSummary, IndexCollection, OutputFormat, SelectedFeature,
-    TemplateMetadata, TemplateSummary,
+    DevcontainerIndex, FeatureSummary, IndexCollection, IndexFeatureSummary, IndexTemplateSummary,
+    OutputFormat, SelectedFeature, TemplateMetadata, TemplateSummary,
 };
 
 use crate::commands::features::prompts::{prompt_feature_options, prompt_single_option};
@@ -83,43 +83,53 @@ pub async fn run(
     )
     .await?;
 
-    // Step 4: Template options
-    let template_opts = prompt_all_options(&metadata)?;
+    // Detect image variant option for pinning support
+    let image_variant_info = read_template_config(&template_dir)
+        .as_deref()
+        .and_then(cella_templates::tags::detect_image_variant_option);
+
+    // Step 4: Template options (with optional pin flow for variant option)
+    let (template_opts, pinned_image) = prompt_options_with_pin(
+        &metadata,
+        image_variant_info.as_ref(),
+        &cache,
+        args.refresh,
+        &progress,
+    )
+    .await?;
 
     // Step 4b: Optional paths
     let excluded_paths = prompt_optional_paths(&metadata)?;
 
-    // Step 5: Feature selection loop (with multi-source support)
+    // Step 5: Dev container name
+    let container_name = prompt_container_name(&metadata)?;
+
+    // Step 6: Feature selection loop (with multi-source support)
     let features = select_features(&cache, args.refresh, &progress).await?;
 
-    // Step 6: Output format
+    // Step 7: Output format
     let format = prompt_output_format()?;
 
-    // Step 7: Summary + confirm
-    let opt_display: Vec<(String, String)> = template_opts
-        .iter()
-        .map(|(k, v)| {
-            let display = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            (k.clone(), display)
-        })
-        .collect();
-
-    let template_name = metadata.name.as_deref().unwrap_or(&metadata.id);
-
-    summary::display_summary(template_name, &opt_display, &features, format, &config_path);
-
-    let confirmed = Confirm::new("Write configuration files?")
-        .with_default(true)
-        .prompt()?;
-    if !confirmed {
+    // Step 8: Summary + confirm
+    if !confirm_summary(
+        &metadata,
+        &container_name,
+        pinned_image.as_deref(),
+        &template_opts,
+        &features,
+        format,
+        &config_path,
+    )? {
         eprintln!("Aborted.");
         return Ok(());
     }
 
-    // Step 8: Apply
+    // Step 9: Apply
+    let overrides = cella_templates::apply::ConfigOverrides {
+        name: Some(container_name),
+        pinned_image,
+        excluded_paths,
+    };
     let written_path = cella_templates::apply::apply_template(
         &metadata.id,
         &template_dir,
@@ -127,13 +137,23 @@ pub async fn run(
         &template_opts,
         &features,
         format,
-        &excluded_paths,
+        &overrides,
     )?;
 
     // Step 9: Verify the generated config is parseable
     super::verify_generated_config(&written_path);
 
-    // Step 10: Success + next steps
+    // Step 10: Success + optional cella up
+    print_success_and_prompt_up(&written_path, args.up)?;
+
+    Ok(())
+}
+
+/// Print success message and optionally prompt to run `cella up`.
+fn print_success_and_prompt_up(
+    written_path: &std::path::Path,
+    auto_up: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!();
     eprintln!(
         "{} Created {}",
@@ -152,9 +172,8 @@ pub async fn run(
         style::dim("Edit .devcontainer/devcontainer.json to customize")
     );
 
-    // Step 10: Prompt to run cella up
     eprintln!();
-    if args.up {
+    if auto_up {
         eprintln!("Starting dev container...");
         exec_cella_up()?;
     } else {
@@ -246,7 +265,10 @@ enum TemplateChoice {
 fn prompt_official_templates(
     templates: &[TemplateSummary],
 ) -> Result<TemplateChoice, Box<dyn std::error::Error + Send + Sync>> {
-    let entries = templates
+    let mut sorted: Vec<&TemplateSummary> = templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -268,7 +290,7 @@ fn prompt_official_templates(
     }
 
     let idx = resolve_selection(&index_map, &selection)?;
-    Ok(TemplateChoice::Selected(templates[idx].clone()))
+    Ok(TemplateChoice::Selected((*sorted[idx]).clone()))
 }
 
 /// Browse all template sources via the aggregated index.
@@ -317,8 +339,10 @@ async fn browse_custom_registry(
         return Ok(None);
     }
 
-    let entries = custom_collection
-        .templates
+    let mut sorted: Vec<&TemplateSummary> = custom_collection.templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -337,7 +361,7 @@ async fn browse_custom_registry(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let t = &custom_collection.templates[idx];
+    let t = sorted[idx];
     let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{registry}/{}:{}", t.id, t.version);
     let template_dir = progress
@@ -372,7 +396,7 @@ fn prompt_collection_picker(
         CollectionKind::Features => BACK_TO_OFFICIAL_FEATURES,
     };
 
-    let relevant: Vec<&IndexCollection> = index
+    let mut relevant: Vec<&IndexCollection> = index
         .collections
         .iter()
         .filter(|c| match kind {
@@ -380,6 +404,11 @@ fn prompt_collection_picker(
             CollectionKind::Features => !c.features.is_empty(),
         })
         .collect();
+    sort_by_display_name(
+        &mut relevant,
+        |c| c.source_information.name.as_deref(),
+        |c| c.source_information.oci_reference.as_deref().unwrap_or(""),
+    );
 
     let kind_label = match kind {
         CollectionKind::Templates => "templates",
@@ -447,8 +476,11 @@ async fn prompt_index_templates(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let entries = collection
-        .templates
+
+    let mut sorted: Vec<&IndexTemplateSummary> = collection.templates.iter().collect();
+    sort_by_display_name(&mut sorted, |t| t.name.as_deref(), |t| &t.id);
+
+    let entries = sorted
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -467,7 +499,7 @@ async fn prompt_index_templates(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let t = &collection.templates[idx];
+    let t = sorted[idx];
     let name = t.name.as_deref().unwrap_or(&t.id);
     let oci_ref = format!("{}:{}", t.id, t.version);
     let template_dir = progress
@@ -534,9 +566,18 @@ enum FeatureChoice {
 fn prompt_feature_list(
     available: &[FeatureSummary],
 ) -> Result<FeatureChoice, Box<dyn std::error::Error + Send + Sync>> {
-    let entries = available
-        .iter()
-        .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
+    // Build sorted indices so we can map back to original positions.
+    let mut sorted_indices: Vec<usize> = (0..available.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        let a_name = available[a].name.as_deref().unwrap_or(&available[a].id);
+        let b_name = available[b].name.as_deref().unwrap_or(&available[b].id);
+        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+    });
+
+    let entries = sorted_indices.iter().map(|&i| {
+        let f = &available[i];
+        format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref())
+    });
     let (entry_choices, index_map) = build_choices_with_index(entries);
 
     let mut choices: Vec<String> = Vec::with_capacity(entry_choices.len() + 2);
@@ -555,8 +596,8 @@ fn prompt_feature_list(
         return Ok(FeatureChoice::ShowAllSources);
     }
 
-    let idx = resolve_selection(&index_map, &selection)?;
-    Ok(FeatureChoice::Selected(idx))
+    let sorted_idx = resolve_selection(&index_map, &selection)?;
+    Ok(FeatureChoice::Selected(sorted_indices[sorted_idx]))
 }
 
 /// Configure an official feature (fetch metadata + prompt options).
@@ -628,8 +669,11 @@ async fn prompt_index_features(
         .name
         .as_deref()
         .unwrap_or("unknown");
-    let entries = collection
-        .features
+
+    let mut sorted: Vec<&IndexFeatureSummary> = collection.features.iter().collect();
+    sort_by_display_name(&mut sorted, |f| f.name.as_deref(), |f| &f.id);
+
+    let entries = sorted
         .iter()
         .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
     let (entry_choices, index_map) = build_choices_with_index(entries);
@@ -648,7 +692,7 @@ async fn prompt_index_features(
 
     let idx = resolve_selection(&index_map, &selection)?;
 
-    let f = &collection.features[idx];
+    let f = sorted[idx];
     let feature_ref = format!("{}:{}", f.id, f.version);
     let short_id = f.id.rsplit('/').next().unwrap_or(&f.id);
     let feature_options =
@@ -694,29 +738,150 @@ async fn fetch_and_prompt_feature_options(
 // Template options, optional paths, output format
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Prompt the user for all template options, showing defaults.
-fn prompt_all_options(
+/// Read the template's `devcontainer.json` content (pre-substitution).
+fn read_template_config(template_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(template_dir.join(".devcontainer").join("devcontainer.json"))
+        .ok()
+        .or_else(|| std::fs::read_to_string(template_dir.join("devcontainer.json")).ok())
+}
+
+const PIN_IMAGE_SENTINEL: &str = "Pin to specific image version...";
+
+/// Prompt for template options with optional image pinning support.
+///
+/// Returns `(options, pinned_image)` where `pinned_image` is `Some` if the
+/// user chose to pin to a specific image tag.
+async fn prompt_options_with_pin(
     metadata: &TemplateMetadata,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    variant_info: Option<&cella_templates::tags::ImageVariantInfo>,
+    cache: &TemplateCache,
+    refresh: bool,
+    progress: &Progress,
+) -> Result<
+    (HashMap<String, serde_json::Value>, Option<String>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     if metadata.options.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     }
 
     eprintln!();
     eprintln!("{}", style::label("Configure template options:"));
 
     let mut resolved = HashMap::new();
+    let mut pinned_image: Option<String> = None;
+
     for (key, opt) in &metadata.options {
         eprintln!();
         eprintln!("  {}", style::label(key));
         if let Some(desc) = &opt.description {
             eprintln!("  {}", style::dim(desc));
         }
-        let value = prompt_single_option(key, opt)?;
-        resolved.insert(key.clone(), value);
+
+        // Check if this is the variant option that supports pinning.
+        let is_variant_option =
+            variant_info.is_some_and(|info| info.option_key == *key) && opt.proposals.is_some();
+
+        if is_variant_option {
+            let (value, pin) =
+                prompt_variant_with_pin(key, opt, variant_info.unwrap(), cache, refresh, progress)
+                    .await?;
+            resolved.insert(key.clone(), value);
+            pinned_image = pin;
+        } else {
+            let value = prompt_single_option(key, opt)?;
+            resolved.insert(key.clone(), value);
+        }
     }
 
-    Ok(resolved)
+    Ok((resolved, pinned_image))
+}
+
+/// Prompt for an image variant option with a pin sentinel at the end.
+///
+/// Returns `(chosen_value, optional_pinned_image)`.
+async fn prompt_variant_with_pin(
+    key: &str,
+    opt: &cella_templates::types::TemplateOption,
+    variant_info: &cella_templates::tags::ImageVariantInfo,
+    cache: &TemplateCache,
+    refresh: bool,
+    progress: &Progress,
+) -> Result<(serde_json::Value, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let description = opt.description.as_deref().unwrap_or(key);
+    let proposals = opt.proposals.as_deref().unwrap_or_default();
+
+    // Build choices: proposals + (custom) + pin sentinel
+    let mut choices: Vec<String> = proposals.to_vec();
+    choices.push("(custom)".to_owned());
+    choices.push(PIN_IMAGE_SENTINEL.to_owned());
+
+    let default_str = opt.default.as_str().unwrap_or("");
+    let default_idx = choices.iter().position(|v| v == default_str).unwrap_or(0);
+
+    let selection = Select::new(description, choices)
+        .with_starting_cursor(default_idx)
+        .prompt()?;
+
+    if selection == "(custom)" {
+        let custom = Text::new(&format!("{description} (custom value):"))
+            .with_default(default_str)
+            .prompt()?;
+        return Ok((serde_json::json!(custom), None));
+    }
+
+    if selection == PIN_IMAGE_SENTINEL {
+        // Step 1: Ask which codename to filter by
+        let codename =
+            Select::new("Select variant to filter tags:", proposals.to_vec()).prompt()?;
+
+        // Step 2: Fetch tags
+        let tags_result = progress
+            .run_step_result(
+                "Fetching image tags",
+                cella_templates::tags::fetch_image_tags(&variant_info.base_image, cache, refresh),
+            )
+            .await;
+
+        match tags_result {
+            Ok(all_tags) => {
+                let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+                let mut filtered =
+                    cella_templates::tags::filter_tags_by_suffix(&tag_refs, &codename);
+                cella_templates::tags::sort_tags_descending(&mut filtered);
+                filtered.truncate(cella_templates::tags::MAX_PINNED_TAGS);
+
+                if filtered.is_empty() {
+                    eprintln!(
+                        "  {} No pinnable tags found for variant \"{codename}\"; using as-is",
+                        style::dim("(note)")
+                    );
+                    return Ok((serde_json::json!(codename), None));
+                }
+
+                let pinned_tag = Select::new(
+                    "Select image version:",
+                    filtered.iter().map(|s| (*s).to_owned()).collect(),
+                )
+                .with_page_size(15)
+                .prompt()?;
+
+                let full_image = format!("{}:{pinned_tag}", variant_info.base_image);
+                // Still set the codename as the option value for substitution of
+                // other template files that reference this option.
+                Ok((serde_json::json!(codename), Some(full_image)))
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} could not fetch image tags: {e}; using variant as-is",
+                    style::dim("(note)")
+                );
+                Ok((serde_json::json!(codename), None))
+            }
+        }
+    } else {
+        Ok((serde_json::json!(selection), None))
+    }
 }
 
 /// Prompt for which optional paths to include via multi-select.
@@ -742,6 +907,17 @@ fn prompt_optional_paths(
     Ok(excluded)
 }
 
+/// Prompt for the dev container name.
+fn prompt_container_name(
+    metadata: &TemplateMetadata,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let default_name = metadata.name.as_deref().unwrap_or(&metadata.id);
+    let name = Text::new("Dev container name:")
+        .with_default(default_name)
+        .prompt()?;
+    Ok(name)
+}
+
 /// Prompt for output format.
 fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error + Send + Sync>> {
     let choices = vec![
@@ -754,6 +930,44 @@ fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error + Se
     } else {
         Ok(OutputFormat::Jsonc)
     }
+}
+
+/// Display the configuration summary and prompt for confirmation.
+fn confirm_summary(
+    metadata: &TemplateMetadata,
+    container_name: &str,
+    pinned_image: Option<&str>,
+    template_opts: &HashMap<String, serde_json::Value>,
+    features: &[SelectedFeature],
+    format: OutputFormat,
+    config_path: &std::path::Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let opt_display: Vec<(String, String)> = template_opts
+        .iter()
+        .map(|(k, v)| {
+            let display = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), display)
+        })
+        .collect();
+
+    let template_name = metadata.name.as_deref().unwrap_or(&metadata.id);
+
+    summary::display_summary(
+        template_name,
+        container_name,
+        pinned_image,
+        &opt_display,
+        features,
+        format,
+        config_path,
+    );
+
+    Ok(Confirm::new("Write configuration files?")
+        .with_default(true)
+        .prompt()?)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -803,4 +1017,17 @@ fn resolve_selection(
         .get(selection)
         .copied()
         .ok_or_else(|| "item not found in selection".into())
+}
+
+/// Sort a slice of items by display name (case-insensitive), falling back to id.
+fn sort_by_display_name<T>(
+    items: &mut [T],
+    get_name: fn(&T) -> Option<&str>,
+    get_id: fn(&T) -> &str,
+) {
+    items.sort_by(|a, b| {
+        let a_name = get_name(a).unwrap_or_else(|| get_id(a));
+        let b_name = get_name(b).unwrap_or_else(|| get_id(b));
+        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+    });
 }

@@ -15,6 +15,7 @@ pub mod error;
 pub mod fetcher;
 pub mod index;
 pub mod options;
+pub mod tags;
 pub mod types;
 
 pub use cache::TemplateCache;

@@ -7,6 +7,8 @@ use crate::style;
 /// Display a summary of the init configuration before writing.
 pub fn display_summary(
     template_name: &str,
+    container_name: &str,
+    pinned_image: Option<&str>,
     template_options: &[(String, String)],
     features: &[SelectedFeature],
     output_format: OutputFormat,
@@ -19,6 +21,14 @@ pub fn display_summary(
         style::label("Template:"),
         style::value(template_name)
     );
+    eprintln!(
+        "  {}      {}",
+        style::label("Name:"),
+        style::value(container_name)
+    );
+    if let Some(image) = pinned_image {
+        eprintln!("  {}     {}", style::label("Image:"), style::value(image));
+    }
 
     if !template_options.is_empty() {
         for (key, value) in template_options {

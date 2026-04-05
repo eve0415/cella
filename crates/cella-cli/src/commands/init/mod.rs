@@ -68,6 +68,14 @@ pub struct InitArgs {
     #[arg(long)]
     pub refresh: bool,
 
+    /// Name for the dev container (overrides template default).
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Pin the base image to a specific tag (e.g. `4.0.6-22-trixie`).
+    #[arg(long)]
+    pub pin_image: Option<String>,
+
     /// Start dev container after generating config.
     #[arg(long)]
     pub up: bool,
