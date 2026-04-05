@@ -57,6 +57,11 @@ pub enum TemplateError {
     #[diagnostic(code(cella::templates::index_fetch_failed))]
     IndexFetchFailed { message: String },
 
+    /// Failed to fetch image tags from a registry.
+    #[error("failed to fetch tags for {image}: {message}")]
+    #[diagnostic(code(cella::templates::tag_fetch_failed))]
+    TagFetchFailed { image: String, message: String },
+
     /// Cache I/O error.
     #[error("cache error: {message}")]
     #[diagnostic(code(cella::templates::cache_error))]
