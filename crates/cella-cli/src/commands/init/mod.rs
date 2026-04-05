@@ -68,6 +68,10 @@ pub struct InitArgs {
     #[arg(long)]
     pub refresh: bool,
 
+    /// Name for the dev container (overrides template default).
+    #[arg(long)]
+    pub name: Option<String>,
+
     /// Start dev container after generating config.
     #[arg(long)]
     pub up: bool,

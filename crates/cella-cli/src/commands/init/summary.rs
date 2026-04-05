@@ -7,6 +7,7 @@ use crate::style;
 /// Display a summary of the init configuration before writing.
 pub fn display_summary(
     template_name: &str,
+    container_name: &str,
     template_options: &[(String, String)],
     features: &[SelectedFeature],
     output_format: OutputFormat,
@@ -18,6 +19,11 @@ pub fn display_summary(
         "  {}  {}",
         style::label("Template:"),
         style::value(template_name)
+    );
+    eprintln!(
+        "  {}      {}",
+        style::label("Name:"),
+        style::value(container_name)
     );
 
     if !template_options.is_empty() {

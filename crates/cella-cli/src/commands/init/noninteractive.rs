@@ -47,6 +47,10 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
     let features = parse_features(&args.feature, &args.option)?;
 
     // Apply template (include all optional paths in non-interactive mode)
+    let overrides = cella_templates::apply::ConfigOverrides {
+        name: args.name,
+        ..Default::default()
+    };
     let written_path = cella_templates::apply::apply_template(
         &metadata.id,
         &template_dir,
@@ -54,7 +58,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
         &resolved_opts,
         &features,
         args.output_format.to_template_format(),
-        &cella_templates::apply::ConfigOverrides::default(),
+        &overrides,
     )?;
 
     super::verify_generated_config(&written_path);

@@ -89,38 +89,31 @@ pub async fn run(
     // Step 4b: Optional paths
     let excluded_paths = prompt_optional_paths(&metadata)?;
 
-    // Step 5: Feature selection loop (with multi-source support)
+    // Step 5: Dev container name
+    let container_name = prompt_container_name(&metadata)?;
+
+    // Step 6: Feature selection loop (with multi-source support)
     let features = select_features(&cache, args.refresh, &progress).await?;
 
-    // Step 6: Output format
+    // Step 7: Output format
     let format = prompt_output_format()?;
 
-    // Step 7: Summary + confirm
-    let opt_display: Vec<(String, String)> = template_opts
-        .iter()
-        .map(|(k, v)| {
-            let display = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            (k.clone(), display)
-        })
-        .collect();
-
-    let template_name = metadata.name.as_deref().unwrap_or(&metadata.id);
-
-    summary::display_summary(template_name, &opt_display, &features, format, &config_path);
-
-    let confirmed = Confirm::new("Write configuration files?")
-        .with_default(true)
-        .prompt()?;
-    if !confirmed {
+    // Step 8: Summary + confirm
+    if !confirm_summary(
+        &metadata,
+        &container_name,
+        &template_opts,
+        &features,
+        format,
+        &config_path,
+    )? {
         eprintln!("Aborted.");
         return Ok(());
     }
 
-    // Step 8: Apply
+    // Step 9: Apply
     let overrides = cella_templates::apply::ConfigOverrides {
+        name: Some(container_name),
         excluded_paths,
         ..Default::default()
     };
@@ -771,6 +764,17 @@ fn prompt_optional_paths(
     Ok(excluded)
 }
 
+/// Prompt for the dev container name.
+fn prompt_container_name(
+    metadata: &TemplateMetadata,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let default_name = metadata.name.as_deref().unwrap_or(&metadata.id);
+    let name = Text::new("Dev container name:")
+        .with_default(default_name)
+        .prompt()?;
+    Ok(name)
+}
+
 /// Prompt for output format.
 fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error + Send + Sync>> {
     let choices = vec![
@@ -783,6 +787,42 @@ fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error + Se
     } else {
         Ok(OutputFormat::Jsonc)
     }
+}
+
+/// Display the configuration summary and prompt for confirmation.
+fn confirm_summary(
+    metadata: &TemplateMetadata,
+    container_name: &str,
+    template_opts: &HashMap<String, serde_json::Value>,
+    features: &[SelectedFeature],
+    format: OutputFormat,
+    config_path: &std::path::Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let opt_display: Vec<(String, String)> = template_opts
+        .iter()
+        .map(|(k, v)| {
+            let display = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), display)
+        })
+        .collect();
+
+    let template_name = metadata.name.as_deref().unwrap_or(&metadata.id);
+
+    summary::display_summary(
+        template_name,
+        container_name,
+        &opt_display,
+        features,
+        format,
+        config_path,
+    );
+
+    Ok(Confirm::new("Write configuration files?")
+        .with_default(true)
+        .prompt()?)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
