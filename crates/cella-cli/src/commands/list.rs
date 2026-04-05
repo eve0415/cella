@@ -24,7 +24,7 @@ pub struct ListArgs {
 }
 
 impl ListArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
 
         let containers = client.list_cella_containers(self.running).await?;

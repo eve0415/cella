@@ -17,7 +17,7 @@ use super::up::{UpContext, output_result};
 /// Run the Docker Compose orchestration flow.
 ///
 /// Called from `UpArgs::execute()` when the resolved config contains `dockerComposeFile`.
-pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hooks = CliComposeUpHooks { ctx: &ctx };
     let cfg = ComposeUpConfig {
         config: ctx.config(),
@@ -39,7 +39,7 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error>
             .await
             .map_err(|e| e.to_string());
     let _ = renderer.await;
-    let result = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let result = result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     let outcome = match result.outcome {
         ComposeUpOutcome::Created => "created",

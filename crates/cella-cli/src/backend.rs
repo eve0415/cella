@@ -63,10 +63,10 @@ impl BackendArgs {
     /// Returns error if backend resolution fails (see [`resolve`](Self::resolve)).
     pub async fn resolve_client(
         &self,
-    ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
+    ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
         self.resolve()
             .await
-            .map_err(|e| e as Box<dyn std::error::Error>)
+            .map_err(|e| e as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 

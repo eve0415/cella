@@ -74,7 +74,10 @@ pub struct InitArgs {
 }
 
 impl InitArgs {
-    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        progress: Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.template.is_some() {
             noninteractive::run(self).await
         } else {

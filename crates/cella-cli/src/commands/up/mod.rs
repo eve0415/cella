@@ -134,7 +134,7 @@ impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
 
         let remove_container = args.build.rebuild || args.build.remove_existing_container;
@@ -175,7 +175,7 @@ impl UpContext {
             .iter()
             .map(|s| super::build::parse_build_secret(s))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
         Ok(Self {
             resolved,
@@ -220,7 +220,7 @@ impl UpContext {
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = workspace_path
             .canonicalize()
             .unwrap_or_else(|_| workspace_path.to_path_buf());
@@ -618,7 +618,7 @@ impl UpContext {
         &self,
         build_no_cache: bool,
         strict: &[StrictnessLevel],
-    ) -> Result<UpResult, Box<dyn std::error::Error>> {
+    ) -> Result<UpResult, Box<dyn std::error::Error + Send + Sync>> {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         let hooks = CliUpHooks {
             config: self.config(),
@@ -662,7 +662,8 @@ impl UpContext {
         // queued events (final step, warnings) are flushed before exit.
         let _ = renderer.await;
 
-        let result = result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let result =
+            result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
         Ok(UpResult {
             container_id: result.container_id,
@@ -683,7 +684,7 @@ impl UpArgs {
         &self,
         branch_name: &str,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
         let worktrees = cella_git::list(&repo_info.root)?;
@@ -737,7 +738,7 @@ impl UpArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref branch_name) = self.branch {
             return self.execute_branch(branch_name, progress).await;
         }

@@ -49,7 +49,7 @@ impl UpdateArgs {
     /// # Errors
     ///
     /// Returns error on config discovery failure or network errors.
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
         let stripped = cella_jsonc::strip(&raw)?;
@@ -130,7 +130,9 @@ async fn find_update_candidates(
 }
 
 /// Print update candidates as JSON.
-fn print_candidates_json(candidates: &[UpdateCandidate]) -> Result<(), Box<dyn std::error::Error>> {
+fn print_candidates_json(
+    candidates: &[UpdateCandidate],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let json_candidates: Vec<serde_json::Value> = candidates
         .iter()
         .map(|c| {
@@ -162,7 +164,7 @@ fn display_update_table(candidates: &[UpdateCandidate]) {
 fn select_updates(
     candidates: &[UpdateCandidate],
     auto_accept: bool,
-) -> Result<Vec<UpdateCandidate>, Box<dyn std::error::Error>> {
+) -> Result<Vec<UpdateCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     if auto_accept {
         return Ok(candidates.to_vec());
     }
@@ -190,7 +192,7 @@ fn apply_updates(
     config_path: &std::path::Path,
     features: &[(String, serde_json::Value)],
     to_update: &[UpdateCandidate],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut edits: Vec<FeatureEdit> = Vec::new();
     for candidate in to_update {
         let current_opts = features

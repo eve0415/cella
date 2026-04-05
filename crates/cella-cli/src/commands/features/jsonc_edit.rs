@@ -37,7 +37,7 @@ pub enum FeatureEdit {
 pub fn apply_edits(
     source: &str,
     edits: &[FeatureEdit],
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if edits.is_empty() {
         return Ok(source.to_owned());
     }

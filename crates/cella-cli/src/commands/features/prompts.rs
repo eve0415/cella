@@ -18,7 +18,7 @@ use cella_templates::types::TemplateOption;
 pub fn prompt_single_option(
     key: &str,
     opt: &TemplateOption,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let description = opt.description.as_deref().unwrap_or(key);
 
     match opt.option_type.as_str() {
@@ -77,7 +77,7 @@ pub fn prompt_single_option(
 pub fn prompt_feature_options(
     feature_id: &str,
     meta: &serde_json::Value,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(options_obj) = meta.get("options").and_then(|o| o.as_object()) else {
         return Ok(HashMap::new());
     };

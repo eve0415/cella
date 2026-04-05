@@ -33,12 +33,13 @@ impl BranchArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
-        let repo_info = cella_git::discover(&cwd).map_err(|e| -> Box<dyn std::error::Error> {
-            format!("Not inside a git repository: {e}").into()
-        })?;
+        let repo_info =
+            cella_git::discover(&cwd).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Not inside a git repository: {e}").into()
+            })?;
         let repo_root = &repo_info.root;
 
         // 2. Create git worktree via orchestrator
@@ -50,7 +51,7 @@ impl BranchArgs {
             None,
             &sender,
         )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         drop(sender);
         let _ = renderer.await;
 
@@ -79,7 +80,7 @@ impl BranchArgs {
         wt_path: &std::path::Path,
         repo_root: &std::path::Path,
         progress: &crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Prepare worktree-specific labels
         let extra_labels = worktree_labels(&self.name, repo_root);
 

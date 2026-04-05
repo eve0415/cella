@@ -188,7 +188,10 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
-    pub async fn execute(self, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        progress: Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Up(args) => args.execute(progress).await,
             Self::Code(args) => args.execute(progress).await,
@@ -242,7 +245,7 @@ pub fn warn_if_missing_backend_label(container: &cella_backend::ContainerInfo) {
 /// Returns error if the current directory cannot be determined.
 pub fn resolve_workspace_folder(
     opt: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(wf) = opt {
         Ok(wf.canonicalize().unwrap_or_else(|_| wf.to_path_buf()))
     } else {
@@ -262,7 +265,7 @@ pub async fn resolve_service_container(
     client: &dyn cella_backend::ContainerBackend,
     container: cella_backend::ContainerInfo,
     service: Option<&str>,
-) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error>> {
+) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error + Send + Sync>> {
     let Some(svc) = service else {
         return Ok(container);
     };
@@ -437,7 +440,7 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
 /// Re-register all running cella containers with the daemon.
 async fn re_register_containers(
     socket_path: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use cella_protocol::ManagementRequest;
 
     let client = crate::backend::BackendArgs::default()

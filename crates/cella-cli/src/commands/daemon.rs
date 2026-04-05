@@ -34,7 +34,7 @@ struct StartArgs {
 }
 
 impl DaemonArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             DaemonCommand::Start(args) => run_start(args).await,
             DaemonCommand::Stop => run_stop(),
@@ -43,7 +43,7 @@ impl DaemonArgs {
     }
 }
 
-async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
     cella_daemon::logging::init_daemon_logging(&data_dir.join("daemon.log"));
 
@@ -56,7 +56,7 @@ async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
+fn run_stop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
     let pid_path = data_dir.join("daemon.pid");
     let socket_path = data_dir.join("daemon.sock");
@@ -65,7 +65,7 @@ fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_status() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = cella_data_dir().ok_or("cannot determine data dir: HOME not set")?;
     let pid_path = data_dir.join("daemon.pid");
     let socket_path = data_dir.join("daemon.sock");

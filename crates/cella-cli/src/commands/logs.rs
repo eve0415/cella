@@ -36,7 +36,7 @@ pub struct LogsArgs {
 }
 
 impl LogsArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.daemon {
             return self.show_daemon_logs();
         }
@@ -46,7 +46,7 @@ impl LogsArgs {
         self.show_container_logs().await
     }
 
-    async fn show_container_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn show_container_logs(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
 
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
@@ -74,7 +74,7 @@ impl LogsArgs {
             compose_cmd
                 .logs(self.follow, self.tail, services.as_deref())
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("docker compose logs failed: {e}").into()
                 })?;
             return Ok(());
@@ -111,7 +111,7 @@ impl LogsArgs {
         Ok(())
     }
 
-    fn show_daemon_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn show_daemon_logs(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(data_dir) = cella_env::paths::cella_data_dir() else {
             return Err("Cannot determine cella data directory".into());
         };
@@ -130,7 +130,7 @@ impl LogsArgs {
         Ok(())
     }
 
-    fn show_lifecycle_logs(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn show_lifecycle_logs(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = self; // tail unused for lifecycle logs
         let Some(data_dir) = cella_env::paths::cella_data_dir() else {
             return Err("Cannot determine cella data directory".into());

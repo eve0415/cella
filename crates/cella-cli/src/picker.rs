@@ -189,7 +189,7 @@ pub fn resolve_worktree_interactive<S: std::hash::BuildHasher>(
     container_states: &HashMap<String, ContainerState, S>,
     name: Option<&str>,
     exclude_branch: Option<&str>,
-) -> Result<WorktreeInfo, Box<dyn std::error::Error>> {
+) -> Result<WorktreeInfo, Box<dyn std::error::Error + Send + Sync>> {
     // Try exact match first
     if let Some(name) = name
         && let Some(wt) = worktrees
@@ -266,7 +266,7 @@ pub fn resolve_container_interactive(
     exclude_name: Option<&str>,
     prompt: &str,
     initial_filter: Option<&str>,
-) -> Result<ContainerInfo, Box<dyn std::error::Error>> {
+) -> Result<ContainerInfo, Box<dyn std::error::Error + Send + Sync>> {
     let items = container_picker_items(containers, exclude_name);
 
     if items.is_empty() {
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn picker_error_is_std_error() {
-        let err: Box<dyn std::error::Error> = Box::new(PickerError::NoCandidates);
+        let err: Box<dyn std::error::Error + Send + Sync> = Box::new(PickerError::NoCandidates);
         assert_eq!(err.to_string(), "no candidates available");
     }
 

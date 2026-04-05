@@ -57,7 +57,7 @@ pub struct ExecArgs {
 }
 
 impl ExecArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
 
         let target = ContainerTarget {

@@ -49,7 +49,7 @@ impl EditArgs {
     /// # Errors
     ///
     /// Returns error on config discovery failure, parse errors, or I/O errors.
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.is_non_interactive() {
             self.run_non_interactive()
         } else {
@@ -57,7 +57,7 @@ impl EditArgs {
         }
     }
 
-    fn run_non_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_non_interactive(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
         let stripped = cella_jsonc::strip(&raw)?;
@@ -108,7 +108,7 @@ impl EditArgs {
         Ok(())
     }
 
-    async fn run_interactive(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run_interactive(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
         let stripped = cella_jsonc::strip(&raw)?;
@@ -196,7 +196,7 @@ async fn handle_add_feature(
     edits: &mut Vec<FeatureEdit>,
     cache: &TemplateCache,
     registry: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some((feature, opts)) = prompt_add_feature(cache, registry).await? {
         current_features.push((feature.reference.clone(), options_to_json(&feature.options)));
         edits.push(FeatureEdit::Add {
@@ -211,7 +211,7 @@ async fn handle_add_feature(
 fn handle_remove_feature(
     current_features: &mut Vec<(String, serde_json::Value)>,
     edits: &mut Vec<FeatureEdit>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if current_features.is_empty() {
         eprintln!("No features to remove.");
         return Ok(());
@@ -230,7 +230,7 @@ async fn handle_edit_options(
     current_features: &mut [(String, serde_json::Value)],
     edits: &mut Vec<FeatureEdit>,
     cache: &TemplateCache,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if current_features.is_empty() {
         eprintln!("No features to edit.");
         return Ok(());
@@ -260,8 +260,10 @@ async fn handle_edit_options(
 async fn prompt_add_feature(
     cache: &TemplateCache,
     registry: Option<&str>,
-) -> Result<Option<(SelectedFeature, HashMap<String, serde_json::Value>)>, Box<dyn std::error::Error>>
-{
+) -> Result<
+    Option<(SelectedFeature, HashMap<String, serde_json::Value>)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let reg = registry.unwrap_or(DEFAULT_FEATURE_COLLECTION);
     let collection = collection::fetch_feature_collection(reg, cache, false).await?;
 
@@ -339,7 +341,7 @@ async fn prompt_edit_options(
     reference: &str,
     current_options: &serde_json::Value,
     cache: &TemplateCache,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     // Try to fetch metadata for proper option types
     if let Ok(feature_dir) = fetcher::fetch_template(reference, cache).await
         && let Ok(content) = std::fs::read_to_string(feature_dir.join("devcontainer-feature.json"))
@@ -384,7 +386,7 @@ async fn prompt_edit_options(
 /// Parse a `--set-option` flag value: `REF=KEY=VALUE`.
 fn parse_set_option_flag(
     s: &str,
-) -> Result<(String, String, serde_json::Value), Box<dyn std::error::Error>> {
+) -> Result<(String, String, serde_json::Value), Box<dyn std::error::Error + Send + Sync>> {
     let (ref_id, rest) = s
         .split_once('=')
         .ok_or_else(|| format!("invalid --set-option format: {s:?} (expected REF=KEY=VALUE)"))?;
