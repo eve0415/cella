@@ -167,6 +167,10 @@ impl TemplateCache {
     }
 
     /// Write a feature collection index to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::CacheError`] if the write fails.
     pub fn put_feature_collection(
         &self,
         registry: &str,
@@ -383,5 +387,106 @@ mod tests {
             "first"
         );
         assert!(!staging.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature collection cache: miss, hit, expiry, empty
+    // -----------------------------------------------------------------------
+
+    fn sample_feature_collection() -> FeatureCollectionIndex {
+        serde_json::from_str(
+            r#"{
+            "features": [
+                { "id": "node", "version": "1.5.0", "name": "Node.js" },
+                { "id": "python", "version": "2.0.0", "name": "Python" }
+            ]
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn feature_collection_cache_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        assert!(cache.get_feature_collection("ghcr.io/features").is_none());
+    }
+
+    #[test]
+    fn feature_collection_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index = sample_feature_collection();
+
+        cache
+            .put_feature_collection("ghcr.io/features", &index)
+            .unwrap();
+        let (cached, _) = cache.get_feature_collection("ghcr.io/features").unwrap();
+        assert_eq!(cached.features.len(), 2);
+        assert_eq!(cached.features[0].id, "node");
+        assert_eq!(cached.features[1].id, "python");
+    }
+
+    #[test]
+    fn feature_collection_stale_cache_returns_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index = sample_feature_collection();
+
+        cache
+            .put_feature_collection("ghcr.io/features", &index)
+            .unwrap();
+
+        // Backdate to simulate expiry
+        let path = cache.collection_path("ghcr.io/features");
+        let old_time = filetime::FileTime::from_unix_time(0, 0);
+        filetime::set_file_mtime(&path, old_time).unwrap();
+
+        // Fresh cache should miss
+        assert!(cache.get_feature_collection("ghcr.io/features").is_none());
+
+        // Stale cache should still hit
+        let (stale, _) = cache
+            .get_feature_collection_stale("ghcr.io/features")
+            .unwrap();
+        assert_eq!(stale.features.len(), 2);
+        assert_eq!(stale.features[0].id, "node");
+    }
+
+    #[test]
+    fn feature_collection_empty_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index: FeatureCollectionIndex = serde_json::from_str(r#"{ "features": [] }"#).unwrap();
+
+        cache
+            .put_feature_collection("ghcr.io/empty", &index)
+            .unwrap();
+        let (cached, _) = cache.get_feature_collection("ghcr.io/empty").unwrap();
+        assert!(cached.features.is_empty());
+    }
+
+    #[test]
+    fn template_cache_unaffected_by_feature_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+
+        // Write both types
+        cache
+            .put_collection("ghcr.io/templates", &sample_collection())
+            .unwrap();
+        cache
+            .put_feature_collection("ghcr.io/features", &sample_feature_collection())
+            .unwrap();
+
+        // Template cache still works
+        let (tc, _) = cache.get_collection("ghcr.io/templates").unwrap();
+        assert_eq!(tc.templates.len(), 1);
+        assert_eq!(tc.templates[0].id, "rust");
+
+        // Feature cache still works
+        let (fc, _) = cache.get_feature_collection("ghcr.io/features").unwrap();
+        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.features[0].id, "node");
     }
 }

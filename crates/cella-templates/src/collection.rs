@@ -219,6 +219,43 @@ mod tests {
         assert!(matches!(err, TemplateError::CollectionFetchFailed { .. }));
     }
 
+    #[test]
+    fn feature_collection_cache_roundtrip_preserves_features() {
+        // Regression test: previously, caching a FeatureCollectionIndex through
+        // TemplateCollectionIndex-typed methods silently dropped the features array.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+
+        let json = r#"{
+            "features": [
+                { "id": "node", "version": "1.5.0", "name": "Node.js", "description": "Installs Node.js" },
+                { "id": "python", "version": "2.0.0", "name": "Python", "description": "Installs Python" },
+                { "id": "rust", "version": "1.0.0", "name": "Rust", "description": "Installs Rust" }
+            ],
+            "sourceInformation": { "name": "Official Features" }
+        }"#;
+        let index: FeatureCollectionIndex = serde_json::from_str(json).unwrap();
+
+        // Write to cache
+        cache
+            .put_feature_collection("ghcr.io/devcontainers/features", &index)
+            .unwrap();
+
+        // Read back — this is the exact code path that was broken
+        let (cached, _) = cache
+            .get_feature_collection("ghcr.io/devcontainers/features")
+            .unwrap();
+
+        assert_eq!(
+            cached.features.len(),
+            3,
+            "all features must survive cache round-trip"
+        );
+        assert_eq!(cached.features[0].id, "node");
+        assert_eq!(cached.features[1].id, "python");
+        assert_eq!(cached.features[2].id, "rust");
+    }
+
     #[tokio::test]
     #[cfg(feature = "integration-tests")]
     async fn fetch_official_template_collection() {
