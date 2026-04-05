@@ -129,12 +129,22 @@ impl TemplateCache {
     // Feature collection index cache
     // -----------------------------------------------------------------------
 
+    /// Compute the cache file path for a feature collection index.
+    ///
+    /// Uses a `feature::` prefix before hashing to avoid collisions with
+    /// template collection entries that share the same registry string.
+    fn feature_collection_path(&self, registry: &str) -> PathBuf {
+        let prefixed = format!("feature::{registry}");
+        let hash = hex::encode(&Sha256::digest(prefixed.as_bytes())[..8]);
+        self.root.join("collections").join(format!("{hash}.json"))
+    }
+
     /// Get a cached feature collection index if it exists and is fresh (< 24h old).
     pub fn get_feature_collection(
         &self,
         registry: &str,
     ) -> Option<(FeatureCollectionIndex, SystemTime)> {
-        let path = self.collection_path(registry);
+        let path = self.feature_collection_path(registry);
         let metadata = std::fs::metadata(&path).ok()?;
         let modified = metadata.modified().ok()?;
 
@@ -157,7 +167,7 @@ impl TemplateCache {
         &self,
         registry: &str,
     ) -> Option<(FeatureCollectionIndex, SystemTime)> {
-        let path = self.collection_path(registry);
+        let path = self.feature_collection_path(registry);
         let metadata = std::fs::metadata(&path).ok()?;
         let modified = metadata.modified().ok()?;
         let content = std::fs::read_to_string(&path).ok()?;
@@ -176,7 +186,7 @@ impl TemplateCache {
         registry: &str,
         index: &FeatureCollectionIndex,
     ) -> Result<(), TemplateError> {
-        let path = self.collection_path(registry);
+        let path = self.feature_collection_path(registry);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| TemplateError::CacheError {
                 message: format!("failed to create cache directory: {e}"),
@@ -438,7 +448,7 @@ mod tests {
             .unwrap();
 
         // Backdate to simulate expiry
-        let path = cache.collection_path("ghcr.io/features");
+        let path = cache.feature_collection_path("ghcr.io/features");
         let old_time = filetime::FileTime::from_unix_time(0, 0);
         filetime::set_file_mtime(&path, old_time).unwrap();
 
