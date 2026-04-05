@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::TemplateCollectionIndex;
 use crate::error::TemplateError;
+use crate::{FeatureCollectionIndex, TemplateCollectionIndex};
 
 /// How long a cached collection index is considered fresh.
 const COLLECTION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -123,6 +123,72 @@ impl TemplateCache {
     fn collection_path(&self, registry: &str) -> PathBuf {
         let hash = hex::encode(&Sha256::digest(registry.as_bytes())[..8]);
         self.root.join("collections").join(format!("{hash}.json"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature collection index cache
+    // -----------------------------------------------------------------------
+
+    /// Get a cached feature collection index if it exists and is fresh (< 24h old).
+    pub fn get_feature_collection(
+        &self,
+        registry: &str,
+    ) -> Option<(FeatureCollectionIndex, SystemTime)> {
+        let path = self.collection_path(registry);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age > COLLECTION_TTL {
+            debug!("feature collection cache expired for {registry} (age: {age:?})");
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let index: FeatureCollectionIndex = serde_json::from_str(&content).ok()?;
+        debug!("feature collection cache hit for {registry}");
+        Some((index, modified))
+    }
+
+    /// Get a cached feature collection index even if expired (for offline fallback).
+    pub fn get_feature_collection_stale(
+        &self,
+        registry: &str,
+    ) -> Option<(FeatureCollectionIndex, SystemTime)> {
+        let path = self.collection_path(registry);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let index: FeatureCollectionIndex = serde_json::from_str(&content).ok()?;
+        debug!("feature collection stale cache hit for {registry}");
+        Some((index, modified))
+    }
+
+    /// Write a feature collection index to the cache.
+    pub fn put_feature_collection(
+        &self,
+        registry: &str,
+        index: &FeatureCollectionIndex,
+    ) -> Result<(), TemplateError> {
+        let path = self.collection_path(registry);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| TemplateError::CacheError {
+                message: format!("failed to create cache directory: {e}"),
+            })?;
+        }
+        let json = serde_json::to_string(index).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to serialize feature collection index: {e}"),
+        })?;
+        std::fs::write(&path, json).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to write feature collection cache: {e}"),
+        })?;
+        debug!(
+            "cached feature collection index for {registry} at {}",
+            path.display()
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
