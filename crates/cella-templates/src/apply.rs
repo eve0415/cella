@@ -82,6 +82,34 @@ pub fn merge_features(config: &mut serde_json::Value, features: &[SelectedFeatur
 }
 
 // ---------------------------------------------------------------------------
+// Config overrides
+// ---------------------------------------------------------------------------
+
+/// User customizations applied on top of the template during generation.
+#[derive(Debug, Default)]
+pub struct ConfigOverrides {
+    /// Custom name for the dev container (overrides template's name).
+    pub name: Option<String>,
+    /// Full pinned image reference (replaces entire `"image"` field value).
+    pub pinned_image: Option<String>,
+    /// Template paths to exclude from the output.
+    pub excluded_paths: Vec<String>,
+}
+
+/// Apply user-specified overrides to the parsed config.
+pub fn apply_overrides(config: &mut serde_json::Value, overrides: &ConfigOverrides) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    if let Some(name) = &overrides.name {
+        obj.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+    }
+    if let Some(image) = &overrides.pinned_image {
+        obj.insert("image".to_owned(), serde_json::Value::String(image.clone()));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JSONC generation
 // ---------------------------------------------------------------------------
 
@@ -197,7 +225,7 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     options: &HashMap<String, serde_json::Value, S>,
     features: &[SelectedFeature],
     format: OutputFormat,
-    excluded_paths: &[String],
+    overrides: &ConfigOverrides,
 ) -> Result<std::path::PathBuf, TemplateError> {
     let devcontainer_dir = output_dir.join(".devcontainer");
     std::fs::create_dir_all(&devcontainer_dir)?;
@@ -212,7 +240,8 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     };
 
     // Compile exclude patterns
-    let compiled_excludes: Vec<glob::Pattern> = excluded_paths
+    let compiled_excludes: Vec<glob::Pattern> = overrides
+        .excluded_paths
         .iter()
         .filter_map(|p| glob::Pattern::new(p).ok())
         .collect();
@@ -242,6 +271,7 @@ pub fn apply_template<S: std::hash::BuildHasher>(
             }
         })?;
 
+        apply_overrides(&mut config, overrides);
         merge_features(&mut config, features);
 
         let formatted = format_config(&config, format);
@@ -494,7 +524,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -529,7 +559,7 @@ mod tests {
             &HashMap::new(),
             &features,
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -567,7 +597,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -601,7 +631,10 @@ mod tests {
             &HashMap::new(),
             &[],
             OutputFormat::Json,
-            &[".github/*".to_owned()],
+            &ConfigOverrides {
+                excluded_paths: vec![".github/*".to_owned()],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -648,7 +681,7 @@ mod tests {
             &HashMap::new(),
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -677,7 +710,7 @@ mod tests {
             &HashMap::new(),
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -706,7 +739,7 @@ mod tests {
             &HashMap::new(),
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -740,7 +773,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -773,7 +806,7 @@ mod tests {
             &options,
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -804,7 +837,7 @@ mod tests {
             &HashMap::new(),
             &[],
             OutputFormat::Json,
-            &[],
+            &ConfigOverrides::default(),
         )
         .unwrap();
 
@@ -845,5 +878,69 @@ mod tests {
 
         // devcontainer.json should NOT be copied by copy_and_substitute
         assert!(!dest_dc.join("devcontainer.json").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_overrides
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_overrides_sets_name() {
+        let mut config = serde_json::json!({"name": "Template Name", "image": "ubuntu"});
+        let overrides = ConfigOverrides {
+            name: Some("My Project".to_owned()),
+            pinned_image: None,
+            ..Default::default()
+        };
+        apply_overrides(&mut config, &overrides);
+        assert_eq!(config["name"], "My Project");
+    }
+
+    #[test]
+    fn apply_overrides_sets_pinned_image() {
+        let mut config = serde_json::json!({"name": "Test", "image": "mcr.microsoft.com/devcontainers/rust:1-trixie"});
+        let overrides = ConfigOverrides {
+            name: None,
+            pinned_image: Some("mcr.microsoft.com/devcontainers/rust:1.87-trixie".to_owned()),
+            ..Default::default()
+        };
+        apply_overrides(&mut config, &overrides);
+        assert_eq!(
+            config["image"],
+            "mcr.microsoft.com/devcontainers/rust:1.87-trixie"
+        );
+    }
+
+    #[test]
+    fn apply_overrides_both() {
+        let mut config = serde_json::json!({"name": "Old", "image": "old:tag"});
+        let overrides = ConfigOverrides {
+            name: Some("New".to_owned()),
+            pinned_image: Some("new:pinned".to_owned()),
+            ..Default::default()
+        };
+        apply_overrides(&mut config, &overrides);
+        assert_eq!(config["name"], "New");
+        assert_eq!(config["image"], "new:pinned");
+    }
+
+    #[test]
+    fn apply_overrides_noop_when_empty() {
+        let mut config = serde_json::json!({"name": "Test", "image": "ubuntu"});
+        let original = config.clone();
+        apply_overrides(&mut config, &ConfigOverrides::default());
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn apply_overrides_inserts_name_when_missing() {
+        let mut config = serde_json::json!({"image": "ubuntu"});
+        let overrides = ConfigOverrides {
+            name: Some("Added Name".to_owned()),
+            pinned_image: None,
+            ..Default::default()
+        };
+        apply_overrides(&mut config, &overrides);
+        assert_eq!(config["name"], "Added Name");
     }
 }

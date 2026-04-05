@@ -54,7 +54,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send 
         &resolved_opts,
         &features,
         args.output_format.to_template_format(),
-        &[],
+        &cella_templates::apply::ConfigOverrides::default(),
     )?;
 
     super::verify_generated_config(&written_path);

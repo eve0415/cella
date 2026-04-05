@@ -120,6 +120,10 @@ pub async fn run(
     }
 
     // Step 8: Apply
+    let overrides = cella_templates::apply::ConfigOverrides {
+        excluded_paths,
+        ..Default::default()
+    };
     let written_path = cella_templates::apply::apply_template(
         &metadata.id,
         &template_dir,
@@ -127,7 +131,7 @@ pub async fn run(
         &template_opts,
         &features,
         format,
-        &excluded_paths,
+        &overrides,
     )?;
 
     // Step 9: Verify the generated config is parseable
