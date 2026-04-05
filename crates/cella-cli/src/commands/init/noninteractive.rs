@@ -17,7 +17,7 @@ use super::InitArgs;
 /// # Errors
 ///
 /// Returns errors for invalid flags, network failures, or I/O errors.
-pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let template_ref = args
         .template
         .as_deref()
@@ -67,7 +67,7 @@ pub async fn run(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Parse `KEY=VALUE` pairs from CLI flag values.
 fn parse_key_value_pairs(
     pairs: &[String],
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     let mut map = HashMap::new();
     for pair in pairs {
         let (key, value) = pair
@@ -84,7 +84,7 @@ fn parse_key_value_pairs(
 fn parse_features(
     feature_refs: &[String],
     option_flags: &[String],
-) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error>> {
+) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error + Send + Sync>> {
     // Group options by feature ID
     let mut feature_options: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
     for opt in option_flags {

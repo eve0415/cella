@@ -26,7 +26,7 @@ pub struct ReadConfigurationArgs {
 }
 
 impl ReadConfigurationArgs {
-    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         let resolved = resolve::config(&cwd, self.config.as_deref())?;

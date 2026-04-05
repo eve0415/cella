@@ -53,7 +53,7 @@ impl CodeArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Check for remote Docker (unsupported)
         check_local_docker()?;
 
@@ -187,7 +187,7 @@ fn build_vscode_uri(container_id: &str, workspace_folder: &str) -> String {
 fn resolve_editor_binary(
     editor: &EditorChoice,
     binary: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let name = if let Some(b) = binary {
         // If it contains a path separator, treat as path
         if b.contains('/') {
@@ -210,7 +210,7 @@ fn resolve_editor_binary(
 }
 
 /// Look up a binary name in PATH.
-fn which_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn which_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(name);
@@ -257,7 +257,7 @@ fn editor_install_hint(editor: &Path) -> String {
 }
 
 /// Check that Docker is local (not a remote host via SSH or TCP).
-fn check_local_docker() -> Result<(), Box<dyn std::error::Error>> {
+fn check_local_docker() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let docker_host = std::env::var("DOCKER_HOST").ok();
     if let Some(ref host) = docker_host {
         if host.starts_with("ssh://") {

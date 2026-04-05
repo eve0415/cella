@@ -43,7 +43,7 @@ pub struct FeaturesLayerContext<'a> {
 /// Returns an error if the Docker build fails or the build context is invalid.
 pub async fn build_features_layer(
     ctx: &FeaturesLayerContext<'_>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let features_digest = compute_features_digest(ctx.config);
     let features_image =
         image_name_with_features(ctx.workspace_root, ctx.config_name, &features_digest);
@@ -124,7 +124,10 @@ pub struct EnsureImageInput<'a> {
 /// Returns an error if the image pull/build or feature resolution fails.
 pub async fn ensure_image(
     input: &EnsureImageInput<'_>,
-) -> Result<(String, Option<ResolvedFeatures>, ImageDetails), Box<dyn std::error::Error>> {
+) -> Result<
+    (String, Option<ResolvedFeatures>, ImageDetails),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let has_features = input
         .config
         .get("features")
@@ -165,7 +168,7 @@ pub async fn ensure_image(
 async fn resolve_base_image(
     input: &EnsureImageInput<'_>,
     will_build_features: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let force_pull = input.pull_policy == Some("always");
     let never_pull = input.pull_policy == Some("never");
     if let Some(image) = input.config.get("image").and_then(|v| v.as_str()) {
@@ -242,7 +245,7 @@ struct FeaturesBuildInput<'a> {
 /// Resolve features and build the features layer image.
 async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
-) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error>> {
+) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error + Send + Sync>> {
     info!("Resolving devcontainer features...");
     let backend_platform = input
         .client

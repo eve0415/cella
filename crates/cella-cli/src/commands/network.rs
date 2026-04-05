@@ -22,7 +22,7 @@ enum NetworkCommand {
 }
 
 impl NetworkArgs {
-    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             NetworkCommand::Status => execute_status(),
             NetworkCommand::Test { url } => execute_test(&url),
@@ -34,7 +34,7 @@ impl NetworkArgs {
     }
 }
 
-fn execute_status() -> Result<(), Box<dyn std::error::Error>> {
+fn execute_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_root = std::env::current_dir()?;
     let settings = cella_config::settings::Settings::load(&workspace_root);
     let net_config = settings.network.to_network_config();
@@ -96,7 +96,7 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_root = std::env::current_dir()?;
     let settings = cella_config::settings::Settings::load(&workspace_root);
     let net_config = settings.network.to_network_config();

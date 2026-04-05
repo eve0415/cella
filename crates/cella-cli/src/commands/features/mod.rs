@@ -31,7 +31,10 @@ pub enum FeaturesCommand {
 }
 
 impl FeaturesArgs {
-    pub async fn execute(self, _progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(
+        self,
+        _progress: Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             FeaturesCommand::Edit(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,

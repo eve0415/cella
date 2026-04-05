@@ -56,17 +56,15 @@ impl BackendArgs {
         resolve_backend(self.backend.as_ref(), self.docker_host.as_deref()).await
     }
 
-    /// Convenience wrapper that coerces the error to `Box<dyn Error>`.
+    /// Convenience wrapper around [`resolve`](Self::resolve).
     ///
     /// # Errors
     ///
     /// Returns error if backend resolution fails (see [`resolve`](Self::resolve)).
     pub async fn resolve_client(
         &self,
-    ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error>> {
-        self.resolve()
-            .await
-            .map_err(|e| e as Box<dyn std::error::Error>)
+    ) -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
+        self.resolve().await
     }
 }
 

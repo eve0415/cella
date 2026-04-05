@@ -14,7 +14,7 @@ pub struct PortsArgs {
 }
 
 impl PortsArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Try querying the daemon first for dynamic port info — only when
         // the selected backend uses daemon-managed port forwarding and no
         // custom Docker host is specified (daemon tracks local containers only).
@@ -106,7 +106,7 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
 async fn print_backend_ports(
     all: bool,
     backend_args: &crate::backend::BackendArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = backend_args.resolve_client().await?;
     let containers = client.list_cella_containers(true).await?;
 

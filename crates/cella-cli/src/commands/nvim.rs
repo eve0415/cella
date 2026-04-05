@@ -35,7 +35,7 @@ impl NvimArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Ensure container is up
         let build_no_cache = self.up.build.build_no_cache;
         let strict = self.up.strict.clone();
@@ -149,7 +149,7 @@ async fn ensure_nvim(
     ctx: &UpContext,
     container_id: &str,
     remote_user: &str,
-) -> Result<NvimInfo, Box<dyn std::error::Error>> {
+) -> Result<NvimInfo, Box<dyn std::error::Error + Send + Sync>> {
     // Check if nvim is already installed
     let check = ctx
         .client
@@ -230,7 +230,7 @@ async fn install_nvim(
     ctx: &UpContext,
     container_id: &str,
     remote_user: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Detect architecture
     let arch_result = ctx
         .client

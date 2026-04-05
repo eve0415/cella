@@ -33,7 +33,7 @@ impl ListArgs {
     /// # Errors
     ///
     /// Returns error on config discovery failure or network errors.
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.available {
             self.list_available().await
         } else {
@@ -41,7 +41,7 @@ impl ListArgs {
         }
     }
 
-    async fn list_configured(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn list_configured(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config_path = resolve::discover_config(&self.common)?;
         let raw = resolve::read_raw_config(&config_path)?;
 
@@ -94,7 +94,7 @@ impl ListArgs {
         Ok(())
     }
 
-    async fn list_available(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn list_available(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let registry = self
             .common
             .registry

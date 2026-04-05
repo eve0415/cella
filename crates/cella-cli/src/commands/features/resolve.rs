@@ -29,7 +29,9 @@ pub struct CommonFeatureFlags {
 /// # Errors
 ///
 /// Returns error with an init suggestion when no config is found.
-pub fn discover_config(flags: &CommonFeatureFlags) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn discover_config(
+    flags: &CommonFeatureFlags,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let workspace = crate::commands::resolve_workspace_folder(flags.workspace_folder.as_deref())?;
 
     if let Some(file) = &flags.file {
@@ -47,7 +49,7 @@ pub fn discover_config(flags: &CommonFeatureFlags) -> Result<PathBuf, Box<dyn st
         if matches!(e, cella_config::devcontainer::discover::Error::NotFound) {
             format!("{e}\nhint: run 'cella init' to create a devcontainer configuration").into()
         } else {
-            Box::new(e) as Box<dyn std::error::Error>
+            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
         }
     })
 }
@@ -57,7 +59,7 @@ pub fn discover_config(flags: &CommonFeatureFlags) -> Result<PathBuf, Box<dyn st
 /// # Errors
 ///
 /// Returns I/O error.
-pub fn read_raw_config(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+pub fn read_raw_config(path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     Ok(std::fs::read_to_string(path)?)
 }
 

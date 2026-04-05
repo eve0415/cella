@@ -61,7 +61,7 @@ pub async fn resolve_compose_features(
     config_path: &Path,
     project: &ComposeProject,
     progress: &ProgressSender,
-) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error>> {
+) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error + Send + Sync>> {
     // 1. Check if features are present
     if !has_features(config) {
         return Ok(None);
@@ -183,7 +183,7 @@ fn write_combined_dockerfile(
     original_dockerfile: &str,
     features_dockerfile: &str,
     stage_name: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let combined = cella_compose::generate_combined_dockerfile(
         original_dockerfile,
         features_dockerfile,
@@ -209,7 +209,7 @@ fn assemble_features_build(
     combined_dockerfile: PathBuf,
     resolved: ResolvedFeatures,
     image_user: String,
-) -> Result<ComposeFeaturesBuild, Box<dyn std::error::Error>> {
+) -> Result<ComposeFeaturesBuild, Box<dyn std::error::Error + Send + Sync>> {
     let mut additional_contexts = BTreeMap::new();
     additional_contexts.insert(
         cella_features::FEATURE_CONTENT_SOURCE.to_string(),

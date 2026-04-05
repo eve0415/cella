@@ -3,8 +3,6 @@
 //! Guides the user through template selection, option configuration,
 //! feature selection, and config generation using inquire prompts.
 //!
-//! The wizard runs on a single thread (user interaction), so futures
-//! do not need to be `Send`.
 
 use std::collections::HashMap;
 
@@ -44,8 +42,10 @@ const BACK_TO_FEATURE_SOURCE_LIST: &str = "\u{2190} Back to feature source list"
 /// # Errors
 ///
 /// Returns errors for network failures, user cancellation, or I/O errors.
-#[allow(clippy::future_not_send)]
-pub async fn run(args: InitArgs, progress: Progress) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    args: InitArgs,
+    progress: Progress,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
     let config_path = workspace.join(".devcontainer").join("devcontainer.json");
     let cache = TemplateCache::new();
@@ -171,7 +171,7 @@ pub async fn run(args: InitArgs, progress: Progress) -> Result<(), Box<dyn std::
 
 /// Launch `cella up`, replacing the current process on Unix.
 #[expect(clippy::needless_return)]
-fn exec_cella_up() -> Result<(), Box<dyn std::error::Error>> {
+fn exec_cella_up() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = std::process::Command::new("cella");
     cmd.arg("up");
 
@@ -200,17 +200,14 @@ fn exec_cella_up() -> Result<(), Box<dyn std::error::Error>> {
 type ResolvedTemplate = (String, std::path::PathBuf, Box<TemplateMetadata>);
 
 /// Select a template through the multi-level navigation flow.
-#[allow(clippy::future_not_send)]
 async fn select_template(
     official_templates: &[TemplateSummary],
     collection_ref: &str,
     cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
-) -> Result<ResolvedTemplate, Box<dyn std::error::Error>> {
+) -> Result<ResolvedTemplate, Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        // Bind the choice before any await to avoid holding non-Send
-        // Box<dyn Error> across await points.
         let choice = prompt_official_templates(official_templates)?;
         match choice {
             TemplateChoice::Selected(summary) => {
@@ -248,7 +245,7 @@ enum TemplateChoice {
 /// Show the official template list with sentinel options.
 fn prompt_official_templates(
     templates: &[TemplateSummary],
-) -> Result<TemplateChoice, Box<dyn std::error::Error>> {
+) -> Result<TemplateChoice, Box<dyn std::error::Error + Send + Sync>> {
     let entries = templates
         .iter()
         .map(|t| format_entry(t.name.as_deref().unwrap_or(&t.id), t.description.as_deref()));
@@ -281,7 +278,7 @@ async fn browse_all_template_sources(
     cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
-) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error>> {
+) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error + Send + Sync>> {
     let index = progress
         .run_step_result(
             "Fetching template index",
@@ -307,7 +304,7 @@ async fn browse_custom_registry(
     cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
-) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error>> {
+) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error + Send + Sync>> {
     let registry = Text::new("Enter registry (e.g. ghcr.io/myorg/templates):").prompt()?;
     let custom_collection = progress
         .run_step_result(
@@ -369,7 +366,7 @@ enum CollectionPick {
 fn prompt_collection_picker(
     index: &DevcontainerIndex,
     kind: CollectionKind,
-) -> Result<CollectionPick, Box<dyn std::error::Error>> {
+) -> Result<CollectionPick, Box<dyn std::error::Error + Send + Sync>> {
     let back_label = match kind {
         CollectionKind::Templates => BACK_TO_OFFICIAL,
         CollectionKind::Features => BACK_TO_OFFICIAL_FEATURES,
@@ -444,7 +441,7 @@ async fn prompt_index_templates(
     collection: &IndexCollection,
     cache: &TemplateCache,
     progress: &Progress,
-) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error>> {
+) -> Result<Option<ResolvedTemplate>, Box<dyn std::error::Error + Send + Sync>> {
     let source_name = collection
         .source_information
         .name
@@ -488,12 +485,11 @@ async fn prompt_index_templates(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Feature selection loop with multi-source support.
-#[allow(clippy::future_not_send)]
 async fn select_features(
     cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
-) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error>> {
+) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error + Send + Sync>> {
     let feature_collection = progress
         .run_step_result(
             "Fetching features",
@@ -537,7 +533,7 @@ enum FeatureChoice {
 
 fn prompt_feature_list(
     available: &[FeatureSummary],
-) -> Result<FeatureChoice, Box<dyn std::error::Error>> {
+) -> Result<FeatureChoice, Box<dyn std::error::Error + Send + Sync>> {
     let entries = available
         .iter()
         .map(|f| format_entry(f.name.as_deref().unwrap_or(&f.id), f.description.as_deref()));
@@ -568,7 +564,7 @@ async fn configure_official_feature(
     feature_summary: &FeatureSummary,
     cache: &TemplateCache,
     progress: &Progress,
-) -> Result<SelectedFeature, Box<dyn std::error::Error>> {
+) -> Result<SelectedFeature, Box<dyn std::error::Error + Send + Sync>> {
     let feature_ref = format!(
         "{DEFAULT_FEATURE_COLLECTION}/{}:{}",
         feature_summary.id, feature_summary.version
@@ -599,7 +595,7 @@ async fn browse_all_feature_sources(
     cache: &TemplateCache,
     refresh: bool,
     progress: &Progress,
-) -> Result<Option<SelectedFeature>, Box<dyn std::error::Error>> {
+) -> Result<Option<SelectedFeature>, Box<dyn std::error::Error + Send + Sync>> {
     let index = progress
         .run_step_result(
             "Fetching feature index",
@@ -626,7 +622,7 @@ async fn prompt_index_features(
     collection: &IndexCollection,
     cache: &TemplateCache,
     progress: &Progress,
-) -> Result<Option<SelectedFeature>, Box<dyn std::error::Error>> {
+) -> Result<Option<SelectedFeature>, Box<dyn std::error::Error + Send + Sync>> {
     let source_name = collection
         .source_information
         .name
@@ -670,7 +666,7 @@ async fn fetch_and_prompt_feature_options(
     display_id: &str,
     cache: &TemplateCache,
     progress: &Progress,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     let fetch_result = progress
         .run_step_result(
             &format!("Fetching feature {display_id}"),
@@ -701,7 +697,7 @@ async fn fetch_and_prompt_feature_options(
 /// Prompt the user for all template options, showing defaults.
 fn prompt_all_options(
     metadata: &TemplateMetadata,
-) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     if metadata.options.is_empty() {
         return Ok(HashMap::new());
     }
@@ -726,7 +722,7 @@ fn prompt_all_options(
 /// Prompt for which optional paths to include via multi-select.
 fn prompt_optional_paths(
     metadata: &TemplateMetadata,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     if metadata.optional_paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -747,7 +743,7 @@ fn prompt_optional_paths(
 }
 
 /// Prompt for output format.
-fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error>> {
+fn prompt_output_format() -> Result<OutputFormat, Box<dyn std::error::Error + Send + Sync>> {
     let choices = vec![
         "JSONC (with comments)".to_owned(),
         "JSON (plain)".to_owned(),
@@ -802,7 +798,7 @@ fn build_choices_with_index<I: Iterator<Item = String>>(
 fn resolve_selection(
     index_map: &HashMap<String, usize>,
     selection: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     index_map
         .get(selection)
         .copied()

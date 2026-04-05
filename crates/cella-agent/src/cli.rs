@@ -22,12 +22,12 @@ const TIMEOUT_SLOW: Duration = Duration::from_secs(600);
 async fn recv_timeout(
     client: &mut ControlClient,
     dur: Duration,
-) -> Result<DaemonMessage, Box<dyn std::error::Error>> {
-    Ok(timeout(dur, client.recv())
-        .await
-        .map_err(|_| -> Box<dyn std::error::Error> {
+) -> Result<DaemonMessage, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(timeout(dur, client.recv()).await.map_err(
+        |_| -> Box<dyn std::error::Error + Send + Sync> {
             "timed out waiting for response from daemon".into()
-        })??)
+        },
+    )??)
 }
 
 /// In-container CLI commands.
@@ -240,7 +240,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
 }
 
 /// Run the in-container CLI.
-pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
         CliCommand::Help => {
             print_help();
@@ -326,7 +326,7 @@ Run `cella --help` on the host for all commands."
 ///
 /// Reads connection info from env vars, falling back to the `.daemon_addr`
 /// file on the shared agent volume.
-async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error>> {
+async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error + Send + Sync>> {
     let (addr, token) = if let Some(info) = crate::control::read_daemon_addr_file() {
         (info.addr, info.token)
     } else if let Ok(addr) = std::env::var("CELLA_DAEMON_ADDR") {
@@ -352,7 +352,7 @@ fn request_id() -> String {
     format!("cli-{n}")
 }
 
-async fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let agent_version = env!("CARGO_PKG_VERSION");
     eprintln!("cella doctor (in-container, agent v{agent_version})\n");
 
@@ -417,7 +417,10 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_branch(name: &str, base: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_branch(
+    name: &str,
+    base: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -458,7 +461,7 @@ async fn run_branch(name: &str, base: Option<&str>) -> Result<(), Box<dyn std::e
     }
 }
 
-async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -481,7 +484,10 @@ async fn run_list() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_exec(branch: &str, command: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_exec(
+    branch: &str,
+    command: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -513,7 +519,7 @@ async fn run_exec(branch: &str, command: &[String]) -> Result<(), Box<dyn std::e
 async fn check_self_target(
     client: &mut ControlClient,
     branch: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let own_container = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
     if own_container.is_empty() {
         return Ok(());
@@ -546,7 +552,7 @@ async fn run_down(
     rm: bool,
     volumes: bool,
     force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
     check_self_target(&mut client, branch).await?;
 
@@ -594,7 +600,10 @@ async fn run_down(
     }
 }
 
-async fn run_up(branch: &str, rebuild: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_up(
+    branch: &str,
+    rebuild: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -632,7 +641,10 @@ async fn run_up(branch: &str, rebuild: bool) -> Result<(), Box<dyn std::error::E
     }
 }
 
-async fn run_prune(dry_run: bool, all: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_prune(
+    dry_run: bool,
+    all: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -671,7 +683,7 @@ async fn run_task_run(
     branch: &str,
     command: &[String],
     base: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -710,7 +722,7 @@ async fn run_task_run(
     }
 }
 
-async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_task_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -743,7 +755,10 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_task_logs(branch: &str, follow: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_task_logs(
+    branch: &str,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -767,7 +782,7 @@ async fn run_task_logs(branch: &str, follow: bool) -> Result<(), Box<dyn std::er
     }
 }
 
-async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -790,7 +805,7 @@ async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -813,7 +828,7 @@ async fn run_task_stop(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_switch(branch: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();

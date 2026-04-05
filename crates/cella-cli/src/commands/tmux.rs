@@ -42,7 +42,7 @@ impl TmuxArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (build_no_cache, force) = (self.up.build.build_no_cache, self.force);
         let (strict, output_format) = (self.up.strict.clone(), self.up.output.clone());
         let mut up = self.up;
@@ -185,7 +185,7 @@ async fn ensure_tmux(
     ctx: &UpContext,
     container_id: &str,
     remote_user: &str,
-) -> Result<TmuxInfo, Box<dyn std::error::Error>> {
+) -> Result<TmuxInfo, Box<dyn std::error::Error + Send + Sync>> {
     let check = ctx
         .client
         .exec_command(
@@ -243,7 +243,7 @@ async fn get_tmux_version(
 async fn install_tmux(
     ctx: &UpContext,
     container_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Detect package manager and build install command
     let install_commands: &[(&str, &str)] = &[
         (
@@ -337,7 +337,7 @@ async fn check_tmux_session(
 }
 
 /// Warn the user about nested tmux sessions and prompt to continue.
-fn warn_nested_tmux() -> Result<(), Box<dyn std::error::Error>> {
+fn warn_nested_tmux() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!();
     eprintln!("\x1b[33m\u{26a0}\x1b[0m  You're already inside a tmux session.");
     eprintln!("   Running cella tmux will create a nested tmux session (tmux-inside-tmux).");

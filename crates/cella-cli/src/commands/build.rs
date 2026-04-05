@@ -65,7 +65,7 @@ impl BuildArgs {
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         info!("Resolving devcontainer config...");
@@ -82,7 +82,7 @@ impl BuildArgs {
             .iter()
             .map(|s| parse_build_secret(s))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
         let client = self.backend.resolve_client().await?;
         client.ping().await?;
@@ -108,7 +108,8 @@ impl BuildArgs {
             .map_err(|e| e.to_string());
             drop(sender);
             let _ = renderer.await;
-            let result = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let result =
+                result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
             print_result(&self.output, &result.image_name, true);
             return Ok(());

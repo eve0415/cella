@@ -57,7 +57,9 @@ pub struct DownArgs {
 }
 
 /// Resolve a branch name to its worktree path.
-fn resolve_branch_to_path(branch_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn resolve_branch_to_path(
+    branch_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let cwd = std::env::current_dir()?;
     let repo_info = cella_git::discover(&cwd)?;
     let worktrees = cella_git::list(&repo_info.root)?;
@@ -69,7 +71,7 @@ fn resolve_branch_to_path(branch_name: &str) -> Result<PathBuf, Box<dyn std::err
 }
 
 /// Remove the worktree directory and clean up stale git records.
-fn remove_worktree(branch_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn remove_worktree(branch_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cwd = std::env::current_dir()?;
     let repo_info = cella_git::discover(&cwd)?;
     let worktrees = cella_git::list(&repo_info.root)?;
@@ -92,7 +94,7 @@ impl DownArgs {
         matches!(self.output, OutputFormat::Text)
     }
 
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
 
         let workspace_folder = if let Some(ref branch_name) = self.branch {
@@ -164,7 +166,7 @@ impl DownArgs {
             compose_cmd
                 .down()
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("docker compose down failed: {e}").into()
                 })?;
 

@@ -22,7 +22,7 @@ pub struct DoctorArgs {
 }
 
 impl DoctorArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let workspace_folder = std::env::current_dir().ok();
         let (backend_client, backend_error) = match self.backend.resolve_client().await {
             Ok(client) => (Some(client), None),

@@ -31,7 +31,7 @@ pub enum ConfigCommand {
 }
 
 impl ConfigArgs {
-    pub fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             ConfigCommand::Validate { file, strict } => validate(file, strict),
             ConfigCommand::Show
@@ -45,7 +45,10 @@ impl ConfigArgs {
     }
 }
 
-fn validate(file: Option<PathBuf>, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn validate(
+    file: Option<PathBuf>,
+    strict: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = if let Some(p) = file {
         p
     } else {

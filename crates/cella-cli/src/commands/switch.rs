@@ -20,7 +20,7 @@ pub struct SwitchArgs {
 }
 
 impl SwitchArgs {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
 
         // Discover repo and list worktrees

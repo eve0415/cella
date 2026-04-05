@@ -311,7 +311,7 @@ impl EnsureUpContext<'_> {
         remote_user: &str,
         metadata: &str,
         lifecycle_env: &[String],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let lc_state = read_lifecycle_state(self.client, container_id, remote_user).await;
         if lc_state.oncreate_done {
             return Ok(());
@@ -331,7 +331,7 @@ impl EnsureUpContext<'_> {
         &self,
         container: &ContainerInfo,
         remote_user: &str,
-    ) -> Result<UpResult, Box<dyn std::error::Error>> {
+    ) -> Result<UpResult, Box<dyn std::error::Error + Send + Sync>> {
         // Spec: initializeCommand runs on the host during every start, including reconnects.
         let config = self.config_json();
         if let Some(init_cmd) = config.get("initializeCommand") {
@@ -444,7 +444,7 @@ impl EnsureUpContext<'_> {
         &self,
         container: &ContainerInfo,
         remote_user: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (_probed_env, lifecycle_env) =
             self.prepare_container_env(&container.id, remote_user).await;
         let metadata = container.labels.get("devcontainer.metadata");
@@ -479,7 +479,7 @@ impl EnsureUpContext<'_> {
         &self,
         container: &ContainerInfo,
         remote_user: &str,
-    ) -> Result<Option<UpResult>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
 
         if let Some(old_hash) = &container.config_hash
@@ -581,7 +581,7 @@ impl EnsureUpContext<'_> {
         &self,
         container: &ContainerInfo,
         reason: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.hooks
             .on_container_stopping(self.config.container_name)
             .await;
@@ -679,7 +679,7 @@ impl EnsureUpContext<'_> {
         remote_user: &str,
         settings: &cella_config::settings::Settings,
         agent_arch: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
 
         for m in &env_fwd.mounts {
@@ -779,7 +779,10 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
-    async fn start_and_notify(&self, container_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start_and_notify(
+        &self,
+        container_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let label = if self.progress.is_verbose() {
             let short_id = &container_id[..12.min(container_id.len())];
             format!("Starting container: {short_id}...")
@@ -1070,7 +1073,7 @@ impl EnsureUpContext<'_> {
         lifecycle_env: &[String],
         resolved_features: Option<&cella_features::ResolvedFeatures>,
         image_metadata: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
         let wait_for = WaitForPhase::from_config(config);
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
@@ -1111,7 +1114,7 @@ impl EnsureUpContext<'_> {
     async fn create_container(
         &self,
         create_opts: &cella_backend::CreateContainerOptions,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if self.progress.is_verbose() {
             let step = self.progress.step(&format!(
                 "Creating container: {}...",
@@ -1141,7 +1144,7 @@ impl EnsureUpContext<'_> {
         image_user: &str,
         remote_user: &str,
         create_opts: &mut cella_backend::CreateContainerOptions,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let update_uid = config
             .get("updateRemoteUserUID")
             .and_then(serde_json::Value::as_bool)
@@ -1165,7 +1168,7 @@ impl EnsureUpContext<'_> {
     async fn create_and_start(
         &self,
         build_no_cache: bool,
-    ) -> Result<CreateResult, Box<dyn std::error::Error>> {
+    ) -> Result<CreateResult, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
 
         if let Some(init_cmd) = config.get("initializeCommand") {
@@ -1264,7 +1267,7 @@ impl EnsureUpContext<'_> {
         })
     }
 
-    async fn ensure_up(self) -> Result<UpResult, Box<dyn std::error::Error>> {
+    async fn ensure_up(self) -> Result<UpResult, Box<dyn std::error::Error + Send + Sync>> {
         let build_no_cache = matches!(self.config.image_strategy, ImageStrategy::RebuildNoCache);
         let remove_container = self.config.remove_existing_container
             || matches!(

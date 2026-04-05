@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 pub fn run_host_command(
     phase: &str,
     value: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Running {phase} on host");
 
     match value {
@@ -54,7 +54,7 @@ pub fn run_host_command(
 fn run_json_array_command(
     phase: &str,
     arr: &[serde_json::Value],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cmd: Vec<String> = arr
         .iter()
         .filter_map(|v| v.as_str().map(String::from))
@@ -66,7 +66,10 @@ fn run_json_array_command(
     Ok(())
 }
 
-fn run_single_host_command(phase: &str, cmd: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+fn run_single_host_command(
+    phase: &str,
+    cmd: &[&str],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cmd.is_empty() {
         return Ok(());
     }
@@ -143,7 +146,7 @@ pub fn resolve_remote_user(
 pub async fn verify_container_running(
     client: &dyn ContainerBackend,
     container_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let info = client.inspect_container(container_id).await?;
     if info.state != ContainerState::Running {
         let logs = client.container_logs(container_id, 20).await?;

@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use crate::TemplateCollectionIndex;
 use crate::error::TemplateError;
+use crate::{FeatureCollectionIndex, TemplateCollectionIndex};
 
 /// How long a cached collection index is considered fresh.
 const COLLECTION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -123,6 +123,86 @@ impl TemplateCache {
     fn collection_path(&self, registry: &str) -> PathBuf {
         let hash = hex::encode(&Sha256::digest(registry.as_bytes())[..8]);
         self.root.join("collections").join(format!("{hash}.json"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature collection index cache
+    // -----------------------------------------------------------------------
+
+    /// Compute the cache file path for a feature collection index.
+    ///
+    /// Uses a `feature::` prefix before hashing to avoid collisions with
+    /// template collection entries that share the same registry string.
+    fn feature_collection_path(&self, registry: &str) -> PathBuf {
+        let prefixed = format!("feature::{registry}");
+        let hash = hex::encode(&Sha256::digest(prefixed.as_bytes())[..8]);
+        self.root.join("collections").join(format!("{hash}.json"))
+    }
+
+    /// Get a cached feature collection index if it exists and is fresh (< 24h old).
+    pub fn get_feature_collection(
+        &self,
+        registry: &str,
+    ) -> Option<(FeatureCollectionIndex, SystemTime)> {
+        let path = self.feature_collection_path(registry);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age > COLLECTION_TTL {
+            debug!("feature collection cache expired for {registry} (age: {age:?})");
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let index: FeatureCollectionIndex = serde_json::from_str(&content).ok()?;
+        debug!("feature collection cache hit for {registry}");
+        Some((index, modified))
+    }
+
+    /// Get a cached feature collection index even if expired (for offline fallback).
+    pub fn get_feature_collection_stale(
+        &self,
+        registry: &str,
+    ) -> Option<(FeatureCollectionIndex, SystemTime)> {
+        let path = self.feature_collection_path(registry);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let index: FeatureCollectionIndex = serde_json::from_str(&content).ok()?;
+        debug!("feature collection stale cache hit for {registry}");
+        Some((index, modified))
+    }
+
+    /// Write a feature collection index to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::CacheError`] if the write fails.
+    pub fn put_feature_collection(
+        &self,
+        registry: &str,
+        index: &FeatureCollectionIndex,
+    ) -> Result<(), TemplateError> {
+        let path = self.feature_collection_path(registry);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| TemplateError::CacheError {
+                message: format!("failed to create cache directory: {e}"),
+            })?;
+        }
+        let json = serde_json::to_string(index).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to serialize feature collection index: {e}"),
+        })?;
+        std::fs::write(&path, json).map_err(|e| TemplateError::CacheError {
+            message: format!("failed to write feature collection cache: {e}"),
+        })?;
+        debug!(
+            "cached feature collection index for {registry} at {}",
+            path.display()
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -317,5 +397,106 @@ mod tests {
             "first"
         );
         assert!(!staging.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature collection cache: miss, hit, expiry, empty
+    // -----------------------------------------------------------------------
+
+    fn sample_feature_collection() -> FeatureCollectionIndex {
+        serde_json::from_str(
+            r#"{
+            "features": [
+                { "id": "node", "version": "1.5.0", "name": "Node.js" },
+                { "id": "python", "version": "2.0.0", "name": "Python" }
+            ]
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn feature_collection_cache_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        assert!(cache.get_feature_collection("ghcr.io/features").is_none());
+    }
+
+    #[test]
+    fn feature_collection_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index = sample_feature_collection();
+
+        cache
+            .put_feature_collection("ghcr.io/features", &index)
+            .unwrap();
+        let (cached, _) = cache.get_feature_collection("ghcr.io/features").unwrap();
+        assert_eq!(cached.features.len(), 2);
+        assert_eq!(cached.features[0].id, "node");
+        assert_eq!(cached.features[1].id, "python");
+    }
+
+    #[test]
+    fn feature_collection_stale_cache_returns_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index = sample_feature_collection();
+
+        cache
+            .put_feature_collection("ghcr.io/features", &index)
+            .unwrap();
+
+        // Backdate to simulate expiry
+        let path = cache.feature_collection_path("ghcr.io/features");
+        let old_time = filetime::FileTime::from_unix_time(0, 0);
+        filetime::set_file_mtime(&path, old_time).unwrap();
+
+        // Fresh cache should miss
+        assert!(cache.get_feature_collection("ghcr.io/features").is_none());
+
+        // Stale cache should still hit
+        let (stale, _) = cache
+            .get_feature_collection_stale("ghcr.io/features")
+            .unwrap();
+        assert_eq!(stale.features.len(), 2);
+        assert_eq!(stale.features[0].id, "node");
+    }
+
+    #[test]
+    fn feature_collection_empty_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let index: FeatureCollectionIndex = serde_json::from_str(r#"{ "features": [] }"#).unwrap();
+
+        cache
+            .put_feature_collection("ghcr.io/empty", &index)
+            .unwrap();
+        let (cached, _) = cache.get_feature_collection("ghcr.io/empty").unwrap();
+        assert!(cached.features.is_empty());
+    }
+
+    #[test]
+    fn template_cache_unaffected_by_feature_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+
+        // Write both types
+        cache
+            .put_collection("ghcr.io/templates", &sample_collection())
+            .unwrap();
+        cache
+            .put_feature_collection("ghcr.io/features", &sample_feature_collection())
+            .unwrap();
+
+        // Template cache still works
+        let (tc, _) = cache.get_collection("ghcr.io/templates").unwrap();
+        assert_eq!(tc.templates.len(), 1);
+        assert_eq!(tc.templates[0].id, "rust");
+
+        // Feature cache still works
+        let (fc, _) = cache.get_feature_collection("ghcr.io/features").unwrap();
+        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.features[0].id, "node");
     }
 }
