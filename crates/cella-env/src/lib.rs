@@ -132,6 +132,22 @@ fn apply_git_config(fwd: &mut EnvForwarding) {
     }
 }
 
+/// Mark all directories as safe for git inside the container.
+///
+/// Matches the official devcontainer CLI behavior: sets
+/// `safe.directory = *` so git operations succeed regardless of file
+/// ownership (common after UID remapping or bind-mount mismatches).
+fn apply_safe_directory(fwd: &mut EnvForwarding) {
+    fwd.post_start.git_config_commands.push(vec![
+        "git".to_string(),
+        "config".to_string(),
+        "--global".to_string(),
+        "--replace-all".to_string(),
+        "safe.directory".to_string(),
+        "*".to_string(),
+    ]);
+}
+
 /// Apply credential forwarding via the agent-based credential helper.
 ///
 /// Always installs the git credential helper pointing to the agent binary.
@@ -179,6 +195,7 @@ pub fn prepare_env_forwarding(
     apply_ssh_agent_forwarding(&mut fwd, &runtime, config);
     apply_ssh_config_files(&mut fwd, remote_user);
     apply_git_config(&mut fwd);
+    apply_safe_directory(&mut fwd);
     apply_credential_forwarding(&mut fwd);
 
     if let Some(net_config) = network {
@@ -292,6 +309,32 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_safe_directory() {
+        let mut fwd = EnvForwarding::default();
+        apply_safe_directory(&mut fwd);
+
+        assert_eq!(
+            fwd.post_start.git_config_commands.len(),
+            1,
+            "should add exactly one git config command"
+        );
+
+        let cmd = &fwd.post_start.git_config_commands[0];
+        assert!(
+            cmd.iter().any(|s| s == "safe.directory"),
+            "command should set safe.directory"
+        );
+        assert!(
+            cmd.iter().any(|s| s == "*"),
+            "safe.directory should be set to wildcard"
+        );
+        assert!(
+            cmd.iter().any(|s| s == "--replace-all"),
+            "should use --replace-all flag"
+        );
+    }
+
+    #[test]
     fn test_prepare_env_forwarding_minimal() {
         let config: serde_json::Value = serde_json::from_str("{}").unwrap();
         let fwd = prepare_env_forwarding(&config, "root", None);
@@ -305,6 +348,17 @@ mod tests {
         assert!(
             has_credential_helper,
             "credential helper should always be present"
+        );
+
+        // safe.directory wildcard is always set for container safety.
+        let has_safe_directory = fwd
+            .post_start
+            .git_config_commands
+            .iter()
+            .any(|cmd| cmd.iter().any(|s| s == "safe.directory"));
+        assert!(
+            has_safe_directory,
+            "safe.directory should always be present"
         );
     }
 
