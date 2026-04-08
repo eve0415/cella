@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use cella_backend::{
     ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, run_lifecycle_phase,
 };
-use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig};
+use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
 
 use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
 use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
@@ -288,11 +288,32 @@ async fn prepare_and_start(
         (String::new(), String::new(), true)
     };
 
-    // 8. Resolve remote user from config
-    let remote_user = resolve_remote_user(config, None, "root");
-    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    // 8. Write initial build override (features Dockerfile only, labels/env added later)
+    let build_ov = OverrideContext {
+        agent_vol_name: agent_vol_name.clone(),
+        agent_vol_target: agent_vol_target.clone(),
+        extra_env: Vec::new(),
+        labels: BTreeMap::new(),
+    };
+    write_build_override(project, features_build.as_ref(), &build_ov)?;
 
-    // 9. Build extra environment variables
+    // 9. Run docker compose build to ensure images exist for inspection.
+    let compose_cmd = ComposeCommand::new(project);
+    run_step_result(
+        progress,
+        "Building compose services...",
+        compose_cmd.build(None),
+    )
+    .await?;
+
+    // 10. Resolve remote user from built image metadata.
+    let (image_user, image_meta_user) =
+        resolve_compose_image_info(client, project, features_build.as_ref(), progress).await;
+    let remote_user = resolve_remote_user(config, image_meta_user.as_ref(), &image_user);
+    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    info!("Resolved remote user: {remote_user} (image user: {image_user})");
+
+    // 11. Build extra environment variables
     let mut extra_env = daemon_env;
     for e in &env_fwd.env {
         extra_env.push(format!("{}={}", e.key, e.value));
@@ -301,7 +322,7 @@ async fn prepare_and_start(
         extra_env.push(e.clone());
     }
 
-    // 10. Build labels for the primary service
+    // 12. Build labels for the primary service
     let labels = build_compose_labels(cfg, project, &remote_user);
 
     let ov_ctx = OverrideContext {
@@ -311,24 +332,20 @@ async fn prepare_and_start(
         labels,
     };
 
-    // 11. Generate and write override YAML
-    write_build_override(project, features_build.as_ref(), &ov_ctx)?;
+    // 13. Build-time UID remap: build a thin image layer with correct UID/GID.
+    let uid_image = build_uid_remap_image_compose(
+        ctx,
+        project,
+        features_build.as_ref(),
+        &remote_user,
+        &image_user,
+    )
+    .await?;
 
-    // 12. Run docker compose build (always when features present, or if --build-no-cache)
-    let compose_cmd = ComposeCommand::new(project);
-    if features_build.is_some() || cfg.build_no_cache {
-        run_step_result(
-            progress,
-            "Building compose services...",
-            compose_cmd.build(None),
-        )
-        .await?;
-    }
+    // 14. Write final override with labels, env, and UID remap image.
+    write_final_override(project, features_build.as_ref(), &ov_ctx, uid_image)?;
 
-    // 12b. Build-time UID remap: build a thin image layer with correct UID/GID.
-    build_uid_remap_override(ctx, project, features_build.as_ref(), &remote_user, &ov_ctx).await?;
-
-    // 13. docker compose up -d (idempotent)
+    // 15. docker compose up -d (idempotent)
     run_step_result(progress, "Starting compose services...", async {
         compose_cmd.up(project.run_services.as_deref(), false).await
     })
@@ -429,7 +446,14 @@ async fn handle_compose_running(
 ) -> Result<ComposeUpResult, Box<dyn std::error::Error + Send + Sync>> {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
     let config = cfg.config;
-    let remote_user = resolve_remote_user(config, None, "root");
+
+    // Prefer the label stored during creation; fall back to config resolution.
+    let remote_user = container
+        .labels
+        .get("dev.cella.remote_user")
+        .filter(|u| u.as_str() != "root")
+        .cloned()
+        .unwrap_or_else(|| resolve_remote_user(config, None, "root"));
 
     // Re-register with daemon in case it restarted
     hooks
@@ -512,17 +536,98 @@ fn write_build_override(
 }
 
 // ---------------------------------------------------------------------------
+// Image metadata resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the image user and metadata from the compose service's built image.
+///
+/// For image-only services, inspects the image directly (pulling if needed).
+/// For build-based services, inspects the compose-built image (`{project}-{service}`).
+///
+/// Returns `(image_user, Option<ImageMetadataUserInfo>)`. Falls back to
+/// `("root", None)` when inspection fails.
+async fn resolve_compose_image_info(
+    client: &dyn ContainerBackend,
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    progress: &ProgressSender,
+) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
+    // If features resolved an image, its metadata was already extracted.
+    if let Some(fb) = features_build {
+        let meta_user = fb
+            .base_image_metadata
+            .as_deref()
+            .map(|m| cella_features::parse_image_metadata(m).1);
+        return (fb.image_user.clone(), meta_user);
+    }
+
+    // Resolve compose config to find the service's image source.
+    let compose_cmd = ComposeCommand::without_override(project);
+    let resolved = match compose_cmd.config().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to resolve compose config for image metadata: {e}");
+            return ("root".to_string(), None);
+        }
+    };
+
+    let service_info =
+        match cella_compose::extract_service_build_info(&resolved, &project.primary_service) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!("Failed to extract service build info: {e}");
+                return ("root".to_string(), None);
+            }
+        };
+
+    let image_name = match &service_info {
+        ServiceBuildInfo::Image { image } => {
+            // Pull the image if not locally available.
+            if matches!(client.image_exists(image).await, Ok(false)) {
+                let _ = run_step_result(
+                    progress,
+                    "Pulling compose service image...",
+                    client.pull_image(image),
+                )
+                .await;
+            }
+            image.clone()
+        }
+        ServiceBuildInfo::Build { .. } => {
+            // After compose build, the image exists as {project}-{service}.
+            format!("{}-{}", project.project_name, project.primary_service)
+        }
+    };
+
+    match client.inspect_image_details(&image_name).await {
+        Ok(details) => {
+            let meta_user = details
+                .metadata
+                .as_deref()
+                .map(|m| cella_features::parse_image_metadata(m).1);
+            (details.user, meta_user)
+        }
+        Err(e) => {
+            warn!("Failed to inspect image '{image_name}' for metadata: {e}");
+            ("root".to_string(), None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UID remap
 // ---------------------------------------------------------------------------
 
-/// Build a UID-remapped image and rewrite the compose override if needed.
-async fn build_uid_remap_override(
+/// Build a UID-remapped image for the compose service.
+///
+/// Returns the UID-remapped image name, or `None` if remap was skipped.
+async fn build_uid_remap_image_compose(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
     features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
     remote_user: &str,
-    ov: &OverrideContext,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    image_user: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let update_uid = ctx
         .cfg
         .config
@@ -531,29 +636,36 @@ async fn build_uid_remap_override(
         .unwrap_or(true);
 
     if !update_uid {
-        return Ok(());
+        return Ok(None);
     }
 
     let compose_image = features_build
         .and_then(|b| b.image_name_override.clone())
         .unwrap_or_else(|| format!("{}-{}", project.project_name, project.primary_service));
-    let image_user = features_build.map_or("root", |b| &b.image_user);
 
-    let Some(uid_img) = crate::uid_image::build_uid_remap_image(
+    crate::uid_image::build_uid_remap_image(
         ctx.client,
         &compose_image,
         image_user,
         remote_user,
         ctx.progress,
     )
-    .await?
-    else {
-        return Ok(());
-    };
+    .await
+}
+
+/// Write the final compose override with labels, env, and optional UID remap image.
+fn write_final_override(
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    ov: &OverrideContext,
+    uid_image: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let image_override =
+        uid_image.or_else(|| features_build.and_then(|b| b.image_name_override.clone()));
 
     let override_config = OverrideConfig {
         primary_service: project.primary_service.clone(),
-        image_override: Some(uid_img),
+        image_override,
         override_command: project.override_command,
         agent_volume_name: ov.agent_vol_name.clone(),
         agent_volume_target: ov.agent_vol_target.clone(),
@@ -569,6 +681,10 @@ async fn build_uid_remap_override(
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    debug!(
+        "Final override written to: {}",
+        project.override_file.display()
+    );
     Ok(())
 }
 

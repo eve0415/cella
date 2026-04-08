@@ -36,6 +36,8 @@ pub struct ComposeFeaturesBuild {
     pub image_name_override: Option<String>,
     /// The base image USER directive (for UID remap image layer).
     pub image_user: String,
+    /// Raw `devcontainer.metadata` label from the base image, if available.
+    pub base_image_metadata: Option<String>,
 }
 
 /// Resolve features for a compose service and generate the combined Dockerfile.
@@ -174,6 +176,7 @@ pub async fn resolve_compose_features(
         combined_path,
         resolved,
         image_user,
+        base_image_metadata,
     )?))
 }
 
@@ -209,6 +212,7 @@ fn assemble_features_build(
     combined_dockerfile: PathBuf,
     resolved: ResolvedFeatures,
     image_user: String,
+    base_image_metadata: Option<String>,
 ) -> Result<ComposeFeaturesBuild, Box<dyn std::error::Error + Send + Sync>> {
     let mut additional_contexts = BTreeMap::new();
     additional_contexts.insert(
@@ -238,6 +242,7 @@ fn assemble_features_build(
         resolved_features: resolved,
         image_name_override,
         image_user,
+        base_image_metadata,
     })
 }
 
