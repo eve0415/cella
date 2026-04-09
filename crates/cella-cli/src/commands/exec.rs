@@ -130,6 +130,9 @@ impl ExecArgs {
         // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
         ensure_ssh_auth_sock(client.as_ref(), &container.id, &user, &mut env).await;
 
+        // Forward AI provider API keys from host environment
+        super::append_ai_keys(&mut env, &container.labels);
+
         // Forward terminal environment variables
         for var in super::TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {

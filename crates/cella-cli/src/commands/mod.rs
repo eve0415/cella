@@ -284,6 +284,43 @@ pub async fn resolve_service_container(
         .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
 
+/// Append AI provider API keys from the host environment into `env`.
+///
+/// Loads settings from the workspace path label on the container,
+/// then detects keys that are present on the host, enabled in config,
+/// and not already set by the user (via `remoteEnv` / `containerEnv`).
+pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<String, String>) {
+    // Fast path: skip settings I/O when no AI key env vars exist on the host.
+    if !cella_env::ai_keys::any_ai_key_present() {
+        return;
+    }
+
+    // Only forward host AI credentials to cella-managed containers.
+    // Without the workspace label, this could be a non-cella container
+    // targeted by --container-id, and leaking keys would be unexpected.
+    let Some(workspace_path) = labels
+        .get("dev.cella.workspace_path")
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return;
+    };
+
+    let settings = cella_config::settings::Settings::load(std::path::Path::new(workspace_path));
+    let ai = &settings.credentials.ai;
+    if !ai.enabled {
+        return;
+    }
+    let existing_keys: Vec<&str> = env
+        .iter()
+        .filter_map(|e| e.split_once('=').map(|(k, _)| k))
+        .collect();
+    let ai_keys =
+        cella_env::ai_keys::detect_ai_keys(&|id| ai.is_provider_enabled(id), &existing_keys);
+    for (key, value) in ai_keys {
+        env.push(format!("{key}={value}"));
+    }
+}
+
 /// Terminal environment variables to forward into the container.
 pub const TERMINAL_ENV_VARS: &[&str] = &[
     "TERM",
@@ -637,5 +674,144 @@ mod tests {
     fn resolve_workspace_folder_returns_absolute_path() {
         let result = resolve_workspace_folder(None).unwrap();
         assert!(result.is_absolute());
+    }
+
+    // ── append_ai_keys ─────────────────────────────────────────────
+
+    /// Serialize tests that mutate the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn append_ai_keys_skips_without_workspace_label() {
+        let labels = std::collections::HashMap::new();
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            env.is_empty(),
+            "no keys should be forwarded without workspace label"
+        );
+    }
+
+    #[test]
+    fn append_ai_keys_skips_empty_workspace_label() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("dev.cella.workspace_path".to_string(), "  ".to_string());
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            env.is_empty(),
+            "no keys should be forwarded with empty workspace label"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn append_ai_keys_forwards_host_key() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("COHERE_API_KEY", "test-cohere") };
+
+        // Use a temp dir that has no config files → default settings (all enabled)
+        let tmp = std::env::temp_dir();
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            tmp.to_string_lossy().to_string(),
+        );
+
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            env.iter().any(|e| e == "COHERE_API_KEY=test-cohere"),
+            "host COHERE_API_KEY should be forwarded"
+        );
+        unsafe { std::env::remove_var("COHERE_API_KEY") };
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn append_ai_keys_skips_existing_override() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("OPENAI_API_KEY", "host-key") };
+
+        let tmp = std::env::temp_dir();
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            tmp.to_string_lossy().to_string(),
+        );
+
+        // Simulate a user override via remoteEnv/containerEnv
+        let mut env = vec!["OPENAI_API_KEY=user-override".to_string()];
+        append_ai_keys(&mut env, &labels);
+
+        // Should still have exactly the original entry, not a duplicate
+        let count = env
+            .iter()
+            .filter(|e| e.starts_with("OPENAI_API_KEY="))
+            .count();
+        assert_eq!(count, 1, "existing override should block auto-forwarding");
+        assert_eq!(env[0], "OPENAI_API_KEY=user-override");
+
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn append_ai_keys_respects_config_disables() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("OPENAI_API_KEY", "host-key") };
+
+        let workspace = std::env::temp_dir().join(format!(
+            "cella-append-ai-keys-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let devcontainer_dir = workspace.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).expect("create .devcontainer directory");
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+
+        // Global disable: [credentials.ai] enabled = false
+        std::fs::write(
+            devcontainer_dir.join("cella.toml"),
+            "[credentials.ai]\nenabled = false\n",
+        )
+        .expect("write disabled AI config");
+
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
+            "OPENAI_API_KEY should not be forwarded when [credentials.ai] enabled = false"
+        );
+
+        // Per-provider disable: openai = false
+        std::fs::write(
+            devcontainer_dir.join("cella.toml"),
+            "[credentials.ai]\nopenai = false\n",
+        )
+        .expect("write provider-disabled AI config");
+
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
+            "OPENAI_API_KEY should not be forwarded when [credentials.ai] openai = false"
+        );
+
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

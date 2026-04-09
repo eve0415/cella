@@ -4,6 +4,7 @@
 //! then produces mounts, env vars, and post-start injection commands
 //! for the container.
 
+pub mod ai_keys;
 pub mod ca_bundle;
 pub mod claude_code;
 pub mod codex;
