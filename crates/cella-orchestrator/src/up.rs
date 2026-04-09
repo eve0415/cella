@@ -862,7 +862,7 @@ impl EnsureUpContext<'_> {
                 cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
             if !detected.is_empty() {
                 tracing::info!(
-                    "Detected AI API keys eligible for forwarding: {}",
+                    "AI API keys detected for exec/shell forwarding: {}",
                     detected.join(", ")
                 );
             }
