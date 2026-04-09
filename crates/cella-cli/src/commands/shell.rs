@@ -120,6 +120,9 @@ impl ShellArgs {
         )
         .await;
 
+        // Forward AI provider API keys from host environment
+        super::append_ai_keys(&mut env, &container.labels);
+
         for var in super::TERMINAL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 env.push(format!("{var}={val}"));

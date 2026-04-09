@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use super::AiCredentials;
+
 const fn default_true() -> bool {
     true
 }
@@ -10,12 +12,18 @@ pub struct Credentials {
     /// Forward gh CLI credentials into containers (default: true).
     #[serde(default = "default_true")]
     pub gh: bool,
-    // Future: claude, codex, gemini
+
+    /// AI provider API key forwarding settings.
+    #[serde(default)]
+    pub ai: AiCredentials,
 }
 
 impl Default for Credentials {
     fn default() -> Self {
-        Self { gh: true }
+        Self {
+            gh: true,
+            ai: AiCredentials::default(),
+        }
     }
 }
 
@@ -27,12 +35,14 @@ mod tests {
     fn default_enables_gh() {
         let settings = Credentials::default();
         assert!(settings.gh);
+        assert!(settings.ai.enabled);
     }
 
     #[test]
     fn deserialize_empty_uses_defaults() {
         let settings: Credentials = toml::from_str("").unwrap();
         assert!(settings.gh);
+        assert!(settings.ai.enabled);
     }
 
     #[test]
@@ -45,5 +55,14 @@ mod tests {
     fn deserialize_explicit_true() {
         let settings: Credentials = toml::from_str("gh = true").unwrap();
         assert!(settings.gh);
+    }
+
+    #[test]
+    fn deserialize_nested_ai_section() {
+        let settings: Credentials = toml::from_str("[ai]\nopenai = false\nenabled = true").unwrap();
+        assert!(settings.gh);
+        assert!(settings.ai.enabled);
+        assert!(!settings.ai.is_provider_enabled("openai"));
+        assert!(settings.ai.is_provider_enabled("anthropic"));
     }
 }

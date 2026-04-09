@@ -1,3 +1,4 @@
+mod ai_credentials;
 mod claude_code;
 mod codex;
 mod credentials;
@@ -11,6 +12,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::debug;
 
+pub use ai_credentials::AiCredentials;
 pub use claude_code::ClaudeCode;
 pub use codex::Codex;
 pub use credentials::Credentials;
@@ -149,6 +151,7 @@ mod tests {
     fn default_settings() {
         let settings = Settings::default();
         assert!(settings.credentials.gh);
+        assert!(settings.credentials.ai.enabled);
         assert!(settings.tools.claude_code.enabled);
         assert!(settings.tools.claude_code.forward_config);
         assert_eq!(settings.tools.claude_code.version, "latest");
@@ -200,6 +203,10 @@ mod tests {
 [credentials]
 gh = false
 
+[credentials.ai]
+enabled = true
+openai = false
+
 [tools.claude-code]
 enabled = false
 version = "stable"
@@ -223,6 +230,9 @@ config_path = "~/dotfiles/.tmux.conf"
 "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(!settings.credentials.gh);
+        assert!(settings.credentials.ai.enabled);
+        assert!(!settings.credentials.ai.is_provider_enabled("openai"));
+        assert!(settings.credentials.ai.is_provider_enabled("anthropic"));
         assert!(!settings.tools.claude_code.enabled);
         assert_eq!(settings.tools.claude_code.version, "stable");
         assert!(!settings.tools.codex.enabled);
@@ -297,11 +307,17 @@ version = "0.5.0"
     #[test]
     fn merge_project_overrides_global() {
         let global = Settings {
-            credentials: Credentials { gh: true },
+            credentials: Credentials {
+                gh: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let project = Settings {
-            credentials: Credentials { gh: false },
+            credentials: Credentials {
+                gh: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let merged = Settings::merge(Some(global), Some(project));
@@ -311,7 +327,10 @@ version = "0.5.0"
     #[test]
     fn merge_global_only() {
         let global = Settings {
-            credentials: Credentials { gh: false },
+            credentials: Credentials {
+                gh: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let merged = Settings::merge(Some(global), None);

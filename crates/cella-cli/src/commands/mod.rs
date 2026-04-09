@@ -284,6 +284,33 @@ pub async fn resolve_service_container(
         .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
 
+/// Append AI provider API keys from the host environment into `env`.
+///
+/// Loads settings from the workspace path label on the container,
+/// then detects keys that are present on the host, enabled in config,
+/// and not already set by the user (via `remoteEnv` / `containerEnv`).
+pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<String, String>) {
+    let settings = labels
+        .get("dev.cella.workspace_path")
+        .map(std::path::Path::new)
+        .map_or_else(cella_config::settings::Settings::default, |p| {
+            cella_config::settings::Settings::load(p)
+        });
+    let ai = &settings.credentials.ai;
+    if !ai.enabled {
+        return;
+    }
+    let existing_keys: Vec<&str> = env
+        .iter()
+        .filter_map(|e| e.split_once('=').map(|(k, _)| k))
+        .collect();
+    let ai_keys =
+        cella_env::ai_keys::detect_ai_keys(&|id| ai.is_provider_enabled(id), &existing_keys);
+    for (key, value) in ai_keys {
+        env.push(format!("{key}={value}"));
+    }
+}
+
 /// Terminal environment variables to forward into the container.
 pub const TERMINAL_ENV_VARS: &[&str] = &[
     "TERM",

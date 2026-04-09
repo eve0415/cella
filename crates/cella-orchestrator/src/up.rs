@@ -855,6 +855,16 @@ impl EnsureUpContext<'_> {
             .await;
         }
 
+        // Log detected AI API keys (names only, never values)
+        if settings.credentials.ai.enabled {
+            let ai = &settings.credentials.ai;
+            let detected =
+                cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
+            if !detected.is_empty() {
+                tracing::info!("Forwarding AI API keys: {}", detected.join(", "));
+            }
+        }
+
         let shell = crate::shell_detect::detect_shell(self.client, container_id, remote_user).await;
         let probed_env = run_step_result(&self.progress, "Running userEnvProbe...", async {
             Ok::<_, std::convert::Infallible>(
