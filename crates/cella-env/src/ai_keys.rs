@@ -87,6 +87,14 @@ pub fn detect_ai_keys(
         .collect()
 }
 
+/// Returns `true` if at least one known AI API key env var is set and
+/// non-empty on the host. Cheap check — no disk I/O.
+pub fn any_ai_key_present() -> bool {
+    AI_PROVIDERS
+        .iter()
+        .any(|p| std::env::var(p.env_var).ok().is_some_and(|v| !v.is_empty()))
+}
+
 /// Return the names of AI API keys detected on the host (for logging).
 ///
 /// Never returns values, only key names.
@@ -196,5 +204,16 @@ mod tests {
             assert!(!name.contains("secret"));
         }
         unsafe { std::env::remove_var("XAI_API_KEY") };
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn any_ai_key_present_returns_true_when_set() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "dk-test") };
+        assert!(any_ai_key_present());
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     }
 }
