@@ -758,4 +758,60 @@ mod tests {
 
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
     }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn append_ai_keys_respects_config_disables() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("OPENAI_API_KEY", "host-key") };
+
+        let workspace = std::env::temp_dir().join(format!(
+            "cella-append-ai-keys-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let devcontainer_dir = workspace.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).expect("create .devcontainer directory");
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            workspace.to_string_lossy().to_string(),
+        );
+
+        // Global disable: [credentials.ai] enabled = false
+        std::fs::write(
+            devcontainer_dir.join("cella.toml"),
+            "[credentials.ai]\nenabled = false\n",
+        )
+        .expect("write disabled AI config");
+
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
+            "OPENAI_API_KEY should not be forwarded when [credentials.ai] enabled = false"
+        );
+
+        // Per-provider disable: openai = false
+        std::fs::write(
+            devcontainer_dir.join("cella.toml"),
+            "[credentials.ai]\nopenai = false\n",
+        )
+        .expect("write provider-disabled AI config");
+
+        let mut env = Vec::new();
+        append_ai_keys(&mut env, &labels);
+        assert!(
+            !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
+            "OPENAI_API_KEY should not be forwarded when [credentials.ai] openai = false"
+        );
+
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }
