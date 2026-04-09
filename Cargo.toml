@@ -118,7 +118,7 @@ regex = "=1.12.3"
 glob = "=0.3.3"
 
 # JSONC editing
-jsonc-parser = { version = "=0.32.2", features = ["cst"] }
+jsonc-parser = { version = "=0.32.3", features = ["cst"] }
 
 # Certificate management
 rcgen = "=0.14.7"
