@@ -290,12 +290,16 @@ pub async fn resolve_service_container(
 /// then detects keys that are present on the host, enabled in config,
 /// and not already set by the user (via `remoteEnv` / `containerEnv`).
 pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<String, String>) {
-    let settings = labels
+    let Some(workspace_path) = labels
         .get("dev.cella.workspace_path")
-        .map(std::path::Path::new)
-        .map_or_else(cella_config::settings::Settings::default, |p| {
-            cella_config::settings::Settings::load(p)
-        });
+        .filter(|p| !p.trim().is_empty())
+    else {
+        // Only forward host AI credentials to containers that carry the
+        // trusted workspace label identifying them as cella-managed.
+        return;
+    };
+
+    let settings = cella_config::settings::Settings::load(std::path::Path::new(workspace_path));
     let ai = &settings.credentials.ai;
     if !ai.enabled {
         return;

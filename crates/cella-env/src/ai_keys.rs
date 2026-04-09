@@ -103,6 +103,14 @@ pub fn detect_ai_key_names(provider_enabled: &dyn Fn(&str) -> bool) -> Vec<&'sta
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate the process environment.
+    ///
+    /// `std::env::set_var` / `remove_var` are `unsafe` in Rust 2024 because
+    /// concurrent access from multiple threads is UB.  Cargo runs tests in
+    /// parallel by default, so every test that touches env vars must hold
+    /// this lock first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn providers_count() {
         assert_eq!(AI_PROVIDERS.len(), 11);
@@ -127,6 +135,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn detect_skips_disabled_provider() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Even if the env var is set, disabled providers are skipped
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let keys = detect_ai_keys(&|id| id != "anthropic", &[]);
@@ -137,6 +148,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn detect_skips_user_override() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         let keys = detect_ai_keys(&|_| true, &["OPENAI_API_KEY"]);
         assert!(!keys.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
@@ -146,6 +160,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn detect_skips_empty_value() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("GEMINI_API_KEY", "") };
         let keys = detect_ai_keys(&|_| true, &[]);
         assert!(!keys.iter().any(|(k, _)| k == "GEMINI_API_KEY"));
@@ -155,6 +172,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn detect_returns_present_key() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("COHERE_API_KEY", "ck-test") };
         let keys = detect_ai_keys(&|_| true, &[]);
         let found = keys.iter().find(|(k, _)| k == "COHERE_API_KEY");
@@ -165,6 +185,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn detect_key_names_never_returns_values() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("XAI_API_KEY", "secret-value") };
         let names = detect_ai_key_names(&|_| true);
         assert!(names.contains(&"XAI_API_KEY"));
