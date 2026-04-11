@@ -174,11 +174,16 @@ fn build_entrypoint_cmd(
     // convention, not Docker-specific, so we hardcode it here rather than
     // pulling in a backend-specific crate.
     let agent_path = "/cella/bin/cella-agent";
+    // Restart loop: if the agent crashes, it is restarted after 1 second.
+    // `restart_agent_in_container()` sends `pkill -x cella-agent` which
+    // terminates only the agent process; the loop survives and restarts it.
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \
+         while true; do \
          \"{agent_path}\" daemon \
-         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &\n\
+         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" 2>/dev/null; \
+         sleep 1; done &\n\
          fi\n"
     );
 
