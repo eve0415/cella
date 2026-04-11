@@ -191,6 +191,14 @@ pub enum ManagementRequest {
     QueryStatus,
     /// Health check.
     Ping,
+    /// Update a container's IP address after it has started.
+    ///
+    /// Sent after pre-registration (with `container_ip: None`) once the
+    /// container is running and its IP is known.
+    UpdateContainerIp {
+        container_id: String,
+        container_ip: Option<String>,
+    },
     /// Request graceful shutdown of the daemon.
     Shutdown,
 }
@@ -228,6 +236,8 @@ pub enum ManagementResponse {
     },
     /// Daemon is shutting down.
     ShuttingDown { pid: u32 },
+    /// Container IP updated.
+    ContainerIpUpdated { container_id: String },
     /// Pong response.
     Pong,
     /// Error response.
