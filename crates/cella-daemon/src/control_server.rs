@@ -39,6 +39,8 @@ pub(crate) struct ControlContext {
 pub struct AgentConnectionState {
     pub connected: AtomicBool,
     pub last_seen_secs: AtomicU64,
+    /// Agent version from the most recent `AgentHello` handshake.
+    pub agent_version: std::sync::Mutex<Option<String>>,
 }
 
 impl AgentConnectionState {
@@ -46,6 +48,7 @@ impl AgentConnectionState {
         Self {
             connected: AtomicBool::new(false),
             last_seen_secs: AtomicU64::new(0),
+            agent_version: std::sync::Mutex::new(None),
         }
     }
 }
@@ -208,6 +211,11 @@ where
         pm.container_ip(&container_id).map(String::from)
     };
 
+    // Store the live agent version for status queries.
+    if let Ok(mut v) = agent_state.agent_version.lock() {
+        *v = Some(agent_hello.agent_version.clone());
+    }
+
     if agent_hello.agent_version != env!("CARGO_PKG_VERSION") {
         warn!(
             "Agent version mismatch: agent={} daemon={}",
@@ -337,6 +345,14 @@ async fn handle_agent_connection(
             send_message(&mut writer, &resp).await?;
         }
     }
+
+    // Connection closed — clear live state so status queries don't report
+    // stale version/connectivity info for this container.
+    hs.agent_state.connected.store(false, Ordering::Relaxed);
+    if let Ok(mut v) = hs.agent_state.agent_version.lock() {
+        *v = None;
+    }
+    info!("Agent disconnected for container {}", hs.container_name);
 
     Ok(())
 }

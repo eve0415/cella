@@ -6,8 +6,6 @@ use cella_port::allocation::PortAllocationTable;
 use cella_protocol::{OnAutoForward, PortAttributes, PortProtocol};
 use tracing::{info, warn};
 
-use crate::proxy::ProxyHandle;
-
 /// Check if a host port is free at the OS level.
 ///
 /// Uses a synchronous TCP bind probe. Fast (~1μs).
@@ -23,8 +21,6 @@ pub struct PortManager {
     allocation: PortAllocationTable,
     /// Whether we're running on `OrbStack` (skips TCP proxies).
     is_orbstack: bool,
-    /// Active TCP proxy handles.
-    proxy_handles: HashMap<u16, ProxyHandle>,
     /// Optional OS-level port availability check.
     port_checker: Option<Box<dyn Fn(u16) -> bool + Send + Sync>>,
 }
@@ -54,7 +50,6 @@ impl PortManager {
             containers: HashMap::new(),
             allocation: PortAllocationTable::new(),
             is_orbstack,
-            proxy_handles: HashMap::new(),
             port_checker: None,
         }
     }
@@ -73,6 +68,14 @@ impl PortManager {
     }
 
     /// Register a container for port management.
+    ///
+    /// If the container was previously registered (e.g. after a restart),
+    /// all existing port allocations are released first so the agent can
+    /// re-report ports without silent remapping.
+    ///
+    /// Returns the list of host ports that were released. The caller must
+    /// send `ProxyCommand::Stop` for each to stop the coordinator-owned
+    /// TCP proxies.
     pub fn register_container(
         &mut self,
         container_id: &str,
@@ -80,7 +83,20 @@ impl PortManager {
         container_ip: Option<String>,
         ports_attributes: Vec<PortAttributes>,
         other_ports_attributes: Option<PortAttributes>,
-    ) {
+    ) -> Vec<u16> {
+        let mut released_ports = Vec::new();
+
+        // Release stale allocations from a previous registration.
+        if self.containers.contains_key(container_id) {
+            released_ports = self
+                .allocation
+                .container_ports(container_id)
+                .iter()
+                .map(|p| p.host_port)
+                .collect();
+            self.allocation.release_container(container_id);
+        }
+
         self.containers.insert(
             container_id.to_string(),
             ContainerPorts {
@@ -91,6 +107,21 @@ impl PortManager {
                 other_ports_attributes,
             },
         );
+
+        released_ports
+    }
+
+    /// Update a container's IP address without touching ports or allocations.
+    ///
+    /// Used after pre-registration (with `None` IP) once the container is
+    /// running and its IP is known.  Returns `true` if the container was found.
+    pub fn update_container_ip(&mut self, container_id: &str, ip: Option<String>) -> bool {
+        if let Some(container) = self.containers.get_mut(container_id) {
+            container.container_ip = ip;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get the container's IP address.
@@ -222,9 +253,6 @@ impl PortManager {
 
         if let Some(hp) = host_port {
             self.allocation.release_port(hp);
-            if let Some(handle) = self.proxy_handles.remove(&hp) {
-                handle.abort();
-            }
         }
 
         host_port
@@ -450,5 +478,44 @@ mod tests {
         // Re-opening should get the same port back, not 3001
         let hp = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         assert_eq!(hp, Some(3000));
+    }
+
+    #[test]
+    fn re_register_releases_old_allocations() {
+        let mut pm = PortManager::new(false);
+        pm.register_container("c1", "test", None, vec![], None);
+        let hp1 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+        assert_eq!(hp1, Some(3000));
+
+        // Re-register simulates a container restart: old allocations must be
+        // released so the agent can reclaim the native port.
+        pm.register_container("c1", "test", None, vec![], None);
+        let hp2 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+        assert_eq!(
+            hp2,
+            Some(3000),
+            "port should get native allocation after re-register"
+        );
+    }
+
+    #[test]
+    fn update_container_ip_preserves_ports() {
+        let mut pm = PortManager::new(false);
+        pm.register_container("c1", "test", None, vec![], None);
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+
+        assert!(pm.update_container_ip("c1", Some("172.20.0.5".to_string())));
+        assert_eq!(pm.container_ip("c1"), Some("172.20.0.5"));
+
+        // Ports must still be forwarded after IP update.
+        let ports = pm.all_forwarded_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].host_port, 3000);
+    }
+
+    #[test]
+    fn update_container_ip_unknown_container() {
+        let mut pm = PortManager::new(false);
+        assert!(!pm.update_container_ip("unknown", Some("1.2.3.4".to_string())));
     }
 }

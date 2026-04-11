@@ -191,6 +191,14 @@ pub enum ManagementRequest {
     QueryStatus,
     /// Health check.
     Ping,
+    /// Update a container's IP address after it has started.
+    ///
+    /// Sent after pre-registration (with `container_ip: None`) once the
+    /// container is running and its IP is known.
+    UpdateContainerIp {
+        container_id: String,
+        container_ip: Option<String>,
+    },
     /// Request graceful shutdown of the daemon.
     Shutdown,
 }
@@ -228,6 +236,8 @@ pub enum ManagementResponse {
     },
     /// Daemon is shutting down.
     ShuttingDown { pid: u32 },
+    /// Container IP updated.
+    ContainerIpUpdated { container_id: String },
     /// Pong response.
     Pong,
     /// Error response.
@@ -254,6 +264,9 @@ pub struct ContainerSummary {
     pub agent_connected: bool,
     #[serde(default)]
     pub last_seen_secs: u64,
+    /// Agent version from the `AgentHello` handshake, if connected.
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
 /// Messages sent from the host daemon to the in-container agent.
@@ -768,6 +781,7 @@ mod tests {
                 forwarded_port_count: 1,
                 agent_connected: true,
                 last_seen_secs: 1000,
+                agent_version: Some("0.1.0".to_string()),
             }],
             is_orbstack: false,
             daemon_version: "0.1.0".to_string(),

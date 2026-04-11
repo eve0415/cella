@@ -144,7 +144,7 @@ async fn check_single_container(
     });
 
     // Version skew check
-    check_version_skew(client, container_id, &mut checks).await;
+    check_version_skew(client, container_id, &mut checks, container_name).await;
 
     // Agent/port checks only apply to backends with managed agents
     if client.capabilities().managed_agent {
@@ -165,31 +165,82 @@ async fn check_version_skew(
     client: &dyn ContainerBackend,
     container_id: &str,
     checks: &mut Vec<CheckResult>,
+    container_name: &str,
 ) {
-    let Ok(info) = client.inspect_container(container_id).await else {
-        return;
-    };
-
     let cli_version = env!("CARGO_PKG_VERSION");
-    let container_version = info
-        .labels
-        .get("dev.cella.version")
-        .map_or("unknown", String::as_str);
 
-    if container_version == cli_version {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Pass,
-            detail: container_version.to_string(),
-            fix_hint: None,
-        });
+    // Prefer the live agent version from the daemon handshake.
+    // Fall back to the Docker label when the agent isn't connected
+    // (unmanaged backend, agent crashed, etc.).
+    let agent_version = query_live_agent_version(container_name).await;
+
+    match agent_version.as_deref() {
+        Some(v) if v == cli_version => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Pass,
+                detail: cli_version.to_string(),
+                fix_hint: None,
+            });
+        }
+        Some(v) => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Warning,
+                detail: format!("agent {v} != CLI {cli_version}"),
+                fix_hint: Some("Run `cella up` to update the agent".into()),
+            });
+        }
+        None => {
+            // Fall back to Docker label for unmanaged backends or
+            // disconnected agents.
+            let label_version = client
+                .inspect_container(container_id)
+                .await
+                .ok()
+                .and_then(|info| info.labels.get("dev.cella.version").cloned());
+            let container_version = label_version.as_deref().unwrap_or("unknown");
+            if container_version == cli_version {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Pass,
+                    detail: cli_version.to_string(),
+                    fix_hint: None,
+                });
+            } else {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Warning,
+                    detail: format!("container {container_version} != CLI {cli_version}"),
+                    fix_hint: Some("Run `cella up` to update".into()),
+                });
+            }
+        }
+    }
+}
+
+/// Query the daemon for a container's live agent version.
+async fn query_live_agent_version(container_name: &str) -> Option<String> {
+    let data_dir = cella_env::paths::cella_data_dir()?;
+    let mgmt_socket = data_dir.join("daemon.sock");
+    if !mgmt_socket.exists() {
+        return None;
+    }
+
+    let resp = cella_daemon::management::send_management_request(
+        &mgmt_socket,
+        &ManagementRequest::QueryStatus,
+    )
+    .await
+    .ok()?;
+
+    if let ManagementResponse::Status { containers, .. } = resp {
+        containers
+            .into_iter()
+            .find(|c| c.container_name == container_name && c.agent_connected)
+            .and_then(|c| c.agent_version)
     } else {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Warning,
-            detail: format!("container {container_version} != CLI {cli_version}"),
-            fix_hint: Some("Run `cella up` to update".into()),
-        });
+        None
     }
 }
 

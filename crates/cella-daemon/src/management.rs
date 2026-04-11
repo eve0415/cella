@@ -208,7 +208,7 @@ async fn handle_management_request(
                 backend_kind: data.backend_kind,
                 docker_host: data.docker_host,
             };
-            handle_register(reg, &ctx.port_manager, container_handles).await
+            handle_register(reg, &ctx.port_manager, container_handles, &ctx.proxy_cmd_tx).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
             handle_deregister(&container_name, &ctx.port_manager, container_handles).await
@@ -225,6 +225,25 @@ async fn handle_management_request(
                 ctx.control_port,
             )
             .await
+        }
+        ManagementRequest::UpdateContainerIp {
+            container_id,
+            container_ip,
+        } => {
+            let found = ctx
+                .port_manager
+                .lock()
+                .await
+                .update_container_ip(&container_id, container_ip);
+            if found {
+                info!("Updated container IP for {container_id}");
+                ManagementResponse::ContainerIpUpdated { container_id }
+            } else {
+                warn!("UpdateContainerIp: unknown container {container_id}");
+                ManagementResponse::Error {
+                    message: format!("unknown container: {container_id}"),
+                }
+            }
         }
         ManagementRequest::Ping => ManagementResponse::Pong,
         ManagementRequest::Shutdown => {
@@ -253,17 +272,25 @@ async fn handle_register(
     reg: ContainerRegistration,
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
 ) -> ManagementResponse {
     // Register with port manager
     {
         let mut pm = port_manager.lock().await;
-        pm.register_container(
+        let released = pm.register_container(
             &reg.container_id,
             &reg.container_name,
             reg.container_ip,
             reg.ports_attributes,
             reg.other_ports_attributes,
         );
+
+        // Stop coordinator-owned proxies for ports released by re-registration.
+        for hp in released {
+            let _ = proxy_cmd_tx
+                .send(ProxyCommand::Stop { host_port: hp })
+                .await;
+        }
 
         // Pre-allocate host ports for forwardPorts
         for &fwd_port in &reg.forward_ports {
@@ -376,6 +403,12 @@ async fn handle_query_status(
                 forwarded_port_count: port_count,
                 agent_connected: handle.agent_state.connected.load(Ordering::Relaxed),
                 last_seen_secs: handle.agent_state.last_seen_secs.load(Ordering::Relaxed),
+                agent_version: handle
+                    .agent_state
+                    .agent_version
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.clone()),
             }
         })
         .collect();

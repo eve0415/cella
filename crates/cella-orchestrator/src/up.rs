@@ -43,6 +43,16 @@ pub trait UpHooks: Send + Sync {
         container_ip: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 
+    /// Update a container's IP address with the daemon after pre-registration.
+    /// Returns `true` if the container was found, `false` if unknown (e.g.
+    /// daemon restarted and lost state — caller should fall back to full
+    /// registration via `on_container_started`).
+    fn update_container_ip(
+        &self,
+        container_id: &str,
+        container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
     /// Called before stopping or removing a managed container.
     fn on_container_stopping(
         &self,
@@ -76,6 +86,14 @@ impl UpHooks for NoOpHooks {
         _container_ip: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
+    }
+
+    fn update_container_ip(
+        &self,
+        _container_id: &str,
+        _container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
     }
 
     fn on_container_stopping(
@@ -385,21 +403,11 @@ impl EnsureUpContext<'_> {
             {
                 warn!("Failed to repopulate agent volume: {e}");
             }
-            restart_agent_in_container(self.client, &container.id).await;
         }
 
-        let container_ip = self
-            .client
-            .get_container_ip(&container.id)
-            .await
-            .unwrap_or(None);
-        self.hooks
-            .on_container_started(
-                &container.id,
-                self.config.container_name,
-                container_ip.as_deref(),
-            )
-            .await;
+        if capabilities.managed_agent {
+            self.ensure_agent_registered(&container.id).await;
+        }
 
         let (_probed_env, lifecycle_env) =
             self.prepare_container_env(&container.id, remote_user).await;
@@ -475,13 +483,8 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
-    async fn handle_stopped(
-        &self,
-        container: &ContainerInfo,
-        remote_user: &str,
-    ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
-        let capabilities = self.client.capabilities();
-
+    /// Emit warnings when the container's config or runtime has drifted.
+    fn warn_config_drift(&self, container: &ContainerInfo) {
         if let Some(old_hash) = &container.config_hash
             && *old_hash != self.config.resolved.config_hash
         {
@@ -502,21 +505,73 @@ impl EnsureUpContext<'_> {
                     .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
             }
         }
+    }
+
+    /// Restart the agent and ensure the container is registered with the daemon.
+    ///
+    /// Restarts the agent so it picks up the latest `.daemon_addr`, then
+    /// tries a non-destructive IP update. If the daemon doesn't know about
+    /// this container (e.g. after a daemon restart), falls back to full
+    /// registration.
+    async fn ensure_agent_registered(&self, container_id: &str) {
+        restart_agent_in_container(self.client, container_id).await;
+
+        let container_ip = self
+            .client
+            .get_container_ip(container_id)
+            .await
+            .unwrap_or(None);
+        let known = self
+            .hooks
+            .update_container_ip(container_id, container_ip.as_deref())
+            .await;
+        if !known {
+            info!("Container not registered with daemon, performing full registration");
+            self.hooks
+                .on_container_started(
+                    container_id,
+                    self.config.container_name,
+                    container_ip.as_deref(),
+                )
+                .await;
+        }
+    }
+
+    /// Roll back a daemon pre-registration that was made before a failed start.
+    async fn rollback_preregistration(&self) {
+        if self.client.capabilities().managed_agent {
+            self.hooks
+                .on_container_stopping(self.config.container_name)
+                .await;
+        }
+    }
+
+    async fn handle_stopped(
+        &self,
+        container: &ContainerInfo,
+        remote_user: &str,
+    ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let capabilities = self.client.capabilities();
+
+        self.warn_config_drift(container);
 
         if capabilities.managed_agent {
             let agent_arch = self.detect_arch().await;
-            let version = env!("CARGO_PKG_VERSION");
             run_step_result(
                 &self.progress,
                 "Populating agent volume...",
                 self.client.ensure_agent_provisioned(
-                    version,
+                    env!("CARGO_PKG_VERSION"),
                     &agent_arch,
                     self.config.skip_checksum,
                 ),
             )
             .await?;
             self.hooks.sync_agent_runtime(self.client).await;
+            // Pre-register before start so the agent can report ports immediately.
+            self.hooks
+                .on_container_started(&container.id, self.config.container_name, None)
+                .await;
         }
 
         let step = self.progress.step("Starting container...");
@@ -529,33 +584,45 @@ impl EnsureUpContext<'_> {
 
         match start_result {
             Ok(()) => {
-                crate::container_setup::verify_container_running(self.client, &container.id)
-                    .await?;
+                if let Err(e) =
+                    crate::container_setup::verify_container_running(self.client, &container.id)
+                        .await
+                {
+                    self.rollback_preregistration().await;
+                    return Err(e);
+                }
 
                 let container_ip = self
                     .client
                     .get_container_ip(&container.id)
                     .await
                     .unwrap_or(None);
-                self.hooks
-                    .on_container_started(
-                        &container.id,
-                        self.config.container_name,
-                        container_ip.as_deref(),
-                    )
-                    .await;
 
                 if capabilities.managed_agent {
+                    // Full re-registration with the actual IP. This is the
+                    // authoritative registration — the pre-registration before
+                    // start was best-effort so the agent doesn't race.
+                    // register_container() releases old state, so this is safe
+                    // even if the pre-registration succeeded.
+                    self.hooks
+                        .on_container_started(
+                            &container.id,
+                            self.config.container_name,
+                            container_ip.as_deref(),
+                        )
+                        .await;
                     restart_agent_in_container(self.client, &container.id).await;
                 }
 
                 self.run_restart_lifecycle(container, remote_user).await?;
 
-                if capabilities.managed_agent {
-                    let prune_version = env!("CARGO_PKG_VERSION");
-                    if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
-                        debug!("Agent version pruning failed: {e}");
-                    }
+                if capabilities.managed_agent
+                    && let Err(e) = self
+                        .client
+                        .prune_old_agent_versions(env!("CARGO_PKG_VERSION"))
+                        .await
+                {
+                    debug!("Agent version pruning failed: {e}");
                 }
 
                 Ok(Some(UpResult {
@@ -568,6 +635,7 @@ impl EnsureUpContext<'_> {
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
+                self.rollback_preregistration().await;
                 self.progress
                     .warn(&format!("Could not start existing container: {e}"));
                 self.progress.hint("Recreating container...");
@@ -1389,10 +1457,24 @@ pub async fn ensure_up(
     })
 }
 
+/// Restart the in-container agent daemon.
+///
+/// Kills only the `cella-agent daemon` process (not credential or browser
+/// helpers that exec the same binary), waits briefly for the entrypoint
+/// restart loop to respawn it, and only explicitly starts a replacement
+/// if nothing came back. This avoids double-launching the daemon on
+/// containers with the restart loop while remaining backward compatible
+/// with containers created before it was introduced.
 async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
     let agent_path = "/cella/bin/cella-agent";
+    // Kill the daemon, wait for the restart loop (if any) to bring it back,
+    // then spawn only if no daemon process is running.
+    // The bracket trick `[c]ella-agent` prevents pgrep -f from matching the
+    // sh -c wrapper itself (the bracket changes the literal string).
     let script = format!(
         "pkill -f 'cella-agent daemon' 2>/dev/null; \
+         sleep 1; \
+         pgrep -f '[c]ella-agent daemon' >/dev/null 2>&1 || \
          \"{agent_path}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
     );
@@ -1409,7 +1491,7 @@ async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id:
         )
         .await
     {
-        Ok(_) => info!("Agent restarted in container {container_id}"),
+        Ok(_) => info!("Agent restart triggered in container {container_id}"),
         Err(e) => warn!("Failed to restart agent in container: {e}"),
     }
 }
