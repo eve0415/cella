@@ -534,6 +534,16 @@ impl EnsureUpContext<'_> {
             self.hooks.sync_agent_runtime(self.client).await;
         }
 
+        // Pre-register with daemon BEFORE starting the container so the
+        // agent can report ports immediately without them being dropped.
+        // IP is unknown until the container is running, so pass None here
+        // and update it after start.
+        if capabilities.managed_agent {
+            self.hooks
+                .on_container_started(&container.id, self.config.container_name, None)
+                .await;
+        }
+
         let step = self.progress.step("Starting container...");
         let start_result = self.client.start_container(&container.id).await;
         if start_result.is_ok() {
@@ -552,13 +562,14 @@ impl EnsureUpContext<'_> {
                     .get_container_ip(&container.id)
                     .await
                     .unwrap_or(None);
-                self.hooks
-                    .on_container_started(
-                        &container.id,
-                        self.config.container_name,
-                        container_ip.as_deref(),
-                    )
-                    .await;
+
+                // Update the daemon with the actual container IP now that
+                // the container is running.
+                if capabilities.managed_agent {
+                    self.hooks
+                        .update_container_ip(&container.id, container_ip.as_deref())
+                        .await;
+                }
 
                 if capabilities.managed_agent {
                     restart_agent_in_container(self.client, &container.id).await;
