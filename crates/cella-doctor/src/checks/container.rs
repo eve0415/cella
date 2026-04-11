@@ -208,17 +208,27 @@ async fn check_version_skew(
             });
         }
         None => {
-            // Fall back to the container label if we can't read the volume.
+            // Volume marker unreadable (unmanaged backend or missing volume).
+            // Fall back to the container label to preserve skew detection.
             let container_version = info
                 .labels
                 .get("dev.cella.version")
                 .map_or("unknown", String::as_str);
-            checks.push(CheckResult {
-                name: "version".into(),
-                severity: Severity::Info,
-                detail: format!("created with {container_version} (agent binary unknown)"),
-                fix_hint: None,
-            });
+            if container_version == cli_version {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Pass,
+                    detail: cli_version.to_string(),
+                    fix_hint: None,
+                });
+            } else {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Warning,
+                    detail: format!("container {container_version} != CLI {cli_version}"),
+                    fix_hint: Some("Run `cella up --rebuild` to recreate the container".into()),
+                });
+            }
         }
     }
 }
