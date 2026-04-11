@@ -6,8 +6,6 @@ use cella_port::allocation::PortAllocationTable;
 use cella_protocol::{OnAutoForward, PortAttributes, PortProtocol};
 use tracing::{info, warn};
 
-use crate::proxy::ProxyHandle;
-
 /// Check if a host port is free at the OS level.
 ///
 /// Uses a synchronous TCP bind probe. Fast (~1μs).
@@ -23,8 +21,6 @@ pub struct PortManager {
     allocation: PortAllocationTable,
     /// Whether we're running on `OrbStack` (skips TCP proxies).
     is_orbstack: bool,
-    /// Active TCP proxy handles.
-    proxy_handles: HashMap<u16, ProxyHandle>,
     /// Optional OS-level port availability check.
     port_checker: Option<Box<dyn Fn(u16) -> bool + Send + Sync>>,
 }
@@ -54,7 +50,6 @@ impl PortManager {
             containers: HashMap::new(),
             allocation: PortAllocationTable::new(),
             is_orbstack,
-            proxy_handles: HashMap::new(),
             port_checker: None,
         }
     }
@@ -75,8 +70,12 @@ impl PortManager {
     /// Register a container for port management.
     ///
     /// If the container was previously registered (e.g. after a restart),
-    /// all existing port allocations and proxy handles are released first
-    /// so the agent can re-report ports without silent remapping.
+    /// all existing port allocations are released first so the agent can
+    /// re-report ports without silent remapping.
+    ///
+    /// Returns the list of host ports that were released. The caller must
+    /// send `ProxyCommand::Stop` for each to stop the coordinator-owned
+    /// TCP proxies.
     pub fn register_container(
         &mut self,
         container_id: &str,
@@ -84,20 +83,17 @@ impl PortManager {
         container_ip: Option<String>,
         ports_attributes: Vec<PortAttributes>,
         other_ports_attributes: Option<PortAttributes>,
-    ) {
-        // Release stale allocations and proxies from a previous registration.
+    ) -> Vec<u16> {
+        let mut released_ports = Vec::new();
+
+        // Release stale allocations from a previous registration.
         if self.containers.contains_key(container_id) {
-            let released: Vec<u16> = self
+            released_ports = self
                 .allocation
                 .container_ports(container_id)
                 .iter()
                 .map(|p| p.host_port)
                 .collect();
-            for hp in released {
-                if let Some(handle) = self.proxy_handles.remove(&hp) {
-                    handle.abort();
-                }
-            }
             self.allocation.release_container(container_id);
         }
 
@@ -111,6 +107,8 @@ impl PortManager {
                 other_ports_attributes,
             },
         );
+
+        released_ports
     }
 
     /// Update a container's IP address without touching ports or allocations.
@@ -255,9 +253,6 @@ impl PortManager {
 
         if let Some(hp) = host_port {
             self.allocation.release_port(hp);
-            if let Some(handle) = self.proxy_handles.remove(&hp) {
-                handle.abort();
-            }
         }
 
         host_port

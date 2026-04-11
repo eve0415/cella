@@ -208,7 +208,7 @@ async fn handle_management_request(
                 backend_kind: data.backend_kind,
                 docker_host: data.docker_host,
             };
-            handle_register(reg, &ctx.port_manager, container_handles).await
+            handle_register(reg, &ctx.port_manager, container_handles, &ctx.proxy_cmd_tx).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
             handle_deregister(&container_name, &ctx.port_manager, container_handles).await
@@ -269,17 +269,25 @@ async fn handle_register(
     reg: ContainerRegistration,
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
 ) -> ManagementResponse {
     // Register with port manager
     {
         let mut pm = port_manager.lock().await;
-        pm.register_container(
+        let released = pm.register_container(
             &reg.container_id,
             &reg.container_name,
             reg.container_ip,
             reg.ports_attributes,
             reg.other_ports_attributes,
         );
+
+        // Stop coordinator-owned proxies for ports released by re-registration.
+        for hp in released {
+            let _ = proxy_cmd_tx
+                .send(ProxyCommand::Stop { host_port: hp })
+                .await;
+        }
 
         // Pre-allocate host ports for forwardPorts
         for &fwd_port in &reg.forward_ports {
