@@ -172,64 +172,29 @@ async fn check_version_skew(
 
     let cli_version = env!("CARGO_PKG_VERSION");
 
-    // Read the agent volume version marker to determine the actual
-    // agent binary version — this is what matters, not the container
-    // creation label (which is immutable after creation).
-    let agent_version = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["cat".to_string(), "/cella/.version".to_string()],
-                user: None,
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .ok()
-        .filter(|r| r.exit_code == 0)
-        .map(|r| r.stdout.trim().split('/').next().unwrap_or("").to_string());
+    // Use the per-container Docker label as the source of truth for version
+    // skew. The shared agent volume marker (/cella/.version) cannot be used
+    // here because it reflects whichever container last ran `cella up`, not
+    // the state of this specific container.
+    let container_version = info
+        .labels
+        .get("dev.cella.version")
+        .map_or("unknown", String::as_str);
 
-    match agent_version.as_deref() {
-        Some(v) if v == cli_version => {
-            checks.push(CheckResult {
-                name: "version".into(),
-                severity: Severity::Pass,
-                detail: cli_version.to_string(),
-                fix_hint: None,
-            });
-        }
-        Some(v) => {
-            checks.push(CheckResult {
-                name: "version".into(),
-                severity: Severity::Warning,
-                detail: format!("agent binary {v} != CLI {cli_version}"),
-                fix_hint: Some("Run `cella up` to update the agent binary".into()),
-            });
-        }
-        None => {
-            // Volume marker unreadable (unmanaged backend or missing volume).
-            // Fall back to the container label to preserve skew detection.
-            let container_version = info
-                .labels
-                .get("dev.cella.version")
-                .map_or("unknown", String::as_str);
-            if container_version == cli_version {
-                checks.push(CheckResult {
-                    name: "version".into(),
-                    severity: Severity::Pass,
-                    detail: cli_version.to_string(),
-                    fix_hint: None,
-                });
-            } else {
-                checks.push(CheckResult {
-                    name: "version".into(),
-                    severity: Severity::Warning,
-                    detail: format!("container {container_version} != CLI {cli_version}"),
-                    fix_hint: Some("Run `cella up --rebuild` to recreate the container".into()),
-                });
-            }
-        }
+    if container_version == cli_version {
+        checks.push(CheckResult {
+            name: "version".into(),
+            severity: Severity::Pass,
+            detail: container_version.to_string(),
+            fix_hint: None,
+        });
+    } else {
+        checks.push(CheckResult {
+            name: "version".into(),
+            severity: Severity::Info,
+            detail: format!("created with {container_version} (agent binary auto-updated)"),
+            fix_hint: None,
+        });
     }
 }
 
