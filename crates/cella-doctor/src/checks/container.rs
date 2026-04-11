@@ -162,16 +162,16 @@ async fn check_single_container(
 }
 
 async fn check_version_skew(
-    _client: &dyn ContainerBackend,
-    _container_id: &str,
+    client: &dyn ContainerBackend,
+    container_id: &str,
     checks: &mut Vec<CheckResult>,
     container_name: &str,
 ) {
     let cli_version = env!("CARGO_PKG_VERSION");
 
-    // Query the daemon for the live agent version from the AgentHello
-    // handshake. This reflects the actual running binary, not a stale
-    // Docker label or shared volume marker.
+    // Prefer the live agent version from the daemon handshake.
+    // Fall back to the Docker label when the agent isn't connected
+    // (unmanaged backend, agent crashed, etc.).
     let agent_version = query_live_agent_version(container_name).await;
 
     match agent_version.as_deref() {
@@ -192,14 +192,29 @@ async fn check_version_skew(
             });
         }
         None => {
-            // Agent not connected — version unknown. The agent connectivity
-            // check will report the connection issue separately.
-            checks.push(CheckResult {
-                name: "version".into(),
-                severity: Severity::Info,
-                detail: "agent not connected (version unknown)".into(),
-                fix_hint: None,
-            });
+            // Fall back to Docker label for unmanaged backends or
+            // disconnected agents.
+            let label_version = client
+                .inspect_container(container_id)
+                .await
+                .ok()
+                .and_then(|info| info.labels.get("dev.cella.version").cloned());
+            let container_version = label_version.as_deref().unwrap_or("unknown");
+            if container_version == cli_version {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Pass,
+                    detail: cli_version.to_string(),
+                    fix_hint: None,
+                });
+            } else {
+                checks.push(CheckResult {
+                    name: "version".into(),
+                    severity: Severity::Warning,
+                    detail: format!("container {container_version} != CLI {cli_version}"),
+                    fix_hint: Some("Run `cella up` to update".into()),
+                });
+            }
         }
     }
 }

@@ -582,8 +582,17 @@ impl EnsureUpContext<'_> {
                     .unwrap_or(None);
 
                 if capabilities.managed_agent {
+                    // Full re-registration with the actual IP. This is the
+                    // authoritative registration — the pre-registration before
+                    // start was best-effort so the agent doesn't race.
+                    // register_container() releases old state, so this is safe
+                    // even if the pre-registration succeeded.
                     self.hooks
-                        .update_container_ip(&container.id, container_ip.as_deref())
+                        .on_container_started(
+                            &container.id,
+                            self.config.container_name,
+                            container_ip.as_deref(),
+                        )
                         .await;
                     restart_agent_in_container(self.client, &container.id).await;
                 }
@@ -1442,13 +1451,13 @@ pub async fn ensure_up(
 async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
     let agent_path = "/cella/bin/cella-agent";
     // Kill the daemon, wait for the restart loop (if any) to bring it back,
-    // then spawn only if no agent daemon is running.
-    // Uses `pgrep -x cella-agent` (exact process name) instead of `pgrep -f`
-    // to avoid matching the sh -c wrapper that contains the pattern string.
+    // then spawn only if no daemon process is running.
+    // The bracket trick `[c]ella-agent` prevents pgrep -f from matching the
+    // sh -c wrapper itself (the bracket changes the literal string).
     let script = format!(
         "pkill -f 'cella-agent daemon' 2>/dev/null; \
          sleep 1; \
-         pgrep -x cella-agent >/dev/null 2>&1 || \
+         pgrep -f '[c]ella-agent daemon' >/dev/null 2>&1 || \
          \"{agent_path}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
     );
