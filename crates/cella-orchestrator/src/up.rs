@@ -560,8 +560,18 @@ impl EnsureUpContext<'_> {
 
         match start_result {
             Ok(()) => {
-                crate::container_setup::verify_container_running(self.client, &container.id)
-                    .await?;
+                if let Err(e) =
+                    crate::container_setup::verify_container_running(self.client, &container.id)
+                        .await
+                {
+                    // Container exited during startup. Roll back pre-registration.
+                    if capabilities.managed_agent {
+                        self.hooks
+                            .on_container_stopping(self.config.container_name)
+                            .await;
+                    }
+                    return Err(e.into());
+                }
 
                 let container_ip = self
                     .client
@@ -1442,10 +1452,12 @@ async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id:
     let agent_path = "/cella/bin/cella-agent";
     // Kill the daemon, wait for the restart loop (if any) to bring it back,
     // then spawn only if no agent daemon is running.
+    // Uses `pgrep -x cella-agent` (exact process name) instead of `pgrep -f`
+    // to avoid matching the sh -c wrapper that contains the pattern string.
     let script = format!(
         "pkill -f 'cella-agent daemon' 2>/dev/null; \
          sleep 1; \
-         pgrep -f 'cella-agent daemon' >/dev/null 2>&1 || \
+         pgrep -x cella-agent >/dev/null 2>&1 || \
          \"{agent_path}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
     );
