@@ -264,6 +264,9 @@ pub struct ContainerSummary {
     pub agent_connected: bool,
     #[serde(default)]
     pub last_seen_secs: u64,
+    /// Agent version from the `AgentHello` handshake, if connected.
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
 /// Messages sent from the host daemon to the in-container agent.
@@ -778,6 +781,7 @@ mod tests {
                 forwarded_port_count: 1,
                 agent_connected: true,
                 last_seen_secs: 1000,
+                agent_version: Some("0.1.0".to_string()),
             }],
             is_orbstack: false,
             daemon_version: "0.1.0".to_string(),

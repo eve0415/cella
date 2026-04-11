@@ -144,7 +144,7 @@ async fn check_single_container(
     });
 
     // Version skew check
-    check_version_skew(client, container_id, &mut checks).await;
+    check_version_skew(client, container_id, &mut checks, container_name).await;
 
     // Agent/port checks only apply to backends with managed agents
     if client.capabilities().managed_agent {
@@ -162,39 +162,70 @@ async fn check_single_container(
 }
 
 async fn check_version_skew(
-    client: &dyn ContainerBackend,
-    container_id: &str,
+    _client: &dyn ContainerBackend,
+    _container_id: &str,
     checks: &mut Vec<CheckResult>,
+    container_name: &str,
 ) {
-    let Ok(info) = client.inspect_container(container_id).await else {
-        return;
-    };
-
     let cli_version = env!("CARGO_PKG_VERSION");
 
-    // Use the per-container Docker label as the source of truth for version
-    // skew. The shared agent volume marker (/cella/.version) cannot be used
-    // here because it reflects whichever container last ran `cella up`, not
-    // the state of this specific container.
-    let container_version = info
-        .labels
-        .get("dev.cella.version")
-        .map_or("unknown", String::as_str);
+    // Query the daemon for the live agent version from the AgentHello
+    // handshake. This reflects the actual running binary, not a stale
+    // Docker label or shared volume marker.
+    let agent_version = query_live_agent_version(container_name).await;
 
-    if container_version == cli_version {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Pass,
-            detail: container_version.to_string(),
-            fix_hint: None,
-        });
+    match agent_version.as_deref() {
+        Some(v) if v == cli_version => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Pass,
+                detail: cli_version.to_string(),
+                fix_hint: None,
+            });
+        }
+        Some(v) => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Warning,
+                detail: format!("agent {v} != CLI {cli_version}"),
+                fix_hint: Some("Run `cella up` to update the agent".into()),
+            });
+        }
+        None => {
+            // Agent not connected — version unknown. The agent connectivity
+            // check will report the connection issue separately.
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Info,
+                detail: "agent not connected (version unknown)".into(),
+                fix_hint: None,
+            });
+        }
+    }
+}
+
+/// Query the daemon for a container's live agent version.
+async fn query_live_agent_version(container_name: &str) -> Option<String> {
+    let data_dir = cella_env::paths::cella_data_dir()?;
+    let mgmt_socket = data_dir.join("daemon.sock");
+    if !mgmt_socket.exists() {
+        return None;
+    }
+
+    let resp = cella_daemon::management::send_management_request(
+        &mgmt_socket,
+        &ManagementRequest::QueryStatus,
+    )
+    .await
+    .ok()?;
+
+    if let ManagementResponse::Status { containers, .. } = resp {
+        containers
+            .into_iter()
+            .find(|c| c.container_name == container_name && c.agent_connected)
+            .and_then(|c| c.agent_version)
     } else {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Info,
-            detail: format!("created with {container_version} (agent binary auto-updated)"),
-            fix_hint: None,
-        });
+        None
     }
 }
 

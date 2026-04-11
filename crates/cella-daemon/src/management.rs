@@ -400,6 +400,12 @@ async fn handle_query_status(
                 forwarded_port_count: port_count,
                 agent_connected: handle.agent_state.connected.load(Ordering::Relaxed),
                 last_seen_secs: handle.agent_state.last_seen_secs.load(Ordering::Relaxed),
+                agent_version: handle
+                    .agent_state
+                    .agent_version
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.clone()),
             }
         })
         .collect();

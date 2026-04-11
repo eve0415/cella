@@ -496,13 +496,8 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
-    async fn handle_stopped(
-        &self,
-        container: &ContainerInfo,
-        remote_user: &str,
-    ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
-        let capabilities = self.client.capabilities();
-
+    /// Emit warnings when the container's config or runtime has drifted.
+    fn warn_config_drift(&self, container: &ContainerInfo) {
         if let Some(old_hash) = &container.config_hash
             && *old_hash != self.config.resolved.config_hash
         {
@@ -523,28 +518,40 @@ impl EnsureUpContext<'_> {
                     .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
             }
         }
+    }
+
+    /// Roll back a daemon pre-registration that was made before a failed start.
+    async fn rollback_preregistration(&self) {
+        if self.client.capabilities().managed_agent {
+            self.hooks
+                .on_container_stopping(self.config.container_name)
+                .await;
+        }
+    }
+
+    async fn handle_stopped(
+        &self,
+        container: &ContainerInfo,
+        remote_user: &str,
+    ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let capabilities = self.client.capabilities();
+
+        self.warn_config_drift(container);
 
         if capabilities.managed_agent {
             let agent_arch = self.detect_arch().await;
-            let version = env!("CARGO_PKG_VERSION");
             run_step_result(
                 &self.progress,
                 "Populating agent volume...",
                 self.client.ensure_agent_provisioned(
-                    version,
+                    env!("CARGO_PKG_VERSION"),
                     &agent_arch,
                     self.config.skip_checksum,
                 ),
             )
             .await?;
             self.hooks.sync_agent_runtime(self.client).await;
-        }
-
-        // Pre-register with daemon BEFORE starting the container so the
-        // agent can report ports immediately without them being dropped.
-        // IP is unknown until the container is running, so pass None here
-        // and update it after start.
-        if capabilities.managed_agent {
+            // Pre-register before start so the agent can report ports immediately.
             self.hooks
                 .on_container_started(&container.id, self.config.container_name, None)
                 .await;
@@ -564,13 +571,8 @@ impl EnsureUpContext<'_> {
                     crate::container_setup::verify_container_running(self.client, &container.id)
                         .await
                 {
-                    // Container exited during startup. Roll back pre-registration.
-                    if capabilities.managed_agent {
-                        self.hooks
-                            .on_container_stopping(self.config.container_name)
-                            .await;
-                    }
-                    return Err(e.into());
+                    self.rollback_preregistration().await;
+                    return Err(e);
                 }
 
                 let container_ip = self
@@ -579,25 +581,22 @@ impl EnsureUpContext<'_> {
                     .await
                     .unwrap_or(None);
 
-                // Update the daemon with the actual container IP now that
-                // the container is running.
                 if capabilities.managed_agent {
                     self.hooks
                         .update_container_ip(&container.id, container_ip.as_deref())
                         .await;
-                }
-
-                if capabilities.managed_agent {
                     restart_agent_in_container(self.client, &container.id).await;
                 }
 
                 self.run_restart_lifecycle(container, remote_user).await?;
 
-                if capabilities.managed_agent {
-                    let prune_version = env!("CARGO_PKG_VERSION");
-                    if let Err(e) = self.client.prune_old_agent_versions(prune_version).await {
-                        debug!("Agent version pruning failed: {e}");
-                    }
+                if capabilities.managed_agent
+                    && let Err(e) = self
+                        .client
+                        .prune_old_agent_versions(env!("CARGO_PKG_VERSION"))
+                        .await
+                {
+                    debug!("Agent version pruning failed: {e}");
                 }
 
                 Ok(Some(UpResult {
@@ -610,15 +609,7 @@ impl EnsureUpContext<'_> {
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
-
-                // Roll back the pre-registration so the daemon doesn't hold
-                // stale port allocations for a container that never started.
-                if capabilities.managed_agent {
-                    self.hooks
-                        .on_container_stopping(self.config.container_name)
-                        .await;
-                }
-
+                self.rollback_preregistration().await;
                 self.progress
                     .warn(&format!("Could not start existing container: {e}"));
                 self.progress.hint("Recreating container...");
