@@ -346,6 +346,14 @@ async fn handle_agent_connection(
         }
     }
 
+    // Connection closed — clear live state so status queries don't report
+    // stale version/connectivity info for this container.
+    hs.agent_state.connected.store(false, Ordering::Relaxed);
+    if let Ok(mut v) = hs.agent_state.agent_version.lock() {
+        *v = None;
+    }
+    info!("Agent disconnected for container {}", hs.container_name);
+
     Ok(())
 }
 

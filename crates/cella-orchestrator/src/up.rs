@@ -409,17 +409,16 @@ impl EnsureUpContext<'_> {
             restart_agent_in_container(self.client, &container.id).await;
         }
 
+        // For running containers, use a non-destructive IP update instead of
+        // full re-registration. Re-registration would release all existing port
+        // allocations and tear down active proxy connections.
         let container_ip = self
             .client
             .get_container_ip(&container.id)
             .await
             .unwrap_or(None);
         self.hooks
-            .on_container_started(
-                &container.id,
-                self.config.container_name,
-                container_ip.as_deref(),
-            )
+            .update_container_ip(&container.id, container_ip.as_deref())
             .await;
 
         let (_probed_env, lifecycle_env) =
