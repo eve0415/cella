@@ -590,6 +590,34 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         })
     }
 
+    fn update_container_ip(
+        &self,
+        container_id: &str,
+        container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let container_id = container_id.to_string();
+        let container_ip = container_ip.map(str::to_string);
+        let managed_agent = self.managed_agent;
+        Box::pin(async move {
+            if !managed_agent {
+                return;
+            }
+
+            let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
+                return;
+            };
+            if !mgmt_sock.exists() {
+                return;
+            }
+
+            let req = cella_protocol::ManagementRequest::UpdateContainerIp {
+                container_id,
+                container_ip,
+            };
+            let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+        })
+    }
+
     fn on_container_stopping(
         &self,
         container_name: &str,
