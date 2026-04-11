@@ -400,6 +400,12 @@ impl EnsureUpContext<'_> {
             {
                 warn!("Failed to repopulate agent volume: {e}");
             }
+        }
+
+        // Always restart the agent so it picks up the latest .daemon_addr.
+        // Without this, an agent stuck in standalone mode (e.g. after a host
+        // restart where the daemon got a new port) would never reconnect.
+        if capabilities.managed_agent {
             restart_agent_in_container(self.client, &container.id).await;
         }
 
