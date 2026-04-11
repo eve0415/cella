@@ -43,6 +43,13 @@ pub trait UpHooks: Send + Sync {
         container_ip: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 
+    /// Update a container's IP address with the daemon after pre-registration.
+    fn update_container_ip(
+        &self,
+        container_id: &str,
+        container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
     /// Called before stopping or removing a managed container.
     fn on_container_stopping(
         &self,
@@ -73,6 +80,14 @@ impl UpHooks for NoOpHooks {
         &self,
         _container_id: &str,
         _container_name: &str,
+        _container_ip: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn update_container_ip(
+        &self,
+        _container_id: &str,
         _container_ip: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
