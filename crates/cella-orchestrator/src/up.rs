@@ -600,6 +600,15 @@ impl EnsureUpContext<'_> {
             }
             Err(e) => {
                 warn!("Failed to start existing container: {e}");
+
+                // Roll back the pre-registration so the daemon doesn't hold
+                // stale port allocations for a container that never started.
+                if capabilities.managed_agent {
+                    self.hooks
+                        .on_container_stopping(self.config.container_name)
+                        .await;
+                }
+
                 self.progress
                     .warn(&format!("Could not start existing container: {e}"));
                 self.progress.hint("Recreating container...");
