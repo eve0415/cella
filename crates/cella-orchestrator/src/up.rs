@@ -1433,19 +1433,19 @@ pub async fn ensure_up(
 /// Restart the in-container agent daemon.
 ///
 /// Kills only the `cella-agent daemon` process (not credential or browser
-/// helpers that exec the same binary) then explicitly starts a replacement.
-/// The explicit respawn is necessary for backward compatibility with
-/// containers created before the entrypoint restart loop was introduced —
-/// on those containers there is no loop to bring the agent back.
-///
-/// On containers that do have the loop, the loop will race with the
-/// explicit spawn; the loser exits harmlessly because the daemon addr
-/// file is already locked by the winner.
+/// helpers that exec the same binary), waits briefly for the entrypoint
+/// restart loop to respawn it, and only explicitly starts a replacement
+/// if nothing came back. This avoids double-launching the daemon on
+/// containers with the restart loop while remaining backward compatible
+/// with containers created before it was introduced.
 async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
     let agent_path = "/cella/bin/cella-agent";
+    // Kill the daemon, wait for the restart loop (if any) to bring it back,
+    // then spawn only if no agent daemon is running.
     let script = format!(
         "pkill -f 'cella-agent daemon' 2>/dev/null; \
-         sleep 0.2; \
+         sleep 1; \
+         pgrep -f 'cella-agent daemon' >/dev/null 2>&1 || \
          \"{agent_path}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
     );
