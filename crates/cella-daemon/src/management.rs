@@ -226,6 +226,22 @@ async fn handle_management_request(
             )
             .await
         }
+        ManagementRequest::UpdateContainerIp {
+            container_id,
+            container_ip,
+        } => {
+            let found = ctx
+                .port_manager
+                .lock()
+                .await
+                .update_container_ip(&container_id, container_ip);
+            if found {
+                info!("Updated container IP for {container_id}");
+            } else {
+                warn!("UpdateContainerIp: unknown container {container_id}");
+            }
+            ManagementResponse::ContainerIpUpdated { container_id }
+        }
         ManagementRequest::Ping => ManagementResponse::Pong,
         ManagementRequest::Shutdown => {
             let pid = std::process::id();

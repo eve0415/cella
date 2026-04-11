@@ -113,6 +113,19 @@ impl PortManager {
         );
     }
 
+    /// Update a container's IP address without touching ports or allocations.
+    ///
+    /// Used after pre-registration (with `None` IP) once the container is
+    /// running and its IP is known.  Returns `true` if the container was found.
+    pub fn update_container_ip(&mut self, container_id: &str, ip: Option<String>) -> bool {
+        if let Some(container) = self.containers.get_mut(container_id) {
+            container.container_ip = ip;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the container's IP address.
     pub fn container_ip(&self, container_id: &str) -> Option<&str> {
         self.containers
@@ -488,5 +501,26 @@ mod tests {
             Some(3000),
             "port should get native allocation after re-register"
         );
+    }
+
+    #[test]
+    fn update_container_ip_preserves_ports() {
+        let mut pm = PortManager::new(false);
+        pm.register_container("c1", "test", None, vec![], None);
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+
+        assert!(pm.update_container_ip("c1", Some("172.20.0.5".to_string())));
+        assert_eq!(pm.container_ip("c1"), Some("172.20.0.5"));
+
+        // Ports must still be forwarded after IP update.
+        let ports = pm.all_forwarded_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].host_port, 3000);
+    }
+
+    #[test]
+    fn update_container_ip_unknown_container() {
+        let mut pm = PortManager::new(false);
+        assert!(!pm.update_container_ip("unknown", Some("1.2.3.4".to_string())));
     }
 }
