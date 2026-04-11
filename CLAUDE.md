@@ -19,6 +19,8 @@ cargo test -p cella-features -p cella-daemon -p cella-compose --features integra
 
 Update snapshots with `cargo insta review`.
 
+**Note:** `cargo-insta` may not be installed in dev containers. Use `cargo test` to check snapshot correctness; update snapshots from the host with `cargo insta review`.
+
 ## Testing
 
 - Unit tests colocated in source files (`#[cfg(test)] mod tests`) — not separate test directories
@@ -42,6 +44,7 @@ Always research before suggesting changes or asking the user questions. Use `/sp
 - No `#[allow(clippy::...)]` annotations — fix the warning or restructure the code
 - No `_`-prefixed unused variables — delete dead code entirely
 - Workspace lints: clippy::pedantic + clippy::nursery (warn), unsafe_code (deny), unused_qualifications (deny)
+- `clippy::significant_drop_tightening` is active — inline mutex `.lock().await.method()` calls instead of binding the guard to a variable when only one method call is needed
 - Error types: thiserror for custom errors, miette for user-facing diagnostics
 - Async: tokio runtime, bollard for Docker API, gix for git operations
 - No backward compatibility constraints — refactor freely when improving code
@@ -57,6 +60,12 @@ Rust workspace (edition 2024, MSRV 1.94.0) with 19 crates in `crates/`. Three-ti
 - **Tier 3 (Foundation):** cella-backend, cella-port, cella-codegen, cella-network, cella-protocol, cella-jsonc
 
 Backend-agnostic design: cella-backend defines traits, cella-docker and cella-container implement them. Hooks pattern (PruneHooks, ComposeUpHooks, UpHooks) bridges CLI-owned operations into the orchestrator without circular dependencies.
+
+Key runtime constraints:
+- The `cella-agent` Docker volume is shared across ALL containers — changes affect every running container
+- Daemon state (port allocations, registrations) is in-memory only, lost on daemon restart
+- Docker container labels and env vars are immutable after creation — don't design around updating them
+- The agent entrypoint runs in a restart loop; `restart_agent_in_container()` just sends pkill and the loop handles restart
 
 ## Commits & PRs
 
