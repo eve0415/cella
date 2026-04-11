@@ -1421,20 +1421,31 @@ pub async fn ensure_up(
     })
 }
 
-/// Kill the running agent process. The entrypoint restart loop will
-/// automatically bring it back within ~1 second with a fresh connection
-/// to the daemon (reading the latest `.daemon_addr` file).
+/// Restart the in-container agent daemon.
 ///
-/// Uses `pkill -x` (exact name match) so only the agent binary is
-/// terminated — not the shell wrapper that runs the restart loop.
+/// Kills only the `cella-agent daemon` process (not credential or browser
+/// helpers that exec the same binary) then explicitly starts a replacement.
+/// The explicit respawn is necessary for backward compatibility with
+/// containers created before the entrypoint restart loop was introduced —
+/// on those containers there is no loop to bring the agent back.
+///
+/// On containers that do have the loop, the loop will race with the
+/// explicit spawn; the loser exits harmlessly because the daemon addr
+/// file is already locked by the winner.
 async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
-    let script = "pkill -x cella-agent 2>/dev/null || true";
+    let agent_path = "/cella/bin/cella-agent";
+    let script = format!(
+        "pkill -f 'cella-agent daemon' 2>/dev/null; \
+         sleep 0.2; \
+         \"{agent_path}\" daemon \
+         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
+    );
 
     match client
         .exec_detached(
             container_id,
             &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+                cmd: vec!["sh".to_string(), "-c".to_string(), script],
                 user: Some("root".to_string()),
                 env: None,
                 working_dir: None,

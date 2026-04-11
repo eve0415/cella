@@ -175,8 +175,8 @@ fn build_entrypoint_cmd(
     // pulling in a backend-specific crate.
     let agent_path = "/cella/bin/cella-agent";
     // Restart loop: if the agent crashes, it is restarted after 1 second.
-    // `restart_agent_in_container()` sends `pkill -x cella-agent` which
-    // terminates only the agent process; the loop survives and restarts it.
+    // `restart_agent_in_container()` sends `pkill -f 'cella-agent daemon'`
+    // which terminates the daemon process; the loop survives and restarts it.
     let _ = write!(
         script,
         "if [ -x \"{agent_path}\" ]; then\n  \
