@@ -171,25 +171,55 @@ async fn check_version_skew(
     };
 
     let cli_version = env!("CARGO_PKG_VERSION");
-    let container_version = info
-        .labels
-        .get("dev.cella.version")
-        .map_or("unknown", String::as_str);
 
-    if container_version == cli_version {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Pass,
-            detail: container_version.to_string(),
-            fix_hint: None,
-        });
-    } else {
-        checks.push(CheckResult {
-            name: "version".into(),
-            severity: Severity::Warning,
-            detail: format!("container {container_version} != CLI {cli_version}"),
-            fix_hint: Some("Run `cella up` to update".into()),
-        });
+    // Read the agent volume version marker to determine the actual
+    // agent binary version — this is what matters, not the container
+    // creation label (which is immutable after creation).
+    let agent_version = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["cat".to_string(), "/cella/.version".to_string()],
+                user: None,
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| r.stdout.trim().split('/').next().unwrap_or("").to_string());
+
+    match agent_version.as_deref() {
+        Some(v) if v == cli_version => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Pass,
+                detail: cli_version.to_string(),
+                fix_hint: None,
+            });
+        }
+        Some(v) => {
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Warning,
+                detail: format!("agent binary {v} != CLI {cli_version}"),
+                fix_hint: Some("Run `cella up` to update the agent binary".into()),
+            });
+        }
+        None => {
+            // Fall back to the container label if we can't read the volume.
+            let container_version = info
+                .labels
+                .get("dev.cella.version")
+                .map_or("unknown", String::as_str);
+            checks.push(CheckResult {
+                name: "version".into(),
+                severity: Severity::Info,
+                detail: format!("created with {container_version} (agent binary unknown)"),
+                fix_hint: None,
+            });
+        }
     }
 }
 
