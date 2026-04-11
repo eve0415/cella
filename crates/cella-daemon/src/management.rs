@@ -237,10 +237,13 @@ async fn handle_management_request(
                 .update_container_ip(&container_id, container_ip);
             if found {
                 info!("Updated container IP for {container_id}");
+                ManagementResponse::ContainerIpUpdated { container_id }
             } else {
                 warn!("UpdateContainerIp: unknown container {container_id}");
+                ManagementResponse::Error {
+                    message: format!("unknown container: {container_id}"),
+                }
             }
-            ManagementResponse::ContainerIpUpdated { container_id }
         }
         ManagementRequest::Ping => ManagementResponse::Pong,
         ManagementRequest::Shutdown => {

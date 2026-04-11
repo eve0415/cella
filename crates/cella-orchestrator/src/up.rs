@@ -44,11 +44,14 @@ pub trait UpHooks: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 
     /// Update a container's IP address with the daemon after pre-registration.
+    /// Returns `true` if the container was found, `false` if unknown (e.g.
+    /// daemon restarted and lost state — caller should fall back to full
+    /// registration via `on_container_started`).
     fn update_container_ip(
         &self,
         container_id: &str,
         container_ip: Option<&str>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 
     /// Called before stopping or removing a managed container.
     fn on_container_stopping(
@@ -89,8 +92,8 @@ impl UpHooks for NoOpHooks {
         &self,
         _container_id: &str,
         _container_ip: Option<&str>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
     }
 
     fn on_container_stopping(
@@ -402,24 +405,9 @@ impl EnsureUpContext<'_> {
             }
         }
 
-        // Always restart the agent so it picks up the latest .daemon_addr.
-        // Without this, an agent stuck in standalone mode (e.g. after a host
-        // restart where the daemon got a new port) would never reconnect.
         if capabilities.managed_agent {
-            restart_agent_in_container(self.client, &container.id).await;
+            self.ensure_agent_registered(&container.id).await;
         }
-
-        // For running containers, use a non-destructive IP update instead of
-        // full re-registration. Re-registration would release all existing port
-        // allocations and tear down active proxy connections.
-        let container_ip = self
-            .client
-            .get_container_ip(&container.id)
-            .await
-            .unwrap_or(None);
-        self.hooks
-            .update_container_ip(&container.id, container_ip.as_deref())
-            .await;
 
         let (_probed_env, lifecycle_env) =
             self.prepare_container_env(&container.id, remote_user).await;
@@ -516,6 +504,36 @@ impl EnsureUpContext<'_> {
                 self.progress
                     .hint("Run `cella up --rebuild` to recreate with the updated runtime.");
             }
+        }
+    }
+
+    /// Restart the agent and ensure the container is registered with the daemon.
+    ///
+    /// Restarts the agent so it picks up the latest `.daemon_addr`, then
+    /// tries a non-destructive IP update. If the daemon doesn't know about
+    /// this container (e.g. after a daemon restart), falls back to full
+    /// registration.
+    async fn ensure_agent_registered(&self, container_id: &str) {
+        restart_agent_in_container(self.client, container_id).await;
+
+        let container_ip = self
+            .client
+            .get_container_ip(container_id)
+            .await
+            .unwrap_or(None);
+        let known = self
+            .hooks
+            .update_container_ip(container_id, container_ip.as_deref())
+            .await;
+        if !known {
+            info!("Container not registered with daemon, performing full registration");
+            self.hooks
+                .on_container_started(
+                    container_id,
+                    self.config.container_name,
+                    container_ip.as_deref(),
+                )
+                .await;
         }
     }
 
