@@ -73,6 +73,10 @@ impl PortManager {
     }
 
     /// Register a container for port management.
+    ///
+    /// If the container was previously registered (e.g. after a restart),
+    /// all existing port allocations and proxy handles are released first
+    /// so the agent can re-report ports without silent remapping.
     pub fn register_container(
         &mut self,
         container_id: &str,
@@ -81,6 +85,22 @@ impl PortManager {
         ports_attributes: Vec<PortAttributes>,
         other_ports_attributes: Option<PortAttributes>,
     ) {
+        // Release stale allocations and proxies from a previous registration.
+        if self.containers.contains_key(container_id) {
+            let released: Vec<u16> = self
+                .allocation
+                .container_ports(container_id)
+                .iter()
+                .map(|p| p.host_port)
+                .collect();
+            for hp in released {
+                if let Some(handle) = self.proxy_handles.remove(&hp) {
+                    handle.abort();
+                }
+            }
+            self.allocation.release_container(container_id);
+        }
+
         self.containers.insert(
             container_id.to_string(),
             ContainerPorts {
@@ -450,5 +470,23 @@ mod tests {
         // Re-opening should get the same port back, not 3001
         let hp = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         assert_eq!(hp, Some(3000));
+    }
+
+    #[test]
+    fn re_register_releases_old_allocations() {
+        let mut pm = PortManager::new(false);
+        pm.register_container("c1", "test", None, vec![], None);
+        let hp1 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+        assert_eq!(hp1, Some(3000));
+
+        // Re-register simulates a container restart: old allocations must be
+        // released so the agent can reclaim the native port.
+        pm.register_container("c1", "test", None, vec![], None);
+        let hp2 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+        assert_eq!(
+            hp2,
+            Some(3000),
+            "port should get native allocation after re-register"
+        );
     }
 }
