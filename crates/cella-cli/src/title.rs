@@ -92,6 +92,22 @@ impl TitleGuard {
     }
 }
 
+/// Convenience: build a guard from a resolved container. Pulls `branch` from
+/// the `dev.cella.branch` label when present, and `service` from the caller's
+/// explicit flag.
+pub fn push_for_container(
+    container: &cella_backend::ContainerInfo,
+    service: Option<&str>,
+    subcommand: &'static str,
+) -> Option<TitleGuard> {
+    TitleGuard::push(&TitleContent {
+        name: title_name(&container.name).to_string(),
+        service: service.map(str::to_string),
+        branch: container.labels.get("dev.cella.branch").cloned(),
+        subcommand,
+    })
+}
+
 impl Drop for TitleGuard {
     fn drop(&mut self) {
         let tmux = in_tmux();

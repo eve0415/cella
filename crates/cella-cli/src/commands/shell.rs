@@ -69,12 +69,8 @@ impl ShellArgs {
             super::resolve_service_container(client.as_ref(), container, self.service.as_deref())
                 .await?;
 
-        let title_guard = crate::title::TitleGuard::push(&crate::title::TitleContent {
-            name: crate::title::title_name(&container.name).to_string(),
-            service: self.service.clone(),
-            branch: container.labels.get("dev.cella.branch").cloned(),
-            subcommand: "shell",
-        });
+        let title_guard =
+            crate::title::push_for_container(&container, self.service.as_deref(), "shell");
 
         super::ensure_cella_daemon().await;
 

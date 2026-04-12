@@ -8,6 +8,7 @@ use cella_orchestrator::env_cache::{ensure_ssh_auth_sock, read_probed_env_cache}
 use cella_orchestrator::shell_detect::{detect_shell, wrap_in_login_shell};
 
 use crate::picker;
+use crate::title::push_for_container;
 
 /// Execute a command inside the running dev container.
 #[derive(Args)]
@@ -160,7 +161,7 @@ impl ExecArgs {
                 .await?;
             println!("{exec_id}");
         } else {
-            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let title_guard = push_for_container(&container, self.service.as_deref(), "exec");
             let exit_code = client
                 .as_ref()
                 .exec_interactive(
@@ -170,10 +171,11 @@ impl ExecArgs {
                         user: Some(user),
                         env: Some(env),
                         working_dir,
-                        tty: is_tty,
+                        tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
                     },
                 )
                 .await?;
+            drop(title_guard);
             std::process::exit(i32::try_from(exit_code).unwrap_or(125));
         }
 
