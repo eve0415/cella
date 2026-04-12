@@ -475,6 +475,8 @@ pub async fn install_codex(
         return;
     }
 
+    ensure_codex_sandbox_deps(client, container_id).await;
+
     debug!("Installing Codex ({})...", settings.version);
     let result = npm_install_global(
         client,
