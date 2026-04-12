@@ -69,6 +69,9 @@ impl ShellArgs {
             super::resolve_service_container(client.as_ref(), container, self.service.as_deref())
                 .await?;
 
+        let title_guard =
+            crate::title::push_for_container(&container, self.service.as_deref(), "shell");
+
         super::ensure_cella_daemon().await;
 
         // Read exec metadata from container labels
@@ -143,6 +146,8 @@ impl ShellArgs {
             )
             .await?;
 
+        // process::exit skips Drop, so pop the title explicitly first.
+        drop(title_guard);
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
 }

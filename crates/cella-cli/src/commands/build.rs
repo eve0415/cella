@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
 
-use cella_backend::BuildSecret;
+use cella_backend::{BuildSecret, container_name};
 use cella_config::devcontainer::resolve;
 use cella_orchestrator::image::EnsureImageInput;
 
@@ -77,6 +77,7 @@ impl BuildArgs {
 
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
+        let fallback_name = container_name(&resolved.workspace_root, config_name);
         let secrets: Vec<BuildSecret> = self
             .secrets
             .iter()
@@ -86,6 +87,15 @@ impl BuildArgs {
 
         let client = self.backend.resolve_client().await?;
         client.ping().await?;
+        let _title_guard = crate::title::push_for_workspace(
+            client.as_ref(),
+            &resolved.workspace_root,
+            &fallback_name,
+            None,
+            None,
+            "build",
+        )
+        .await;
 
         // Docker Compose path: delegate to orchestrator
         if config.get("dockerComposeFile").is_some() {
