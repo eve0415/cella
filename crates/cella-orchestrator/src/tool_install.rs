@@ -1225,20 +1225,20 @@ mod tests {
         }
     }
 
-    fn ok_exit(code: i64) -> Result<ExecResult, BackendError> {
-        Ok(ExecResult {
+    fn ok_exit(code: i64) -> ExecResult {
+        ExecResult {
             exit_code: code,
             stdout: String::new(),
             stderr: String::new(),
-        })
+        }
     }
 
-    fn err_exit(code: i64, stderr: &str) -> Result<ExecResult, BackendError> {
-        Ok(ExecResult {
+    fn fail_exit(code: i64, stderr: &str) -> ExecResult {
+        ExecResult {
             exit_code: code,
             stdout: String::new(),
             stderr: stderr.to_string(),
-        })
+        }
     }
 
     // Call sequence for ensure_codex_sandbox_deps:
@@ -1249,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_codex_sandbox_deps_bwrap_already_installed() {
         // bwrap found on PATH -> return true, no further calls
-        let backend = MockBackend::new(vec![ok_exit(0)]);
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(result);
     }
@@ -1257,9 +1257,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_codex_sandbox_deps_debian_install_success() {
         let backend = MockBackend::new(vec![
-            ok_exit(1), // bwrap not found
-            ok_exit(1), // not alpine (test -f /etc/alpine-release fails)
-            ok_exit(0), // apt-get install succeeds
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(1)), // not alpine (test -f /etc/alpine-release fails)
+            Ok(ok_exit(0)), // apt-get install succeeds
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(result);
@@ -1268,9 +1268,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_codex_sandbox_deps_alpine_install_success() {
         let backend = MockBackend::new(vec![
-            ok_exit(1), // bwrap not found
-            ok_exit(0), // is alpine (test -f /etc/alpine-release succeeds)
-            ok_exit(0), // apk add succeeds
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(0)), // is alpine (test -f /etc/alpine-release succeeds)
+            Ok(ok_exit(0)), // apk add succeeds
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(result);
@@ -1279,9 +1279,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_codex_sandbox_deps_debian_install_failure() {
         let backend = MockBackend::new(vec![
-            ok_exit(1),                                              // bwrap not found
-            ok_exit(1),                                              // not alpine
-            err_exit(100, "E: Unable to locate package bubblewrap"), // apt-get fails
+            Ok(ok_exit(1)),                                               // bwrap not found
+            Ok(ok_exit(1)),                                               // not alpine
+            Ok(fail_exit(100, "E: Unable to locate package bubblewrap")), // apt-get fails
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(!result);
@@ -1290,9 +1290,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_codex_sandbox_deps_alpine_install_failure() {
         let backend = MockBackend::new(vec![
-            ok_exit(1),                                      // bwrap not found
-            ok_exit(0),                                      // is alpine
-            err_exit(1, "ERROR: unable to select packages"), // apk add fails
+            Ok(ok_exit(1)),                                       // bwrap not found
+            Ok(ok_exit(0)),                                       // is alpine
+            Ok(fail_exit(1, "ERROR: unable to select packages")), // apk add fails
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(!result);
