@@ -110,48 +110,37 @@ pub fn push_for_container(
     })
 }
 
-/// Build a guard from a container name. Used as a fallback by
-/// [`push_for_workspace`] when no live container exists yet (e.g. first
-/// `cella up` / `cella build` before creation).
-pub fn push_for_name(
-    container_name: &str,
-    service: Option<&str>,
-    branch: Option<&str>,
-    subcommand: &'static str,
-) -> Option<TitleGuard> {
-    TitleGuard::push(&TitleContent {
-        name: title_name(container_name).to_string(),
-        service: service.map(str::to_string),
-        branch: branch.map(str::to_string),
-        subcommand,
-    })
-}
-
 /// Look up the existing container for `workspace_root` and derive a guard from
-/// its labels (compose project, branch). Falls back to `fallback_name` and
-/// `fallback_branch` when the container doesn't exist yet.
+/// its labels (compose project, branch). Falls back to `fallback_name` when no
+/// container exists yet.
 ///
-/// Use this for long-running commands that may be operating on a worktree or
-/// compose devcontainer — it ensures the title reflects the container's
-/// actual identity (branch, project) when available, instead of only the
-/// deterministic name derived from the workspace path.
+/// `branch` is the caller's authoritative branch (e.g. from `--branch <b>` or
+/// from `cella branch <name>`). When provided, it always wins over whatever
+/// `dev.cella.branch` label the live container happens to carry — a fresh
+/// `cella branch` creation has no container label yet, and a retry after a
+/// partial failure may see a stale or mismatched one. `None` means the caller
+/// doesn't know the branch a priori, so the container label (if any) is used.
 pub async fn push_for_workspace(
     client: &dyn cella_backend::ContainerBackend,
     workspace_root: &std::path::Path,
     fallback_name: &str,
     service: Option<&str>,
-    fallback_branch: Option<&str>,
+    branch: Option<&str>,
     subcommand: &'static str,
 ) -> Option<TitleGuard> {
-    client
-        .find_container(workspace_root)
-        .await
-        .ok()
-        .flatten()
-        .map_or_else(
-            || push_for_name(fallback_name, service, fallback_branch, subcommand),
-            |container| push_for_container(&container, service, subcommand),
-        )
+    let container = client.find_container(workspace_root).await.ok().flatten();
+    let name = title_name(container.as_ref().map_or(fallback_name, base_name)).to_string();
+    let effective_branch = branch.map(String::from).or_else(|| {
+        container
+            .as_ref()
+            .and_then(|c| c.labels.get("dev.cella.branch").cloned())
+    });
+    TitleGuard::push(&TitleContent {
+        name,
+        service: service.map(str::to_string),
+        branch: effective_branch,
+        subcommand,
+    })
 }
 
 /// Prefer the compose project label so that compose containers surface as
@@ -455,6 +444,48 @@ mod tests {
             content.format(),
             "myrepo-deadbe12@feat/auth \u{2014} cella up"
         );
+    }
+
+    /// Mirrors the branch-merge logic inside `push_for_workspace` so it can be
+    /// unit-tested without a mock `ContainerBackend`.
+    fn effective_branch(explicit: Option<&str>, container_label: Option<&str>) -> Option<String> {
+        explicit
+            .map(String::from)
+            .or_else(|| container_label.map(String::from))
+    }
+
+    #[test]
+    fn explicit_branch_wins_over_container_label() {
+        // `cella branch feat/new` with a stale leftover container labelled
+        // `feat/old` must title as feat/new (the user's intent), not feat/old.
+        assert_eq!(
+            effective_branch(Some("feat/new"), Some("feat/old")),
+            Some("feat/new".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_branch_used_when_no_container() {
+        // `cella branch feat/auth` on a fresh worktree (no container yet).
+        assert_eq!(
+            effective_branch(Some("feat/auth"), None),
+            Some("feat/auth".to_string())
+        );
+    }
+
+    #[test]
+    fn container_label_used_when_no_explicit_branch() {
+        // `cella up` (no --branch) in an existing worktree container.
+        assert_eq!(
+            effective_branch(None, Some("feat/auth")),
+            Some("feat/auth".to_string())
+        );
+    }
+
+    #[test]
+    fn no_branch_without_explicit_or_label() {
+        // Plain `cella up` in a non-worktree with no existing container.
+        assert_eq!(effective_branch(None, None), None);
     }
 
     // ── public API reachability ──────────────────────────────────────
