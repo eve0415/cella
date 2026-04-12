@@ -453,7 +453,8 @@ pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Checks if already installed, then runs `npm install -g @openai/codex`.
+/// Ensures bubblewrap is available for sandbox support, then checks if
+/// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
 pub async fn install_codex(
     client: &dyn ContainerBackend,
@@ -462,6 +463,8 @@ pub async fn install_codex(
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) {
+    ensure_codex_sandbox_deps(client, container_id).await;
+
     if is_npm_tool_installed(
         client,
         container_id,
@@ -474,8 +477,6 @@ pub async fn install_codex(
     {
         return;
     }
-
-    ensure_codex_sandbox_deps(client, container_id).await;
 
     debug!("Installing Codex ({})...", settings.version);
     let result = npm_install_global(
