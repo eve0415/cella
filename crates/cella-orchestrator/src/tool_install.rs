@@ -385,6 +385,72 @@ pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, Backen
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
+/// Ensure bubblewrap is available in the container for Codex sandbox support.
+///
+/// Checks if `bwrap` is already on PATH. If not, installs the `bubblewrap`
+/// package via the system package manager (apt-get or apk). Runs as root.
+/// Returns `true` if bwrap is available after the check.
+pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
+    let bwrap_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "command -v bwrap".to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if bwrap_check.is_ok_and(|r| r.exit_code == 0) {
+        debug!("bubblewrap already installed");
+        return true;
+    }
+
+    debug!("bubblewrap not found, installing...");
+    let install_cmd = if is_alpine_container(client, container_id).await {
+        "apk add --no-cache bubblewrap"
+    } else {
+        "apt-get update -qq && apt-get install -y -qq bubblewrap"
+    };
+
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match &result {
+        Ok(r) if r.exit_code == 0 => {
+            debug!("bubblewrap installed successfully");
+            true
+        }
+        Ok(r) => {
+            warn!(
+                "bubblewrap installation failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+            false
+        }
+        Err(e) => {
+            warn!("bubblewrap installation failed: {e}");
+            false
+        }
+    }
+}
+
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
 /// Checks if already installed, then runs `npm install -g @openai/codex`.
