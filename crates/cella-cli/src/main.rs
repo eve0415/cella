@@ -4,6 +4,7 @@ pub mod picker;
 pub mod progress;
 pub mod style;
 mod table;
+mod title;
 
 use std::io::IsTerminal;
 
