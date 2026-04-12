@@ -10,6 +10,7 @@ use super::OutputFormat;
 use super::up::{UpArgs, UpContext};
 
 use crate::picker;
+use crate::title::push_for_container;
 
 /// Open a persistent tmux session inside the dev container.
 ///
@@ -50,14 +51,10 @@ impl TmuxArgs {
         let ctx = UpContext::new(&up, progress).await?;
         let result = ctx.ensure_up(build_no_cache, &strict).await?;
         let container_id = if self.service.is_some() {
-            let container = ctx.client.inspect_container(&result.container_id).await?;
-            let resolved = super::resolve_service_container(
-                ctx.client.as_ref(),
-                container,
-                self.service.as_deref(),
-            )
-            .await?;
-            resolved.id
+            let c = ctx.client.inspect_container(&result.container_id).await?;
+            super::resolve_service_container(ctx.client.as_ref(), c, self.service.as_deref())
+                .await?
+                .id
         } else {
             result.container_id.clone()
         };
@@ -87,6 +84,7 @@ impl TmuxArgs {
         }
 
         let container = ctx.client.inspect_container(&container_id).await?;
+        let title_guard = push_for_container(&container, self.service.as_deref(), "tmux");
         let label_env: Vec<String> = container
             .labels
             .get("dev.cella.remote_env")
@@ -147,6 +145,7 @@ impl TmuxArgs {
             )
             .await?;
 
+        drop(title_guard);
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
 }
