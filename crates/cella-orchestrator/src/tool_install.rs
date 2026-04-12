@@ -385,9 +385,76 @@ pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, Backen
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
+/// Ensure bubblewrap is available in the container for Codex sandbox support.
+///
+/// Checks if `bwrap` is already on PATH. If not, installs the `bubblewrap`
+/// package via the system package manager (apt-get or apk). Runs as root.
+/// Returns `true` if bwrap is available after the check.
+pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
+    let bwrap_check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "command -v bwrap".to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    if bwrap_check.is_ok_and(|r| r.exit_code == 0) {
+        debug!("bubblewrap already installed");
+        return true;
+    }
+
+    debug!("bubblewrap not found, installing...");
+    let install_cmd = if is_alpine_container(client, container_id).await {
+        "apk add --no-cache bubblewrap"
+    } else {
+        "apt-get update -qq && apt-get install -y -qq bubblewrap"
+    };
+
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await;
+
+    match &result {
+        Ok(r) if r.exit_code == 0 => {
+            debug!("bubblewrap installed successfully");
+            true
+        }
+        Ok(r) => {
+            warn!(
+                "bubblewrap installation failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            );
+            false
+        }
+        Err(e) => {
+            warn!("bubblewrap installation failed: {e}");
+            false
+        }
+    }
+}
+
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Checks if already installed, then runs `npm install -g @openai/codex`.
+/// Ensures bubblewrap is available for sandbox support, then checks if
+/// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
 pub async fn install_codex(
     client: &dyn ContainerBackend,
@@ -396,6 +463,8 @@ pub async fn install_codex(
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) {
+    ensure_codex_sandbox_deps(client, container_id).await;
+
     if is_npm_tool_installed(
         client,
         container_id,
@@ -905,5 +974,328 @@ mod tests {
             identifier: "missing".into(),
         });
         log_npm_install_result("TestTool", result);
+    }
+
+    // ── MockBackend for ensure_codex_sandbox_deps tests ─────────────────────
+
+    use std::collections::VecDeque;
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use cella_backend::{
+        BackendCapabilities, BackendKind, BoxFuture, BuildOptions, ContainerInfo,
+        CreateContainerOptions, FileToUpload, ImageDetails, InteractiveExecOptions, Platform,
+    };
+
+    /// Minimal mock that replays pre-configured `exec_command` responses in order.
+    struct MockBackend {
+        responses: Mutex<VecDeque<Result<ExecResult, BackendError>>>,
+    }
+
+    impl MockBackend {
+        fn new(responses: Vec<Result<ExecResult, BackendError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    impl ContainerBackend for MockBackend {
+        fn kind(&self) -> BackendKind {
+            unimplemented!()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            unimplemented!()
+        }
+
+        fn find_container<'a>(
+            &'a self,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn create_container<'a>(
+            &'a self,
+            _: &'a CreateContainerOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn start_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn stop_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn remove_container<'a>(
+            &'a self,
+            _: &'a str,
+            _: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_container<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ContainerInfo, BackendError>> {
+            unimplemented!()
+        }
+
+        fn list_cella_containers(
+            &self,
+            _: bool,
+        ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn find_compose_service<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn find_container_by_label<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn container_logs<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_command<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockBackend: no more responses");
+            Box::pin(async move { response })
+        }
+
+        fn exec_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+            _: Box<dyn Write + Send + 'a>,
+            _: Box<dyn Write + Send + 'a>,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_interactive<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a InteractiveExecOptions,
+        ) -> BoxFuture<'a, Result<i64, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_detached<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn pull_image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn build_image<'a>(
+            &'a self,
+            _: &'a BuildOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn image_exists<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_details<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
+            unimplemented!()
+        }
+
+        fn upload_files<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [FileToUpload],
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn host_gateway(&self) -> &'static str {
+            unimplemented!()
+        }
+
+        fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
+            unimplemented!()
+        }
+
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_user<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_container_network<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn get_container_ip<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn write_agent_addr<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            unimplemented!()
+        }
+
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+    }
+
+    fn ok_exit(code: i64) -> ExecResult {
+        ExecResult {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn fail_exit(code: i64, stderr: &str) -> ExecResult {
+        ExecResult {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    // Call sequence for ensure_codex_sandbox_deps:
+    // 1. exec: "command -v bwrap"          (bwrap check)
+    // 2. exec: "test -f /etc/alpine-release" (alpine check, only if bwrap missing)
+    // 3. exec: install command               (only if bwrap missing)
+
+    #[tokio::test]
+    async fn ensure_codex_sandbox_deps_bwrap_already_installed() {
+        // bwrap found on PATH -> return true, no further calls
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn ensure_codex_sandbox_deps_debian_install_success() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(1)), // not alpine (test -f /etc/alpine-release fails)
+            Ok(ok_exit(0)), // apt-get install succeeds
+        ]);
+        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn ensure_codex_sandbox_deps_alpine_install_success() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(0)), // is alpine (test -f /etc/alpine-release succeeds)
+            Ok(ok_exit(0)), // apk add succeeds
+        ]);
+        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn ensure_codex_sandbox_deps_debian_install_failure() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)),                                               // bwrap not found
+            Ok(ok_exit(1)),                                               // not alpine
+            Ok(fail_exit(100, "E: Unable to locate package bubblewrap")), // apt-get fails
+        ]);
+        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn ensure_codex_sandbox_deps_alpine_install_failure() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)),                                       // bwrap not found
+            Ok(ok_exit(0)),                                       // is alpine
+            Ok(fail_exit(1, "ERROR: unable to select packages")), // apk add fails
+        ]);
+        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
+        assert!(!result);
     }
 }
