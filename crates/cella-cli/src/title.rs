@@ -108,6 +108,23 @@ pub fn push_for_container(
     })
 }
 
+/// Convenience: build a guard from a container name alone. Used by commands
+/// that know the deterministic container name (via [`cella_backend::container_name`]
+/// or `UpContext::container_nm`) without having a full [`cella_backend::ContainerInfo`]
+/// to pull labels from.
+pub fn push_for_name(
+    container_name: &str,
+    branch: Option<&str>,
+    subcommand: &'static str,
+) -> Option<TitleGuard> {
+    TitleGuard::push(&TitleContent {
+        name: title_name(container_name).to_string(),
+        service: None,
+        branch: branch.map(str::to_string),
+        subcommand,
+    })
+}
+
 impl Drop for TitleGuard {
     fn drop(&mut self) {
         let tmux = in_tmux();

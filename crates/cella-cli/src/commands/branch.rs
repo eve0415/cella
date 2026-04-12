@@ -93,6 +93,8 @@ impl BranchArgs {
             self.output.clone(),
         )
         .await?;
+        let _title_guard =
+            crate::title::push_for_name(&ctx.container_nm, Some(&self.name), "branch");
 
         // Remove any leftover container from a previous failed attempt so
         // ensure_up always runs the full first-create path (lifecycle hooks,

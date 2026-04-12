@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
 
-use cella_backend::BuildSecret;
+use cella_backend::{BuildSecret, container_name};
 use cella_config::devcontainer::resolve;
 use cella_orchestrator::image::EnsureImageInput;
 
@@ -77,6 +77,8 @@ impl BuildArgs {
 
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
+        let title_name = container_name(&resolved.workspace_root, config_name);
+        let _title_guard = crate::title::push_for_name(&title_name, None, "build");
         let secrets: Vec<BuildSecret> = self
             .secrets
             .iter()

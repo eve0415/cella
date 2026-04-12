@@ -739,6 +739,7 @@ impl UpArgs {
             self.output.clone(),
         )
         .await?;
+        let _title_guard = crate::title::push_for_name(&ctx.container_nm, Some(branch_name), "up");
         ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
         ctx.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
@@ -776,6 +777,7 @@ impl UpArgs {
         }
 
         let ctx = UpContext::new(&self, progress).await?;
+        let _title_guard = crate::title::push_for_name(&ctx.container_nm, None, "up");
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {
