@@ -68,7 +68,15 @@ impl CodeArgs {
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
         let ctx = UpContext::new(&up, progress).await?;
-        let _title_guard = crate::title::push_for_name(&ctx.container_nm, None, "code");
+        let _title_guard = crate::title::push_for_workspace(
+            ctx.client.as_ref(),
+            &ctx.resolved.workspace_root,
+            &ctx.container_nm,
+            self.service.as_deref(),
+            None,
+            "code",
+        )
+        .await;
 
         // Reject non-Docker backends — VS Code attach URI is Docker-specific
         if ctx.client.kind() != cella_backend::BackendKind::Docker {

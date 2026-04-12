@@ -77,8 +77,7 @@ impl BuildArgs {
 
         let config = &resolved.config;
         let config_name = config.get("name").and_then(|v| v.as_str());
-        let title_name = container_name(&resolved.workspace_root, config_name);
-        let _title_guard = crate::title::push_for_name(&title_name, None, "build");
+        let fallback_name = container_name(&resolved.workspace_root, config_name);
         let secrets: Vec<BuildSecret> = self
             .secrets
             .iter()
@@ -88,6 +87,15 @@ impl BuildArgs {
 
         let client = self.backend.resolve_client().await?;
         client.ping().await?;
+        let _title_guard = crate::title::push_for_workspace(
+            client.as_ref(),
+            &resolved.workspace_root,
+            &fallback_name,
+            None,
+            None,
+            "build",
+        )
+        .await;
 
         // Docker Compose path: delegate to orchestrator
         if config.get("dockerComposeFile").is_some() {

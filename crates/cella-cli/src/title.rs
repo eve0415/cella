@@ -94,35 +94,74 @@ impl TitleGuard {
 
 /// Convenience: build a guard from a resolved container. Pulls `branch` from
 /// the `dev.cella.branch` label when present, and `service` from the caller's
-/// explicit flag.
+/// explicit flag. For compose containers, prefers the `com.docker.compose.project`
+/// label as the name source so the title reads as the project (not
+/// `<project>-<service>-<index>` which would duplicate the service suffix).
 pub fn push_for_container(
     container: &cella_backend::ContainerInfo,
     service: Option<&str>,
     subcommand: &'static str,
 ) -> Option<TitleGuard> {
     TitleGuard::push(&TitleContent {
-        name: title_name(&container.name).to_string(),
+        name: title_name(base_name(container)).to_string(),
         service: service.map(str::to_string),
         branch: container.labels.get("dev.cella.branch").cloned(),
         subcommand,
     })
 }
 
-/// Convenience: build a guard from a container name alone. Used by commands
-/// that know the deterministic container name (via [`cella_backend::container_name`]
-/// or `UpContext::container_nm`) without having a full [`cella_backend::ContainerInfo`]
-/// to pull labels from.
+/// Build a guard from a container name. Used as a fallback by
+/// [`push_for_workspace`] when no live container exists yet (e.g. first
+/// `cella up` / `cella build` before creation).
 pub fn push_for_name(
     container_name: &str,
+    service: Option<&str>,
     branch: Option<&str>,
     subcommand: &'static str,
 ) -> Option<TitleGuard> {
     TitleGuard::push(&TitleContent {
         name: title_name(container_name).to_string(),
-        service: None,
+        service: service.map(str::to_string),
         branch: branch.map(str::to_string),
         subcommand,
     })
+}
+
+/// Look up the existing container for `workspace_root` and derive a guard from
+/// its labels (compose project, branch). Falls back to `fallback_name` and
+/// `fallback_branch` when the container doesn't exist yet.
+///
+/// Use this for long-running commands that may be operating on a worktree or
+/// compose devcontainer — it ensures the title reflects the container's
+/// actual identity (branch, project) when available, instead of only the
+/// deterministic name derived from the workspace path.
+pub async fn push_for_workspace(
+    client: &dyn cella_backend::ContainerBackend,
+    workspace_root: &std::path::Path,
+    fallback_name: &str,
+    service: Option<&str>,
+    fallback_branch: Option<&str>,
+    subcommand: &'static str,
+) -> Option<TitleGuard> {
+    client
+        .find_container(workspace_root)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(
+            || push_for_name(fallback_name, service, fallback_branch, subcommand),
+            |container| push_for_container(&container, service, subcommand),
+        )
+}
+
+/// Prefer the compose project label so that compose containers surface as
+/// `<project>` (e.g. `cella-myrepo-a1b2c3d4`) instead of
+/// `<project>-<service>-<index>` (e.g. `cella-myrepo-a1b2c3d4-api-1`).
+fn base_name(container: &cella_backend::ContainerInfo) -> &str {
+    container
+        .labels
+        .get("com.docker.compose.project")
+        .map_or(container.name.as_str(), String::as_str)
 }
 
 impl Drop for TitleGuard {
@@ -334,6 +373,87 @@ mod tests {
         assert_eq!(
             tmux_wrap(b"\x1bA\x1bB"),
             b"\x1bPtmux;\x1b\x1bA\x1b\x1bB\x1b\\"
+        );
+    }
+
+    // ── base_name selection (compose project vs container name) ─────
+
+    fn container_with_labels(name: &str, labels: &[(&str, &str)]) -> cella_backend::ContainerInfo {
+        let labels: std::collections::HashMap<String, String> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        cella_backend::ContainerInfo {
+            id: "id".to_string(),
+            name: name.to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: vec![],
+            backend: cella_backend::BackendKind::Docker,
+        }
+    }
+
+    #[test]
+    fn base_name_prefers_compose_project_label() {
+        // Compose container: actual name has -<service>-<index> suffix, but
+        // `com.docker.compose.project` points at the clean project name.
+        let c = container_with_labels(
+            "cella-myrepo-a1b2c3d4-api-1",
+            &[("com.docker.compose.project", "cella-myrepo-a1b2c3d4")],
+        );
+        assert_eq!(base_name(&c), "cella-myrepo-a1b2c3d4");
+    }
+
+    #[test]
+    fn base_name_falls_back_to_container_name_when_no_compose_label() {
+        let c = container_with_labels("cella-myrepo-a1b2c3d4", &[]);
+        assert_eq!(base_name(&c), "cella-myrepo-a1b2c3d4");
+    }
+
+    #[test]
+    fn push_for_container_compose_title_has_no_redundant_service_suffix() {
+        // Compose + explicit --service api: title should show project + :api,
+        // NOT project-api-1:api. (Regression: codex stop-time review caught
+        // this.)
+        let c = container_with_labels(
+            "cella-myrepo-a1b2c3d4-api-1",
+            &[
+                ("com.docker.compose.project", "cella-myrepo-a1b2c3d4"),
+                ("com.docker.compose.service", "api"),
+            ],
+        );
+        // Format directly (no OSC emission under non-TTY) to verify composition.
+        let content = TitleContent {
+            name: title_name(base_name(&c)).to_string(),
+            service: Some("api".to_string()),
+            branch: None,
+            subcommand: "shell",
+        };
+        assert_eq!(content.format(), "myrepo-a1b2c3d4:api \u{2014} cella shell");
+    }
+
+    #[test]
+    fn push_for_container_worktree_surfaces_branch_label() {
+        // Container exists with dev.cella.branch label set by `cella branch`.
+        let c = container_with_labels(
+            "cella-myrepo-deadbe12",
+            &[("dev.cella.branch", "feat/auth")],
+        );
+        let content = TitleContent {
+            name: title_name(base_name(&c)).to_string(),
+            service: None,
+            branch: c.labels.get("dev.cella.branch").cloned(),
+            subcommand: "up",
+        };
+        assert_eq!(
+            content.format(),
+            "myrepo-deadbe12@feat/auth \u{2014} cella up"
         );
     }
 
