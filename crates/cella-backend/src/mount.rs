@@ -116,17 +116,37 @@ impl MountSpec {
         let mut out = String::new();
         let _ = writeln!(out, "{indent}- type: {}", self.kind.as_str());
         if !self.source.is_empty() {
-            let _ = writeln!(out, "{indent}  source: \"{}\"", self.source);
+            let _ = writeln!(
+                out,
+                "{indent}  source: \"{}\"",
+                escape_yaml_double_quoted(&self.source)
+            );
         }
-        let _ = writeln!(out, "{indent}  target: \"{}\"", self.target);
+        let _ = writeln!(
+            out,
+            "{indent}  target: \"{}\"",
+            escape_yaml_double_quoted(&self.target)
+        );
         if self.read_only {
             let _ = writeln!(out, "{indent}  read_only: true");
         }
         if let Some(c) = &self.consistency {
-            let _ = writeln!(out, "{indent}  consistency: {c}");
+            let _ = writeln!(
+                out,
+                "{indent}  consistency: \"{}\"",
+                escape_yaml_double_quoted(c)
+            );
         }
         out
     }
+}
+
+/// Escape a string for use inside a YAML double-quoted scalar.
+///
+/// YAML double-quoted scalars treat `\` as the escape character and `"` as the
+/// closing delimiter, so both must be escaped before interpolation.
+fn escape_yaml_double_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -211,7 +231,29 @@ mod tests {
       - type: bind
         source: "/host"
         target: "/container"
-        consistency: cached
+        consistency: "cached"
 "#);
+    }
+
+    #[test]
+    fn to_compose_yaml_escapes_backslash() {
+        // Windows-style path: backslashes must be doubled in YAML double-quoted scalars.
+        let spec = MountSpec::bind("C:\\Users\\a\\.codex", "/root/.codex");
+        let yaml = spec.to_compose_yaml_entry("      ");
+        assert!(
+            yaml.contains("C:\\\\Users\\\\a\\\\.codex"),
+            "expected doubled backslashes in YAML output, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn to_compose_yaml_escapes_double_quote() {
+        // Path containing a double-quote must be escaped to avoid terminating the scalar.
+        let spec = MountSpec::bind("/ha\"d/path", "/container");
+        let yaml = spec.to_compose_yaml_entry("      ");
+        assert!(
+            yaml.contains("/ha\\\"d/path"),
+            "expected escaped double-quote in YAML output, got:\n{yaml}"
+        );
     }
 }
