@@ -379,6 +379,7 @@ fn to_bollard_mount(m: &MountConfig) -> Mount {
             _ => MountTypeEnum::BIND,
         }),
         consistency: m.consistency.clone(),
+        read_only: Some(m.read_only),
         ..Default::default()
     }
 }
@@ -673,6 +674,35 @@ mod tests {
         };
         let bollard_mount = to_bollard_mount(&m);
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
+    }
+
+    #[test]
+    fn mount_read_only_forwarded_to_bollard() {
+        // MountConfig.read_only must be wired through to bollard Mount.read_only.
+        let ro = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/container/data".to_string(),
+            consistency: None,
+            read_only: true,
+        };
+        let rw = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/container/data".to_string(),
+            consistency: None,
+            read_only: false,
+        };
+        assert_eq!(
+            to_bollard_mount(&ro).read_only,
+            Some(true),
+            "read_only:true must reach bollard Mount"
+        );
+        assert_eq!(
+            to_bollard_mount(&rw).read_only,
+            Some(false),
+            "read_only:false must reach bollard Mount"
+        );
     }
 
     #[test]
