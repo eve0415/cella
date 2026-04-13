@@ -53,9 +53,13 @@ pub(crate) fn filter_reserved_agent_subtree(
 /// any target already declared in the primary service's resolved volumes.
 ///
 /// A second pass then removes cella-side candidates that have the **exact same
-/// target** as an earlier cella candidate (first-wins). Only exact-target
-/// matches are dropped here — intentional parent+child overlays (e.g. a bind at
+/// target** as another cella candidate (last-wins). Only exact-target matches
+/// are dropped here — intentional parent+child overlays (e.g. a bind at
 /// `/root/.claude` plus a tmpfs at `/root/.claude/plugins`) are preserved.
+///
+/// Last-wins matches the merge order established by `merge_with_devcontainer`:
+/// feature mounts are prepended and user mounts are appended, so a user mount
+/// that collides with a feature mount on the same target correctly overrides it.
 pub fn dedup_against_base(
     resolved: &ResolvedComposeConfig,
     primary_service: &str,
@@ -70,7 +74,14 @@ pub fn dedup_against_base(
     // ancestor-match would silently defeat that isolation. Instead, tmpfs is
     // only dropped when the target EXACTLY matches a base target (the base
     // already owns that path entirely).
-    let after_base: Vec<MountSpec> = candidates
+    //
+    // Pass 2 (last-wins dedup) follows immediately: we collect into a Vec so
+    // that `.rev()` is available for the reverse+filter+reverse idiom.
+    // Rationale for last-wins: `merge_with_devcontainer` prepends feature mounts
+    // and appends user mounts, so user mounts appear last. Last-wins ensures a
+    // user's explicit devcontainer.json mount overrides an earlier feature-declared
+    // mount at the same target, matching single-container behaviour.
+    let mut after_base: Vec<MountSpec> = candidates
         .into_iter()
         .filter(|spec| {
             if spec.kind == MountKind::Tmpfs {
@@ -83,16 +94,14 @@ pub fn dedup_against_base(
         })
         .collect();
 
-    // Pass 2: dedup cella candidates against each other — exact target match only,
-    // first declaration wins. Intentional parent+child overlays are preserved.
-    let mut seen_targets: HashSet<String> = HashSet::new();
-    let mut accepted: Vec<MountSpec> = Vec::with_capacity(after_base.len());
-    for candidate in after_base {
-        if seen_targets.insert(candidate.target.clone()) {
-            accepted.push(candidate);
-        }
-    }
-    accepted
+    // Reverse in place so that iterating forward visits last candidates first,
+    // then retain only the first occurrence of each target (which was last in
+    // the original order). Reverse again to restore original relative order.
+    after_base.reverse();
+    let mut seen: HashSet<String> = HashSet::new();
+    after_base.retain(|spec| seen.insert(spec.target.clone()));
+    after_base.reverse();
+    after_base
 }
 
 fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> Vec<String> {
@@ -406,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn dedup_first_candidate_wins_on_internal_collision() {
-        // Two cella candidates with the same target: only the first survives.
+    fn dedup_last_candidate_wins_on_internal_collision() {
+        // Two cella candidates with the same target: only the last survives.
         let resolved = make_resolved("app", vec![]);
         let candidates = vec![
             MountSpec::bind("/a", "/root/.foo"),
@@ -415,7 +424,7 @@ mod tests {
         ];
         let result = dedup_against_base(&resolved, "app", candidates);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].source, "/a", "first candidate must win");
+        assert_eq!(result[0].kind, MountKind::Tmpfs, "last candidate must win");
     }
 
     #[test]
@@ -439,16 +448,34 @@ mod tests {
     }
 
     #[test]
-    fn dedup_first_candidate_wins_on_exact_collision() {
-        // Two candidates with the same exact target: only the first survives.
+    fn dedup_last_candidate_wins_on_exact_collision() {
+        // Two candidates with the same exact target: only the last survives.
+        // This matches merge_with_devcontainer order: features prepended, users
+        // appended — so the user mount (last) overrides the feature mount (first).
         let resolved = make_resolved("app", vec![]);
-        let candidates = vec![
-            MountSpec::bind("/a", "/root/.foo"),
-            MountSpec::bind("/b", "/root/.foo"),
-        ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let first = MountSpec::bind("/first/source", "/root/.foo");
+        let last = MountSpec::bind("/last/source", "/root/.foo");
+        let result = dedup_against_base(&resolved, "app", vec![first, last]);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].source, "/a", "first candidate must win");
+        assert_eq!(
+            result[0].source, "/last/source",
+            "last candidate wins on exact target"
+        );
+    }
+
+    #[test]
+    fn dedup_preserves_relative_order_of_non_colliding_entries() {
+        // Non-colliding entries must retain their original relative order after
+        // the reverse+filter+reverse pass-2 dedup.
+        let resolved = make_resolved("app", vec![]);
+        let a = MountSpec::bind("/a", "/target/a");
+        let b = MountSpec::bind("/b", "/target/b");
+        let c = MountSpec::bind("/c", "/target/c");
+        let result = dedup_against_base(&resolved, "app", vec![a, b, c]);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].target, "/target/a");
+        assert_eq!(result[1].target, "/target/b");
+        assert_eq!(result[2].target, "/target/c");
     }
 
     // -----------------------------------------------------------------------
