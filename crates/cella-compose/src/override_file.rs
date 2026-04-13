@@ -165,10 +165,12 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     //
     // Always emit the agent volume first (external: true — cella pre-creates
     // it). Then, for each extra volume mount that uses a named volume
-    // (MountKind::Volume with a non-empty source), emit a bare key declaration
-    // so compose auto-creates the volume on first `up` and reuses it on
-    // subsequent runs. Skip volumes already declared in the user's base compose
-    // config — merging a duplicate declaration would conflict.
+    // (MountKind::Volume with a non-empty source), emit a declaration with an
+    // explicit `name:` pin so that Docker Compose uses the literal volume name
+    // instead of project-scoping it as `<project>_<source>`. This preserves
+    // parity with the single-container path which passes the literal source
+    // name directly to the Docker API. Skip volumes already declared in the
+    // user's base compose config — merging a duplicate declaration would conflict.
     yaml.push_str("volumes:\n");
     let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
     yaml.push_str("    external: true\n");
@@ -178,7 +180,7 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
             && !config.base_compose_volumes.contains(&spec.source)
         {
             let _ = writeln!(yaml, "  {}:", spec.source);
-            // Empty mapping — compose auto-creates the named volume on first `up`.
+            let _ = writeln!(yaml, "    name: {}", spec.source);
         }
     }
 
@@ -579,15 +581,20 @@ mod tests {
     #[test]
     fn named_volume_mount_emits_top_level_declaration() {
         // A user `type=volume,source=mycache,target=/cache` mount must produce
-        // a bare top-level `mycache:` declaration so compose auto-creates the
-        // volume on first `up`. It must NOT be declared as `external: true`
+        // a top-level `mycache:` declaration with a `name: mycache` pin so
+        // compose uses the literal volume name instead of project-scoping it
+        // (e.g. `<project>_mycache`). It must NOT be declared as `external: true`
         // because that would break fresh installs.
         let mut config = base_config();
         config.extra_volumes = vec![named_volume_spec("mycache", "/cache")];
         let yaml = generate_override_yaml(&config);
         assert!(
-            yaml.contains("mycache:"),
+            yaml.contains("  mycache:"),
             "top-level mycache declaration must be emitted; yaml:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    name: mycache"),
+            "literal name pin must be emitted; yaml:\n{yaml}"
         );
         // Only the agent volume should be external: true — not user-managed volumes.
         let external_count = yaml.matches("external: true").count();
@@ -602,8 +609,9 @@ mod tests {
     #[test]
     fn named_volume_not_emitted_as_external() {
         // Regression test: extra named volumes must use bare key declarations
-        // (compose auto-creates them). `external: true` would break first-run
-        // on machines where the volume has never been created.
+        // with a `name:` pin (compose auto-creates them with the literal name).
+        // `external: true` would break first-run on machines where the volume
+        // has never been created.
         let mut config = base_config();
         config.extra_volumes = vec![MountSpec {
             kind: MountKind::Volume,
@@ -616,6 +624,10 @@ mod tests {
         assert!(
             yaml.contains("npm-cache:"),
             "volume declaration missing; yaml:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    name: npm-cache"),
+            "literal name pin must be emitted; yaml:\n{yaml}"
         );
         // Only the agent volume entry should be external.
         let external_count = yaml.matches("external: true").count();
@@ -685,6 +697,38 @@ mod tests {
                 .count(),
             2,
             "top-level volumes must have exactly 2 non-empty lines (agent + external); yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn named_volume_pins_literal_docker_name() {
+        // Regression: a bare top-level volume declaration (no `name:` field) is
+        // project-scoped by Docker Compose as `<project>_<source>`. The user's
+        // existing literal volume (which single-container `up` targets directly)
+        // would then be ignored — a silent data fork. The `name:` pin preserves
+        // the literal volume name regardless of the compose project name.
+        let mut config = base_config();
+        config.extra_volumes = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "shared-cache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("  shared-cache:"),
+            "top-level key must be emitted; yaml:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    name: shared-cache"),
+            "literal name pin must be emitted to prevent project-scoping; yaml:\n{yaml}"
+        );
+        // Only the agent volume should be external.
+        let external_count = yaml.matches("external: true").count();
+        assert_eq!(
+            external_count, 1,
+            "only the agent volume should be external; yaml:\n{yaml}"
         );
     }
 }
