@@ -127,6 +127,7 @@ fn combined_dockerfile_global_arg_before_from() {
         &named_content,
         &feature_dockerfile,
         &stage_name,
+        "root",
     );
 
     // Global ARG must appear before first FROM

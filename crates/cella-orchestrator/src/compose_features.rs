@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use cella_backend::{ContainerBackend, image_name_with_features};
 use cella_compose::{
@@ -108,11 +108,14 @@ pub async fn resolve_compose_features(
                 dockerfile_path.display()
             );
 
-            // For build-based services, we can't easily inspect the image user
-            // before building. Default to "root" — features resolve the correct
-            // user from the image metadata after build, and the devcontainer CLI
-            // also defaults to "root" for Dockerfile-based services.
-            (named_content, name, "root".to_string(), None)
+            // Resolve the effective image user via parse → base-image inspect
+            // → "root". Mirrors the devcontainer CLI's findUserStatement +
+            // imageBuildInfoFromDockerfile fallback chain so the features
+            // stage's final USER matches the Dockerfile's declared user.
+            let (image_user, base_image_metadata) =
+                resolve_build_image_user(client, &named_content, Some(&name), progress).await;
+
+            (named_content, name, image_user, base_image_metadata)
         }
         ServiceBuildInfo::Image { image } => {
             // Pull image if needed for inspection
@@ -166,6 +169,7 @@ pub async fn resolve_compose_features(
         &original_dockerfile,
         &resolved.dockerfile,
         &stage_name,
+        &image_user,
     )?;
 
     // 7. Assemble build context overrides and return.
@@ -180,17 +184,73 @@ pub async fn resolve_compose_features(
     )?))
 }
 
+/// Resolve the effective USER for a build-based compose service.
+///
+/// Mirrors the devcontainer CLI's resolution:
+/// 1. Static parse of the Dockerfile target stage's last `USER` directive.
+/// 2. Pull + inspect the external base image's `Config.User`. Pulling is
+///    acceptable because the user is about to build anyway.
+/// 3. Fall back to `"root"`.
+///
+/// Also returns the base image's `devcontainer.metadata` label when step 2
+/// succeeds, mirroring how the image-only arm populates metadata.
+async fn resolve_build_image_user(
+    client: &dyn ContainerBackend,
+    dockerfile_content: &str,
+    target_stage: Option<&str>,
+    progress: &ProgressSender,
+) -> (String, Option<String>) {
+    if let Some(user) = cella_compose::find_user_statement(dockerfile_content, target_stage) {
+        debug!("Resolved image user from Dockerfile USER directive: {user}");
+        return (user, None);
+    }
+
+    let Some(base_image) = cella_compose::find_stage_base_image(dockerfile_content, target_stage)
+    else {
+        debug!("Could not resolve a base image to inspect; defaulting image user to root");
+        return ("root".to_string(), None);
+    };
+
+    if matches!(client.image_exists(&base_image).await, Ok(false))
+        && let Err(e) = run_step_result(
+            progress,
+            "Pulling base image for user inspection...",
+            client.pull_image(&base_image),
+        )
+        .await
+    {
+        warn!("Failed to pull base image '{base_image}' for user inspection: {e}");
+        return ("root".to_string(), None);
+    }
+
+    match client.inspect_image_details(&base_image).await {
+        Ok(details) => {
+            debug!(
+                "Resolved image user from base image '{base_image}' inspect: {}",
+                details.user
+            );
+            (details.user, details.metadata)
+        }
+        Err(e) => {
+            warn!("Failed to inspect base image '{base_image}': {e}");
+            ("root".to_string(), None)
+        }
+    }
+}
+
 /// Generate the combined Dockerfile and write it to disk.
 fn write_combined_dockerfile(
     project_name: &str,
     original_dockerfile: &str,
     features_dockerfile: &str,
     stage_name: &str,
+    image_user: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let combined = cella_compose::generate_combined_dockerfile(
         original_dockerfile,
         features_dockerfile,
         stage_name,
+        image_user,
     );
     let combined_path = compose_dockerfile_path(project_name);
     if let Some(parent) = combined_path.parent() {

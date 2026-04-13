@@ -225,7 +225,11 @@ fn write_cleanup_and_user_reset(out: &mut String) {
     .unwrap();
 
     writeln!(out).unwrap();
-    writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER=root").unwrap();
+    // Re-declare the ARG without a default so the features target stage
+    // inherits the global-scope `ARG _DEV_CONTAINERS_IMAGE_USER` injected by
+    // `cella_compose::generate_combined_dockerfile`. A stage-local default
+    // here would shadow the global value and force the container to root.
+    writeln!(out, "ARG _DEV_CONTAINERS_IMAGE_USER").unwrap();
     writeln!(out, "USER $_DEV_CONTAINERS_IMAGE_USER").unwrap();
 }
 

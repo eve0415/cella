@@ -28,5 +28,5 @@ RUN chmod +x /usr/local/share/docker-init.sh
 
 RUN rm -rf /tmp/dev-container-features && chmod 1777 /tmp
 
-ARG _DEV_CONTAINERS_IMAGE_USER=root
+ARG _DEV_CONTAINERS_IMAGE_USER
 USER $_DEV_CONTAINERS_IMAGE_USER

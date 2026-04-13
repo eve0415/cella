@@ -83,10 +83,12 @@ pub fn synthetic_dockerfile(image: &str) -> (String, String) {
 
 /// Generate a combined Dockerfile: original content + feature layers.
 ///
-/// Inserts a global-scope `ARG _DEV_CONTAINERS_BASE_IMAGE=<base_image>`
-/// after any parser directives but before the first `FROM`, so that the
-/// feature layers' `FROM $_DEV_CONTAINERS_BASE_IMAGE` resolves correctly
-/// in `docker compose build` (which cannot pass `--build-arg`).
+/// Inserts global-scope `ARG _DEV_CONTAINERS_BASE_IMAGE=<base_image>` and
+/// `ARG _DEV_CONTAINERS_IMAGE_USER=<image_user>` after any parser directives
+/// but before the first `FROM`, so that the feature layers' final
+/// `USER $_DEV_CONTAINERS_IMAGE_USER` resolves to the user's Dockerfile USER
+/// (and `FROM $_DEV_CONTAINERS_BASE_IMAGE` resolves across stages) in
+/// `docker compose build`, which cannot accept `--build-arg` via the override.
 ///
 /// The `feature_dockerfile` should be the output of
 /// `cella_features::dockerfile::generate_dockerfile()` called with the
@@ -96,10 +98,12 @@ pub fn generate_combined_dockerfile(
     original_content: &str,
     feature_dockerfile: &str,
     base_image: &str,
+    image_user: &str,
 ) -> String {
     let directive_end = find_directive_end_offset(original_content);
     let mut global_arg = String::new();
     writeln!(global_arg, "ARG _DEV_CONTAINERS_BASE_IMAGE={base_image}").unwrap();
+    writeln!(global_arg, "ARG _DEV_CONTAINERS_IMAGE_USER={image_user}").unwrap();
 
     let mut combined = String::with_capacity(
         original_content.len() + global_arg.len() + feature_dockerfile.len() + 2,
@@ -107,7 +111,9 @@ pub fn generate_combined_dockerfile(
 
     // Preserve parser directives at the top
     combined.push_str(&original_content[..directive_end]);
-    // Global ARG so FROM $_DEV_CONTAINERS_BASE_IMAGE resolves across stages
+    // Global ARGs so FROM $_DEV_CONTAINERS_BASE_IMAGE resolves across stages
+    // and the features target stage's `ARG _DEV_CONTAINERS_IMAGE_USER` (without
+    // a stage-local default) inherits this value.
     combined.push_str(&global_arg);
     // Rest of original Dockerfile
     combined.push_str(&original_content[directive_end..]);
@@ -338,6 +344,58 @@ fn find_last_user_in_range(lines: &[&str], start: usize, end: usize) -> Option<S
     last
 }
 
+/// Return the external base image for a named stage, after resolving any
+/// in-Dockerfile stage chain.
+///
+/// Walks `FROM <image> AS <stage>` references: if `<image>` names another
+/// stage in this Dockerfile, recurses; otherwise returns `<image>`. Returns
+/// `None` when the image token contains `$` (unresolved variable), the
+/// target stage is missing, or a cycle is detected.
+///
+/// Used by callers that need to inspect the external base image's
+/// `Config.User` when the Dockerfile does not declare a `USER` itself.
+#[must_use]
+pub fn find_stage_base_image(content: &str, target_stage: Option<&str>) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let from_entries = parse_from_lines(&lines);
+
+    if from_entries.is_empty() {
+        return None;
+    }
+
+    let start_idx = if let Some(target) = target_stage {
+        from_entries
+            .iter()
+            .position(|e| e.stage_name.as_deref() == Some(target))?
+    } else {
+        from_entries.len() - 1
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut current_idx = start_idx;
+
+    loop {
+        if !seen.insert(current_idx) {
+            return None;
+        }
+
+        let source = from_entries[current_idx].source_image.as_deref()?;
+        if source.contains('$') {
+            return None;
+        }
+
+        if let Some(next) = from_entries
+            .iter()
+            .position(|e| e.stage_name.as_deref() == Some(source))
+        {
+            current_idx = next;
+            continue;
+        }
+
+        return Some(source.to_string());
+    }
+}
+
 /// Extract the bare username from a `USER` argument.
 ///
 /// - `node` → `Some("node")`
@@ -492,13 +550,23 @@ RUN echo hello
     fn combined_dockerfile() {
         let original = "FROM node:18 AS base\nRUN npm install\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\nUSER root\n";
-        let combined = generate_combined_dockerfile(original, features, "base");
-        // Global ARG should appear before the first FROM
-        let arg_pos = combined
+        let combined = generate_combined_dockerfile(original, features, "base", "node");
+        // Global ARGs should appear before the first FROM
+        let base_arg_pos = combined
             .find("ARG _DEV_CONTAINERS_BASE_IMAGE=base")
             .unwrap();
+        let user_arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_IMAGE_USER=node")
+            .unwrap();
         let from_pos = combined.find("FROM node:18 AS base").unwrap();
-        assert!(arg_pos < from_pos, "global ARG must precede first FROM");
+        assert!(
+            base_arg_pos < from_pos,
+            "global base ARG must precede first FROM"
+        );
+        assert!(
+            user_arg_pos < from_pos,
+            "global user ARG must precede first FROM"
+        );
         assert!(
             combined.contains("FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage")
         );
@@ -508,8 +576,10 @@ RUN echo hello
     fn combined_adds_newline_separator() {
         let original = "FROM node:18";
         let features = "FROM node:18 AS target";
-        let combined = generate_combined_dockerfile(original, features, "node:18");
-        assert!(combined.contains("ARG _DEV_CONTAINERS_BASE_IMAGE=node:18\nFROM node:18"));
+        let combined = generate_combined_dockerfile(original, features, "node:18", "root");
+        assert!(
+            combined.contains("ARG _DEV_CONTAINERS_BASE_IMAGE=node:18\nARG _DEV_CONTAINERS_IMAGE_USER=root\nFROM node:18")
+        );
         assert!(combined.contains("\n\nFROM node:18 AS target"));
     }
 
@@ -517,7 +587,7 @@ RUN echo hello
     fn combined_with_syntax_directive() {
         let original = "# syntax=docker/dockerfile:1\nFROM node:18 AS base\nRUN npm install\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\nUSER root\n";
-        let combined = generate_combined_dockerfile(original, features, "base");
+        let combined = generate_combined_dockerfile(original, features, "base", "root");
 
         // Parser directive must remain at the very top
         assert!(combined.starts_with("# syntax=docker/dockerfile:1\n"));
@@ -525,17 +595,24 @@ RUN echo hello
         let arg_pos = combined
             .find("ARG _DEV_CONTAINERS_BASE_IMAGE=base")
             .unwrap();
+        let user_arg_pos = combined
+            .find("ARG _DEV_CONTAINERS_IMAGE_USER=root")
+            .unwrap();
         let syntax_pos = combined.find("# syntax=docker/dockerfile:1").unwrap();
         let from_pos = combined.find("FROM node:18 AS base").unwrap();
         assert!(syntax_pos < arg_pos, "directive must precede global ARG");
         assert!(arg_pos < from_pos, "global ARG must precede first FROM");
+        assert!(
+            user_arg_pos < from_pos,
+            "global user ARG must precede first FROM"
+        );
     }
 
     #[test]
     fn combined_with_multiple_directives() {
         let original = "# syntax=docker/dockerfile:1\n# escape=\\\nFROM ubuntu:22.04 AS base\nRUN apt-get update\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
-        let combined = generate_combined_dockerfile(original, features, "base");
+        let combined = generate_combined_dockerfile(original, features, "base", "root");
 
         assert!(combined.starts_with("# syntax=docker/dockerfile:1\n# escape=\\\n"));
         let arg_pos = combined
@@ -549,11 +626,11 @@ RUN echo hello
     fn combined_no_directives() {
         let original = "FROM alpine:3.18 AS base\nRUN echo hello\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
-        let combined = generate_combined_dockerfile(original, features, "base");
+        let combined = generate_combined_dockerfile(original, features, "base", "root");
 
-        assert!(
-            combined.starts_with("ARG _DEV_CONTAINERS_BASE_IMAGE=base\nFROM alpine:3.18 AS base")
-        );
+        assert!(combined.starts_with(
+            "ARG _DEV_CONTAINERS_BASE_IMAGE=base\nARG _DEV_CONTAINERS_IMAGE_USER=root\nFROM alpine:3.18 AS base"
+        ));
     }
 
     #[test]
@@ -561,7 +638,7 @@ RUN echo hello
         // Original has ARG before FROM (common pattern)
         let original = "ARG BASE=node:18\nFROM $BASE AS builder\nRUN npm install\n";
         let features = "ARG _DEV_CONTAINERS_BASE_IMAGE=builder\nFROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\n";
-        let combined = generate_combined_dockerfile(original, features, "builder");
+        let combined = generate_combined_dockerfile(original, features, "builder", "root");
 
         let global_arg_pos = combined
             .find("ARG _DEV_CONTAINERS_BASE_IMAGE=builder")
@@ -571,6 +648,17 @@ RUN echo hello
             global_arg_pos < first_from_pos,
             "global ARG must precede first FROM"
         );
+    }
+
+    #[test]
+    fn combined_passes_image_user_to_global_arg() {
+        // Regression: the user's Dockerfile USER must be exposed as a global
+        // ARG so the features stage's `ARG _DEV_CONTAINERS_IMAGE_USER` (no
+        // local default) inherits it.
+        let original = "FROM node:18 AS base\nUSER node:node\n";
+        let features = "FROM $_DEV_CONTAINERS_BASE_IMAGE AS dev_containers_target_stage\nARG _DEV_CONTAINERS_IMAGE_USER\nUSER $_DEV_CONTAINERS_IMAGE_USER\n";
+        let combined = generate_combined_dockerfile(original, features, "base", "node");
+        assert!(combined.contains("ARG _DEV_CONTAINERS_IMAGE_USER=node\n"));
     }
 
     // ---------------------------------------------------------------
@@ -793,5 +881,67 @@ USER user
         // named stage), the caller is expected to fall back to image inspect.
         let dockerfile = "FROM ubuntu:22.04 AS base\nRUN echo hi\n";
         assert_eq!(find_user_statement(dockerfile, Some("base")), None);
+    }
+
+    // ---------------------------------------------------------------
+    // find_stage_base_image
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn stage_base_image_simple() {
+        let dockerfile = "FROM mcr.microsoft.com/devcontainers/typescript-node:4.0 AS base\n";
+        assert_eq!(
+            find_stage_base_image(dockerfile, Some("base")),
+            Some("mcr.microsoft.com/devcontainers/typescript-node:4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn stage_base_image_walks_chain_to_external() {
+        let dockerfile = "\
+FROM ubuntu:22.04 AS base
+
+FROM base AS mid
+
+FROM mid AS final
+";
+        assert_eq!(
+            find_stage_base_image(dockerfile, Some("final")),
+            Some("ubuntu:22.04".to_string())
+        );
+    }
+
+    #[test]
+    fn stage_base_image_variable_returns_none() {
+        let dockerfile = "FROM $BASE_IMAGE AS base\n";
+        assert_eq!(find_stage_base_image(dockerfile, Some("base")), None);
+    }
+
+    #[test]
+    fn stage_base_image_missing_target_returns_none() {
+        let dockerfile = "FROM ubuntu:22.04 AS base\n";
+        assert_eq!(find_stage_base_image(dockerfile, Some("other")), None);
+    }
+
+    #[test]
+    fn stage_base_image_cycle_returns_none() {
+        let dockerfile = "\
+FROM b AS a
+
+FROM a AS b
+";
+        assert_eq!(find_stage_base_image(dockerfile, Some("a")), None);
+    }
+
+    #[test]
+    fn stage_base_image_defaults_to_last_stage() {
+        let dockerfile = "\
+FROM ubuntu:22.04 AS builder
+FROM alpine:3.18
+";
+        assert_eq!(
+            find_stage_base_image(dockerfile, None),
+            Some("alpine:3.18".to_string())
+        );
     }
 }
