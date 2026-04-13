@@ -4,31 +4,60 @@
 //! for converting `EnvForwarding` and `MountConfig` inputs into `MountSpec`.
 //! Mount assembly (combining all sources) lives in `compose_up.rs`.
 
-use std::collections::HashSet;
-
 use cella_backend::{MountConfig, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
 
-/// Remove candidate mounts whose target path already appears in the primary
-/// service's resolved volumes list.
+/// Return `true` if `candidate` is equal to `base` or is a descendant path of it.
+///
+/// Trailing slashes on `base` are normalised before comparison so that
+/// `/root/.claude/` and `/root/.claude` are treated identically.
+fn is_descendant_or_equal(candidate: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    candidate == base || candidate.starts_with(&format!("{base}/"))
+}
+
+/// Remove candidate mounts whose target path is equal to, or a descendant of,
+/// any target already declared in the primary service's resolved volumes.
+///
+/// A second pass then removes cella-side candidates that conflict with an
+/// *earlier* cella candidate (first-wins), using the same ancestor-or-equal
+/// rule so that e.g. a bind at `/root/.foo` blocks a tmpfs at `/root/.foo/sub`.
 pub fn dedup_against_base(
     resolved: &ResolvedComposeConfig,
     primary_service: &str,
     candidates: Vec<MountSpec>,
 ) -> Vec<MountSpec> {
     let base_targets = extract_service_targets(resolved, primary_service);
-    candidates
+
+    // Pass 1: drop candidates covered by any base target.
+    let after_base: Vec<MountSpec> = candidates
         .into_iter()
-        .filter(|spec| !base_targets.contains(&spec.target))
-        .collect()
+        .filter(|spec| {
+            !base_targets
+                .iter()
+                .any(|base| is_descendant_or_equal(&spec.target, base))
+        })
+        .collect();
+
+    // Pass 2: dedup cella candidates against each other — first declaration wins.
+    let mut accepted: Vec<MountSpec> = Vec::with_capacity(after_base.len());
+    for candidate in after_base {
+        let blocked = accepted
+            .iter()
+            .any(|a| is_descendant_or_equal(&candidate.target, &a.target));
+        if !blocked {
+            accepted.push(candidate);
+        }
+    }
+    accepted
 }
 
-fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> Vec<String> {
     let Some(svc) = resolved.services.get(service) else {
-        return out;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for v in &svc.volumes {
         match v {
             serde_json::Value::String(s) => {
@@ -37,12 +66,12 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> H
                 // this branch handles caller-supplied or hand-written test fixtures.)
                 let parts: Vec<&str> = s.splitn(3, ':').collect();
                 if parts.len() >= 2 {
-                    out.insert(parts[1].to_string());
+                    out.push(parts[1].to_string());
                 }
             }
             serde_json::Value::Object(obj) => {
-                if let Some(t) = obj.get("target").and_then(|x| x.as_str()) {
-                    out.insert(t.to_string());
+                if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
+                    out.push(t.to_string());
                 }
             }
             _ => {}
@@ -210,5 +239,117 @@ mod tests {
             yaml.contains("read_only: true"),
             "emitted YAML must include read_only: true, got:\n{yaml}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 3: ancestor-path dedup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_drops_descendant_of_base_mount() {
+        // Base has `/root/.claude`; candidate targets `/root/.claude/plugins` — must be dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "descendant of base target must be dropped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_does_not_drop_sibling_of_base_mount() {
+        // `/root/.claude-plus` is NOT a descendant of `/root/.claude`.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/host/claude-plus", "/root/.claude-plus")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "sibling path must not be dropped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_handles_trailing_slash_in_base() {
+        // Base target has a trailing slash; descendant must still be dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/"})],
+        );
+        let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "trailing slash on base must not defeat ancestor matching, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_first_candidate_wins_on_internal_collision() {
+        // Two cella candidates with the same target: only the first survives.
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![
+            MountSpec::bind("/a", "/root/.foo"),
+            MountSpec::tmpfs("/root/.foo"),
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source, "/a", "first candidate must win");
+    }
+
+    #[test]
+    fn dedup_parent_candidate_drops_child_candidate() {
+        // Parent bind at `/root/.foo` must block a child tmpfs at `/root/.foo/sub`.
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![
+            MountSpec::bind("/a", "/root/.foo"),
+            MountSpec::tmpfs("/root/.foo/sub"),
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].target, "/root/.foo",
+            "parent must survive; child must be dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_descendant_or_equal unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_descendant_equal_exact_match() {
+        assert!(is_descendant_or_equal("/root/.claude", "/root/.claude"));
+    }
+
+    #[test]
+    fn is_descendant_or_equal_child() {
+        assert!(is_descendant_or_equal(
+            "/root/.claude/plugins",
+            "/root/.claude"
+        ));
+    }
+
+    #[test]
+    fn is_descendant_or_equal_sibling_is_false() {
+        assert!(!is_descendant_or_equal(
+            "/root/.claude-plus",
+            "/root/.claude"
+        ));
+    }
+
+    #[test]
+    fn is_descendant_or_equal_trailing_slash_on_base() {
+        assert!(is_descendant_or_equal(
+            "/root/.claude/plugins",
+            "/root/.claude/"
+        ));
     }
 }
