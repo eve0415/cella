@@ -463,6 +463,32 @@ async fn handle_compose_running(
         .cloned()
         .unwrap_or_else(|| resolve_remote_user(config, None, "root"));
 
+    // Warn on config-hash drift (mirrors single-container warn_config_drift at up.rs:486-508).
+    let current_hash = project.config_hash.as_str();
+    let old_hash: Option<&str> = container.config_hash.as_deref().or_else(|| {
+        container
+            .labels
+            .get("dev.cella.config_hash")
+            .map(String::as_str)
+    });
+    if let Some(old) = old_hash
+        && old != current_hash
+    {
+        progress.warn("Config has changed since this container was created.");
+        progress.hint("Run `cella up --rebuild` to recreate with the updated config.");
+    }
+
+    // Runtime drift.
+    let current_runtime = cella_env::platform::detect_runtime().as_label();
+    if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime")
+        && old_runtime != current_runtime
+    {
+        progress.warn(&format!(
+            "Docker runtime changed ({old_runtime} -> {current_runtime})."
+        ));
+        progress.hint("Run `cella up --rebuild` to recreate with the updated runtime.");
+    }
+
     // Re-register with daemon in case it restarted
     hooks
         .register_container(client, &container.id, config, cfg.container_name)
