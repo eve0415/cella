@@ -190,14 +190,6 @@ pub async fn compose_up(
         find_compose_container(client, &project.project_name, &project.primary_service).await?;
 
     if let Some(ref container) = existing {
-        if let Some(old_hash) = &container.config_hash
-            && *old_hash != project.config_hash
-            && !cfg.remove_container
-        {
-            progress.warn("Config or compose files changed since last up.");
-            progress.hint("Run `cella up --rebuild` to recreate.");
-        }
-
         if container.state == ContainerState::Running
             && !cfg.remove_container
             && !cfg.build_no_cache
