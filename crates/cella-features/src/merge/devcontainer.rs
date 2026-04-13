@@ -38,8 +38,16 @@ pub fn merge_with_devcontainer(
                     .get("target")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let read_only = mount_obj
+                    .get("readOnly")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 if !tgt.is_empty() {
-                    mounts.push(format!("type={mt},source={src},target={tgt}"));
+                    if read_only {
+                        mounts.push(format!("type={mt},source={src},target={tgt},readonly"));
+                    } else {
+                        mounts.push(format!("type={mt},source={src},target={tgt}"));
+                    }
                 }
             }
         }
@@ -422,5 +430,35 @@ mod tests {
 
         let merged = merge_with_devcontainer(&feature_config, &devcontainer);
         assert!(merged.mounts.is_empty());
+    }
+
+    #[test]
+    fn object_mount_with_readonly_flag_preserves_readonly_in_csv() {
+        let feature_config = FeatureContainerConfig::default();
+        let devcontainer = json!({
+            "mounts": [
+                {"type": "bind", "source": "/host/data", "target": "/data", "readOnly": true},
+                {"type": "bind", "source": "/host/rw", "target": "/rw"},
+            ]
+        });
+
+        let merged = merge_with_devcontainer(&feature_config, &devcontainer);
+
+        assert_eq!(merged.mounts.len(), 2);
+
+        // The read-only mount must carry the `readonly` bare token so that
+        // `parse_mount_string` (cella-orchestrator) can recover read_only=true.
+        let ro_csv = &merged.mounts[0];
+        assert!(
+            ro_csv.split(',').any(|t| t == "readonly"),
+            "expected `readonly` bare token in CSV, got: {ro_csv}"
+        );
+
+        // The writable mount must NOT carry `readonly` or `ro`.
+        let rw_csv = &merged.mounts[1];
+        assert!(
+            !rw_csv.split(',').any(|t| t == "readonly" || t == "ro"),
+            "unexpected read-only token in writable mount CSV: {rw_csv}"
+        );
     }
 }
