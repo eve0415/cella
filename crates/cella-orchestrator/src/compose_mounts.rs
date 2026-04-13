@@ -4,6 +4,8 @@
 //! for converting `EnvForwarding` and `MountConfig` inputs into `MountSpec`.
 //! Mount assembly (combining all sources) lives in `compose_up.rs`.
 
+use std::collections::HashSet;
+
 use cella_backend::{MountConfig, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
@@ -20,9 +22,10 @@ fn is_descendant_or_equal(candidate: &str, base: &str) -> bool {
 /// Remove candidate mounts whose target path is equal to, or a descendant of,
 /// any target already declared in the primary service's resolved volumes.
 ///
-/// A second pass then removes cella-side candidates that conflict with an
-/// *earlier* cella candidate (first-wins), using the same ancestor-or-equal
-/// rule so that e.g. a bind at `/root/.foo` blocks a tmpfs at `/root/.foo/sub`.
+/// A second pass then removes cella-side candidates that have the **exact same
+/// target** as an earlier cella candidate (first-wins). Only exact-target
+/// matches are dropped here — intentional parent+child overlays (e.g. a bind at
+/// `/root/.claude` plus a tmpfs at `/root/.claude/plugins`) are preserved.
 pub fn dedup_against_base(
     resolved: &ResolvedComposeConfig,
     primary_service: &str,
@@ -30,7 +33,7 @@ pub fn dedup_against_base(
 ) -> Vec<MountSpec> {
     let base_targets = extract_service_targets(resolved, primary_service);
 
-    // Pass 1: drop candidates covered by any base target.
+    // Pass 1: drop candidates covered by any base target (ancestor-or-equal).
     let after_base: Vec<MountSpec> = candidates
         .into_iter()
         .filter(|spec| {
@@ -40,13 +43,12 @@ pub fn dedup_against_base(
         })
         .collect();
 
-    // Pass 2: dedup cella candidates against each other — first declaration wins.
+    // Pass 2: dedup cella candidates against each other — exact target match only,
+    // first declaration wins. Intentional parent+child overlays are preserved.
+    let mut seen_targets: HashSet<String> = HashSet::new();
     let mut accepted: Vec<MountSpec> = Vec::with_capacity(after_base.len());
     for candidate in after_base {
-        let blocked = accepted
-            .iter()
-            .any(|a| is_descendant_or_equal(&candidate.target, &a.target));
-        if !blocked {
+        if seen_targets.insert(candidate.target.clone()) {
             accepted.push(candidate);
         }
     }
@@ -321,19 +323,36 @@ mod tests {
     }
 
     #[test]
-    fn dedup_parent_candidate_drops_child_candidate() {
-        // Parent bind at `/root/.foo` must block a child tmpfs at `/root/.foo/sub`.
+    fn dedup_preserves_intentional_tmpfs_over_bind() {
+        // Claude plugin isolation: bind at `/root/.claude` plus tmpfs at
+        // `/root/.claude/plugins` are an *intentional* parent+child overlay.
+        // Both must survive Pass-2 dedup (exact-match only).
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![
+            MountSpec::bind("/host/.claude", "/root/.claude"),
+            MountSpec::tmpfs("/root/.claude/plugins"),
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            2,
+            "bind+tmpfs overlay must both survive; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/root/.claude");
+        assert_eq!(result[1].target, "/root/.claude/plugins");
+    }
+
+    #[test]
+    fn dedup_first_candidate_wins_on_exact_collision() {
+        // Two candidates with the same exact target: only the first survives.
         let resolved = make_resolved("app", vec![]);
         let candidates = vec![
             MountSpec::bind("/a", "/root/.foo"),
-            MountSpec::tmpfs("/root/.foo/sub"),
+            MountSpec::bind("/b", "/root/.foo"),
         ];
         let result = dedup_against_base(&resolved, "app", candidates);
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].target, "/root/.foo",
-            "parent must survive; child must be dropped"
-        );
+        assert_eq!(result[0].source, "/a", "first candidate must win");
     }
 
     // -----------------------------------------------------------------------
