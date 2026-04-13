@@ -319,7 +319,6 @@ async fn prepare_and_start(
         settings: &settings,
         remote_user: &remote_user,
         env_fwd: &env_fwd,
-        compose_cmd: &compose_cmd,
         project,
         config,
         resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
@@ -839,7 +838,6 @@ struct ComposeMountParams<'a> {
     settings: &'a cella_config::settings::Settings,
     remote_user: &'a str,
     env_fwd: &'a cella_env::EnvForwarding,
-    compose_cmd: &'a ComposeCommand,
     project: &'a ComposeProject,
     config: &'a serde_json::Value,
     resolved_features: Option<&'a cella_features::ResolvedFeatures>,
@@ -917,10 +915,18 @@ async fn build_compose_mount_specs(
         );
     }
 
-    // Validate the base compose config and dedup candidates against it. If
-    // `docker compose config` fails, emit a warning and skip both validation
-    // and dedup — Docker Compose will surface any eventual collision.
-    match p.compose_cmd.config().await {
+    // Validate the base compose config and dedup candidates against it.
+    //
+    // Use `without_override` so that cella's own injected mounts (written in
+    // step 8 above) are excluded from the resolved config.  If we used the
+    // override-inclusive command the agent volume entry cella injected would
+    // trigger a false-positive self-rejection on the very check designed to
+    // protect that volume.
+    //
+    // If `docker compose config` fails, emit a warning and skip both
+    // validation and dedup — Docker Compose will surface any eventual collision.
+    let validation_cmd = ComposeCommand::without_override(p.project);
+    match validation_cmd.config().await {
         Ok(resolved) => {
             // Reject the whole `cella up` if the user's base compose file aliases
             // or mounts the managed agent volume. Docker Compose multi-file merge
@@ -928,12 +934,18 @@ async fn build_compose_mount_specs(
             if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
                 crate::compose_mounts::validate_base_compose_against_reserved_agent(
                     &resolved,
-                    &p.project.primary_service,
+                    p.project.run_services.as_deref(),
                     p.agent_vol_name,
                     p.agent_vol_target,
                 )
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             }
+            // Reject any extra named-volume source that collides with a base
+            // top-level volume key bound to a different backing volume.  Compose
+            // deep-merges top-level volume declarations, so our `name:` pin could
+            // silently repoint an existing volume and break other services.
+            crate::compose_mounts::validate_extra_named_volumes_against_base(&resolved, &specs)
+                .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             Ok(crate::compose_mounts::dedup_against_base(
                 &resolved,
                 &p.project.primary_service,
