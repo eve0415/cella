@@ -196,14 +196,17 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 /// The rules applied per extra volume `source`:
 ///
 /// - No top-level base entry for `source` → no collision, emit normally.
-/// - Base has `volumes: <source>: { name: <source> }` (same literal) → compatible,
-///   cella's pin and the base pin agree.
+/// - Base has `volumes: <source>: { name: <source> }` (explicit name, same literal)
+///   → compatible: cella's pin and the base pin agree.
+/// - Base has `volumes: <source>: { external: true }` with no `name:`
+///   → compatible: Docker Compose resolves the volume name to the literal key
+///   (same semantics as cella's pin). No collision.
 /// - Base has `volumes: <source>: {}` (bare, project-scoped as `<project>_<source>`)
 ///   → **reject**: single-container uses the literal `source`; compose would diverge.
 /// - Base has `volumes: <source>: { name: <other> }` (explicit alias mismatch)
 ///   → **reject**: cella's literal pin overwrites the alias.
-/// - Base has `volumes: <source>: { external: true }` with no `name:`
-///   → **reject**: external lookup identity is ambiguous without an explicit name.
+/// - Base has `volumes: <source>: { external: true, name: <other> }` (mismatched)
+///   → **reject**: external lookup identity differs from the literal source name.
 ///
 /// Returns `Ok(())` when all extra volumes are safe, or `Err(message)` on the
 /// first collision.
@@ -218,21 +221,46 @@ pub(crate) fn validate_extra_named_volumes_against_base(
         let Some(base_vol) = resolved.volumes.get(&spec.source) else {
             continue; // no collision — safe to emit
         };
-        let base_name = base_vol.get("name").and_then(|v| v.as_str());
-        if base_name == Some(spec.source.as_str()) {
-            // Base already pins the exact same literal name — compatible.
+        let effective = base_volume_effective_name(base_vol, &spec.source);
+        if effective == Some(spec.source.as_str()) {
+            // Effective name agrees with the literal source — compatible.
             continue;
         }
         return Err(format!(
             "devcontainer mount 'source={}' collides with base compose top-level volume key \
-             of different identity (base name: {}). Cella cannot safely pin the literal \
+             of different identity (effective base name: {}). Cella cannot safely pin the literal \
              volume without potentially breaking other services. Rename the mount source \
              or remove the conflicting base top-level volume declaration.",
             spec.source,
-            base_name.map_or_else(|| "<project-scoped>".to_string(), str::to_string),
+            effective.map_or_else(|| "<project-scoped>".to_string(), str::to_string),
         ));
     }
     Ok(())
+}
+
+/// Compute the effective volume name that Docker Compose will resolve for a
+/// top-level volume entry.
+///
+/// Docker Compose volume-name resolution rules:
+/// - Explicit `name:` always wins, regardless of `external:`.
+/// - `external: true` without `name:` → the key itself is the literal external
+///   volume name (no project prefix is applied).
+/// - No `name:`, no `external:` (bare key) → project-scoped name
+///   (`<project>_<key>`); the literal key is NOT used → return `None`.
+fn base_volume_effective_name<'a>(
+    base_vol: &'a serde_json::Value,
+    key: &'a str,
+) -> Option<&'a str> {
+    let explicit_name = base_vol.get("name").and_then(|v| v.as_str());
+    let external = base_vol
+        .get("external")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match (explicit_name, external) {
+        (Some(n), _) => Some(n),   // explicit name always wins
+        (None, true) => Some(key), // external without name → key is the literal name
+        (None, false) => None,     // project-scoped → no literal name
+    }
 }
 
 /// Normalise a mount target path by stripping trailing slashes.
@@ -1363,6 +1391,116 @@ mod tests {
         assert_ne!(
             fp_a, fp_b,
             "fingerprint must change when nvim.config_path override differs"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_extra_named_volumes_against_base (Finding 3, round 9)
+    // -----------------------------------------------------------------------
+
+    fn make_volume_spec(source: &str) -> MountSpec {
+        MountSpec {
+            kind: MountKind::Volume,
+            source: source.to_string(),
+            target: "/mnt".to_string(),
+            read_only: false,
+            consistency: None,
+        }
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_no_base_entry() {
+        // No top-level volume in base → no collision.
+        let resolved = make_resolved_with_volumes("app", vec![], HashMap::new());
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(validate_extra_named_volumes_against_base(&resolved, &extras).is_ok());
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_pins_same_name() {
+        // Base has explicit name: matching source → compatible.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"name": "mycache"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "explicit name matching source must be accepted"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_is_external_with_matching_key() {
+        // external: true without name: → Docker resolves to literal key, same as
+        // cella's pin — compatible (no false-positive rejection).
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"external": true}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "external: true with matching key resolves to literal — compatible"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_rejected_when_base_is_external_with_different_name() {
+        // external: true with a name: that differs from source → mismatch.
+        let mut top_vols = HashMap::new();
+        top_vols.insert(
+            "mycache".to_string(),
+            json!({"external": true, "name": "other"}),
+        );
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "external with mismatched name must reject"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_rejected_when_base_has_bare_key() {
+        // Bare key → project-scoped (no effective literal name) → reject.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "bare key (project-scoped) must reject"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_rejected_when_base_has_different_name() {
+        // Explicit name mismatch → reject.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"name": "app_db_vol"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "explicit name mismatch must reject"
+        );
+    }
+
+    #[test]
+    fn extra_non_volume_mounts_are_skipped() {
+        // Bind and tmpfs mounts are not named volumes — always pass through.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let bind = MountSpec {
+            kind: MountKind::Bind,
+            source: "mycache".to_string(),
+            target: "/mnt".to_string(),
+            read_only: false,
+            consistency: None,
+        };
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &[bind]).is_ok(),
+            "bind mounts must be skipped by the volume-collision check"
         );
     }
 }
