@@ -14,6 +14,8 @@ pub enum MountKind {
     Bind,
     Tmpfs,
     Volume,
+    /// Windows named pipe (`npipe`).
+    NamedPipe,
 }
 
 impl MountKind {
@@ -22,14 +24,17 @@ impl MountKind {
             Self::Bind => "bind",
             Self::Tmpfs => "tmpfs",
             Self::Volume => "volume",
+            Self::NamedPipe => "npipe",
         }
     }
 
-    fn from_type_str(s: &str) -> Self {
+    fn from_type_str(s: &str) -> Option<Self> {
         match s {
-            "tmpfs" => Self::Tmpfs,
-            "volume" => Self::Volume,
-            _ => Self::Bind,
+            "bind" => Some(Self::Bind),
+            "tmpfs" => Some(Self::Tmpfs),
+            "volume" => Some(Self::Volume),
+            "npipe" => Some(Self::NamedPipe),
+            _ => None,
         }
     }
 }
@@ -98,14 +103,19 @@ impl MountSpec {
     }
 
     /// Adapter: parse from a Docker `MountConfig`.
-    pub fn from_mount_config(mc: &MountConfig) -> Self {
-        Self {
-            kind: MountKind::from_type_str(&mc.mount_type),
+    ///
+    /// Returns `None` when `mount_type` is not a recognised kind (e.g. an
+    /// unsupported or future type). Callers should log a warning and skip the
+    /// mount rather than silently demoting it to `bind`.
+    pub fn from_mount_config(mc: &MountConfig) -> Option<Self> {
+        let kind = MountKind::from_type_str(&mc.mount_type)?;
+        Some(Self {
+            kind,
             source: mc.source.clone(),
             target: mc.target.clone(),
             read_only: mc.read_only,
             consistency: mc.consistency.clone(),
-        }
+        })
     }
 
     /// Adapter: long-form YAML entry for docker-compose override files.
@@ -188,11 +198,40 @@ mod tests {
             consistency: Some("cached".into()),
             read_only: false,
         };
-        let spec = MountSpec::from_mount_config(&mc);
+        let spec = MountSpec::from_mount_config(&mc).unwrap();
         assert_eq!(spec.kind, MountKind::Bind);
         assert_eq!(spec.source, "/a");
         assert_eq!(spec.target, "/b");
         assert_eq!(spec.consistency.as_deref(), Some("cached"));
+    }
+
+    #[test]
+    fn from_mount_config_returns_none_for_unknown_type() {
+        let mc = MountConfig {
+            mount_type: "cluster".into(),
+            source: String::new(),
+            target: "/data".into(),
+            consistency: None,
+            read_only: false,
+        };
+        assert!(
+            MountSpec::from_mount_config(&mc).is_none(),
+            "unknown mount type 'cluster' must yield None"
+        );
+    }
+
+    #[test]
+    fn from_mount_config_accepts_npipe() {
+        let mc = MountConfig {
+            mount_type: "npipe".into(),
+            source: r"//./pipe/docker_engine".into(),
+            target: r"//./pipe/docker_engine".into(),
+            consistency: None,
+            read_only: false,
+        };
+        let spec = MountSpec::from_mount_config(&mc).unwrap();
+        assert_eq!(spec.kind, MountKind::NamedPipe);
+        assert_eq!(spec.kind.as_str(), "npipe");
     }
 
     #[test]

@@ -90,8 +90,24 @@ pub fn env_fwd_to_mount_specs(fwd: &EnvForwarding) -> Vec<MountSpec> {
 
 /// Adapt `MountConfig` → `MountSpec` (used for user `mounts:` and feature `mounts:`
 /// which already parse to `MountConfig` via shared parser).
+///
+/// Configs with unrecognised mount types are skipped with a warning rather than
+/// silently demoted to `bind`.
 pub fn mount_configs_to_specs(configs: &[MountConfig]) -> Vec<MountSpec> {
-    configs.iter().map(MountSpec::from_mount_config).collect()
+    configs
+        .iter()
+        .filter_map(|mc| {
+            let spec = MountSpec::from_mount_config(mc);
+            if spec.is_none() {
+                tracing::warn!(
+                    mount_type = %mc.mount_type,
+                    target = %mc.target,
+                    "unsupported mount type — skipping",
+                );
+            }
+            spec
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -229,7 +245,7 @@ mod tests {
             consistency: None,
             read_only: true,
         };
-        let spec = MountSpec::from_mount_config(&config);
+        let spec = MountSpec::from_mount_config(&config).unwrap();
         assert!(
             spec.read_only,
             "read_only must survive the MountConfig→MountSpec conversion"
