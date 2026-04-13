@@ -321,6 +321,7 @@ async fn prepare_and_start(
         project,
         config,
         resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
+        agent_vol_target: &agent_vol_target,
     })
     .await;
 
@@ -809,14 +810,19 @@ struct ComposeMountParams<'a> {
     project: &'a ComposeProject,
     config: &'a serde_json::Value,
     resolved_features: Option<&'a cella_features::ResolvedFeatures>,
+    /// Agent volume mount target (e.g., `/cella`). Mounts targeting this path
+    /// or any descendant are rejected to protect the managed agent.
+    agent_vol_target: &'a str,
 }
 
 /// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
 /// user `mounts:`, and feature `mounts:`.
 ///
 /// Sources are appended in priority order (tool configs → env-fwd → parent-git
-/// → user/feature mounts) then deduplicated against paths already declared in
-/// the base compose config so the override file never shadows user-owned volumes.
+/// → user/feature mounts) then:
+/// 1. Any user/feature mount targeting the agent subtree is stripped and warned.
+/// 2. Remaining candidates are deduplicated against paths already declared in
+///    the base compose config so the override file never shadows user-owned volumes.
 async fn build_compose_mount_specs(p: ComposeMountParams<'_>) -> Vec<MountSpec> {
     let mut specs = crate::tool_install::build_tool_config_mount_specs(p.settings, p.remote_user);
     specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(p.env_fwd));
@@ -842,6 +848,13 @@ async fn build_compose_mount_specs(p: ComposeMountParams<'_>) -> Vec<MountSpec> 
     specs.extend(crate::compose_mounts::mount_configs_to_specs(
         &user_feature_mounts,
     ));
+
+    // Strip any mount whose target is inside the reserved agent subtree.
+    // Tool-config / env-fwd / parent-git mounts should never target /cella, but
+    // user and feature mounts are untrusted input — apply this filter to all.
+    if !p.agent_vol_target.is_empty() {
+        specs = crate::compose_mounts::filter_reserved_agent_subtree(specs, p.agent_vol_target);
+    }
 
     // Dedup against the user's base compose config. If this call fails, emit a
     // warning and skip dedup — Docker Compose will surface any eventual collision.

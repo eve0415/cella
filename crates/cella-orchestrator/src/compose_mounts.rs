@@ -14,9 +14,39 @@ use cella_env::EnvForwarding;
 ///
 /// Trailing slashes on `base` are normalised before comparison so that
 /// `/root/.claude/` and `/root/.claude` are treated identically.
-fn is_descendant_or_equal(candidate: &str, base: &str) -> bool {
+pub(crate) fn is_descendant_or_equal(candidate: &str, base: &str) -> bool {
     let base = base.trim_end_matches('/');
     candidate == base || candidate.starts_with(&format!("{base}/"))
+}
+
+/// Filter out mount specs whose target is equal to or a descendant of the
+/// reserved `agent_vol_target` (e.g., `/cella`).
+///
+/// The agent volume is the single most critical resource cella manages. Any
+/// user or feature mount that shadows it or any subdirectory (e.g. `/cella/bin`)
+/// would replace the agent binary path and break managed-agent behaviour.
+///
+/// Returns the filtered list; each rejected mount is logged at `warn` level.
+pub(crate) fn filter_reserved_agent_subtree(
+    specs: Vec<MountSpec>,
+    agent_vol_target: &str,
+) -> Vec<MountSpec> {
+    specs
+        .into_iter()
+        .filter(|spec| {
+            if is_descendant_or_equal(&spec.target, agent_vol_target) {
+                tracing::warn!(
+                    target = %spec.target,
+                    source = %spec.source,
+                    reserved = %agent_vol_target,
+                    "mount rejected: target is inside the reserved agent subtree",
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 /// Remove candidate mounts whose target path is equal to, or a descendant of,
@@ -446,5 +476,63 @@ mod tests {
             "/root/.claude/plugins",
             "/root/.claude/"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // filter_reserved_agent_subtree (Finding 1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reject_mount_targeting_cella_root() {
+        // A user mount targeting `/cella` exactly must be filtered out.
+        let specs = vec![MountSpec::bind("/host-cella", "/cella")];
+        let result = filter_reserved_agent_subtree(specs, "/cella");
+        assert!(
+            result.is_empty(),
+            "mount at /cella must be rejected; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_mount_targeting_cella_descendant() {
+        // A user mount targeting `/cella/bin` (descendant) must be filtered out.
+        let specs = vec![MountSpec::bind("/host-bin", "/cella/bin")];
+        let result = filter_reserved_agent_subtree(specs, "/cella");
+        assert!(
+            result.is_empty(),
+            "mount at /cella/bin must be rejected; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allow_mount_with_similar_prefix() {
+        // `/cellax/bin` and `/cella-other` are NOT descendants of `/cella`.
+        let specs = vec![
+            MountSpec::bind("/host-x", "/cellax/bin"),
+            MountSpec::bind("/host-other", "/cella-other"),
+        ];
+        let result = filter_reserved_agent_subtree(specs, "/cella");
+        assert_eq!(
+            result.len(),
+            2,
+            "mounts at /cellax/bin and /cella-other must NOT be rejected; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_tool_config_mount_at_cella() {
+        // Defense-in-depth: even if a tool-config mount somehow targets /cella,
+        // the filter must still reject it.
+        let specs = vec![
+            MountSpec::bind("/legit", "/workspace"),
+            MountSpec::bind("/bad", "/cella"),
+        ];
+        let result = filter_reserved_agent_subtree(specs, "/cella");
+        assert_eq!(
+            result.len(),
+            1,
+            "only the /workspace mount should survive; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/workspace");
     }
 }
