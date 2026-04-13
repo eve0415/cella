@@ -288,7 +288,6 @@ async fn prepare_and_start(
         extra_env: Vec::new(),
         labels: BTreeMap::new(),
         extra_volumes: Vec::new(),
-        base_compose_volumes: std::collections::BTreeSet::new(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
@@ -315,7 +314,7 @@ async fn prepare_and_start(
     let settings = cella_config::settings::Settings::load(cfg.workspace_root);
     insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
 
-    let (mount_specs, base_compose_volumes) = build_compose_mount_specs(ComposeMountParams {
+    let mount_specs = build_compose_mount_specs(ComposeMountParams {
         workspace_root: cfg.workspace_root,
         settings: &settings,
         remote_user: &remote_user,
@@ -335,7 +334,6 @@ async fn prepare_and_start(
         extra_env,
         labels,
         extra_volumes: mount_specs,
-        base_compose_volumes,
     };
 
     // 13. Build-time UID remap: build a thin image layer with correct UID/GID.
@@ -547,10 +545,6 @@ struct OverrideContext {
     extra_env: Vec<String>,
     labels: BTreeMap<String, String>,
     extra_volumes: Vec<MountSpec>,
-    /// Top-level volume names from the user's base compose config.
-    /// Passed through to the override YAML generator to avoid emitting
-    /// duplicate top-level declarations for user-owned volumes.
-    base_compose_volumes: std::collections::BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +573,6 @@ fn write_build_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
-        base_compose_volumes: std::collections::BTreeSet::new(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -734,7 +727,6 @@ fn write_final_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
-        base_compose_volumes: ov.base_compose_volumes.clone(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -870,14 +862,9 @@ struct ComposeMountParams<'a> {
 /// 2. Any user/feature mount targeting the agent subtree is stripped and warned.
 /// 3. Remaining candidates are deduplicated against paths already declared in
 ///    the base compose config so the override file never shadows user-owned volumes.
-///
-/// Returns `(mount_specs, base_compose_volumes)` where `base_compose_volumes` is
-/// the set of top-level volume names from the user's base compose config. This is
-/// needed by the override YAML generator to avoid emitting duplicate declarations
-/// for volumes the user already declared.
 async fn build_compose_mount_specs(
     p: ComposeMountParams<'_>,
-) -> Result<(Vec<MountSpec>, std::collections::BTreeSet<String>), crate::error::OrchestratorError> {
+) -> Result<Vec<MountSpec>, crate::error::OrchestratorError> {
     // Assembly order mirrors single-container `config_map::map_config`:
     //   1. User devcontainer.json `mounts:` and feature `mounts:` FIRST.
     //   2. Auto-forwarded mounts (tool-config, env-fwd, parent-git) LAST.
@@ -933,8 +920,6 @@ async fn build_compose_mount_specs(
     // Validate the base compose config and dedup candidates against it. If
     // `docker compose config` fails, emit a warning and skip both validation
     // and dedup — Docker Compose will surface any eventual collision.
-    // Also extract the top-level volume names from the resolved config so the
-    // override generator can avoid duplicating user-declared volumes.
     match p.compose_cmd.config().await {
         Ok(resolved) => {
             // Reject the whole `cella up` if the user's base compose file aliases
@@ -949,17 +934,15 @@ async fn build_compose_mount_specs(
                 )
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             }
-            let base_vols = resolved.volumes.keys().cloned().collect();
-            let deduped = crate::compose_mounts::dedup_against_base(
+            Ok(crate::compose_mounts::dedup_against_base(
                 &resolved,
                 &p.project.primary_service,
                 specs,
-            );
-            Ok((deduped, base_vols))
+            ))
         }
         Err(e) => {
             warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");
-            Ok((specs, std::collections::BTreeSet::new()))
+            Ok(specs)
         }
     }
 }

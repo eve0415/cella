@@ -59,13 +59,6 @@ pub struct OverrideConfig {
     /// SSH/GPG, parent-git, user mounts, feature mounts). An empty `Vec`
     /// preserves the existing YAML output byte-for-byte.
     pub extra_volumes: Vec<MountSpec>,
-    /// Top-level volume names already declared in the user's base compose config.
-    ///
-    /// When `extra_volumes` contains a `MountKind::Volume` entry with a non-empty
-    /// source, cella emits a bare top-level declaration so compose can
-    /// auto-create the volume. Names present in this set are skipped — the user
-    /// owns them and merging a duplicate declaration would conflict.
-    pub base_compose_volumes: BTreeSet<String>,
 }
 
 /// Generate the override compose YAML as a string.
@@ -169,8 +162,13 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     // explicit `name:` pin so that Docker Compose uses the literal volume name
     // instead of project-scoping it as `<project>_<source>`. This preserves
     // parity with the single-container path which passes the literal source
-    // name directly to the Docker API. Skip volumes already declared in the
-    // user's base compose config — merging a duplicate declaration would conflict.
+    // name directly to the Docker API.
+    //
+    // docker compose -f merges top-level volume declarations (deep merge per
+    // key across files). Emitting `name: <source>` unconditionally pins the
+    // literal Docker volume name in the merged output regardless of what the
+    // base compose file declares for that key (project-scoped, aliased via
+    // `name:`, or `external: true` with no `name:`).
     yaml.push_str("volumes:\n");
     let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
     yaml.push_str("    external: true\n");
@@ -178,7 +176,6 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     for spec in &config.extra_volumes {
         if spec.kind == MountKind::Volume
             && !spec.source.is_empty()
-            && !config.base_compose_volumes.contains(&spec.source)
             && emitted_volumes.insert(spec.source.as_str())
         {
             let _ = writeln!(yaml, "  {}:", spec.source);
@@ -230,7 +227,6 @@ mod tests {
             additional_contexts: BTreeMap::new(),
             build_secrets: Vec::new(),
             extra_volumes: Vec::new(),
-            base_compose_volumes: BTreeSet::new(),
         }
     }
 
@@ -640,21 +636,22 @@ mod tests {
     }
 
     #[test]
-    fn named_volume_skips_top_level_if_in_base() {
-        // When the user's base compose already declares the volume, cella must
-        // NOT emit a duplicate top-level entry (merging would conflict).
+    fn named_volume_always_pins_literal_name_even_with_base_collision() {
+        // Even if the base compose has a top-level key matching the source,
+        // cella's override still emits its literal-name pin. Compose -f merge
+        // ensures the final volume declaration carries `name: <source>`,
+        // pinning the literal Docker volume name regardless of base config.
         let mut config = base_config();
-        config.extra_volumes = vec![named_volume_spec("mycache", "/cache")];
-        config.base_compose_volumes.insert("mycache".to_string());
+        config.extra_volumes = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
         let yaml = generate_override_yaml(&config);
-        // The service-level volume entry is still emitted, but the top-level
-        // declaration for mycache must NOT appear.
-        let top_level_start = yaml.find("volumes:\n  cella-agent:").unwrap();
-        let after_agent = &yaml[top_level_start..];
-        assert!(
-            !after_agent.contains("mycache:"),
-            "user-declared volume must not get a duplicate top-level entry; yaml:\n{yaml}"
-        );
+        assert!(yaml.contains("  mycache:"));
+        assert!(yaml.contains("    name: mycache"));
     }
 
     #[test]

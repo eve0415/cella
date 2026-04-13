@@ -8,7 +8,7 @@ use super::helpers::{ComposeTestContext, create_test_feature, load_fixture_confi
 use crate::dockerfile::{FEATURES_TARGET_STAGE, ensure_stage_named, synthetic_dockerfile};
 use crate::override_file::{OverrideConfig, generate_override_yaml, write_override_file};
 use crate::project::ComposeProject;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Verify that the override file exists on disk after `write_override_file`.
 #[test]
@@ -34,7 +34,6 @@ fn override_file_exists_before_compose_uses_it() {
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
-        base_compose_volumes: BTreeSet::new(),
     };
 
     let yaml = generate_override_yaml(&override_cfg);
@@ -189,7 +188,6 @@ fn additional_contexts_in_override_for_features() {
         additional_contexts,
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
-        base_compose_volumes: BTreeSet::new(),
     };
 
     let yaml = generate_override_yaml(&override_cfg);

@@ -3,7 +3,7 @@
 //! These tests are `#[ignore = "requires Docker daemon"]`-d by default because they require a running
 //! Docker daemon. Run them with `cargo test --features integration-tests -- --ignored`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::helpers::{ComposeTestContext, load_fixture_config};
 use crate::cli::ComposeCommand;
@@ -26,7 +26,6 @@ fn plain_override(service: &str) -> OverrideConfig {
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
-        base_compose_volumes: BTreeSet::new(),
     }
 }
 
