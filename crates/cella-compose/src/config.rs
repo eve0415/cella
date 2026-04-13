@@ -39,6 +39,12 @@ pub struct ResolvedService {
     /// `serde_json::Value` because both forms are valid in the compose spec.
     #[serde(default)]
     pub volumes: Vec<serde_json::Value>,
+    /// Raw `volumes_from` entries. Each entry may be a string (`"service"`,
+    /// `"service:ro"`) or an object (`{"source": "service"}`). Kept as raw
+    /// `serde_json::Value` to avoid an exhaustive schema; non-empty signals
+    /// that this service inherits volumes from another service at runtime.
+    #[serde(default)]
+    pub volumes_from: Vec<serde_json::Value>,
 }
 
 /// Resolved build config for a compose service.
@@ -346,5 +352,21 @@ mod tests {
             config.volumes.contains_key("mycache"),
             "top-level volumes must deserialize"
         );
+    }
+
+    #[test]
+    fn deserialize_volumes_from() {
+        let json = r#"{"services": {"app": {"volumes_from": ["db", {"source": "cache"}]}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert_eq!(svc.volumes_from.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_service_without_volumes_from_yields_empty_vec() {
+        let json = r#"{"services": {"app": {"image": "nginx"}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.volumes_from.is_empty());
     }
 }

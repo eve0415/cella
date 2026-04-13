@@ -130,6 +130,19 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
     // dependency closure (depends_on) without --no-deps, so every service in
     // the resolved config may be started implicitly.
     for (svc_name, svc) in &resolved.services {
+        // Check 0: volumes_from is a legacy compose feature that inherits ALL
+        // volumes from another service at runtime — including cella's injected
+        // agent mount — without cella's read-only protection. Hard-reject any
+        // service that declares volumes_from.
+        if !svc.volumes_from.is_empty() {
+            return Err(format!(
+                "service '{svc_name}' declares volumes_from, which would inherit cella's managed \
+                 agent volume without cella's read-only protection. Use explicit `volumes:` \
+                 entries instead. (volumes_from is a legacy compose feature and is not \
+                 supported with cella's managed-agent devcontainers.)"
+            ));
+        }
+
         for entry in &svc.volumes {
             let serde_json::Value::Object(obj) = entry else {
                 continue; // short-form strings — not produced by `docker compose config`
@@ -492,6 +505,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes,
+                volumes_from: vec![],
             },
         );
         ResolvedComposeConfig {
@@ -551,6 +565,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes: vec![json!({"type": "bind", "source": "x", "target": "/root/.claude"})],
+                volumes_from: vec![],
             },
         );
         services.insert(
@@ -559,6 +574,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes: vec![],
+                volumes_from: vec![],
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1140,6 +1156,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes: svc_volumes,
+                volumes_from: vec![],
             },
         );
         ResolvedComposeConfig {
@@ -1219,6 +1236,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes: vec![], // clean primary
+                volumes_from: vec![],
             },
         );
         services.insert(
@@ -1229,6 +1247,7 @@ mod tests {
                 volumes: vec![
                     json!({"type": "volume", "source": "cella-agent", "target": "/attack"}),
                 ],
+                volumes_from: vec![],
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1256,6 +1275,7 @@ mod tests {
                 image: None,
                 build: None,
                 volumes: vec![],
+                volumes_from: vec![],
             },
         );
         services.insert(
@@ -1266,6 +1286,7 @@ mod tests {
                 volumes: vec![
                     json!({"type": "volume", "source": "cella-agent", "target": "/ignored"}),
                 ],
+                volumes_from: vec![],
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1278,6 +1299,39 @@ mod tests {
             result.is_err(),
             "sibling service aliasing agent must be rejected"
         );
+    }
+
+    #[test]
+    fn validator_rejects_service_using_volumes_from() {
+        // volumes_from inherits ALL volumes from the named service at runtime,
+        // including cella's injected agent mount, without cella's read-only
+        // protection. Any service declaring volumes_from must be rejected.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+            },
+        );
+        services.insert(
+            "sidecar".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("app")],
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+        assert!(result.is_err(), "volumes_from must be rejected");
     }
 
     // -----------------------------------------------------------------------
