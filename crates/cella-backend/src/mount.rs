@@ -82,6 +82,10 @@ impl MountSpec {
     }
 
     /// Adapter: Docker API `MountConfig`.
+    ///
+    /// Note: `read_only` is not represented in `MountConfig` and will be lost
+    /// in the conversion. Callers that need to round-trip read-only state must
+    /// track it separately.
     pub fn to_mount_config(&self) -> MountConfig {
         MountConfig {
             mount_type: self.kind.as_str().to_owned(),
@@ -118,6 +122,9 @@ impl MountSpec {
         if self.read_only {
             let _ = writeln!(out, "{indent}  read_only: true");
         }
+        if let Some(c) = &self.consistency {
+            let _ = writeln!(out, "{indent}  consistency: {c}");
+        }
         out
     }
 }
@@ -137,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_bind_mount_round_trip() {
+    fn readonly_flag_set_on_spec() {
         let spec = MountSpec::bind("/host", "/container").read_only();
         let mc = spec.to_mount_config();
         assert_eq!(mc.mount_type, "bind");
@@ -193,6 +200,18 @@ mod tests {
         insta::assert_snapshot!(yaml, @r#"
       - type: tmpfs
         target: "/root/.claude/plugins"
+"#);
+    }
+
+    #[test]
+    fn to_compose_yaml_bind_with_consistency() {
+        let spec = MountSpec::bind("/host", "/container").with_consistency("cached");
+        let yaml = spec.to_compose_yaml_entry("      ");
+        insta::assert_snapshot!(yaml, @r#"
+      - type: bind
+        source: "/host"
+        target: "/container"
+        consistency: cached
 "#);
     }
 }
