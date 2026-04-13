@@ -202,11 +202,14 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 ///   → compatible: Docker Compose resolves the volume name to the literal key
 ///   (same semantics as cella's pin). No collision.
 /// - Base has `volumes: <source>: {}` (bare, project-scoped as `<project>_<source>`)
-///   → **reject**: single-container uses the literal `source`; compose would diverge.
+///   AND a service references it → **reject**: single-container uses the literal
+///   `source`; compose would diverge.
+/// - Base has `volumes: <source>: {}` with NO service referencing it → **skip**:
+///   the declaration is inert; cella's emission cannot break any live mount.
 /// - Base has `volumes: <source>: { name: <other> }` (explicit alias mismatch)
-///   → **reject**: cella's literal pin overwrites the alias.
+///   AND a service references it → **reject**: cella's literal pin overwrites the alias.
 /// - Base has `volumes: <source>: { external: true, name: <other> }` (mismatched)
-///   → **reject**: external lookup identity differs from the literal source name.
+///   AND a service references it → **reject**: external lookup identity differs.
 ///
 /// Returns `Ok(())` when all extra volumes are safe, or `Err(message)` on the
 /// first collision.
@@ -225,6 +228,20 @@ pub(crate) fn validate_extra_named_volumes_against_base(
         if effective == Some(spec.source.as_str()) {
             // Effective name agrees with the literal source — compatible.
             continue;
+        }
+        // Top-level volume declarations are inert until a service references
+        // them.  If no service uses this key, cella's emission cannot cause
+        // volume-identity divergence at runtime — skip the rejection.
+        let key_is_used = resolved.services.values().any(|svc| {
+            svc.volumes.iter().any(|entry| {
+                entry
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| s == spec.source)
+            })
+        });
+        if !key_is_used {
+            continue; // inert base declaration — no runtime impact
         }
         return Err(format!(
             "devcontainer mount 'source={}' collides with base compose top-level volume key \
@@ -1445,43 +1462,49 @@ mod tests {
 
     #[test]
     fn extra_named_volume_rejected_when_base_is_external_with_different_name() {
-        // external: true with a name: that differs from source → mismatch.
+        // external: true with a name: that differs from source, AND a service
+        // references the key → mismatch causes identity divergence.
         let mut top_vols = HashMap::new();
         top_vols.insert(
             "mycache".to_string(),
             json!({"external": true, "name": "other"}),
         );
-        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
+        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "external with mismatched name must reject"
+            "external with mismatched name must reject when service references the key"
         );
     }
 
     #[test]
     fn extra_named_volume_rejected_when_base_has_bare_key() {
-        // Bare key → project-scoped (no effective literal name) → reject.
+        // Bare key → project-scoped (no effective literal name), AND a service
+        // references it → reject: single-container uses the literal `source`;
+        // compose would diverge.
         let mut top_vols = HashMap::new();
         top_vols.insert("mycache".to_string(), json!({}));
-        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
+        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "bare key (project-scoped) must reject"
+            "bare key (project-scoped) referenced by a service must reject"
         );
     }
 
     #[test]
     fn extra_named_volume_rejected_when_base_has_different_name() {
-        // Explicit name mismatch → reject.
+        // Explicit name mismatch AND a service references the key → reject.
         let mut top_vols = HashMap::new();
         top_vols.insert("mycache".to_string(), json!({"name": "app_db_vol"}));
-        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
+        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "explicit name mismatch must reject"
+            "explicit name mismatch referenced by a service must reject"
         );
     }
 
@@ -1518,6 +1541,50 @@ mod tests {
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
             "empty post-dedup list should not trigger collision validation"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_top_level_key_is_unreferenced() {
+        // Base has a top-level `mycache` key (bare, project-scoped), but no
+        // service references it.  The declaration is inert — cella can safely
+        // emit its own named volume without risking identity divergence.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({})); // bare key, unused
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "unreferenced top-level key should not block"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_still_rejects_when_base_top_level_key_is_referenced() {
+        // Base has a top-level `mycache` bare key AND a service references it
+        // via `source: mycache`.  This is a real collision: single-container
+        // uses the literal source name while compose would project-scope it,
+        // causing identity divergence.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({})); // bare — project-scoped
+        let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
+        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "referenced key with bare (project-scoped) declaration still rejects"
         );
     }
 }
