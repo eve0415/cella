@@ -184,31 +184,33 @@ pub async fn resolve_compose_features(
     )?))
 }
 
-/// Resolve the effective USER for a build-based compose service.
+/// Resolve the effective USER and base-image metadata for a build-based
+/// compose service.
 ///
-/// Mirrors the devcontainer CLI's resolution:
+/// Mirrors the devcontainer CLI's `internalGetImageBuildInfoFromDockerfile`:
+/// always inspects the external base image (for `devcontainer.metadata`),
+/// and picks the user as:
+///
 /// 1. Static parse of the Dockerfile target stage's last `USER` directive.
-/// 2. Pull + inspect the external base image's `Config.User`. Pulling is
-///    acceptable because the user is about to build anyway.
-/// 3. Fall back to `"root"`.
+/// 2. The base image's `Config.User` from inspect.
+/// 3. `"root"` fallback.
 ///
-/// Also returns the base image's `devcontainer.metadata` label when step 2
-/// succeeds, mirroring how the image-only arm populates metadata.
+/// The base image's `devcontainer.metadata` label is returned regardless of
+/// which source set `image_user`, so downstream `resolve_remote_user` can
+/// apply the full spec precedence (config.remoteUser > config.containerUser >
+/// image metadata remoteUser > image metadata containerUser > image USER).
 async fn resolve_build_image_user(
     client: &dyn ContainerBackend,
     dockerfile_content: &str,
     target_stage: Option<&str>,
     progress: &ProgressSender,
 ) -> (String, Option<String>) {
-    if let Some(user) = cella_compose::find_user_statement(dockerfile_content, target_stage) {
-        debug!("Resolved image user from Dockerfile USER directive: {user}");
-        return (user, None);
-    }
+    let parsed_user = cella_compose::find_user_statement(dockerfile_content, target_stage);
 
     let Some(base_image) = cella_compose::find_stage_base_image(dockerfile_content, target_stage)
     else {
-        debug!("Could not resolve a base image to inspect; defaulting image user to root");
-        return ("root".to_string(), None);
+        debug!("Could not resolve a base image to inspect for metadata");
+        return (parsed_user.unwrap_or_else(|| "root".to_string()), None);
     };
 
     if matches!(client.image_exists(&base_image).await, Ok(false))
@@ -220,22 +222,48 @@ async fn resolve_build_image_user(
         .await
     {
         warn!("Failed to pull base image '{base_image}' for user inspection: {e}");
-        return ("root".to_string(), None);
+        return (parsed_user.unwrap_or_else(|| "root".to_string()), None);
     }
 
     match client.inspect_image_details(&base_image).await {
         Ok(details) => {
-            debug!(
-                "Resolved image user from base image '{base_image}' inspect: {}",
-                details.user
+            let (user, metadata) = pick_image_user_and_metadata(
+                parsed_user.as_deref(),
+                Some(details.user.as_str()),
+                details.metadata,
             );
-            (details.user, details.metadata)
+            debug!(
+                "Resolved image user: {user} (has metadata: {})",
+                metadata.is_some()
+            );
+            (user, metadata)
         }
         Err(e) => {
             warn!("Failed to inspect base image '{base_image}': {e}");
-            ("root".to_string(), None)
+            (parsed_user.unwrap_or_else(|| "root".to_string()), None)
         }
     }
+}
+
+/// Combine a Dockerfile-parsed USER with a base-image inspect result into the
+/// final `(image_user, base_image_metadata)` tuple.
+///
+/// - `image_user` precedence: parser > inspect (non-empty) > `"root"`.
+/// - `base_image_metadata` is returned as-is; the caller always wants it
+///   when inspect succeeded, regardless of which source set `image_user`.
+///
+/// Extracted so it can be unit-tested without a `ContainerBackend` mock.
+fn pick_image_user_and_metadata(
+    parser_user: Option<&str>,
+    inspect_user: Option<&str>,
+    inspect_metadata: Option<String>,
+) -> (String, Option<String>) {
+    let inspect_nonempty = inspect_user.filter(|u| !u.is_empty());
+    let user = parser_user
+        .or(inspect_nonempty)
+        .unwrap_or("root")
+        .to_string();
+    (user, inspect_metadata)
 }
 
 /// Generate the combined Dockerfile and write it to disk.
@@ -490,5 +518,70 @@ RUN echo hi
             find_user_statement(dockerfile, Some("base")),
             Some("1000".to_string())
         );
+    }
+
+    // ---------------------------------------------------------------
+    // pick_image_user_and_metadata
+    //
+    // Regression coverage for the Codex stop-time review: the parser-hit
+    // path must NOT drop the base image's devcontainer.metadata label. The
+    // helper always returns the inspect metadata when inspect succeeded,
+    // regardless of which source set image_user.
+    // ---------------------------------------------------------------
+
+    use super::pick_image_user_and_metadata;
+
+    #[test]
+    fn picker_parser_wins_and_metadata_preserved() {
+        // Parser found USER node — inspect user is vscode. Parser wins for
+        // image_user, BUT the metadata from inspect must still be returned
+        // so resolve_remote_user can apply the full spec precedence.
+        let (user, metadata) = pick_image_user_and_metadata(
+            Some("node"),
+            Some("vscode"),
+            Some("{\"remoteUser\":\"vscode\"}".to_string()),
+        );
+        assert_eq!(user, "node");
+        assert_eq!(
+            metadata.as_deref(),
+            Some("{\"remoteUser\":\"vscode\"}"),
+            "metadata must survive the parser-hit path"
+        );
+    }
+
+    #[test]
+    fn picker_falls_back_to_inspect_user_when_parser_empty() {
+        let (user, metadata) =
+            pick_image_user_and_metadata(None, Some("vscode"), Some("{\"k\":1}".to_string()));
+        assert_eq!(user, "vscode");
+        assert_eq!(metadata.as_deref(), Some("{\"k\":1}"));
+    }
+
+    #[test]
+    fn picker_falls_back_to_root_when_both_empty() {
+        let (user, metadata) = pick_image_user_and_metadata(None, Some(""), None);
+        assert_eq!(user, "root");
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn picker_ignores_empty_inspect_user() {
+        // Empty Config.User (most Docker images) must not short-circuit to
+        // "" — we need to fall back to the final `"root"` default.
+        let (user, _) = pick_image_user_and_metadata(None, Some(""), None);
+        assert_eq!(user, "root");
+    }
+
+    #[test]
+    fn picker_returns_metadata_even_with_root_user() {
+        // Base image USER=root but has metadata (e.g. mcr devcontainers with
+        // spec-compliant metadata label). Metadata must flow through.
+        let (user, metadata) = pick_image_user_and_metadata(
+            None,
+            Some("root"),
+            Some("{\"containerUser\":\"node\"}".to_string()),
+        );
+        assert_eq!(user, "root");
+        assert_eq!(metadata.as_deref(), Some("{\"containerUser\":\"node\"}"));
     }
 }
