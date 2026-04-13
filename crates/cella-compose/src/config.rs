@@ -26,6 +26,12 @@ pub struct ResolvedService {
     pub image: Option<String>,
     /// Build configuration (Dockerfile-based).
     pub build: Option<ResolvedBuild>,
+    /// Resolved volumes list. Each entry is either a short-form string
+    /// (`"./host:/container[:opts]"`) or a long-form object
+    /// (`{"type": "bind", "source": ..., "target": ...}`). Kept as raw
+    /// `serde_json::Value` because both forms are valid in the compose spec.
+    #[serde(default)]
+    pub volumes: Vec<serde_json::Value>,
 }
 
 /// Resolved build config for a compose service.
@@ -273,6 +279,31 @@ mod tests {
         let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
         let info = extract_service_build_info(&config, "api").unwrap();
         assert!(matches!(info, ServiceBuildInfo::Image { image } if image == "node:20"));
+    }
+
+    #[test]
+    fn deserialize_volumes_short_and_long_form() {
+        let json = r#"{
+            "services": {
+                "app": {
+                    "volumes": [
+                        "/host:/container:ro",
+                        {"type": "bind", "source": "/h", "target": "/t"}
+                    ]
+                }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert_eq!(svc.volumes.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_service_without_volumes_yields_empty_vec() {
+        let json = r#"{"services": {"app": {"image": "nginx"}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.volumes.is_empty());
     }
 
     #[test]
