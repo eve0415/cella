@@ -12,7 +12,8 @@ use std::pin::Pin;
 use tracing::{debug, info, warn};
 
 use cella_backend::{
-    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, run_lifecycle_phase,
+    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
+    run_lifecycle_phase,
 };
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
 
@@ -294,6 +295,7 @@ async fn prepare_and_start(
         agent_vol_target: agent_vol_target.clone(),
         extra_env: Vec::new(),
         labels: BTreeMap::new(),
+        extra_volumes: Vec::new(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
@@ -325,11 +327,15 @@ async fn prepare_and_start(
     // 12. Build labels for the primary service
     let labels = build_compose_labels(cfg, project, &remote_user);
 
+    let mount_specs =
+        build_compose_mount_specs(cfg, &remote_user, &env_fwd, &compose_cmd, project).await;
+
     let ov_ctx = OverrideContext {
         agent_vol_name,
         agent_vol_target,
         extra_env,
         labels,
+        extra_volumes: mount_specs,
     };
 
     // 13. Build-time UID remap: build a thin image layer with correct UID/GID.
@@ -498,6 +504,7 @@ struct OverrideContext {
     agent_vol_target: String,
     extra_env: Vec<String>,
     labels: BTreeMap<String, String>,
+    extra_volumes: Vec<MountSpec>,
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +686,7 @@ fn write_final_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
-        extra_volumes: Vec::new(),
+        extra_volumes: ov.extra_volumes.clone(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -747,6 +754,44 @@ fn build_compose_labels(
     labels.insert("devcontainer.config_file".to_string(), config_str);
 
     labels
+}
+
+// ---------------------------------------------------------------------------
+// Mount assembly
+// ---------------------------------------------------------------------------
+
+/// Build Phase 1 compose mount specs: tool configs, SSH/GPG forwarding, parent-git.
+///
+/// User `mounts:` and feature `mounts:` are added in Task 7.
+/// Silently deduplicates against paths already declared in the base compose config.
+async fn build_compose_mount_specs(
+    cfg: &ComposeUpConfig<'_>,
+    remote_user: &str,
+    env_fwd: &cella_env::EnvForwarding,
+    compose_cmd: &ComposeCommand,
+    project: &ComposeProject,
+) -> Vec<MountSpec> {
+    let settings = cella_config::settings::Settings::load(cfg.workspace_root);
+    let mut specs = crate::tool_install::build_tool_config_mount_specs(&settings, remote_user);
+    specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(env_fwd));
+
+    // Parent git dir (mirrors single-container up.rs:826-835).
+    if let Some(parent_git) = cella_git::parent_git_dir(cfg.workspace_root) {
+        let path_str = parent_git.to_string_lossy().to_string();
+        specs.push(MountSpec::bind(path_str.clone(), path_str));
+    }
+
+    // Dedup against the user's base compose config. If this call fails, emit a
+    // warning and skip dedup — Docker Compose will surface any eventual collision.
+    match compose_cmd.config().await {
+        Ok(resolved) => {
+            crate::compose_mounts::dedup_against_base(&resolved, &project.primary_service, specs)
+        }
+        Err(e) => {
+            warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");
+            specs
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
