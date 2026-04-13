@@ -105,6 +105,7 @@ pub async fn compose_build(
             build_context: fb.build_context.clone(),
             additional_contexts: fb.additional_contexts.clone(),
             build_secrets: compose_secrets,
+            extra_volumes: Vec::new(),
         };
         let yaml = cella_compose::override_file::generate_override_yaml(&override_config);
         cella_compose::override_file::write_override_file(&project.override_file, &yaml)?;

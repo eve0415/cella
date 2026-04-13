@@ -525,6 +525,7 @@ fn write_build_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        extra_volumes: Vec::new(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -678,6 +679,7 @@ fn write_final_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        extra_volumes: Vec::new(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
