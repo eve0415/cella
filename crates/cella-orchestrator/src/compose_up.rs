@@ -939,17 +939,23 @@ async fn build_compose_mount_specs(
                 )
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             }
+            // Dedup first: remove mounts whose target is already covered by the
+            // base service.  Only the surviving (emittable) specs are then
+            // validated for named-volume identity collisions.  Running the
+            // collision check on the pre-dedup list would produce false positives
+            // for mounts that dedup will silently drop anyway.
+            let deduped = crate::compose_mounts::dedup_against_base(
+                &resolved,
+                &p.project.primary_service,
+                specs,
+            );
             // Reject any extra named-volume source that collides with a base
             // top-level volume key bound to a different backing volume.  Compose
             // deep-merges top-level volume declarations, so our `name:` pin could
             // silently repoint an existing volume and break other services.
-            crate::compose_mounts::validate_extra_named_volumes_against_base(&resolved, &specs)
+            crate::compose_mounts::validate_extra_named_volumes_against_base(&resolved, &deduped)
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
-            Ok(crate::compose_mounts::dedup_against_base(
-                &resolved,
-                &p.project.primary_service,
-                specs,
-            ))
+            Ok(deduped)
         }
         Err(e) => {
             warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");

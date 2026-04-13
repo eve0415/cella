@@ -1503,4 +1503,21 @@ mod tests {
             "bind mounts must be skipped by the volume-collision check"
         );
     }
+
+    #[test]
+    fn extra_named_volume_not_rejected_when_dedup_would_drop_it() {
+        // The collision validator is called post-dedup, so when dedup removes
+        // a user mount (because the base service already owns that target) the
+        // validator never sees it.  This test exercises the validator directly
+        // on an empty post-dedup list — the bare key in top-level volumes must
+        // not trigger a rejection because there are no emittable specs to check.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({})); // bare key, would normally conflict
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras: Vec<MountSpec> = vec![]; // post-dedup: empty
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "empty post-dedup list should not trigger collision validation"
+        );
+    }
 }
