@@ -756,6 +756,7 @@ impl EnsureUpContext<'_> {
                 source: m.source.clone(),
                 target: m.target.clone(),
                 consistency: None,
+                read_only: false,
             });
         }
 
@@ -833,6 +834,7 @@ impl EnsureUpContext<'_> {
                 source: path_str.clone(),
                 target: path_str,
                 consistency: None,
+                read_only: false,
             });
         }
 
@@ -843,6 +845,7 @@ impl EnsureUpContext<'_> {
                 source: vol_name,
                 target: vol_target,
                 consistency: None,
+                read_only: false,
             });
         }
 

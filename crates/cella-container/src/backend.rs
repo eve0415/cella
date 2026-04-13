@@ -997,6 +997,7 @@ mod tests {
             source: "/host/project".to_string(),
             target: "/workspace".to_string(),
             consistency: None,
+            read_only: false,
         });
         let staging = PathBuf::from("/tmp/staging");
         let args = build_create_args(&opts, &staging);
@@ -1219,12 +1220,14 @@ mod tests {
                 source: "/host/data".to_string(),
                 target: "/data".to_string(),
                 consistency: None,
+                read_only: false,
             },
             MountConfig {
                 mount_type: "volume".to_string(),
                 source: "vol1".to_string(),
                 target: "/vol".to_string(),
                 consistency: None,
+                read_only: false,
             },
         ];
         let staging = PathBuf::from("/tmp/staging");

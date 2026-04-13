@@ -24,6 +24,7 @@ pub(super) fn map_workspace_mount(
             .to_string(),
         target: workspace_folder.to_string(),
         consistency: Some("cached".to_string()),
+        read_only: false,
     })
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConf
                     source,
                     target,
                     consistency: None,
+                    read_only: false,
                 })
             }
             _ => None,
@@ -96,6 +98,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
         source,
         target,
         consistency,
+        read_only: false,
     })
 }
 

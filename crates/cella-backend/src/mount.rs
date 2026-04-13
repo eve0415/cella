@@ -83,28 +83,27 @@ impl MountSpec {
 
     /// Adapter: Docker API `MountConfig`.
     ///
-    /// Note: `read_only` is not represented in `MountConfig` and will be lost
-    /// in the conversion. Callers that need to round-trip read-only state must
-    /// track it separately.
+    /// `read_only` is preserved in `MountConfig` but note that `cella-docker`
+    /// does not yet forward it to bollard's `Mount` struct — wiring
+    /// read-only into the single-container path is deferred to a follow-up
+    /// phase.
     pub fn to_mount_config(&self) -> MountConfig {
         MountConfig {
             mount_type: self.kind.as_str().to_owned(),
             source: self.source.clone(),
             target: self.target.clone(),
             consistency: self.consistency.clone(),
+            read_only: self.read_only,
         }
     }
 
     /// Adapter: parse from a Docker `MountConfig`.
-    ///
-    /// Note: `read_only` cannot be recovered (`MountConfig` doesn't carry it)
-    /// — callers that need RO must set it on the spec before emission.
     pub fn from_mount_config(mc: &MountConfig) -> Self {
         Self {
             kind: MountKind::from_type_str(&mc.mount_type),
             source: mc.source.clone(),
             target: mc.target.clone(),
-            read_only: false,
+            read_only: mc.read_only,
             consistency: mc.consistency.clone(),
         }
     }
@@ -187,6 +186,7 @@ mod tests {
             source: "/a".into(),
             target: "/b".into(),
             consistency: Some("cached".into()),
+            read_only: false,
         };
         let spec = MountSpec::from_mount_config(&mc);
         assert_eq!(spec.kind, MountKind::Bind);

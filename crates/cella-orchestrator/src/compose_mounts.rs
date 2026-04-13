@@ -182,6 +182,7 @@ mod tests {
             source: "/h".to_string(),
             target: "/c".to_string(),
             consistency: None,
+            read_only: false,
         }];
         let specs = mount_configs_to_specs(&configs);
         assert_eq!(specs.len(), 1);
