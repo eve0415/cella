@@ -327,7 +327,7 @@ async fn prepare_and_start(
         agent_vol_target: &agent_vol_target,
         agent_vol_name: &agent_vol_name,
     })
-    .await;
+    .await?;
 
     let ov_ctx = OverrideContext {
         agent_vol_name,
@@ -864,8 +864,11 @@ struct ComposeMountParams<'a> {
 ///
 /// Sources are appended in priority order (tool configs → env-fwd → parent-git
 /// → user/feature mounts) then:
-/// 1. Any user/feature mount targeting the agent subtree is stripped and warned.
-/// 2. Remaining candidates are deduplicated against paths already declared in
+/// 1. The user's base compose config is validated for agent-volume aliasing — if
+///    the primary service mounts or aliases the managed agent volume, the whole
+///    `cella up` is aborted with a clear error.
+/// 2. Any user/feature mount targeting the agent subtree is stripped and warned.
+/// 3. Remaining candidates are deduplicated against paths already declared in
 ///    the base compose config so the override file never shadows user-owned volumes.
 ///
 /// Returns `(mount_specs, base_compose_volumes)` where `base_compose_volumes` is
@@ -874,7 +877,7 @@ struct ComposeMountParams<'a> {
 /// for volumes the user already declared.
 async fn build_compose_mount_specs(
     p: ComposeMountParams<'_>,
-) -> (Vec<MountSpec>, std::collections::BTreeSet<String>) {
+) -> Result<(Vec<MountSpec>, std::collections::BTreeSet<String>), crate::error::OrchestratorError> {
     // Assembly order mirrors single-container `config_map::map_config`:
     //   1. User devcontainer.json `mounts:` and feature `mounts:` FIRST.
     //   2. Auto-forwarded mounts (tool-config, env-fwd, parent-git) LAST.
@@ -927,23 +930,36 @@ async fn build_compose_mount_specs(
         );
     }
 
-    // Dedup against the user's base compose config. If this call fails, emit a
-    // warning and skip dedup — Docker Compose will surface any eventual collision.
+    // Validate the base compose config and dedup candidates against it. If
+    // `docker compose config` fails, emit a warning and skip both validation
+    // and dedup — Docker Compose will surface any eventual collision.
     // Also extract the top-level volume names from the resolved config so the
     // override generator can avoid duplicating user-declared volumes.
     match p.compose_cmd.config().await {
         Ok(resolved) => {
+            // Reject the whole `cella up` if the user's base compose file aliases
+            // or mounts the managed agent volume. Docker Compose multi-file merge
+            // appends entries — cella cannot remove base service volumes, only add.
+            if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
+                crate::compose_mounts::validate_base_compose_against_reserved_agent(
+                    &resolved,
+                    &p.project.primary_service,
+                    p.agent_vol_name,
+                    p.agent_vol_target,
+                )
+                .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            }
             let base_vols = resolved.volumes.keys().cloned().collect();
             let deduped = crate::compose_mounts::dedup_against_base(
                 &resolved,
                 &p.project.primary_service,
                 specs,
             );
-            (deduped, base_vols)
+            Ok((deduped, base_vols))
         }
         Err(e) => {
             warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");
-            (specs, std::collections::BTreeSet::new())
+            Ok((specs, std::collections::BTreeSet::new()))
         }
     }
 }

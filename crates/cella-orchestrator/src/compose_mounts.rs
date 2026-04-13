@@ -70,6 +70,96 @@ pub(crate) fn filter_reserved_agent(
         .collect()
 }
 
+/// Validate that the user's base compose config does not alias the managed
+/// agent volume in the primary service or through top-level volume declarations.
+///
+/// Three aliasing patterns are rejected:
+///
+/// 1. **Source alias** — a service volume entry whose `source` matches
+///    `agent_vol_name` exactly. Docker would mount the same underlying volume
+///    at a second path, making the agent volume writable via that alias.
+///
+/// 2. **Target subtree alias** — a service volume entry whose `target` is
+///    equal to or a descendant of `agent_vol_target` (e.g., `/cella`). This
+///    would shadow or overwrite the agent at that path.
+///
+/// 3. **Top-level volume name alias** — any top-level volume entry that has a
+///    `name:` field equal to `agent_vol_name`. If a service references that
+///    compose-key by source, it silently mounts the agent volume even though
+///    the source string looks innocuous.
+///
+/// Returns `Ok(())` when the config is clean, or `Err(message)` with a
+/// human-readable description of what was rejected.
+///
+/// # Notes
+///
+/// `docker compose config` normalises all service volume entries to long-form
+/// objects before this function is called, so short-form strings are not
+/// expected in practice and are silently skipped.
+pub(crate) fn validate_base_compose_against_reserved_agent(
+    resolved: &ResolvedComposeConfig,
+    primary_service: &str,
+    agent_vol_name: &str,
+    agent_vol_target: &str,
+) -> Result<(), String> {
+    // Build the set of compose volume keys whose `name` field resolves to the
+    // agent volume name.  E.g. `pretty-name: { name: cella-agent }` makes the
+    // key "pretty-name" an alias even though its compose-side key is different.
+    let aliased_keys: HashSet<&str> = resolved
+        .volumes
+        .iter()
+        .filter_map(|(key, val)| {
+            val.get("name")
+                .and_then(|n| n.as_str())
+                .filter(|name| *name == agent_vol_name)
+                .map(|_| key.as_str())
+        })
+        .collect();
+
+    let Some(svc) = resolved.services.get(primary_service) else {
+        return Ok(());
+    };
+
+    for entry in &svc.volumes {
+        let serde_json::Value::Object(obj) = entry else {
+            continue; // short-form strings — not produced by `docker compose config`
+        };
+
+        let source = obj.get("source").and_then(|s| s.as_str()).unwrap_or("");
+        let target = obj.get("target").and_then(|t| t.as_str()).unwrap_or("");
+
+        // Check 1: source matches agent volume name directly.
+        if source == agent_vol_name {
+            return Err(format!(
+                "compose file primary service mounts or aliases the managed \
+                 agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
+                 rejected source='{source}' target='{target}'"
+            ));
+        }
+
+        // Check 2: source is a top-level volume key aliased to the agent volume name.
+        if aliased_keys.contains(source) {
+            return Err(format!(
+                "compose file primary service mounts or aliases the managed \
+                 agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
+                 rejected source='{source}' (top-level volume name aliases '{agent_vol_name}') \
+                 target='{target}'"
+            ));
+        }
+
+        // Check 3: target is inside the reserved agent subtree.
+        if !target.is_empty() && is_descendant_or_equal(target, agent_vol_target) {
+            return Err(format!(
+                "compose file primary service mounts or aliases the managed \
+                 agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
+                 rejected source='{source}' target='{target}'"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Normalise a mount target path by stripping trailing slashes.
 ///
 /// The only special case is the filesystem root `"/"`: stripping its slash
@@ -895,6 +985,94 @@ mod tests {
         assert_ne!(
             fp_before, fp_after,
             "fingerprint must change when an env_fwd mount is added"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_base_compose_against_reserved_agent (Finding 1, round 7)
+    // -----------------------------------------------------------------------
+
+    /// Build a `ResolvedComposeConfig` with per-service volumes AND top-level
+    /// volume declarations.
+    fn make_resolved_with_volumes(
+        service: &str,
+        svc_volumes: Vec<serde_json::Value>,
+        top_level_volumes: HashMap<String, serde_json::Value>,
+    ) -> ResolvedComposeConfig {
+        let mut services = HashMap::new();
+        services.insert(
+            service.to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: svc_volumes,
+            },
+        );
+        ResolvedComposeConfig {
+            services,
+            volumes: top_level_volumes,
+        }
+    }
+
+    #[test]
+    fn base_compose_rejected_for_agent_volume_alias_by_source() {
+        let resolved = make_resolved_with_volumes(
+            "app",
+            vec![json!({"type": "volume", "source": "cella-agent", "target": "/tmp/agent-rw"})],
+            HashMap::new(),
+        );
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "app", "cella-agent", "/cella");
+        assert!(
+            result.is_err(),
+            "expected rejection for source=cella-agent alias; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn base_compose_rejected_for_agent_target_path() {
+        let resolved = make_resolved_with_volumes(
+            "app",
+            vec![json!({"type": "bind", "source": "/host", "target": "/cella/foo"})],
+            HashMap::new(),
+        );
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "app", "cella-agent", "/cella");
+        assert!(
+            result.is_err(),
+            "expected rejection for target inside /cella; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn base_compose_rejected_when_top_level_alias_name_matches_agent() {
+        let mut top_vols = HashMap::new();
+        top_vols.insert("pretty-name".to_string(), json!({"name": "cella-agent"}));
+        let resolved = make_resolved_with_volumes(
+            "app",
+            vec![json!({"type": "volume", "source": "pretty-name", "target": "/data"})],
+            top_vols,
+        );
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "app", "cella-agent", "/cella");
+        assert!(
+            result.is_err(),
+            "expected rejection for top-level volume aliasing cella-agent; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn base_compose_ok_when_no_aliasing() {
+        let resolved = make_resolved_with_volumes(
+            "app",
+            vec![json!({"type": "bind", "source": "/host", "target": "/app"})],
+            HashMap::new(),
+        );
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "app", "cella-agent", "/cella");
+        assert!(
+            result.is_ok(),
+            "normal compose should pass; got: {result:?}"
         );
     }
 }
