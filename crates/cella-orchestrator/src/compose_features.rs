@@ -354,3 +354,141 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for compose + features user resolution.
+    //!
+    //! Pure-function tests; the `resolve_build_image_user` paths that call
+    //! `inspect_image_details` are covered by integration tests gated on the
+    //! `integration-tests` feature of `cella-compose`.
+
+    use cella_compose::{FEATURES_TARGET_STAGE, find_stage_base_image, find_user_statement};
+    use cella_features::dockerfile::generate_dockerfile;
+
+    /// End-to-end reproduction of the original bug: a Dockerfile ending with
+    /// `USER node:node` plus features must produce a combined Dockerfile
+    /// whose final `USER` instruction resolves to `node`, not `root`.
+    #[test]
+    fn combined_dockerfile_preserves_non_root_user_with_features() {
+        // Representative user Dockerfile: ends with `USER node:node` and then
+        // a few more non-USER instructions (like the reporter's case).
+        let original = "\
+FROM mcr.microsoft.com/devcontainers/typescript-node:4.0 AS base
+RUN echo install-as-root
+USER node:node
+RUN echo install-as-node
+";
+
+        let resolved_user =
+            find_user_statement(original, Some("base")).expect("USER node:node must be parseable");
+        assert_eq!(resolved_user, "node");
+
+        // Feature Dockerfile (no real features needed to exercise the
+        // user-reset path — use a synthetic feature with an install script).
+        let feature = cella_features::ResolvedFeature {
+            id: "marker".to_string(),
+            original_ref: "marker".to_string(),
+            metadata: cella_features::FeatureMetadata::default(),
+            user_options: std::collections::HashMap::new(),
+            artifact_dir: std::path::PathBuf::from("/tmp/marker"),
+            has_install_script: true,
+        };
+        let feature_dockerfile =
+            generate_dockerfile("base", &resolved_user, "node", "node", &[feature], true);
+
+        // Features target stage's final ARG must now be bare (no default),
+        // so it inherits the global value.
+        assert!(
+            feature_dockerfile
+                .contains("\nARG _DEV_CONTAINERS_IMAGE_USER\nUSER $_DEV_CONTAINERS_IMAGE_USER\n"),
+            "features closing ARG must be bare to inherit from global: got\n{feature_dockerfile}"
+        );
+        assert!(
+            !feature_dockerfile.contains("ARG _DEV_CONTAINERS_IMAGE_USER=root"),
+            "features closing ARG must not shadow the global with =root"
+        );
+
+        let combined = cella_compose::generate_combined_dockerfile(
+            original,
+            &feature_dockerfile,
+            "base",
+            &resolved_user,
+        );
+
+        // Global ARG carries the resolved user.
+        assert!(
+            combined.contains("ARG _DEV_CONTAINERS_IMAGE_USER=node\n"),
+            "global ARG must set _DEV_CONTAINERS_IMAGE_USER=node so the features stage inherits it"
+        );
+
+        // Global ARG precedes the first FROM (true global scope).
+        let global_pos = combined
+            .find("ARG _DEV_CONTAINERS_IMAGE_USER=node")
+            .unwrap();
+        let first_from_pos = combined.find("FROM ").unwrap();
+        assert!(
+            global_pos < first_from_pos,
+            "global user ARG must appear before the first FROM"
+        );
+
+        // Features target stage is present and ends with the USER directive
+        // that references the now-global-inherited ARG.
+        assert!(combined.contains(&format!("AS {FEATURES_TARGET_STAGE}")));
+        assert!(
+            combined
+                .trim_end()
+                .ends_with("USER $_DEV_CONTAINERS_IMAGE_USER"),
+            "combined Dockerfile must end on the inherited-USER line: got tail\n{}",
+            combined
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// When the Dockerfile has no `USER` directive but the target stage's
+    /// FROM references a resolvable external base image, `find_user_statement`
+    /// returns None so the caller can fall back to image inspect.
+    /// `find_stage_base_image` must return that external image reference.
+    #[test]
+    fn fallback_path_exposes_external_base_image() {
+        let dockerfile = "\
+FROM mcr.microsoft.com/devcontainers/base:ubuntu AS base
+RUN echo nothing-user-related
+";
+        assert_eq!(find_user_statement(dockerfile, Some("base")), None);
+        assert_eq!(
+            find_stage_base_image(dockerfile, Some("base")),
+            Some("mcr.microsoft.com/devcontainers/base:ubuntu".to_string())
+        );
+    }
+
+    /// When the target stage has no `USER` and its FROM is a variable
+    /// reference we cannot resolve statically, the helpers hand back None
+    /// for both directions so the caller ends up using the `"root"` fallback.
+    #[test]
+    fn fallback_chain_terminates_on_variable_from() {
+        let dockerfile = "\
+ARG BASE_IMAGE=ubuntu:22.04
+FROM $BASE_IMAGE AS base
+RUN echo hi
+";
+        assert_eq!(find_user_statement(dockerfile, Some("base")), None);
+        assert_eq!(find_stage_base_image(dockerfile, Some("base")), None);
+    }
+
+    /// Target stage with `USER numeric:gid` should be parsed and stripped
+    /// down to just the user portion — this is what the UID remap `sed`
+    /// pattern expects.
+    #[test]
+    fn numeric_user_group_is_stripped() {
+        let dockerfile = "FROM alpine:3.18 AS base\nUSER 1000:1000\n";
+        assert_eq!(
+            find_user_statement(dockerfile, Some("base")),
+            Some("1000".to_string())
+        );
+    }
+}
