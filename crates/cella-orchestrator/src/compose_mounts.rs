@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use cella_backend::{MountConfig, MountSpec};
+use cella_backend::{MountConfig, MountKind, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
 
@@ -34,12 +34,22 @@ pub fn dedup_against_base(
     let base_targets = extract_service_targets(resolved, primary_service);
 
     // Pass 1: drop candidates covered by any base target (ancestor-or-equal).
+    //
+    // Tmpfs mounts are cella's isolation mechanism for subdirectories (e.g.
+    // `.claude/plugins` under a user-owned `~/.claude` bind). Dropping them on
+    // ancestor-match would silently defeat that isolation. Instead, tmpfs is
+    // only dropped when the target EXACTLY matches a base target (the base
+    // already owns that path entirely).
     let after_base: Vec<MountSpec> = candidates
         .into_iter()
         .filter(|spec| {
-            !base_targets
-                .iter()
-                .any(|base| is_descendant_or_equal(&spec.target, base))
+            if spec.kind == MountKind::Tmpfs {
+                !base_targets.contains(&spec.target)
+            } else {
+                !base_targets
+                    .iter()
+                    .any(|base| is_descendant_or_equal(&spec.target, base))
+            }
         })
         .collect();
 
@@ -260,21 +270,71 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Finding 3: ancestor-path dedup
+    // Pass-1 tmpfs isolation (Finding 3)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn dedup_drops_descendant_of_base_mount() {
-        // Base has `/root/.claude`; candidate targets `/root/.claude/plugins` — must be dropped.
+    fn pass_one_preserves_tmpfs_under_base_bind() {
+        // Base owns `/root/.claude` via bind; cella wants a tmpfs at
+        // `/root/.claude/plugins` for isolation. The tmpfs must survive Pass-1
+        // so it can shadow the subdirectory instead of leaking to host storage.
         let resolved = make_resolved(
             "app",
             vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
         let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "tmpfs descendant of base bind must be preserved; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/root/.claude/plugins");
+    }
+
+    #[test]
+    fn pass_one_drops_tmpfs_on_exact_target_match() {
+        // Base already owns `/root/.claude/plugins` exactly — a cella tmpfs at
+        // the same path would conflict, so it must be dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/plugins"})],
+        );
+        let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
+        let result = dedup_against_base(&resolved, "app", candidates);
         assert!(
             result.is_empty(),
-            "descendant of base target must be dropped, got: {result:?}"
+            "tmpfs on exact base target must be dropped; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pass_one_still_drops_bind_descendants() {
+        // Non-tmpfs mounts that are descendants of a base target are still dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/foo", "/root/.claude/other")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "bind descendant of base must still be dropped; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pass_one_still_drops_exact_bind_match() {
+        // Non-tmpfs mounts that exactly match a base target are dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/foo", "/root/.claude")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "bind on exact base target must be dropped; got: {result:?}"
         );
     }
 
@@ -296,12 +356,12 @@ mod tests {
 
     #[test]
     fn dedup_handles_trailing_slash_in_base() {
-        // Base target has a trailing slash; descendant must still be dropped.
+        // Base target has a trailing slash; a non-tmpfs descendant must still be dropped.
         let resolved = make_resolved(
             "app",
             vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/"})],
         );
-        let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
+        let candidates = vec![MountSpec::bind("/foo", "/root/.claude/plugins")];
         let result = dedup_against_base(&resolved, "app", candidates);
         assert!(
             result.is_empty(),
