@@ -141,32 +141,26 @@ pub fn dedup_against_base(
     after_base
 }
 
+/// Extract the set of normalised mount target paths declared for `service` in
+/// the resolved compose config.
+///
+/// Only long-form object volume entries (with a `"target"` key) are recognised.
+/// `docker compose config --format json` always normalises volume entries to
+/// this form; short-form strings (e.g. `"host:target:opts"`) are therefore not
+/// expected in production input and are silently ignored to avoid misinterpreting
+/// Windows drive-letter bind paths or anonymous volumes.
 fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> HashSet<String> {
     let Some(svc) = resolved.services.get(service) else {
         return HashSet::new();
     };
     let mut out = HashSet::new();
     for v in &svc.volumes {
-        match v {
-            serde_json::Value::String(s) => {
-                // Short form "host:target[:opts]" — target is the second field.
-                // (Defensive: docker compose config --format json normalizes to objects;
-                // this branch handles caller-supplied or hand-written test fixtures.)
-                let parts: Vec<&str> = s.splitn(3, ':').collect();
-                if parts.len() >= 2 {
-                    // Normalise via the shared helper so that "/root/.claude/" and
-                    // "/root/.claude" compare equal against candidate targets, and
-                    // the root path "/" is never collapsed to "".
-                    out.insert(normalize_target(parts[1]).to_string());
-                }
-            }
-            serde_json::Value::Object(obj) => {
-                if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
-                    // Same normalisation for long-form object targets.
-                    out.insert(normalize_target(t).to_string());
-                }
-            }
-            _ => {}
+        if let serde_json::Value::Object(obj) = v
+            && let Some(t) = obj.get("target").and_then(serde_json::Value::as_str)
+        {
+            // Normalise so that "/root/.claude/" and "/root/.claude" compare
+            // equal against candidate targets, and "/" is never collapsed to "".
+            out.insert(normalize_target(t).to_string());
         }
     }
     out
@@ -244,11 +238,18 @@ mod tests {
     }
 
     #[test]
-    fn dedup_drops_matching_target_short_form() {
-        let resolved = make_resolved("app", vec![json!("/host/claude:/root/.claude:ro")]);
-        let candidates = vec![MountSpec::bind("/cella/claude", "/root/.claude")];
+    fn extract_service_targets_ignores_short_form_strings() {
+        // Short-form strings are not parsed (docker compose config normalizes
+        // to long-form objects). This keeps parsing simple and avoids
+        // misinterpreting Windows drive-letter binds or anonymous volumes.
+        let resolved = make_resolved("app", vec![json!("C:\\Users\\me\\.claude:/root/.claude")]);
+        let candidates = vec![MountSpec::bind("/cella", "/root/.claude")];
         let result = dedup_against_base(&resolved, "app", candidates);
-        assert!(result.is_empty(), "should drop the matching target");
+        assert_eq!(
+            result.len(),
+            1,
+            "short-form base entries are not parsed; candidate survives"
+        );
     }
 
     #[test]
