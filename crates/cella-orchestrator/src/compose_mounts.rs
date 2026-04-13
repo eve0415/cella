@@ -271,7 +271,11 @@ pub fn env_fwd_to_mount_specs(fwd: &EnvForwarding) -> Vec<MountSpec> {
 /// compose file contents).
 ///
 /// Hashes the tool `forward_config` flags, tool config override paths, the
-/// env-forwarding mount list, and the presence/path of a parent git directory.
+/// resolved host paths for each enabled tool (so installing/removing a tool
+/// config directory flips the fingerprint even without changing settings),
+/// the env-forwarding mount list, and the presence/path of a parent git
+/// directory.
+///
 /// This fingerprint is stored as `dev.cella.mount_input_fingerprint` at
 /// container creation time and recomputed on reconnect to detect drift in
 /// settings, SSH/GPG agent state, or git worktree layout.
@@ -301,6 +305,15 @@ pub fn compute_mount_input_fingerprint(
         hasher.update(b"\0");
     }
 
+    // Tool host-path detection results.
+    //
+    // Include the resolved host path for each enabled tool so that installing
+    // or removing a tool config (e.g. adding ~/.codex after an initial `cella
+    // up`) flips the fingerprint and triggers a drift warning on reconnect.
+    // The paths checked here must match exactly what `build_tool_config_mount_specs`
+    // consults so that any change to the actual mount set is reflected.
+    hash_tool_host_paths(&mut hasher, settings);
+
     // env_fwd mount list (SSH socket, GPG agent, etc.).
     for m in &env_fwd.mounts {
         hasher.update(m.source.as_bytes());
@@ -316,6 +329,65 @@ pub fn compute_mount_input_fingerprint(
     }
 
     hex::encode(hasher.finalize())
+}
+
+/// Hash the resolved host paths for all enabled tool configs into `hasher`.
+///
+/// Called from [`compute_mount_input_fingerprint`]. Extracted into a helper to
+/// keep that function within clippy's `too_many_lines` limit.
+fn hash_tool_host_paths(hasher: &mut Sha256, settings: &cella_config::settings::Settings) {
+    let t = &settings.tools;
+
+    if t.claude_code.forward_config {
+        if let Some(p) = cella_env::claude_code::host_claude_json_path() {
+            hasher.update(b"claude_json:");
+            hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        if let Some(p) = cella_env::claude_code::host_claude_dir() {
+            hasher.update(b"claude_dir:");
+            hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        if let Some(p) = cella_env::claude_code::host_plugins_dir() {
+            hasher.update(b"claude_plugins:");
+            hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    if t.codex.forward_config
+        && let Some(p) = cella_env::codex::host_codex_dir()
+    {
+        hasher.update(b"codex_dir:");
+        hasher.update(p.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+    }
+    if t.gemini.forward_config
+        && let Some(p) = cella_env::gemini::host_gemini_dir()
+    {
+        hasher.update(b"gemini_dir:");
+        hasher.update(p.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+    }
+    if t.nvim.forward_config
+        && let Some(p) = cella_env::nvim::host_nvim_config_dir(t.nvim.config_path.as_deref())
+    {
+        hasher.update(b"nvim_dir:");
+        hasher.update(p.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+    }
+    if t.tmux.forward_config {
+        if let Some(p) = cella_env::tmux::host_tmux_conf(t.tmux.config_path.as_deref()) {
+            hasher.update(b"tmux_conf:");
+            hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        if let Some(p) = cella_env::tmux::host_tmux_config_dir(t.tmux.config_path.as_deref()) {
+            hasher.update(b"tmux_dir:");
+            hasher.update(p.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+    }
 }
 
 /// Adapt `MountConfig` → `MountSpec` (used for user `mounts:` and feature `mounts:`
@@ -1073,6 +1145,38 @@ mod tests {
         assert!(
             result.is_ok(),
             "normal compose should pass; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_tool_host_paths / compute_mount_input_fingerprint host-path detection
+    // (Finding 2, round 7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mount_input_fingerprint_changes_when_tool_host_path_changes() {
+        // We cannot easily install/remove real tool dirs during a unit test, but
+        // we CAN verify that changing a settings field that feeds into
+        // host_nvim_config_dir (the config_path override) changes the fingerprint.
+        // This exercises the hash_tool_host_paths path that invokes
+        // host_nvim_config_dir with a non-None argument.
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+
+        let mut settings_a = cella_config::settings::Settings::default();
+        settings_a.tools.nvim.forward_config = true;
+        // config_path = None → host_nvim_config_dir checks default ~/.config/nvim
+        let fp_a = compute_mount_input_fingerprint(&settings_a, &env_fwd, ws);
+
+        let mut settings_b = cella_config::settings::Settings::default();
+        settings_b.tools.nvim.forward_config = true;
+        // config_path = Some fake path → different input to host_nvim_config_dir
+        settings_b.tools.nvim.config_path = Some("/tmp/fake-nvim-config".to_string());
+        let fp_b = compute_mount_input_fingerprint(&settings_b, &env_fwd, ws);
+
+        assert_ne!(
+            fp_a, fp_b,
+            "fingerprint must change when nvim.config_path override differs"
         );
     }
 }
