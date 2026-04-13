@@ -189,4 +189,26 @@ mod tests {
         assert_eq!(specs[0].source, "/h");
         assert_eq!(specs[0].target, "/c");
     }
+
+    #[test]
+    fn to_compose_yaml_bind_readonly_via_from_mount_config() {
+        // Round-trip: MountConfig with read_only:true → MountSpec → YAML emits read_only: true.
+        let config = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/container/data".to_string(),
+            consistency: None,
+            read_only: true,
+        };
+        let spec = MountSpec::from_mount_config(&config);
+        assert!(
+            spec.read_only,
+            "read_only must survive the MountConfig→MountSpec conversion"
+        );
+        let yaml = spec.to_compose_yaml_entry("    ");
+        assert!(
+            yaml.contains("read_only: true"),
+            "emitted YAML must include read_only: true, got:\n{yaml}"
+        );
+    }
 }
