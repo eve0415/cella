@@ -68,6 +68,19 @@ pub(crate) fn filter_reserved_agent(
         .collect()
 }
 
+/// Normalise a mount target path by stripping trailing slashes.
+///
+/// The only special case is the filesystem root `"/"`: stripping its slash
+/// would produce an empty string, so we return `"/"` unchanged.
+///
+/// This helper is applied to **both** base targets (when building the dedup
+/// set) and candidate targets (when querying the set), ensuring that
+/// `/root/.claude` and `/root/.claude/` are treated as the same logical path.
+fn normalize_target(s: &str) -> &str {
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
+}
+
 /// Remove candidate mounts whose target path exactly matches a target already
 /// declared in the primary service's resolved volumes.
 ///
@@ -81,6 +94,10 @@ pub(crate) fn filter_reserved_agent(
 /// target** as another cella candidate (last-wins). Only exact-target matches
 /// are dropped here — intentional parent+child overlays (e.g. a bind at
 /// `/root/.claude` plus a tmpfs at `/root/.claude/plugins`) are preserved.
+///
+/// Trailing slashes are normalised on both sides in both passes via
+/// [`normalize_target`], so `/root/.foo` and `/root/.foo/` resolve to the
+/// same logical path and are deduplicated correctly.
 ///
 /// Last-wins matches the merge order established by `merge_with_devcontainer`:
 /// feature mounts are prepended and user mounts are appended, so a user mount
@@ -106,26 +123,29 @@ pub fn dedup_against_base(
     // and appends user mounts, so user mounts appear last. Last-wins ensures a
     // user's explicit devcontainer.json mount overrides an earlier feature-declared
     // mount at the same target, matching single-container behaviour.
+    //
+    // Candidate targets are normalised via `normalize_target` before the
+    // HashSet lookup so that trailing-slash variants match their bare counterparts.
     let mut after_base: Vec<MountSpec> = candidates
         .into_iter()
-        .filter(|spec| !base_targets.contains(&spec.target))
+        .filter(|spec| !base_targets.contains(normalize_target(&spec.target)))
         .collect();
 
     // Reverse in place so that iterating forward visits last candidates first,
-    // then retain only the first occurrence of each target (which was last in
-    // the original order). Reverse again to restore original relative order.
+    // then retain only the first occurrence of each normalised target (which was
+    // last in the original order). Reverse again to restore original relative order.
     after_base.reverse();
     let mut seen: HashSet<String> = HashSet::new();
-    after_base.retain(|spec| seen.insert(spec.target.clone()));
+    after_base.retain(|spec| seen.insert(normalize_target(&spec.target).to_string()));
     after_base.reverse();
     after_base
 }
 
-fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> Vec<String> {
+fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> HashSet<String> {
     let Some(svc) = resolved.services.get(service) else {
-        return Vec::new();
+        return HashSet::new();
     };
-    let mut out = Vec::new();
+    let mut out = HashSet::new();
     for v in &svc.volumes {
         match v {
             serde_json::Value::String(s) => {
@@ -134,15 +154,16 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> V
                 // this branch handles caller-supplied or hand-written test fixtures.)
                 let parts: Vec<&str> = s.splitn(3, ':').collect();
                 if parts.len() >= 2 {
-                    // Normalise trailing slashes so that "/root/.claude/" and
-                    // "/root/.claude" compare equal against candidate targets.
-                    out.push(parts[1].trim_end_matches('/').to_string());
+                    // Normalise via the shared helper so that "/root/.claude/" and
+                    // "/root/.claude" compare equal against candidate targets, and
+                    // the root path "/" is never collapsed to "".
+                    out.insert(normalize_target(parts[1]).to_string());
                 }
             }
             serde_json::Value::Object(obj) => {
                 if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
                     // Same normalisation for long-form object targets.
-                    out.push(t.trim_end_matches('/').to_string());
+                    out.insert(normalize_target(t).to_string());
                 }
             }
             _ => {}
@@ -577,6 +598,90 @@ mod tests {
         assert!(
             result.is_empty(),
             "trailing slash on base target must not defeat exact-match dropping; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trailing-slash normalization on candidate side (Finding P2 — round 5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_normalizes_candidate_trailing_slash_against_base() {
+        // Base: /root/.claude (no slash). Candidate: /root/.claude/ (with slash).
+        // The candidate must be dropped because the normalised forms are equal.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/x", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/cella/x", "/root/.claude/")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "candidate with trailing slash should match base without; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_normalizes_pass_two_trailing_slash_collision() {
+        // Pass 2: two cella candidates targeting the same logical path, one with
+        // a trailing slash. Last-wins: the second candidate (with slash) survives.
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![
+            MountSpec::bind("/a", "/root/.foo"),
+            MountSpec::bind("/b", "/root/.foo/"),
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "trailing-slash variant must dedup against bare; got: {result:?}"
+        );
+        // Last-wins: the second candidate survives.
+        assert_eq!(result[0].source, "/b");
+    }
+
+    #[test]
+    fn dedup_preserves_root_target_as_slash() {
+        // Edge case: candidate target is "/" (root). normalize_target must not
+        // collapse it to an empty string, leaving the root mount intact.
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![MountSpec::bind("/host", "/")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "root-target mount must survive; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Compose mount precedence: auto-forwarded wins over user on collision
+    // (Finding P2 round 5 — assembly order in build_compose_mount_specs)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_auto_forwarded_mount_wins_over_user_mount_on_collision() {
+        // build_compose_mount_specs places user/feature mounts FIRST and
+        // auto-forwarded (tool-config, env-fwd) mounts LAST. With last-wins
+        // dedup, the auto-forwarded mount survives on an exact-target collision —
+        // matching single-container behaviour.
+        //
+        // This test exercises dedup_against_base directly with the same ordering
+        // that build_compose_mount_specs produces; it validates the last-wins
+        // invariant that the reorder relies on.
+        let resolved = make_resolved("app", vec![]);
+        let candidates = vec![
+            // User mount (first — as map_merged_mounts returns it)
+            MountSpec::bind("/user/.claude", "/root/.claude"),
+            // Auto-forwarded tool-config mount (last — appended after user mounts)
+            MountSpec::bind("/host/.claude", "/root/.claude"),
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].source, "/host/.claude",
+            "auto-forwarded mount must win over user mount on exact target collision"
         );
     }
 
