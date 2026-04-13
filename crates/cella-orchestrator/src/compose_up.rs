@@ -811,18 +811,14 @@ async fn build_compose_mount_specs(p: ComposeMountParams<'_>) -> Vec<MountSpec> 
 
     // User devcontainer.json `mounts:` and feature `mounts:`.
     //
-    // When features are present, `container_config.mounts` already contains
-    // both feature mounts (prepended) and user mounts (appended) because
-    // `merge_with_devcontainer` is called during `resolve_features`. Mirror
-    // the same branching as `config_map::mod::map_merged_mounts` to avoid
-    // double-counting user mounts.
-    //
-    // `container_config.mounts` are stored as short-form mount strings
-    // ("type=…,source=…,target=…"), so parse each one via `parse_mount_string`
-    // before converting to `MountSpec`.
-    specs.extend(append_user_and_feature_mounts(
-        p.config,
-        p.resolved_features,
+    // Delegate to `map_merged_mounts`: when features are present, that function
+    // uses `container_config.mounts` (which already includes both feature and
+    // user mounts after `merge_with_devcontainer`); otherwise it falls back to
+    // `map_additional_mounts` on the raw config.
+    let feature_config = p.resolved_features.map(|rf| &rf.container_config);
+    let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
+    specs.extend(crate::compose_mounts::mount_configs_to_specs(
+        &user_feature_mounts,
     ));
 
     // Dedup against the user's base compose config. If this call fails, emit a
@@ -836,35 +832,6 @@ async fn build_compose_mount_specs(p: ComposeMountParams<'_>) -> Vec<MountSpec> 
             specs
         }
     }
-}
-
-/// Collect user `mounts:` and/or feature `mounts:` as `MountSpec` values.
-///
-/// When features are resolved, `container_config.mounts` already contains both
-/// feature-declared and user-declared mounts (merged by `merge_with_devcontainer`),
-/// so we use that single source of truth to avoid double-counting. Without
-/// features, we fall back to parsing `mounts:` from the devcontainer config
-/// directly.
-fn append_user_and_feature_mounts(
-    config: &serde_json::Value,
-    resolved_features: Option<&cella_features::ResolvedFeatures>,
-) -> Vec<MountSpec> {
-    resolved_features.map_or_else(
-        || {
-            let user_mounts = crate::config_map::mounts::map_additional_mounts(config);
-            crate::compose_mounts::mount_configs_to_specs(&user_mounts)
-        },
-        |features| {
-            // container_config.mounts = feature mounts + user mounts (merged order).
-            let mount_configs: Vec<cella_backend::MountConfig> = features
-                .container_config
-                .mounts
-                .iter()
-                .filter_map(|s| crate::config_map::mounts::parse_mount_string(s))
-                .collect();
-            crate::compose_mounts::mount_configs_to_specs(&mount_configs)
-        },
-    )
 }
 
 // ---------------------------------------------------------------------------
