@@ -934,7 +934,6 @@ async fn build_compose_mount_specs(
             if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
                 crate::compose_mounts::validate_base_compose_against_reserved_agent(
                     &resolved,
-                    p.project.run_services.as_deref(),
                     p.agent_vol_name,
                     p.agent_vol_target,
                 )

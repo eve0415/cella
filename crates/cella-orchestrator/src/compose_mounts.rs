@@ -71,7 +71,7 @@ pub(crate) fn filter_reserved_agent(
 }
 
 /// Validate that the user's base compose config does not alias the managed
-/// agent volume in any service that compose will actually start.
+/// agent volume in any service.
 ///
 /// Three aliasing patterns are rejected for each checked service:
 ///
@@ -88,11 +88,12 @@ pub(crate) fn filter_reserved_agent(
 ///    compose-key by source, it silently mounts the agent volume even though
 ///    the source string looks innocuous.
 ///
-/// The set of services inspected is determined by `run_services`:
-/// - `None` — compose's default is to start **all** services, so all services
-///   in `resolved.services` are checked.
-/// - `Some(list)` — only the named services are checked; others are ignored
-///   because compose will not start them.
+/// All services in `resolved.services` are always inspected, regardless of
+/// which services the caller intends to run. `docker compose up` starts the
+/// transitive dependency closure (via `depends_on`) unless `--no-deps` is
+/// passed; cella does not pass `--no-deps`. Any service that aliases the agent
+/// volume — even a dependency that is not in the explicit `run_services` list
+/// — represents a trust-boundary violation and must block `cella up`.
 ///
 /// Returns `Ok(())` when the config is clean, or `Err(message)` with a
 /// human-readable description of what was rejected.
@@ -108,7 +109,6 @@ pub(crate) fn filter_reserved_agent(
 /// does not trigger a false-positive self-rejection.
 pub(crate) fn validate_base_compose_against_reserved_agent(
     resolved: &ResolvedComposeConfig,
-    run_services: Option<&[String]>,
     agent_vol_name: &str,
     agent_vol_target: &str,
 ) -> Result<(), String> {
@@ -126,19 +126,10 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         })
         .collect();
 
-    // Determine which services to inspect:
-    // - run_services = None → compose starts ALL services → check all.
-    // - run_services = Some(list) → compose starts only those → check only those.
-    let services_to_check: Vec<&str> = run_services.map_or_else(
-        || resolved.services.keys().map(String::as_str).collect(),
-        |list| list.iter().map(String::as_str).collect(),
-    );
-
-    for svc_name in services_to_check {
-        let Some(svc) = resolved.services.get(svc_name) else {
-            continue; // named service not in resolved config — skip
-        };
-
+    // Always inspect ALL services: docker compose up starts the transitive
+    // dependency closure (depends_on) without --no-deps, so every service in
+    // the resolved config may be started implicitly.
+    for (svc_name, svc) in &resolved.services {
         for entry in &svc.volumes {
             let serde_json::Value::Object(obj) = entry else {
                 continue; // short-form strings — not produced by `docker compose config`
@@ -1165,7 +1156,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, None, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
         assert!(
             result.is_err(),
             "expected rejection for source=cella-agent alias; got: {result:?}"
@@ -1180,7 +1171,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, None, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
         assert!(
             result.is_err(),
             "expected rejection for target inside /cella; got: {result:?}"
@@ -1197,7 +1188,7 @@ mod tests {
             top_vols,
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, None, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
         assert!(
             result.is_err(),
             "expected rejection for top-level volume aliasing cella-agent; got: {result:?}"
@@ -1212,7 +1203,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, None, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
         assert!(
             result.is_ok(),
             "normal compose should pass; got: {result:?}"
@@ -1244,9 +1235,9 @@ mod tests {
             services,
             volumes: HashMap::new(),
         };
-        // run_services = None → check ALL services → sidecar fails
+        // All services are always checked — sidecar must cause failure.
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, None, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
         assert!(
             result.is_err(),
             "sibling service aliasing agent must be rejected"
@@ -1254,7 +1245,10 @@ mod tests {
     }
 
     #[test]
-    fn validator_ignores_non_run_services_when_run_services_set() {
+    fn validator_inspects_all_services_regardless_of_run_services() {
+        // run_services is no longer a parameter; sibling/dependency services
+        // are always validated because docker compose up starts the dependency
+        // closure implicitly (without --no-deps).
         let mut services = HashMap::new();
         services.insert(
             "app".to_string(),
@@ -1265,7 +1259,7 @@ mod tests {
             },
         );
         services.insert(
-            "scratch".to_string(),
+            "sibling".to_string(),
             ResolvedService {
                 image: None,
                 build: None,
@@ -1278,14 +1272,12 @@ mod tests {
             services,
             volumes: HashMap::new(),
         };
-        // run_services = Some(["app"]) → only check "app" → scratch ignored → OK
-        let result = validate_base_compose_against_reserved_agent(
-            &resolved,
-            Some(&["app".to_string()]),
-            "cella-agent",
-            "/cella",
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+        assert!(
+            result.is_err(),
+            "sibling service aliasing agent must be rejected"
         );
-        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
