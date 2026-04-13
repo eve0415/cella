@@ -62,9 +62,9 @@ pub struct OverrideConfig {
     /// Top-level volume names already declared in the user's base compose config.
     ///
     /// When `extra_volumes` contains a `MountKind::Volume` entry with a non-empty
-    /// source, cella emits a top-level declaration so compose can resolve the
-    /// volume. Names present in this set are skipped — the user owns them and
-    /// merging a cella-generated `external: true` block would conflict.
+    /// source, cella emits a bare top-level declaration so compose can
+    /// auto-create the volume. Names present in this set are skipped — the user
+    /// owns them and merging a duplicate declaration would conflict.
     pub base_compose_volumes: BTreeSet<String>,
 }
 
@@ -163,11 +163,12 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
 
     // Top-level volumes declarations.
     //
-    // Always emit the agent volume first. Then, for each extra volume mount
-    // that uses a named volume (MountKind::Volume with a non-empty source),
-    // emit a top-level declaration so compose can resolve it. Skip volumes
-    // already declared in the user's base compose config — merging an extra
-    // `external: true` block into a user-owned volume definition would conflict.
+    // Always emit the agent volume first (external: true — cella pre-creates
+    // it). Then, for each extra volume mount that uses a named volume
+    // (MountKind::Volume with a non-empty source), emit a bare key declaration
+    // so compose auto-creates the volume on first `up` and reuses it on
+    // subsequent runs. Skip volumes already declared in the user's base compose
+    // config — merging a duplicate declaration would conflict.
     yaml.push_str("volumes:\n");
     let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
     yaml.push_str("    external: true\n");
@@ -177,7 +178,7 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
             && !config.base_compose_volumes.contains(&spec.source)
         {
             let _ = writeln!(yaml, "  {}:", spec.source);
-            yaml.push_str("    external: true\n");
+            // Empty mapping — compose auto-creates the named volume on first `up`.
         }
     }
 
@@ -578,8 +579,9 @@ mod tests {
     #[test]
     fn named_volume_mount_emits_top_level_declaration() {
         // A user `type=volume,source=mycache,target=/cache` mount must produce
-        // a top-level `mycache: external: true` declaration so compose can
-        // resolve the volume.
+        // a bare top-level `mycache:` declaration so compose auto-creates the
+        // volume on first `up`. It must NOT be declared as `external: true`
+        // because that would break fresh installs.
         let mut config = base_config();
         config.extra_volumes = vec![named_volume_spec("mycache", "/cache")];
         let yaml = generate_override_yaml(&config);
@@ -587,12 +589,40 @@ mod tests {
             yaml.contains("mycache:"),
             "top-level mycache declaration must be emitted; yaml:\n{yaml}"
         );
-        assert!(
-            yaml.contains("    external: true"),
-            "mycache must be marked external; yaml:\n{yaml}"
+        // Only the agent volume should be external: true — not user-managed volumes.
+        let external_count = yaml.matches("external: true").count();
+        assert_eq!(
+            external_count, 1,
+            "only the agent volume should be declared external; yaml:\n{yaml}"
         );
         // The agent volume declaration must still be present.
         assert!(yaml.contains("cella-agent:"));
+    }
+
+    #[test]
+    fn named_volume_not_emitted_as_external() {
+        // Regression test: extra named volumes must use bare key declarations
+        // (compose auto-creates them). `external: true` would break first-run
+        // on machines where the volume has never been created.
+        let mut config = base_config();
+        config.extra_volumes = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "npm-cache".to_string(),
+            target: "/home/node/.npm".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("npm-cache:"),
+            "volume declaration missing; yaml:\n{yaml}"
+        );
+        // Only the agent volume entry should be external.
+        let external_count = yaml.matches("external: true").count();
+        assert_eq!(
+            external_count, 1,
+            "must not declare extra named volumes as external — breaks first-run; yaml:\n{yaml}"
+        );
     }
 
     #[test]
