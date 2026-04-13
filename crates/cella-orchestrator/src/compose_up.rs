@@ -310,9 +310,11 @@ async fn prepare_and_start(
 
     // 11-12. Build extra env vars and labels for the primary service.
     let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
-    let labels = build_compose_labels(cfg, project, &remote_user);
+    let mut labels = build_compose_labels(cfg, project, &remote_user);
 
     let settings = cella_config::settings::Settings::load(cfg.workspace_root);
+    insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
+
     let (mount_specs, base_compose_volumes) = build_compose_mount_specs(ComposeMountParams {
         workspace_root: cfg.workspace_root,
         settings: &settings,
@@ -483,6 +485,22 @@ async fn handle_compose_running(
             "Docker runtime changed ({old_runtime} -> {current_runtime})."
         ));
         progress.hint("Run `cella up --rebuild` to recreate with the updated runtime.");
+    }
+
+    // Mount-input drift (settings, env forwarding, parent-git) — catches
+    // mount-affecting changes that `config_hash` does not cover.
+    let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    let settings_now = cella_config::settings::Settings::load(cfg.workspace_root);
+    let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
+        &settings_now,
+        &env_fwd_now,
+        cfg.workspace_root,
+    );
+    if let Some(old_fp) = container.labels.get("dev.cella.mount_input_fingerprint")
+        && old_fp != &current_mount_fp
+    {
+        progress.warn("Mount configuration has changed since this container was created.");
+        progress.hint("Run `cella up --rebuild` to recreate with the updated mounts.");
     }
 
     // Re-register with daemon in case it restarted
@@ -803,6 +821,20 @@ fn build_extra_env(
     extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
     extra_env.extend(remote_env.iter().cloned());
     extra_env
+}
+
+/// Compute the mount-input fingerprint and insert it as a label on the
+/// primary service. Reconnect uses this to detect drift in settings,
+/// env-forwarding, or parent-git state that `config_hash` does not cover.
+fn insert_mount_input_fingerprint_label(
+    labels: &mut BTreeMap<String, String>,
+    settings: &cella_config::settings::Settings,
+    env_fwd: &cella_env::EnvForwarding,
+    workspace_root: &Path,
+) {
+    let fp =
+        crate::compose_mounts::compute_mount_input_fingerprint(settings, env_fwd, workspace_root);
+    labels.insert("dev.cella.mount_input_fingerprint".to_string(), fp);
 }
 
 // ---------------------------------------------------------------------------

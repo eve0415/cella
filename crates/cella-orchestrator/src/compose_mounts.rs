@@ -5,10 +5,12 @@
 //! Mount assembly (combining all sources) lives in `compose_up.rs`.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use cella_backend::{MountConfig, MountKind, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
+use sha2::{Digest, Sha256};
 
 /// Return `true` if `candidate` is equal to `base` or is a descendant path of it.
 ///
@@ -172,6 +174,58 @@ pub fn env_fwd_to_mount_specs(fwd: &EnvForwarding) -> Vec<MountSpec> {
         .iter()
         .map(|m| MountSpec::bind(m.source.clone(), m.target.clone()))
         .collect()
+}
+
+/// Compute a stable fingerprint over mount-affecting inputs that are **not**
+/// reflected in `project.config_hash` (which only covers devcontainer.json +
+/// compose file contents).
+///
+/// Hashes the tool `forward_config` flags, tool config override paths, the
+/// env-forwarding mount list, and the presence/path of a parent git directory.
+/// This fingerprint is stored as `dev.cella.mount_input_fingerprint` at
+/// container creation time and recomputed on reconnect to detect drift in
+/// settings, SSH/GPG agent state, or git worktree layout.
+///
+/// The hash is order-dependent and deterministic: same inputs always produce
+/// the same hex string.
+pub fn compute_mount_input_fingerprint(
+    settings: &cella_config::settings::Settings,
+    env_fwd: &EnvForwarding,
+    workspace_root: &Path,
+) -> String {
+    let mut hasher = Sha256::new();
+    let t = &settings.tools;
+
+    // Tool forward_config booleans.
+    hasher.update([u8::from(t.claude_code.forward_config)]);
+    hasher.update([u8::from(t.codex.forward_config)]);
+    hasher.update([u8::from(t.gemini.forward_config)]);
+    hasher.update([u8::from(t.nvim.forward_config)]);
+    hasher.update([u8::from(t.tmux.forward_config)]);
+
+    // Tool config override paths (None is represented by a bare NUL separator).
+    for path in [t.nvim.config_path.as_deref(), t.tmux.config_path.as_deref()] {
+        if let Some(p) = path {
+            hasher.update(p.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+
+    // env_fwd mount list (SSH socket, GPG agent, etc.).
+    for m in &env_fwd.mounts {
+        hasher.update(m.source.as_bytes());
+        hasher.update(b"|");
+        hasher.update(m.target.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    // Parent git directory presence + canonical path.
+    if let Some(pg) = cella_git::parent_git_dir(workspace_root) {
+        hasher.update(b"pg:");
+        hasher.update(pg.to_string_lossy().as_bytes());
+    }
+
+    hex::encode(hasher.finalize())
 }
 
 /// Adapt `MountConfig` → `MountSpec` (used for user `mounts:` and feature `mounts:`
@@ -796,6 +850,51 @@ mod tests {
             result.len(),
             1,
             "volume with non-agent source must be kept; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_mount_input_fingerprint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mount_input_fingerprint_stable_across_calls() {
+        let settings = cella_config::settings::Settings::default();
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+        let fp1 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        let fp2 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+    }
+
+    #[test]
+    fn mount_input_fingerprint_changes_on_forward_config_toggle() {
+        let mut settings = cella_config::settings::Settings::default();
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+        let fp_before = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        settings.tools.claude_code.forward_config = !settings.tools.claude_code.forward_config;
+        let fp_after = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        assert_ne!(
+            fp_before, fp_after,
+            "fingerprint must change when claude_code.forward_config is toggled"
+        );
+    }
+
+    #[test]
+    fn mount_input_fingerprint_changes_on_env_fwd_mount_change() {
+        let settings = cella_config::settings::Settings::default();
+        let mut env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
+        let fp_before = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        env_fwd.mounts.push(cella_env::ForwardMount {
+            source: "/ssh-sock".to_string(),
+            target: "/ssh-sock".to_string(),
+        });
+        let fp_after = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        assert_ne!(
+            fp_before, fp_after,
+            "fingerprint must change when an env_fwd mount is added"
         );
     }
 }
