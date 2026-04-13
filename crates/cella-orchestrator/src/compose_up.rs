@@ -323,6 +323,7 @@ async fn prepare_and_start(
         config,
         resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
         agent_vol_target: &agent_vol_target,
+        agent_vol_name: &agent_vol_name,
     })
     .await;
 
@@ -821,6 +822,9 @@ struct ComposeMountParams<'a> {
     /// Agent volume mount target (e.g., `/cella`). Mounts targeting this path
     /// or any descendant are rejected to protect the managed agent.
     agent_vol_target: &'a str,
+    /// Agent volume name (e.g., `cella-agent`). Volume mounts aliasing this
+    /// source name are rejected regardless of their target path.
+    agent_vol_name: &'a str,
 }
 
 /// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
@@ -864,11 +868,17 @@ async fn build_compose_mount_specs(
         &user_feature_mounts,
     ));
 
-    // Strip any mount whose target is inside the reserved agent subtree.
-    // Tool-config / env-fwd / parent-git mounts should never target /cella, but
-    // user and feature mounts are untrusted input — apply this filter to all.
-    if !p.agent_vol_target.is_empty() {
-        specs = crate::compose_mounts::filter_reserved_agent_subtree(specs, p.agent_vol_target);
+    // Strip any mount that would shadow or alias the reserved agent volume:
+    // 1. Target inside the agent subtree (e.g., /cella or /cella/bin).
+    // 2. Volume mount sourcing the agent volume by name (bypasses target check).
+    // Tool-config / env-fwd / parent-git mounts should never trigger these, but
+    // user and feature mounts are untrusted input — apply the filter to all.
+    if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
+        specs = crate::compose_mounts::filter_reserved_agent(
+            specs,
+            p.agent_vol_target,
+            p.agent_vol_name,
+        );
     }
 
     // Dedup against the user's base compose config. If this call fails, emit a

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use cella_backend::{MountConfig, MountSpec};
+use cella_backend::{MountConfig, MountKind, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
 
@@ -19,17 +19,29 @@ pub(crate) fn is_descendant_or_equal(candidate: &str, base: &str) -> bool {
     candidate == base || candidate.starts_with(&format!("{base}/"))
 }
 
-/// Filter out mount specs whose target is equal to or a descendant of the
-/// reserved `agent_vol_target` (e.g., `/cella`).
+/// Reject user/feature mounts that would shadow or alias the reserved agent volume.
 ///
-/// The agent volume is the single most critical resource cella manages. Any
-/// user or feature mount that shadows it or any subdirectory (e.g. `/cella/bin`)
-/// would replace the agent binary path and break managed-agent behaviour.
+/// Two independent checks are applied:
+///
+/// 1. **Target subtree** — any mount whose target is equal to or a descendant
+///    of `agent_vol_target` (e.g., `/cella` or `/cella/bin`) is rejected.
+///    Such a mount would silently replace the agent binary path.
+///
+/// 2. **Source name alias** — any `MountKind::Volume` mount whose source name
+///    equals `agent_vol_name` is rejected, regardless of target.
+///    Docker would mount the *same* underlying volume at two paths; a
+///    user-writable alias at (e.g.) `/tmp/agent-rw` breaks the integrity
+///    boundary even though the target is outside `/cella`.
+///
+///    Bind and tmpfs mounts with a source string matching the agent volume name
+///    are **not** rejected — they have different semantics and do not share
+///    volume identity.
 ///
 /// Returns the filtered list; each rejected mount is logged at `warn` level.
-pub(crate) fn filter_reserved_agent_subtree(
+pub(crate) fn filter_reserved_agent(
     specs: Vec<MountSpec>,
     agent_vol_target: &str,
+    agent_vol_name: &str,
 ) -> Vec<MountSpec> {
     specs
         .into_iter()
@@ -41,10 +53,17 @@ pub(crate) fn filter_reserved_agent_subtree(
                     reserved = %agent_vol_target,
                     "mount rejected: target is inside the reserved agent subtree",
                 );
-                false
-            } else {
-                true
+                return false;
             }
+            if spec.kind == MountKind::Volume && spec.source == agent_vol_name {
+                tracing::warn!(
+                    vol_name = %agent_vol_name,
+                    target = %spec.target,
+                    "mount rejected: source aliases the reserved agent volume",
+                );
+                return false;
+            }
+            true
         })
         .collect()
 }
@@ -562,14 +581,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // filter_reserved_agent_subtree (Finding 1)
+    // filter_reserved_agent (Finding 1)
     // -----------------------------------------------------------------------
 
     #[test]
     fn reject_mount_targeting_cella_root() {
         // A user mount targeting `/cella` exactly must be filtered out.
         let specs = vec![MountSpec::bind("/host-cella", "/cella")];
-        let result = filter_reserved_agent_subtree(specs, "/cella");
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
         assert!(
             result.is_empty(),
             "mount at /cella must be rejected; got: {result:?}"
@@ -580,7 +599,7 @@ mod tests {
     fn reject_mount_targeting_cella_descendant() {
         // A user mount targeting `/cella/bin` (descendant) must be filtered out.
         let specs = vec![MountSpec::bind("/host-bin", "/cella/bin")];
-        let result = filter_reserved_agent_subtree(specs, "/cella");
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
         assert!(
             result.is_empty(),
             "mount at /cella/bin must be rejected; got: {result:?}"
@@ -594,7 +613,7 @@ mod tests {
             MountSpec::bind("/host-x", "/cellax/bin"),
             MountSpec::bind("/host-other", "/cella-other"),
         ];
-        let result = filter_reserved_agent_subtree(specs, "/cella");
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
         assert_eq!(
             result.len(),
             2,
@@ -610,12 +629,67 @@ mod tests {
             MountSpec::bind("/legit", "/workspace"),
             MountSpec::bind("/bad", "/cella"),
         ];
-        let result = filter_reserved_agent_subtree(specs, "/cella");
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
         assert_eq!(
             result.len(),
             1,
             "only the /workspace mount should survive; got: {result:?}"
         );
         assert_eq!(result[0].target, "/workspace");
+    }
+
+    #[test]
+    fn reject_mount_aliasing_agent_volume_by_source() {
+        // A volume mount sourced from the agent volume name must be rejected even
+        // when its target is outside the reserved `/cella` subtree.
+        let specs = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "cella-agent".to_string(),
+            target: "/tmp/agent-rw".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
+        assert!(
+            result.is_empty(),
+            "volume aliasing agent volume by source must be rejected; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allow_non_volume_mount_with_name_matching_agent() {
+        // A bind mount whose source string matches the agent volume name is NOT
+        // rejected — bind mounts don't share volume identity.
+        let specs = vec![MountSpec {
+            kind: MountKind::Bind,
+            source: "cella-agent".to_string(),
+            target: "/whatever".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
+        assert_eq!(
+            result.len(),
+            1,
+            "bind mount with agent-named source must be kept; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allow_volume_mount_with_different_source() {
+        // A volume mount with a different source name must pass through.
+        let specs = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = filter_reserved_agent(specs, "/cella", "cella-agent");
+        assert_eq!(
+            result.len(),
+            1,
+            "volume with non-agent source must be kept; got: {result:?}"
+        );
     }
 }
