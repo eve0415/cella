@@ -327,8 +327,16 @@ async fn prepare_and_start(
     // 12. Build labels for the primary service
     let labels = build_compose_labels(cfg, project, &remote_user);
 
-    let mount_specs =
-        build_compose_mount_specs(cfg, &remote_user, &env_fwd, &compose_cmd, project).await;
+    let settings = cella_config::settings::Settings::load(cfg.workspace_root);
+    let mount_specs = build_compose_mount_specs(
+        cfg.workspace_root,
+        &settings,
+        &remote_user,
+        &env_fwd,
+        &compose_cmd,
+        project,
+    )
+    .await;
 
     let ov_ctx = OverrideContext {
         agent_vol_name,
@@ -765,19 +773,23 @@ fn build_compose_labels(
 /// User `mounts:` and feature `mounts:` are added in Task 7.
 /// Silently deduplicates against paths already declared in the base compose config.
 async fn build_compose_mount_specs(
-    cfg: &ComposeUpConfig<'_>,
+    workspace_root: &Path,
+    settings: &cella_config::settings::Settings,
     remote_user: &str,
     env_fwd: &cella_env::EnvForwarding,
     compose_cmd: &ComposeCommand,
     project: &ComposeProject,
 ) -> Vec<MountSpec> {
-    let settings = cella_config::settings::Settings::load(cfg.workspace_root);
-    let mut specs = crate::tool_install::build_tool_config_mount_specs(&settings, remote_user);
+    let mut specs = crate::tool_install::build_tool_config_mount_specs(settings, remote_user);
     specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(env_fwd));
 
-    // Parent git dir (mirrors single-container up.rs:826-835).
-    if let Some(parent_git) = cella_git::parent_git_dir(cfg.workspace_root) {
-        let path_str = parent_git.to_string_lossy().to_string();
+    // Parent git dir — canonicalize mirrors single-container up.rs:826-830 to
+    // handle linked git worktrees whose .gitdir pointer is non-canonical.
+    if let Some(parent_git) = cella_git::parent_git_dir(workspace_root) {
+        let canonical = parent_git
+            .canonicalize()
+            .unwrap_or_else(|_| parent_git.clone());
+        let path_str = canonical.to_string_lossy().to_string();
         specs.push(MountSpec::bind(path_str.clone(), path_str));
     }
 
