@@ -1,9 +1,8 @@
-//! Assemble the full mount list for the compose `up` path.
+//! Mount-list utilities for the compose `up` path.
 //!
-//! Combines tool-config mounts, SSH/GPG forwarding mounts, parent-git mounts,
-//! user devcontainer.json `mounts:`, and feature `mounts:`. Applies silent
-//! target-path dedup against the resolved base compose config so the user's
-//! explicit declarations always win.
+//! Provides target-path dedup against resolved compose config and adapters
+//! for converting `EnvForwarding` and `MountConfig` inputs into `MountSpec`.
+//! Mount assembly (combining all sources) lives in `compose_up.rs`.
 
 use std::collections::HashSet;
 
@@ -34,6 +33,8 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> H
         match v {
             serde_json::Value::String(s) => {
                 // Short form "host:target[:opts]" — target is the second field.
+                // (Defensive: docker compose config --format json normalizes to objects;
+                // this branch handles caller-supplied or hand-written test fixtures.)
                 let parts: Vec<&str> = s.splitn(3, ':').collect();
                 if parts.len() >= 2 {
                     out.insert(parts[1].to_string());
@@ -107,6 +108,18 @@ mod tests {
         let candidates = vec![MountSpec::bind("/cella/claude", "/root/.claude")];
         let result = dedup_against_base(&resolved, "app", candidates);
         assert!(result.is_empty(), "should drop the matching target");
+    }
+
+    #[test]
+    fn dedup_unknown_service_returns_all_candidates() {
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/x", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/cella/claude", "/root/.claude")];
+        // "web" is not in resolved config — all candidates must pass through
+        let result = dedup_against_base(&resolved, "web", candidates);
+        assert_eq!(result.len(), 1);
     }
 
     #[test]
