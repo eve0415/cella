@@ -315,27 +315,21 @@ async fn prepare_and_start(
     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
-    // 11. Build extra environment variables
-    let mut extra_env = daemon_env;
-    for e in &env_fwd.env {
-        extra_env.push(format!("{}={}", e.key, e.value));
-    }
-    for e in cfg.remote_env {
-        extra_env.push(e.clone());
-    }
-
-    // 12. Build labels for the primary service
+    // 11-12. Build extra env vars and labels for the primary service.
+    let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
     let labels = build_compose_labels(cfg, project, &remote_user);
 
     let settings = cella_config::settings::Settings::load(cfg.workspace_root);
-    let mount_specs = build_compose_mount_specs(
-        cfg.workspace_root,
-        &settings,
-        &remote_user,
-        &env_fwd,
-        &compose_cmd,
+    let mount_specs = build_compose_mount_specs(ComposeMountParams {
+        workspace_root: cfg.workspace_root,
+        settings: &settings,
+        remote_user: &remote_user,
+        env_fwd: &env_fwd,
+        compose_cmd: &compose_cmd,
         project,
-    )
+        config,
+        resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
+    })
     .await;
 
     let ov_ctx = OverrideContext {
@@ -764,28 +758,50 @@ fn build_compose_labels(
     labels
 }
 
+/// Assemble the extra environment variable list for the compose service.
+///
+/// Combines daemon-injected env vars, forwarded env vars (SSH/GPG agent sockets,
+/// etc.), and user-specified `remote_env` overrides in precedence order.
+fn build_extra_env(
+    daemon_env: Vec<String>,
+    env_fwd: &cella_env::EnvForwarding,
+    remote_env: &[String],
+) -> Vec<String> {
+    let mut extra_env = daemon_env;
+    extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
+    extra_env.extend(remote_env.iter().cloned());
+    extra_env
+}
+
 // ---------------------------------------------------------------------------
 // Mount assembly
 // ---------------------------------------------------------------------------
 
-/// Build Phase 1 compose mount specs: tool configs, SSH/GPG forwarding, parent-git.
+/// Parameters for `build_compose_mount_specs`.
+struct ComposeMountParams<'a> {
+    workspace_root: &'a Path,
+    settings: &'a cella_config::settings::Settings,
+    remote_user: &'a str,
+    env_fwd: &'a cella_env::EnvForwarding,
+    compose_cmd: &'a ComposeCommand,
+    project: &'a ComposeProject,
+    config: &'a serde_json::Value,
+    resolved_features: Option<&'a cella_features::ResolvedFeatures>,
+}
+
+/// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
+/// user `mounts:`, and feature `mounts:`.
 ///
-/// User `mounts:` and feature `mounts:` are added in Task 7.
-/// Silently deduplicates against paths already declared in the base compose config.
-async fn build_compose_mount_specs(
-    workspace_root: &Path,
-    settings: &cella_config::settings::Settings,
-    remote_user: &str,
-    env_fwd: &cella_env::EnvForwarding,
-    compose_cmd: &ComposeCommand,
-    project: &ComposeProject,
-) -> Vec<MountSpec> {
-    let mut specs = crate::tool_install::build_tool_config_mount_specs(settings, remote_user);
-    specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(env_fwd));
+/// Sources are appended in priority order (tool configs → env-fwd → parent-git
+/// → user/feature mounts) then deduplicated against paths already declared in
+/// the base compose config so the override file never shadows user-owned volumes.
+async fn build_compose_mount_specs(p: ComposeMountParams<'_>) -> Vec<MountSpec> {
+    let mut specs = crate::tool_install::build_tool_config_mount_specs(p.settings, p.remote_user);
+    specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(p.env_fwd));
 
     // Parent git dir — canonicalize mirrors single-container up.rs:826-830 to
     // handle linked git worktrees whose .gitdir pointer is non-canonical.
-    if let Some(parent_git) = cella_git::parent_git_dir(workspace_root) {
+    if let Some(parent_git) = cella_git::parent_git_dir(p.workspace_root) {
         let canonical = parent_git
             .canonicalize()
             .unwrap_or_else(|_| parent_git.clone());
@@ -793,17 +809,62 @@ async fn build_compose_mount_specs(
         specs.push(MountSpec::bind(path_str.clone(), path_str));
     }
 
+    // User devcontainer.json `mounts:` and feature `mounts:`.
+    //
+    // When features are present, `container_config.mounts` already contains
+    // both feature mounts (prepended) and user mounts (appended) because
+    // `merge_with_devcontainer` is called during `resolve_features`. Mirror
+    // the same branching as `config_map::mod::map_merged_mounts` to avoid
+    // double-counting user mounts.
+    //
+    // `container_config.mounts` are stored as short-form mount strings
+    // ("type=…,source=…,target=…"), so parse each one via `parse_mount_string`
+    // before converting to `MountSpec`.
+    specs.extend(append_user_and_feature_mounts(
+        p.config,
+        p.resolved_features,
+    ));
+
     // Dedup against the user's base compose config. If this call fails, emit a
     // warning and skip dedup — Docker Compose will surface any eventual collision.
-    match compose_cmd.config().await {
+    match p.compose_cmd.config().await {
         Ok(resolved) => {
-            crate::compose_mounts::dedup_against_base(&resolved, &project.primary_service, specs)
+            crate::compose_mounts::dedup_against_base(&resolved, &p.project.primary_service, specs)
         }
         Err(e) => {
             warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");
             specs
         }
     }
+}
+
+/// Collect user `mounts:` and/or feature `mounts:` as `MountSpec` values.
+///
+/// When features are resolved, `container_config.mounts` already contains both
+/// feature-declared and user-declared mounts (merged by `merge_with_devcontainer`),
+/// so we use that single source of truth to avoid double-counting. Without
+/// features, we fall back to parsing `mounts:` from the devcontainer config
+/// directly.
+fn append_user_and_feature_mounts(
+    config: &serde_json::Value,
+    resolved_features: Option<&cella_features::ResolvedFeatures>,
+) -> Vec<MountSpec> {
+    resolved_features.map_or_else(
+        || {
+            let user_mounts = crate::config_map::mounts::map_additional_mounts(config);
+            crate::compose_mounts::mount_configs_to_specs(&user_mounts)
+        },
+        |features| {
+            // container_config.mounts = feature mounts + user mounts (merged order).
+            let mount_configs: Vec<cella_backend::MountConfig> = features
+                .container_config
+                .mounts
+                .iter()
+                .filter_map(|s| crate::config_map::mounts::parse_mount_string(s))
+                .collect();
+            crate::compose_mounts::mount_configs_to_specs(&mount_configs)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

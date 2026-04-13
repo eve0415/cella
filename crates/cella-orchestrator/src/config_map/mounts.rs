@@ -27,7 +27,7 @@ pub(super) fn map_workspace_mount(
     })
 }
 
-pub(super) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
+pub(crate) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
     let Some(mounts) = config.get("mounts").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
