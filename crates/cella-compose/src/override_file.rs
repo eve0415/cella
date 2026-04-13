@@ -4,11 +4,11 @@
 //! allowing cella to inject its customizations into the primary service:
 //! image swap (for features), agent volume, environment variables, and labels.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use cella_backend::MountSpec;
+use cella_backend::{MountKind, MountSpec};
 
 use crate::error::CellaComposeError;
 
@@ -59,6 +59,13 @@ pub struct OverrideConfig {
     /// SSH/GPG, parent-git, user mounts, feature mounts). An empty `Vec`
     /// preserves the existing YAML output byte-for-byte.
     pub extra_volumes: Vec<MountSpec>,
+    /// Top-level volume names already declared in the user's base compose config.
+    ///
+    /// When `extra_volumes` contains a `MountKind::Volume` entry with a non-empty
+    /// source, cella emits a top-level declaration so compose can resolve the
+    /// volume. Names present in this set are skipped — the user owns them and
+    /// merging a cella-generated `external: true` block would conflict.
+    pub base_compose_volumes: BTreeSet<String>,
 }
 
 /// Generate the override compose YAML as a string.
@@ -154,10 +161,25 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         }
     }
 
-    // Top-level volumes declaration (external volume)
+    // Top-level volumes declarations.
+    //
+    // Always emit the agent volume first. Then, for each extra volume mount
+    // that uses a named volume (MountKind::Volume with a non-empty source),
+    // emit a top-level declaration so compose can resolve it. Skip volumes
+    // already declared in the user's base compose config — merging an extra
+    // `external: true` block into a user-owned volume definition would conflict.
     yaml.push_str("volumes:\n");
     let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
     yaml.push_str("    external: true\n");
+    for spec in &config.extra_volumes {
+        if spec.kind == MountKind::Volume
+            && !spec.source.is_empty()
+            && !config.base_compose_volumes.contains(&spec.source)
+        {
+            let _ = writeln!(yaml, "  {}:", spec.source);
+            yaml.push_str("    external: true\n");
+        }
+    }
 
     yaml
 }
@@ -203,6 +225,7 @@ mod tests {
             additional_contexts: BTreeMap::new(),
             build_secrets: Vec::new(),
             extra_volumes: Vec::new(),
+            base_compose_volumes: BTreeSet::new(),
         }
     }
 
@@ -536,5 +559,102 @@ mod tests {
         assert!(!yaml.contains("type: tmpfs"));
         // Agent volume short-form line is still present.
         assert!(yaml.contains("cella-agent:/cella:ro"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2: named volume top-level declarations
+    // -----------------------------------------------------------------------
+
+    fn named_volume_spec(source: &str, target: &str) -> MountSpec {
+        MountSpec {
+            kind: MountKind::Volume,
+            source: source.to_string(),
+            target: target.to_string(),
+            read_only: false,
+            consistency: None,
+        }
+    }
+
+    #[test]
+    fn named_volume_mount_emits_top_level_declaration() {
+        // A user `type=volume,source=mycache,target=/cache` mount must produce
+        // a top-level `mycache: external: true` declaration so compose can
+        // resolve the volume.
+        let mut config = base_config();
+        config.extra_volumes = vec![named_volume_spec("mycache", "/cache")];
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("mycache:"),
+            "top-level mycache declaration must be emitted; yaml:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    external: true"),
+            "mycache must be marked external; yaml:\n{yaml}"
+        );
+        // The agent volume declaration must still be present.
+        assert!(yaml.contains("cella-agent:"));
+    }
+
+    #[test]
+    fn named_volume_skips_top_level_if_in_base() {
+        // When the user's base compose already declares the volume, cella must
+        // NOT emit a duplicate top-level entry (merging would conflict).
+        let mut config = base_config();
+        config.extra_volumes = vec![named_volume_spec("mycache", "/cache")];
+        config.base_compose_volumes.insert("mycache".to_string());
+        let yaml = generate_override_yaml(&config);
+        // The service-level volume entry is still emitted, but the top-level
+        // declaration for mycache must NOT appear.
+        let top_level_start = yaml.find("volumes:\n  cella-agent:").unwrap();
+        let after_agent = &yaml[top_level_start..];
+        assert!(
+            !after_agent.contains("mycache:"),
+            "user-declared volume must not get a duplicate top-level entry; yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn bind_mount_does_not_emit_top_level_declaration() {
+        // Bind mounts have no named volume to declare.
+        let mut config = base_config();
+        config.extra_volumes = vec![MountSpec::bind("/host/data", "/container/data")];
+        let yaml = generate_override_yaml(&config);
+        // The top-level `volumes:` block (un-indented) must contain only the
+        // agent volume — no extra entry for the bind source or target path.
+        // Use "\nvolumes:\n" to find the top-level section (not the service-level one).
+        let top_level_volumes = yaml
+            .split("\nvolumes:\n")
+            .nth(1)
+            .expect("must have a top-level volumes section");
+        // Only "  cella-agent:" and "    external: true" should appear.
+        assert_eq!(
+            top_level_volumes
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count(),
+            2,
+            "top-level volumes must have exactly 2 non-empty lines (agent + external); yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn tmpfs_mount_does_not_emit_top_level_declaration() {
+        // Tmpfs mounts have no named volume source — no top-level declaration.
+        let mut config = base_config();
+        config.extra_volumes = vec![MountSpec::tmpfs("/volatile")];
+        let yaml = generate_override_yaml(&config);
+        // Same: only the agent volume entry.
+        let top_level_volumes = yaml
+            .split("\nvolumes:\n")
+            .nth(1)
+            .expect("must have a top-level volumes section");
+        assert_eq!(
+            top_level_volumes
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count(),
+            2,
+            "top-level volumes must have exactly 2 non-empty lines (agent + external); yaml:\n{yaml}"
+        );
     }
 }

@@ -12,11 +12,18 @@ use serde::Deserialize;
 use crate::error::CellaComposeError;
 
 /// Resolved compose config from `docker compose config --format json`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ResolvedComposeConfig {
     /// Map of service name to resolved service definition.
     #[serde(default)]
     pub services: HashMap<String, ResolvedService>,
+    /// Top-level volumes section from the resolved compose config.
+    ///
+    /// Keys are volume names. Values are raw JSON (`driver`, `driver_opts`,
+    /// `external`, etc.). Kept as `serde_json::Value` to preserve all
+    /// driver options without needing an exhaustive schema.
+    #[serde(default)]
+    pub volumes: HashMap<String, serde_json::Value>,
 }
 
 /// A single resolved service from the compose config.
@@ -328,6 +335,16 @@ mod tests {
         assert!(
             msg.contains("beta"),
             "error should list available service beta"
+        );
+    }
+
+    #[test]
+    fn deserialize_top_level_volumes() {
+        let json = r#"{"volumes": {"mycache": {"external": true}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.volumes.contains_key("mycache"),
+            "top-level volumes must deserialize"
         );
     }
 }

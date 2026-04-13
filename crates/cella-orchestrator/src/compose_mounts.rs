@@ -171,7 +171,10 @@ mod tests {
                 volumes,
             },
         );
-        ResolvedComposeConfig { services }
+        ResolvedComposeConfig {
+            services,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -228,7 +231,10 @@ mod tests {
                 volumes: vec![],
             },
         );
-        let resolved = ResolvedComposeConfig { services };
+        let resolved = ResolvedComposeConfig {
+            services,
+            ..Default::default()
+        };
         let candidates = vec![MountSpec::bind("/x", "/root/.claude")];
         let result = dedup_against_base(&resolved, "app", candidates);
         assert_eq!(
