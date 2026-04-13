@@ -9,3 +9,7 @@ docs/superpowers/
 
 # Worktrees
 .worktrees/
+
+# Insta pending snapshots (review via `cargo insta review` on host)
+**/*.snap.new
+
