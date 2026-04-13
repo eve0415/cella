@@ -174,10 +174,12 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     yaml.push_str("volumes:\n");
     let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
     yaml.push_str("    external: true\n");
+    let mut emitted_volumes: BTreeSet<&str> = BTreeSet::new();
     for spec in &config.extra_volumes {
         if spec.kind == MountKind::Volume
             && !spec.source.is_empty()
             && !config.base_compose_volumes.contains(&spec.source)
+            && emitted_volumes.insert(spec.source.as_str())
         {
             let _ = writeln!(yaml, "  {}:", spec.source);
             let _ = writeln!(yaml, "    name: {}", spec.source);
@@ -697,6 +699,42 @@ mod tests {
                 .count(),
             2,
             "top-level volumes must have exactly 2 non-empty lines (agent + external); yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn named_volume_source_declared_once_across_multiple_targets() {
+        let mut config = base_config();
+        config.extra_volumes = vec![
+            MountSpec {
+                kind: MountKind::Volume,
+                source: "mycache".to_string(),
+                target: "/cache1".to_string(),
+                read_only: false,
+                consistency: None,
+            },
+            MountSpec {
+                kind: MountKind::Volume,
+                source: "mycache".to_string(),
+                target: "/cache2".to_string(),
+                read_only: false,
+                consistency: None,
+            },
+        ];
+        let yaml = generate_override_yaml(&config);
+        // Both service-level mounts present
+        assert!(yaml.contains("target: \"/cache1\""));
+        assert!(yaml.contains("target: \"/cache2\""));
+        // Top-level volume declared ONCE
+        let declarations = yaml.matches("  mycache:\n").count();
+        assert_eq!(
+            declarations, 1,
+            "top-level volume must be declared exactly once; yaml:\n{yaml}"
+        );
+        let name_pins = yaml.matches("    name: mycache").count();
+        assert_eq!(
+            name_pins, 1,
+            "literal name pin emitted exactly once; yaml:\n{yaml}"
         );
     }
 
