@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use cella_backend::{MountConfig, MountKind, MountSpec};
+use cella_backend::{MountConfig, MountSpec};
 use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
 
@@ -49,8 +49,14 @@ pub(crate) fn filter_reserved_agent_subtree(
         .collect()
 }
 
-/// Remove candidate mounts whose target path is equal to, or a descendant of,
-/// any target already declared in the primary service's resolved volumes.
+/// Remove candidate mounts whose target path exactly matches a target already
+/// declared in the primary service's resolved volumes.
+///
+/// Pass 1 uses exact-target matching only. Descendant paths (e.g. an SSH socket
+/// bind at `/tmp/cella-ssh-agent.sock` when the user base has `/tmp:/tmp`, or a
+/// feature subdir bind under a user-owned parent) are intentional overlay patterns
+/// and must survive. Dropping them would sever env vars that point at sockets or
+/// paths inside those directories.
 ///
 /// A second pass then removes cella-side candidates that have the **exact same
 /// target** as another cella candidate (last-wins). Only exact-target matches
@@ -67,13 +73,13 @@ pub fn dedup_against_base(
 ) -> Vec<MountSpec> {
     let base_targets = extract_service_targets(resolved, primary_service);
 
-    // Pass 1: drop candidates covered by any base target (ancestor-or-equal).
+    // Pass 1: drop candidates whose target EXACTLY matches a base-compose target.
     //
-    // Tmpfs mounts are cella's isolation mechanism for subdirectories (e.g.
-    // `.claude/plugins` under a user-owned `~/.claude` bind). Dropping them on
-    // ancestor-match would silently defeat that isolation. Instead, tmpfs is
-    // only dropped when the target EXACTLY matches a base target (the base
-    // already owns that path entirely).
+    // Ancestor/descendant relationships are NOT considered here. Patterns like a
+    // tmpfs isolation at `/root/.claude/plugins` under a user-owned `~/.claude`
+    // bind, an SSH socket bind at `/tmp/cella-ssh-agent.sock` when the user
+    // declares `/tmp:/tmp`, or a feature-specific subdir overlay are all
+    // legitimate and must survive to the compose file.
     //
     // Pass 2 (last-wins dedup) follows immediately: we collect into a Vec so
     // that `.rev()` is available for the reverse+filter+reverse idiom.
@@ -83,15 +89,7 @@ pub fn dedup_against_base(
     // mount at the same target, matching single-container behaviour.
     let mut after_base: Vec<MountSpec> = candidates
         .into_iter()
-        .filter(|spec| {
-            if spec.kind == MountKind::Tmpfs {
-                !base_targets.contains(&spec.target)
-            } else {
-                !base_targets
-                    .iter()
-                    .any(|base| is_descendant_or_equal(&spec.target, base))
-            }
-        })
+        .filter(|spec| !base_targets.contains(&spec.target))
         .collect();
 
     // Reverse in place so that iterating forward visits last candidates first,
@@ -117,12 +115,15 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> V
                 // this branch handles caller-supplied or hand-written test fixtures.)
                 let parts: Vec<&str> = s.splitn(3, ':').collect();
                 if parts.len() >= 2 {
-                    out.push(parts[1].to_string());
+                    // Normalise trailing slashes so that "/root/.claude/" and
+                    // "/root/.claude" compare equal against candidate targets.
+                    out.push(parts[1].trim_end_matches('/').to_string());
                 }
             }
             serde_json::Value::Object(obj) => {
                 if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
-                    out.push(t.to_string());
+                    // Same normalisation for long-form object targets.
+                    out.push(t.trim_end_matches('/').to_string());
                 }
             }
             _ => {}
@@ -165,6 +166,7 @@ pub fn mount_configs_to_specs(configs: &[MountConfig]) -> Vec<MountSpec> {
 mod tests {
     use std::collections::HashMap;
 
+    use cella_backend::MountKind;
     use cella_compose::config::{ResolvedComposeConfig, ResolvedService};
     use serde_json::json;
 
@@ -354,21 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn pass_one_still_drops_bind_descendants() {
-        // Non-tmpfs mounts that are descendants of a base target are still dropped.
-        let resolved = make_resolved(
-            "app",
-            vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
-        );
-        let candidates = vec![MountSpec::bind("/foo", "/root/.claude/other")];
-        let result = dedup_against_base(&resolved, "app", candidates);
-        assert!(
-            result.is_empty(),
-            "bind descendant of base must still be dropped; got: {result:?}"
-        );
-    }
-
-    #[test]
     fn pass_one_still_drops_exact_bind_match() {
         // Non-tmpfs mounts that exactly match a base target are dropped.
         let resolved = make_resolved(
@@ -396,21 +383,6 @@ mod tests {
             result.len(),
             1,
             "sibling path must not be dropped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn dedup_handles_trailing_slash_in_base() {
-        // Base target has a trailing slash; a non-tmpfs descendant must still be dropped.
-        let resolved = make_resolved(
-            "app",
-            vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/"})],
-        );
-        let candidates = vec![MountSpec::bind("/foo", "/root/.claude/plugins")];
-        let result = dedup_against_base(&resolved, "app", candidates);
-        assert!(
-            result.is_empty(),
-            "trailing slash on base must not defeat ancestor matching, got: {result:?}"
         );
     }
 
@@ -509,6 +481,84 @@ mod tests {
             "/root/.claude/plugins",
             "/root/.claude/"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass-1 exact-match regression tests (Finding P2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pass_one_preserves_ssh_socket_under_base_tmp_bind() {
+        // User's base compose has /tmp:/tmp. Cella's env_fwd has SSH socket
+        // at /tmp/cella-ssh-agent.sock (a descendant). Socket must survive
+        // because pass-1 only drops exact-target matches.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/tmp", "target": "/tmp"})],
+        );
+        let candidates = vec![MountSpec::bind(
+            "/tmp/cella-ssh-agent.sock",
+            "/tmp/cella-ssh-agent.sock",
+        )];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "SSH socket descendant of base /tmp must survive; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/tmp/cella-ssh-agent.sock");
+    }
+
+    #[test]
+    fn pass_one_preserves_feature_subdir_under_user_parent_mount() {
+        // Feature mounts /root/.config/feature-x. User's base has /root/.config.
+        // Feature subdir must survive — it's an intentional overlay.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/host/config", "target": "/root/.config"})],
+        );
+        let candidates = vec![MountSpec::bind(
+            "/host/feature-x-data",
+            "/root/.config/feature-x",
+        )];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert_eq!(
+            result.len(),
+            1,
+            "feature subdir under user-owned parent must survive; got: {result:?}"
+        );
+        assert_eq!(result[0].target, "/root/.config/feature-x");
+    }
+
+    #[test]
+    fn pass_one_still_drops_exact_target_match() {
+        // User explicitly mounted /root/.claude — cella's /root/.claude bind dropped.
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/user/.claude", "target": "/root/.claude"})],
+        );
+        let candidates = vec![MountSpec::bind("/cella/.claude", "/root/.claude")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "cella's exact-target bind must be dropped in favor of user's; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pass_one_exact_match_with_trailing_slash_in_base() {
+        // Base target has a trailing slash — after normalisation it must still
+        // drop a candidate at the same path (no trailing slash).
+        let resolved = make_resolved(
+            "app",
+            vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/"})],
+        );
+        let candidates = vec![MountSpec::bind("/foo", "/root/.claude")];
+        let result = dedup_against_base(&resolved, "app", candidates);
+        assert!(
+            result.is_empty(),
+            "trailing slash on base target must not defeat exact-match dropping; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
