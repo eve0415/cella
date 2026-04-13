@@ -843,7 +843,33 @@ struct ComposeMountParams<'a> {
 async fn build_compose_mount_specs(
     p: ComposeMountParams<'_>,
 ) -> (Vec<MountSpec>, std::collections::BTreeSet<String>) {
-    let mut specs = crate::tool_install::build_tool_config_mount_specs(p.settings, p.remote_user);
+    // Assembly order mirrors single-container `config_map::map_config`:
+    //   1. User devcontainer.json `mounts:` and feature `mounts:` FIRST.
+    //   2. Auto-forwarded mounts (tool-config, env-fwd, parent-git) LAST.
+    //
+    // With last-wins dedup, placing auto-forwarded mounts after user/feature
+    // mounts gives them precedence on collision — matching single-container
+    // behaviour where `build_tool_config_mount_specs` + env-forwarding appends
+    // override any earlier user-declared mount at the same target.
+    // See: dedup_auto_forwarded_mount_wins_over_user_mount_on_collision in
+    // compose_mounts.rs tests.
+
+    // 1. User devcontainer.json `mounts:` and feature `mounts:`.
+    //
+    // Delegate to `map_merged_mounts`: when features are present, that function
+    // uses `container_config.mounts` (which already includes both feature and
+    // user mounts after `merge_with_devcontainer`); otherwise it falls back to
+    // `map_additional_mounts` on the raw config.
+    let feature_config = p.resolved_features.map(|rf| &rf.container_config);
+    let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
+    let mut specs = crate::compose_mounts::mount_configs_to_specs(&user_feature_mounts);
+
+    // 2. Auto-forwarded mounts — appended last so last-wins dedup gives them
+    //    precedence over a user/feature mount at the same target.
+    specs.extend(crate::tool_install::build_tool_config_mount_specs(
+        p.settings,
+        p.remote_user,
+    ));
     specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(p.env_fwd));
 
     // Parent git dir — canonicalize mirrors single-container up.rs:826-830 to
@@ -855,18 +881,6 @@ async fn build_compose_mount_specs(
         let path_str = canonical.to_string_lossy().to_string();
         specs.push(MountSpec::bind(path_str.clone(), path_str));
     }
-
-    // User devcontainer.json `mounts:` and feature `mounts:`.
-    //
-    // Delegate to `map_merged_mounts`: when features are present, that function
-    // uses `container_config.mounts` (which already includes both feature and
-    // user mounts after `merge_with_devcontainer`); otherwise it falls back to
-    // `map_additional_mounts` on the raw config.
-    let feature_config = p.resolved_features.map(|rf| &rf.container_config);
-    let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
-    specs.extend(crate::compose_mounts::mount_configs_to_specs(
-        &user_feature_mounts,
-    ));
 
     // Strip any mount that would shadow or alias the reserved agent volume:
     // 1. Target inside the agent subtree (e.g., /cella or /cella/bin).
