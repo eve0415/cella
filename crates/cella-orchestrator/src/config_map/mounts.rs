@@ -85,6 +85,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
     for part in s.split(',') {
         let trimmed = part.trim();
         if let Some((key, value)) = trimmed.split_once('=') {
+            let value = value.trim();
             match key.trim() {
                 "type" => mount_type = value.to_string(),
                 "source" | "src" => source = value.to_string(),
@@ -130,6 +131,17 @@ mod tests {
     #[test]
     fn parse_mount_string_empty_returns_none() {
         assert!(parse_mount_string("").is_none());
+    }
+
+    #[test]
+    fn parse_mount_string_trims_whitespace_around_equals() {
+        let mount = parse_mount_string("type = bind, source = /a, target = /b").unwrap();
+        assert_eq!(
+            mount.mount_type, "bind",
+            "leading space around '=' must not leave ' bind'"
+        );
+        assert_eq!(mount.source, "/a");
+        assert_eq!(mount.target, "/b");
     }
 
     #[test]
