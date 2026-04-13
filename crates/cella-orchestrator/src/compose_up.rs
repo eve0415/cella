@@ -768,6 +768,10 @@ fn build_compose_labels(
         "dev.cella.workspace_folder".to_string(),
         project.workspace_folder.clone(),
     );
+    labels.insert(
+        "dev.cella.docker_runtime".to_string(),
+        cella_env::platform::detect_runtime().as_label().to_string(),
+    );
 
     // Spec-standard labels for VS Code / tooling interop.
     labels.insert("devcontainer.local_folder".to_string(), workspace_str);
