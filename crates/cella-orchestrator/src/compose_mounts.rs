@@ -155,10 +155,11 @@ fn compute_service_closure<'a>(
 ///
 /// # Notes
 ///
-/// `docker compose config` normalises all service volume entries to long-form
-/// objects before this function is called. If a short-form string is encountered
-/// this function returns `Err` immediately (fail-closed): a non-normalised entry
-/// could silently bypass the aliasing checks and must be treated as an error.
+/// Both long-form object entries and short-form string entries (e.g.
+/// `"host:/container"`) are handled. Short-form strings are parsed by
+/// [`parse_short_form_volume`] to extract `source`, `target`, and inferred
+/// mount type. This is necessary because some `docker compose config --format
+/// json` versions still emit short-form strings for ordinary bind mounts.
 ///
 /// This function must be called with a config resolved via
 /// `ComposeCommand::without_override` so that cella's own injected agent mount
@@ -218,21 +219,34 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         check_volumes_from(svc_name, svc, primary_service)?;
 
         for entry in &svc.volumes {
-            let serde_json::Value::Object(obj) = entry else {
-                return Err(format!(
-                    "service '{svc_name}' has an unresolved short-form volume entry \
-                     ({entry:?}). Cella requires `docker compose config --format json` \
-                     to normalize to long-form objects; this entry would bypass agent \
-                     volume aliasing checks."
-                ));
+            let (mount_type, source, target) = match entry {
+                serde_json::Value::Object(obj) => {
+                    let mt = obj
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("volume");
+                    let src = obj.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                    let tgt = obj.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                    (mt, src, tgt)
+                }
+                serde_json::Value::String(s) => {
+                    // Short-form: parse source and target, infer mount type.
+                    // A source with no leading '/' or '.' is a named volume;
+                    // a source with '/' or '.' prefix is a bind path; empty source
+                    // (anonymous form "/path") is an anonymous volume.
+                    let Some((src_opt, tgt)) = parse_short_form_volume(s) else {
+                        continue; // malformed — skip
+                    };
+                    let src = src_opt.unwrap_or("");
+                    let mt = if src.starts_with('/') || src.starts_with('.') || src.is_empty() {
+                        "bind"
+                    } else {
+                        "volume"
+                    };
+                    (mt, src, tgt)
+                }
+                _ => continue, // not object or string — not spec-compliant; ignore
             };
-
-            let mount_type = obj
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("volume");
-            let source = obj.get("source").and_then(|s| s.as_str()).unwrap_or("");
-            let target = obj.get("target").and_then(|t| t.as_str()).unwrap_or("");
 
             // Checks 1 and 2 only apply to volume-type mounts.
             // Bind mounts with source matching the agent volume name point at a
@@ -419,6 +433,44 @@ pub(crate) fn validate_extra_named_volumes_against_base(
     Ok(())
 }
 
+/// Parse a short-form compose volume string into `(source, target)`.
+///
+/// Forms:
+/// - `"/path"` → `(None, "/path")` — anonymous volume or bare target
+/// - `"name:/path"` → `(Some("name"), "/path")` — named volume or bind
+/// - `"host:/container:opts"` → `(Some("host"), "/container")` — bind with opts
+///
+/// Returns `None` for malformed input (empty string or empty target path).
+///
+/// # Note
+///
+/// Windows drive-letter paths such as `C:\foo:/bar` are **not** supported on
+/// the Linux-first cella path and will be parsed ambiguously (the drive letter
+/// becomes the "source", the rest becomes the "target"). Cella is Linux-first
+/// per its architecture documentation; Windows paths should not appear in
+/// practice.
+fn parse_short_form_volume(s: &str) -> Option<(Option<&str>, &str)> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    match parts.len() {
+        1 => {
+            // Anonymous volume or bare target (no colon).
+            if parts[0].is_empty() {
+                None
+            } else {
+                Some((None, parts[0]))
+            }
+        }
+        _ => {
+            // Has at least one colon — source:target[:opts].
+            if parts[1].is_empty() {
+                None
+            } else {
+                Some((Some(parts[0]), parts[1]))
+            }
+        }
+    }
+}
+
 /// Normalise a mount target path by stripping trailing slashes.
 ///
 /// The only special case is the filesystem root `"/"`: stripping its slash
@@ -456,16 +508,14 @@ fn normalize_target(s: &str) -> &str {
 ///
 /// # Errors
 ///
-/// Returns `Err` if any service volume entry is not a long-form object, which
-/// indicates `docker compose config --format json` did not fully normalise the
-/// config. This is a fail-closed safety check: a short-form string in this
-/// position would bypass target-dedup and silently admit user-controlled paths.
+/// `extract_service_targets` is infallible; this function propagates its
+/// `Result` for the caller's convenience and currently always returns `Ok`.
 pub fn dedup_against_base(
     resolved: &ResolvedComposeConfig,
     primary_service: &str,
     candidates: Vec<MountSpec>,
 ) -> Result<Vec<MountSpec>, String> {
-    let base_targets = extract_service_targets(resolved, primary_service)?;
+    let base_targets = extract_service_targets(resolved, primary_service);
 
     // Pass 1: drop candidates whose target EXACTLY matches a base-compose target.
     //
@@ -502,40 +552,41 @@ pub fn dedup_against_base(
 /// Extract the set of normalised mount target paths declared for `service` in
 /// the resolved compose config.
 ///
-/// Only long-form object volume entries (with a `"target"` key) are recognised.
-/// `docker compose config --format json` always normalises volume entries to
-/// this form; encountering a short-form string is therefore a hard error — it
-/// means the config was not fully normalised, and skipping it would silently
-/// bypass mount target dedup, letting user-controlled paths through unchecked.
+/// Both long-form object entries (with a `"target"` key) and short-form string
+/// entries (e.g. `"host:/container"` or `"/path"`) are handled. Short-form
+/// strings are parsed by [`parse_short_form_volume`] to extract the target.
+/// Malformed entries (empty string, empty target) are silently skipped.
+/// Non-object, non-string entries are also silently skipped.
 ///
-/// # Errors
-///
-/// Returns `Err` if any volume entry for `service` is not a long-form JSON
-/// object. The caller should propagate this as a configuration error.
-fn extract_service_targets(
-    resolved: &ResolvedComposeConfig,
-    service: &str,
-) -> Result<HashSet<String>, String> {
+/// `docker compose config --format json` normalises volume entries to long-form
+/// objects on most Compose versions, but some versions still emit short-form
+/// strings for ordinary bind mounts. Both forms receive the same dedup checks.
+fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> HashSet<String> {
     let Some(svc) = resolved.services.get(service) else {
-        return Ok(HashSet::new());
+        return HashSet::new();
     };
     let mut out = HashSet::new();
     for entry in &svc.volumes {
-        let serde_json::Value::Object(obj) = entry else {
-            return Err(format!(
-                "service '{service}' has an unresolved short-form volume entry \
-                 ({entry:?}). Cella requires `docker compose config --format json` \
-                 to normalize to long-form objects; this entry would bypass mount \
-                 safety checks."
-            ));
-        };
-        if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
-            // Normalise so that "/root/.claude/" and "/root/.claude" compare
-            // equal against candidate targets, and "/" is never collapsed to "".
-            out.insert(normalize_target(t).to_string());
+        match entry {
+            serde_json::Value::Object(obj) => {
+                if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
+                    // Normalise so that "/root/.claude/" and "/root/.claude" compare
+                    // equal against candidate targets, and "/" is never collapsed to "".
+                    out.insert(normalize_target(t).to_string());
+                }
+            }
+            serde_json::Value::String(s) => {
+                if let Some((_src, target)) = parse_short_form_volume(s) {
+                    out.insert(normalize_target(target).to_string());
+                }
+                // else: malformed entry — silently skip.
+            }
+            _ => {
+                // Neither object nor string — not spec-compliant; ignore.
+            }
         }
     }
-    Ok(out)
+    out
 }
 
 /// Convert `env_fwd.mounts` (source/target only) to `MountSpec` list.
@@ -774,14 +825,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_service_targets_errors_on_short_form_string() {
-        // Short-form strings are not produced by `docker compose config
-        // --format json`. Encountering one is a hard error (fail-closed):
-        // silently skipping it would let the entry bypass mount safety checks.
-        let resolved = make_resolved("app", vec![json!("some-vol:/data")]);
-        let candidates = vec![MountSpec::bind("/x", "/y")];
-        let result = dedup_against_base(&resolved, "app", candidates);
-        assert!(result.is_err(), "short-form entries must fail-closed");
+    fn extract_service_targets_parses_short_form_strings() {
+        // Some `docker compose config --format json` versions emit short-form
+        // strings for ordinary bind mounts. These must be parsed, not hard-failed.
+        let resolved = make_resolved(
+            "app",
+            vec![
+                json!("/anonymous"),        // anonymous: target = /anonymous
+                json!("named:/data"),       // named volume or bind: target = /data
+                json!("./cache:/cache:ro"), // bind with opts: target = /cache
+            ],
+        );
+        let candidates = vec![
+            MountSpec::bind("/x", "/anonymous"), // collides with entry 1 → dropped
+            MountSpec::bind("/y", "/data"),      // collides with entry 2 → dropped
+            MountSpec::bind("/z", "/cache"),     // collides with entry 3 → dropped
+            MountSpec::bind("/w", "/other"),     // no collision → kept
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].target, "/other");
     }
 
     #[test]
@@ -1715,10 +1778,11 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_short_form_volume_entry() {
-        // A short-form string in a service's volume list must trigger a hard
-        // error (fail-closed). Silently skipping it could allow a crafted entry
-        // like "cella-agent:/tmp/agent-rw" to bypass the aliasing checks.
+    fn validator_rejects_short_form_aliasing_agent_volume() {
+        // Short-form "cella-agent:/tmp/agent-rw" parses to source="cella-agent",
+        // target="/tmp/agent-rw". Source has no leading '/' or '.' → inferred
+        // type=volume → caught by Check 1 (source alias). Must still be rejected,
+        // but via alias check rather than a fail-closed hard error.
         let mut services = HashMap::new();
         services.insert(
             "app".to_string(),
@@ -1741,7 +1805,43 @@ mod tests {
             "app",
             None,
         );
-        assert!(result.is_err(), "short-form volume entry must fail-closed");
+        assert!(
+            result.is_err(),
+            "short-form volume-type alias must still be rejected via alias check"
+        );
+    }
+
+    #[test]
+    fn validator_allows_short_form_bind_with_source_matching_agent_name() {
+        // Short-form "./cella-agent:/data" → source="./cella-agent", target="/data".
+        // Source starts with '.' → inferred type=bind → not a volume alias.
+        // A host directory literally named "cella-agent" is not a Docker volume.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!("./cella-agent:/data")],
+                volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "bind mount with literal dir path is not a volume alias; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
