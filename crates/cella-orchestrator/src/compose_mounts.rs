@@ -307,60 +307,8 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 /// - Anything else — `external`, `driver`, `driver_opts`, `labels`, a `name`
 ///   that differs from `expected_name` — is **incompatible**.
 ///
-/// The function is called for both the agent volume key (Finding 1) and
-/// user-declared extra volume keys (Finding 2).
-/// Reject writable `volumes_from` entries that inherit from the primary service.
-/// Read-only inheritance (`:ro` suffix / `read_only: true`) preserves cella's
-/// agent read-only protection and is safe; writable inheritance is the bypass.
-fn check_volumes_from(
-    svc_name: &str,
-    svc: &cella_compose::config::ResolvedService,
-    primary_service: &str,
-) -> Result<(), String> {
-    for vf_entry in &svc.volumes_from {
-        let (inherit_from, read_only) = parse_volumes_from_entry(vf_entry);
-        if inherit_from == primary_service && !read_only {
-            return Err(format!(
-                "service '{svc_name}' uses writable volumes_from on primary service \
-                 '{primary_service}', which would inherit cella's managed agent volume \
-                 without cella's read-only protection. Use ':ro' suffix or \
-                 'read_only: true' for read-only inheritance, or remove the \
-                 volumes_from entry."
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Extract (`service_name`, `is_read_only`) from a single `volumes_from` entry.
-fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool) {
-    match entry {
-        serde_json::Value::String(s) => {
-            let parts: Vec<&str> = s.rsplitn(2, ':').collect();
-            if parts.len() == 2 && (parts[0] == "ro" || parts[0] == "rw") {
-                let service_name = parts[1].split(':').next_back().unwrap_or("");
-                (service_name, parts[0] == "ro")
-            } else {
-                let service_name = s.split(':').next_back().unwrap_or("");
-                (service_name, false)
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            let name = obj
-                .get("source")
-                .or_else(|| obj.get("from"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ro = obj
-                .get("read_only")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            (name, ro)
-        }
-        _ => ("", false),
-    }
-}
-
+/// The function is called for both the agent volume key and user-declared extra
+/// volume keys.
 fn is_compatible_base_volume_declaration(value: &serde_json::Value, expected_name: &str) -> bool {
     let Some(obj) = value.as_object() else {
         // null or non-object primitive: treat as bare
@@ -380,6 +328,90 @@ fn is_compatible_base_volume_declaration(value: &serde_json::Value, expected_nam
         }
     }
     true
+}
+
+/// Reject writable `volumes_from` entries that inherit from the primary service,
+/// or that use the `container:<name>` form in writable mode.
+///
+/// - Writable inheritance from the primary service would bring in cella's
+///   injected agent mount without cella's read-only protection.
+/// - Writable `container:<name>` entries inherit volumes from an arbitrary
+///   running container (potentially outside the project) and could expose the
+///   managed agent volume at read-write. Read-only inheritance preserves
+///   protection and is safe.
+///
+/// Read-only inheritance (`:ro` suffix / `read_only: true`) is always allowed.
+fn check_volumes_from(
+    svc_name: &str,
+    svc: &cella_compose::config::ResolvedService,
+    primary_service: &str,
+) -> Result<(), String> {
+    for vf_entry in &svc.volumes_from {
+        let (inherit_from, read_only, is_container) = parse_volumes_from_entry(vf_entry);
+        // container: form check — must come before primary-service check so that
+        // `container:app` (where `app` is the primary) gets the container-form
+        // error rather than the primary-inheritance one.
+        if !read_only && is_container {
+            return Err(format!(
+                "service '{svc_name}' uses writable volumes_from with container:<name> form. \
+                 This form inherits volumes from a running container (possibly outside the \
+                 project) and could expose the managed agent volume at read-write. Use the \
+                 service-name form with ':ro' suffix if you need read-only inheritance, or \
+                 remove the volumes_from entry."
+            ));
+        }
+        if inherit_from == primary_service && !read_only {
+            return Err(format!(
+                "service '{svc_name}' uses writable volumes_from on primary service \
+                 '{primary_service}', which would inherit cella's managed agent volume \
+                 without cella's read-only protection. Use ':ro' suffix or \
+                 'read_only: true' for read-only inheritance, or remove the \
+                 volumes_from entry."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract (`service_name_or_container`, `is_read_only`, `is_container_form`)
+/// from a single `volumes_from` entry.
+///
+/// String form examples:
+/// - `"app"` → `("app", false, false)`
+/// - `"app:ro"` → `("app", true, false)`
+/// - `"container:primary"` → `("primary", false, true)`
+/// - `"container:primary:ro"` → `("primary", true, true)`
+///
+/// Object form: `source`/`from` key is inspected for a `container:` prefix.
+fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool, bool) {
+    match entry {
+        serde_json::Value::String(s) => {
+            let parts: Vec<&str> = s.rsplitn(2, ':').collect();
+            let (rest, is_ro) = if parts.len() == 2 && (parts[0] == "ro" || parts[0] == "rw") {
+                (parts[1], parts[0] == "ro")
+            } else {
+                (s.as_str(), false)
+            };
+            // Check container: prefix on the remaining portion.
+            rest.strip_prefix("container:")
+                .map_or((rest, is_ro, false), |stripped| (stripped, is_ro, true))
+        }
+        serde_json::Value::Object(obj) => {
+            let name = obj
+                .get("source")
+                .or_else(|| obj.get("from"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ro = obj
+                .get("read_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // Object form may also use "container:" prefix in source.
+            name.strip_prefix("container:")
+                .map_or((name, ro, false), |stripped| (stripped, ro, true))
+        }
+        _ => ("", false, false),
+    }
 }
 
 /// Reject if any extra named-volume source collides with an existing base
@@ -2462,6 +2494,90 @@ mod tests {
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
             "bare empty-object declaration is compatible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-13 findings: container: form in volumes_from
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn volumes_from_writable_container_form_is_rejected() {
+        // `container:<name>` in writable mode inherits from an arbitrary running
+        // container and could expose the managed agent volume. Must reject.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "sidecar".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("container:other-project-primary")],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(result.is_err(), "writable container: form must be rejected");
+    }
+
+    #[test]
+    fn volumes_from_readonly_container_form_is_allowed() {
+        // `container:<name>:ro` is read-only — protection is preserved.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "reader".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("container:external-container:ro")],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "read-only container: form preserves protection; got: {result:?}"
         );
     }
 
