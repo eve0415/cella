@@ -860,6 +860,11 @@ struct ComposeMountParams<'a> {
 /// 2. Any user/feature mount targeting the agent subtree is stripped and warned.
 /// 3. Remaining candidates are deduplicated against paths already declared in
 ///    the base compose config so the override file never shadows user-owned volumes.
+///
+/// Fails the whole `cella up` if `docker compose config --format json` cannot
+/// resolve the base config. Reserved-agent alias rejection and named-volume
+/// collision detection require a resolved model; silently skipping them would
+/// be a security hole.
 async fn build_compose_mount_specs(
     p: ComposeMountParams<'_>,
 ) -> Result<Vec<MountSpec>, crate::error::OrchestratorError> {
@@ -966,10 +971,14 @@ async fn build_compose_mount_specs(
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             Ok(deduped)
         }
-        Err(e) => {
-            warn!("compose config unavailable for mount dedup ({e}); emitting all candidates");
-            Ok(specs)
-        }
+        Err(e) => Err(crate::error::OrchestratorError::Config {
+            message: format!(
+                "cannot resolve compose config for mount validation: {e}. \
+                 Cella cannot safely emit compose mounts without validating the \
+                 base compose file. Fix the compose file or pin a compatible \
+                 Docker Compose version."
+            ),
+        }),
     }
 }
 
