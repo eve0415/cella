@@ -45,6 +45,12 @@ pub struct ResolvedService {
     /// that this service inherits volumes from another service at runtime.
     #[serde(default)]
     pub volumes_from: Vec<serde_json::Value>,
+    /// Service dependencies. May be absent (→ `Value::Null`), an array of
+    /// service name strings (short form), or an object mapping service name
+    /// to condition (long form). Kept as raw `serde_json::Value` to handle
+    /// both compose forms without an exhaustive schema.
+    #[serde(default)]
+    pub depends_on: serde_json::Value,
 }
 
 /// Resolved build config for a compose service.
@@ -368,5 +374,30 @@ mod tests {
         let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
         let svc = config.services.get("app").unwrap();
         assert!(svc.volumes_from.is_empty());
+    }
+
+    #[test]
+    fn deserialize_depends_on_short_form() {
+        let json = r#"{"services": {"app": {"depends_on": ["db", "cache"]}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.depends_on.is_array());
+    }
+
+    #[test]
+    fn deserialize_depends_on_long_form() {
+        let json =
+            r#"{"services": {"app": {"depends_on": {"db": {"condition": "service_started"}}}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.depends_on.is_object());
+    }
+
+    #[test]
+    fn deserialize_depends_on_absent_defaults_to_null() {
+        let json = r#"{"services": {"app": {}}}"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.depends_on.is_null());
     }
 }

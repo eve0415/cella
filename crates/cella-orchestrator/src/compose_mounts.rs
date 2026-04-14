@@ -70,15 +70,61 @@ pub(crate) fn filter_reserved_agent(
         .collect()
 }
 
+/// Extract service names from a `depends_on` value (short or long form).
+///
+/// - Array of strings → each element is a dependency name.
+/// - Object keyed by service name → each key is a dependency name.
+/// - Null / absent → no dependencies.
+fn depends_on_names(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        serde_json::Value::Object(obj) => obj.keys().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Compute the set of services compose will start given an optional
+/// `run_services` filter.
+///
+/// - `None` → compose starts all services → the full service map is the closure.
+/// - `Some(list)` → compose starts the listed services plus their transitive
+///   `depends_on` closure (compose always follows dependencies unless
+///   `--no-deps` is given; cella never passes `--no-deps`).
+fn compute_service_closure<'a>(
+    resolved: &'a ResolvedComposeConfig,
+    run_services: Option<&'a [String]>,
+) -> HashSet<&'a str> {
+    let mut closure: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = run_services.map_or_else(
+        || resolved.services.keys().map(String::as_str).collect(),
+        |list| list.iter().map(String::as_str).collect(),
+    );
+    while let Some(name) = stack.pop() {
+        if !closure.insert(name) {
+            continue;
+        }
+        if let Some(svc) = resolved.services.get(name) {
+            for dep in depends_on_names(&svc.depends_on) {
+                if !closure.contains(dep) {
+                    stack.push(dep);
+                }
+            }
+        }
+    }
+    closure
+}
+
 /// Validate that the user's base compose config does not alias the managed
-/// agent volume in any service.
+/// agent volume in any service that compose will actually start.
 ///
-/// Four aliasing patterns are checked across services:
+/// Four aliasing patterns are checked across services in the computed closure:
 ///
-/// 1. **Source alias** — a service volume entry whose `source` matches
-///    `agent_vol_name` exactly. Docker would mount the same underlying volume
-///    at a second path, making the agent volume writable via that alias.
-///    Applies to **all** services.
+/// 1. **Source alias** — a service volume entry of type `volume` whose
+///    `source` matches `agent_vol_name` exactly. Docker would mount the same
+///    underlying volume at a second path, making the agent volume writable via
+///    that alias. Bind mounts with a source string matching the agent volume
+///    name are **not** rejected: they point at a host directory, not the
+///    Docker volume.
 ///
 /// 2. **Target subtree alias** — a service volume entry whose `target` is
 ///    equal to or a descendant of `agent_vol_target` (e.g., `/cella`). This
@@ -90,21 +136,19 @@ pub(crate) fn filter_reserved_agent(
 /// 3. **Top-level volume name alias** — any top-level volume entry that has a
 ///    `name:` field equal to `agent_vol_name`. If a service references that
 ///    compose-key by source, it silently mounts the agent volume even though
-///    the source string looks innocuous.
-///    Applies to **all** services.
+///    the source string looks innocuous. Only applies when the mount type is
+///    `volume`.
 ///
-/// 4. **`volumes_from` on primary** — inheriting ALL volumes from the primary
-///    service at runtime would bring in cella's injected agent mount without
-///    cella's read-only protection. Only rejected when the referenced service
-///    name equals `primary_service`. `volumes_from: [db]` on a migrator that
-///    does not reference the primary is harmless.
+/// 4. **Writable `volumes_from` on primary** — inheriting volumes from the
+///    primary service in writable mode (no `:ro` suffix, or `read_only: true`
+///    not set) would bring in cella's injected agent mount without cella's
+///    read-only protection. Read-only inheritance (`svc:ro` or
+///    `read_only: true`) is safe and allowed.
 ///
-/// All services in `resolved.services` are always inspected, regardless of
-/// which services the caller intends to run. `docker compose up` starts the
-/// transitive dependency closure (via `depends_on`) unless `--no-deps` is
-/// passed; cella does not pass `--no-deps`. Any service that aliases the agent
-/// volume — even a dependency that is not in the explicit `run_services` list
-/// — represents a trust-boundary violation and must block `cella up`.
+/// Only services in the `run_services` + transitive `depends_on` closure are
+/// inspected. When `run_services` is `None` (no filter — compose starts
+/// everything), all services are validated. Unrelated utility services not
+/// reachable from the explicit service list are skipped.
 ///
 /// Returns `Ok(())` when the config is clean, or `Err(message)` with a
 /// human-readable description of what was rejected.
@@ -124,6 +168,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
     agent_vol_name: &str,
     agent_vol_target: &str,
     primary_service: &str,
+    run_services: Option<&[String]>,
 ) -> Result<(), String> {
     // Build the set of compose volume keys whose `name` field resolves to the
     // agent volume name.  E.g. `pretty-name: { name: cella-agent }` makes the
@@ -139,37 +184,61 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         })
         .collect();
 
-    // Always inspect ALL services: docker compose up starts the transitive
-    // dependency closure (depends_on) without --no-deps, so every service in
-    // the resolved config may be started implicitly.
+    // Determine the set of services compose will actually start.
+    let closure = compute_service_closure(resolved, run_services);
+
     for (svc_name, svc) in &resolved.services {
+        // Skip services outside the run_services + depends_on closure.
+        if !closure.contains(svc_name.as_str()) {
+            continue;
+        }
+
         // Check 0: volumes_from inherits ALL volumes from the named service at
         // runtime, including cella's injected agent mount, without cella's
         // read-only protection. Only the primary service receives the injected
         // agent mount, so only references to the primary are a bypass threat.
-        // A sidecar using volumes_from on an unrelated service (e.g. a migrator
-        // inheriting from a db service) is harmless.
+        // Read-only inheritance (:ro / read_only: true) preserves the protection
+        // and is safe. Writable inheritance is the bypass.
         for vf_entry in &svc.volumes_from {
-            let inherit_from = match vf_entry {
+            let (inherit_from, read_only) = match vf_entry {
                 serde_json::Value::String(s) => {
-                    // Forms: "svc", "svc:ro", "svc:rw".
-                    // Docker Compose v1 "container:name" syntax yields "container"
-                    // as the first token, which will not match a service name.
-                    s.split(':').next().unwrap_or("")
+                    // Short form: "svc", "svc:ro", "svc:rw", "container:svc".
+                    // Use rsplitn so the rightmost colon-delimited token is
+                    // checked for a mode suffix before extracting the name.
+                    let parts: Vec<&str> = s.rsplitn(2, ':').collect();
+                    if parts.len() == 2 && (parts[0] == "ro" || parts[0] == "rw") {
+                        // parts[0] is the mode, parts[1] is "name" or
+                        // "container:name" — take the last ':'-delimited token
+                        // as the service name.
+                        let service_name = parts[1].split(':').next_back().unwrap_or("");
+                        (service_name, parts[0] == "ro")
+                    } else {
+                        // No mode suffix → default rw.
+                        let service_name = s.split(':').next_back().unwrap_or("");
+                        (service_name, false)
+                    }
                 }
-                serde_json::Value::Object(obj) => obj
-                    .get("source")
-                    .or_else(|| obj.get("from"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
+                serde_json::Value::Object(obj) => {
+                    let name = obj
+                        .get("source")
+                        .or_else(|| obj.get("from"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ro = obj
+                        .get("read_only")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    (name, ro)
+                }
                 _ => continue,
             };
-            if inherit_from == primary_service {
+            if inherit_from == primary_service && !read_only {
                 return Err(format!(
-                    "service '{svc_name}' uses volumes_from on primary service \
+                    "service '{svc_name}' uses writable volumes_from on primary service \
                      '{primary_service}', which would inherit cella's managed agent volume \
-                     without cella's read-only protection. Remove the volumes_from entry or \
-                     restructure to avoid sharing the primary's volumes."
+                     without cella's read-only protection. Use ':ro' suffix or \
+                     'read_only: true' for read-only inheritance, or remove the \
+                     volumes_from entry."
                 ));
             }
         }
@@ -184,26 +253,35 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
                 ));
             };
 
+            let mount_type = obj
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("volume");
             let source = obj.get("source").and_then(|s| s.as_str()).unwrap_or("");
             let target = obj.get("target").and_then(|t| t.as_str()).unwrap_or("");
 
-            // Check 1: source matches agent volume name directly.
-            if source == agent_vol_name {
-                return Err(format!(
-                    "compose file service '{svc_name}' mounts or aliases the managed \
-                     agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
-                     rejected source='{source}' target='{target}'"
-                ));
-            }
+            // Checks 1 and 2 only apply to volume-type mounts.
+            // Bind mounts with source matching the agent volume name point at a
+            // host directory, not the Docker volume — not an alias.
+            if mount_type == "volume" {
+                // Check 1: source matches agent volume name directly.
+                if source == agent_vol_name {
+                    return Err(format!(
+                        "compose file service '{svc_name}' mounts or aliases the managed \
+                         agent volume (source='{agent_vol_name}' or target inside \
+                         '{agent_vol_target}'): rejected source='{source}' target='{target}'"
+                    ));
+                }
 
-            // Check 2: source is a top-level volume key aliased to the agent volume name.
-            if aliased_keys.contains(source) {
-                return Err(format!(
-                    "compose file service '{svc_name}' mounts or aliases the managed \
-                     agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
-                     rejected source='{source}' (top-level volume name aliases '{agent_vol_name}') \
-                     target='{target}'"
-                ));
+                // Check 2: source is a top-level volume key aliased to the agent volume name.
+                if aliased_keys.contains(source) {
+                    return Err(format!(
+                        "compose file service '{svc_name}' mounts or aliases the managed \
+                         agent volume (source='{agent_vol_name}' or target inside \
+                         '{agent_vol_target}'): rejected source='{source}' (top-level volume \
+                         name aliases '{agent_vol_name}') target='{target}'"
+                    ));
+                }
             }
 
             // Check 3: target is inside the reserved agent subtree.
@@ -667,6 +745,7 @@ mod tests {
                 build: None,
                 volumes,
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         ResolvedComposeConfig {
@@ -723,6 +802,7 @@ mod tests {
                 build: None,
                 volumes: vec![json!({"type": "bind", "source": "x", "target": "/root/.claude"})],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -732,6 +812,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1314,6 +1395,7 @@ mod tests {
                 build: None,
                 volumes: svc_volumes,
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         ResolvedComposeConfig {
@@ -1329,8 +1411,13 @@ mod tests {
             vec![json!({"type": "volume", "source": "cella-agent", "target": "/tmp/agent-rw"})],
             HashMap::new(),
         );
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_err(),
             "expected rejection for source=cella-agent alias; got: {result:?}"
@@ -1344,8 +1431,13 @@ mod tests {
             vec![json!({"type": "bind", "source": "/host", "target": "/cella/foo"})],
             HashMap::new(),
         );
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_err(),
             "expected rejection for target inside /cella; got: {result:?}"
@@ -1361,8 +1453,13 @@ mod tests {
             vec![json!({"type": "volume", "source": "pretty-name", "target": "/data"})],
             top_vols,
         );
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_err(),
             "expected rejection for top-level volume aliasing cella-agent; got: {result:?}"
@@ -1376,8 +1473,13 @@ mod tests {
             vec![json!({"type": "bind", "source": "/host", "target": "/app"})],
             HashMap::new(),
         );
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_ok(),
             "normal compose should pass; got: {result:?}"
@@ -1394,6 +1496,7 @@ mod tests {
                 build: None,
                 volumes: vec![], // clean primary
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1405,6 +1508,7 @@ mod tests {
                     json!({"type": "volume", "source": "cella-agent", "target": "/attack"}),
                 ],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1412,8 +1516,13 @@ mod tests {
             volumes: HashMap::new(),
         };
         // All services are always checked — sidecar must cause failure.
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_err(),
             "sibling service aliasing agent must be rejected"
@@ -1421,10 +1530,9 @@ mod tests {
     }
 
     #[test]
-    fn validator_inspects_all_services_regardless_of_run_services() {
-        // run_services is no longer a parameter; sibling/dependency services
-        // are always validated because docker compose up starts the dependency
-        // closure implicitly (without --no-deps).
+    fn validator_inspects_all_services_when_run_services_is_none() {
+        // When run_services is None, all services are in the closure — a
+        // sibling service aliasing the agent volume must be rejected.
         let mut services = HashMap::new();
         services.insert(
             "app".to_string(),
@@ -1433,6 +1541,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1444,14 +1553,20 @@ mod tests {
                     json!({"type": "volume", "source": "cella-agent", "target": "/ignored"}),
                 ],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
             services,
             volumes: HashMap::new(),
         };
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_err(),
             "sibling service aliasing agent must be rejected"
@@ -1471,6 +1586,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1480,14 +1596,20 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![json!("app")],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
             services,
             volumes: HashMap::new(),
         };
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(result.is_err(), "volumes_from must be rejected");
     }
 
@@ -1503,6 +1625,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1512,6 +1635,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1521,14 +1645,20 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![json!("db")],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
             services,
             volumes: HashMap::new(),
         };
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_ok(),
             "volumes_from on unrelated service must be allowed; got: {result:?}"
@@ -1548,6 +1678,7 @@ mod tests {
                 build: None,
                 volumes: vec![],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         services.insert(
@@ -1559,14 +1690,20 @@ mod tests {
                     json!({"type": "bind", "source": "/host/data", "target": "/cella/something"}),
                 ],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
             services,
             volumes: HashMap::new(),
         };
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(
             result.is_ok(),
             "sidecar mounting /cella/* in its own namespace must be allowed; got: {result:?}"
@@ -1586,15 +1723,274 @@ mod tests {
                 build: None,
                 volumes: vec![json!("cella-agent:/tmp/agent-rw")],
                 volumes_from: vec![],
+                depends_on: serde_json::Value::default(),
             },
         );
         let resolved = ResolvedComposeConfig {
             services,
             volumes: HashMap::new(),
         };
-        let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
         assert!(result.is_err(), "short-form volume entry must fail-closed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-11 findings: compute_service_closure + refined validator scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn closure_includes_transitive_dependencies() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!(["db"]),
+            },
+        );
+        services.insert(
+            "db".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!(["cache"]),
+            },
+        );
+        services.insert(
+            "cache".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "unrelated".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let app = "app".to_string();
+        let closure = compute_service_closure(&resolved, Some(std::slice::from_ref(&app)));
+        assert!(closure.contains("app"));
+        assert!(closure.contains("db"));
+        assert!(closure.contains("cache"));
+        assert!(
+            !closure.contains("unrelated"),
+            "unrelated service not started"
+        );
+    }
+
+    #[test]
+    fn validator_skips_unrelated_services_when_run_services_set() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "unrelated".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "volume", "source": "cella-agent", "target": "/x"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let app = "app".to_string();
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            Some(std::slice::from_ref(&app)),
+        );
+        assert!(
+            result.is_ok(),
+            "unrelated sidecar (not in runServices closure) must be ignored; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn volumes_from_primary_readonly_suffix_is_allowed() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "reader".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("app:ro")],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "read-only inheritance from primary is safe; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn volumes_from_primary_writable_is_rejected() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "writer".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("app")], // no mode = rw
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "writable volumes_from on primary must be rejected"
+        );
+    }
+
+    #[test]
+    fn volumes_from_primary_object_read_only_true_is_allowed() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "reader".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!({"source": "app", "read_only": true})],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "object-form read_only: true inheritance is safe; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bind_mount_with_source_matching_agent_name_is_allowed() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "bind", "source": "cella-agent", "target": "/data"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "bind mount with literal directory named 'cella-agent' is not a volume alias; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

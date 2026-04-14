@@ -949,6 +949,7 @@ async fn build_compose_mount_specs(
                     p.agent_vol_name,
                     p.agent_vol_target,
                     &p.project.primary_service,
+                    p.project.run_services.as_deref(),
                 )
                 .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             }
