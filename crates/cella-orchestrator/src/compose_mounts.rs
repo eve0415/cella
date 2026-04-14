@@ -112,8 +112,9 @@ pub(crate) fn filter_reserved_agent(
 /// # Notes
 ///
 /// `docker compose config` normalises all service volume entries to long-form
-/// objects before this function is called, so short-form strings are not
-/// expected in practice and are silently skipped.
+/// objects before this function is called. If a short-form string is encountered
+/// this function returns `Err` immediately (fail-closed): a non-normalised entry
+/// could silently bypass the aliasing checks and must be treated as an error.
 ///
 /// This function must be called with a config resolved via
 /// `ComposeCommand::without_override` so that cella's own injected agent mount
@@ -175,7 +176,12 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 
         for entry in &svc.volumes {
             let serde_json::Value::Object(obj) = entry else {
-                continue; // short-form strings — not produced by `docker compose config`
+                return Err(format!(
+                    "service '{svc_name}' has an unresolved short-form volume entry \
+                     ({entry:?}). Cella requires `docker compose config --format json` \
+                     to normalize to long-form objects; this entry would bypass agent \
+                     volume aliasing checks."
+                ));
             };
 
             let source = obj.get("source").and_then(|s| s.as_str()).unwrap_or("");
@@ -271,14 +277,26 @@ pub(crate) fn validate_extra_named_volumes_against_base(
         // Top-level volume declarations are inert until a service references
         // them.  If no service uses this key, cella's emission cannot cause
         // volume-identity divergence at runtime — skip the rejection.
-        let key_is_used = resolved.services.values().any(|svc| {
-            svc.volumes.iter().any(|entry| {
-                entry
-                    .get("source")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| s == spec.source)
-            })
-        });
+        //
+        // Fail-closed on short-form entries: if any service volume is not a
+        // long-form object we cannot determine whether the key is referenced,
+        // so we treat the config as invalid and return Err.
+        let mut key_is_used = false;
+        'outer: for svc in resolved.services.values() {
+            for entry in &svc.volumes {
+                let serde_json::Value::Object(obj) = entry else {
+                    return Err(format!(
+                        "service has an unresolved short-form volume entry ({entry:?}); \
+                         cannot determine if top-level key '{}' is referenced.",
+                        spec.source,
+                    ));
+                };
+                if obj.get("source").and_then(|v| v.as_str()) == Some(spec.source.as_str()) {
+                    key_is_used = true;
+                    break 'outer;
+                }
+            }
+        }
         if !key_is_used {
             continue; // inert base declaration — no runtime impact
         }
@@ -353,12 +371,19 @@ fn normalize_target(s: &str) -> &str {
 /// Last-wins matches the merge order established by `merge_with_devcontainer`:
 /// feature mounts are prepended and user mounts are appended, so a user mount
 /// that collides with a feature mount on the same target correctly overrides it.
+///
+/// # Errors
+///
+/// Returns `Err` if any service volume entry is not a long-form object, which
+/// indicates `docker compose config --format json` did not fully normalise the
+/// config. This is a fail-closed safety check: a short-form string in this
+/// position would bypass target-dedup and silently admit user-controlled paths.
 pub fn dedup_against_base(
     resolved: &ResolvedComposeConfig,
     primary_service: &str,
     candidates: Vec<MountSpec>,
-) -> Vec<MountSpec> {
-    let base_targets = extract_service_targets(resolved, primary_service);
+) -> Result<Vec<MountSpec>, String> {
+    let base_targets = extract_service_targets(resolved, primary_service)?;
 
     // Pass 1: drop candidates whose target EXACTLY matches a base-compose target.
     //
@@ -389,7 +414,7 @@ pub fn dedup_against_base(
     let mut seen: HashSet<String> = HashSet::new();
     after_base.retain(|spec| seen.insert(normalize_target(&spec.target).to_string()));
     after_base.reverse();
-    after_base
+    Ok(after_base)
 }
 
 /// Extract the set of normalised mount target paths declared for `service` in
@@ -397,24 +422,38 @@ pub fn dedup_against_base(
 ///
 /// Only long-form object volume entries (with a `"target"` key) are recognised.
 /// `docker compose config --format json` always normalises volume entries to
-/// this form; short-form strings (e.g. `"host:target:opts"`) are therefore not
-/// expected in production input and are silently ignored to avoid misinterpreting
-/// Windows drive-letter bind paths or anonymous volumes.
-fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> HashSet<String> {
+/// this form; encountering a short-form string is therefore a hard error — it
+/// means the config was not fully normalised, and skipping it would silently
+/// bypass mount target dedup, letting user-controlled paths through unchecked.
+///
+/// # Errors
+///
+/// Returns `Err` if any volume entry for `service` is not a long-form JSON
+/// object. The caller should propagate this as a configuration error.
+fn extract_service_targets(
+    resolved: &ResolvedComposeConfig,
+    service: &str,
+) -> Result<HashSet<String>, String> {
     let Some(svc) = resolved.services.get(service) else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
     let mut out = HashSet::new();
-    for v in &svc.volumes {
-        if let serde_json::Value::Object(obj) = v
-            && let Some(t) = obj.get("target").and_then(serde_json::Value::as_str)
-        {
+    for entry in &svc.volumes {
+        let serde_json::Value::Object(obj) = entry else {
+            return Err(format!(
+                "service '{service}' has an unresolved short-form volume entry \
+                 ({entry:?}). Cella requires `docker compose config --format json` \
+                 to normalize to long-form objects; this entry would bypass mount \
+                 safety checks."
+            ));
+        };
+        if let Some(t) = obj.get("target").and_then(serde_json::Value::as_str) {
             // Normalise so that "/root/.claude/" and "/root/.claude" compare
             // equal against candidate targets, and "/" is never collapsed to "".
             out.insert(normalize_target(t).to_string());
         }
     }
-    out
+    Ok(out)
 }
 
 /// Convert `env_fwd.mounts` (source/target only) to `MountSpec` list.
@@ -608,24 +647,20 @@ mod tests {
             MountSpec::bind("/cella/claude", "/root/.claude"), // should be dropped
             MountSpec::bind("/cella/codex", "/root/.codex"),   // should survive
         ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].target, "/root/.codex");
     }
 
     #[test]
-    fn extract_service_targets_ignores_short_form_strings() {
-        // Short-form strings are not parsed (docker compose config normalizes
-        // to long-form objects). This keeps parsing simple and avoids
-        // misinterpreting Windows drive-letter binds or anonymous volumes.
-        let resolved = make_resolved("app", vec![json!("C:\\Users\\me\\.claude:/root/.claude")]);
-        let candidates = vec![MountSpec::bind("/cella", "/root/.claude")];
+    fn extract_service_targets_errors_on_short_form_string() {
+        // Short-form strings are not produced by `docker compose config
+        // --format json`. Encountering one is a hard error (fail-closed):
+        // silently skipping it would let the entry bypass mount safety checks.
+        let resolved = make_resolved("app", vec![json!("some-vol:/data")]);
+        let candidates = vec![MountSpec::bind("/x", "/y")];
         let result = dedup_against_base(&resolved, "app", candidates);
-        assert_eq!(
-            result.len(),
-            1,
-            "short-form base entries are not parsed; candidate survives"
-        );
+        assert!(result.is_err(), "short-form entries must fail-closed");
     }
 
     #[test]
@@ -636,7 +671,7 @@ mod tests {
         );
         let candidates = vec![MountSpec::bind("/cella/claude", "/root/.claude")];
         // "web" is not in resolved config — all candidates must pass through
-        let result = dedup_against_base(&resolved, "web", candidates);
+        let result = dedup_against_base(&resolved, "web", candidates).unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -666,7 +701,7 @@ mod tests {
             ..Default::default()
         };
         let candidates = vec![MountSpec::bind("/x", "/root/.claude")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -678,7 +713,7 @@ mod tests {
     fn dedup_empty_base_returns_all() {
         let resolved = make_resolved("app", vec![]);
         let candidates = vec![MountSpec::bind("/a", "/a"), MountSpec::bind("/b", "/b")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -749,7 +784,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -767,7 +802,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/plugins"})],
         );
         let candidates = vec![MountSpec::tmpfs("/root/.claude/plugins")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert!(
             result.is_empty(),
             "tmpfs on exact base target must be dropped; got: {result:?}"
@@ -782,7 +817,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::bind("/foo", "/root/.claude")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert!(
             result.is_empty(),
             "bind on exact base target must be dropped; got: {result:?}"
@@ -797,7 +832,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/host/claude", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::bind("/host/claude-plus", "/root/.claude-plus")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -813,7 +848,7 @@ mod tests {
             MountSpec::bind("/a", "/root/.foo"),
             MountSpec::tmpfs("/root/.foo"),
         ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].kind, MountKind::Tmpfs, "last candidate must win");
     }
@@ -828,7 +863,7 @@ mod tests {
             MountSpec::bind("/host/.claude", "/root/.claude"),
             MountSpec::tmpfs("/root/.claude/plugins"),
         ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             2,
@@ -846,7 +881,7 @@ mod tests {
         let resolved = make_resolved("app", vec![]);
         let first = MountSpec::bind("/first/source", "/root/.foo");
         let last = MountSpec::bind("/last/source", "/root/.foo");
-        let result = dedup_against_base(&resolved, "app", vec![first, last]);
+        let result = dedup_against_base(&resolved, "app", vec![first, last]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].source, "/last/source",
@@ -862,7 +897,7 @@ mod tests {
         let a = MountSpec::bind("/a", "/target/a");
         let b = MountSpec::bind("/b", "/target/b");
         let c = MountSpec::bind("/c", "/target/c");
-        let result = dedup_against_base(&resolved, "app", vec![a, b, c]);
+        let result = dedup_against_base(&resolved, "app", vec![a, b, c]).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].target, "/target/a");
         assert_eq!(result[1].target, "/target/b");
@@ -919,7 +954,7 @@ mod tests {
             "/tmp/cella-ssh-agent.sock",
             "/tmp/cella-ssh-agent.sock",
         )];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -940,7 +975,7 @@ mod tests {
             "/host/feature-x-data",
             "/root/.config/feature-x",
         )];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -957,7 +992,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/user/.claude", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::bind("/cella/.claude", "/root/.claude")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert!(
             result.is_empty(),
             "cella's exact-target bind must be dropped in favor of user's; got: {result:?}"
@@ -973,7 +1008,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/h", "target": "/root/.claude/"})],
         );
         let candidates = vec![MountSpec::bind("/foo", "/root/.claude")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert!(
             result.is_empty(),
             "trailing slash on base target must not defeat exact-match dropping; got: {result:?}"
@@ -993,7 +1028,7 @@ mod tests {
             vec![json!({"type": "bind", "source": "/x", "target": "/root/.claude"})],
         );
         let candidates = vec![MountSpec::bind("/cella/x", "/root/.claude/")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert!(
             result.is_empty(),
             "candidate with trailing slash should match base without; got: {result:?}"
@@ -1009,7 +1044,7 @@ mod tests {
             MountSpec::bind("/a", "/root/.foo"),
             MountSpec::bind("/b", "/root/.foo/"),
         ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -1025,7 +1060,7 @@ mod tests {
         // collapse it to an empty string, leaving the root mount intact.
         let resolved = make_resolved("app", vec![]);
         let candidates = vec![MountSpec::bind("/host", "/")];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -1056,7 +1091,7 @@ mod tests {
             // Auto-forwarded tool-config mount (last — appended after user mounts)
             MountSpec::bind("/host/.claude", "/root/.claude"),
         ];
-        let result = dedup_against_base(&resolved, "app", candidates);
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].source, "/host/.claude",
@@ -1500,6 +1535,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validator_rejects_short_form_volume_entry() {
+        // A short-form string in a service's volume list must trigger a hard
+        // error (fail-closed). Silently skipping it could allow a crafted entry
+        // like "cella-agent:/tmp/agent-rw" to bypass the aliasing checks.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!("cella-agent:/tmp/agent-rw")],
+                volumes_from: vec![],
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        assert!(result.is_err(), "short-form volume entry must fail-closed");
+    }
+
     // -----------------------------------------------------------------------
     // hash_tool_host_paths / compute_mount_input_fingerprint host-path detection
     // (Finding 2, round 7)
@@ -1706,6 +1765,26 @@ mod tests {
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
             "referenced key with bare (project-scoped) declaration still rejects"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_rejects_short_form_service_volume_entry() {
+        // A short-form string in a service's volume list must trigger a hard
+        // error when `validate_extra_named_volumes_against_base` tries to
+        // determine whether a top-level key is referenced. Silently skipping
+        // it would misclassify a used key as unused and suppress the collision
+        // rejection.
+        let mut top_vols = HashMap::new();
+        // Bare key with mismatched identity — would normally reject if referenced.
+        top_vols.insert("mycache".to_string(), json!({}));
+        // Short-form string instead of a long-form object.
+        let svc_vols = vec![json!("mycache:/data")];
+        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "short-form service volume entry must fail-closed"
         );
     }
 }

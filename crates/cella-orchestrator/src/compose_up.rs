@@ -949,7 +949,8 @@ async fn build_compose_mount_specs(
                 &resolved,
                 &p.project.primary_service,
                 specs,
-            );
+            )
+            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             // Reject any extra named-volume source that collides with a base
             // top-level volume key bound to a different backing volume.  Compose
             // deep-merges top-level volume declarations, so our `name:` pin could
