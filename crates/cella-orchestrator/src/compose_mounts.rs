@@ -415,7 +415,8 @@ fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool, bool) {
 }
 
 /// Reject if any extra named-volume source collides with an existing base
-/// top-level volume key that has cella-incompatible attributes.
+/// top-level volume key that has cella-incompatible attributes, or would
+/// retarget a project-scoped named volume already used by a base service.
 ///
 /// Docker Compose deep-merges top-level volume declarations across files.
 /// Once cella's override references a source as a named volume, the base key
@@ -427,17 +428,27 @@ fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool, bool) {
 /// - Changing the backing driver or its options (`driver`, `driver_opts`).
 /// - Overriding volume identity (`name` pointing at a different literal).
 ///
+/// An additional retargeting check applies when there is **no** top-level
+/// entry (or it does not already pin `name: <source>`): if any base service
+/// already references `source` as a named volume mount, cella's literal-name
+/// pin would change that service's volume from `<project>_<source>` to the
+/// global `<source>`, effectively forking its data. In that case the pin is
+/// rejected unless the base explicitly opts in by declaring
+/// `volumes.<source>.name: <source>`.
+///
 /// The rules applied per extra volume `source`:
 ///
-/// - No top-level base entry for `source` → no collision, emit normally.
+/// - No top-level base entry, no service reference → no collision, emit normally.
 /// - `{}` (bare key) → compatible: cella's `name: <source>` pin fully defines
-///   identity; no base attribute survives to conflict.
-/// - `{ name: <source> }` → compatible: base and cella pin agree.
+///   identity; no base attribute survives to conflict. Service references are safe.
+/// - `{ name: <source> }` → already pinned; cella's emission is idempotent.
 /// - Anything else (`external`, `driver`, `driver_opts`, `labels`, mismatched
-///   `name`) → **reject**.
+///   `name`) → **reject** (top-level compatibility check).
+/// - No top-level entry but a service uses `source` as a volume mount → reject
+///   (retarget check); user must add `volumes.<source>.name: <source>` to opt in.
 ///
 /// Returns `Ok(())` when all extra volumes are safe, or `Err(message)` on the
-/// first incompatible base declaration.
+/// first incompatible or retargeting declaration.
 pub(crate) fn validate_extra_named_volumes_against_base(
     resolved: &ResolvedComposeConfig,
     extra_volumes: &[MountSpec],
@@ -446,21 +457,92 @@ pub(crate) fn validate_extra_named_volumes_against_base(
         if spec.kind != MountKind::Volume || spec.source.is_empty() {
             continue;
         }
-        let Some(base_vol) = resolved.volumes.get(&spec.source) else {
-            continue; // no base declaration — safe to emit
-        };
-        if is_compatible_base_volume_declaration(base_vol, &spec.source) {
-            continue; // bare or name-only-matching — cella's pin survives the merge intact
+
+        let top_level = resolved.volumes.get(&spec.source);
+
+        // Check 1: top-level compatibility (existing check — driver, external, etc.)
+        let top_level_compatible =
+            top_level.is_none_or(|v| is_compatible_base_volume_declaration(v, &spec.source));
+        if !top_level_compatible {
+            return Err(format!(
+                "devcontainer mount source '{}' collides with base compose top-level \
+                 volume declaration that has cella-incompatible attributes. Rename the \
+                 mount, or clear the base top-level declaration's attributes (leave only \
+                 `name: {}` if needed).",
+                spec.source, spec.source,
+            ));
         }
-        return Err(format!(
-            "devcontainer mount source '{}' collides with a base compose top-level volume \
-             declaration that has cella-incompatible attributes (external, driver, or other). \
-             Cella cannot safely pin the literal volume; the merged declaration may require \
-             pre-provisioning, change the backing driver, or alter volume identity. Rename \
-             the mount, or clear the base top-level declaration's attributes (leave only \
-             `name: {}` if needed).",
-            spec.source, spec.source,
-        ));
+
+        // Check 2: retarget check — only needed when the top-level does NOT already
+        // pin the literal name. If it does, the base service already resolves to the
+        // literal volume, so cella's emission is idempotent and safe.
+        let top_level_pins_name = top_level
+            .and_then(serde_json::Value::as_object)
+            .and_then(|obj| obj.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some(spec.source.as_str());
+
+        if !top_level_pins_name {
+            check_extra_volume_against_base_services(resolved, &spec.source)?;
+        }
+    }
+    Ok(())
+}
+
+/// Scan base service volumes for a named-volume mount whose source matches
+/// `source`. Returns `Err` if found — cella's literal-name pin would retarget
+/// the service's `<project>_<source>` volume to the global `<source>` volume.
+///
+/// Extracted from [`validate_extra_named_volumes_against_base`] to stay within
+/// clippy's `too_many_lines` limit.
+fn check_extra_volume_against_base_services(
+    resolved: &ResolvedComposeConfig,
+    source: &str,
+) -> Result<(), String> {
+    for (svc_name, svc) in &resolved.services {
+        for entry in &svc.volumes {
+            let (mount_type, src) = match entry {
+                serde_json::Value::Object(obj) => {
+                    let mt = obj
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("volume");
+                    let s = obj
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    (mt, s)
+                }
+                serde_json::Value::String(s) => {
+                    let Some((src_opt, _)) = parse_short_form_volume(s) else {
+                        continue;
+                    };
+                    let src_val = src_opt.unwrap_or("");
+                    // A source with a leading '/' or '.' is a bind path; an empty
+                    // source is an anonymous volume — neither is a named-volume ref.
+                    let mt = if src_val.starts_with('/')
+                        || src_val.starts_with('.')
+                        || src_val.is_empty()
+                    {
+                        "bind"
+                    } else {
+                        "volume"
+                    };
+                    (mt, src_val)
+                }
+                _ => continue,
+            };
+            if mount_type == "volume" && src == source {
+                return Err(format!(
+                    "devcontainer mount source '{source}' is already used as a named \
+                     volume by base service '{svc_name}'. Cella cannot safely pin the \
+                     literal Docker volume name without retargeting that service (from \
+                     <project>_{source} to global {source}). Rename the mount, or \
+                     explicitly add a compatible top-level declaration \
+                     (volumes.{source}.name = {source}) to opt into the literal pin.",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2419,10 +2501,12 @@ mod tests {
     }
 
     #[test]
-    fn extra_named_volume_ok_when_bare_key_is_referenced_by_base_service() {
-        // Base has a bare `mycache` key AND a service references it.  Bare
-        // carries no conflicting attributes — cella's `name: mycache` pin in the
-        // override wins after the deep merge regardless of base service use.
+    fn extra_named_volume_rejected_when_bare_key_is_referenced_by_base_service() {
+        // Base has a bare `mycache` key AND a service references it. A bare key
+        // has no `name:` field, so Compose defaults to `<project>_mycache`.
+        // Cella's literal-name pin would retarget that service's volume from
+        // `<project>_mycache` to the global `mycache` — a data fork. Must reject.
+        // The user must add `volumes.mycache.name: mycache` to opt in.
         let mut top_vols = HashMap::new();
         top_vols.insert("mycache".to_string(), json!({}));
         let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
@@ -2435,8 +2519,8 @@ mod tests {
             consistency: None,
         }];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
-            "bare key — even when referenced — has no conflicting attributes"
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "bare key with service reference must be rejected — retargets project-scoped volume"
         );
     }
 
@@ -2494,6 +2578,113 @@ mod tests {
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
             "bare empty-object declaration is compatible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-13 findings: retarget of base-service project-scoped volumes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extra_named_volume_rejected_when_base_service_uses_project_scoped_volume() {
+        // Base service uses `mycache` as a volume (no top-level declaration →
+        // project-scoped as `<project>_mycache`). Cella's literal-name pin would
+        // retarget it from `<project>_mycache` to global `mycache` — reject.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        assert!(
+            result.is_err(),
+            "retargeting base service's project-scoped volume must reject"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_service_uses_pinned_volume() {
+        // Base service uses `mycache` AND top-level pins `name: mycache`.
+        // Base service already resolves to the literal — cella's emission is
+        // idempotent and safe.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"name": "mycache"}));
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: top_vols,
+        };
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        assert!(
+            result.is_ok(),
+            "compatible pin exists — safe to emit; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_service_uses_bind_mount_with_same_source_name() {
+        // Base service uses `./mycache` as a BIND source (host directory named
+        // `mycache`). Not a volume — cella's named-volume pin doesn't affect it.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "bind", "source": "./mycache", "target": "/data"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        assert!(
+            result.is_ok(),
+            "bind mount with similar source name is not a conflict; got: {result:?}"
         );
     }
 
