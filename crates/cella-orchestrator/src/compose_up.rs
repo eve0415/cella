@@ -882,7 +882,14 @@ async fn build_compose_mount_specs(
     // `map_additional_mounts` on the raw config.
     let feature_config = p.resolved_features.map(|rf| &rf.container_config);
     let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
-    let mut specs = crate::compose_mounts::mount_configs_to_specs(&user_feature_mounts);
+    let mut user_feature_specs =
+        crate::compose_mounts::mount_configs_to_specs(&user_feature_mounts);
+    // Absolutize relative bind sources before emission. Docker Compose resolves
+    // relative paths relative to the compose file's parent directory, but cella
+    // writes its override to ~/.cella/…, so relative sources must be resolved
+    // against the user's workspace root to point at the intended host path.
+    crate::compose_mounts::resolve_bind_sources(&mut user_feature_specs, p.workspace_root);
+    let mut specs = user_feature_specs;
 
     // 2. Auto-forwarded mounts — appended last so last-wins dedup gives them
     //    precedence over a user/feature mount at the same target.

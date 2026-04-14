@@ -595,6 +595,37 @@ fn hash_tool_host_paths(hasher: &mut Sha256, settings: &cella_config::settings::
     }
 }
 
+/// Resolve relative bind-source paths against a base directory.
+///
+/// Docker Compose resolves relative `source:` paths relative to the compose
+/// file's directory. Cella writes its override to `~/.cella/compose/<project>/`,
+/// so any relative source in a user/feature mount would resolve to that
+/// internal directory instead of the user's workspace. This function
+/// canonicalizes relative bind sources against `workspace_root` before emission.
+///
+/// - Absolute sources and empty sources (tmpfs) are left unchanged.
+/// - Non-bind kinds (Volume, Tmpfs, `NamedPipe`) are left unchanged.
+/// - If `canonicalize` fails (e.g. the path does not yet exist), the raw join
+///   is used as-is so the user sees a compose error rather than a silent wrong path.
+pub(crate) fn resolve_bind_sources(specs: &mut [MountSpec], workspace_root: &Path) {
+    for spec in specs.iter_mut() {
+        if spec.kind != MountKind::Bind {
+            continue;
+        }
+        let source_path = Path::new(&spec.source);
+        if source_path.is_absolute() || spec.source.is_empty() {
+            continue;
+        }
+        // Relative — resolve against workspace_root and canonicalize if possible.
+        let joined = workspace_root.join(source_path);
+        spec.source = joined
+            .canonicalize()
+            .unwrap_or(joined)
+            .to_string_lossy()
+            .into_owned();
+    }
+}
+
 /// Adapt `MountConfig` → `MountSpec` (used for user `mounts:` and feature `mounts:`
 /// which already parse to `MountConfig` via shared parser).
 ///
@@ -1810,5 +1841,60 @@ mod tests {
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
             "short-form service volume entry must fail-closed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_bind_sources
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_bind_sources_makes_relative_paths_absolute() {
+        let mut specs = vec![
+            MountSpec::bind("./cache", "/cache"),
+            MountSpec::bind("/already/absolute", "/abs"),
+            MountSpec::bind("../sibling", "/sib"),
+        ];
+        // Non-existent path: canonicalize fails, raw join is returned as-is.
+        let ws = Path::new("/tmp/fake-workspace");
+        resolve_bind_sources(&mut specs, ws);
+        // Relative `./cache` → joined with workspace (non-existent → raw join)
+        assert_eq!(specs[0].source, "/tmp/fake-workspace/./cache");
+        // Already-absolute source unchanged
+        assert_eq!(specs[1].source, "/already/absolute");
+        // `../sibling`: non-existent path → raw join returned
+        assert_eq!(specs[2].source, "/tmp/fake-workspace/../sibling");
+    }
+
+    #[test]
+    fn resolve_bind_sources_canonical_for_existing_path() {
+        // Use /tmp which always exists — canonicalize must resolve it.
+        let ws = Path::new("/tmp");
+        let mut specs = vec![MountSpec::bind(".", "/container")];
+        resolve_bind_sources(&mut specs, ws);
+        // /tmp on Linux is often a symlink to /private/tmp (macOS) or resolves
+        // to /tmp itself. Either way the result must be absolute.
+        assert!(
+            Path::new(&specs[0].source).is_absolute(),
+            "resolved source must be absolute; got: {}",
+            specs[0].source,
+        );
+    }
+
+    #[test]
+    fn resolve_bind_sources_ignores_non_bind_kinds() {
+        let mut specs = vec![
+            MountSpec::tmpfs("/mnt/shadow"),
+            MountSpec {
+                kind: MountKind::Volume,
+                source: "mycache".to_string(),
+                target: "/cache".to_string(),
+                read_only: false,
+                consistency: None,
+            },
+        ];
+        let ws = Path::new("/tmp/workspace");
+        resolve_bind_sources(&mut specs, ws);
+        assert_eq!(specs[0].source, ""); // tmpfs source unchanged
+        assert_eq!(specs[1].source, "mycache"); // volume source unchanged (it's a name, not path)
     }
 }
