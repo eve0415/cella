@@ -73,20 +73,31 @@ pub(crate) fn filter_reserved_agent(
 /// Validate that the user's base compose config does not alias the managed
 /// agent volume in any service.
 ///
-/// Three aliasing patterns are rejected for each checked service:
+/// Four aliasing patterns are checked across services:
 ///
 /// 1. **Source alias** — a service volume entry whose `source` matches
 ///    `agent_vol_name` exactly. Docker would mount the same underlying volume
 ///    at a second path, making the agent volume writable via that alias.
+///    Applies to **all** services.
 ///
 /// 2. **Target subtree alias** — a service volume entry whose `target` is
 ///    equal to or a descendant of `agent_vol_target` (e.g., `/cella`). This
 ///    would shadow or overwrite the agent at that path.
+///    Applies to the **primary service only**: cella injects the agent volume
+///    into the primary; sidecars run in their own container filesystem so a
+///    sidecar mount at `/cella/foo` cannot shadow the primary's agent path.
 ///
 /// 3. **Top-level volume name alias** — any top-level volume entry that has a
 ///    `name:` field equal to `agent_vol_name`. If a service references that
 ///    compose-key by source, it silently mounts the agent volume even though
 ///    the source string looks innocuous.
+///    Applies to **all** services.
+///
+/// 4. **`volumes_from` on primary** — inheriting ALL volumes from the primary
+///    service at runtime would bring in cella's injected agent mount without
+///    cella's read-only protection. Only rejected when the referenced service
+///    name equals `primary_service`. `volumes_from: [db]` on a migrator that
+///    does not reference the primary is harmless.
 ///
 /// All services in `resolved.services` are always inspected, regardless of
 /// which services the caller intends to run. `docker compose up` starts the
@@ -111,6 +122,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
     resolved: &ResolvedComposeConfig,
     agent_vol_name: &str,
     agent_vol_target: &str,
+    primary_service: &str,
 ) -> Result<(), String> {
     // Build the set of compose volume keys whose `name` field resolves to the
     // agent volume name.  E.g. `pretty-name: { name: cella-agent }` makes the
@@ -130,17 +142,35 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
     // dependency closure (depends_on) without --no-deps, so every service in
     // the resolved config may be started implicitly.
     for (svc_name, svc) in &resolved.services {
-        // Check 0: volumes_from is a legacy compose feature that inherits ALL
-        // volumes from another service at runtime — including cella's injected
-        // agent mount — without cella's read-only protection. Hard-reject any
-        // service that declares volumes_from.
-        if !svc.volumes_from.is_empty() {
-            return Err(format!(
-                "service '{svc_name}' declares volumes_from, which would inherit cella's managed \
-                 agent volume without cella's read-only protection. Use explicit `volumes:` \
-                 entries instead. (volumes_from is a legacy compose feature and is not \
-                 supported with cella's managed-agent devcontainers.)"
-            ));
+        // Check 0: volumes_from inherits ALL volumes from the named service at
+        // runtime, including cella's injected agent mount, without cella's
+        // read-only protection. Only the primary service receives the injected
+        // agent mount, so only references to the primary are a bypass threat.
+        // A sidecar using volumes_from on an unrelated service (e.g. a migrator
+        // inheriting from a db service) is harmless.
+        for vf_entry in &svc.volumes_from {
+            let inherit_from = match vf_entry {
+                serde_json::Value::String(s) => {
+                    // Forms: "svc", "svc:ro", "svc:rw".
+                    // Docker Compose v1 "container:name" syntax yields "container"
+                    // as the first token, which will not match a service name.
+                    s.split(':').next().unwrap_or("")
+                }
+                serde_json::Value::Object(obj) => obj
+                    .get("source")
+                    .or_else(|| obj.get("from"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                _ => continue,
+            };
+            if inherit_from == primary_service {
+                return Err(format!(
+                    "service '{svc_name}' uses volumes_from on primary service \
+                     '{primary_service}', which would inherit cella's managed agent volume \
+                     without cella's read-only protection. Remove the volumes_from entry or \
+                     restructure to avoid sharing the primary's volumes."
+                ));
+            }
         }
 
         for entry in &svc.volumes {
@@ -171,7 +201,16 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
             }
 
             // Check 3: target is inside the reserved agent subtree.
-            if !target.is_empty() && is_descendant_or_equal(target, agent_vol_target) {
+            //
+            // The override injects the agent volume into the primary service
+            // only. Sidecars run in their own container filesystem: a sidecar
+            // mounting something at `/cella/foo` in its own namespace cannot
+            // shadow the primary's agent path. Only enforce this check for
+            // the primary service.
+            if svc_name == primary_service
+                && !target.is_empty()
+                && is_descendant_or_equal(target, agent_vol_target)
+            {
                 return Err(format!(
                     "compose file service '{svc_name}' mounts or aliases the managed \
                      agent volume (source='{agent_vol_name}' or target inside '{agent_vol_target}'): \
@@ -1218,7 +1257,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_err(),
             "expected rejection for source=cella-agent alias; got: {result:?}"
@@ -1233,7 +1272,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_err(),
             "expected rejection for target inside /cella; got: {result:?}"
@@ -1250,7 +1289,7 @@ mod tests {
             top_vols,
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_err(),
             "expected rejection for top-level volume aliasing cella-agent; got: {result:?}"
@@ -1265,7 +1304,7 @@ mod tests {
             HashMap::new(),
         );
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_ok(),
             "normal compose should pass; got: {result:?}"
@@ -1301,7 +1340,7 @@ mod tests {
         };
         // All services are always checked — sidecar must cause failure.
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_err(),
             "sibling service aliasing agent must be rejected"
@@ -1339,7 +1378,7 @@ mod tests {
             volumes: HashMap::new(),
         };
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(
             result.is_err(),
             "sibling service aliasing agent must be rejected"
@@ -1348,9 +1387,9 @@ mod tests {
 
     #[test]
     fn validator_rejects_service_using_volumes_from() {
-        // volumes_from inherits ALL volumes from the named service at runtime,
+        // volumes_from on the primary service inherits ALL volumes at runtime,
         // including cella's injected agent mount, without cella's read-only
-        // protection. Any service declaring volumes_from must be rejected.
+        // protection. A sidecar using volumes_from: [primary] must be rejected.
         let mut services = HashMap::new();
         services.insert(
             "app".to_string(),
@@ -1375,8 +1414,90 @@ mod tests {
             volumes: HashMap::new(),
         };
         let result =
-            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella");
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
         assert!(result.is_err(), "volumes_from must be rejected");
+    }
+
+    #[test]
+    fn volumes_from_unrelated_service_is_allowed() {
+        // A migrator service using volumes_from on a db service is harmless —
+        // db does not receive the injected agent volume, so no bypass occurs.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+            },
+        );
+        services.insert(
+            "db".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+            },
+        );
+        services.insert(
+            "migrator".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("db")],
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        assert!(
+            result.is_ok(),
+            "volumes_from on unrelated service must be allowed; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_primary_service_may_target_cella_path() {
+        // A sidecar service mounting /cella/something in its own container
+        // filesystem does not shadow the primary's agent path — different
+        // containers, different namespaces. This must be allowed.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+            },
+        );
+        services.insert(
+            "sidecar".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![
+                    json!({"type": "bind", "source": "/host/data", "target": "/cella/something"}),
+                ],
+                volumes_from: vec![],
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result =
+            validate_base_compose_against_reserved_agent(&resolved, "cella-agent", "/cella", "app");
+        assert!(
+            result.is_ok(),
+            "sidecar mounting /cella/* in its own namespace must be allowed; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
