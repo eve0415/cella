@@ -521,9 +521,16 @@ pub fn compute_mount_input_fingerprint(
     }
 
     // Parent git directory presence + canonical path.
+    //
+    // Canonicalize mirrors the same canonicalize+fallback applied in
+    // `build_compose_mount_specs` when assembling the actual parent-git mount.
+    // Without this, linked worktrees with symlinked .gitdir pointers would
+    // produce a fingerprint that describes a different path than what is
+    // actually mounted, causing false drift detections on reconnect.
     if let Some(pg) = cella_git::parent_git_dir(workspace_root) {
+        let canonical = pg.canonicalize().unwrap_or_else(|_| pg.clone());
         hasher.update(b"pg:");
-        hasher.update(pg.to_string_lossy().as_bytes());
+        hasher.update(canonical.to_string_lossy().as_bytes());
     }
 
     hex::encode(hasher.finalize())
@@ -1589,6 +1596,23 @@ mod tests {
             fp_a, fp_b,
             "fingerprint must change when nvim.config_path override differs"
         );
+    }
+
+    #[test]
+    fn mount_input_fingerprint_canonicalizes_parent_git_path() {
+        // The fingerprint must use the same canonicalize+fallback pattern as
+        // `build_compose_mount_specs` so that linked worktrees with symlinked
+        // .gitdir pointers produce consistent, comparable fingerprints.
+        //
+        // With a non-existent workspace root, `parent_git_dir` returns None and
+        // `canonicalize()` is never called, but the fingerprint must still be
+        // deterministic across calls (the fallback path is identical).
+        let settings = cella_config::settings::Settings::default();
+        let env_fwd = EnvForwarding::default();
+        let ws = Path::new("/tmp/nowhere-cella-canonicalize-test-xyz");
+        let fp1 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        let fp2 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic across calls");
     }
 
     // -----------------------------------------------------------------------
