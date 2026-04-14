@@ -359,6 +359,8 @@ mod tests {
               - type: bind
                 source: "/home/u/.claude"
                 target: "/root/.claude"
+                bind:
+                  create_host_path: false
               - type: tmpfs
                 target: "/root/.claude/plugins"
         volumes:
@@ -522,6 +524,8 @@ mod tests {
               - type: bind
                 source: "/home/u/.claude"
                 target: "/root/.claude"
+                bind:
+                  create_host_path: false
         volumes:
           cella-agent:
             external: true

@@ -121,6 +121,11 @@ impl MountSpec {
     /// Adapter: long-form YAML entry for docker-compose override files.
     ///
     /// `indent` is the leading whitespace (e.g., `"      "` for `services.<svc>.volumes`).
+    ///
+    /// For bind mounts, emits `bind.create_host_path: false` to disable Docker
+    /// Compose's default behaviour of silently creating a host directory when the
+    /// source path is missing. A missing source should surface as a compose error
+    /// rather than producing a garbage directory at an unexpected location.
     pub fn to_compose_yaml_entry(&self, indent: &str) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "{indent}- type: {}", self.kind.as_str());
@@ -145,6 +150,12 @@ impl MountSpec {
                 "{indent}  consistency: \"{}\"",
                 escape_yaml_double_quoted(c)
             );
+        }
+        // Disable auto-creation of missing host paths so typos or uninstalled
+        // tools fail loudly instead of creating garbage directories.
+        if self.kind == MountKind::Bind {
+            let _ = writeln!(out, "{indent}  bind:");
+            let _ = writeln!(out, "{indent}    create_host_path: false");
         }
         out
     }
@@ -242,6 +253,8 @@ mod tests {
       - type: bind
         source: "/host/.claude"
         target: "/root/.claude"
+        bind:
+          create_host_path: false
 "#);
     }
 
@@ -271,7 +284,20 @@ mod tests {
         source: "/host"
         target: "/container"
         consistency: "cached"
+        bind:
+          create_host_path: false
 "#);
+    }
+
+    #[test]
+    fn to_compose_yaml_tmpfs_has_no_bind_block() {
+        let spec = MountSpec::tmpfs("/tmp/scratch");
+        let yaml = spec.to_compose_yaml_entry("      ");
+        assert!(!yaml.contains("bind:"), "tmpfs must not emit a bind: block");
+        assert!(
+            !yaml.contains("create_host_path"),
+            "tmpfs must not emit create_host_path"
+        );
     }
 
     #[test]
