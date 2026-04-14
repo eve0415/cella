@@ -756,10 +756,13 @@ impl EnsureUpContext<'_> {
                 source: m.source.clone(),
                 target: m.target.clone(),
                 consistency: None,
+                read_only: false,
             });
         }
 
-        crate::tool_install::add_tool_config_mounts(create_opts, settings, remote_user);
+        for spec in crate::tool_install::build_tool_config_mount_specs(settings, remote_user) {
+            create_opts.mounts.push(spec.to_mount_config());
+        }
 
         if !env_fwd.env.is_empty() {
             let fwd_env: Vec<String> = env_fwd
@@ -831,6 +834,7 @@ impl EnsureUpContext<'_> {
                 source: path_str.clone(),
                 target: path_str,
                 consistency: None,
+                read_only: false,
             });
         }
 
@@ -841,6 +845,7 @@ impl EnsureUpContext<'_> {
                 source: vol_name,
                 target: vol_target,
                 consistency: None,
+                read_only: false,
             });
         }
 

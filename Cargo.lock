@@ -326,6 +326,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "insta",
  "miette",
  "serde",
  "serde_json",
@@ -388,6 +389,7 @@ dependencies = [
 name = "cella-compose"
 version = "0.0.24"
 dependencies = [
+ "cella-backend",
  "hex",
  "insta",
  "miette",

@@ -196,6 +196,12 @@ pub struct MountConfig {
     pub source: String,
     pub target: String,
     pub consistency: Option<String>,
+    /// Whether the mount should be read-only.
+    ///
+    /// Note: `cella-docker` does not yet forward this flag to bollard's
+    /// `Mount` struct — wiring read-only into the single-container path is
+    /// deferred to a follow-up phase.
+    pub read_only: bool,
 }
 
 /// Backend-agnostic port forward specification.

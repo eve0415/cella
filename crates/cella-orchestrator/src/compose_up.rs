@@ -12,7 +12,8 @@ use std::pin::Pin;
 use tracing::{debug, info, warn};
 
 use cella_backend::{
-    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, run_lifecycle_phase,
+    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
+    run_lifecycle_phase,
 };
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
 
@@ -189,14 +190,6 @@ pub async fn compose_up(
         find_compose_container(client, &project.project_name, &project.primary_service).await?;
 
     if let Some(ref container) = existing {
-        if let Some(old_hash) = &container.config_hash
-            && *old_hash != project.config_hash
-            && !cfg.remove_container
-        {
-            progress.warn("Config or compose files changed since last up.");
-            progress.hint("Run `cella up --rebuild` to recreate.");
-        }
-
         if container.state == ContainerState::Running
             && !cfg.remove_container
             && !cfg.build_no_cache
@@ -294,6 +287,7 @@ async fn prepare_and_start(
         agent_vol_target: agent_vol_target.clone(),
         extra_env: Vec::new(),
         labels: BTreeMap::new(),
+        extra_volumes: Vec::new(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
@@ -313,23 +307,32 @@ async fn prepare_and_start(
     let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
-    // 11. Build extra environment variables
-    let mut extra_env = daemon_env;
-    for e in &env_fwd.env {
-        extra_env.push(format!("{}={}", e.key, e.value));
-    }
-    for e in cfg.remote_env {
-        extra_env.push(e.clone());
-    }
+    // 11-12. Build extra env vars and labels for the primary service.
+    let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
+    let mut labels = build_compose_labels(cfg, project, &remote_user);
 
-    // 12. Build labels for the primary service
-    let labels = build_compose_labels(cfg, project, &remote_user);
+    let settings = cella_config::settings::Settings::load(cfg.workspace_root);
+    insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
+
+    let mount_specs = build_compose_mount_specs(ComposeMountParams {
+        workspace_root: cfg.workspace_root,
+        settings: &settings,
+        remote_user: &remote_user,
+        env_fwd: &env_fwd,
+        project,
+        config,
+        resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
+        agent_vol_target: &agent_vol_target,
+        agent_vol_name: &agent_vol_name,
+    })
+    .await?;
 
     let ov_ctx = OverrideContext {
         agent_vol_name,
         agent_vol_target,
         extra_env,
         labels,
+        extra_volumes: mount_specs,
     };
 
     // 13. Build-time UID remap: build a thin image layer with correct UID/GID.
@@ -455,6 +458,48 @@ async fn handle_compose_running(
         .cloned()
         .unwrap_or_else(|| resolve_remote_user(config, None, "root"));
 
+    // Warn on config-hash drift (mirrors single-container warn_config_drift at up.rs:486-508).
+    let current_hash = project.config_hash.as_str();
+    let old_hash: Option<&str> = container.config_hash.as_deref().or_else(|| {
+        container
+            .labels
+            .get("dev.cella.config_hash")
+            .map(String::as_str)
+    });
+    if let Some(old) = old_hash
+        && old != current_hash
+    {
+        progress.warn("Config has changed since this container was created.");
+        progress.hint("Run `cella up --rebuild` to recreate with the updated config.");
+    }
+
+    // Runtime drift.
+    let current_runtime = cella_env::platform::detect_runtime().as_label();
+    if let Some(old_runtime) = container.labels.get("dev.cella.docker_runtime")
+        && old_runtime != current_runtime
+    {
+        progress.warn(&format!(
+            "Docker runtime changed ({old_runtime} -> {current_runtime})."
+        ));
+        progress.hint("Run `cella up --rebuild` to recreate with the updated runtime.");
+    }
+
+    // Mount-input drift (settings, env forwarding, parent-git) — catches
+    // mount-affecting changes that `config_hash` does not cover.
+    let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    let settings_now = cella_config::settings::Settings::load(cfg.workspace_root);
+    let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
+        &settings_now,
+        &env_fwd_now,
+        cfg.workspace_root,
+    );
+    if let Some(old_fp) = container.labels.get("dev.cella.mount_input_fingerprint")
+        && old_fp != &current_mount_fp
+    {
+        progress.warn("Mount configuration has changed since this container was created.");
+        progress.hint("Run `cella up --rebuild` to recreate with the updated mounts.");
+    }
+
     // Re-register with daemon in case it restarted
     hooks
         .register_container(client, &container.id, config, cfg.container_name)
@@ -498,6 +543,7 @@ struct OverrideContext {
     agent_vol_target: String,
     extra_env: Vec<String>,
     labels: BTreeMap<String, String>,
+    extra_volumes: Vec<MountSpec>,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +571,7 @@ fn write_build_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        extra_volumes: Vec::new(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -678,6 +725,7 @@ fn write_final_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        extra_volumes: ov.extra_volumes.clone(),
     };
     let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
     cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -739,12 +787,204 @@ fn build_compose_labels(
         "dev.cella.workspace_folder".to_string(),
         project.workspace_folder.clone(),
     );
+    labels.insert(
+        "dev.cella.docker_runtime".to_string(),
+        cella_env::platform::detect_runtime().as_label().to_string(),
+    );
 
     // Spec-standard labels for VS Code / tooling interop.
     labels.insert("devcontainer.local_folder".to_string(), workspace_str);
     labels.insert("devcontainer.config_file".to_string(), config_str);
 
     labels
+}
+
+/// Assemble the extra environment variable list for the compose service.
+///
+/// Combines daemon-injected env vars, forwarded env vars (SSH/GPG agent sockets,
+/// etc.), and user-specified `remote_env` overrides in precedence order.
+fn build_extra_env(
+    daemon_env: Vec<String>,
+    env_fwd: &cella_env::EnvForwarding,
+    remote_env: &[String],
+) -> Vec<String> {
+    let mut extra_env = daemon_env;
+    extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
+    extra_env.extend(remote_env.iter().cloned());
+    extra_env
+}
+
+/// Compute the mount-input fingerprint and insert it as a label on the
+/// primary service. Reconnect uses this to detect drift in settings,
+/// env-forwarding, or parent-git state that `config_hash` does not cover.
+fn insert_mount_input_fingerprint_label(
+    labels: &mut BTreeMap<String, String>,
+    settings: &cella_config::settings::Settings,
+    env_fwd: &cella_env::EnvForwarding,
+    workspace_root: &Path,
+) {
+    let fp =
+        crate::compose_mounts::compute_mount_input_fingerprint(settings, env_fwd, workspace_root);
+    labels.insert("dev.cella.mount_input_fingerprint".to_string(), fp);
+}
+
+// ---------------------------------------------------------------------------
+// Mount assembly
+// ---------------------------------------------------------------------------
+
+/// Parameters for `build_compose_mount_specs`.
+struct ComposeMountParams<'a> {
+    workspace_root: &'a Path,
+    settings: &'a cella_config::settings::Settings,
+    remote_user: &'a str,
+    env_fwd: &'a cella_env::EnvForwarding,
+    project: &'a ComposeProject,
+    config: &'a serde_json::Value,
+    resolved_features: Option<&'a cella_features::ResolvedFeatures>,
+    /// Agent volume mount target (e.g., `/cella`). Mounts targeting this path
+    /// or any descendant are rejected to protect the managed agent.
+    agent_vol_target: &'a str,
+    /// Agent volume name (e.g., `cella-agent`). Volume mounts aliasing this
+    /// source name are rejected regardless of their target path.
+    agent_vol_name: &'a str,
+}
+
+/// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
+/// user `mounts:`, and feature `mounts:`.
+///
+/// Sources are appended in priority order (tool configs → env-fwd → parent-git
+/// → user/feature mounts) then:
+/// 1. The user's base compose config is validated for agent-volume aliasing — if
+///    the primary service mounts or aliases the managed agent volume, the whole
+///    `cella up` is aborted with a clear error.
+/// 2. Any user/feature mount targeting the agent subtree is stripped and warned.
+/// 3. Remaining candidates are deduplicated against paths already declared in
+///    the base compose config so the override file never shadows user-owned volumes.
+///
+/// Fails the whole `cella up` if `docker compose config --format json` cannot
+/// resolve the base config. Reserved-agent alias rejection and named-volume
+/// collision detection require a resolved model; silently skipping them would
+/// be a security hole.
+async fn build_compose_mount_specs(
+    p: ComposeMountParams<'_>,
+) -> Result<Vec<MountSpec>, crate::error::OrchestratorError> {
+    // Assembly order mirrors single-container `config_map::map_config`:
+    //   1. User devcontainer.json `mounts:` and feature `mounts:` FIRST.
+    //   2. Auto-forwarded mounts (tool-config, env-fwd, parent-git) LAST.
+    //
+    // With last-wins dedup, placing auto-forwarded mounts after user/feature
+    // mounts gives them precedence on collision — matching single-container
+    // behaviour where `build_tool_config_mount_specs` + env-forwarding appends
+    // override any earlier user-declared mount at the same target.
+    // See: dedup_auto_forwarded_mount_wins_over_user_mount_on_collision in
+    // compose_mounts.rs tests.
+
+    // 1. User devcontainer.json `mounts:` and feature `mounts:`.
+    //
+    // Delegate to `map_merged_mounts`: when features are present, that function
+    // uses `container_config.mounts` (which already includes both feature and
+    // user mounts after `merge_with_devcontainer`); otherwise it falls back to
+    // `map_additional_mounts` on the raw config.
+    let feature_config = p.resolved_features.map(|rf| &rf.container_config);
+    let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
+    let mut user_feature_specs =
+        crate::compose_mounts::mount_configs_to_specs(&user_feature_mounts);
+    // Absolutize relative bind sources before emission. Docker Compose resolves
+    // relative paths relative to the compose file's parent directory, but cella
+    // writes its override to ~/.cella/…, so relative sources must be resolved
+    // against the user's workspace root to point at the intended host path.
+    crate::compose_mounts::resolve_bind_sources(&mut user_feature_specs, p.workspace_root);
+    let mut specs = user_feature_specs;
+
+    // 2. Auto-forwarded mounts — appended last so last-wins dedup gives them
+    //    precedence over a user/feature mount at the same target.
+    specs.extend(crate::tool_install::build_tool_config_mount_specs(
+        p.settings,
+        p.remote_user,
+    ));
+    specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(p.env_fwd));
+
+    // Parent git dir — canonicalize mirrors single-container up.rs:826-830 to
+    // handle linked git worktrees whose .gitdir pointer is non-canonical.
+    if let Some(parent_git) = cella_git::parent_git_dir(p.workspace_root) {
+        let canonical = parent_git
+            .canonicalize()
+            .unwrap_or_else(|_| parent_git.clone());
+        let path_str = canonical.to_string_lossy().to_string();
+        specs.push(MountSpec::bind(path_str.clone(), path_str));
+    }
+
+    // Strip any mount that would shadow or alias the reserved agent volume:
+    // 1. Target inside the agent subtree (e.g., /cella or /cella/bin).
+    // 2. Volume mount sourcing the agent volume by name (bypasses target check).
+    // Tool-config / env-fwd / parent-git mounts should never trigger these, but
+    // user and feature mounts are untrusted input — apply the filter to all.
+    if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
+        specs = crate::compose_mounts::filter_reserved_agent(
+            specs,
+            p.agent_vol_target,
+            p.agent_vol_name,
+        );
+    }
+
+    // Validate the base compose config and dedup candidates against it.
+    //
+    // Use `without_override` so that cella's own injected mounts (written in
+    // step 8 above) are excluded from the resolved config.  If we used the
+    // override-inclusive command the agent volume entry cella injected would
+    // trigger a false-positive self-rejection on the very check designed to
+    // protect that volume.
+    //
+    // If `docker compose config` fails, emit a warning and skip both
+    // validation and dedup — Docker Compose will surface any eventual collision.
+    let validation_cmd = ComposeCommand::without_override(p.project);
+    match validation_cmd.config().await {
+        Ok(resolved) => {
+            // Reject the whole `cella up` if the user's base compose file aliases
+            // or mounts the managed agent volume. Docker Compose multi-file merge
+            // appends entries — cella cannot remove base service volumes, only add.
+            if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
+                crate::compose_mounts::validate_base_compose_against_reserved_agent(
+                    &resolved,
+                    p.agent_vol_name,
+                    p.agent_vol_target,
+                    &p.project.primary_service,
+                    p.project.run_services.as_deref(),
+                )
+                .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            }
+            // Dedup first: remove mounts whose target is already covered by the
+            // base service.  Only the surviving (emittable) specs are then
+            // validated for named-volume identity collisions.  Running the
+            // collision check on the pre-dedup list would produce false positives
+            // for mounts that dedup will silently drop anyway.
+            let deduped = crate::compose_mounts::dedup_against_base(
+                &resolved,
+                &p.project.primary_service,
+                specs,
+            )
+            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            // Reject any extra named-volume source that collides with a base
+            // top-level volume key bound to a different backing volume.  Compose
+            // deep-merges top-level volume declarations, so our `name:` pin could
+            // silently repoint an existing volume and break other services.
+            crate::compose_mounts::validate_extra_named_volumes_against_base(
+                &resolved,
+                &deduped,
+                p.project.run_services.as_deref(),
+            )
+            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            Ok(deduped)
+        }
+        Err(e) => Err(crate::error::OrchestratorError::Config {
+            message: format!(
+                "cannot resolve compose config for mount validation: {e}. \
+                 Cella cannot safely emit compose mounts without validating the \
+                 base compose file. Fix the compose file or pin a compatible \
+                 Docker Compose version."
+            ),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         build_context: None,
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
+        extra_volumes: Vec::new(),
     }
 }
 

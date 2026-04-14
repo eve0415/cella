@@ -7,6 +7,7 @@
 pub mod branch;
 pub mod compose_build;
 pub mod compose_features;
+pub mod compose_mounts;
 pub mod compose_up;
 pub mod config;
 pub mod config_map;

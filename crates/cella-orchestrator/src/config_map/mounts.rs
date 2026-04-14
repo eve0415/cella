@@ -24,10 +24,11 @@ pub(super) fn map_workspace_mount(
             .to_string(),
         target: workspace_folder.to_string(),
         consistency: Some("cached".to_string()),
+        read_only: false,
     })
 }
 
-pub(super) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
+pub(crate) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
     let Some(mounts) = config.get("mounts").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -52,6 +53,10 @@ pub(super) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConf
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let read_only = obj
+                    .get("readOnly")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
 
                 if target.is_empty() {
                     return None;
@@ -62,6 +67,7 @@ pub(super) fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConf
                     source,
                     target,
                     consistency: None,
+                    read_only,
                 })
             }
             _ => None,
@@ -74,14 +80,23 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
     let mut source = String::new();
     let mut target = String::new();
     let mut consistency = None;
+    let mut read_only = false;
 
     for part in s.split(',') {
-        if let Some((key, value)) = part.split_once('=') {
+        let trimmed = part.trim();
+        if let Some((key, value)) = trimmed.split_once('=') {
+            let value = value.trim();
             match key.trim() {
                 "type" => mount_type = value.to_string(),
                 "source" | "src" => source = value.to_string(),
                 "target" | "dst" | "destination" => target = value.to_string(),
                 "consistency" => consistency = Some(value.to_string()),
+                _ => {}
+            }
+        } else {
+            // Bare token (no `=`): handle read-only flags.
+            match trimmed {
+                "ro" | "readonly" => read_only = true,
                 _ => {}
             }
         }
@@ -96,6 +111,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
         source,
         target,
         consistency,
+        read_only,
     })
 }
 
@@ -115,6 +131,17 @@ mod tests {
     #[test]
     fn parse_mount_string_empty_returns_none() {
         assert!(parse_mount_string("").is_none());
+    }
+
+    #[test]
+    fn parse_mount_string_trims_whitespace_around_equals() {
+        let mount = parse_mount_string("type = bind, source = /a, target = /b").unwrap();
+        assert_eq!(
+            mount.mount_type, "bind",
+            "leading space around '=' must not leave ' bind'"
+        );
+        assert_eq!(mount.source, "/a");
+        assert_eq!(mount.target, "/b");
     }
 
     #[test]
@@ -149,5 +176,62 @@ mod tests {
         assert_eq!(mounts[1].mount_type, "bind");
         assert_eq!(mounts[1].source, "/host");
         assert_eq!(mounts[1].target, "/container");
+    }
+
+    #[test]
+    fn parse_mount_string_with_ro_bare_token() {
+        let mount = parse_mount_string("type=bind,source=/a,target=/b,ro").unwrap();
+        assert_eq!(mount.mount_type, "bind");
+        assert_eq!(mount.source, "/a");
+        assert_eq!(mount.target, "/b");
+        assert!(mount.read_only, "ro bare token must set read_only=true");
+    }
+
+    #[test]
+    fn parse_mount_string_with_readonly_bare_token() {
+        let mount = parse_mount_string("type=bind,source=/a,target=/b,readonly").unwrap();
+        assert!(
+            mount.read_only,
+            "readonly bare token must set read_only=true"
+        );
+    }
+
+    #[test]
+    fn parse_mount_string_read_only_defaults_false() {
+        let mount = parse_mount_string("type=bind,source=/a,target=/b").unwrap();
+        assert!(
+            !mount.read_only,
+            "no ro token → read_only must default to false"
+        );
+    }
+
+    #[test]
+    fn map_additional_mounts_honors_read_only_object() {
+        let config = json!({
+            "mounts": [
+                {"type": "bind", "source": "/host", "target": "/container", "readOnly": true}
+            ]
+        });
+        let mounts = map_additional_mounts(&config);
+        assert_eq!(mounts.len(), 1);
+        assert!(
+            mounts[0].read_only,
+            "readOnly:true must propagate to MountConfig"
+        );
+    }
+
+    #[test]
+    fn map_additional_mounts_read_only_defaults_false_object() {
+        let config = json!({
+            "mounts": [
+                {"type": "bind", "source": "/host", "target": "/container"}
+            ]
+        });
+        let mounts = map_additional_mounts(&config);
+        assert_eq!(mounts.len(), 1);
+        assert!(
+            !mounts[0].read_only,
+            "absent readOnly must default to false"
+        );
     }
 }

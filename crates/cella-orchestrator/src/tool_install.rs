@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountConfig};
+use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountSpec};
 use tracing::{debug, warn};
 
 use crate::progress::ProgressSender;
@@ -639,12 +639,16 @@ pub async fn setup_plugin_manifests(
 
 // ── Tool config mounts ───────────────────────────────────────────────────────
 
-/// Add bind mounts for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
-pub fn add_tool_config_mounts(
-    create_opts: &mut cella_backend::CreateContainerOptions,
+/// Build bind/tmpfs mount specs for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
+///
+/// Returns a [`Vec<MountSpec>`] rather than mutating [`cella_backend::CreateContainerOptions`]
+/// so that both the single-container and compose paths can reuse the same decision logic.
+pub fn build_tool_config_mount_specs(
     settings: &cella_config::settings::Settings,
     remote_user: &str,
-) {
+) -> Vec<MountSpec> {
+    let mut out = Vec::new();
+
     // Claude Code: ~/.claude.json (single file) and ~/.claude/ (directory)
     if settings.tools.claude_code.forward_config {
         if let Some(host_path) = cella_env::claude_code::host_claude_json_path() {
@@ -652,37 +656,26 @@ pub fn add_tool_config_mounts(
                 "{}/.claude.json",
                 cella_env::claude_code::container_home(remote_user),
             );
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
+            out.push(MountSpec::bind(
+                host_path.to_string_lossy().to_string(),
                 target,
-                consistency: None,
-            });
+            ));
         }
         if let Some(host_path) = cella_env::claude_code::host_claude_dir() {
             let target = cella_env::claude_code::claude_dir_for_user(remote_user);
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target: target.clone(),
-                consistency: None,
-            });
+            out.push(MountSpec::bind(
+                host_path.to_string_lossy().to_string(),
+                target.clone(),
+            ));
 
             // Hidden mount for host plugins (backward sync access)
             if let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() {
-                create_opts.mounts.push(MountConfig {
-                    mount_type: "bind".to_string(),
-                    source: host_plugins.to_string_lossy().to_string(),
-                    target: "/tmp/.cella/host-plugins".to_string(),
-                    consistency: None,
-                });
+                out.push(MountSpec::bind(
+                    host_plugins.to_string_lossy().to_string(),
+                    "/tmp/.cella/host-plugins".to_string(),
+                ));
                 // tmpfs shadows the parent bind mount's plugins/ subdirectory
-                create_opts.mounts.push(MountConfig {
-                    mount_type: "tmpfs".to_string(),
-                    source: String::new(),
-                    target: format!("{target}/plugins"),
-                    consistency: None,
-                });
+                out.push(MountSpec::tmpfs(format!("{target}/plugins")));
             }
         }
     }
@@ -691,26 +684,20 @@ pub fn add_tool_config_mounts(
     if settings.tools.codex.forward_config
         && let Some(host_path) = cella_env::codex::host_codex_dir()
     {
-        let target = cella_env::codex::container_codex_dir(remote_user);
-        create_opts.mounts.push(MountConfig {
-            mount_type: "bind".to_string(),
-            source: host_path.to_string_lossy().to_string(),
-            target,
-            consistency: None,
-        });
+        out.push(MountSpec::bind(
+            host_path.to_string_lossy().to_string(),
+            cella_env::codex::container_codex_dir(remote_user),
+        ));
     }
 
     // Gemini: ~/.gemini
     if settings.tools.gemini.forward_config
         && let Some(host_path) = cella_env::gemini::host_gemini_dir()
     {
-        let target = cella_env::gemini::container_gemini_dir(remote_user);
-        create_opts.mounts.push(MountConfig {
-            mount_type: "bind".to_string(),
-            source: host_path.to_string_lossy().to_string(),
-            target,
-            consistency: None,
-        });
+        out.push(MountSpec::bind(
+            host_path.to_string_lossy().to_string(),
+            cella_env::gemini::container_gemini_dir(remote_user),
+        ));
     }
 
     // Nvim: ~/.config/nvim
@@ -718,13 +705,10 @@ pub fn add_tool_config_mounts(
         && let Some(host_path) =
             cella_env::nvim::host_nvim_config_dir(settings.tools.nvim.config_path.as_deref())
     {
-        let target = cella_env::nvim::container_nvim_config_dir(remote_user);
-        create_opts.mounts.push(MountConfig {
-            mount_type: "bind".to_string(),
-            source: host_path.to_string_lossy().to_string(),
-            target,
-            consistency: None,
-        });
+        out.push(MountSpec::bind(
+            host_path.to_string_lossy().to_string(),
+            cella_env::nvim::container_nvim_config_dir(remote_user),
+        ));
     }
 
     // Tmux: ~/.tmux.conf (file) and/or ~/.config/tmux/ (directory)
@@ -732,26 +716,22 @@ pub fn add_tool_config_mounts(
         if let Some(host_path) =
             cella_env::tmux::host_tmux_conf(settings.tools.tmux.config_path.as_deref())
         {
-            let target = cella_env::tmux::container_tmux_conf(remote_user);
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target,
-                consistency: None,
-            });
+            out.push(MountSpec::bind(
+                host_path.to_string_lossy().to_string(),
+                cella_env::tmux::container_tmux_conf(remote_user),
+            ));
         }
         if let Some(host_path) =
             cella_env::tmux::host_tmux_config_dir(settings.tools.tmux.config_path.as_deref())
         {
-            let target = cella_env::tmux::container_tmux_config_dir(remote_user);
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: host_path.to_string_lossy().to_string(),
-                target,
-                consistency: None,
-            });
+            out.push(MountSpec::bind(
+                host_path.to_string_lossy().to_string(),
+                cella_env::tmux::container_tmux_config_dir(remote_user),
+            ));
         }
     }
+
+    out
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────────
@@ -1297,5 +1277,20 @@ mod tests {
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(!result);
+    }
+
+    #[test]
+    fn build_tool_config_mount_specs_returns_empty_when_disabled() {
+        let mut settings = cella_config::settings::Settings::default();
+        settings.tools.claude_code.forward_config = false;
+        settings.tools.codex.forward_config = false;
+        settings.tools.gemini.forward_config = false;
+        settings.tools.nvim.forward_config = false;
+        settings.tools.tmux.forward_config = false;
+        let specs = build_tool_config_mount_specs(&settings, "root");
+        assert!(
+            specs.is_empty(),
+            "no mounts when all forward_config=false; got {specs:?}"
+        );
     }
 }

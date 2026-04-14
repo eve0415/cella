@@ -95,11 +95,15 @@ fn build_port_mappings(opts: &CreateContainerOptions) -> (Vec<String>, PortMap) 
 /// Build deduplicated mount list (last occurrence wins per target path).
 fn build_deduped_mounts(opts: &CreateContainerOptions) -> Vec<Mount> {
     let mut mounts: Vec<Mount> = Vec::new();
-    if let Some(ws_mount) = &opts.workspace_mount {
-        mounts.push(to_bollard_mount(ws_mount));
+    if let Some(ws_mount) = &opts.workspace_mount
+        && let Some(m) = to_bollard_mount(ws_mount)
+    {
+        mounts.push(m);
     }
     for m in &opts.mounts {
-        mounts.push(to_bollard_mount(m));
+        if let Some(bm) = to_bollard_mount(m) {
+            mounts.push(bm);
+        }
     }
 
     let mut seen = HashSet::new();
@@ -369,18 +373,29 @@ fn gpu_request_to_device_request(gpu: &GpuRequest) -> DeviceRequest {
     }
 }
 
-fn to_bollard_mount(m: &MountConfig) -> Mount {
-    Mount {
+fn to_bollard_mount(m: &MountConfig) -> Option<Mount> {
+    let typ = match m.mount_type.as_str() {
+        "bind" => MountTypeEnum::BIND,
+        "volume" => MountTypeEnum::VOLUME,
+        "tmpfs" => MountTypeEnum::TMPFS,
+        "npipe" => MountTypeEnum::NPIPE,
+        other => {
+            tracing::warn!(
+                mount_type = other,
+                target = %m.target,
+                "unsupported mount type — skipping"
+            );
+            return None;
+        }
+    };
+    Some(Mount {
         target: Some(m.target.clone()),
         source: Some(m.source.clone()),
-        typ: Some(match m.mount_type.as_str() {
-            "volume" => MountTypeEnum::VOLUME,
-            "tmpfs" => MountTypeEnum::TMPFS,
-            _ => MountTypeEnum::BIND,
-        }),
+        typ: Some(typ),
         consistency: m.consistency.clone(),
+        read_only: Some(m.read_only),
         ..Default::default()
-    }
+    })
 }
 
 #[cfg(test)]
@@ -404,12 +419,14 @@ mod tests {
                     source: "/first".to_string(),
                     target: "/shared-target".to_string(),
                     consistency: None,
+                    read_only: false,
                 },
                 MountConfig {
                     mount_type: "bind".to_string(),
                     source: "/second".to_string(),
                     target: "/shared-target".to_string(),
                     consistency: None,
+                    read_only: false,
                 },
             ],
             port_bindings: HashMap::new(),
@@ -445,12 +462,14 @@ mod tests {
                 source: "/ws-source".to_string(),
                 target: "/workspace".to_string(),
                 consistency: Some("cached".to_string()),
+                read_only: false,
             }),
             mounts: vec![MountConfig {
                 mount_type: "bind".to_string(),
                 source: "/override-source".to_string(),
                 target: "/workspace".to_string(),
                 consistency: None,
+                read_only: false,
             }],
             port_bindings: HashMap::new(),
             entrypoint: None,
@@ -625,8 +644,9 @@ mod tests {
             source: "my-vol".to_string(),
             target: "/data".to_string(),
             consistency: None,
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
+        let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::VOLUME));
     }
 
@@ -637,34 +657,85 @@ mod tests {
             source: String::new(),
             target: "/tmp".to_string(),
             consistency: None,
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
+        let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::TMPFS));
     }
 
     #[test]
-    fn mount_type_defaults_to_bind() {
+    fn mount_type_bind() {
         let m = MountConfig {
             mount_type: "bind".to_string(),
             source: "/host".to_string(),
             target: "/container".to_string(),
             consistency: Some("cached".to_string()),
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
+        let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
         assert_eq!(bollard_mount.consistency, Some("cached".to_string()));
     }
 
     #[test]
-    fn mount_unknown_type_defaults_to_bind() {
+    fn mount_type_npipe_maps_to_npipe_variant() {
+        let m = MountConfig {
+            mount_type: "npipe".to_string(),
+            source: "//./pipe/docker_engine".to_string(),
+            target: "//./pipe/docker_engine".to_string(),
+            consistency: None,
+            read_only: false,
+        };
+        let bollard_mount = to_bollard_mount(&m).unwrap();
+        assert_eq!(
+            bollard_mount.typ,
+            Some(MountTypeEnum::NPIPE),
+            "npipe mount type must map to MountTypeEnum::NPIPE"
+        );
+    }
+
+    #[test]
+    fn mount_unknown_type_returns_none() {
         let m = MountConfig {
             mount_type: "something_else".to_string(),
             source: "/a".to_string(),
             target: "/b".to_string(),
             consistency: None,
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
-        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
+        assert!(
+            to_bollard_mount(&m).is_none(),
+            "unsupported mount types must be rejected (return None)"
+        );
+    }
+
+    #[test]
+    fn mount_read_only_forwarded_to_bollard() {
+        // MountConfig.read_only must be wired through to bollard Mount.read_only.
+        let ro = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/container/data".to_string(),
+            consistency: None,
+            read_only: true,
+        };
+        let rw = MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/container/data".to_string(),
+            consistency: None,
+            read_only: false,
+        };
+        assert_eq!(
+            to_bollard_mount(&ro).unwrap().read_only,
+            Some(true),
+            "read_only:true must reach bollard Mount"
+        );
+        assert_eq!(
+            to_bollard_mount(&rw).unwrap().read_only,
+            Some(false),
+            "read_only:false must reach bollard Mount"
+        );
     }
 
     #[test]
@@ -1327,8 +1398,9 @@ mod tests {
             source: "/host".to_string(),
             target: "/container".to_string(),
             consistency: None,
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
+        let bollard_mount = to_bollard_mount(&m).unwrap();
         assert!(bollard_mount.consistency.is_none());
     }
 
@@ -1339,8 +1411,9 @@ mod tests {
             source: "/host".to_string(),
             target: "/container".to_string(),
             consistency: Some("delegated".to_string()),
+            read_only: false,
         };
-        let bollard_mount = to_bollard_mount(&m);
+        let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.consistency, Some("delegated".to_string()));
     }
 
@@ -1356,6 +1429,7 @@ mod tests {
             source: "/home/user/project".to_string(),
             target: "/workspace".to_string(),
             consistency: Some("cached".to_string()),
+            read_only: false,
         });
         let config = to_bollard_config(&opts);
         let hc = config.host_config.unwrap();

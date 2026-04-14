@@ -685,13 +685,15 @@ fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<
     // Workspace mount
     if let Some(ref wm) = opts.workspace_mount {
         args.push("--volume".to_string());
-        args.push(format!("{}:{}", wm.source, wm.target));
+        let ro_suffix = if wm.read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{ro_suffix}", wm.source, wm.target));
     }
 
     // Additional mounts
     for mount in &opts.mounts {
         args.push("--volume".to_string());
-        args.push(format!("{}:{}", mount.source, mount.target));
+        let ro_suffix = if mount.read_only { ":ro" } else { "" };
+        args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
     }
 
     // Staging directory mount for file uploads.
@@ -997,12 +999,34 @@ mod tests {
             source: "/host/project".to_string(),
             target: "/workspace".to_string(),
             consistency: None,
+            read_only: false,
         });
         let staging = PathBuf::from("/tmp/staging");
         let args = build_create_args(&opts, &staging);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(args[vol_idx + 1], "/host/project:/workspace");
+    }
+
+    #[test]
+    fn build_create_args_workspace_mount_read_only() {
+        let mut opts = minimal_create_opts();
+        opts.workspace_mount = Some(MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/project".to_string(),
+            target: "/workspace".to_string(),
+            consistency: None,
+            read_only: true,
+        });
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
+        assert_eq!(
+            args[vol_idx + 1],
+            "/host/project:/workspace:ro",
+            "read_only workspace mount must append :ro"
+        );
     }
 
     #[test]
@@ -1219,12 +1243,14 @@ mod tests {
                 source: "/host/data".to_string(),
                 target: "/data".to_string(),
                 consistency: None,
+                read_only: false,
             },
             MountConfig {
                 mount_type: "volume".to_string(),
                 source: "vol1".to_string(),
                 target: "/vol".to_string(),
                 consistency: None,
+                read_only: false,
             },
         ];
         let staging = PathBuf::from("/tmp/staging");
@@ -1247,6 +1273,35 @@ mod tests {
         assert!(
             vol_args.contains(&"vol1:/vol"),
             "expected vol1:/vol mount, got: {vol_args:?}"
+        );
+    }
+
+    #[test]
+    fn build_create_args_additional_mount_read_only() {
+        let mut opts = minimal_create_opts();
+        opts.mounts = vec![MountConfig {
+            mount_type: "bind".to_string(),
+            source: "/host/data".to_string(),
+            target: "/data".to_string(),
+            consistency: None,
+            read_only: true,
+        }];
+        let staging = PathBuf::from("/tmp/staging");
+        let args = build_create_args(&opts, &staging);
+
+        let vol_args: Vec<&str> = args
+            .windows(2)
+            .filter_map(|w| {
+                if w[0] == "--volume" {
+                    Some(w[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            vol_args.contains(&"/host/data:/data:ro"),
+            "read_only additional mount must append :ro; got: {vol_args:?}"
         );
     }
 

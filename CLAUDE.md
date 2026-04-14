@@ -45,6 +45,8 @@ Always research before suggesting changes or asking the user questions. Use `/sp
 - No `_`-prefixed unused variables — delete dead code entirely
 - Workspace lints: clippy::pedantic + clippy::nursery (warn), unsafe_code (deny), unused_qualifications (deny)
 - `clippy::significant_drop_tightening` is active — inline mutex `.lock().await.method()` calls instead of binding the guard to a variable when only one method call is needed
+- Clippy `too_many_lines` limit is 100 LOC per fn — extract helpers before hitting it, don't reach for `#[allow]`
+- SHA-256 hex output: `hex::encode(hasher.finalize())` — `format!("{:x}", ...)` does not compile against `GenericArray`
 - Error types: thiserror for custom errors, miette for user-facing diagnostics
 - Async: tokio runtime, bollard for Docker API, gix for git operations
 - No backward compatibility constraints — refactor freely when improving code

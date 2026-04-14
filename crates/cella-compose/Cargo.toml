@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-backend.workspace = true
 hex.workspace = true
 miette.workspace = true
 serde.workspace = true
