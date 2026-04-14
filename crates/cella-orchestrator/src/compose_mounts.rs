@@ -88,8 +88,13 @@ fn depends_on_names(value: &serde_json::Value) -> Vec<&str> {
 ///
 /// - `None` → compose starts all services → the full service map is the closure.
 /// - `Some(list)` → compose starts the listed services plus their transitive
-///   `depends_on` closure (compose always follows dependencies unless
-///   `--no-deps` is given; cella never passes `--no-deps`).
+///   `depends_on` and `volumes_from` closure (compose always follows
+///   dependencies unless `--no-deps` is given; cella never passes `--no-deps`;
+///   `volumes_from` references another service's container at runtime, so that
+///   service must also be validated).
+///
+/// The `container:<name>` form of `volumes_from` references an external
+/// container, not a compose service, and is not traversed as an edge.
 fn compute_service_closure<'a>(
     resolved: &'a ResolvedComposeConfig,
     run_services: Option<&'a [String]>,
@@ -109,11 +114,28 @@ fn compute_service_closure<'a>(
         if !closure.insert(name) {
             continue;
         }
-        if let Some(svc) = resolved.services.get(name) {
-            for dep in depends_on_names(&svc.depends_on) {
-                if !closure.contains(dep) {
-                    stack.push(dep);
-                }
+        let Some(svc) = resolved.services.get(name) else {
+            continue;
+        };
+        // depends_on edges.
+        for dep in depends_on_names(&svc.depends_on) {
+            if !closure.contains(dep) {
+                stack.push(dep);
+            }
+        }
+        // volumes_from edges — a service that inherits mounts via volumes_from
+        // implicitly depends on the named service being started, so that service
+        // must also be included in the closure for validation purposes.
+        // Skip the `container:<name>` form: it references an external container,
+        // not a compose service, and has no compose-side service entry to validate.
+        for vf_entry in &svc.volumes_from {
+            let (inherit_from, _, is_container) = parse_volumes_from_entry(vf_entry);
+            if !is_container
+                && !inherit_from.is_empty()
+                && !closure.contains(inherit_from)
+                && resolved.services.contains_key(inherit_from)
+            {
+                stack.push(inherit_from);
             }
         }
     }
@@ -158,11 +180,11 @@ fn compute_service_closure<'a>(
 ///    primary service's `volumes_from` is therefore rejected outright. Use
 ///    explicit `volumes:` entries instead.
 ///
-/// Only services in the `run_services` + transitive `depends_on` closure are
-/// inspected. When `run_services` is `None` (no filter — compose starts
-/// everything) or an empty list (same effect: compose starts all services),
-/// all services are validated. Unrelated utility services not reachable from
-/// the explicit service list are skipped.
+/// Only services in the `run_services` + transitive `depends_on` + `volumes_from`
+/// closure are inspected. When `run_services` is `None` (no filter — compose
+/// starts everything) or an empty list (same effect: compose starts all
+/// services), all services are validated. Unrelated utility services not
+/// reachable from the explicit service list are skipped.
 ///
 /// Returns `Ok(())` when the config is clean, or `Err(message)` with a
 /// human-readable description of what was rejected.
@@ -564,10 +586,20 @@ fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool, bool) {
 ///
 /// Returns `Ok(())` when all extra volumes are safe, or `Err(message)` on the
 /// first incompatible or retargeting declaration.
+///
+/// `run_services` limits which services are inspected in the retarget check:
+/// only services within the `run_services` + transitive closure are started by
+/// compose, so only they can be affected by a literal-name pin. Unrelated
+/// utility services outside the closure are skipped. Pass `None` (or an empty
+/// slice) to inspect all services (same as when compose starts everything).
 pub(crate) fn validate_extra_named_volumes_against_base(
     resolved: &ResolvedComposeConfig,
     extra_volumes: &[MountSpec],
+    run_services: Option<&[String]>,
 ) -> Result<(), String> {
+    // Compute the run_services closure once for use in the retarget check below.
+    let closure = compute_service_closure(resolved, run_services);
+
     for spec in extra_volumes {
         if spec.kind != MountKind::Volume || spec.source.is_empty() {
             continue;
@@ -598,7 +630,7 @@ pub(crate) fn validate_extra_named_volumes_against_base(
             == Some(spec.source.as_str());
 
         if !top_level_pins_name {
-            check_extra_volume_against_base_services(resolved, &spec.source)?;
+            check_extra_volume_against_base_services(resolved, &spec.source, &closure)?;
         }
     }
     Ok(())
@@ -608,13 +640,21 @@ pub(crate) fn validate_extra_named_volumes_against_base(
 /// `source`. Returns `Err` if found — cella's literal-name pin would retarget
 /// the service's `<project>_<source>` volume to the global `<source>` volume.
 ///
+/// Only services present in `closure` are scanned. Services outside the
+/// `run_services` closure are not started and cannot be retargeted by cella's
+/// pin, so they do not need to block the operation.
+///
 /// Extracted from [`validate_extra_named_volumes_against_base`] to stay within
 /// clippy's `too_many_lines` limit.
 fn check_extra_volume_against_base_services(
     resolved: &ResolvedComposeConfig,
     source: &str,
+    closure: &HashSet<&str>,
 ) -> Result<(), String> {
     for (svc_name, svc) in &resolved.services {
+        if !closure.contains(svc_name.as_str()) {
+            continue;
+        }
         for entry in &svc.volumes {
             let (mount_type, src) = match entry {
                 serde_json::Value::Object(obj) => {
@@ -2683,7 +2723,7 @@ mod tests {
         // No top-level volume in base → no collision.
         let resolved = make_resolved_with_volumes("app", vec![], HashMap::new());
         let extras = vec![make_volume_spec("mycache")];
-        assert!(validate_extra_named_volumes_against_base(&resolved, &extras).is_ok());
+        assert!(validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok());
     }
 
     #[test]
@@ -2694,7 +2734,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "explicit name matching source must be accepted"
         );
     }
@@ -2709,7 +2749,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "external: true attribute is incompatible — must reject"
         );
     }
@@ -2727,7 +2767,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "external with mismatched name must reject when service references the key"
         );
     }
@@ -2741,7 +2781,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "bare key has no conflicting attributes — must be accepted"
         );
     }
@@ -2755,7 +2795,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "explicit name mismatch referenced by a service must reject"
         );
     }
@@ -2774,7 +2814,7 @@ mod tests {
             consistency: None,
         };
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &[bind]).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &[bind], None).is_ok(),
             "bind mounts must be skipped by the volume-collision check"
         );
     }
@@ -2791,7 +2831,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras: Vec<MountSpec> = vec![]; // post-dedup: empty
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "empty post-dedup list should not trigger collision validation"
         );
     }
@@ -2812,7 +2852,7 @@ mod tests {
             consistency: None,
         }];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "bare unreferenced key is compatible — must not block"
         );
     }
@@ -2836,7 +2876,7 @@ mod tests {
             consistency: None,
         }];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "bare key with service reference must be rejected — retargets project-scoped volume"
         );
     }
@@ -2850,7 +2890,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "driver attribute is incompatible — must reject"
         );
     }
@@ -2865,7 +2905,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_err(),
             "external base attribute survives merge — must reject"
         );
     }
@@ -2879,7 +2919,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "matching name-only base declaration is compatible"
         );
     }
@@ -2893,7 +2933,7 @@ mod tests {
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            validate_extra_named_volumes_against_base(&resolved, &extras, None).is_ok(),
             "bare empty-object declaration is compatible"
         );
     }
@@ -2930,7 +2970,7 @@ mod tests {
             read_only: false,
             consistency: None,
         }];
-        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras, None);
         assert!(
             result.is_err(),
             "retargeting base service's project-scoped volume must reject"
@@ -2967,7 +3007,7 @@ mod tests {
             read_only: false,
             consistency: None,
         }];
-        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras, None);
         assert!(
             result.is_ok(),
             "compatible pin exists — safe to emit; got: {result:?}"
@@ -3001,7 +3041,7 @@ mod tests {
             read_only: false,
             consistency: None,
         }];
-        let result = validate_extra_named_volumes_against_base(&resolved, &extras);
+        let result = validate_extra_named_volumes_against_base(&resolved, &extras, None);
         assert!(
             result.is_ok(),
             "bind mount with similar source name is not a conflict; got: {result:?}"
@@ -3477,5 +3517,187 @@ mod tests {
         let result = dedup_against_base(&resolved, "app", candidates).unwrap();
         assert_eq!(result.len(), 1, "only /other must survive; got: {result:?}");
         assert_eq!(result[0].target, "/other");
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-14 findings: volumes_from closure traversal + run_services scoping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn closure_includes_volumes_from_services() {
+        // runServices: [app], app.volumes_from: [helper]
+        // helper must enter the closure via the volumes_from edge.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                volumes_from: vec![json!("helper")],
+                ..ResolvedService::default()
+            },
+        );
+        services.insert("helper".to_string(), ResolvedService::default());
+        services.insert("unrelated".to_string(), ResolvedService::default());
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let app = "app".to_string();
+        let closure = compute_service_closure(&resolved, Some(std::slice::from_ref(&app)));
+        assert!(closure.contains("app"), "app must be in closure");
+        assert!(
+            closure.contains("helper"),
+            "helper must enter closure via volumes_from edge"
+        );
+        assert!(
+            !closure.contains("unrelated"),
+            "unrelated service not reachable from app"
+        );
+    }
+
+    #[test]
+    fn closure_does_not_traverse_container_form_volumes_from() {
+        // `container:<name>` references an external running container, not a
+        // compose service. It must not be pushed into the closure.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                volumes_from: vec![json!("container:other-project-svc")],
+                ..ResolvedService::default()
+            },
+        );
+        services.insert("unrelated".to_string(), ResolvedService::default());
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let app = "app".to_string();
+        let closure = compute_service_closure(&resolved, Some(std::slice::from_ref(&app)));
+        assert!(closure.contains("app"));
+        assert!(
+            !closure.contains("unrelated"),
+            "container: form must not pull in unrelated services"
+        );
+        // The string "other-project-svc" is not a key in resolved.services,
+        // so it must not appear in the closure either.
+        assert!(!closure.contains("other-project-svc"));
+    }
+
+    #[test]
+    fn validator_rejects_agent_alias_via_volumes_from_chain() {
+        // runServices: [inheritor], inheritor.volumes_from: [helper],
+        // helper has a writable cella-agent volume mount.
+        // Previously, helper was outside the closure (only depends_on was
+        // traversed) and the alias bypassed validation.  After the fix, helper
+        // is reachable via the volumes_from edge and gets validated.
+        let mut services = HashMap::new();
+        // "primary" is the compose primary; it has no concerning mounts.
+        services.insert("primary".to_string(), ResolvedService::default());
+        // "inheritor" starts via runServices and uses volumes_from on "helper".
+        services.insert(
+            "inheritor".to_string(),
+            ResolvedService {
+                volumes_from: vec![json!("helper")],
+                ..ResolvedService::default()
+            },
+        );
+        // "helper" aliases the managed agent volume.
+        services.insert(
+            "helper".to_string(),
+            ResolvedService {
+                volumes: vec![
+                    json!({"type": "volume", "source": "cella-agent", "target": "/tmp/rw"}),
+                ],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let inheritor = "inheritor".to_string();
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "primary",
+            Some(std::slice::from_ref(&inheritor)),
+        );
+        assert!(
+            result.is_err(),
+            "helper must be reachable via volumes_from traversal and rejected"
+        );
+    }
+
+    #[test]
+    fn extra_volume_allowed_when_referencing_service_is_outside_run_services() {
+        // "utility" references mycache as a volume but is NOT in runServices.
+        // Previously, the scan was unconditional and "utility" blocked the
+        // operation even though it is never started.  After the fix the scan
+        // is limited to the closure; utility is skipped, and the result is Ok.
+        let mut services = HashMap::new();
+        services.insert("app".to_string(), ResolvedService::default());
+        services.insert(
+            "utility".to_string(),
+            ResolvedService {
+                volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let app = "app".to_string();
+        let result = validate_extra_named_volumes_against_base(
+            &resolved,
+            &extras,
+            Some(std::slice::from_ref(&app)),
+        );
+        assert!(
+            result.is_ok(),
+            "utility is not in runServices closure — retarget is not a real risk; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn extra_volume_rejected_when_referencing_service_is_in_run_services() {
+        // Same setup but runServices includes utility — now the retarget is real.
+        let mut services = HashMap::new();
+        services.insert("app".to_string(), ResolvedService::default());
+        services.insert(
+            "utility".to_string(),
+            ResolvedService {
+                volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let extras = vec![MountSpec {
+            kind: MountKind::Volume,
+            source: "mycache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+            consistency: None,
+        }];
+        let result = validate_extra_named_volumes_against_base(
+            &resolved,
+            &extras,
+            Some(&["app".to_string(), "utility".to_string()]),
+        );
+        assert!(
+            result.is_err(),
+            "utility is started — retarget is a real bypass; must reject"
+        );
     }
 }

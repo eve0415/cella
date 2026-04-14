@@ -968,8 +968,12 @@ async fn build_compose_mount_specs(
             // top-level volume key bound to a different backing volume.  Compose
             // deep-merges top-level volume declarations, so our `name:` pin could
             // silently repoint an existing volume and break other services.
-            crate::compose_mounts::validate_extra_named_volumes_against_base(&resolved, &deduped)
-                .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            crate::compose_mounts::validate_extra_named_volumes_against_base(
+                &resolved,
+                &deduped,
+                p.project.run_services.as_deref(),
+            )
+            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
             Ok(deduped)
         }
         Err(e) => Err(crate::error::OrchestratorError::Config {
