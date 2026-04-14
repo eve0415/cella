@@ -75,7 +75,6 @@ Key runtime constraints:
 - Tiny atomic commits, one concern per commit
 - Independent branches per feature, rebase before PR, no merge commits on main
 - Breaking changes are acceptable
-- Verify signatures via `git cat-file -p <sha> | head` (look for `gpgsig`) — `git log --show-signature` reports "No signature" when `gpg.ssh.allowedSignersFile` is unset, even on correctly signed commits
 
 ## CI Workflows
 
