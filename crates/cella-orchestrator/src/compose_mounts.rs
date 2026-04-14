@@ -184,6 +184,25 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         })
         .collect();
 
+    // Check 0.5: reject if the base compose file declares the agent volume key
+    // itself (`cella-agent: { ... }`) with any attribute other than a matching
+    // `name:`.  Compose deep-merges top-level volume maps, so user attributes on
+    // the `cella-agent` key survive into the merged output even when cella's
+    // override also declares `cella-agent: { external: true, name: cella-agent }`.
+    // A user-supplied `name: attacker-vol` or `driver: nfs` would silently win
+    // or produce an inconsistency error (external+conflicting-name), breaking the
+    // trust boundary.
+    if let Some(agent_base) = resolved.volumes.get(agent_vol_name)
+        && !is_compatible_base_volume_declaration(agent_base, agent_vol_name)
+    {
+        return Err(format!(
+            "base compose top-level volume '{agent_vol_name}' has cella-incompatible \
+             attributes (cella manages this volume's identity; base declarations must be \
+             empty or `name: {agent_vol_name}` only). Remove the declaration or clear \
+             its fields.",
+        ));
+    }
+
     // Determine the set of services compose will actually start.
     let closure = compute_service_closure(resolved, run_services);
 
@@ -194,54 +213,9 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         }
 
         // Check 0: volumes_from inherits ALL volumes from the named service at
-        // runtime, including cella's injected agent mount, without cella's
-        // read-only protection. Only the primary service receives the injected
-        // agent mount, so only references to the primary are a bypass threat.
-        // Read-only inheritance (:ro / read_only: true) preserves the protection
-        // and is safe. Writable inheritance is the bypass.
-        for vf_entry in &svc.volumes_from {
-            let (inherit_from, read_only) = match vf_entry {
-                serde_json::Value::String(s) => {
-                    // Short form: "svc", "svc:ro", "svc:rw", "container:svc".
-                    // Use rsplitn so the rightmost colon-delimited token is
-                    // checked for a mode suffix before extracting the name.
-                    let parts: Vec<&str> = s.rsplitn(2, ':').collect();
-                    if parts.len() == 2 && (parts[0] == "ro" || parts[0] == "rw") {
-                        // parts[0] is the mode, parts[1] is "name" or
-                        // "container:name" — take the last ':'-delimited token
-                        // as the service name.
-                        let service_name = parts[1].split(':').next_back().unwrap_or("");
-                        (service_name, parts[0] == "ro")
-                    } else {
-                        // No mode suffix → default rw.
-                        let service_name = s.split(':').next_back().unwrap_or("");
-                        (service_name, false)
-                    }
-                }
-                serde_json::Value::Object(obj) => {
-                    let name = obj
-                        .get("source")
-                        .or_else(|| obj.get("from"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let ro = obj
-                        .get("read_only")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    (name, ro)
-                }
-                _ => continue,
-            };
-            if inherit_from == primary_service && !read_only {
-                return Err(format!(
-                    "service '{svc_name}' uses writable volumes_from on primary service \
-                     '{primary_service}', which would inherit cella's managed agent volume \
-                     without cella's read-only protection. Use ':ro' suffix or \
-                     'read_only: true' for read-only inheritance, or remove the \
-                     volumes_from entry."
-                ));
-            }
-        }
+        // runtime. Only writable inheritance from the primary service bypasses
+        // cella's read-only agent protection.
+        check_volumes_from(svc_name, svc, primary_service)?;
 
         for entry in &svc.volumes {
             let serde_json::Value::Object(obj) = entry else {
@@ -307,35 +281,117 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
     Ok(())
 }
 
+/// Return `true` if a base compose top-level volume declaration is compatible
+/// with cella pinning that volume to the literal name `expected_name`.
+///
+/// Compatible means the merged declaration will not carry attributes that alter
+/// volume identity or impose external pre-existence requirements:
+///
+/// - `null` / JSON null → treated as bare (compatible).
+/// - `{}` (empty object) → bare key, no conflicting attributes (compatible).
+/// - `{ name: <expected_name> }` → explicit name matches literal (compatible).
+/// - Anything else — `external`, `driver`, `driver_opts`, `labels`, a `name`
+///   that differs from `expected_name` — is **incompatible**.
+///
+/// The function is called for both the agent volume key (Finding 1) and
+/// user-declared extra volume keys (Finding 2).
+/// Reject writable `volumes_from` entries that inherit from the primary service.
+/// Read-only inheritance (`:ro` suffix / `read_only: true`) preserves cella's
+/// agent read-only protection and is safe; writable inheritance is the bypass.
+fn check_volumes_from(
+    svc_name: &str,
+    svc: &cella_compose::config::ResolvedService,
+    primary_service: &str,
+) -> Result<(), String> {
+    for vf_entry in &svc.volumes_from {
+        let (inherit_from, read_only) = parse_volumes_from_entry(vf_entry);
+        if inherit_from == primary_service && !read_only {
+            return Err(format!(
+                "service '{svc_name}' uses writable volumes_from on primary service \
+                 '{primary_service}', which would inherit cella's managed agent volume \
+                 without cella's read-only protection. Use ':ro' suffix or \
+                 'read_only: true' for read-only inheritance, or remove the \
+                 volumes_from entry."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract (`service_name`, `is_read_only`) from a single `volumes_from` entry.
+fn parse_volumes_from_entry(entry: &serde_json::Value) -> (&str, bool) {
+    match entry {
+        serde_json::Value::String(s) => {
+            let parts: Vec<&str> = s.rsplitn(2, ':').collect();
+            if parts.len() == 2 && (parts[0] == "ro" || parts[0] == "rw") {
+                let service_name = parts[1].split(':').next_back().unwrap_or("");
+                (service_name, parts[0] == "ro")
+            } else {
+                let service_name = s.split(':').next_back().unwrap_or("");
+                (service_name, false)
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let name = obj
+                .get("source")
+                .or_else(|| obj.get("from"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ro = obj
+                .get("read_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            (name, ro)
+        }
+        _ => ("", false),
+    }
+}
+
+fn is_compatible_base_volume_declaration(value: &serde_json::Value, expected_name: &str) -> bool {
+    let Some(obj) = value.as_object() else {
+        // null or non-object primitive: treat as bare
+        return value.is_null();
+    };
+    if obj.is_empty() {
+        return true; // bare {}
+    }
+    for (k, v) in obj {
+        if k == "name" {
+            if v.as_str() != Some(expected_name) {
+                return false; // name mismatch
+            }
+        } else {
+            // Any non-name attribute (external, driver, driver_opts, labels…)
+            return false;
+        }
+    }
+    true
+}
+
 /// Reject if any extra named-volume source collides with an existing base
-/// top-level volume key that binds to a different backing volume.
+/// top-level volume key that has cella-incompatible attributes.
 ///
 /// Docker Compose deep-merges top-level volume declarations across files.
-/// If cella's override emits `volumes: mycache: { name: mycache }` but the
-/// user's base has `volumes: mycache: { name: app_db_vol }`, the merge result
-/// silently repoints `mycache` to `mycache`, breaking all services that rely
-/// on `app_db_vol` through that key.
+/// Once cella's override references a source as a named volume, the base key
+/// is live at runtime regardless of whether any *base* service referenced it.
+/// Any attributes the base key carries will survive the merge and stick to the
+/// final declaration, potentially:
+///
+/// - Requiring the volume to pre-exist (`external: true`).
+/// - Changing the backing driver or its options (`driver`, `driver_opts`).
+/// - Overriding volume identity (`name` pointing at a different literal).
 ///
 /// The rules applied per extra volume `source`:
 ///
 /// - No top-level base entry for `source` → no collision, emit normally.
-/// - Base has `volumes: <source>: { name: <source> }` (explicit name, same literal)
-///   → compatible: cella's pin and the base pin agree.
-/// - Base has `volumes: <source>: { external: true }` with no `name:`
-///   → compatible: Docker Compose resolves the volume name to the literal key
-///   (same semantics as cella's pin). No collision.
-/// - Base has `volumes: <source>: {}` (bare, project-scoped as `<project>_<source>`)
-///   AND a service references it → **reject**: single-container uses the literal
-///   `source`; compose would diverge.
-/// - Base has `volumes: <source>: {}` with NO service referencing it → **skip**:
-///   the declaration is inert; cella's emission cannot break any live mount.
-/// - Base has `volumes: <source>: { name: <other> }` (explicit alias mismatch)
-///   AND a service references it → **reject**: cella's literal pin overwrites the alias.
-/// - Base has `volumes: <source>: { external: true, name: <other> }` (mismatched)
-///   AND a service references it → **reject**: external lookup identity differs.
+/// - `{}` (bare key) → compatible: cella's `name: <source>` pin fully defines
+///   identity; no base attribute survives to conflict.
+/// - `{ name: <source> }` → compatible: base and cella pin agree.
+/// - Anything else (`external`, `driver`, `driver_opts`, `labels`, mismatched
+///   `name`) → **reject**.
 ///
 /// Returns `Ok(())` when all extra volumes are safe, or `Err(message)` on the
-/// first collision.
+/// first incompatible base declaration.
 pub(crate) fn validate_extra_named_volumes_against_base(
     resolved: &ResolvedComposeConfig,
     extra_volumes: &[MountSpec],
@@ -345,74 +401,22 @@ pub(crate) fn validate_extra_named_volumes_against_base(
             continue;
         }
         let Some(base_vol) = resolved.volumes.get(&spec.source) else {
-            continue; // no collision — safe to emit
+            continue; // no base declaration — safe to emit
         };
-        let effective = base_volume_effective_name(base_vol, &spec.source);
-        if effective == Some(spec.source.as_str()) {
-            // Effective name agrees with the literal source — compatible.
-            continue;
-        }
-        // Top-level volume declarations are inert until a service references
-        // them.  If no service uses this key, cella's emission cannot cause
-        // volume-identity divergence at runtime — skip the rejection.
-        //
-        // Fail-closed on short-form entries: if any service volume is not a
-        // long-form object we cannot determine whether the key is referenced,
-        // so we treat the config as invalid and return Err.
-        let mut key_is_used = false;
-        'outer: for svc in resolved.services.values() {
-            for entry in &svc.volumes {
-                let serde_json::Value::Object(obj) = entry else {
-                    return Err(format!(
-                        "service has an unresolved short-form volume entry ({entry:?}); \
-                         cannot determine if top-level key '{}' is referenced.",
-                        spec.source,
-                    ));
-                };
-                if obj.get("source").and_then(|v| v.as_str()) == Some(spec.source.as_str()) {
-                    key_is_used = true;
-                    break 'outer;
-                }
-            }
-        }
-        if !key_is_used {
-            continue; // inert base declaration — no runtime impact
+        if is_compatible_base_volume_declaration(base_vol, &spec.source) {
+            continue; // bare or name-only-matching — cella's pin survives the merge intact
         }
         return Err(format!(
-            "devcontainer mount 'source={}' collides with base compose top-level volume key \
-             of different identity (effective base name: {}). Cella cannot safely pin the literal \
-             volume without potentially breaking other services. Rename the mount source \
-             or remove the conflicting base top-level volume declaration.",
-            spec.source,
-            effective.map_or_else(|| "<project-scoped>".to_string(), str::to_string),
+            "devcontainer mount source '{}' collides with a base compose top-level volume \
+             declaration that has cella-incompatible attributes (external, driver, or other). \
+             Cella cannot safely pin the literal volume; the merged declaration may require \
+             pre-provisioning, change the backing driver, or alter volume identity. Rename \
+             the mount, or clear the base top-level declaration's attributes (leave only \
+             `name: {}` if needed).",
+            spec.source, spec.source,
         ));
     }
     Ok(())
-}
-
-/// Compute the effective volume name that Docker Compose will resolve for a
-/// top-level volume entry.
-///
-/// Docker Compose volume-name resolution rules:
-/// - Explicit `name:` always wins, regardless of `external:`.
-/// - `external: true` without `name:` → the key itself is the literal external
-///   volume name (no project prefix is applied).
-/// - No `name:`, no `external:` (bare key) → project-scoped name
-///   (`<project>_<key>`); the literal key is NOT used → return `None`.
-fn base_volume_effective_name<'a>(
-    base_vol: &'a serde_json::Value,
-    key: &'a str,
-) -> Option<&'a str> {
-    let explicit_name = base_vol.get("name").and_then(|v| v.as_str());
-    let external = base_vol
-        .get("external")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    match (explicit_name, external) {
-        (Some(n), _) => Some(n),   // explicit name always wins
-        (None, true) => Some(key), // external without name → key is the literal name
-        (None, false) => None,     // project-scoped → no literal name
-    }
 }
 
 /// Normalise a mount target path by stripping trailing slashes.
@@ -1994,6 +1998,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_base_compose_against_reserved_agent — agent key attribute checks
+    // (Finding 1, round 12)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn base_compose_rejected_when_agent_key_has_conflicting_fields() {
+        // User base declares `volumes: cella-agent: { name: attacker-vol, driver: local }`.
+        // Deep merge would carry those attributes into the final merged declaration,
+        // breaking volume identity or causing an external+name conflict.
+        let mut top_vols = HashMap::new();
+        top_vols.insert(
+            "cella-agent".to_string(),
+            json!({"name": "attacker-vol", "driver": "local"}),
+        );
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "user base compose cannot redefine agent volume with conflicting attributes"
+        );
+    }
+
+    #[test]
+    fn base_compose_ok_when_agent_key_is_bare() {
+        // Bare `{}` carries no conflicting attributes — cella's override fully
+        // pins `external: true` + `name: cella-agent`, so the merged declaration
+        // is correct.  No rejection.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("cella-agent".to_string(), json!({}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(result.is_ok(), "bare agent-key declaration is compatible");
+    }
+
+    #[test]
+    fn base_compose_ok_when_agent_key_only_pins_same_name() {
+        // `{ name: cella-agent }` is redundant but not conflicting — the merged
+        // result has the same identity cella would produce.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("cella-agent".to_string(), json!({"name": "cella-agent"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "matching name-only declaration is compatible"
+        );
+    }
+
+    #[test]
+    fn base_compose_rejected_when_agent_key_pins_different_name() {
+        // `{ name: other }` would survive the merge and point the volume at a
+        // different Docker volume identity — reject unconditionally.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("cella-agent".to_string(), json!({"name": "other"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "mismatched name on agent key must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // hash_tool_host_paths / compute_mount_input_fingerprint host-path detection
     // (Finding 2, round 7)
     // -----------------------------------------------------------------------
@@ -2079,15 +2170,16 @@ mod tests {
 
     #[test]
     fn extra_named_volume_ok_when_base_is_external_with_matching_key() {
-        // external: true without name: → Docker resolves to literal key, same as
-        // cella's pin — compatible (no false-positive rejection).
+        // external: true survives the Compose deep-merge and would require the
+        // volume to pre-exist on first run.  Must reject even though the key
+        // name happens to match.
         let mut top_vols = HashMap::new();
         top_vols.insert("mycache".to_string(), json!({"external": true}));
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
-            "external: true with matching key resolves to literal — compatible"
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "external: true attribute is incompatible — must reject"
         );
     }
 
@@ -2110,18 +2202,16 @@ mod tests {
     }
 
     #[test]
-    fn extra_named_volume_rejected_when_base_has_bare_key() {
-        // Bare key → project-scoped (no effective literal name), AND a service
-        // references it → reject: single-container uses the literal `source`;
-        // compose would diverge.
+    fn extra_named_volume_ok_when_base_has_bare_key() {
+        // Bare key carries no conflicting attributes — cella's `name: <source>`
+        // pin fully defines identity after the deep merge.  Compatible.
         let mut top_vols = HashMap::new();
         top_vols.insert("mycache".to_string(), json!({}));
-        let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
-        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "bare key (project-scoped) referenced by a service must reject"
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "bare key has no conflicting attributes — must be accepted"
         );
     }
 
@@ -2177,11 +2267,11 @@ mod tests {
 
     #[test]
     fn extra_named_volume_ok_when_base_top_level_key_is_unreferenced() {
-        // Base has a top-level `mycache` key (bare, project-scoped), but no
-        // service references it.  The declaration is inert — cella can safely
-        // emit its own named volume without risking identity divergence.
+        // Base has a bare `mycache` key with no service reference.  Even if a
+        // base service were to reference it, the bare key has no conflicting
+        // attributes — cella's pin wins after the deep merge.  Compatible.
         let mut top_vols = HashMap::new();
-        top_vols.insert("mycache".to_string(), json!({})); // bare key, unused
+        top_vols.insert("mycache".to_string(), json!({})); // bare key, no service reference
         let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![MountSpec {
             kind: MountKind::Volume,
@@ -2192,18 +2282,17 @@ mod tests {
         }];
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
-            "unreferenced top-level key should not block"
+            "bare unreferenced key is compatible — must not block"
         );
     }
 
     #[test]
-    fn extra_named_volume_still_rejects_when_base_top_level_key_is_referenced() {
-        // Base has a top-level `mycache` bare key AND a service references it
-        // via `source: mycache`.  This is a real collision: single-container
-        // uses the literal source name while compose would project-scope it,
-        // causing identity divergence.
+    fn extra_named_volume_ok_when_bare_key_is_referenced_by_base_service() {
+        // Base has a bare `mycache` key AND a service references it.  Bare
+        // carries no conflicting attributes — cella's `name: mycache` pin in the
+        // override wins after the deep merge regardless of base service use.
         let mut top_vols = HashMap::new();
-        top_vols.insert("mycache".to_string(), json!({})); // bare — project-scoped
+        top_vols.insert("mycache".to_string(), json!({}));
         let svc_vols = vec![json!({"type": "volume", "source": "mycache", "target": "/data"})];
         let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
         let extras = vec![MountSpec {
@@ -2214,28 +2303,65 @@ mod tests {
             consistency: None,
         }];
         assert!(
-            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "referenced key with bare (project-scoped) declaration still rejects"
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "bare key — even when referenced — has no conflicting attributes"
         );
     }
 
     #[test]
-    fn extra_named_volume_rejects_short_form_service_volume_entry() {
-        // A short-form string in a service's volume list must trigger a hard
-        // error when `validate_extra_named_volumes_against_base` tries to
-        // determine whether a top-level key is referenced. Silently skipping
-        // it would misclassify a used key as unused and suppress the collision
-        // rejection.
+    fn extra_named_volume_rejected_when_base_has_driver_field() {
+        // `driver` survives the Compose deep-merge and would change the backing
+        // storage from the default.  Must reject regardless of service reference.
         let mut top_vols = HashMap::new();
-        // Bare key with mismatched identity — would normally reject if referenced.
-        top_vols.insert("mycache".to_string(), json!({}));
-        // Short-form string instead of a long-form object.
-        let svc_vols = vec![json!("mycache:/data")];
-        let resolved = make_resolved_with_volumes("app", svc_vols, top_vols);
+        top_vols.insert("mycache".to_string(), json!({"driver": "nfs"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
         let extras = vec![make_volume_spec("mycache")];
         assert!(
             validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
-            "short-form service volume entry must fail-closed"
+            "driver attribute is incompatible — must reject"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_rejected_when_base_has_external_field() {
+        // `external: true` survives the Compose deep-merge and would require the
+        // volume to pre-exist on first run, breaking fresh installs.  Must reject
+        // regardless of whether any base service references the key.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"external": true}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_err(),
+            "external base attribute survives merge — must reject"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_has_only_matching_name() {
+        // `{ name: mycache }` is redundant but not conflicting — after the merge
+        // cella's pin still produces the same literal name.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({"name": "mycache"}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "matching name-only base declaration is compatible"
+        );
+    }
+
+    #[test]
+    fn extra_named_volume_ok_when_base_has_bare_empty_object() {
+        // Bare `{}` carries no attributes that would survive the merge
+        // and conflict with cella's pin.
+        let mut top_vols = HashMap::new();
+        top_vols.insert("mycache".to_string(), json!({}));
+        let resolved = make_resolved_with_volumes("app", vec![], top_vols);
+        let extras = vec![make_volume_spec("mycache")];
+        assert!(
+            validate_extra_named_volumes_against_base(&resolved, &extras).is_ok(),
+            "bare empty-object declaration is compatible"
         );
     }
 
