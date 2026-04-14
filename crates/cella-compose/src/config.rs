@@ -27,7 +27,7 @@ pub struct ResolvedComposeConfig {
 }
 
 /// A single resolved service from the compose config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ResolvedService {
     /// Pre-built image reference (e.g., `node:18`).
     pub image: Option<String>,
@@ -51,6 +51,18 @@ pub struct ResolvedService {
     /// both compose forms without an exhaustive schema.
     #[serde(default)]
     pub depends_on: serde_json::Value,
+    /// Tmpfs mounts declared via the top-level `tmpfs:` service key.
+    /// May be a single string or an array of strings.
+    #[serde(default)]
+    pub tmpfs: serde_json::Value,
+    /// Config file mounts. Each entry is typically
+    /// `{source, target, uid, gid, mode}` (long form) or a plain string
+    /// name (short form). Kept as raw `serde_json::Value` to handle both.
+    #[serde(default)]
+    pub configs: Vec<serde_json::Value>,
+    /// Secret file mounts. Same shape as `configs`.
+    #[serde(default)]
+    pub secrets: Vec<serde_json::Value>,
 }
 
 /// Resolved build config for a compose service.
@@ -399,5 +411,23 @@ mod tests {
         let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
         let svc = config.services.get("app").unwrap();
         assert!(svc.depends_on.is_null());
+    }
+
+    #[test]
+    fn deserialize_tmpfs_and_configs_and_secrets() {
+        let json = r#"{
+            "services": {
+                "app": {
+                    "tmpfs": ["/run", "/var/tmp"],
+                    "configs": [{"source": "cfg", "target": "/etc/cfg"}],
+                    "secrets": ["secret-a"]
+                }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let svc = config.services.get("app").unwrap();
+        assert!(svc.tmpfs.is_array());
+        assert_eq!(svc.configs.len(), 1);
+        assert_eq!(svc.secrets.len(), 1);
     }
 }

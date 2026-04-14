@@ -320,9 +320,94 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
                 ));
             }
         }
+
+        // Checks 4 and 5 only apply to the primary service (same rationale as
+        // Check 3: sidecars run in their own container namespace).
+        if svc_name == primary_service {
+            check_primary_tmpfs_configs_secrets(svc, primary_service, agent_vol_target)?;
+        }
     }
 
     Ok(())
+}
+
+/// Check that the primary service does not declare `tmpfs`, `configs`, or
+/// `secrets` mounts with targets inside the reserved agent subtree.
+///
+/// These three service keys create file-system mounts that are distinct from
+/// `volumes:` and were not covered by the earlier volume-centric checks. An
+/// attacker could bypass the subtree guard with `tmpfs: ["/cella"]` or a
+/// config/secret whose default target resolves to `/cella`.
+///
+/// Extracted from [`validate_base_compose_against_reserved_agent`] to stay
+/// within clippy's `too_many_lines` limit.
+fn check_primary_tmpfs_configs_secrets(
+    svc: &cella_compose::config::ResolvedService,
+    primary_service: &str,
+    agent_vol_target: &str,
+) -> Result<(), String> {
+    // Check 4: tmpfs targets.
+    let tmpfs_targets: Vec<&str> = match &svc.tmpfs {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        _ => vec![],
+    };
+    for tgt in tmpfs_targets {
+        if is_descendant_or_equal(tgt, agent_vol_target) {
+            return Err(format!(
+                "primary service '{primary_service}' declares tmpfs target inside \
+                 reserved agent subtree '{agent_vol_target}': '{tgt}'"
+            ));
+        }
+    }
+
+    // Check 5: configs / secrets targets.
+    //
+    // Docker Compose maps configs and secrets as file mounts. The default
+    // target is `/<name>` when no explicit `target:` is given. A
+    // config/secret named "cella" would default to `/cella`, shadowing the
+    // agent.
+    for (field_name, entries) in [("configs", &svc.configs), ("secrets", &svc.secrets)] {
+        for entry in entries {
+            if let Some(tgt) = cs_entry_target(entry)
+                && is_descendant_or_equal(&tgt, agent_vol_target)
+            {
+                return Err(format!(
+                    "primary service '{primary_service}' declares {field_name} \
+                     target inside reserved agent subtree '{agent_vol_target}': \
+                     '{tgt}'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve the container target path for a single `configs` or `secrets` entry.
+///
+/// - Long-form object: uses the `target` field if present; falls back to
+///   `/<source>` (Docker Compose default when no target is specified).
+/// - Short-form string: the value is the config/secret name; the default
+///   target is `/<name>`.
+/// - Anything else: returns `None` (malformed; caller ignores it).
+fn cs_entry_target(entry: &serde_json::Value) -> Option<String> {
+    match entry {
+        serde_json::Value::Object(obj) => {
+            if let Some(tgt) = obj.get("target").and_then(|v| v.as_str()) {
+                return Some(tgt.to_string());
+            }
+            // No explicit target — fall back to /<source> (Docker Compose default).
+            obj.get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("/{s}"))
+        }
+        serde_json::Value::String(s) => {
+            // Short-form: value is the name; default target is /<name>.
+            Some(format!("/{s}"))
+        }
+        _ => None,
+    }
 }
 
 /// Return `true` if a base compose top-level volume declaration is compatible
@@ -577,12 +662,37 @@ fn check_extra_volume_against_base_services(
     Ok(())
 }
 
+/// Return `true` if `s` is a trailing mode-suffix token (or a comma-separated
+/// list of them) as recognised by Docker Compose.
+///
+/// Valid tokens per the Compose spec: `ro`, `rw`, `z`, `Z`, `cached`,
+/// `delegated`, `consistent`, `nocopy`. A suffix of `"ro,z"` or `"rw,Z"` is
+/// also recognised. The empty string is not a valid suffix.
+fn is_mode_suffix(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.split(',').all(|tok| {
+        matches!(
+            tok.trim(),
+            "ro" | "rw" | "z" | "Z" | "cached" | "delegated" | "consistent" | "nocopy"
+        )
+    })
+}
+
 /// Parse a short-form compose volume string into `(source, target)`.
 ///
 /// Forms:
 /// - `"/path"` → `(None, "/path")` — anonymous volume or bare target
+/// - `"/path:ro"` → `(None, "/path")` — anonymous volume with mode suffix
 /// - `"name:/path"` → `(Some("name"), "/path")` — named volume or bind
-/// - `"host:/container:opts"` → `(Some("host"), "/container")` — bind with opts
+/// - `"host:/container:ro"` → `(Some("host"), "/container")` — bind with mode
+/// - `"host:/container:rw,Z"` → `(Some("host"), "/container")` — combined modes
+///
+/// The algorithm strips a trailing `:MODES` suffix (where MODES is a
+/// comma-separated list of known mode tokens) before splitting on `:`.  This
+/// is necessary to correctly handle anonymous-volume forms like `"/cella:ro"`,
+/// which should parse as `(None, "/cella")` — not `(Some("/cella"), "ro")`.
 ///
 /// Returns `None` for malformed input (empty string or empty target path).
 ///
@@ -594,22 +704,36 @@ fn check_extra_volume_against_base_services(
 /// per its architecture documentation; Windows paths should not appear in
 /// practice.
 fn parse_short_form_volume(s: &str) -> Option<(Option<&str>, &str)> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    match parts.len() {
-        1 => {
-            // Anonymous volume or bare target (no colon).
-            if parts[0].is_empty() {
-                None
-            } else {
-                Some((None, parts[0]))
-            }
+    if s.is_empty() {
+        return None;
+    }
+
+    // Strip a trailing `:MODES` suffix when the tail after the last colon is a
+    // recognised mode token (or a comma-separated list of them).  This handles
+    // `"/cella:ro"` (→ anonymous at "/cella") and `"./host:/ctr:rw,Z"` (→
+    // bind, target "/ctr").  If the tail is not a mode token we leave `s`
+    // unchanged: the tail is the target, not a mode.
+    let stripped = s.rfind(':').map_or(s, |idx| {
+        let tail = &s[idx + 1..];
+        if is_mode_suffix(tail) { &s[..idx] } else { s }
+    });
+
+    if stripped.is_empty() {
+        return None;
+    }
+
+    // Remaining string is either `"target"` (anonymous / bare) or
+    // `"source:target"`.  Split on the first `:` only.
+    match stripped.split_once(':') {
+        None => {
+            // No colon left — anonymous volume or bare target.
+            Some((None, stripped))
         }
-        _ => {
-            // Has at least one colon — source:target[:opts].
-            if parts[1].is_empty() {
+        Some((src, tgt)) => {
+            if tgt.is_empty() {
                 None
             } else {
-                Some((Some(parts[0]), parts[1]))
+                Some((Some(src), tgt))
             }
         }
     }
@@ -702,6 +826,11 @@ pub fn dedup_against_base(
 /// Malformed entries (empty string, empty target) are silently skipped.
 /// Non-object, non-string entries are also silently skipped.
 ///
+/// In addition to `volumes`, the `tmpfs`, `configs`, and `secrets` service keys
+/// are also inspected. All three produce file-system mounts that occupy target
+/// paths — including them in the dedup set prevents cella-side mounts from
+/// silently overlapping base-compose-owned paths declared through those keys.
+///
 /// Does NOT recurse through `volumes_from` — primary-service `volumes_from` is
 /// rejected outright by [`validate_base_compose_against_reserved_agent`] (cella
 /// cannot opaquely validate mounts inherited through a `volumes_from` chain), so
@@ -716,6 +845,8 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> H
         return HashSet::new();
     };
     let mut out = HashSet::new();
+
+    // volumes (long-form objects and short-form strings)
     for entry in &svc.volumes {
         match entry {
             serde_json::Value::Object(obj) => {
@@ -736,6 +867,31 @@ fn extract_service_targets(resolved: &ResolvedComposeConfig, service: &str) -> H
             }
         }
     }
+
+    // tmpfs: string or array of strings
+    match &svc.tmpfs {
+        serde_json::Value::String(s) => {
+            out.insert(normalize_target(s).to_string());
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    out.insert(normalize_target(s).to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // configs and secrets: same target-resolution logic as cs_entry_target
+    for entries in [&svc.configs, &svc.secrets] {
+        for entry in entries {
+            if let Some(tgt) = cs_entry_target(entry) {
+                out.insert(normalize_target(&tgt).to_string());
+            }
+        }
+    }
+
     out
 }
 
@@ -951,6 +1107,7 @@ mod tests {
                 volumes,
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         ResolvedComposeConfig {
@@ -1020,6 +1177,7 @@ mod tests {
                 volumes: vec![json!({"type": "bind", "source": "x", "target": "/root/.claude"})],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1030,6 +1188,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1613,6 +1772,7 @@ mod tests {
                 volumes: svc_volumes,
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         ResolvedComposeConfig {
@@ -1714,6 +1874,7 @@ mod tests {
                 volumes: vec![], // clean primary
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1726,6 +1887,7 @@ mod tests {
                 ],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1759,6 +1921,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1771,6 +1934,7 @@ mod tests {
                 ],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1804,6 +1968,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1814,6 +1979,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("app")],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1843,6 +2009,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1853,6 +2020,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1863,6 +2031,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("db")],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1896,6 +2065,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -1908,6 +2078,7 @@ mod tests {
                 ],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1942,6 +2113,7 @@ mod tests {
                 volumes: vec![json!("cella-agent:/tmp/agent-rw")],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -1975,6 +2147,7 @@ mod tests {
                 volumes: vec![json!("./cella-agent:/data")],
                 volumes_from: vec![],
                 depends_on: serde_json::Value::default(),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2009,6 +2182,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!(["db"]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2019,6 +2193,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!(["cache"]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2029,6 +2204,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2039,6 +2215,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2067,6 +2244,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2077,6 +2255,7 @@ mod tests {
                 volumes: vec![json!({"type": "volume", "source": "cella-agent", "target": "/x"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2108,6 +2287,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2118,6 +2298,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("app:ro")],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2148,6 +2329,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2158,6 +2340,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("app")], // no mode = rw
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2196,6 +2379,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2206,6 +2390,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2239,6 +2424,7 @@ mod tests {
                 volumes: vec![json!({"type": "bind", "source": "/host", "target": "/cella/foo"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2249,6 +2435,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("helper")],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2279,6 +2466,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2289,6 +2477,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!({"source": "app", "read_only": true})],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2319,6 +2508,7 @@ mod tests {
                 volumes: vec![json!({"type": "bind", "source": "cella-agent", "target": "/data"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2726,6 +2916,7 @@ mod tests {
                 volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2760,6 +2951,7 @@ mod tests {
                 volumes: vec![json!({"type": "volume", "source": "mycache", "target": "/data"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let mut top_vols = HashMap::new();
@@ -2795,6 +2987,7 @@ mod tests {
                 volumes: vec![json!({"type": "bind", "source": "./mycache", "target": "/data"})],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2832,6 +3025,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2842,6 +3036,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("container:other-project-primary")],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2870,6 +3065,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         services.insert(
@@ -2880,6 +3076,7 @@ mod tests {
                 volumes: vec![],
                 volumes_from: vec![json!("container:external-container:ro")],
                 depends_on: json!([]),
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -2952,5 +3149,333 @@ mod tests {
         resolve_bind_sources(&mut specs, ws);
         assert_eq!(specs[0].source, ""); // tmpfs source unchanged
         assert_eq!(specs[1].source, "mycache"); // volume source unchanged (it's a name, not path)
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-14 Finding 2: parse_short_form_volume with mode suffix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_short_form_anonymous_with_mode_suffix() {
+        // `/cella:ro` → anonymous volume at /cella, not source=/cella target=ro
+        let (src, tgt) = parse_short_form_volume("/cella:ro").unwrap();
+        assert_eq!(src, None);
+        assert_eq!(tgt, "/cella");
+    }
+
+    #[test]
+    fn parse_short_form_source_target_with_mode() {
+        let (src, tgt) = parse_short_form_volume("./host:/container:ro").unwrap();
+        assert_eq!(src, Some("./host"));
+        assert_eq!(tgt, "/container");
+    }
+
+    #[test]
+    fn parse_short_form_anonymous_with_combined_modes() {
+        let (src, tgt) = parse_short_form_volume("/data:rw,Z").unwrap();
+        assert_eq!(src, None);
+        assert_eq!(tgt, "/data");
+    }
+
+    #[test]
+    fn parse_short_form_named_volume_without_mode() {
+        let (src, tgt) = parse_short_form_volume("mycache:/data").unwrap();
+        assert_eq!(src, Some("mycache"));
+        assert_eq!(tgt, "/data");
+    }
+
+    #[test]
+    fn parse_short_form_absolute_host_with_container() {
+        let (src, tgt) = parse_short_form_volume("/host:/container").unwrap();
+        assert_eq!(src, Some("/host"));
+        assert_eq!(tgt, "/container");
+    }
+
+    #[test]
+    fn parse_short_form_nocopy_mode_suffix() {
+        // nocopy is a valid Compose volume option
+        let (src, tgt) = parse_short_form_volume("/data:nocopy").unwrap();
+        assert_eq!(src, None);
+        assert_eq!(tgt, "/data");
+    }
+
+    #[test]
+    fn validator_rejects_anonymous_volume_at_reserved_subtree_with_mode() {
+        // Regression for the parser fix: `/cella:ro` is anonymous at /cella —
+        // the old parser misread it as source=/cella, target=ro and missed the
+        // reserved-subtree check. Must now be rejected.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!("/cella:ro")],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "anonymous volume at /cella with :ro suffix must be rejected; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-14 Finding 1: tmpfs / configs / secrets validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validator_rejects_primary_tmpfs_inside_cella_subtree() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                tmpfs: json!(["/cella"]),
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(result.is_err(), "tmpfs at /cella must be rejected");
+    }
+
+    #[test]
+    fn validator_rejects_primary_tmpfs_string_form_inside_cella_subtree() {
+        // tmpfs: "/cella" (single string, not array)
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                tmpfs: json!("/cella"),
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "string-form tmpfs at /cella must be rejected"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_primary_config_inside_cella_subtree() {
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                configs: vec![json!({"source": "x", "target": "/cella/override"})],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "config target inside /cella must be rejected"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_primary_config_default_target_inside_cella_subtree() {
+        // No explicit target — default is /<source>. Source "cella" → target "/cella".
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                configs: vec![json!({"source": "cella"})],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "config with source=cella and default target /cella must be rejected"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_primary_secret_shortform_inside_cella_subtree() {
+        // Short-form `secrets: ["cella"]` → default target /cella
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                secrets: vec![json!("cella")],
+                ..ResolvedService::default()
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "secret short-form defaulting to /cella must be rejected"
+        );
+    }
+
+    #[test]
+    fn validator_ignores_non_primary_tmpfs_configs_secrets() {
+        // Subtree protection applies only to the primary service. Sidecar's own
+        // /cella paths run in a different container namespace and cannot shadow
+        // the primary's agent volume.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                ..ResolvedService::default()
+            },
+        );
+        services.insert(
+            "sidecar".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                tmpfs: json!(["/cella"]),
+                configs: vec![json!({"source": "x", "target": "/cella/cfg"})],
+                secrets: vec![json!("cella")],
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "sidecar /cella tmpfs/configs/secrets must not be a primary-service bypass; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn extract_targets_includes_tmpfs_and_configs_and_secrets() {
+        // dedup_against_base must account for base-compose paths from all mount
+        // keys, not just `volumes`.
+        let mut services = HashMap::new();
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+                tmpfs: json!(["/run", "/var/tmp"]),
+                configs: vec![json!({"source": "cfg", "target": "/etc/cfg"})],
+                secrets: vec![json!("mysecret")], // default target: /mysecret
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        // Candidates that overlap with tmpfs / config / secret targets must be
+        // dropped by dedup_against_base.
+        let candidates = vec![
+            MountSpec::bind("/x", "/run"),      // overlaps tmpfs target
+            MountSpec::bind("/y", "/etc/cfg"),  // overlaps config target
+            MountSpec::bind("/z", "/mysecret"), // overlaps secret default target
+            MountSpec::bind("/w", "/other"),    // no overlap — must survive
+        ];
+        let result = dedup_against_base(&resolved, "app", candidates).unwrap();
+        assert_eq!(result.len(), 1, "only /other must survive; got: {result:?}");
+        assert_eq!(result[0].target, "/other");
     }
 }
