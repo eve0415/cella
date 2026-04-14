@@ -95,10 +95,16 @@ fn compute_service_closure<'a>(
     run_services: Option<&'a [String]>,
 ) -> HashSet<&'a str> {
     let mut closure: HashSet<&str> = HashSet::new();
-    let mut stack: Vec<&str> = run_services.map_or_else(
-        || resolved.services.keys().map(String::as_str).collect(),
-        |list| list.iter().map(String::as_str).collect(),
-    );
+    // Empty list and None both mean "all services" — compose starts everything
+    // in that case (compose starts ALL services when no service list is given,
+    // and `ComposeCommand::up()` emits no service args for an empty list, which
+    // has the same effect). Treat them identically.
+    let seeds: Vec<&str> = if run_services.is_none_or(<[String]>::is_empty) {
+        resolved.services.keys().map(String::as_str).collect()
+    } else {
+        run_services.unwrap().iter().map(String::as_str).collect()
+    };
+    let mut stack: Vec<&str> = seeds;
     while let Some(name) = stack.pop() {
         if !closure.insert(name) {
             continue;
@@ -117,7 +123,7 @@ fn compute_service_closure<'a>(
 /// Validate that the user's base compose config does not alias the managed
 /// agent volume in any service that compose will actually start.
 ///
-/// Four aliasing patterns are checked across services in the computed closure:
+/// Five aliasing patterns are checked across services in the computed closure:
 ///
 /// 1. **Source alias** — a service volume entry of type `volume` whose
 ///    `source` matches `agent_vol_name` exactly. Docker would mount the same
@@ -145,10 +151,18 @@ fn compute_service_closure<'a>(
 ///    read-only protection. Read-only inheritance (`svc:ro` or
 ///    `read_only: true`) is safe and allowed.
 ///
+/// 5. **Primary service `volumes_from` any source** — if the primary service
+///    itself has any `volumes_from` entries, cella cannot validate what mounts
+///    those sources carry into the primary's namespace (they may include paths
+///    under `agent_vol_target` that bypass the subtree check above). The
+///    primary service's `volumes_from` is therefore rejected outright. Use
+///    explicit `volumes:` entries instead.
+///
 /// Only services in the `run_services` + transitive `depends_on` closure are
 /// inspected. When `run_services` is `None` (no filter — compose starts
-/// everything), all services are validated. Unrelated utility services not
-/// reachable from the explicit service list are skipped.
+/// everything) or an empty list (same effect: compose starts all services),
+/// all services are validated. Unrelated utility services not reachable from
+/// the explicit service list are skipped.
 ///
 /// Returns `Ok(())` when the config is clean, or `Err(message)` with a
 /// human-readable description of what was rejected.
@@ -217,6 +231,22 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         // runtime. Only writable inheritance from the primary service bypasses
         // cella's read-only agent protection.
         check_volumes_from(svc_name, svc, primary_service)?;
+
+        // Check 0.1: the PRIMARY service must not use volumes_from at all.
+        // If the primary inherits volumes from another service, any mounts that
+        // service declares under the reserved agent subtree (agent_vol_target)
+        // are silently inherited into the primary's namespace — cella cannot
+        // validate them without recursing into every possible chain. Rejecting
+        // primary volumes_from outright is the safe, simple rule: the user can
+        // always replace volumes_from with explicit `volumes:` entries.
+        if svc_name == primary_service && !svc.volumes_from.is_empty() {
+            return Err(format!(
+                "primary service '{primary_service}' uses volumes_from, which can inherit \
+                 mounts into the reserved agent subtree '{agent_vol_target}' without cella \
+                 being able to validate them. Explicitly list all primary-service mounts \
+                 under `volumes:` instead.",
+            ));
+        }
 
         for entry in &svc.volumes {
             let (mount_type, source, target) = match entry {
@@ -671,6 +701,12 @@ pub fn dedup_against_base(
 /// strings are parsed by [`parse_short_form_volume`] to extract the target.
 /// Malformed entries (empty string, empty target) are silently skipped.
 /// Non-object, non-string entries are also silently skipped.
+///
+/// Does NOT recurse through `volumes_from` — primary-service `volumes_from` is
+/// rejected outright by [`validate_base_compose_against_reserved_agent`] (cella
+/// cannot opaquely validate mounts inherited through a `volumes_from` chain), so
+/// by the time this function runs there are no inherited targets on the primary
+/// to account for.
 ///
 /// `docker compose config --format json` normalises volume entries to long-form
 /// objects on most Compose versions, but some versions still emit short-form
@@ -2138,6 +2174,97 @@ mod tests {
         assert!(
             result.is_err(),
             "writable volumes_from on primary must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-13 findings: empty runServices + primary volumes_from rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn closure_with_empty_run_services_includes_all() {
+        // Some(vec![]) must be treated identically to None: compose starts ALL
+        // services when no service args are passed, which is what an empty list
+        // produces via ComposeCommand::up(). The validation closure must cover
+        // every service to avoid bypassing security checks via an empty list.
+        let mut services = HashMap::new();
+        services.insert(
+            "a".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "b".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let empty: Vec<String> = Vec::new();
+        let closure = compute_service_closure(&resolved, Some(&empty));
+        assert!(
+            closure.contains("a"),
+            "empty run_services must include service 'a'"
+        );
+        assert!(
+            closure.contains("b"),
+            "empty run_services must include service 'b'"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_primary_volumes_from_any_service() {
+        // primary volumes_from must be rejected regardless of what the target
+        // service mounts, because cella cannot validate inherited mounts under
+        // the reserved agent subtree. Even a "safe-looking" helper with an
+        // /cella/foo bind would slip through if we only check primary volumes.
+        let mut services = HashMap::new();
+        services.insert(
+            "helper".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![json!({"type": "bind", "source": "/host", "target": "/cella/foo"})],
+                volumes_from: vec![],
+                depends_on: json!([]),
+            },
+        );
+        services.insert(
+            "app".to_string(),
+            ResolvedService {
+                image: None,
+                build: None,
+                volumes: vec![],
+                volumes_from: vec![json!("helper")],
+                depends_on: json!([]),
+            },
+        );
+        let resolved = ResolvedComposeConfig {
+            services,
+            volumes: HashMap::new(),
+        };
+        let result = validate_base_compose_against_reserved_agent(
+            &resolved,
+            "cella-agent",
+            "/cella",
+            "app",
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "primary volumes_from must be rejected to prevent subtree bypass"
         );
     }
 
