@@ -346,7 +346,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
         // Checks 4 and 5 only apply to the primary service (same rationale as
         // Check 3: sidecars run in their own container namespace).
         if svc_name == primary_service {
-            check_primary_tmpfs_configs_secrets(svc, primary_service, agent_vol_target)?;
+            check_primary_non_volume_mount_targets(svc, primary_service, agent_vol_target)?;
         }
     }
 
@@ -363,7 +363,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 ///
 /// Extracted from [`validate_base_compose_against_reserved_agent`] to stay
 /// within clippy's `too_many_lines` limit.
-fn check_primary_tmpfs_configs_secrets(
+fn check_primary_non_volume_mount_targets(
     svc: &cella_compose::config::ResolvedService,
     primary_service: &str,
     agent_vol_target: &str,
