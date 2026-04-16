@@ -422,6 +422,10 @@ fn is_binary_newer_than(daemon_started_at: u64) -> bool {
 }
 
 /// Shut down the old daemon and start a fresh one, then re-register containers.
+///
+/// Order is load-bearing: `.daemon_addr` must be written BEFORE agents are
+/// restarted, because restarted agents read this file on startup via
+/// `read_daemon_addr_file()`.
 async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Path) {
     use cella_daemon::daemon;
 
@@ -434,9 +438,23 @@ async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Pat
 
     wait_for_socket(socket_path).await;
 
-    if let Err(e) = re_register_containers(socket_path).await {
+    // Construct a single client for all post-restart operations.
+    let Ok(client) = crate::backend::BackendArgs::default()
+        .resolve_client()
+        .await
+    else {
+        warn!("Failed to resolve container backend after daemon restart");
+        return;
+    };
+
+    // Update the shared-volume address file so agents can discover the new daemon.
+    up::write_daemon_addr_to_volume(&*client).await;
+
+    if let Err(e) = re_register_containers(socket_path, &*client).await {
         warn!("Failed to re-register containers after restart: {e}");
     }
+
+    restart_agents_in_all_containers(&*client).await;
 }
 
 /// Send shutdown request and wait for the old daemon to exit.
@@ -477,12 +495,10 @@ async fn wait_for_socket(socket_path: &std::path::Path) {
 /// Re-register all running cella containers with the daemon.
 async fn re_register_containers(
     socket_path: &std::path::Path,
+    client: &dyn cella_backend::ContainerBackend,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use cella_protocol::ManagementRequest;
 
-    let client = crate::backend::BackendArgs::default()
-        .resolve_client()
-        .await?;
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
@@ -524,6 +540,18 @@ async fn re_register_containers(
     }
 
     Ok(())
+}
+
+/// Restart agents in all running cella containers so they reconnect to the new daemon.
+async fn restart_agents_in_all_containers(client: &dyn cella_backend::ContainerBackend) {
+    let Ok(containers) = client.list_cella_containers(true).await else {
+        warn!("Failed to list containers for agent restart");
+        return;
+    };
+
+    for container in &containers {
+        cella_orchestrator::up::restart_agent_in_container(client, &container.id).await;
+    }
 }
 
 #[cfg(test)]
