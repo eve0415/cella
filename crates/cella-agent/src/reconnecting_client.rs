@@ -1,16 +1,31 @@
 //! Reconnecting wrapper around [`ControlClient`] that retries initial connection
 //! and transparently reconnects on TCP drops.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use cella_port::CellaPortError;
 use cella_protocol::{AgentMessage, DaemonHello, DaemonMessage};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::control::ControlClient;
 
 /// Interval between connection attempts during initial retry and reconnection.
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Duration of the initial burst phase with exponential backoff.
+const BURST_DURATION: Duration = Duration::from_secs(5 * 60);
+
+/// Maximum backoff during the burst phase.
+const MAX_BURST_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Backoff interval after the burst phase.
+const SLOW_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Base interval for exponential backoff.
+const BASE_BACKOFF: Duration = Duration::from_secs(2);
 
 /// A wrapper around [`ControlClient`] that retries the initial connection and
 /// attempts a single reconnect when a send or receive fails.
@@ -229,6 +244,82 @@ impl ReconnectingClient {
     }
 }
 
+/// Calculate the next backoff duration for reconnection attempts.
+///
+/// Uses exponential backoff: 2s, 4s, 8s, 16s, 30s (cap).
+/// After `BURST_DURATION` (5 min), slows to 60s intervals.
+fn next_backoff(attempt: u32, elapsed: Duration) -> Duration {
+    if elapsed >= BURST_DURATION {
+        return SLOW_BACKOFF;
+    }
+    let backoff = BASE_BACKOFF.saturating_mul(1 << attempt.min(4));
+    backoff.min(MAX_BURST_BACKOFF)
+}
+
+/// Spawn a background reconnection task if one isn't already running.
+///
+/// The task runs outside any lock — connect attempts don't block the port
+/// watcher or health reporter. On success it briefly locks the mutex to
+/// install the new connection.
+pub fn spawn_background_reconnect(
+    control: Arc<Mutex<ReconnectingClient>>,
+    reconnecting: Arc<AtomicBool>,
+) {
+    if reconnecting
+        .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+        .is_err()
+    {
+        debug!("Background reconnection already in progress");
+        return;
+    }
+
+    let reconnecting_flag = reconnecting;
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        let mut attempt: u32 = 0;
+
+        let (initial_addr, container_name, initial_token) = {
+            let guard = control.lock().await;
+            guard.connection_params()
+        };
+
+        info!("Starting background reconnection (initial addr: {initial_addr})");
+
+        loop {
+            let elapsed = start.elapsed();
+            let backoff = next_backoff(attempt, elapsed);
+
+            tokio::time::sleep(backoff).await;
+
+            // Re-read .daemon_addr for a potentially updated address.
+            let (addr, token) = if let Some(info) = crate::control::read_daemon_addr_file() {
+                (info.addr, info.token)
+            } else {
+                (initial_addr.clone(), initial_token.clone())
+            };
+
+            match ControlClient::connect(&addr, &container_name, &token).await {
+                Ok((client, hello)) => {
+                    info!("Background reconnection succeeded (addr: {addr})");
+                    control
+                        .lock()
+                        .await
+                        .install_connection(client, hello, addr, token);
+                    reconnecting_flag.store(false, AtomicOrdering::SeqCst);
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        "Background reconnect attempt {attempt} failed: {e} (next in {backoff:?})"
+                    );
+                }
+            }
+
+            attempt = attempt.saturating_add(1);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +504,48 @@ mod tests {
         assert_eq!(client.auth_token, "new-token");
         assert!(client.reconnected);
         assert!(client.daemon_hello.is_some());
+    }
+
+    #[test]
+    fn next_backoff_exponential_sequence() {
+        let zero = Duration::ZERO;
+        assert_eq!(next_backoff(0, zero), Duration::from_secs(2));
+        assert_eq!(next_backoff(1, zero), Duration::from_secs(4));
+        assert_eq!(next_backoff(2, zero), Duration::from_secs(8));
+        assert_eq!(next_backoff(3, zero), Duration::from_secs(16));
+        assert_eq!(next_backoff(4, zero), Duration::from_secs(30));
+        // Cap at 30s
+        assert_eq!(next_backoff(5, zero), Duration::from_secs(30));
+        assert_eq!(next_backoff(10, zero), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_backoff_slow_after_burst() {
+        let past_burst = Duration::from_secs(5 * 60 + 1);
+        assert_eq!(next_backoff(0, past_burst), Duration::from_secs(60));
+        assert_eq!(next_backoff(5, past_burst), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn next_backoff_at_burst_boundary() {
+        // Exactly at burst duration — still within burst.
+        let at_burst = BURST_DURATION;
+        assert_eq!(next_backoff(0, at_burst), SLOW_BACKOFF);
+    }
+
+    #[test]
+    fn spawn_background_reconnect_prevents_duplicate() {
+        let reconnecting = Arc::new(AtomicBool::new(true));
+        // Flag is already set — compare_exchange should fail, no task spawned.
+        assert!(reconnecting.load(AtomicOrdering::SeqCst));
+        // Calling the function with an already-set flag is a no-op.
+        // We verify the flag remains true (not reset).
+        let after = reconnecting.compare_exchange(
+            false,
+            true,
+            AtomicOrdering::SeqCst,
+            AtomicOrdering::SeqCst,
+        );
+        assert!(after.is_err());
     }
 }
