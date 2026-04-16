@@ -448,13 +448,20 @@ async fn restart_daemon(pid_path: &std::path::Path, socket_path: &std::path::Pat
     };
 
     // Update the shared-volume address file so agents can discover the new daemon.
-    up::write_daemon_addr_to_volume(&*client).await;
+    // Only restart agents if the write succeeded — restarting with a stale
+    // .daemon_addr would put agents into standalone mode permanently, which is
+    // worse than leaving the existing process with its background retry loop.
+    let addr_updated = up::write_daemon_addr_to_volume(&*client).await;
 
     if let Err(e) = re_register_containers(socket_path, &*client).await {
         warn!("Failed to re-register containers after restart: {e}");
     }
 
-    restart_agents_in_all_containers(&*client).await;
+    if addr_updated {
+        restart_agents_in_all_containers(&*client).await;
+    } else {
+        warn!("Skipping agent restart: .daemon_addr was not updated");
+    }
 }
 
 /// Send shutdown request and wait for the old daemon to exit.
