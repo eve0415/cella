@@ -953,12 +953,14 @@ async fn setup_plugin_manifests(
 /// Queries the daemon for its current control port and auth token, then
 /// writes them to `/cella/.daemon_addr` on the volume so agents can
 /// discover the daemon on startup and reconnect after restarts.
-async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
+///
+/// Returns `true` if the file was written successfully.
+pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool {
     let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
-        return;
+        return false;
     };
     if !mgmt_sock.exists() {
-        return;
+        return false;
     }
 
     let Ok(cella_protocol::ManagementResponse::Status {
@@ -972,14 +974,16 @@ async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
     .await
     else {
         warn!("Failed to query daemon status for .daemon_addr write");
-        return;
+        return false;
     };
 
     let gateway = client.host_gateway();
     let addr = format!("{gateway}:{control_port}");
     if let Err(e) = client.write_agent_addr("", &addr, &control_token).await {
         warn!("Failed to write .daemon_addr to agent volume: {e}");
+        return false;
     }
+    true
 }
 
 #[cfg(test)]

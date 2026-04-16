@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::port_proxy;
-use crate::reconnecting_client::ReconnectingClient;
+use crate::reconnecting_client::{self, ReconnectingClient};
 
 /// Port mappings from daemon (`container_port` → `host_port`).
 pub type PortMap = Arc<Mutex<HashMap<u16, u16>>>;
@@ -126,8 +126,9 @@ async fn send_port_open_and_record(
     listener: &DetectedListener,
     process: Option<String>,
     agent_proxy_port: Option<u16>,
-    control: &Mutex<ReconnectingClient>,
+    control: &Arc<Mutex<ReconnectingClient>>,
     port_map: &PortMap,
+    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     let msg = AgentMessage::PortOpen {
         port: listener.port,
@@ -140,6 +141,8 @@ async fn send_port_open_and_record(
     let mut ctrl = control.lock().await;
     if let Err(e) = ctrl.send(&msg).await {
         warn!("Failed to report port open: {e}");
+        drop(ctrl);
+        reconnecting_client::spawn_background_reconnect(control.clone(), reconnecting.clone());
         return false;
     }
 
@@ -155,10 +158,11 @@ async fn send_port_open_and_record(
 /// Returns `true` if the listener was successfully reported and should be tracked.
 async fn handle_new_listener(
     listener: &DetectedListener,
-    control: &Mutex<ReconnectingClient>,
+    control: &Arc<Mutex<ReconnectingClient>>,
     port_map: &PortMap,
     proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
     proxy_ports: &mut HashMap<u16, u16>,
+    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     let process = cella_port::detection::process_name_for_inode(listener.inode);
     info!(
@@ -168,17 +172,26 @@ async fn handle_new_listener(
 
     let agent_proxy_port = maybe_start_localhost_proxy(listener, proxy_handles, proxy_ports).await;
 
-    send_port_open_and_record(listener, process, agent_proxy_port, control, port_map).await
+    send_port_open_and_record(
+        listener,
+        process,
+        agent_proxy_port,
+        control,
+        port_map,
+        reconnecting,
+    )
+    .await
 }
 
 /// Handle a single closed listener: report to daemon and clean up proxies.
 async fn handle_closed_listener(
     key: (u16, PortProtocol),
-    control: &Mutex<ReconnectingClient>,
+    control: &Arc<Mutex<ReconnectingClient>>,
     ports_detected: &AtomicUsize,
     port_map: &PortMap,
     proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
     proxy_ports: &mut HashMap<u16, u16>,
+    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     info!("Listener closed: port {} ({:?})", key.0, key.1);
 
@@ -190,6 +203,8 @@ async fn handle_closed_listener(
         let mut ctrl = control.lock().await;
         if let Err(e) = ctrl.send(&msg).await {
             warn!("Failed to report port closed: {e}");
+            drop(ctrl);
+            reconnecting_client::spawn_background_reconnect(control.clone(), reconnecting.clone());
         } else {
             ports_detected.fetch_sub(1, Ordering::Relaxed);
             port_map.lock().await.remove(&key.0);
@@ -221,6 +236,7 @@ pub async fn run(
     control: Arc<Mutex<ReconnectingClient>>,
     ports_detected: Arc<AtomicUsize>,
     port_map: PortMap,
+    reconnecting: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let proc_path = Path::new("/proc");
     let mut known: HashMap<(u16, PortProtocol), DetectedListener> = HashMap::new();
@@ -250,6 +266,7 @@ pub async fn run(
                 &port_map,
                 &mut proxy_handles,
                 &mut proxy_ports,
+                &reconnecting,
             )
             .await;
 
@@ -271,6 +288,7 @@ pub async fn run(
                 &port_map,
                 &mut proxy_handles,
                 &mut proxy_ports,
+                &reconnecting,
             )
             .await;
         }

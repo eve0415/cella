@@ -1470,7 +1470,7 @@ pub async fn ensure_up(
 /// if nothing came back. This avoids double-launching the daemon on
 /// containers with the restart loop while remaining backward compatible
 /// with containers created before it was introduced.
-async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
+pub async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
     let agent_path = "/cella/bin/cella-agent";
     // Kill the daemon, wait for the restart loop (if any) to bring it back,
     // then spawn only if no daemon process is running.

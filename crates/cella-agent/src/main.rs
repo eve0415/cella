@@ -171,12 +171,11 @@ async fn main() {
     }
 }
 
-async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
-    let poll_interval = Duration::from_millis(poll_interval_ms);
-    let connect_timeout = Duration::from_secs(30);
-
-    // Start forward proxy if config is provided (via CLI arg or env var).
-    // CELLA_NO_NETWORK_RULES=1 disables rule enforcement at runtime.
+/// Resolve and start the forward proxy if configured.
+///
+/// Checks `CELLA_NO_NETWORK_RULES`, then falls back to the CLI arg or
+/// `CELLA_PROXY_CONFIG` env var.
+async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
     let rules_disabled = std::env::var("CELLA_NO_NETWORK_RULES")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let proxy_json = if rules_disabled {
@@ -186,7 +185,6 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         proxy_config_json.or_else(|| {
             let val = std::env::var("CELLA_PROXY_CONFIG").ok()?;
             if val.starts_with('/') {
-                // File path — read the config from disk (contains sensitive CA key).
                 match std::fs::read_to_string(&val) {
                     Ok(content) => Some(content),
                     Err(e) => {
@@ -195,7 +193,6 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
                     }
                 }
             } else {
-                // Raw JSON (legacy / direct injection).
                 Some(val)
             }
         })
@@ -205,19 +202,20 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
             Ok(config) => {
                 let config = std::sync::Arc::new(config);
                 match forward_proxy::start_forward_proxy(config).await {
-                    Ok(_handle) => {
-                        info!("Forward proxy started");
-                    }
-                    Err(e) => {
-                        error!("Failed to start forward proxy: {e}");
-                    }
+                    Ok(_handle) => info!("Forward proxy started"),
+                    Err(e) => error!("Failed to start forward proxy: {e}"),
                 }
             }
-            Err(e) => {
-                error!("Invalid proxy config: {e}");
-            }
+            Err(e) => error!("Invalid proxy config: {e}"),
         }
     }
+}
+
+async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+    let connect_timeout = Duration::from_secs(30);
+
+    maybe_start_forward_proxy(proxy_config_json).await;
 
     // Read connection info: .daemon_addr file is authoritative (updated on
     // every `cella up`), env vars are fallback (may be stale after restart).
@@ -250,16 +248,18 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     }
 
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+    let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = std::time::Instant::now();
     let ports_detected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Spawn port watcher
     let ctrl = control.clone();
     let pd = ports_detected.clone();
+    let rc = reconnecting.clone();
     let pm: port_watcher::PortMap =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let watcher_handle = tokio::spawn(async move {
-        port_watcher::run(poll_interval, ctrl, pd, pm).await;
+        port_watcher::run(poll_interval, ctrl, pd, pm, rc).await;
     });
 
     // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
@@ -271,6 +271,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     // Spawn health reporter
     let ctrl = control.clone();
     let pd = ports_detected.clone();
+    let rc = reconnecting.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -283,6 +284,8 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
             let mut c = ctrl.lock().await;
             if let Err(e) = c.send(&msg).await {
                 tracing::warn!("Health report failed: {e}");
+                drop(c);
+                reconnecting_client::spawn_background_reconnect(ctrl.clone(), rc.clone());
             }
         }
     });
