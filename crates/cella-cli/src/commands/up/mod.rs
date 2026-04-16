@@ -953,7 +953,7 @@ async fn setup_plugin_manifests(
 /// Queries the daemon for its current control port and auth token, then
 /// writes them to `/cella/.daemon_addr` on the volume so agents can
 /// discover the daemon on startup and reconnect after restarts.
-async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
+pub(crate) async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) {
     let Some(mgmt_sock) = cella_env::paths::daemon_socket_path() else {
         return;
     };
