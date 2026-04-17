@@ -250,6 +250,11 @@ where
         message: format!("hello flush error: {e}"),
     })?;
 
+    agent_state.connected.store(true, Ordering::Relaxed);
+    agent_state
+        .last_seen_secs
+        .store(current_time_secs(), Ordering::Relaxed);
+
     let workspace_path = hello.workspace_path.clone();
 
     Ok(Some(HandshakeResult {
@@ -498,7 +503,6 @@ pub(crate) async fn handle_agent_message(
     ctx: &AgentHandlerContext<'_>,
     agent_state: &Arc<AgentConnectionState>,
 ) -> Option<DaemonMessage> {
-    agent_state.connected.store(true, Ordering::Relaxed);
     agent_state
         .last_seen_secs
         .store(current_time_secs(), Ordering::Relaxed);
@@ -2228,6 +2232,198 @@ mod tests {
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
     }
 
+    // -- perform_handshake --
+
+    fn test_control_context(
+        handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+        auth_token: &str,
+    ) -> ControlContext {
+        let (proxy_tx, _proxy_rx) = tokio::sync::mpsc::channel(16);
+        ControlContext {
+            auth_token: auth_token.to_string(),
+            port_manager: Arc::new(Mutex::new(PortManager::new(false))),
+            browser_handler: Arc::new(BrowserHandler::new()),
+            container_handles: handles,
+            proxy_cmd_tx: proxy_tx,
+            task_manager: crate::task_manager::new_shared(),
+            cella_bin: std::path::PathBuf::from("/nonexistent"),
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_marks_connected_without_follow_up_message() {
+        use tokio::io::AsyncWriteExt;
+
+        let agent_state = Arc::new(AgentConnectionState::new());
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "test-container".to_string(),
+                ContainerHandle {
+                    container_id: "container-id-123".to_string(),
+                    agent_state: agent_state.clone(),
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles, "test-token");
+
+        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
+        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
+        let mut daemon_reader = BufReader::new(daemon_r);
+
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "test-container".to_string(),
+            auth_token: "test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        agent_side.write_all(json.as_bytes()).await.unwrap();
+        agent_side.flush().await.unwrap();
+
+        assert!(
+            !agent_state.connected.load(Ordering::Relaxed),
+            "pre-condition: connected starts false"
+        );
+
+        let mut line = String::new();
+        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+
+        let hs = result
+            .expect("handshake should not error")
+            .expect("handshake should return Some");
+        assert_eq!(hs.container_name, "test-container");
+        assert!(
+            agent_state.connected.load(Ordering::Relaxed),
+            "connected must be true immediately after handshake, before any message"
+        );
+        assert_ne!(
+            agent_state.last_seen_secs.load(Ordering::Relaxed),
+            0,
+            "last_seen_secs must be set on handshake"
+        );
+        assert_eq!(
+            agent_state.agent_version.lock().unwrap().as_deref(),
+            Some("0.0.28"),
+            "agent_version must be recorded from AgentHello"
+        );
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn control_server_marks_connected_via_real_tcp_handshake() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let agent_state = Arc::new(AgentConnectionState::new());
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "int-test-container".to_string(),
+                ContainerHandle {
+                    container_id: "int-container-id".to_string(),
+                    agent_state: agent_state.clone(),
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles, "int-test-token");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let last_activity = Arc::new(AtomicU64::new(0));
+        let la = last_activity.clone();
+        let server = tokio::spawn(async move {
+            run_control_server(listener, ctx, la, shutdown_rx).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "int-test-container".to_string(),
+            auth_token: "int-test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stream);
+        let mut daemon_resp = String::new();
+        reader.read_line(&mut daemon_resp).await.unwrap();
+        let daemon_hello: DaemonHello = serde_json::from_str(daemon_resp.trim()).unwrap();
+        assert!(
+            daemon_hello.error.is_none(),
+            "daemon rejected handshake: {:?}",
+            daemon_hello.error
+        );
+
+        let start = std::time::Instant::now();
+        while !agent_state.connected.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() <= std::time::Duration::from_secs(1),
+                "agent_state.connected never became true within 1s of handshake"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_ne!(
+            agent_state.last_seen_secs.load(Ordering::Relaxed),
+            0,
+            "last_seen_secs should be updated at handshake"
+        );
+        assert_eq!(
+            agent_state.agent_version.lock().unwrap().as_deref(),
+            Some("0.0.28"),
+        );
+
+        drop(stream);
+        let _ = shutdown_tx.send(true);
+        // Nudge the listener so the select! observes the shutdown.
+        let _ = TcpStream::connect(addr).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server).await;
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_unknown_container_does_not_mark_connected() {
+        use tokio::io::AsyncWriteExt;
+
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = test_control_context(handles, "test-token");
+
+        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
+        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
+        let mut daemon_reader = BufReader::new(daemon_r);
+
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "not-registered".to_string(),
+            auth_token: "test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        agent_side.write_all(json.as_bytes()).await.unwrap();
+        agent_side.flush().await.unwrap();
+
+        let mut line = String::new();
+        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "handshake must reject and return Ok(None) for unknown container"
+        );
+    }
+
     // ---------------------------------------------------------------
     // extract_port
     // ---------------------------------------------------------------
@@ -2726,6 +2922,8 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
         let state = Arc::new(AgentConnectionState::new());
+        // Post-handshake invariant: connected is owned by perform_handshake.
+        state.connected.store(true, Ordering::Relaxed);
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
@@ -2740,7 +2938,6 @@ branch refs/heads/feat-b
         };
         let result = handle_agent_message(msg, &ctx, &state).await;
         assert!(result.is_none());
-        // Should update state
         assert!(state.connected.load(Ordering::Relaxed));
         assert!(state.last_seen_secs.load(Ordering::Relaxed) > 0);
     }
@@ -2810,15 +3007,16 @@ branch refs/heads/feat-b
     }
 
     // ---------------------------------------------------------------
-    // handle_agent_message updates agent_state
+    // handle_agent_message updates last_seen_secs (connected owned by handshake)
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn agent_state_updated_on_message() {
+    async fn handle_agent_message_updates_last_seen_preserves_connected() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
         let state = Arc::new(AgentConnectionState::new());
-        assert!(!state.connected.load(Ordering::Relaxed));
+        // Simulate post-handshake invariant: connected is owned by perform_handshake.
+        state.connected.store(true, Ordering::Relaxed);
         assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 0);
 
         let ctx = AgentHandlerContext {
@@ -2835,7 +3033,10 @@ branch refs/heads/feat-b
         };
         let _ = handle_agent_message(msg, &ctx, &state).await;
 
-        assert!(state.connected.load(Ordering::Relaxed));
+        assert!(
+            state.connected.load(Ordering::Relaxed),
+            "connected should remain true"
+        );
         let ts = state.last_seen_secs.load(Ordering::Relaxed);
         assert!(ts > 0, "last_seen_secs should be non-zero after message");
     }

@@ -20,6 +20,7 @@ mod port_proxy;
 mod port_watcher;
 mod proxy_config;
 mod reconnecting_client;
+mod state;
 
 use std::time::Duration;
 
@@ -216,6 +217,15 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
 
     maybe_start_forward_proxy(proxy_config_json).await;
 
+    // Publish Disconnected early so an in-container `cella doctor` run before
+    // the handshake completes can tell the process is alive and still trying.
+    let state_writer = state::spawn_state_writer(
+        std::path::PathBuf::from(state::DEFAULT_STATE_FILE),
+        env!("CARGO_PKG_VERSION").to_string(),
+        state::AgentState::Disconnected,
+        Duration::from_secs(10),
+    );
+
     // Read connection info: .daemon_addr file is authoritative (updated on
     // every `cella up`), env vars are fallback (may be stale after restart).
     let (addr, token) = if let Some(info) = control::read_daemon_addr_file() {
@@ -239,6 +249,8 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         reconnecting_client::ReconnectingClient::connect_with_retry(&addr, &container_name, &token)
             .await;
 
+    state_writer.set_connected(addr.clone());
+
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = std::time::Instant::now();
@@ -250,8 +262,9 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let rc = reconnecting.clone();
     let pm: port_watcher::PortMap =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let sw_for_watcher = state_writer.clone();
     let watcher_handle = tokio::spawn(async move {
-        port_watcher::run(poll_interval, ctrl, pd, pm, rc).await;
+        port_watcher::run(poll_interval, ctrl, pd, pm, rc, Some(sw_for_watcher)).await;
     });
 
     // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
@@ -264,6 +277,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let ctrl = control.clone();
     let pd = ports_detected.clone();
     let rc = reconnecting.clone();
+    let sw_for_health = state_writer.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -277,7 +291,11 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
             if let Err(e) = c.send(&msg).await {
                 tracing::warn!("Health report failed: {e}");
                 drop(c);
-                reconnecting_client::spawn_background_reconnect(ctrl.clone(), rc.clone());
+                reconnecting_client::spawn_background_reconnect(
+                    ctrl.clone(),
+                    rc.clone(),
+                    Some(sw_for_health.clone()),
+                );
             }
         }
     });
