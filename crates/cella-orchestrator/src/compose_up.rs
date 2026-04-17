@@ -318,14 +318,8 @@ async fn prepare_and_start(
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-12. Build extra env vars and labels for the primary service.
-    let mut extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
-    // BROWSER=/cella/bin/cella-browser is required for in-container URL
-    // forwarding. The non-compose path injects it explicitly (up.rs); without
-    // this the compose path ships containers with BROWSER unset and host
-    // `cella doctor` reports "browser helper not configured".
-    if client.capabilities().managed_agent {
-        extra_env.extend(agent_env_vars());
-    }
+    let managed = client.capabilities().managed_agent;
+    let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env, managed);
     let mut labels = build_compose_labels(cfg, project, &remote_user);
 
     let settings = cella_config::settings::Settings::load(cfg.workspace_root);
@@ -830,15 +824,21 @@ fn build_compose_labels(
 /// Assemble the extra environment variable list for the compose service.
 ///
 /// Combines daemon-injected env vars, forwarded env vars (SSH/GPG agent sockets,
-/// etc.), and user-specified `remote_env` overrides in precedence order.
+/// etc.), user-specified `remote_env` overrides, and — when the backend has a
+/// managed agent — the agent env vars (notably `BROWSER=/cella/bin/cella-browser`)
+/// in precedence order.
 fn build_extra_env(
     daemon_env: Vec<String>,
     env_fwd: &cella_env::EnvForwarding,
     remote_env: &[String],
+    managed_agent: bool,
 ) -> Vec<String> {
     let mut extra_env = daemon_env;
     extra_env.extend(env_fwd.env.iter().map(|e| format!("{}={}", e.key, e.value)));
     extra_env.extend(remote_env.iter().cloned());
+    if managed_agent {
+        extra_env.extend(agent_env_vars());
+    }
     extra_env
 }
 
@@ -1065,5 +1065,67 @@ where
             step.fail(&error.to_string());
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_extra_env_injects_browser_when_managed_agent() {
+        let env_fwd = cella_env::EnvForwarding::default();
+        let extra = build_extra_env(vec![], &env_fwd, &[], true);
+        assert!(
+            extra
+                .iter()
+                .any(|v| v == "BROWSER=/cella/bin/cella-browser"),
+            "managed_agent=true must inject BROWSER; got {extra:?}"
+        );
+        assert!(
+            extra.iter().any(|v| v.starts_with("CELLA_AGENT_VERSION=")),
+            "managed_agent=true must inject CELLA_AGENT_VERSION; got {extra:?}"
+        );
+    }
+
+    #[test]
+    fn build_extra_env_omits_browser_when_not_managed() {
+        let env_fwd = cella_env::EnvForwarding::default();
+        let extra = build_extra_env(vec![], &env_fwd, &[], false);
+        assert!(
+            !extra.iter().any(|v| v.starts_with("BROWSER=")),
+            "managed_agent=false must NOT inject BROWSER; got {extra:?}"
+        );
+    }
+
+    #[test]
+    fn build_extra_env_preserves_precedence_order() {
+        // daemon_env first, then env_fwd, then remote_env, then agent vars.
+        let env_fwd = cella_env::EnvForwarding {
+            env: vec![cella_env::ForwardEnv {
+                key: "FWD_KEY".into(),
+                value: "fwd_val".into(),
+            }],
+            ..Default::default()
+        };
+        let extra = build_extra_env(
+            vec!["CELLA_DAEMON_ADDR=h:1".to_string()],
+            &env_fwd,
+            &["USER_KEY=user_val".to_string()],
+            true,
+        );
+        let daemon_idx = extra
+            .iter()
+            .position(|v| v == "CELLA_DAEMON_ADDR=h:1")
+            .unwrap();
+        let fwd_idx = extra.iter().position(|v| v == "FWD_KEY=fwd_val").unwrap();
+        let user_idx = extra.iter().position(|v| v == "USER_KEY=user_val").unwrap();
+        let browser_idx = extra
+            .iter()
+            .position(|v| v == "BROWSER=/cella/bin/cella-browser")
+            .unwrap();
+        assert!(daemon_idx < fwd_idx);
+        assert!(fwd_idx < user_idx);
+        assert!(user_idx < browser_idx);
     }
 }
