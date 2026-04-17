@@ -20,6 +20,7 @@ mod port_proxy;
 mod port_watcher;
 mod proxy_config;
 mod reconnecting_client;
+mod state;
 
 use std::time::Duration;
 
@@ -216,6 +217,15 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
 
     maybe_start_forward_proxy(proxy_config_json).await;
 
+    // Publish Disconnected early so an in-container `cella doctor` run before
+    // the handshake completes can tell the process is alive and still trying.
+    let state_writer = state::spawn_state_writer(
+        std::path::PathBuf::from(state::DEFAULT_STATE_FILE),
+        env!("CARGO_PKG_VERSION").to_string(),
+        state::AgentState::Disconnected,
+        Duration::from_secs(10),
+    );
+
     // Read connection info: .daemon_addr file is authoritative (updated on
     // every `cella up`), env vars are fallback (may be stale after restart).
     let (addr, token) = if let Some(info) = control::read_daemon_addr_file() {
@@ -238,6 +248,9 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let client =
         reconnecting_client::ReconnectingClient::connect_with_retry(&addr, &container_name, &token)
             .await;
+
+    state_writer.set_daemon_addr(Some(addr.clone()));
+    state_writer.set_state(state::AgentState::Connected);
 
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -405,6 +405,9 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // 4b. Main agent process liveness (read state file written by cella-agent daemon)
+    report_main_agent_status();
+
     // 5. Credential helper
     let browser = std::env::var("BROWSER").unwrap_or_default();
     if browser.contains("cella") {
@@ -415,6 +418,62 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     eprintln!();
     Ok(())
+}
+
+fn report_main_agent_status() {
+    let path = std::path::Path::new(crate::state::DEFAULT_STATE_FILE);
+    let Some(snap) = crate::state::read_snapshot(path) else {
+        eprintln!(
+            "  \u{2717} main agent: state file missing at {}",
+            crate::state::DEFAULT_STATE_FILE
+        );
+        eprintln!("    Main `cella-agent daemon` process may not be running");
+        return;
+    };
+
+    if !crate::state::pid_alive(snap.pid) {
+        eprintln!(
+            "  \u{2717} main agent: process gone (pid {} no longer in /proc)",
+            snap.pid
+        );
+        eprintln!("    Container needs restart or rebuild");
+        return;
+    }
+
+    let age = now_unix_secs().saturating_sub(snap.last_heartbeat_unix);
+    match snap.state {
+        crate::state::AgentState::Connected if age < 30 => {
+            eprintln!(
+                "  \u{2713} main agent: connected (pid {}, heartbeat {age}s ago)",
+                snap.pid
+            );
+        }
+        crate::state::AgentState::Connected => {
+            eprintln!(
+                "  \u{26a0} main agent: connected but heartbeat stale (pid {}, {age}s ago)",
+                snap.pid
+            );
+        }
+        crate::state::AgentState::Reconnecting => {
+            eprintln!(
+                "  \u{26a0} main agent: reconnecting (pid {}, last heartbeat {age}s ago)",
+                snap.pid
+            );
+        }
+        crate::state::AgentState::Disconnected => {
+            eprintln!(
+                "  \u{26a0} main agent: disconnected (pid {}, last heartbeat {age}s ago)",
+                snap.pid
+            );
+        }
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn run_branch(
