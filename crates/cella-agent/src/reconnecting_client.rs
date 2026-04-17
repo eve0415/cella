@@ -30,8 +30,11 @@ const BASE_BACKOFF: Duration = Duration::from_secs(2);
 /// A wrapper around [`ControlClient`] that retries the initial connection and
 /// attempts a single reconnect when a send or receive fails.
 ///
-/// The daemon may not have registered the container yet when the agent starts,
-/// so `connect_with_retry` retries TCP connection attempts until timeout.
+/// The daemon may not have started yet when the agent starts, so
+/// `connect_with_retry` blocks until the TCP handshake succeeds. Giving up
+/// and running in standalone mode is a trap: the daemon often comes up
+/// seconds-to-minutes later and the agent needs to pick that up without
+/// external intervention.
 ///
 /// Once connected, any I/O failure on `send` triggers a single reconnect
 /// attempt. If reconnection succeeds the `reconnected` flag is set so callers
@@ -46,62 +49,63 @@ pub struct ReconnectingClient {
     daemon_hello: Option<DaemonHello>,
 }
 
+/// How often to surface a progress log while the initial connect retries.
+const INITIAL_CONNECT_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
 impl ReconnectingClient {
-    /// Try to connect to the daemon, retrying every 500 ms until
-    /// `timeout` elapses.
+    /// Connect to the daemon, retrying indefinitely until the handshake
+    /// succeeds. Re-reads `/cella/.daemon_addr` on every attempt so an
+    /// updated address from a later `cella up` is picked up automatically.
     ///
-    /// Returns a client with `inner = None` (i.e. disconnected) if every
-    /// attempt fails within the timeout window. The caller should check
-    /// [`is_connected`](Self::is_connected) before assuming the connection is
-    /// live.
+    /// The returned client is always connected (its `inner` is `Some`).
     pub async fn connect_with_retry(
-        addr: &str,
+        initial_addr: &str,
         container_name: &str,
-        auth_token: &str,
-        timeout: Duration,
+        initial_token: &str,
     ) -> Self {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let start = tokio::time::Instant::now();
+        let mut last_warn = start;
+        let mut addr = initial_addr.to_string();
+        let mut token = initial_token.to_string();
 
         loop {
-            match ControlClient::connect(addr, container_name, auth_token).await {
+            match ControlClient::connect(&addr, container_name, &token).await {
                 Ok((client, hello)) => {
                     info!("Connected to daemon at {addr}");
                     return Self {
-                        addr: addr.to_string(),
+                        addr,
                         container_name: container_name.to_string(),
-                        auth_token: auth_token.to_string(),
+                        auth_token: token,
                         inner: Some(client),
                         reconnected: false,
                         daemon_hello: Some(hello),
                     };
                 }
                 Err(e) => {
-                    debug!("Daemon connect failed, will retry: {e}");
+                    debug!("Daemon connect to {addr} failed, will retry: {e}");
+                    if last_warn.elapsed() >= INITIAL_CONNECT_WARN_INTERVAL {
+                        warn!(
+                            "Still waiting for daemon at {addr} after {}s ({e})",
+                            start.elapsed().as_secs()
+                        );
+                        last_warn = tokio::time::Instant::now();
+                    }
                 }
             }
 
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    "Timed out waiting for daemon after {:.1}s: {addr}",
-                    timeout.as_secs_f64(),
-                );
-                return Self {
-                    addr: addr.to_string(),
-                    container_name: container_name.to_string(),
-                    auth_token: auth_token.to_string(),
-                    inner: None,
-                    reconnected: false,
-                    daemon_hello: None,
-                };
-            }
-
             tokio::time::sleep(RETRY_INTERVAL).await;
-        }
-    }
 
-    /// Returns `true` if the underlying connection is currently established.
-    pub const fn is_connected(&self) -> bool {
-        self.inner.is_some()
+            if let Some(info) = crate::control::read_daemon_addr_file()
+                && (info.addr != addr || info.token != token)
+            {
+                info!(
+                    "Daemon address updated via .daemon_addr ({} -> {})",
+                    addr, info.addr
+                );
+                addr = info.addr;
+                token = info.token;
+            }
+        }
     }
 
     /// Check if the given daemon info matches the current connection params.
@@ -325,12 +329,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn connect_with_retry_returns_disconnected_on_unreachable() {
-        let timeout = Duration::from_millis(100);
-        let client =
-            ReconnectingClient::connect_with_retry("127.0.0.1:1", "test", "token", timeout).await;
-
-        assert!(!client.is_connected());
+    async fn connect_with_retry_blocks_when_daemon_unreachable() {
+        // Regression guard for the permanent-standalone trap: the old
+        // implementation gave up after 30s and returned a disconnected
+        // client. Callers then fell into `run_standalone` with no
+        // reconnect loop, silently ignoring the daemon when it came up
+        // later. The fix is to never return until connected.
+        let fut = ReconnectingClient::connect_with_retry("127.0.0.1:1", "test", "token");
+        let result = tokio::time::timeout(Duration::from_secs(2), fut).await;
+        assert!(
+            result.is_err(),
+            "connect_with_retry must not return while the daemon is unreachable",
+        );
     }
 
     #[tokio::test]
@@ -385,19 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn is_connected_when_disconnected() {
-        let client = ReconnectingClient {
-            addr: "127.0.0.1:1".to_string(),
-            container_name: "test".to_string(),
-            auth_token: "token".to_string(),
-            inner: None,
-            reconnected: false,
-            daemon_hello: None,
-        };
-        assert!(!client.is_connected());
-    }
-
-    #[test]
     fn take_reconnected_false_when_not_set() {
         let mut client = ReconnectingClient {
             addr: "127.0.0.1:1".to_string(),
@@ -422,7 +419,7 @@ mod tests {
         };
         let result = client.try_reconnect().await;
         assert!(result.is_err());
-        assert!(!client.is_connected());
+        assert!(client.inner.is_none());
         assert!(!client.reconnected);
     }
 
@@ -475,7 +472,7 @@ mod tests {
             daemon_hello: None,
         };
 
-        assert!(!client.is_connected());
+        assert!(client.inner.is_none());
         assert!(!client.reconnected);
 
         // install_connection without a real ControlClient — verify
