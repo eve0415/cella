@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.26"
+version = "0.0.27"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -36,7 +36,7 @@ rust-version = "1.94.1"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "=1.51.1", features = [
+tokio = { version = "=1.52.1", features = [
     "fs",
     "io-std",
     "io-util",
@@ -66,8 +66,8 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 # CLI
-clap = { version = "=4.6.0", features = ["derive"] }
-clap_complete = "=4.6.0"
+clap = { version = "=4.6.1", features = ["derive"] }
+clap_complete = "=4.6.2"
 
 # Interactive prompts
 inquire = "=0.9.4"
