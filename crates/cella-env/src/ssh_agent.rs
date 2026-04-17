@@ -56,8 +56,9 @@ fn desktop_ssh_forwarding(host_socket: Option<&String>) -> SshAgentForwarding {
 /// 1Password's `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`)
 /// are unreachable from the Lima VM and the bind-mount would fail at
 /// container-create with `operation not supported`. Skip with a warning
-/// so `cella up` still succeeds and point the user at colima's native
-/// `--ssh-agent` forwarding, which routes the host agent through Lima.
+/// so `cella up` still succeeds; the warning names the root cause and
+/// lets the user decide how to resolve it out-of-band — cella does not
+/// yet implement end-to-end host-agent forwarding through colima.
 fn direct_ssh_forwarding(
     runtime: &DockerRuntime,
     host_socket: Option<String>,
@@ -73,7 +74,7 @@ fn direct_ssh_forwarding(
 
     if matches!(runtime, DockerRuntime::Colima) && is_macos_sandboxed_path(&host_socket) {
         warn!(
-            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory unreachable from colima's VM; skipping SSH agent mount. Use colima's native host-agent forwarding instead: `colima start --ssh-agent`."
+            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory that colima's Lima VM cannot stat; skipping SSH agent mount. 1Password 8's agent socket is the common case."
         );
         return None;
     }
