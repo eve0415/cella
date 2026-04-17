@@ -421,51 +421,57 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn report_main_agent_status() {
-    let path = std::path::Path::new(crate::state::DEFAULT_STATE_FILE);
-    let Some(snap) = crate::state::read_snapshot(path) else {
-        eprintln!(
-            "  \u{2717} main agent: state file missing at {}",
-            crate::state::DEFAULT_STATE_FILE
+    let snapshot =
+        crate::state::read_snapshot(std::path::Path::new(crate::state::DEFAULT_STATE_FILE));
+    let lines = format_main_agent_status(
+        snapshot.as_ref(),
+        crate::state::DEFAULT_STATE_FILE,
+        crate::state::pid_alive,
+        now_unix_secs(),
+    );
+    eprint!("{lines}");
+}
+
+/// Render the doctor's main-agent status line(s). Pure — no I/O, no globals.
+/// Takes a snapshot (or `None` if file missing) and a closure to check PID
+/// liveness so tests can inject any state without touching `/proc`.
+fn format_main_agent_status(
+    snapshot: Option<&crate::state::AgentStateSnapshot>,
+    state_file_path: &str,
+    pid_alive: impl Fn(u32) -> bool,
+    now_unix: u64,
+) -> String {
+    let Some(snap) = snapshot else {
+        return format!(
+            "  \u{2717} main agent: state file missing at {state_file_path}\n    Main `cella-agent daemon` process may not be running\n"
         );
-        eprintln!("    Main `cella-agent daemon` process may not be running");
-        return;
     };
 
-    if !crate::state::pid_alive(snap.pid) {
-        eprintln!(
-            "  \u{2717} main agent: process gone (pid {} no longer in /proc)",
+    if !pid_alive(snap.pid) {
+        return format!(
+            "  \u{2717} main agent: process gone (pid {} no longer in /proc)\n    Container needs restart or rebuild\n",
             snap.pid
         );
-        eprintln!("    Container needs restart or rebuild");
-        return;
     }
 
-    let age = now_unix_secs().saturating_sub(snap.last_heartbeat_unix);
+    let age = now_unix.saturating_sub(snap.last_heartbeat_unix);
     match snap.state {
-        crate::state::AgentState::Connected if age < 30 => {
-            eprintln!(
-                "  \u{2713} main agent: connected (pid {}, heartbeat {age}s ago)",
-                snap.pid
-            );
-        }
-        crate::state::AgentState::Connected => {
-            eprintln!(
-                "  \u{26a0} main agent: connected but heartbeat stale (pid {}, {age}s ago)",
-                snap.pid
-            );
-        }
-        crate::state::AgentState::Reconnecting => {
-            eprintln!(
-                "  \u{26a0} main agent: reconnecting (pid {}, last heartbeat {age}s ago)",
-                snap.pid
-            );
-        }
-        crate::state::AgentState::Disconnected => {
-            eprintln!(
-                "  \u{26a0} main agent: disconnected (pid {}, last heartbeat {age}s ago)",
-                snap.pid
-            );
-        }
+        crate::state::AgentState::Connected if age < 30 => format!(
+            "  \u{2713} main agent: connected (pid {}, heartbeat {age}s ago)\n",
+            snap.pid
+        ),
+        crate::state::AgentState::Connected => format!(
+            "  \u{26a0} main agent: connected but heartbeat stale (pid {}, {age}s ago)\n",
+            snap.pid
+        ),
+        crate::state::AgentState::Reconnecting => format!(
+            "  \u{26a0} main agent: reconnecting (pid {}, last heartbeat {age}s ago)\n",
+            snap.pid
+        ),
+        crate::state::AgentState::Disconnected => format!(
+            "  \u{26a0} main agent: disconnected (pid {}, last heartbeat {age}s ago)\n",
+            snap.pid
+        ),
     }
 }
 
@@ -474,6 +480,84 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+    use crate::state::{AgentState, AgentStateSnapshot};
+
+    fn snap(state: AgentState, pid: u32, last_heartbeat_unix: u64) -> AgentStateSnapshot {
+        AgentStateSnapshot {
+            pid,
+            state,
+            daemon_addr: Some("host.docker.internal:60000".to_string()),
+            agent_version: "0.0.28".to_string(),
+            started_at_unix: 1_700_000_000,
+            last_heartbeat_unix,
+        }
+    }
+
+    #[test]
+    fn status_missing_file() {
+        let out = format_main_agent_status(None, "/tmp/cella-agent.state", |_| true, 0);
+        assert!(out.contains("\u{2717} main agent: state file missing"));
+        assert!(out.contains("/tmp/cella-agent.state"));
+    }
+
+    #[test]
+    fn status_pid_gone() {
+        let s = snap(AgentState::Connected, 12345, 1_700_000_100);
+        let out =
+            format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| false, 1_700_000_100);
+        assert!(out.contains("\u{2717} main agent: process gone"));
+        assert!(out.contains("pid 12345"));
+    }
+
+    #[test]
+    fn status_connected_fresh() {
+        let now = 1_700_000_100;
+        let s = snap(AgentState::Connected, 25, now - 5);
+        let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
+        assert!(out.contains("\u{2713} main agent: connected (pid 25"));
+        assert!(out.contains("heartbeat 5s ago"));
+    }
+
+    #[test]
+    fn status_connected_stale() {
+        let now = 1_700_000_100;
+        // age > 30 triggers the stale branch.
+        let s = snap(AgentState::Connected, 25, now - 45);
+        let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
+        assert!(out.contains("\u{26a0} main agent: connected but heartbeat stale"));
+        assert!(out.contains("45s ago"));
+    }
+
+    #[test]
+    fn status_reconnecting() {
+        let now = 1_700_000_100;
+        let s = snap(AgentState::Reconnecting, 25, now - 3);
+        let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
+        assert!(out.contains("\u{26a0} main agent: reconnecting (pid 25"));
+        assert!(out.contains("3s ago"));
+    }
+
+    #[test]
+    fn status_disconnected() {
+        let now = 1_700_000_100;
+        let s = snap(AgentState::Disconnected, 25, now - 1);
+        let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
+        assert!(out.contains("\u{26a0} main agent: disconnected (pid 25"));
+    }
+
+    #[test]
+    fn status_connected_exactly_at_threshold_is_stale() {
+        // Boundary: age == 30 is not "< 30", so treated as stale.
+        let now = 1_700_000_100;
+        let s = snap(AgentState::Connected, 25, now - 30);
+        let out = format_main_agent_status(Some(&s), "/tmp/cella-agent.state", |_| true, now);
+        assert!(out.contains("connected but heartbeat stale"));
+    }
 }
 
 async fn run_branch(
