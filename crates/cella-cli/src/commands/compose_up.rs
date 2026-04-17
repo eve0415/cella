@@ -76,6 +76,15 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
         })
     }
 
+    fn sync_agent_runtime<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            super::up::write_daemon_addr_to_volume(client).await;
+        })
+    }
+
     fn register_container<'a>(
         &'a self,
         _client: &'a dyn ContainerBackend,

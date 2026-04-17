@@ -90,6 +90,16 @@ pub trait ComposeUpHooks: Send + Sync {
         host_gateway: &'a str,
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
 
+    /// Synchronize daemon connection details into the shared agent volume
+    /// (writes `/cella/.daemon_addr`). Mirrors the single-container
+    /// `UpHooks::sync_agent_runtime` so an agent can discover a new daemon
+    /// address after a daemon restart without relying on its (immutable)
+    /// env vars from container creation time.
+    fn sync_agent_runtime<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
     /// Register a container with the daemon for port management.
     fn register_container<'a>(
         &'a self,
@@ -405,10 +415,16 @@ async fn finalize_compose(
         )
         .await;
 
-    // 18. Launch agent as background process via exec
+    // 18. Publish daemon address to the shared agent volume before the
+    // agent starts reading it. Without this, the agent is left relying on
+    // the container's (immutable) env vars and has no way to learn about
+    // a daemon restart that changed the port.
+    hooks.sync_agent_runtime(client).await;
+
+    // 19. Launch agent as background process via exec
     hooks.launch_agent(client, &primary.id, agent_arch).await;
 
-    // 19. Run lifecycle phases (primary service only)
+    // 20. Run lifecycle phases (primary service only)
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
     for phase in [
         "onCreateCommand",
@@ -504,6 +520,11 @@ async fn handle_compose_running(
     hooks
         .register_container(client, &container.id, config, cfg.container_name)
         .await;
+
+    // Refresh `.daemon_addr` on the shared volume so any agent still
+    // running inside the already-up container can follow a daemon port
+    // change since the last `cella up` (e.g., daemon binary update).
+    hooks.sync_agent_runtime(client).await;
 
     if let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()
