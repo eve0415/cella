@@ -149,7 +149,7 @@ async fn check_single_container(
     // Agent/port checks only apply to backends with managed agents
     if client.capabilities().managed_agent {
         // Agent connectivity via daemon
-        check_agent_connectivity(client, container_id, &mut checks, container_name).await;
+        check_agent_connectivity(&mut checks, container_name).await;
 
         // Credential forwarding
         check_credentials(client, container_id, &mut checks).await;
@@ -244,12 +244,7 @@ async fn query_live_agent_version(container_name: &str) -> Option<String> {
     }
 }
 
-async fn check_agent_connectivity(
-    client: &dyn ContainerBackend,
-    container_id: &str,
-    checks: &mut Vec<CheckResult>,
-    container_name: &str,
-) {
+async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name: &str) {
     let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         return;
     };
@@ -273,17 +268,11 @@ async fn check_agent_connectivity(
                     fix_hint: None,
                 });
             } else {
-                let label_missing = client
-                    .inspect_container(container_id)
-                    .await
-                    .ok()
-                    .and_then(|info| info.labels.get("dev.cella.version").cloned())
-                    .is_none();
                 checks.push(CheckResult {
                     name: "agent".into(),
                     severity: Severity::Warning,
                     detail: "not connected".into(),
-                    fix_hint: Some(agent_not_connected_hint(label_missing)),
+                    fix_hint: Some("Check container logs: `cella logs`".into()),
                 });
             }
         }
@@ -295,18 +284,6 @@ async fn check_agent_connectivity(
                 fix_hint: None,
             });
         }
-    }
-}
-
-/// Pick the remedy hint for an "agent not connected" result. Containers that
-/// predate the `dev.cella.version` label were created before this release
-/// could register them with the daemon; their only fix is a rebuild, not a
-/// log check.
-fn agent_not_connected_hint(label_missing: bool) -> String {
-    if label_missing {
-        "Container was created by an older cella; run `cella up --rebuild` to re-register".into()
-    } else {
-        "Check container logs: `cella logs`".into()
     }
 }
 
@@ -496,31 +473,5 @@ mod tests {
         let reports = check_containers(&ctx, true).await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].checks[0].name, "skipped");
-    }
-
-    #[test]
-    fn agent_not_connected_hint_suggests_rebuild_when_label_missing() {
-        let hint = agent_not_connected_hint(true);
-        assert!(
-            hint.contains("cella up --rebuild"),
-            "legacy container hint must point at rebuild; got {hint:?}"
-        );
-        assert!(
-            hint.contains("older cella"),
-            "legacy container hint must explain the why; got {hint:?}"
-        );
-    }
-
-    #[test]
-    fn agent_not_connected_hint_points_to_logs_when_label_present() {
-        let hint = agent_not_connected_hint(false);
-        assert!(
-            hint.contains("cella logs"),
-            "non-legacy hint should point to `cella logs`; got {hint:?}"
-        );
-        assert!(
-            !hint.contains("--rebuild"),
-            "non-legacy hint must NOT suggest rebuild; got {hint:?}"
-        );
     }
 }

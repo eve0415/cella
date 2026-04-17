@@ -787,15 +787,6 @@ fn build_compose_labels(
 
     // Cella-specific labels.
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
-    // `dev.cella.version` is the authoritative create-time version stamp.
-    // The host doctor falls back to this label when the agent isn't
-    // connected; without it, brand-new compose containers are misclassified
-    // as pre-versioned legacy containers and doctor suggests `cella up
-    // --rebuild` incorrectly.
-    labels.insert(
-        "dev.cella.version".to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-    );
     labels.insert(
         "dev.cella.workspace_path".to_string(),
         workspace_str.clone(),
@@ -1105,52 +1096,6 @@ mod tests {
             !extra.iter().any(|v| v.starts_with("BROWSER=")),
             "managed_agent=false must NOT inject BROWSER; got {extra:?}"
         );
-    }
-
-    #[test]
-    fn build_compose_labels_stamps_cella_version() {
-        // Regression: compose containers used to ship without
-        // `dev.cella.version`, which the host doctor then read as missing
-        // and misclassified as a pre-versioned legacy container —
-        // recommending `cella up --rebuild` on brand-new containers.
-        let config = serde_json::json!({});
-        let config_path = PathBuf::from("/tmp/devcontainer.json");
-        let workspace_root = PathBuf::from("/tmp/workspace");
-        let cfg = ComposeUpConfig {
-            config: &config,
-            config_path: &config_path,
-            workspace_root: &workspace_root,
-            container_name: "test-container",
-            remote_env: &[],
-            remove_container: false,
-            build_no_cache: false,
-            skip_checksum: false,
-            profiles: vec![],
-            env_files: vec![],
-            pull_policy: None,
-        };
-        let project = ComposeProject {
-            project_name: "cella-test".to_string(),
-            compose_files: vec![],
-            override_file: PathBuf::from("/tmp/override.yaml"),
-            primary_service: "app".to_string(),
-            run_services: None,
-            shutdown_action: cella_compose::ShutdownAction::StopCompose,
-            override_command: false,
-            workspace_folder: "/workspace".to_string(),
-            config_dir: PathBuf::from("/tmp"),
-            workspace_root: workspace_root.clone(),
-            config_hash: "hash123".to_string(),
-            profiles: vec![],
-            env_files: vec![],
-            pull_policy: None,
-        };
-
-        let labels = build_compose_labels(&cfg, &project, "vscode");
-        let version = labels
-            .get("dev.cella.version")
-            .expect("compose labels must include dev.cella.version");
-        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
