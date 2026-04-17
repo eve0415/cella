@@ -125,14 +125,20 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
 ///
 /// Since compose's `overrideCommand` defaults to `false`, the container runs its
 /// own entrypoint. The agent is started via `exec` as a background daemon.
+///
+/// Agent stdout/stderr goes to `/tmp/cella-agent.log` (appended) so failures
+/// are observable via `docker exec $CID tail /tmp/cella-agent.log` instead
+/// of being silently discarded — without this, every agent-side problem is
+/// invisible to users and maintainers.
 async fn launch_agent_exec(client: &dyn ContainerBackend, container_id: &str) {
     let agent_path = "/cella/bin/cella-agent";
+    let log_path = "/tmp/cella-agent.log";
 
     let script = format!(
         "if [ -x \"{agent_path}\" ]; then \
          nohup \"{agent_path}\" daemon \
          --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" \
-         > /dev/null 2>&1 & fi"
+         >> \"{log_path}\" 2>&1 & fi"
     );
 
     debug!("Launching agent in container {container_id}: {agent_path}");
