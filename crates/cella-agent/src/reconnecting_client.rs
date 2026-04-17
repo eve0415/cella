@@ -265,9 +265,14 @@ fn next_backoff(attempt: u32, elapsed: Duration) -> Duration {
 /// The task runs outside any lock — connect attempts don't block the port
 /// watcher or health reporter. On success it briefly locks the mutex to
 /// install the new connection.
+///
+/// When `state_writer` is provided, emits `Reconnecting` at task entry and
+/// `Connected` (with the successful address) once a new connection is
+/// installed.
 pub fn spawn_background_reconnect(
     control: Arc<Mutex<ReconnectingClient>>,
     reconnecting: Arc<AtomicBool>,
+    state_writer: Option<crate::state::StateWriter>,
 ) {
     if reconnecting
         .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
@@ -275,6 +280,10 @@ pub fn spawn_background_reconnect(
     {
         debug!("Background reconnection already in progress");
         return;
+    }
+
+    if let Some(w) = &state_writer {
+        w.set_state(crate::state::AgentState::Reconnecting);
     }
 
     let reconnecting_flag = reconnecting;
@@ -308,7 +317,11 @@ pub fn spawn_background_reconnect(
                     control
                         .lock()
                         .await
-                        .install_connection(client, hello, addr, token);
+                        .install_connection(client, hello, addr.clone(), token);
+                    if let Some(w) = &state_writer {
+                        w.set_daemon_addr(Some(addr));
+                        w.set_state(crate::state::AgentState::Connected);
+                    }
                     reconnecting_flag.store(false, AtomicOrdering::SeqCst);
                     return;
                 }

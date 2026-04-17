@@ -121,14 +121,21 @@ async fn process_port_open_response(
     }
 }
 
+/// Shared immutable context for port event handlers. Groups references so
+/// the inner functions stay under the clippy argument limit.
+struct PortWatcherCtx<'a> {
+    control: &'a Arc<Mutex<ReconnectingClient>>,
+    port_map: &'a PortMap,
+    reconnecting: &'a Arc<std::sync::atomic::AtomicBool>,
+    state_writer: Option<&'a crate::state::StateWriter>,
+}
+
 /// Send a `PortOpen` message to the daemon and process the port mapping response.
 async fn send_port_open_and_record(
     listener: &DetectedListener,
     process: Option<String>,
     agent_proxy_port: Option<u16>,
-    control: &Arc<Mutex<ReconnectingClient>>,
-    port_map: &PortMap,
-    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
+    ctx: &PortWatcherCtx<'_>,
 ) -> bool {
     let msg = AgentMessage::PortOpen {
         port: listener.port,
@@ -138,17 +145,21 @@ async fn send_port_open_and_record(
         proxy_port: agent_proxy_port,
     };
 
-    let mut ctrl = control.lock().await;
+    let mut ctrl = ctx.control.lock().await;
     if let Err(e) = ctrl.send(&msg).await {
         warn!("Failed to report port open: {e}");
         drop(ctrl);
-        reconnecting_client::spawn_background_reconnect(control.clone(), reconnecting.clone());
+        reconnecting_client::spawn_background_reconnect(
+            ctx.control.clone(),
+            ctx.reconnecting.clone(),
+            ctx.state_writer.cloned(),
+        );
         return false;
     }
 
     let response = ctrl.recv().await;
     drop(ctrl);
-    process_port_open_response(response, port_map).await;
+    process_port_open_response(response, ctx.port_map).await;
     true
 }
 
@@ -158,11 +169,9 @@ async fn send_port_open_and_record(
 /// Returns `true` if the listener was successfully reported and should be tracked.
 async fn handle_new_listener(
     listener: &DetectedListener,
-    control: &Arc<Mutex<ReconnectingClient>>,
-    port_map: &PortMap,
+    ctx: &PortWatcherCtx<'_>,
     proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
     proxy_ports: &mut HashMap<u16, u16>,
-    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     let process = cella_port::detection::process_name_for_inode(listener.inode);
     info!(
@@ -172,26 +181,16 @@ async fn handle_new_listener(
 
     let agent_proxy_port = maybe_start_localhost_proxy(listener, proxy_handles, proxy_ports).await;
 
-    send_port_open_and_record(
-        listener,
-        process,
-        agent_proxy_port,
-        control,
-        port_map,
-        reconnecting,
-    )
-    .await
+    send_port_open_and_record(listener, process, agent_proxy_port, ctx).await
 }
 
 /// Handle a single closed listener: report to daemon and clean up proxies.
 async fn handle_closed_listener(
     key: (u16, PortProtocol),
-    control: &Arc<Mutex<ReconnectingClient>>,
+    ctx: &PortWatcherCtx<'_>,
     ports_detected: &AtomicUsize,
-    port_map: &PortMap,
     proxy_handles: &mut HashMap<u16, tokio::task::JoinHandle<()>>,
     proxy_ports: &mut HashMap<u16, u16>,
-    reconnecting: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     info!("Listener closed: port {} ({:?})", key.0, key.1);
 
@@ -200,15 +199,19 @@ async fn handle_closed_listener(
         protocol: key.1,
     };
     {
-        let mut ctrl = control.lock().await;
+        let mut ctrl = ctx.control.lock().await;
         if let Err(e) = ctrl.send(&msg).await {
             warn!("Failed to report port closed: {e}");
             drop(ctrl);
-            reconnecting_client::spawn_background_reconnect(control.clone(), reconnecting.clone());
+            reconnecting_client::spawn_background_reconnect(
+                ctx.control.clone(),
+                ctx.reconnecting.clone(),
+                ctx.state_writer.cloned(),
+            );
         } else {
             ports_detected.fetch_sub(1, Ordering::Relaxed);
-            port_map.lock().await.remove(&key.0);
-            write_port_map(port_map).await;
+            ctx.port_map.lock().await.remove(&key.0);
+            write_port_map(ctx.port_map).await;
         }
     }
 
@@ -237,6 +240,7 @@ pub async fn run(
     ports_detected: Arc<AtomicUsize>,
     port_map: PortMap,
     reconnecting: Arc<std::sync::atomic::AtomicBool>,
+    state_writer: Option<crate::state::StateWriter>,
 ) {
     let proc_path = Path::new("/proc");
     let mut known: HashMap<(u16, PortProtocol), DetectedListener> = HashMap::new();
@@ -253,6 +257,13 @@ pub async fn run(
             continue;
         };
 
+        let ctx = PortWatcherCtx {
+            control: &control,
+            port_map: &port_map,
+            reconnecting: &reconnecting,
+            state_writer: state_writer.as_ref(),
+        };
+
         // Detect new listeners
         for listener in &current {
             let key = (listener.port, listener.protocol);
@@ -260,15 +271,8 @@ pub async fn run(
                 continue;
             }
 
-            let send_ok = handle_new_listener(
-                listener,
-                &control,
-                &port_map,
-                &mut proxy_handles,
-                &mut proxy_ports,
-                &reconnecting,
-            )
-            .await;
+            let send_ok =
+                handle_new_listener(listener, &ctx, &mut proxy_handles, &mut proxy_ports).await;
 
             if send_ok {
                 ports_detected.fetch_add(1, Ordering::Relaxed);
@@ -283,12 +287,10 @@ pub async fn run(
             known.remove(&key);
             handle_closed_listener(
                 key,
-                &control,
+                &ctx,
                 &ports_detected,
-                &port_map,
                 &mut proxy_handles,
                 &mut proxy_ports,
-                &reconnecting,
             )
             .await;
         }

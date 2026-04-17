@@ -263,8 +263,9 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let rc = reconnecting.clone();
     let pm: port_watcher::PortMap =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let sw_for_watcher = state_writer.clone();
     let watcher_handle = tokio::spawn(async move {
-        port_watcher::run(poll_interval, ctrl, pd, pm, rc).await;
+        port_watcher::run(poll_interval, ctrl, pd, pm, rc, Some(sw_for_watcher)).await;
     });
 
     // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
@@ -277,6 +278,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let ctrl = control.clone();
     let pd = ports_detected.clone();
     let rc = reconnecting.clone();
+    let sw_for_health = state_writer.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -290,7 +292,11 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
             if let Err(e) = c.send(&msg).await {
                 tracing::warn!("Health report failed: {e}");
                 drop(c);
-                reconnecting_client::spawn_background_reconnect(ctrl.clone(), rc.clone());
+                reconnecting_client::spawn_background_reconnect(
+                    ctrl.clone(),
+                    rc.clone(),
+                    Some(sw_for_health.clone()),
+                );
             }
         }
     });
