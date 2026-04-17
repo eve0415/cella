@@ -113,14 +113,20 @@ fn parse_forward_agent_from_yaml(content: &str) -> bool {
     false
 }
 
-/// Returns `true` if any provided candidate colima config file declares
-/// `forwardAgent: true`. Missing or unreadable files are treated as
-/// "not enabled". Split from `colima_forward_agent_enabled` so tests
-/// can drive this with a tempdir-backed path without mutating process env.
+/// First-readable-file-wins probe over candidate colima configs. Matches
+/// colima's own precedence in `abiosoft/colima` `config/files.go`: the
+/// highest-priority path that exists IS the active config; lower-priority
+/// files are not consulted. Treating this as `any()` would let a stale
+/// lower-priority file with `forwardAgent: true` override an active
+/// config with `forwardAgent: false`, which would send cella to a
+/// non-existent VM socket.
 fn colima_forward_agent_enabled_at(paths: &[std::path::PathBuf]) -> bool {
-    paths.iter().any(|path| {
-        std::fs::read_to_string(path).is_ok_and(|content| parse_forward_agent_from_yaml(&content))
-    })
+    for path in paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return parse_forward_agent_from_yaml(&content);
+        }
+    }
+    false
 }
 
 /// Returns `true` when any candidate colima config file for the active
@@ -624,5 +630,37 @@ mod tests {
         let yaml = tmp.path().join("colima.yaml");
         std::fs::write(&yaml, "forwardAgent: false\n").unwrap();
         assert!(!colima_forward_agent_enabled_at(&[yaml]));
+    }
+
+    #[test]
+    fn colima_forward_agent_enabled_at_first_readable_wins_over_stale_later() {
+        // Active config (highest priority) says OFF; a stale lower-priority
+        // file has ON. Colima would use the active config; so must we —
+        // otherwise we'd route to a non-existent VM socket.
+        let tmp = tempfile::tempdir().unwrap();
+        let active_dir = tmp.path().join("active");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let active = active_dir.join("colima.yaml");
+        std::fs::write(&active, "forwardAgent: false\n").unwrap();
+
+        let stale_dir = tmp.path().join("stale");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let stale = stale_dir.join("colima.yaml");
+        std::fs::write(&stale, "forwardAgent: true\n").unwrap();
+
+        assert!(!colima_forward_agent_enabled_at(&[active, stale]));
+    }
+
+    #[test]
+    fn colima_forward_agent_enabled_at_skips_missing_until_readable() {
+        // Highest-priority path is missing (user hasn't set $COLIMA_HOME);
+        // second path exists with true — should detect it.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing/colima.yaml");
+
+        let present = tmp.path().join("colima.yaml");
+        std::fs::write(&present, "forwardAgent: true\n").unwrap();
+
+        assert!(colima_forward_agent_enabled_at(&[missing, present]));
     }
 }
