@@ -786,4 +786,17 @@ mod tests {
             "only the agent volume should be external; yaml:\n{yaml}"
         );
     }
+
+    #[test]
+    fn emits_host_docker_internal_extra_host() {
+        // Regression guard independent of inline snapshots: host.docker.internal
+        // must always resolve inside the container so the agent can reach the
+        // host daemon on colima / bare Linux Docker.
+        let config = base_config();
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+            "override must inject host.docker.internal:host-gateway; yaml:\n{yaml}"
+        );
+    }
 }
