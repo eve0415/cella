@@ -2233,6 +2233,118 @@ mod tests {
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
     }
 
+    // -- perform_handshake --
+
+    fn test_control_context(
+        handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+        auth_token: &str,
+    ) -> ControlContext {
+        let (proxy_tx, _proxy_rx) = tokio::sync::mpsc::channel(16);
+        ControlContext {
+            auth_token: auth_token.to_string(),
+            port_manager: Arc::new(Mutex::new(PortManager::new(false))),
+            browser_handler: Arc::new(BrowserHandler::new()),
+            container_handles: handles,
+            proxy_cmd_tx: proxy_tx,
+            task_manager: crate::task_manager::new_shared(),
+            cella_bin: std::path::PathBuf::from("/nonexistent"),
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_marks_connected_without_follow_up_message() {
+        use tokio::io::AsyncWriteExt;
+
+        let agent_state = Arc::new(AgentConnectionState::new());
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "test-container".to_string(),
+                ContainerHandle {
+                    container_id: "container-id-123".to_string(),
+                    agent_state: agent_state.clone(),
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles, "test-token");
+
+        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
+        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
+        let mut daemon_reader = BufReader::new(daemon_r);
+
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "test-container".to_string(),
+            auth_token: "test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        agent_side.write_all(json.as_bytes()).await.unwrap();
+        agent_side.flush().await.unwrap();
+
+        assert!(
+            !agent_state.connected.load(Ordering::Relaxed),
+            "pre-condition: connected starts false"
+        );
+
+        let mut line = String::new();
+        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+
+        let hs = result
+            .expect("handshake should not error")
+            .expect("handshake should return Some");
+        assert_eq!(hs.container_name, "test-container");
+        assert!(
+            agent_state.connected.load(Ordering::Relaxed),
+            "connected must be true immediately after handshake, before any message"
+        );
+        assert_ne!(
+            agent_state.last_seen_secs.load(Ordering::Relaxed),
+            0,
+            "last_seen_secs must be set on handshake"
+        );
+        assert_eq!(
+            agent_state.agent_version.lock().unwrap().as_deref(),
+            Some("0.0.28"),
+            "agent_version must be recorded from AgentHello"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_unknown_container_does_not_mark_connected() {
+        use tokio::io::AsyncWriteExt;
+
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = test_control_context(handles, "test-token");
+
+        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
+        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
+        let mut daemon_reader = BufReader::new(daemon_r);
+
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "not-registered".to_string(),
+            auth_token: "test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        agent_side.write_all(json.as_bytes()).await.unwrap();
+        agent_side.flush().await.unwrap();
+
+        let mut line = String::new();
+        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "handshake must reject and return Ok(None) for unknown container"
+        );
+    }
+
     // ---------------------------------------------------------------
     // extract_port
     // ---------------------------------------------------------------
