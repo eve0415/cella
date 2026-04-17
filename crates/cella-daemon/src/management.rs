@@ -623,4 +623,90 @@ mod tests {
 
         server_handle.abort();
     }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn query_status_reports_connected_after_bare_handshake() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+
+        let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = ctrl_listener.local_addr().unwrap().port();
+
+        let sock = socket_path.clone();
+        let server_handle = tokio::spawn({
+            let (ctx, srx) = test_management_context(ctrl_port);
+            async move {
+                let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
+            }
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        send_management_request(
+            &socket_path,
+            &ManagementRequest::RegisterContainer(Box::new(
+                cella_protocol::ContainerRegistrationData {
+                    container_id: "hs-container-id".to_string(),
+                    container_name: "hs-container".to_string(),
+                    container_ip: Some("172.20.0.5".to_string()),
+                    ports_attributes: vec![],
+                    other_ports_attributes: None,
+                    forward_ports: vec![],
+                    shutdown_action: None,
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", ctrl_port))
+            .await
+            .unwrap();
+        let hello = cella_protocol::AgentHello {
+            protocol_version: cella_protocol::PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "hs-container".to_string(),
+            auth_token: "test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let start = std::time::Instant::now();
+        let mut observed = None;
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            let resp = send_management_request(&socket_path, &ManagementRequest::QueryStatus)
+                .await
+                .unwrap();
+            if let ManagementResponse::Status { containers, .. } = resp
+                && let Some(c) = containers
+                    .into_iter()
+                    .find(|c| c.container_name == "hs-container")
+                && c.agent_connected
+            {
+                observed = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let summary =
+            observed.expect("QueryStatus should show agent_connected=true within 1s of handshake");
+        assert!(summary.agent_connected);
+        assert_eq!(summary.agent_version.as_deref(), Some("0.0.28"));
+
+        drop(stream);
+        server_handle.abort();
+    }
 }

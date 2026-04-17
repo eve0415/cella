@@ -2313,6 +2313,86 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn control_server_marks_connected_via_real_tcp_handshake() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let agent_state = Arc::new(AgentConnectionState::new());
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "int-test-container".to_string(),
+                ContainerHandle {
+                    container_id: "int-container-id".to_string(),
+                    agent_state: agent_state.clone(),
+                    backend_kind: Some("docker".to_string()),
+                    docker_host: None,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles, "int-test-token");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let last_activity = Arc::new(AtomicU64::new(0));
+        let la = last_activity.clone();
+        let server = tokio::spawn(async move {
+            run_control_server(listener, ctx, la, shutdown_rx).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "int-test-container".to_string(),
+            auth_token: "int-test-token".to_string(),
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(&mut stream);
+        let mut daemon_resp = String::new();
+        reader.read_line(&mut daemon_resp).await.unwrap();
+        let daemon_hello: DaemonHello = serde_json::from_str(daemon_resp.trim()).unwrap();
+        assert!(
+            daemon_hello.error.is_none(),
+            "daemon rejected handshake: {:?}",
+            daemon_hello.error
+        );
+
+        let start = std::time::Instant::now();
+        while !agent_state.connected.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() <= std::time::Duration::from_secs(1),
+                "agent_state.connected never became true within 1s of handshake"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_ne!(
+            agent_state.last_seen_secs.load(Ordering::Relaxed),
+            0,
+            "last_seen_secs should be updated at handshake"
+        );
+        assert_eq!(
+            agent_state.agent_version.lock().unwrap().as_deref(),
+            Some("0.0.28"),
+        );
+
+        drop(stream);
+        let _ = shutdown_tx.send(true);
+        // Nudge the listener so the select! observes the shutdown.
+        let _ = TcpStream::connect(addr).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server).await;
+    }
+
     #[tokio::test]
     async fn perform_handshake_unknown_container_does_not_mark_connected() {
         use tokio::io::AsyncWriteExt;
