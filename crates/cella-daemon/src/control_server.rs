@@ -250,6 +250,11 @@ where
         message: format!("hello flush error: {e}"),
     })?;
 
+    agent_state.connected.store(true, Ordering::Relaxed);
+    agent_state
+        .last_seen_secs
+        .store(current_time_secs(), Ordering::Relaxed);
+
     let workspace_path = hello.workspace_path.clone();
 
     Ok(Some(HandshakeResult {
