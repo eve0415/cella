@@ -12,7 +12,7 @@ use std::pin::Pin;
 use tracing::{debug, info, warn};
 
 use cella_backend::{
-    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
+    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec, agent_env_vars,
     run_lifecycle_phase,
 };
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
@@ -318,7 +318,14 @@ async fn prepare_and_start(
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-12. Build extra env vars and labels for the primary service.
-    let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
+    let mut extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env);
+    // BROWSER=/cella/bin/cella-browser is required for in-container URL
+    // forwarding. The non-compose path injects it explicitly (up.rs); without
+    // this the compose path ships containers with BROWSER unset and host
+    // `cella doctor` reports "browser helper not configured".
+    if client.capabilities().managed_agent {
+        extra_env.extend(agent_env_vars());
+    }
     let mut labels = build_compose_labels(cfg, project, &remote_user);
 
     let settings = cella_config::settings::Settings::load(cfg.workspace_root);
