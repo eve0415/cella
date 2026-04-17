@@ -213,7 +213,6 @@ async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
 
 async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let poll_interval = Duration::from_millis(poll_interval_ms);
-    let connect_timeout = Duration::from_secs(30);
 
     maybe_start_forward_proxy(proxy_config_json).await;
 
@@ -232,20 +231,13 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     };
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
-    // Wait for the host daemon to accept connections (race with cella up).
-    let client = reconnecting_client::ReconnectingClient::connect_with_retry(
-        &addr,
-        &container_name,
-        &token,
-        connect_timeout,
-    )
-    .await;
-
-    if !client.is_connected() {
-        info!("Running in standalone mode (no host daemon connection)");
-        port_watcher::run_standalone(poll_interval).await;
-        return;
-    }
+    // Block until the daemon accepts the handshake. Retries forever so a
+    // late-starting daemon (e.g., the common case where `cella up` spawns
+    // the container before the daemon finishes binding) recovers on its
+    // own instead of falling into permanent standalone mode.
+    let client =
+        reconnecting_client::ReconnectingClient::connect_with_retry(&addr, &container_name, &token)
+            .await;
 
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
