@@ -319,8 +319,7 @@ pub fn spawn_background_reconnect(
                         .await
                         .install_connection(client, hello, addr.clone(), token);
                     if let Some(w) = &state_writer {
-                        w.set_daemon_addr(Some(addr));
-                        w.set_state(crate::state::AgentState::Connected);
+                        w.set_connected(addr);
                     }
                     reconnecting_flag.store(false, AtomicOrdering::SeqCst);
                     return;

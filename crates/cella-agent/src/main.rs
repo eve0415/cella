@@ -249,8 +249,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
         reconnecting_client::ReconnectingClient::connect_with_retry(&addr, &container_name, &token)
             .await;
 
-    state_writer.set_daemon_addr(Some(addr.clone()));
-    state_writer.set_state(state::AgentState::Connected);
+    state_writer.set_connected(addr.clone());
 
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

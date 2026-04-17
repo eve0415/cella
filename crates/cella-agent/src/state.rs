@@ -66,8 +66,10 @@ pub struct AgentStateSnapshot {
 pub enum StateUpdate {
     /// Replace the transport state.
     SetState(AgentState),
-    /// Replace the daemon address (e.g., on reconnect with a new addr).
-    SetDaemonAddr(Option<String>),
+    /// Atomic transition: set both state and daemon address in a single
+    /// writer-loop iteration. Avoids the brief intermediate snapshot that
+    /// would otherwise be written between two separate updates.
+    Connected { daemon_addr: String },
 }
 
 /// Handle to the state writer task. Cloneable so multiple producers can share
@@ -86,14 +88,18 @@ impl StateWriter {
         }
     }
 
-    /// Convenience: push a new transport state.
+    /// Convenience: push a new transport state without touching the daemon
+    /// address. Used for `Reconnecting` and `Disconnected` transitions where
+    /// the addr either stays or becomes irrelevant.
     pub fn set_state(&self, state: AgentState) {
         self.update(StateUpdate::SetState(state));
     }
 
-    /// Convenience: push a new daemon address.
-    pub fn set_daemon_addr(&self, addr: Option<String>) {
-        self.update(StateUpdate::SetDaemonAddr(addr));
+    /// Convenience: atomically transition to `Connected` with the given
+    /// daemon address. Preferred over two separate updates to avoid a
+    /// half-written intermediate snapshot.
+    pub fn set_connected(&self, daemon_addr: String) {
+        self.update(StateUpdate::Connected { daemon_addr });
     }
 }
 
@@ -156,7 +162,10 @@ async fn writer_loop(
             maybe_update = rx.recv() => {
                 match maybe_update {
                     Some(StateUpdate::SetState(s)) => current_state = s,
-                    Some(StateUpdate::SetDaemonAddr(a)) => daemon_addr = a,
+                    Some(StateUpdate::Connected { daemon_addr: a }) => {
+                        current_state = AgentState::Connected;
+                        daemon_addr = Some(a);
+                    }
                     None => {
                         // All senders dropped — process is shutting down.
                         return;
@@ -326,11 +335,11 @@ mod tests {
         let initial = read_snapshot(&path).unwrap();
         assert!(matches!(initial.state, AgentState::Disconnected));
 
-        writer.set_state(AgentState::Connected);
-        writer.set_daemon_addr(Some("host.docker.internal:60000".to_string()));
+        writer.set_connected("host.docker.internal:60000".to_string());
 
-        // After two updates (two select iterations), a Connected snapshot
-        // with the addr must be on disk.
+        // The atomic Connected update should produce a snapshot with BOTH
+        // state=Connected and the daemon address in a single write — never
+        // a torn {Disconnected, Some(addr)} intermediate.
         let start = std::time::Instant::now();
         loop {
             let snap = read_snapshot(&path).unwrap();
@@ -339,11 +348,63 @@ mod tests {
             {
                 break;
             }
+            // If state is Connected, daemon_addr must already be set — never
+            // Connected without an addr (would mean torn write).
+            if matches!(snap.state, AgentState::Connected) {
+                assert_eq!(
+                    snap.daemon_addr.as_deref(),
+                    Some("host.docker.internal:60000"),
+                    "Connected without daemon_addr indicates torn write"
+                );
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(2),
-                "writer did not reflect updates within 2s"
+                "writer did not reflect update within 2s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_connected_is_atomic() {
+        // Regression for the two-message race: with separate set_state +
+        // set_daemon_addr calls, the writer could emit a {Disconnected,
+        // Some(addr)} snapshot between the two updates. `set_connected`
+        // fuses them into a single StateUpdate so no intermediate exists.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let writer = spawn_state_writer(
+            path.clone(),
+            "0.0.28".to_string(),
+            AgentState::Disconnected,
+            Duration::from_secs(60),
+        );
+
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        writer.set_connected("host.docker.internal:60000".to_string());
+
+        let start = std::time::Instant::now();
+        loop {
+            let snap = read_snapshot(&path).unwrap();
+            // Invariant: if state is Connected, daemon_addr must be Some.
+            if matches!(snap.state, AgentState::Connected) {
+                assert_eq!(
+                    snap.daemon_addr.as_deref(),
+                    Some("host.docker.internal:60000")
+                );
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "Connected state never observed within 2s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
