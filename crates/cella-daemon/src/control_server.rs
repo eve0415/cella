@@ -503,7 +503,6 @@ pub(crate) async fn handle_agent_message(
     ctx: &AgentHandlerContext<'_>,
     agent_state: &Arc<AgentConnectionState>,
 ) -> Option<DaemonMessage> {
-    agent_state.connected.store(true, Ordering::Relaxed);
     agent_state
         .last_seen_secs
         .store(current_time_secs(), Ordering::Relaxed);
@@ -2843,6 +2842,8 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
         let state = Arc::new(AgentConnectionState::new());
+        // Post-handshake invariant: connected is owned by perform_handshake.
+        state.connected.store(true, Ordering::Relaxed);
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
@@ -2857,7 +2858,6 @@ branch refs/heads/feat-b
         };
         let result = handle_agent_message(msg, &ctx, &state).await;
         assert!(result.is_none());
-        // Should update state
         assert!(state.connected.load(Ordering::Relaxed));
         assert!(state.last_seen_secs.load(Ordering::Relaxed) > 0);
     }
@@ -2927,15 +2927,16 @@ branch refs/heads/feat-b
     }
 
     // ---------------------------------------------------------------
-    // handle_agent_message updates agent_state
+    // handle_agent_message updates last_seen_secs (connected owned by handshake)
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn agent_state_updated_on_message() {
+    async fn handle_agent_message_updates_last_seen_preserves_connected() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
         let state = Arc::new(AgentConnectionState::new());
-        assert!(!state.connected.load(Ordering::Relaxed));
+        // Simulate post-handshake invariant: connected is owned by perform_handshake.
+        state.connected.store(true, Ordering::Relaxed);
         assert_eq!(state.last_seen_secs.load(Ordering::Relaxed), 0);
 
         let ctx = AgentHandlerContext {
@@ -2952,7 +2953,10 @@ branch refs/heads/feat-b
         };
         let _ = handle_agent_message(msg, &ctx, &state).await;
 
-        assert!(state.connected.load(Ordering::Relaxed));
+        assert!(
+            state.connected.load(Ordering::Relaxed),
+            "connected should remain true"
+        );
         let ts = state.last_seen_secs.load(Ordering::Relaxed);
         assert!(ts > 0, "last_seen_secs should be non-zero after message");
     }
