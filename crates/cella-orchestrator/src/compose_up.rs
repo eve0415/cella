@@ -787,6 +787,19 @@ fn build_compose_labels(
 
     // Cella-specific labels.
     labels.insert("dev.cella.tool".to_string(), "cella".to_string());
+    // `dev.cella.version` mirrors what the non-compose path stamps at
+    // up.rs:686. Two existing readers consult it:
+    //   - cella-doctor's check_version_skew falls back to this label when
+    //     the agent isn't connected; without it, compose containers show
+    //     "container unknown != CLI <ver>" every time the daemon restarts.
+    //   - cella-orchestrator's up.rs uses it to detect version skew and
+    //     decide whether to repopulate the agent volume on `cella up`.
+    // Both readers treat a missing label as "unknown", so this is a
+    // best-effort fallback, not an authoritative source of truth.
+    labels.insert(
+        "dev.cella.version".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
     labels.insert(
         "dev.cella.workspace_path".to_string(),
         workspace_str.clone(),
@@ -1096,6 +1109,54 @@ mod tests {
             !extra.iter().any(|v| v.starts_with("BROWSER=")),
             "managed_agent=false must NOT inject BROWSER; got {extra:?}"
         );
+    }
+
+    #[test]
+    fn build_compose_labels_stamps_cella_version() {
+        // Parity with up.rs:686. Doctor's version-skew check falls back to
+        // `dev.cella.version` when the live agent can't be reached; missing
+        // label makes the fallback show "container unknown != CLI <ver>".
+        // The label is best-effort (can go stale on CLI upgrade) — its
+        // absence is handled gracefully but its presence gives users useful
+        // info when the daemon is down.
+        let config = serde_json::json!({});
+        let config_path = PathBuf::from("/tmp/devcontainer.json");
+        let workspace_root = PathBuf::from("/tmp/workspace");
+        let cfg = ComposeUpConfig {
+            config: &config,
+            config_path: &config_path,
+            workspace_root: &workspace_root,
+            container_name: "test-container",
+            remote_env: &[],
+            remove_container: false,
+            build_no_cache: false,
+            skip_checksum: false,
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        };
+        let project = ComposeProject {
+            project_name: "cella-test".to_string(),
+            compose_files: vec![],
+            override_file: PathBuf::from("/tmp/override.yaml"),
+            primary_service: "app".to_string(),
+            run_services: None,
+            shutdown_action: cella_compose::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspace".to_string(),
+            config_dir: PathBuf::from("/tmp"),
+            workspace_root: workspace_root.clone(),
+            config_hash: "hash123".to_string(),
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        };
+
+        let labels = build_compose_labels(&cfg, &project, "vscode");
+        let version = labels
+            .get("dev.cella.version")
+            .expect("compose labels must include dev.cella.version");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
