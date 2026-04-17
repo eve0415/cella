@@ -55,8 +55,9 @@ fn desktop_ssh_forwarding(host_socket: Option<&String>) -> SshAgentForwarding {
 /// On `DockerRuntime::Colima`, paths under macOS App Sandbox dirs (e.g.
 /// 1Password's `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`)
 /// are unreachable from the Lima VM and the bind-mount would fail at
-/// container-create with `operation not supported`. Skip with a warning so
-/// `cella up` still succeeds; users can override via `containerEnv.SSH_AUTH_SOCK`.
+/// container-create with `operation not supported`. Skip with a warning
+/// so `cella up` still succeeds and point the user at colima's native
+/// `--ssh-agent` forwarding, which routes the host agent through Lima.
 fn direct_ssh_forwarding(
     runtime: &DockerRuntime,
     host_socket: Option<String>,
@@ -72,7 +73,7 @@ fn direct_ssh_forwarding(
 
     if matches!(runtime, DockerRuntime::Colima) && is_macos_sandboxed_path(&host_socket) {
         warn!(
-            "SSH_AUTH_SOCK at {host_socket} is a macOS sandboxed path unreachable from {runtime}'s VM; skipping SSH agent mount. Set SSH_AUTH_SOCK in devcontainer.json containerEnv to override."
+            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory unreachable from colima's VM; skipping SSH agent mount. Use colima's native host-agent forwarding instead: `colima start --ssh-agent`."
         );
         return None;
     }
