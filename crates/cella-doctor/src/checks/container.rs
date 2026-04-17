@@ -497,4 +497,30 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].checks[0].name, "skipped");
     }
+
+    #[test]
+    fn agent_not_connected_hint_suggests_rebuild_when_label_missing() {
+        let hint = agent_not_connected_hint(true);
+        assert!(
+            hint.contains("cella up --rebuild"),
+            "legacy container hint must point at rebuild; got {hint:?}"
+        );
+        assert!(
+            hint.contains("older cella"),
+            "legacy container hint must explain the why; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn agent_not_connected_hint_points_to_logs_when_label_present() {
+        let hint = agent_not_connected_hint(false);
+        assert!(
+            hint.contains("cella logs"),
+            "non-legacy hint should point to `cella logs`; got {hint:?}"
+        );
+        assert!(
+            !hint.contains("--rebuild"),
+            "non-legacy hint must NOT suggest rebuild; got {hint:?}"
+        );
+    }
 }
