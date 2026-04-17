@@ -14,8 +14,12 @@ pub struct SshAgentForwarding {
     pub env_value: String,
 }
 
-/// Docker Desktop's built-in SSH agent socket path (available inside the VM).
-const DOCKER_DESKTOP_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
+/// The VM-side magic SSH agent socket path that Docker Desktop, `OrbStack`,
+/// and colima (when `colima start --ssh-agent` is set) all expose inside
+/// their VMs as a forwarded host agent. Lima creates this path as a symlink
+/// to the host agent when `ssh.forwardAgent: true`; colima enables that
+/// Lima option via its own `forwardAgent` config flag.
+const VM_HOST_SERVICES_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
 
 /// Container-side socket path for direct bind-mount forwarding.
 const CONTAINER_SSH_SOCK: &str = "/tmp/cella-ssh-agent.sock";
@@ -38,27 +42,124 @@ fn is_macos_sandboxed_path(path: &str) -> bool {
         .any(|marker| canonical.contains(marker))
 }
 
-/// SSH agent forwarding for Docker Desktop / `OrbStack` (VM-based runtimes).
-fn desktop_ssh_forwarding(host_socket: Option<&String>) -> SshAgentForwarding {
+/// Pure path-builder used by `colima_config_paths`. Kept separate so tests
+/// can exercise the ordering without manipulating process env vars
+/// (workspace denies `unsafe_code`, which rules out `std::env::set_var`).
+fn colima_config_paths_from_env(
+    profile: &str,
+    colima_home: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(ch) = colima_home {
+        paths.push(
+            std::path::PathBuf::from(ch)
+                .join(profile)
+                .join("colima.yaml"),
+        );
+    }
+    if let Some(xdg) = xdg_config_home {
+        paths.push(
+            std::path::PathBuf::from(xdg)
+                .join("colima")
+                .join(profile)
+                .join("colima.yaml"),
+        );
+    }
+    if let Some(h) = home {
+        paths.push(
+            std::path::PathBuf::from(h)
+                .join(".colima")
+                .join(profile)
+                .join("colima.yaml"),
+        );
+    }
+    paths
+}
+
+/// Candidate paths for the active colima profile's `colima.yaml`, in the
+/// lookup order colima itself uses (see `abiosoft/colima` `config/files.go`):
+/// `$COLIMA_HOME` → `$XDG_CONFIG_HOME/colima` → `$HOME/.colima`, each joined
+/// with the active profile name (`$COLIMA_PROFILE` or `default`).
+fn colima_config_paths() -> Vec<std::path::PathBuf> {
+    let profile = std::env::var("COLIMA_PROFILE").unwrap_or_else(|_| "default".to_string());
+    colima_config_paths_from_env(
+        &profile,
+        std::env::var("COLIMA_HOME").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Returns `true` if the given colima YAML sets `forwardAgent: true` as a
+/// top-level key. Tolerant of leading whitespace, trailing comments, and
+/// mixed casing of the boolean; rejects nested keys or quoted booleans to
+/// avoid false positives on fields like `ssh: {forwardAgent: ...}`.
+fn parse_forward_agent_from_yaml(content: &str) -> bool {
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim_end();
+        // Top-level only — reject indented/nested entries.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("forwardAgent:") else {
+            continue;
+        };
+        if rest.trim().eq_ignore_ascii_case("true") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` if any provided candidate colima config file declares
+/// `forwardAgent: true`. Missing or unreadable files are treated as
+/// "not enabled". Split from `colima_forward_agent_enabled` so tests
+/// can drive this with a tempdir-backed path without mutating process env.
+fn colima_forward_agent_enabled_at(paths: &[std::path::PathBuf]) -> bool {
+    paths.iter().any(|path| {
+        std::fs::read_to_string(path).is_ok_and(|content| parse_forward_agent_from_yaml(&content))
+    })
+}
+
+/// Returns `true` when any candidate colima config file for the active
+/// profile declares `forwardAgent: true`. Missing or unreadable files are
+/// treated as "not enabled".
+fn colima_forward_agent_enabled() -> bool {
+    colima_forward_agent_enabled_at(&colima_config_paths())
+}
+
+/// SSH agent forwarding for runtimes whose VM exposes the host agent at the
+/// Docker Desktop / Lima magic path `/run/host-services/ssh-auth.sock`.
+/// Used for Docker Desktop, `OrbStack`, and colima-with-`forwardAgent`.
+fn vm_host_services_ssh_forwarding(
+    runtime: &DockerRuntime,
+    host_socket: Option<&String>,
+) -> SshAgentForwarding {
     if host_socket.is_none() {
-        warn!("SSH_AUTH_SOCK not set on host, but Docker Desktop may still provide SSH agent");
+        warn!(
+            "SSH_AUTH_SOCK not set on host, but {runtime} may still provide the SSH agent via /run/host-services/ssh-auth.sock"
+        );
     }
     SshAgentForwarding {
-        mount_source: DOCKER_DESKTOP_SSH_SOCK.to_string(),
-        mount_target: DOCKER_DESKTOP_SSH_SOCK.to_string(),
-        env_value: DOCKER_DESKTOP_SSH_SOCK.to_string(),
+        mount_source: VM_HOST_SERVICES_SSH_SOCK.to_string(),
+        mount_target: VM_HOST_SERVICES_SSH_SOCK.to_string(),
+        env_value: VM_HOST_SERVICES_SSH_SOCK.to_string(),
     }
 }
 
 /// SSH agent forwarding via direct bind-mount of the host socket.
 ///
-/// On `DockerRuntime::Colima`, paths under macOS App Sandbox dirs (e.g.
-/// 1Password's `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`)
-/// are unreachable from the Lima VM and the bind-mount would fail at
-/// container-create with `operation not supported`. Skip with a warning
-/// so `cella up` still succeeds; the warning names the root cause and
-/// lets the user decide how to resolve it out-of-band — cella does not
-/// yet implement end-to-end host-agent forwarding through colima.
+/// Only reached when the dispatcher in `ssh_agent_forwarding` couldn't
+/// satisfy the request from a VM-side magic path: for colima this means
+/// `forwardAgent` is OFF in colima.yaml, so we fall back to attempting a
+/// direct bind-mount of the host socket. If that host path is under a
+/// macOS App Sandbox dir (the 1Password case), Lima's virtiofs cannot
+/// stat it and the bind-mount would fail at container-create with
+/// `operation not supported`; short-circuit here with a warning that
+/// tells the user exactly which colima knob to flip to get full
+/// host-agent forwarding on the next up.
 fn direct_ssh_forwarding(
     runtime: &DockerRuntime,
     host_socket: Option<String>,
@@ -74,7 +175,7 @@ fn direct_ssh_forwarding(
 
     if matches!(runtime, DockerRuntime::Colima) && is_macos_sandboxed_path(&host_socket) {
         warn!(
-            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory that colima's Lima VM cannot stat; skipping SSH agent mount. 1Password 8's agent socket is the common case."
+            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory that colima's Lima VM cannot stat; skipping SSH agent mount. Restart colima with `colima start --ssh-agent` and cella will pick up the host agent from /run/host-services/ssh-auth.sock on the next up."
         );
         return None;
     }
@@ -105,13 +206,20 @@ pub fn ssh_agent_forwarding(
         .ok()
         .filter(|s| !s.is_empty());
 
-    if matches!(
-        runtime,
-        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack
-    ) {
-        Some(desktop_ssh_forwarding(host_socket.as_ref()))
-    } else {
-        direct_ssh_forwarding(runtime, host_socket)
+    match runtime {
+        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack => Some(
+            vm_host_services_ssh_forwarding(runtime, host_socket.as_ref()),
+        ),
+        DockerRuntime::Colima if colima_forward_agent_enabled() => {
+            tracing::info!(
+                "colima forwardAgent is enabled; using {VM_HOST_SERVICES_SSH_SOCK} for SSH agent forwarding"
+            );
+            Some(vm_host_services_ssh_forwarding(
+                runtime,
+                host_socket.as_ref(),
+            ))
+        }
+        _ => direct_ssh_forwarding(runtime, host_socket),
     }
 }
 
@@ -234,19 +342,26 @@ mod tests {
     }
 
     #[test]
-    fn test_desktop_ssh_forwarding_returns_docker_desktop_path() {
-        let fwd = desktop_ssh_forwarding(None);
+    fn vm_host_services_ssh_forwarding_returns_magic_path() {
+        let fwd = vm_host_services_ssh_forwarding(&DockerRuntime::DockerDesktop, None);
         assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
         assert_eq!(fwd.mount_target, "/run/host-services/ssh-auth.sock");
         assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
     }
 
     #[test]
-    fn test_desktop_ssh_forwarding_with_socket_ignores_it() {
+    fn vm_host_services_ssh_forwarding_with_socket_ignores_it() {
         let host = "/tmp/ssh.sock".to_string();
-        let fwd = desktop_ssh_forwarding(Some(&host));
+        let fwd = vm_host_services_ssh_forwarding(&DockerRuntime::OrbStack, Some(&host));
         assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
         assert_eq!(fwd.mount_target, "/run/host-services/ssh-auth.sock");
+        assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
+    }
+
+    #[test]
+    fn vm_host_services_ssh_forwarding_works_for_colima() {
+        let fwd = vm_host_services_ssh_forwarding(&DockerRuntime::Colima, None);
+        assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
         assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
     }
 
@@ -418,5 +533,96 @@ mod tests {
             result.is_none(),
             "symlink pointing into Group Containers must be skipped on colima"
         );
+    }
+
+    #[test]
+    fn parse_forward_agent_yaml_detects_top_level_true() {
+        assert!(parse_forward_agent_from_yaml("forwardAgent: true\n"));
+        assert!(parse_forward_agent_from_yaml(
+            "cpu: 4\nforwardAgent: true\nmemory: 8\n"
+        ));
+        assert!(parse_forward_agent_from_yaml(
+            "forwardAgent: TRUE # enable 1Password\n"
+        ));
+    }
+
+    #[test]
+    fn parse_forward_agent_yaml_rejects_false_or_missing() {
+        assert!(!parse_forward_agent_from_yaml(""));
+        assert!(!parse_forward_agent_from_yaml("cpu: 4\nmemory: 8\n"));
+        assert!(!parse_forward_agent_from_yaml("forwardAgent: false\n"));
+        assert!(!parse_forward_agent_from_yaml("forwardAgent: no\n"));
+    }
+
+    #[test]
+    fn parse_forward_agent_yaml_rejects_nested_key() {
+        // `ssh.forwardAgent` is NOT colima's top-level knob. Lima uses
+        // `ssh.forwardAgent` internally but colima's user-facing field
+        // is a top-level `forwardAgent`. Reject indented matches to avoid
+        // accidentally picking up unrelated nested fields.
+        let yaml = "ssh:\n  forwardAgent: true\n";
+        assert!(!parse_forward_agent_from_yaml(yaml));
+    }
+
+    #[test]
+    fn parse_forward_agent_yaml_ignores_comments() {
+        assert!(!parse_forward_agent_from_yaml("# forwardAgent: true\n"));
+        assert!(parse_forward_agent_from_yaml(
+            "forwardAgent: true # commented explanation\n"
+        ));
+    }
+
+    #[test]
+    fn colima_config_paths_full_env_returns_three_paths_in_priority_order() {
+        let paths = colima_config_paths_from_env("work", Some("/ch"), Some("/xdg"), Some("/h"));
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("/ch/work/colima.yaml"),
+                std::path::PathBuf::from("/xdg/colima/work/colima.yaml"),
+                std::path::PathBuf::from("/h/.colima/work/colima.yaml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn colima_config_paths_skips_unset_env_vars() {
+        // Only HOME set — the other two candidates should be omitted.
+        let paths = colima_config_paths_from_env("default", None, None, Some("/h"));
+        assert_eq!(
+            paths,
+            vec![std::path::PathBuf::from("/h/.colima/default/colima.yaml")]
+        );
+    }
+
+    #[test]
+    fn colima_config_paths_no_env_returns_empty() {
+        assert!(colima_config_paths_from_env("default", None, None, None).is_empty());
+    }
+
+    #[test]
+    fn colima_forward_agent_enabled_at_reads_tempdir_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("default");
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("colima.yaml");
+        std::fs::write(&yaml, "cpu: 2\nforwardAgent: true\nmemory: 4\n").unwrap();
+
+        assert!(colima_forward_agent_enabled_at(&[yaml]));
+    }
+
+    #[test]
+    fn colima_forward_agent_enabled_at_missing_files_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("missing/colima.yaml");
+        assert!(!colima_forward_agent_enabled_at(&[nonexistent]));
+    }
+
+    #[test]
+    fn colima_forward_agent_enabled_at_disabled_yaml_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("colima.yaml");
+        std::fs::write(&yaml, "forwardAgent: false\n").unwrap();
+        assert!(!colima_forward_agent_enabled_at(&[yaml]));
     }
 }
