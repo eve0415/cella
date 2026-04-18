@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountSpec};
 use tracing::{debug, warn};
 
-use crate::progress::ProgressSender;
+use crate::progress::{PhaseChildHandle, ProgressSender};
+use crate::shell_detect::detect_shell;
 
 /// Probed user environment (e.g. from `userEnvProbe`).
 ///
@@ -876,10 +877,113 @@ pub async fn symlink_to_usr_local_bin(
 
 // ── Orchestration ────────────────────────────────────────────────────────────
 
+/// Shared context for per-tool verified install steps. Bundles the
+/// container-targeting args so `verified_install_step` stays under the
+/// per-function argument limit and so `install_tools` does not repeat itself.
+struct InstallCtx<'a> {
+    client: &'a dyn ContainerBackend,
+    container_id: &'a str,
+    remote_user: &'a str,
+    shell: &'a str,
+    probed_env: Option<&'a ProbedEnv>,
+}
+
+/// Finish a phase-child step after verifying the tool is callable via the same
+/// login-shell wrap `cella exec` uses. On `InstalledElsewhere` attempts a
+/// `/usr/local/bin` symlink and re-verifies. On any terminal failure, folds
+/// the installer's exit code and stderr into the `step.fail` message so the
+/// user sees why the `✗` appeared.
+async fn verified_install_step(
+    ctx: &InstallCtx<'_>,
+    binary: &str,
+    install_result: Option<ExecResult>,
+    step: PhaseChildHandle,
+) {
+    let verify = verify_tool_callable(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        ctx.shell,
+        binary,
+        ctx.probed_env,
+    )
+    .await;
+
+    match verify {
+        VerifyOutcome::Reachable => step.finish(),
+        VerifyOutcome::InstalledElsewhere(path) => {
+            match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
+                Ok(()) => {
+                    let second = verify_tool_callable(
+                        ctx.client,
+                        ctx.container_id,
+                        ctx.remote_user,
+                        ctx.shell,
+                        binary,
+                        ctx.probed_env,
+                    )
+                    .await;
+                    match second {
+                        VerifyOutcome::Reachable => step.finish(),
+                        other => step.fail(&render_failure_reason(
+                            install_result.as_ref(),
+                            &format!("symlink created but still not reachable: {other:?}"),
+                        )),
+                    }
+                }
+                Err(e) => step.fail(&render_failure_reason(
+                    install_result.as_ref(),
+                    &format!("symlink failed: {e}"),
+                )),
+            }
+        }
+        VerifyOutcome::NotInstalled => step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            "install did not produce a reachable binary",
+        )),
+        VerifyOutcome::ProbeError(e) => step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            &format!("verification failed: {e}"),
+        )),
+    }
+}
+
+/// Compose the `step.fail` reason string. When the installer exited non-zero,
+/// prefix with `"installer exit {code}: {stderr_first_line} — "` (stderr line
+/// truncated for readability) and also `warn!` the full stderr so it is
+/// captured by tracing consumers.
+fn render_failure_reason(install_result: Option<&ExecResult>, reason: &str) -> String {
+    match install_result {
+        Some(r) if r.exit_code != 0 => {
+            warn!(
+                "Tool install failed (exit {}): {}\nstderr:\n{}",
+                r.exit_code,
+                reason,
+                r.stderr.trim(),
+            );
+            let head = r.stderr.lines().next().unwrap_or("").trim();
+            let head = if head.len() > 200 { &head[..200] } else { head };
+            if head.is_empty() {
+                format!("installer exit {} — {reason}", r.exit_code)
+            } else {
+                format!("installer exit {}: {head} — {reason}", r.exit_code)
+            }
+        }
+        _ => reason.to_string(),
+    }
+}
+
 /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
 ///
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
+///
+/// After each install attempt, `verified_install_step` confirms the binary is
+/// callable via the same login-shell wrap `cella exec` uses. When the tool is
+/// installed elsewhere (e.g. `~/.local/bin`, an nvm-managed npm global), a
+/// `/usr/local/bin/<tool>` symlink is created so repeated `cella up` runs
+/// self-heal. A `✗` is rendered with the installer's exit code + stderr when
+/// verification still fails.
 pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -904,13 +1008,24 @@ pub async fn install_tools(
         return;
     }
 
+    // Detect shell once — verify_tool_callable and cella exec both use `-lc`
+    // wrapping through this shell, so the decision stays consistent.
+    let shell = detect_shell(client, container_id, remote_user).await;
+    let ctx = InstallCtx {
+        client,
+        container_id,
+        remote_user,
+        shell: &shell,
+        probed_env,
+    };
+
     // Grouped phase: parallel Claude Code (curl) || npm tools (Codex -> Gemini)
     let phase = progress.phase("Installing tools...");
 
     let claude_branch = async {
         if settings.tools.claude_code.enabled {
             let step = phase.step("Claude Code");
-            install_claude_code(
+            let install_result = install_claude_code(
                 client,
                 container_id,
                 remote_user,
@@ -918,7 +1033,7 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "claude", install_result, step).await;
         }
     };
 
@@ -929,7 +1044,7 @@ pub async fn install_tools(
         }
         if settings.tools.codex.enabled {
             let step = phase.step("Codex");
-            install_codex(
+            let install_result = install_codex(
                 client,
                 container_id,
                 remote_user,
@@ -937,11 +1052,11 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "codex", install_result, step).await;
         }
         if settings.tools.gemini.enabled {
             let step = phase.step("Gemini CLI");
-            install_gemini(
+            let install_result = install_gemini(
                 client,
                 container_id,
                 remote_user,
@@ -949,7 +1064,7 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "gemini", install_result, step).await;
         }
     };
 
