@@ -57,6 +57,14 @@ pub enum ProgressEvent {
         elapsed: Duration,
     },
 
+    /// A phase child failed with an explanatory message.
+    PhaseChildFailed {
+        parent_id: u64,
+        id: u64,
+        message: String,
+        elapsed: Duration,
+    },
+
     /// A phase finished.
     PhaseCompleted { id: u64, elapsed: Duration },
 
@@ -285,6 +293,17 @@ impl PhaseChildHandle {
         let _ = self.tx.try_send(ProgressEvent::PhaseChildCompleted {
             parent_id: self.parent_id,
             id: self.id,
+            elapsed: self.start.elapsed(),
+        });
+    }
+
+    /// Mark the child step as failed with an explanatory message.
+    pub fn fail(mut self, msg: &str) {
+        self.finished = true;
+        let _ = self.tx.try_send(ProgressEvent::PhaseChildFailed {
+            parent_id: self.parent_id,
+            id: self.id,
+            message: msg.to_string(),
             elapsed: self.start.elapsed(),
         });
     }
@@ -528,6 +547,34 @@ mod tests {
         assert!(matches!(ev, ProgressEvent::PhaseChildCompleted { .. }));
         let ev = rx.recv().await.unwrap(); // PhaseCompleted (from drop)
         assert!(matches!(ev, ProgressEvent::PhaseCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn phase_child_fail_sends_failed_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let sender = ProgressSender::new(tx, false);
+
+        let phase = sender.phase("Installing tools");
+        let child = phase.step("Claude Code");
+        child.fail("installer exit 42");
+        phase.finish();
+
+        let _ = rx.recv().await.unwrap(); // PhaseStarted
+        let _ = rx.recv().await.unwrap(); // PhaseChildStarted
+        let ev = rx.recv().await.unwrap();
+        match ev {
+            ProgressEvent::PhaseChildFailed {
+                parent_id,
+                id,
+                message,
+                ..
+            } => {
+                assert_eq!(parent_id, 1);
+                assert_eq!(id, 2);
+                assert_eq!(message, "installer exit 42");
+            }
+            other => panic!("Expected PhaseChildFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
