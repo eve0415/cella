@@ -733,6 +733,83 @@ pub fn build_tool_config_mount_specs(
     out
 }
 
+// ── Verify & symlink ─────────────────────────────────────────────────────────
+
+/// Outcome of checking whether a tool is callable through `cella exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// `<shell> -lc "command -v <bin>"` returned exit 0 — the tool is on the
+    /// same PATH that `cella exec` uses, so no remediation is needed.
+    Reachable,
+    /// The `-lc` probe failed but a login+interactive probe (`-lic`) found the
+    /// binary at the contained absolute path. Caller may choose to symlink it
+    /// into `/usr/local/bin` so that the `-lc` wrap `cella exec` uses can
+    /// find it next time.
+    InstalledElsewhere(String),
+    /// Neither probe located the binary. The installer did not produce a
+    /// reachable file.
+    NotInstalled,
+    /// A backend error prevented verification from running. Treated as a
+    /// hard failure because we cannot tell the user whether the install
+    /// worked.
+    ProbeError(String),
+}
+
+/// Check whether `binary` is callable by a login shell, mirroring the exact
+/// wrapping `cella exec` uses at `crates/cella-cli/src/commands/exec.rs`.
+///
+/// Passes `probed_env`'s `PATH` through `tool_exec_env` so the verification
+/// decision matches the real env `cella exec` will pass to `docker exec`,
+/// not a stricter default PATH.
+pub async fn verify_tool_callable(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    shell: &str,
+    binary: &str,
+    probed_env: Option<&ProbedEnv>,
+) -> VerifyOutcome {
+    let env = tool_exec_env(probed_env);
+    let cmd_str = format!("command -v {binary}");
+
+    // 1. Login-shell probe — matches cella exec's `<shell> -lc ...` wrap.
+    let lc_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![shell.to_string(), "-lc".to_string(), cmd_str.clone()],
+                user: Some(user.to_string()),
+                env: env.clone(),
+                working_dir: None,
+            },
+        )
+        .await;
+    match lc_result {
+        Ok(r) if r.exit_code == 0 => return VerifyOutcome::Reachable,
+        Ok(_) => {}
+        Err(e) => return VerifyOutcome::ProbeError(e.to_string()),
+    }
+
+    // 2. Login+interactive fallback — catches installers that only touched
+    //    `.bashrc` / `.zshrc`, which `-lc` does not source.
+    let lic_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![shell.to_string(), "-lic".to_string(), cmd_str],
+                user: Some(user.to_string()),
+                env,
+                working_dir: None,
+            },
+        )
+        .await;
+    match lic_result {
+        Ok(r) if r.exit_code == 0 => VerifyOutcome::InstalledElsewhere(r.stdout.trim().to_string()),
+        Ok(_) => VerifyOutcome::NotInstalled,
+        Err(e) => VerifyOutcome::ProbeError(e.to_string()),
+    }
+}
+
 // ── Orchestration ────────────────────────────────────────────────────────────
 
 /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
@@ -1234,5 +1311,93 @@ mod tests {
             specs.is_empty(),
             "no mounts when all forward_config=false; got {specs:?}"
         );
+    }
+
+    // ── verify_tool_callable ────────────────────────────────────────────────
+    //
+    // Call sequence:
+    //   1. `<shell> -lc "command -v <binary>"` (must match cella exec wrap)
+    //   2. `<shell> -lic "command -v <binary>"` (only if 1 exited non-zero)
+
+    fn ok_stdout(code: i64, stdout: &str) -> ExecResult {
+        ExecResult {
+            exit_code: code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_reachable_via_lc() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::Reachable);
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_installed_elsewhere_via_lic() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_stdout(0, "/home/vscode/.local/bin/claude\n")),
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VerifyOutcome::InstalledElsewhere("/home/vscode/.local/bin/claude".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_not_installed() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_exit(1)), // -lic: also not found
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::NotInstalled);
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_probe_error_on_first_call() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContainerNotFound {
+            identifier: "dead".into(),
+        })]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        match outcome {
+            VerifyOutcome::ProbeError(msg) => assert!(msg.contains("dead")),
+            other => panic!("expected ProbeError, got {other:?}"),
+        }
     }
 }
