@@ -893,12 +893,28 @@ struct InstallCtx<'a> {
 /// `/usr/local/bin` symlink and re-verifies. On any terminal failure, folds
 /// the installer's exit code and stderr into the `step.fail` message so the
 /// user sees why the `✗` appeared.
+///
+/// If `install_result` indicates the installer itself exited non-zero, the
+/// step fails immediately without even asking `verify_tool_callable` — an
+/// older copy of the binary may still be on `PATH` from a previous run, but
+/// the upgrade the user asked for did not land.
 async fn verified_install_step(
     ctx: &InstallCtx<'_>,
     binary: &str,
     install_result: Option<ExecResult>,
     step: PhaseChildHandle,
 ) {
+    // Short-circuit: if the installer ran and reported a non-zero exit, the
+    // requested install/upgrade did not take effect. Do not let a stale
+    // binary still on PATH render as ✓.
+    if matches!(install_result.as_ref(), Some(r) if r.exit_code != 0) {
+        step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            "installer exited non-zero",
+        ));
+        return;
+    }
+
     let verify = verify_tool_callable(
         ctx.client,
         ctx.container_id,
@@ -1631,5 +1647,64 @@ mod tests {
         .await
         .expect_err("ln exit 1 should surface");
         assert!(err.contains("Permission denied"), "got: {err}");
+    }
+
+    // ── verified_install_step: installer-failed short-circuit ───────────────
+    //
+    // Regression: a non-zero installer exit should render ✗ even when an
+    // older copy of the same binary is still on PATH from a previous run.
+
+    #[tokio::test]
+    async fn verified_install_step_installer_nonzero_exits_short_circuits_to_fail() {
+        use crate::progress::{ProgressEvent, ProgressSender};
+
+        // Empty MockBackend: short-circuit must not issue any exec calls.
+        let backend = MockBackend::new(vec![]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Claude Code");
+
+        let install_result = Some(ExecResult {
+            exit_code: 42,
+            stdout: String::new(),
+            stderr: "network unreachable".into(),
+        });
+        verified_install_step(&ctx, "claude", install_result, step).await;
+        phase.finish();
+
+        // Drain events and assert the child ended with PhaseChildFailed.
+        let mut saw_failed = false;
+        let mut saw_completed = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ProgressEvent::PhaseChildFailed { message, .. } => {
+                    saw_failed = true;
+                    assert!(
+                        message.contains("42"),
+                        "expected installer exit code in message, got: {message}",
+                    );
+                    assert!(
+                        message.contains("network unreachable"),
+                        "expected stderr first line in message, got: {message}",
+                    );
+                }
+                ProgressEvent::PhaseChildCompleted { .. } => saw_completed = true,
+                _ => {}
+            }
+        }
+        assert!(saw_failed, "expected PhaseChildFailed");
+        assert!(
+            !saw_completed,
+            "must not render ✓ when installer exited non-zero",
+        );
     }
 }
