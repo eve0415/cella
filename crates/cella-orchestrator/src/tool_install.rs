@@ -206,13 +206,19 @@ pub async fn ensure_alpine_claude_deps(client: &dyn ContainerBackend, container_
 ///
 /// Checks if already installed at the desired version, installs Alpine
 /// dependencies if needed, then runs the native installer.
+///
+/// Returns `Some(ExecResult)` when the native installer was invoked (whether
+/// or not it succeeded), and `None` when the idempotency guard short-circuited
+/// because the requested version is already installed. Backend errors during
+/// exec are flattened into a synthetic `ExecResult` with exit code `-1` so
+/// callers can treat all failure modes uniformly.
 pub async fn install_claude_code(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::ClaudeCode,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     if is_claude_code_installed(
         client,
         container_id,
@@ -222,22 +228,28 @@ pub async fn install_claude_code(
     )
     .await
     {
-        return;
+        return None;
     }
 
     let is_alpine = ensure_alpine_claude_deps(client, container_id).await;
-    run_claude_install(
-        client,
-        container_id,
-        remote_user,
-        &settings.version,
-        is_alpine,
-        probed_env,
+    Some(
+        run_claude_install(
+            client,
+            container_id,
+            remote_user,
+            &settings.version,
+            is_alpine,
+            probed_env,
+        )
+        .await,
     )
-    .await;
 }
 
 /// Execute the Claude Code install script inside the container.
+///
+/// Backend errors are converted into a synthetic `ExecResult` with exit code
+/// `-1` and the error string placed in `stderr`, so the caller can surface
+/// the cause without a separate error path.
 pub async fn run_claude_install(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -245,7 +257,7 @@ pub async fn run_claude_install(
     version: &str,
     is_alpine: bool,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> ExecResult {
     if version != "latest" && version != "stable" {
         debug!("Installing Claude Code v{version} (native installer will attempt version pinning)");
     }
@@ -259,7 +271,7 @@ pub async fn run_claude_install(
     }
     let env = if env.is_empty() { None } else { Some(env) };
 
-    let result = client
+    client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -269,28 +281,12 @@ pub async fn run_claude_install(
                 working_dir: None,
             },
         )
-        .await;
-
-    log_install_result(result);
-}
-
-/// Log the result of a Claude Code installation attempt.
-pub fn log_install_result(result: Result<ExecResult, BackendError>) {
-    match result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("Claude Code installed successfully");
-        }
-        Ok(r) => {
-            warn!(
-                "Claude Code installation exited with code {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-        }
-        Err(e) => {
-            warn!("Claude Code installation failed: {e}");
-        }
-    }
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        })
 }
 
 // ── npm tool helpers ─────────────────────────────────────────────────────────
@@ -897,35 +893,6 @@ mod tests {
     fn tool_shell_cmd_login_shell_for_empty_inner() {
         let cmd = tool_shell_cmd(None, "");
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
-    }
-
-    #[test]
-    fn log_install_result_success() {
-        let result = Ok(ExecResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-        // Should not panic
-        log_install_result(result);
-    }
-
-    #[test]
-    fn log_install_result_nonzero_exit() {
-        let result = Ok(ExecResult {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: "error occurred".to_string(),
-        });
-        log_install_result(result);
-    }
-
-    #[test]
-    fn log_install_result_error() {
-        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
-            identifier: "test".into(),
-        });
-        log_install_result(result);
     }
 
     #[test]
