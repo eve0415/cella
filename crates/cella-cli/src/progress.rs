@@ -23,6 +23,7 @@
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -165,6 +166,7 @@ impl Progress {
             start: Instant::now(),
             enabled: self.inner.enabled,
             completed_children: Arc::new(std::sync::Mutex::new(Vec::new())),
+            any_child_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -317,6 +319,9 @@ pub struct Phase {
     enabled: bool,
     /// Completed child descriptions, collected as children finish.
     completed_children: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set to `true` by any [`PhaseChild::fail`] so the phase header
+    /// renders `✗` instead of `✓`.
+    any_child_failed: Arc<AtomicBool>,
 }
 
 impl Phase {
@@ -335,21 +340,29 @@ impl Phase {
             label: label.to_string(),
             start: Instant::now(),
             completed: Arc::clone(&self.completed_children),
+            any_failed: Arc::clone(&self.any_child_failed),
         }
     }
 
     /// Finish the phase with total elapsed time.
     ///
     /// Prints parent + children as permanent output in correct order,
-    /// then clears all bars from the managed region.
+    /// then clears all bars from the managed region. The header marker is
+    /// `✓` when every child succeeded and `✗` when any child failed.
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
         let time_suffix = format_elapsed(elapsed);
 
+        let marker = if self.any_child_failed.load(Ordering::Relaxed) {
+            "✗".red().to_string()
+        } else {
+            "✓".green().to_string()
+        };
+
         // Print parent line first (permanent).
         let _ = self
             .multi
-            .println(format!("  {} {}{time_suffix}", "✓".green(), self.label));
+            .println(format!("  {marker} {}{time_suffix}", self.label));
 
         // Print completed children in the order they finished (permanent).
         let Ok(children) = self.completed_children.lock() else {
@@ -381,6 +394,7 @@ pub struct PhaseChild {
     label: String,
     start: Instant,
     completed: Arc<std::sync::Mutex<Vec<String>>>,
+    any_failed: Arc<AtomicBool>,
 }
 
 impl PhaseChild {
@@ -392,6 +406,21 @@ impl PhaseChild {
         if let Ok(mut children) = self.completed.lock() {
             children.push(msg);
         }
+        self.bar.finish_and_clear();
+    }
+
+    /// Mark as failed with a red `✗` and an explanatory message.
+    ///
+    /// Also sets the parent phase's shared `any_failed` flag so the phase
+    /// header renders `✗` instead of `✓`.
+    pub fn fail(self, reason: &str) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        let msg = format!("      {} {}: {reason}{time_suffix}", "✗".red(), self.label);
+        if let Ok(mut children) = self.completed.lock() {
+            children.push(msg);
+        }
+        self.any_failed.store(true, Ordering::Relaxed);
         self.bar.finish_and_clear();
     }
 }
@@ -529,6 +558,11 @@ pub fn bridge(progress: &Progress) -> (ProgressSender, tokio::task::JoinHandle<(
                 ProgressEvent::PhaseChildCompleted { id, .. } => {
                     if let Some(child) = children.remove(&id) {
                         child.finish();
+                    }
+                }
+                ProgressEvent::PhaseChildFailed { id, message, .. } => {
+                    if let Some(child) = children.remove(&id) {
+                        child.fail(&message);
                     }
                 }
                 ProgressEvent::PhaseCompleted { id, .. } => {

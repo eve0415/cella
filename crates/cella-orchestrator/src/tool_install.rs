@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountSpec};
 use tracing::{debug, warn};
 
-use crate::progress::ProgressSender;
+use crate::progress::{PhaseChildHandle, ProgressSender};
+use crate::shell_detect::detect_shell;
 
 /// Probed user environment (e.g. from `userEnvProbe`).
 ///
@@ -206,13 +207,19 @@ pub async fn ensure_alpine_claude_deps(client: &dyn ContainerBackend, container_
 ///
 /// Checks if already installed at the desired version, installs Alpine
 /// dependencies if needed, then runs the native installer.
+///
+/// Returns `Some(ExecResult)` when the native installer was invoked (whether
+/// or not it succeeded), and `None` when the idempotency guard short-circuited
+/// because the requested version is already installed. Backend errors during
+/// exec are flattened into a synthetic `ExecResult` with exit code `-1` so
+/// callers can treat all failure modes uniformly.
 pub async fn install_claude_code(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::ClaudeCode,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     if is_claude_code_installed(
         client,
         container_id,
@@ -222,22 +229,28 @@ pub async fn install_claude_code(
     )
     .await
     {
-        return;
+        return None;
     }
 
     let is_alpine = ensure_alpine_claude_deps(client, container_id).await;
-    run_claude_install(
-        client,
-        container_id,
-        remote_user,
-        &settings.version,
-        is_alpine,
-        probed_env,
+    Some(
+        run_claude_install(
+            client,
+            container_id,
+            remote_user,
+            &settings.version,
+            is_alpine,
+            probed_env,
+        )
+        .await,
     )
-    .await;
 }
 
 /// Execute the Claude Code install script inside the container.
+///
+/// Backend errors are converted into a synthetic `ExecResult` with exit code
+/// `-1` and the error string placed in `stderr`, so the caller can surface
+/// the cause without a separate error path.
 pub async fn run_claude_install(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -245,7 +258,7 @@ pub async fn run_claude_install(
     version: &str,
     is_alpine: bool,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> ExecResult {
     if version != "latest" && version != "stable" {
         debug!("Installing Claude Code v{version} (native installer will attempt version pinning)");
     }
@@ -259,7 +272,7 @@ pub async fn run_claude_install(
     }
     let env = if env.is_empty() { None } else { Some(env) };
 
-    let result = client
+    client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -269,28 +282,12 @@ pub async fn run_claude_install(
                 working_dir: None,
             },
         )
-        .await;
-
-    log_install_result(result);
-}
-
-/// Log the result of a Claude Code installation attempt.
-pub fn log_install_result(result: Result<ExecResult, BackendError>) {
-    match result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("Claude Code installed successfully");
-        }
-        Ok(r) => {
-            warn!(
-                "Claude Code installation exited with code {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-        }
-        Err(e) => {
-            warn!("Claude Code installation failed: {e}");
-        }
-    }
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        })
 }
 
 // ── npm tool helpers ─────────────────────────────────────────────────────────
@@ -362,25 +359,6 @@ pub async fn npm_install_global(
             },
         )
         .await
-}
-
-/// Log the result of an npm tool installation attempt.
-pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, BackendError>) {
-    match result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("{tool_name} installed successfully");
-        }
-        Ok(r) => {
-            warn!(
-                "{tool_name} installation exited with code {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-        }
-        Err(e) => {
-            warn!("{tool_name} installation failed: {e}");
-        }
-    }
 }
 
 // ── Codex ────────────────────────────────────────────────────────────────────
@@ -456,13 +434,18 @@ pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_
 /// Ensures bubblewrap is available for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
+///
+/// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
+/// and `None` when Codex is already present at the requested version.
+/// Backend errors are flattened into a synthetic `ExecResult` with exit
+/// code `-1` so all failure modes share one shape.
 pub async fn install_codex(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     ensure_codex_sandbox_deps(client, container_id).await;
 
     if is_npm_tool_installed(
@@ -475,20 +458,26 @@ pub async fn install_codex(
     )
     .await
     {
-        return;
+        return None;
     }
 
     debug!("Installing Codex ({})...", settings.version);
-    let result = npm_install_global(
-        client,
-        container_id,
-        remote_user,
-        "@openai/codex",
-        &settings.version,
-        probed_env,
+    Some(
+        npm_install_global(
+            client,
+            container_id,
+            remote_user,
+            "@openai/codex",
+            &settings.version,
+            probed_env,
+        )
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }),
     )
-    .await;
-    log_npm_install_result("Codex", result);
 }
 
 // ── Gemini ───────────────────────────────────────────────────────────────────
@@ -497,13 +486,18 @@ pub async fn install_codex(
 ///
 /// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
 /// Caller must ensure Node.js/npm are available before calling this.
+///
+/// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
+/// and `None` when Gemini CLI is already present at the requested version.
+/// Backend errors are flattened into a synthetic `ExecResult` with exit
+/// code `-1` so all failure modes share one shape.
 pub async fn install_gemini(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::Gemini,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     if is_npm_tool_installed(
         client,
         container_id,
@@ -514,20 +508,26 @@ pub async fn install_gemini(
     )
     .await
     {
-        return;
+        return None;
     }
 
     debug!("Installing Gemini CLI ({})...", settings.version);
-    let result = npm_install_global(
-        client,
-        container_id,
-        remote_user,
-        "@google/gemini-cli",
-        &settings.version,
-        probed_env,
+    Some(
+        npm_install_global(
+            client,
+            container_id,
+            remote_user,
+            "@google/gemini-cli",
+            &settings.version,
+            probed_env,
+        )
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }),
     )
-    .await;
-    log_npm_install_result("Gemini CLI", result);
 }
 
 // ── Claude Code config helpers ───────────────────────────────────────────────
@@ -734,12 +734,272 @@ pub fn build_tool_config_mount_specs(
     out
 }
 
+// ── Verify & symlink ─────────────────────────────────────────────────────────
+
+/// Outcome of checking whether a tool is callable through `cella exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// `<shell> -lc "command -v <bin>"` returned exit 0 — the tool is on the
+    /// same PATH that `cella exec` uses, so no remediation is needed.
+    Reachable,
+    /// The `-lc` probe failed but a login+interactive probe (`-lic`) found the
+    /// binary at the contained absolute path. Caller may choose to symlink it
+    /// into `/usr/local/bin` so that the `-lc` wrap `cella exec` uses can
+    /// find it next time.
+    InstalledElsewhere(String),
+    /// Neither probe located the binary. The installer did not produce a
+    /// reachable file.
+    NotInstalled,
+    /// A backend error prevented verification from running. Treated as a
+    /// hard failure because we cannot tell the user whether the install
+    /// worked.
+    ProbeError(String),
+}
+
+/// Check whether `binary` is callable by a login shell, mirroring the exact
+/// wrapping `cella exec` uses at `crates/cella-cli/src/commands/exec.rs`.
+///
+/// Passes `probed_env`'s `PATH` through `tool_exec_env` so the verification
+/// decision matches the real env `cella exec` will pass to `docker exec`,
+/// not a stricter default PATH.
+pub async fn verify_tool_callable(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    shell: &str,
+    binary: &str,
+    probed_env: Option<&ProbedEnv>,
+) -> VerifyOutcome {
+    let env = tool_exec_env(probed_env);
+    let cmd_str = format!("command -v {binary}");
+
+    // 1. Login-shell probe — matches cella exec's `<shell> -lc ...` wrap.
+    let lc_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![shell.to_string(), "-lc".to_string(), cmd_str.clone()],
+                user: Some(user.to_string()),
+                env: env.clone(),
+                working_dir: None,
+            },
+        )
+        .await;
+    match lc_result {
+        Ok(r) if r.exit_code == 0 => return VerifyOutcome::Reachable,
+        Ok(_) => {}
+        Err(e) => return VerifyOutcome::ProbeError(e.to_string()),
+    }
+
+    // 2. Login+interactive fallback — catches installers that only touched
+    //    `.bashrc` / `.zshrc`, which `-lc` does not source.
+    let lic_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![shell.to_string(), "-lic".to_string(), cmd_str],
+                user: Some(user.to_string()),
+                env,
+                working_dir: None,
+            },
+        )
+        .await;
+    match lic_result {
+        Ok(r) if r.exit_code == 0 => VerifyOutcome::InstalledElsewhere(r.stdout.trim().to_string()),
+        Ok(_) => VerifyOutcome::NotInstalled,
+        Err(e) => VerifyOutcome::ProbeError(e.to_string()),
+    }
+}
+
+/// Symlink `source_path` to `/usr/local/bin/<binary>` as root.
+///
+/// `/usr/local/bin` is on the default PATH of every shell in every base image,
+/// so placing a symlink there guarantees `cella exec <binary>` resolves.
+///
+/// Refuses to overwrite a regular file at the target (could be user- or
+/// image-provided); replaces existing symlinks via `ln -sfn` so the operation
+/// is idempotent across repeated `cella up` runs.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable reason suitable for `step.fail` when:
+///   * a non-symlink already exists at `/usr/local/bin/<binary>`;
+///   * the backend exec call fails;
+///   * the `ln` invocation exits non-zero.
+pub async fn symlink_to_usr_local_bin(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    binary: &str,
+    source_path: &str,
+) -> Result<(), String> {
+    let target = format!("/usr/local/bin/{binary}");
+
+    // Safety: refuse to overwrite a pre-existing regular file. Replacing a
+    // symlink we (or a prior cella run) created is fine.
+    let check_cmd = format!("if [ -e {target} ] && [ ! -L {target} ]; then echo regular; fi");
+    match client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), check_cmd],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(r) if r.stdout.contains("regular") => {
+            return Err(format!("pre-existing {target} is not a symlink"));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("pre-check failed: {e}")),
+    }
+
+    let link_cmd = format!("ln -sfn '{}' {target}", source_path.replace('\'', "'\\''"));
+    match client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), link_cmd],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(r) if r.exit_code == 0 => Ok(()),
+        Ok(r) => Err(format!("ln exit {}: {}", r.exit_code, r.stderr.trim())),
+        Err(e) => Err(format!("exec failed: {e}")),
+    }
+}
+
 // ── Orchestration ────────────────────────────────────────────────────────────
+
+/// Shared context for per-tool verified install steps. Bundles the
+/// container-targeting args so `verified_install_step` stays under the
+/// per-function argument limit and so `install_tools` does not repeat itself.
+struct InstallCtx<'a> {
+    client: &'a dyn ContainerBackend,
+    container_id: &'a str,
+    remote_user: &'a str,
+    shell: &'a str,
+    probed_env: Option<&'a ProbedEnv>,
+}
+
+/// Finish a phase-child step after verifying the tool is callable via the same
+/// login-shell wrap `cella exec` uses. On `InstalledElsewhere` attempts a
+/// `/usr/local/bin` symlink and re-verifies. On any terminal failure, folds
+/// the installer's exit code and stderr into the `step.fail` message so the
+/// user sees why the `✗` appeared.
+///
+/// If `install_result` indicates the installer itself exited non-zero, the
+/// step fails immediately without even asking `verify_tool_callable` — an
+/// older copy of the binary may still be on `PATH` from a previous run, but
+/// the upgrade the user asked for did not land.
+async fn verified_install_step(
+    ctx: &InstallCtx<'_>,
+    binary: &str,
+    install_result: Option<ExecResult>,
+    step: PhaseChildHandle,
+) {
+    // Short-circuit: if the installer ran and reported a non-zero exit, the
+    // requested install/upgrade did not take effect. Do not let a stale
+    // binary still on PATH render as ✓.
+    if matches!(install_result.as_ref(), Some(r) if r.exit_code != 0) {
+        step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            "installer exited non-zero",
+        ));
+        return;
+    }
+
+    let verify = verify_tool_callable(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        ctx.shell,
+        binary,
+        ctx.probed_env,
+    )
+    .await;
+
+    match verify {
+        VerifyOutcome::Reachable => step.finish(),
+        VerifyOutcome::InstalledElsewhere(path) => {
+            match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
+                Ok(()) => {
+                    let second = verify_tool_callable(
+                        ctx.client,
+                        ctx.container_id,
+                        ctx.remote_user,
+                        ctx.shell,
+                        binary,
+                        ctx.probed_env,
+                    )
+                    .await;
+                    match second {
+                        VerifyOutcome::Reachable => step.finish(),
+                        other => step.fail(&render_failure_reason(
+                            install_result.as_ref(),
+                            &format!("symlink created but still not reachable: {other:?}"),
+                        )),
+                    }
+                }
+                Err(e) => step.fail(&render_failure_reason(
+                    install_result.as_ref(),
+                    &format!("symlink failed: {e}"),
+                )),
+            }
+        }
+        VerifyOutcome::NotInstalled => step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            "install did not produce a reachable binary",
+        )),
+        VerifyOutcome::ProbeError(e) => step.fail(&render_failure_reason(
+            install_result.as_ref(),
+            &format!("verification failed: {e}"),
+        )),
+    }
+}
+
+/// Compose the `step.fail` reason string. When the installer exited non-zero,
+/// prefix with `"installer exit {code}: {stderr_first_line} — "` (stderr line
+/// truncated for readability) and also `warn!` the full stderr so it is
+/// captured by tracing consumers.
+fn render_failure_reason(install_result: Option<&ExecResult>, reason: &str) -> String {
+    match install_result {
+        Some(r) if r.exit_code != 0 => {
+            warn!(
+                "Tool install failed (exit {}): {}\nstderr:\n{}",
+                r.exit_code,
+                reason,
+                r.stderr.trim(),
+            );
+            let head = r.stderr.lines().next().unwrap_or("").trim();
+            let head = if head.len() > 200 { &head[..200] } else { head };
+            if head.is_empty() {
+                format!("installer exit {} — {reason}", r.exit_code)
+            } else {
+                format!("installer exit {}: {head} — {reason}", r.exit_code)
+            }
+        }
+        _ => reason.to_string(),
+    }
+}
 
 /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
 ///
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
+///
+/// After each install attempt, `verified_install_step` confirms the binary is
+/// callable via the same login-shell wrap `cella exec` uses. When the tool is
+/// installed elsewhere (e.g. `~/.local/bin`, an nvm-managed npm global), a
+/// `/usr/local/bin/<tool>` symlink is created so repeated `cella up` runs
+/// self-heal. A `✗` is rendered with the installer's exit code + stderr when
+/// verification still fails.
 pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -764,13 +1024,24 @@ pub async fn install_tools(
         return;
     }
 
+    // Detect shell once — verify_tool_callable and cella exec both use `-lc`
+    // wrapping through this shell, so the decision stays consistent.
+    let shell = detect_shell(client, container_id, remote_user).await;
+    let ctx = InstallCtx {
+        client,
+        container_id,
+        remote_user,
+        shell: &shell,
+        probed_env,
+    };
+
     // Grouped phase: parallel Claude Code (curl) || npm tools (Codex -> Gemini)
     let phase = progress.phase("Installing tools...");
 
     let claude_branch = async {
         if settings.tools.claude_code.enabled {
             let step = phase.step("Claude Code");
-            install_claude_code(
+            let install_result = install_claude_code(
                 client,
                 container_id,
                 remote_user,
@@ -778,7 +1049,7 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "claude", install_result, step).await;
         }
     };
 
@@ -789,7 +1060,7 @@ pub async fn install_tools(
         }
         if settings.tools.codex.enabled {
             let step = phase.step("Codex");
-            install_codex(
+            let install_result = install_codex(
                 client,
                 container_id,
                 remote_user,
@@ -797,11 +1068,11 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "codex", install_result, step).await;
         }
         if settings.tools.gemini.enabled {
             let step = phase.step("Gemini CLI");
-            install_gemini(
+            let install_result = install_gemini(
                 client,
                 container_id,
                 remote_user,
@@ -809,7 +1080,7 @@ pub async fn install_tools(
                 probed_env,
             )
             .await;
-            step.finish();
+            verified_install_step(&ctx, "gemini", install_result, step).await;
         }
     };
 
@@ -897,63 +1168,6 @@ mod tests {
     fn tool_shell_cmd_login_shell_for_empty_inner() {
         let cmd = tool_shell_cmd(None, "");
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
-    }
-
-    #[test]
-    fn log_install_result_success() {
-        let result = Ok(ExecResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-        // Should not panic
-        log_install_result(result);
-    }
-
-    #[test]
-    fn log_install_result_nonzero_exit() {
-        let result = Ok(ExecResult {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: "error occurred".to_string(),
-        });
-        log_install_result(result);
-    }
-
-    #[test]
-    fn log_install_result_error() {
-        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
-            identifier: "test".into(),
-        });
-        log_install_result(result);
-    }
-
-    #[test]
-    fn log_npm_install_result_success() {
-        let result = Ok(ExecResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-        log_npm_install_result("TestTool", result);
-    }
-
-    #[test]
-    fn log_npm_install_result_nonzero_exit() {
-        let result = Ok(ExecResult {
-            exit_code: 127,
-            stdout: String::new(),
-            stderr: "command not found".to_string(),
-        });
-        log_npm_install_result("TestTool", result);
-    }
-
-    #[test]
-    fn log_npm_install_result_error() {
-        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
-            identifier: "missing".into(),
-        });
-        log_npm_install_result("TestTool", result);
     }
 
     // ── MockBackend for ensure_codex_sandbox_deps tests ─────────────────────
@@ -1291,6 +1505,206 @@ mod tests {
         assert!(
             specs.is_empty(),
             "no mounts when all forward_config=false; got {specs:?}"
+        );
+    }
+
+    // ── verify_tool_callable ────────────────────────────────────────────────
+    //
+    // Call sequence:
+    //   1. `<shell> -lc "command -v <binary>"` (must match cella exec wrap)
+    //   2. `<shell> -lic "command -v <binary>"` (only if 1 exited non-zero)
+
+    fn ok_stdout(code: i64, stdout: &str) -> ExecResult {
+        ExecResult {
+            exit_code: code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_reachable_via_lc() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::Reachable);
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_installed_elsewhere_via_lic() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_stdout(0, "/home/vscode/.local/bin/claude\n")),
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VerifyOutcome::InstalledElsewhere("/home/vscode/.local/bin/claude".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_not_installed() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // -lc: not found
+            Ok(ok_exit(1)), // -lic: also not found
+        ]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        assert_eq!(outcome, VerifyOutcome::NotInstalled);
+    }
+
+    #[tokio::test]
+    async fn verify_tool_callable_probe_error_on_first_call() {
+        let backend = MockBackend::new(vec![Err(BackendError::ContainerNotFound {
+            identifier: "dead".into(),
+        })]);
+        let outcome = verify_tool_callable(
+            &backend,
+            "test-container",
+            "vscode",
+            "/bin/bash",
+            "claude",
+            None,
+        )
+        .await;
+        match outcome {
+            VerifyOutcome::ProbeError(msg) => assert!(msg.contains("dead")),
+            other => panic!("expected ProbeError, got {other:?}"),
+        }
+    }
+
+    // ── symlink_to_usr_local_bin ────────────────────────────────────────────
+    //
+    // Call sequence:
+    //   1. pre-check: `sh -c "if [ -e /usr/local/bin/X ] && [ ! -L ... ]; then echo regular; fi"`
+    //   2. `sh -c "ln -sfn SOURCE /usr/local/bin/X"` (only when pre-check clean)
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_success_target_absent() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // pre-check: nothing at target
+            Ok(ok_exit(0)), // ln -sfn
+        ]);
+        let result = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_refuses_regular_file() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "regular\n"))]);
+        let err = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await
+        .expect_err("should refuse to overwrite regular file");
+        assert!(err.contains("not a symlink"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_ln_nonzero_exit() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),                        // pre-check clean
+            Ok(fail_exit(1, "Permission denied")), // ln fails
+        ]);
+        let err = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await
+        .expect_err("ln exit 1 should surface");
+        assert!(err.contains("Permission denied"), "got: {err}");
+    }
+
+    // ── verified_install_step: installer-failed short-circuit ───────────────
+    //
+    // Regression: a non-zero installer exit should render ✗ even when an
+    // older copy of the same binary is still on PATH from a previous run.
+
+    #[tokio::test]
+    async fn verified_install_step_installer_nonzero_exits_short_circuits_to_fail() {
+        use crate::progress::{ProgressEvent, ProgressSender};
+
+        // Empty MockBackend: short-circuit must not issue any exec calls.
+        let backend = MockBackend::new(vec![]);
+        let ctx = InstallCtx {
+            client: &backend,
+            container_id: "test-container",
+            remote_user: "vscode",
+            shell: "/bin/bash",
+            probed_env: None,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(32);
+        let sender = ProgressSender::new(tx, false);
+        let phase = sender.phase("Installing tools...");
+        let step = phase.step("Claude Code");
+
+        let install_result = Some(ExecResult {
+            exit_code: 42,
+            stdout: String::new(),
+            stderr: "network unreachable".into(),
+        });
+        verified_install_step(&ctx, "claude", install_result, step).await;
+        phase.finish();
+
+        // Drain events and assert the child ended with PhaseChildFailed.
+        let mut saw_failed = false;
+        let mut saw_completed = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ProgressEvent::PhaseChildFailed { message, .. } => {
+                    saw_failed = true;
+                    assert!(
+                        message.contains("42"),
+                        "expected installer exit code in message, got: {message}",
+                    );
+                    assert!(
+                        message.contains("network unreachable"),
+                        "expected stderr first line in message, got: {message}",
+                    );
+                }
+                ProgressEvent::PhaseChildCompleted { .. } => saw_completed = true,
+                _ => {}
+            }
+        }
+        assert!(saw_failed, "expected PhaseChildFailed");
+        assert!(
+            !saw_completed,
+            "must not render ✓ when installer exited non-zero",
         );
     }
 }
