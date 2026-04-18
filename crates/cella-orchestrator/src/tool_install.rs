@@ -360,25 +360,6 @@ pub async fn npm_install_global(
         .await
 }
 
-/// Log the result of an npm tool installation attempt.
-pub fn log_npm_install_result(tool_name: &str, result: Result<ExecResult, BackendError>) {
-    match result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("{tool_name} installed successfully");
-        }
-        Ok(r) => {
-            warn!(
-                "{tool_name} installation exited with code {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-        }
-        Err(e) => {
-            warn!("{tool_name} installation failed: {e}");
-        }
-    }
-}
-
 // ── Codex ────────────────────────────────────────────────────────────────────
 
 /// Ensure bubblewrap is available in the container for Codex sandbox support.
@@ -452,13 +433,18 @@ pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_
 /// Ensures bubblewrap is available for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
+///
+/// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
+/// and `None` when Codex is already present at the requested version.
+/// Backend errors are flattened into a synthetic `ExecResult` with exit
+/// code `-1` so all failure modes share one shape.
 pub async fn install_codex(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     ensure_codex_sandbox_deps(client, container_id).await;
 
     if is_npm_tool_installed(
@@ -471,20 +457,26 @@ pub async fn install_codex(
     )
     .await
     {
-        return;
+        return None;
     }
 
     debug!("Installing Codex ({})...", settings.version);
-    let result = npm_install_global(
-        client,
-        container_id,
-        remote_user,
-        "@openai/codex",
-        &settings.version,
-        probed_env,
+    Some(
+        npm_install_global(
+            client,
+            container_id,
+            remote_user,
+            "@openai/codex",
+            &settings.version,
+            probed_env,
+        )
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }),
     )
-    .await;
-    log_npm_install_result("Codex", result);
 }
 
 // ── Gemini ───────────────────────────────────────────────────────────────────
@@ -493,13 +485,18 @@ pub async fn install_codex(
 ///
 /// Checks if already installed, then runs `npm install -g @google/gemini-cli`.
 /// Caller must ensure Node.js/npm are available before calling this.
+///
+/// Returns `Some(ExecResult)` when npm was invoked (success or non-zero),
+/// and `None` when Gemini CLI is already present at the requested version.
+/// Backend errors are flattened into a synthetic `ExecResult` with exit
+/// code `-1` so all failure modes share one shape.
 pub async fn install_gemini(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::Gemini,
     probed_env: Option<&ProbedEnv>,
-) {
+) -> Option<ExecResult> {
     if is_npm_tool_installed(
         client,
         container_id,
@@ -510,20 +507,26 @@ pub async fn install_gemini(
     )
     .await
     {
-        return;
+        return None;
     }
 
     debug!("Installing Gemini CLI ({})...", settings.version);
-    let result = npm_install_global(
-        client,
-        container_id,
-        remote_user,
-        "@google/gemini-cli",
-        &settings.version,
-        probed_env,
+    Some(
+        npm_install_global(
+            client,
+            container_id,
+            remote_user,
+            "@google/gemini-cli",
+            &settings.version,
+            probed_env,
+        )
+        .await
+        .unwrap_or_else(|e| ExecResult {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }),
     )
-    .await;
-    log_npm_install_result("Gemini CLI", result);
 }
 
 // ── Claude Code config helpers ───────────────────────────────────────────────
@@ -893,34 +896,6 @@ mod tests {
     fn tool_shell_cmd_login_shell_for_empty_inner() {
         let cmd = tool_shell_cmd(None, "");
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
-    }
-
-    #[test]
-    fn log_npm_install_result_success() {
-        let result = Ok(ExecResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-        log_npm_install_result("TestTool", result);
-    }
-
-    #[test]
-    fn log_npm_install_result_nonzero_exit() {
-        let result = Ok(ExecResult {
-            exit_code: 127,
-            stdout: String::new(),
-            stderr: "command not found".to_string(),
-        });
-        log_npm_install_result("TestTool", result);
-    }
-
-    #[test]
-    fn log_npm_install_result_error() {
-        let result: Result<ExecResult, BackendError> = Err(BackendError::ContainerNotFound {
-            identifier: "missing".into(),
-        });
-        log_npm_install_result("TestTool", result);
     }
 
     // ── MockBackend for ensure_codex_sandbox_deps tests ─────────────────────
