@@ -810,6 +810,70 @@ pub async fn verify_tool_callable(
     }
 }
 
+/// Symlink `source_path` to `/usr/local/bin/<binary>` as root.
+///
+/// `/usr/local/bin` is on the default PATH of every shell in every base image,
+/// so placing a symlink there guarantees `cella exec <binary>` resolves.
+///
+/// Refuses to overwrite a regular file at the target (could be user- or
+/// image-provided); replaces existing symlinks via `ln -sfn` so the operation
+/// is idempotent across repeated `cella up` runs.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable reason suitable for `step.fail` when:
+///   * a non-symlink already exists at `/usr/local/bin/<binary>`;
+///   * the backend exec call fails;
+///   * the `ln` invocation exits non-zero.
+pub async fn symlink_to_usr_local_bin(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    binary: &str,
+    source_path: &str,
+) -> Result<(), String> {
+    let target = format!("/usr/local/bin/{binary}");
+
+    // Safety: refuse to overwrite a pre-existing regular file. Replacing a
+    // symlink we (or a prior cella run) created is fine.
+    let check_cmd = format!("if [ -e {target} ] && [ ! -L {target} ]; then echo regular; fi");
+    match client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), check_cmd],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(r) if r.stdout.contains("regular") => {
+            return Err(format!("pre-existing {target} is not a symlink"));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("pre-check failed: {e}")),
+    }
+
+    let link_cmd = format!("ln -sfn '{}' {target}", source_path.replace('\'', "'\\''"));
+    match client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), link_cmd],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+    {
+        Ok(r) if r.exit_code == 0 => Ok(()),
+        Ok(r) => Err(format!("ln exit {}: {}", r.exit_code, r.stderr.trim())),
+        Err(e) => Err(format!("exec failed: {e}")),
+    }
+}
+
 // ── Orchestration ────────────────────────────────────────────────────────────
 
 /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
@@ -1399,5 +1463,58 @@ mod tests {
             VerifyOutcome::ProbeError(msg) => assert!(msg.contains("dead")),
             other => panic!("expected ProbeError, got {other:?}"),
         }
+    }
+
+    // ── symlink_to_usr_local_bin ────────────────────────────────────────────
+    //
+    // Call sequence:
+    //   1. pre-check: `sh -c "if [ -e /usr/local/bin/X ] && [ ! -L ... ]; then echo regular; fi"`
+    //   2. `sh -c "ln -sfn SOURCE /usr/local/bin/X"` (only when pre-check clean)
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_success_target_absent() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // pre-check: nothing at target
+            Ok(ok_exit(0)), // ln -sfn
+        ]);
+        let result = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_refuses_regular_file() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "regular\n"))]);
+        let err = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await
+        .expect_err("should refuse to overwrite regular file");
+        assert!(err.contains("not a symlink"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn symlink_to_usr_local_bin_ln_nonzero_exit() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),                        // pre-check clean
+            Ok(fail_exit(1, "Permission denied")), // ln fails
+        ]);
+        let err = symlink_to_usr_local_bin(
+            &backend,
+            "test-container",
+            "claude",
+            "/home/vscode/.local/bin/claude",
+        )
+        .await
+        .expect_err("ln exit 1 should surface");
+        assert!(err.contains("Permission denied"), "got: {err}");
     }
 }
