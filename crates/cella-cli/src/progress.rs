@@ -394,6 +394,17 @@ impl PhaseChild {
         }
         self.bar.finish_and_clear();
     }
+
+    /// Mark as failed with a red `✗` and an explanatory message.
+    pub fn fail(self, reason: &str) {
+        let elapsed = self.start.elapsed();
+        let time_suffix = format_elapsed(elapsed);
+        let msg = format!("      {} {}: {reason}{time_suffix}", "✗".red(), self.label);
+        if let Ok(mut children) = self.completed.lock() {
+            children.push(msg);
+        }
+        self.bar.finish_and_clear();
+    }
 }
 
 impl Drop for PhaseChild {
@@ -529,6 +540,11 @@ pub fn bridge(progress: &Progress) -> (ProgressSender, tokio::task::JoinHandle<(
                 ProgressEvent::PhaseChildCompleted { id, .. } => {
                     if let Some(child) = children.remove(&id) {
                         child.finish();
+                    }
+                }
+                ProgressEvent::PhaseChildFailed { id, message, .. } => {
+                    if let Some(child) = children.remove(&id) {
+                        child.fail(&message);
                     }
                 }
                 ProgressEvent::PhaseCompleted { id, .. } => {
