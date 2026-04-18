@@ -19,5 +19,12 @@
     "feature-dev@claude-plugins-official": true,
     "code-review@claude-code-plugins": true,
     "superpowers@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(gh search code *)",
+      "Bash(gh search issues *)",
+      "Bash(gh search prs *)"
+    ]
   }
 }
