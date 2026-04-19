@@ -2,6 +2,8 @@
 
 Use this skill when you need to work on multiple independent changes simultaneously. Each change runs in its own isolated container with its own worktree.
 
+> **Prerequisite:** `cella task` is available only from inside a cella container via the in-container CLI (the agent binary symlinked as `cella`). If you're on the host, use `cella branch` to create worktree containers and `cella exec` to run commands inside them; the task-dispatch pattern below assumes you are already inside a container.
+
 ## When to use
 
 - User gives you a large task with independent parts (e.g., "implement auth, API, and UI")
