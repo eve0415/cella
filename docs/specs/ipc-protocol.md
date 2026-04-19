@@ -648,14 +648,16 @@ All variants are tagged with `"type"` in snake_case.
 |---|---|---|
 | `container_id` | `string` | Docker container ID |
 | `container_name` | `string` | Container name |
-| `container_ip` | `string?` | Container IP address |
+| `container_ip` | `string?` | Container IP address (may be `null` during pre-registration before the container has started; see `update_container_ip`) |
 | `ports_attributes` | `PortAttributes[]` | Per-port forwarding attributes from devcontainer.json |
 | `other_ports_attributes` | `PortAttributes?` | Default attributes for ports not matched by `ports_attributes` |
 | `forward_ports` | `u16[]` | Ports from `forwardPorts` in devcontainer.json (pre-allocate on registration, default: `[]`) |
 | `shutdown_action` | `string?` | The `shutdownAction` from devcontainer.json (`"none"`, `"stopContainer"`, or `"stopCompose"` for compose workspaces) |
+| `backend_kind` | `string?` | Backend that created the container (`"docker"`, `"apple-container"`). Defaults to `null` for backward compatibility with older CLIs |
+| `docker_host` | `string?` | Docker host override used when the container was created. Defaults to `null` |
 
 ```json
-{"type":"register_container","container_id":"abc123","container_name":"cella-myapp-main","container_ip":"172.20.0.5","ports_attributes":[],"other_ports_attributes":null,"forward_ports":[],"shutdown_action":null}
+{"type":"register_container","container_id":"abc123","container_name":"cella-myapp-main","container_ip":"172.20.0.5","ports_attributes":[],"other_ports_attributes":null,"forward_ports":[],"shutdown_action":null,"backend_kind":"docker","docker_host":null}
 ```
 
 **`deregister_container`** -- Deregister a container (stop proxies, release ports).
@@ -684,6 +686,17 @@ All variants are tagged with `"type"` in snake_case.
 
 ```json
 {"type":"ping"}
+```
+
+**`update_container_ip`** -- Update a container's IP address after it has started. Sent after pre-registration (with `container_ip: null`) once the container is running and its IP is known.
+
+| Field | Type | Description |
+|---|---|---|
+| `container_id` | `string` | Docker container ID |
+| `container_ip` | `string?` | Newly discovered container IP |
+
+```json
+{"type":"update_container_ip","container_id":"abc123","container_ip":"172.20.0.5"}
 ```
 
 **`shutdown`** -- Request graceful shutdown of the daemon. No fields.
@@ -755,6 +768,16 @@ All variants are tagged with `"type"` in snake_case.
 {"type":"shutting_down","pid":12345}
 ```
 
+**`container_ip_updated`** -- Container IP update acknowledged.
+
+| Field | Type | Description |
+|---|---|---|
+| `container_id` | `string` | Docker container ID the update was applied to |
+
+```json
+{"type":"container_ip_updated","container_id":"abc123"}
+```
+
 **`pong`** -- Pong response. No fields.
 
 ```json
@@ -793,6 +816,7 @@ All variants are tagged with `"type"` in snake_case.
 | `forwarded_port_count` | `usize` | Number of currently forwarded ports |
 | `agent_connected` | `bool` | Whether the agent TCP connection is active |
 | `last_seen_secs` | `u64` | Seconds since last agent heartbeat (default: `0`) |
+| `agent_version` | `string?` | Agent version from the `AgentHello` handshake, if connected (default: `null`) |
 
 ---
 

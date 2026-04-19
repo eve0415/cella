@@ -3,12 +3,14 @@
 ## Port Detection
 
 The in-container agent polls `/proc/net/tcp` and `/proc/net/tcp6` at a
-configurable interval (default 1 s) to discover listening sockets.
+configurable interval (default 1 s) to discover listening sockets. Only
+TCP is detected from `/proc/net/tcp*` today; the `PortProtocol` wire
+type also carries a `Udp` variant for future use.
 
 Each scan returns a list of `DetectedListener` entries containing:
 
 - Port number
-- Protocol (TCP)
+- Protocol (`tcp`)
 - Bind address (localhost-only vs all-interfaces)
 - Inode (used to resolve the process name via `/proc/<pid>/fd`)
 
@@ -50,7 +52,7 @@ a shared token.
 
 | Message | Fields | Description |
 |---------|--------|-------------|
-| `PortOpen` | port, protocol, process, bind | New listener detected |
+| `PortOpen` | port, protocol, process, bind, proxy_port? | New listener detected. `proxy_port` is the agent-side localhost-to-all-interfaces proxy when the underlying listener binds localhost only — the daemon then connects to `container_ip:proxy_port` instead of `container_ip:port`. |
 | `PortClosed` | port, protocol | Listener closed |
 | `BrowserOpen` | url | Open URL in host browser |
 | `CredentialRequest` | id, operation, fields | Git credential forwarding |

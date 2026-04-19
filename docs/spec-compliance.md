@@ -2,7 +2,7 @@
 
 Audit of cella against the official devcontainer specification (containers.dev) and reference CLI (devcontainers/cli).
 
-Date: 2026-04-01
+Date: 2026-04-19
 
 ## Legend
 
@@ -37,7 +37,11 @@ Date: 2026-04-01
 | `templates generate-docs` | Generate docs | Not implemented | MISSING |
 
 ### Cella-Specific Commands (beyond spec, keep as-is)
-`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completions`
+`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config validate`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completions`
+
+### CLI surface reserved for future work (stubs present, not yet implemented)
+
+`cella config show`, `cella config global`, `cella config dotfiles`, `cella config agent`, `cella template new`, `cella template list`, `cella template edit` — these subcommands parse successfully at the CLI layer but return `"not yet implemented"` at runtime. They are kept visible so the flag shape and routing are stable when the implementation lands.
 
 ---
 
@@ -48,8 +52,8 @@ Date: 2026-04-01
 | Flag | Spec Default | Cella | Status |
 |------|-------------|-------|--------|
 | `--workspace-folder` | cwd | Has it | PASS |
-| `--config` | - | Has as `--file` | FAIL (wrong name) |
-| `--override-config` | - | Not implemented | MISSING |
+| `--config` | - | Has it | PASS |
+| `--override-config` | - | Not implemented (use `.devcontainer/devcontainer.local.jsonc` instead) | MISSING |
 | `--id-label` (repeatable) | - | Not implemented | MISSING |
 | `--docker-path` | - | Not implemented | MISSING |
 | `--docker-compose-path` | - | Not implemented | MISSING |
@@ -59,8 +63,8 @@ Date: 2026-04-01
 | `--gpu-availability` | `detect` | Not implemented | MISSING |
 | `--mount-workspace-git-root` | `true` | Not implemented | MISSING |
 | `--mount-git-worktree-common-dir` | `false` | Not implemented | MISSING |
-| `--log-level` | `info` | Has as `--verbose` | PARTIAL |
-| `--log-format` | `text` | Not implemented | MISSING |
+| `--log-level` | `info` | Has as `--verbose` (boolean) | PARTIAL |
+| `--log-format` | `text` | Has as `--output` (`text`, `json`) | PARTIAL (name differs) |
 | `--terminal-columns/rows` | - | Not implemented | MISSING |
 | `--default-user-env-probe` | `loginInteractiveShell` | Not implemented | MISSING |
 | `--update-remote-user-uid-default` | `on` | Not implemented | MISSING |
@@ -83,8 +87,29 @@ Date: 2026-04-01
 | `--dotfiles-target-path` | `~/dotfiles` | Not implemented | MISSING |
 | `--container-session-data-folder` | - | Not implemented | MISSING |
 | `--secrets-file` | - | Not implemented | MISSING |
-| `--include-configuration` | `false` | Not implemented | MISSING |
-| `--include-merged-configuration` | `false` | Not implemented | MISSING |
+| `--include-configuration` | `false` | Not implemented (spec places it on `read-configuration`, see `read-configuration` row in §1) | MISSING |
+| `--include-merged-configuration` | `false` | Implemented on `read-configuration` (spec location) | PARTIAL (spec docs also allow it on `up`; cella only supports it on `read-configuration`) |
+
+### Cella-specific flags on `up` (not in spec)
+
+These flags are cella-only. They do not conflict with any spec flag name and can be kept.
+
+| Flag | Purpose |
+|------|---------|
+| `-v`, `--verbose` | Expanded step details in TUI progress |
+| `--rebuild` | Force rebuild before start (semantically overlaps spec's `--remove-existing-container` + cache invalidation) |
+| `--pull <always\|missing\|never>` | Image pull policy (independent of spec's `--buildkit`/build-cache flags) |
+| `--secret` (repeatable) | BuildKit `id=X[,src=Y][,env=Z]` secret for image builds |
+| `--backend <docker>` | Container backend selection (docker today; apple-container gated on macOS) |
+| `--docker-host` | Override `DOCKER_HOST` for this invocation |
+| `--output <text\|json>` | Output/log format — see `--log-format` row in the spec table |
+| `--strict <host-requirements\|all>` | Elevate host-requirements from warn to fail |
+| `--skip-checksum` | Skip agent-binary SHA256 check (for custom agent builds) |
+| `--branch <BRANCH>` | Target a worktree-backed branch container |
+| `--no-network-rules` | Skip network proxy block rules (proxy forwarding still active) |
+| `--profile` (repeatable) | Docker Compose profile(s) to activate |
+| `--env-file` (repeatable) | Extra env-file(s) for Docker Compose |
+| `--pull-policy <always\|missing\|never\|build>` | Docker Compose service pull policy |
 
 ### `build` Command Flags
 
@@ -95,11 +120,23 @@ Date: 2026-04-01
 | `--platform` | - | Not implemented | MISSING |
 | `--push` | `false` | Not implemented | MISSING |
 | `--label` (repeatable) | - | Not implemented | MISSING |
-| `--output` | - | Not implemented | MISSING |
+| `--output` | - (buildx output target, e.g. `type=image`) | Has `--output` but as log format (`text`/`json`) — name collision | FAIL (same flag name, different semantics) |
 | `--cache-from` | - | Not implemented | MISSING |
 | `--cache-to` | - | Not implemented | MISSING |
-| `--buildkit` | `auto` | Not implemented | MISSING |
+| `--buildkit` | `auto` | Not implemented (BuildKit is driven implicitly by `--secret`) | MISSING |
 | `--additional-features` | - | Not implemented | MISSING |
+
+### Cella-specific flags on `build` (not in spec)
+
+| Flag | Purpose |
+|------|---------|
+| `-v`, `--verbose` | Expanded step details |
+| `--pull <always\|missing\|never>` | Image pull policy (cella-specific; also on `up`) |
+| `--workspace-folder` | Explicit workspace folder |
+| `--config` | Path to devcontainer.json |
+| `--backend`, `--docker-host` | Backend selection / Docker host override |
+| `--secret` (repeatable) | BuildKit build secret (`id=X[,src=Y][,env=Z]`) |
+| `--profile`, `--env-file`, `--pull-policy` | Docker Compose flags (when building a compose workspace) |
 
 ---
 
@@ -166,8 +203,8 @@ Date: 2026-04-01
 
 ### 3.12 hostRequirements Merge
 - **Spec**: Maximum value wins across metadata layers
-- **Cella**: Validation exists in `host_requirements.rs` but merge strategy across layers not confirmed
-- **Status**: NEEDS AUDIT
+- **Cella**: `merge_host_requirements` in `cella-config/src/devcontainer/merge.rs` applies per-key max semantics during layer merge. `host_requirements.rs` in `cella-orchestrator` validates the merged values against the detected host
+- **Status**: PASS
 
 ### 3.13 Port String Format
 - **Spec**: Supports `"host:container"` strings in `forwardPorts`
@@ -197,7 +234,6 @@ Date: 2026-04-01
 | upgrade command | Feature lockfile update | Medium |
 | Feature authoring | test/package/publish/info/resolve-deps/generate-docs | Low |
 | Template commands | apply/publish/metadata/generate-docs | Low |
-| Host requirements | CPU/memory/storage/GPU validation with warnings | Medium |
 | Git root mount | `--mount-workspace-git-root` | Medium |
 
 ---
@@ -225,3 +261,7 @@ Date: 2026-04-01
 | Multi-config repos | Error + list configs, prompt for `--config` | Non-interactive: first alphabetically |
 | customizations.cella merge | Deep merge, last wins per key | Consistent with env var merge strategy |
 | Default additional feature | `ghcr.io/devcontainers/features/github-cli:1` | Opt-out via config |
+| CLI enum flags | `ValueEnum` (clap strict parsing) | Invalid values fail at parse time with a helpful list rather than slipping through to a late runtime error |
+| `--pull` semantics | Uniform `always`/`missing`/`never` on `up` and `build` | Match Docker's own pull policy vocabulary rather than invent a new one |
+| BuildKit secrets | `--secret id=X[,src=Y][,env=Z]` (repeatable) | Reuse BuildKit's established secret syntax so existing `Dockerfile` `RUN --mount=type=secret` works unchanged |
+| Prebuilt image lifecycle | Run lifecycle hooks baked into the image's `devcontainer.metadata` label | Prebuilds skip building but still need postCreate/postStart to run; follows spec metadata semantics |

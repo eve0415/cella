@@ -27,7 +27,7 @@ Implements the environment-related portions of the [Dev Container specification]
 - `ForwardMount` — a bind mount (source path on host, target path in container)
 - `ForwardEnv` — an environment variable (key, value)
 - `FileUpload` — file content to upload into the container (path, content, permissions)
-- `DockerRuntime` — detected container runtime (DockerDesktop, OrbStack, LinuxNative, Colima, Unknown)
+- `DockerRuntime` — detected container runtime (DockerDesktop, OrbStack, LinuxNative, Colima, Podman, RancherDesktop, Unknown)
 - `GitConfigEntry` — a git config key-value pair to forward
 - `ProxyForwardingConfig` — proxy configuration for container environment
 
@@ -57,6 +57,7 @@ This is the main entry point. It detects the runtime, probes the host environmen
 | `gemini` | Google Gemini CLI host detection and container path helpers |
 | `nvim` | Neovim config directory detection and mount preparation |
 | `tmux` | tmux config detection, mount preparation, and install command generation |
+| `ai_keys` | AI provider API-key forwarding — reads known provider env vars live on every `exec`/`shell` (never baked into the container at creation time) |
 
 ## Crate Dependencies
 

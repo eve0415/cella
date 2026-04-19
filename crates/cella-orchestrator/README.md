@@ -40,6 +40,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 | `up` | Main container-up pipeline with `UpHooks` trait for host integration |
 | `compose_build` | Docker Compose build pipeline with feature resolution |
 | `compose_features` | Combined-Dockerfile generation for Compose + Features |
+| `compose_mounts` | Mount parity helpers for Compose services (workspace bind, SSH-agent forward, cella-agent volume) so compose containers match single-container behavior |
 | `compose_up` | Docker Compose container-up pipeline with `ComposeUpHooks` trait |
 | `config` | Input configuration types (`UpConfig`, `ImageStrategy`, `HostRequirementPolicy`, `BranchConfig`, `PruneConfig`) |
 | `config_map` | Maps devcontainer.json to `CreateContainerOptions` (submodules: env, mounts, ports, run_args) |
@@ -52,7 +53,8 @@ cella-orchestrator extracts the shared container management logic so that both t
 | `env_cache` | User environment probing and caching (`~/.cella/probed-env.json`) |
 | `host_requirements` | CPU/memory/storage/GPU validation against `hostRequirements` |
 | `shell_detect` | Shell detection and quoting for container exec |
-| `tool_install` | AI coding tool installation (Claude Code, Codex, Gemini CLI) |
+| `tool_install` | AI coding tool installation (Claude Code, Codex, Gemini CLI); self-heals PATH and reports install status from on-disk reality rather than optimistic success |
+| `uid_image` | Build-time UID remap layer (`Dockerfile.uid-remap`) that matches the devcontainer CLI's `updateUID.Dockerfile` approach |
 | `branch` | Worktree-backed branch creation and container delegation |
 | `prune` | Detect and remove merged worktrees with their containers |
 | `docker_helpers` | Container lookup and exec helpers via `ContainerBackend` trait |

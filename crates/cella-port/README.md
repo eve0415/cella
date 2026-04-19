@@ -34,7 +34,7 @@ Supports the `forwardPorts` and `portsAttributes` properties from the [Dev Conta
 
 **Depends on:** [cella-protocol](../cella-protocol)
 
-**Depended on by:** [cella-agent](../cella-agent), [cella-cli](../cella-cli), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-agent](../cella-agent), [cella-daemon](../cella-daemon)
 
 ## Testing
 

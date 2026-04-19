@@ -7,7 +7,7 @@ Run all CI checks in sequence, stopping on first failure. Report each step's res
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings -D clippy::all
+cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::all
 cargo test --workspace
 cargo insta test --workspace --check --unreferenced=reject
 ```

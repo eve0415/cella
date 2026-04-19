@@ -17,7 +17,7 @@ cella-agent is a binary that runs inside dev containers started by cella. It is 
 7. **Plugin synchronization** — synchronizes editor plugin/extension manifests between host and container
 8. **CLI mode** — when invoked as `cella` (via symlink, `cella` -> `cella-agent`), provides in-container CLI commands that delegate to the host daemon
 
-The agent communicates with the host-side cella-daemon over a TCP control connection. If the daemon is unavailable, it falls back to standalone mode (port watching only, no forwarding).
+The agent communicates with the host-side cella-daemon over a TCP control connection. When a daemon address is configured, the agent retries the initial connection indefinitely and transparently reconnects after daemon restarts or binary upgrades — it never gives up. A lightweight standalone mode (port watching and localhost→all-interfaces proxying only, no host-side forwarding) is used only when no daemon address is configured at all.
 
 The binary uses manual argument parsing instead of clap to minimize binary size, since it ships inside every container.
 

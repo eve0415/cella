@@ -29,6 +29,7 @@ graph TD
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
+        jsonc[cella-jsonc<br><i>JSONC preprocessor</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
@@ -37,6 +38,7 @@ graph TD
     agent & daemon --> port
     port --> protocol
     config --> codegen
+    config & templates --> jsonc
     agent & config & env & orchestrator --> network
 ```
 
@@ -44,7 +46,7 @@ graph TD
 
 **Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, worktree orchestration, in-container agent, configuration parsing, and feature resolution.
 
-**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, and network proxy.
+**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, network proxy, and JSONC preprocessing.
 
 ## Crate Responsibilities
 
@@ -54,11 +56,15 @@ The binary entry point. Handles argument parsing via clap, initializes tracing, 
 
 ### cella-docker
 
-Abstracts container runtime operations. Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Wraps the bollard Docker API client behind a `DockerApi` trait for testability and future runtime support (Podman). Handles `runArgs` parsing (30+ docker create flags), lifecycle command execution, file uploads, and spec compliance features like `shutdownAction`, `waitFor`, and `appPort` deprecation.
+The Docker backend. Implements `cella-backend`'s `ContainerBackend` trait against the bollard Docker API client (itself wrapped behind a `DockerApi` trait for testability and future runtime support). Manages the full container lifecycle (create, start, stop, remove), image building, and runtime detection. Handles `runArgs` parsing (30+ docker create flags), lifecycle command execution, file uploads, and spec compliance features like `shutdownAction`, `waitFor`, and `appPort` deprecation.
+
+### cella-container
+
+The Apple Container backend (experimental, macOS 26+ Apple Silicon only). Implements `cella-backend`'s `ContainerBackend` trait against Apple's `container` CLI. Pre-1.0 surface with no Docker Compose support; gated behind `cfg(target_os = "macos")` so non-Apple builds never pull it in. Advertises its lack of compose support via the backend `BackendCapabilities` flags so the orchestrator refuses compose workflows up front rather than failing mid-pipeline.
 
 ### cella-compose
 
-Docker Compose orchestration. Generates override compose files that layer cella's customizations on top of user compose files, shells out to the `docker compose` V2 CLI, discovers compose-managed containers via Docker labels, and detects config changes via multi-file SHA-256 hashing.
+Docker Compose orchestration. Generates override compose files that layer cella's customizations on top of user compose files, shells out to the `docker compose` V2 CLI, discovers compose-managed containers via Docker labels, and detects config changes via multi-file SHA-256 hashing. Also resolves the final `USER` for Compose+Features builds by parsing the combined Dockerfile (`find_user_statement`) so lifecycle commands and cella-agent run as the correct user, and reaches mount parity with single-container by emitting the same `/workspaces` bind, SSH-agent forwarding, and agent-volume mount in the override file.
 
 ### cella-git
 
@@ -66,15 +72,15 @@ Git worktree management and branch resolution. Creates, lists, and removes workt
 
 ### cella-env
 
-Environment forwarding orchestration. Detects the host environment (SSH agent, git config, credential proxies, AI agent tools) and produces the mounts, environment variables, and post-start commands needed to forward that environment into containers. Includes platform-aware runtime detection (Docker Desktop, OrbStack, Linux native, Colima) and AI agent config forwarding for Claude Code, Codex, and Gemini CLI.
+Environment forwarding orchestration. Detects the host environment (SSH agent, git config, credential proxies, AI agent tools) and produces the mounts, environment variables, and post-start commands needed to forward that environment into containers. Includes platform-aware runtime detection (Docker Desktop, OrbStack, Linux native, Colima, Podman, Rancher Desktop), AI agent config forwarding for Claude Code, Codex, and Gemini CLI, and AI provider API-key forwarding (`ai_keys` reads known provider env vars live on every `exec`/`shell` rather than persisting them in container labels).
 
 ### cella-daemon
 
-Unified host-side daemon for credential forwarding, port management, and browser handling. Runs as a background process, accepting TCP connections from in-container agents. Includes OrbStack-specific port coordination, health monitoring, auth token management, and file-based logging.
+Unified host-side daemon for credential forwarding, port management, browser handling, worktree operations, and background tasks. Runs as a background process, accepting TCP connections from in-container agents and Unix-socket connections from the CLI. Includes OrbStack-specific port coordination, health monitoring, auth token management, file-based logging, a per-exec TCP stream bridge for TTY forwarding (used by `cella switch`), and a task manager that tracks `cella task run` background processes with live output broadcast.
 
 ### cella-agent
 
-In-container binary uploaded during `cella up`. Polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding. Proxies localhost-bound applications to `0.0.0.0`, handles `BROWSER` environment variable interception for OAuth callbacks, and forwards git credential requests to the host. Uses manual argument parsing (no clap) to minimize binary size.
+In-container binary uploaded during `cella up`. Polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding. Proxies localhost-bound applications to `0.0.0.0`, handles `BROWSER` environment variable interception for OAuth callbacks, and forwards git credential requests to the host. The initial daemon connect retries indefinitely (so containers that start before the daemon is ready eventually reconnect), and the agent transparently reconnects after daemon restarts (including binary upgrades). When the binary is invoked as `cella` via an in-container symlink, it enters CLI mode instead of daemon mode — worktree and task commands inside the container delegate to the host daemon over the existing TCP control connection. Uses manual argument parsing (no clap) to minimize binary size.
 
 ### cella-doctor
 
@@ -92,9 +98,13 @@ Dev Container Features resolution. Parses feature references (OCI, local path, H
 
 Devcontainer template lifecycle. Discovers templates from OCI registries (default: `ghcr.io/devcontainers/templates`), fetches and caches artifacts with a 24-hour TTL, reads template metadata (`devcontainer-template.json`), validates and substitutes template options, merges selected features, and generates the final `devcontainer.json` in JSONC or JSON format. Powers `cella init`.
 
+### cella-backend
+
+The backend abstraction layer. Defines the `ContainerBackend` trait that every backend (`cella-docker`, `cella-container`) implements, plus the shared types every consumer works against: `ContainerInfo`, `ContainerState`, `CreateContainerOptions`, `ExecOptions`, `BuildOptions`, `MountConfig`, `PortBinding`, and the `BackendError` unified error type. Also owns container/image naming conventions and label generation so all backends emit the same `dev.cella.*` and spec-standard `devcontainer.*` labels. Uses `BoxFuture` return types for object safety so callers can work against `dyn ContainerBackend` without knowing which runtime is underneath.
+
 ### cella-port
 
-Port allocation and detection. Provides `/proc/net/tcp` parsing for port detection and manages host port allocation to avoid conflicts across concurrent containers.
+Port allocation and detection. Provides `/proc/net/tcp` and `/proc/net/tcp6` parsing for detecting listening sockets inside containers and manages host port allocation to avoid conflicts across concurrent containers.
 
 ### cella-orchestrator
 
@@ -112,6 +122,10 @@ Build-time code generator. Transforms the devcontainer JSON Schema into typed Ru
 
 IPC wire format definitions for agent<->daemon and CLI<->daemon communication. Defines the newline-delimited JSON message types (`AgentMessage`, `DaemonMessage`, `ManagementRequest`, `ManagementResponse`), connection handshake (`AgentHello`, `DaemonHello`), and git credential helper format. Not a runtime logic crate — it only defines types and serialization.
 
+### cella-jsonc
+
+JSONC (JSON with Comments) preprocessor. Strips `//` and `/* */` comments and trailing commas from JSONC source, returning strict JSON with byte offsets preserved (`output.len() == input.len()`). Used by cella-config and cella-templates to parse devcontainer.json files while keeping source positions accurate for miette diagnostics.
+
 ## Dependency Graph
 
 The dependency graph evolves as crates are added. To view the current graph:
@@ -123,14 +137,23 @@ cargo tree -i cella-port --depth 1   # reverse dependencies of a specific crate
 
 ## Config Layer Merge Order
 
-Configuration is resolved by merging layers from lowest to highest priority:
+At resolve time, cella merges three devcontainer.json layers from lowest to highest priority:
 
-1. **Defaults** — built-in cella defaults
-2. **Template** — values from the selected template
-3. **Workspace** — `.devcontainer/devcontainer.json` in the repo
-4. **User** — user-level overrides (`~/.cella/config.toml`)
+1. **Global** — user-wide overrides at `~/.config/cella/global.jsonc` (optional)
+2. **Workspace** — `.devcontainer/devcontainer.json` in the repo
+3. **Local** — per-workspace overrides at `.devcontainer/devcontainer.local.jsonc` (optional, typically gitignored)
 
-Later layers override earlier ones for scalar values. Arrays and objects follow devcontainer spec merge semantics.
+Per-key merge semantics implemented in `cella-config`'s `merge::layers`:
+
+- **Scalars** — later layer wins
+- **Deep-merge objects** — `features`, `containerEnv`, `remoteEnv`, `customizations`, `portsAttributes`, `otherPortsAttributes`
+- **Concat arrays** — `mounts`, `runArgs`, `overrideFeatureInstallOrder`
+- **Union arrays** (dedup) — `forwardPorts`, `capAdd`, `securityOpt`
+- **Boolean OR** — `init`, `privileged` (any `true` wins)
+- **`hostRequirements`** — per-key maximum (cpu/memory/storage/gpu)
+- **Lifecycle commands** — later layer wins entirely
+
+Cella-specific settings (TOML) layer separately: `~/.cella/config.toml` provides user defaults; `.devcontainer/cella.toml` provides workspace overrides. The `customizations.cella` block inside `devcontainer.json` is deep-merged through the devcontainer layer pipeline above.
 
 ## Worktree-Container Binding
 
@@ -142,4 +165,4 @@ Each git worktree is bound to its own dev container instance. When you create a 
 4. Starts the container with the worktree mounted
 5. Allocates non-conflicting ports
 
-This binding is tracked so that `cella switch` can open a shell in the correct container, and `cella prune` can clean up both the worktree and its container.
+The binding is tracked via Docker labels (`dev.cella.worktree`, `dev.cella.worktree_branch`, `dev.cella.parent_repo`) on the container itself — no separate state file. `cella switch` looks up the container by worktree-branch label, and `cella prune` walks worktrees and removes the labelled container and its host port allocations together.

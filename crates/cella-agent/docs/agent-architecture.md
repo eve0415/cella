@@ -8,26 +8,33 @@ host daemon.
 
 ## Modes
 
-### Connected Mode
+### Connected Mode (default)
 
-When the daemon is reachable, the agent connects via TCP and operates in
-full mode:
+When a daemon address is available (either from `CELLA_DAEMON_ADDR` or
+from `/cella/.daemon_addr`), the agent retries the connection
+**indefinitely** and operates in full mode once it succeeds:
 
-1. **Port watcher** — polls `/proc/net/tcp` for listener changes, reports
-   `PortOpen`/`PortClosed` to the daemon, receives `PortMapping` responses
+1. **Port watcher** — polls `/proc/net/tcp` and `/proc/net/tcp6` for
+   listener changes, reports `PortOpen`/`PortClosed` to the daemon,
+   receives `PortMapping` responses
 2. **Credential forwarder** — intercepts `git credential` requests and
    forwards them to the daemon for host-side resolution
-3. **Health reporter** — sends periodic heartbeats with uptime and port
-   count
+3. **Browser forwarder** — forwards `BrowserOpen` requests to the
+   host browser (for OAuth callbacks, etc.)
+4. **Health reporter** — sends periodic heartbeats with uptime and
+   port count
+5. **Worktree/task proxy** — in CLI mode (see below) forwards
+   `branch`, `exec`, `prune`, `down`, `up`, `switch`, and `task run/list/
+   logs/wait/stop` commands to the daemon for host-side execution
 
-### Standalone Mode
+### Standalone Mode (fallback only when no address is configured)
 
-When the daemon is unreachable (timeout after retries), the agent falls back
-to standalone mode:
-
-- Port watcher runs locally without daemon communication
-- Only starts localhost→all-interfaces proxies (no host port allocation)
-- No credential forwarding or browser integration
+Entered only when there is no daemon address at all. In this mode the
+agent runs localhost→all-interfaces proxies locally but does not
+communicate with any daemon. This is a last-resort mode — when a
+daemon address exists but the daemon is temporarily unreachable, the
+agent stays in connecting state and retries until the daemon comes
+back (it does **not** fall through to standalone).
 
 ## Port Watcher (`port_watcher.rs`)
 
@@ -54,9 +61,17 @@ host (useful for OAuth callbacks, browser-open URLs, etc.).
 ### Reconnection
 
 The agent uses `ReconnectingClient` which:
-- Retries initial connection with timeout
-- Attempts single reconnect on send failure
-- Sets `reconnected` flag so the port watcher re-reports all known ports
+- **Retries the initial connection indefinitely** (`connect_with_retry`),
+  logging a progress warning every 30 s so the log isn't silent. The
+  agent never gives up — if the daemon is late coming up, the agent
+  will still be there when it arrives.
+- Re-reads `/cella/.daemon_addr` on every attempt, so a new daemon
+  address (e.g. after a `cella up` that restarted the daemon or
+  replaced the binary) is picked up automatically without restarting
+  the agent.
+- On a send failure during normal operation, attempts reconnect; on
+  success, sets a `reconnected` flag so the port watcher re-reports
+  all known ports and state is restored.
 
 ## Localhost Proxy (`port_proxy.rs`)
 
@@ -96,7 +111,13 @@ The agent assigns a unique ID to each request and waits for the matching
 
 ## Startup
 
-The agent is started by the container entrypoint script:
+The agent is started by the container entrypoint script under a
+restart loop so the daemon binary can be replaced in place (e.g. after
+`cella up` upgrades the agent). From `cella-orchestrator`'s perspective
+a restart is `pkill -f 'cella-agent daemon'; sleep 1; pgrep ... ||
+spawn`. The loop (in newer containers) picks it back up; the manual
+spawn is a backward-compat fallback for images created before the
+restart loop existed.
 
 ```sh
 if [ -x "$AGENT_PATH" ]; then
@@ -104,5 +125,22 @@ if [ -x "$AGENT_PATH" ]; then
 fi
 ```
 
-It reads the daemon's address and auth token from environment variables
-injected during container creation.
+Configuration sources, in priority order:
+
+1. **`CELLA_DAEMON_ADDR`** / **`CELLA_CONTROL_TOKEN`** env vars,
+   injected at container creation time.
+2. **`/cella/.daemon_addr`** file, refreshed by the CLI on every
+   `cella up` so agents that were running before a daemon restart pick
+   up the new address without intervention.
+
+## CLI Mode
+
+The agent binary is symlinked to `/cella/bin/cella` inside the container
+so that invoking `cella` from a shell prompt enters CLI mode instead of
+agent-daemon mode. CLI subcommands (`branch`, `list`, `exec`, `down`,
+`up`, `switch`, `prune`, `task run/list/logs/wait/stop`) are parsed by
+`cli.rs` and converted to `AgentMessage` requests sent over the
+already-established control connection. Each response is streamed back
+from the host daemon (progress, stdout/stderr chunks, final result) and
+rendered on the caller's terminal. Manual argument parsing keeps the
+binary small (no clap dependency).

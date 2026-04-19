@@ -78,7 +78,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | Runtime dependency | None | Node.js 14+ |
 | `stop` / `down` command | Yes | No ([cli#386](https://github.com/devcontainers/cli/issues/386)) |
 | Port forwarding | Automatic (daemon + in-container agent) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/22) ([cli#186](https://github.com/devcontainers/cli/issues/186)) |
-| SSH agent forwarding | Platform-aware (Docker Desktop, OrbStack, Linux) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/441) |
+| SSH agent forwarding | Platform-aware (Docker Desktop, OrbStack, Colima, Linux) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/441) |
 | Git credential forwarding | gh CLI via socket + TCP, auto-on | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/4202) |
 | BROWSER interception | Host browser opens for OAuth | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/9935) |
 | Container listing | `cella list` | No ([cli#843](https://github.com/devcontainers/cli/issues/843)) |
@@ -115,12 +115,14 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Environment & Credentials
 
-- [x] SSH agent forwarding (Docker Desktop, OrbStack, Linux)
+- [x] SSH agent forwarding (Docker Desktop, OrbStack, Colima, Linux)
 - [x] Git config forwarding
 - [x] gh CLI credential forwarding (auto-on)
 - [x] AI agent config forwarding (Claude Code, Codex, Gemini CLI)
+- [x] AI provider API key forwarding (read live from the host on every exec/shell — never baked into the container)
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
+- [x] Bubblewrap installed for Codex sandbox support
 
 ### Spec Compliance
 
@@ -152,6 +154,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] `cella code` — open VS Code connected to the container
 - [x] `cella nvim` — open Neovim connected to the container
 - [x] `cella tmux` — open tmux session inside the container
+- [x] Terminal title integration (sets the host terminal title to reflect the active container/branch)
 
 ### Runtime Support
 
@@ -166,8 +169,8 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
-- [ ] Template management (`cella template new/list/edit`)
-- [ ] Global config management (`cella config show/global/dotfiles/agent`)
+- [ ] `cella template new/list/edit` — template authoring (subcommands exist as stubs, not yet implemented)
+- [ ] `cella config show/global/dotfiles/agent` — global/dotfiles/agent config management (subcommands exist as stubs, not yet implemented; only `cella config validate` is live)
 - [ ] Podman backend
 - [ ] Colima / Lima support
 
@@ -233,7 +236,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 
 ## Architecture
 
-cella is a Rust workspace with 18 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 19 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```mermaid
 graph TD
@@ -262,12 +265,14 @@ graph TD
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
+        jsonc[cella-jsonc<br><i>JSONC preprocessor</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
+    config & templates --> jsonc
     agent & config & env & orchestrator --> network
     templates --> features
     port --> protocol
