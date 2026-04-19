@@ -95,7 +95,7 @@ Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container) (macOS), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port), [cella-templates](../cella-templates)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container) (macOS only, gated on `cfg(target_os = "macos")`), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-git](../cella-git), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-protocol](../cella-protocol), [cella-templates](../cella-templates)
 
 **Depended on by:** none (top of the dependency tree)
 

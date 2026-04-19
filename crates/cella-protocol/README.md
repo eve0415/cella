@@ -47,7 +47,7 @@ See [docs/specs/ipc-protocol.md](../../docs/specs/ipc-protocol.md) for the full 
 
 **Depends on:** none (only serde, serde_json, thiserror)
 
-**Depended on by:** [cella-port](../cella-port)
+**Depended on by:** [cella-agent](../cella-agent), [cella-cli](../cella-cli), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port)
 
 ## Testing
 

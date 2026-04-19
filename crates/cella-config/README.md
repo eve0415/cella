@@ -32,8 +32,7 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 | Module | Purpose |
 |--------|---------|
 | `devcontainer/discover` | Locates devcontainer.json files in workspace directories |
-| `devcontainer/jsonc` | Single-pass JSONC preprocessor (strips comments, preserves byte offsets) |
-| `devcontainer/parse` | Parses preprocessed JSON into typed config structs |
+| `devcontainer/parse` | Parses preprocessed JSON (via [cella-jsonc](../cella-jsonc)) into typed config structs |
 | `devcontainer/merge` | Merges config layers (global -> workspace -> local) |
 | `devcontainer/resolve` | Resolves variable references and paths |
 | `devcontainer/subst` | Variable substitution (`${localWorkspaceFolder}`, etc.) |
@@ -48,7 +47,7 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 ## Crate Dependencies
 
-**Depends on:** [cella-codegen](../cella-codegen) (build-time), [cella-network](../cella-network)
+**Depends on:** [cella-codegen](../cella-codegen) (build-time), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
@@ -66,7 +65,7 @@ cargo insta review
 
 ## Development
 
-The JSONC preprocessor is a single-pass state machine that preserves byte offsets. This is critical for diagnostics — every parse error can be traced back to the exact position in the original `.jsonc` file. Do not use string replacement on raw JSON as it breaks offset tracking.
+The JSONC preprocessor (the [cella-jsonc](../cella-jsonc) crate) is a single-pass state machine that preserves byte offsets. This is critical for diagnostics — every parse error can be traced back to the exact position in the original `.jsonc` file. Do not use string replacement on raw JSON as it breaks offset tracking.
 
 When the devcontainer schema changes upstream, update the schema JSON in the build inputs. Codegen will produce new types automatically. Run `cargo insta review` to accept the updated snapshots.
 

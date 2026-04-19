@@ -1,16 +1,14 @@
 # cella-doctor
 
-> System diagnostics, health checking, and hostRequirements validation.
+> System diagnostics and health checking for cella.
 
 Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-doctor powers the `cella doctor` command. It runs structured health checks across six categories (system, Docker, git/credentials, daemon, configuration, containers), validates host requirements from devcontainer.json, and can redact PII for safe sharing of diagnostic output.
+cella-doctor powers the `cella doctor` command. It runs structured health checks across six categories (system, Docker, git/credentials, daemon, configuration, containers) and can redact PII for safe sharing of diagnostic output. `hostRequirements` validation itself lives in `cella-orchestrator` (where the up pipeline needs it); cella-doctor surfaces the orchestrator's decision under the `config` category so `cella doctor` reports it alongside the other checks.
 
-Each check category runs with a 5-second timeout to prevent hangs from unresponsive services. Results are collected into a structured report with severity levels (pass, warning, error, info) that can be output as human-readable text or JSON.
-
-The host requirements module validates `hostRequirements` from the devcontainer spec — checking available CPUs, memory, storage, and GPU against the requirements. By default unmet requirements produce warnings; `--strict host-requirements` makes them errors.
+Each check category runs with a 5-second timeout to prevent hangs from unresponsive services. Results are collected into a structured report with severity levels (pass, warning, error, info) that can be output as human-readable text or JSON. When invoked inside a container, `cella doctor` reconciles the host view with the in-container view so the report reflects what the user actually sees (e.g. whether `BROWSER` interception is wired up on compose workspaces).
 
 ## Architecture
 
@@ -32,12 +30,11 @@ The host requirements module validates `hostRequirements` from the devcontainer 
 | `checks/daemon` | cella daemon health — running status, PID file, port file, socket connectivity |
 | `checks/config` | Devcontainer configuration discovery and validation |
 | `checks/container` | Running container inspection — state, mounts, labels, port bindings |
-| `host_requirements` | `hostRequirements` spec validation — CPU, memory (parses "8gb"/"512mb"), storage, GPU detection |
 | `redact` | PII redaction — strips usernames, paths, tokens from diagnostic output for safe sharing |
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-orchestrator](../cella-orchestrator), [cella-port](../cella-port)
+**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-protocol](../cella-protocol)
 
 **Depended on by:** [cella-cli](../cella-cli)
 
