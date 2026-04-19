@@ -10,7 +10,7 @@ Every git worktree gets its own dev container. Create a branch, get an isolated 
 |---------|-------------|
 | `$ cella branch <name> [--base <ref>]` | Create a worktree-backed branch with its own container |
 | `$ cella list` | List all containers with status and ports |
-| `$ cella switch <name>` | Open a shell in a worktree branch's container |
+| `$ cella switch [<name>]` | Open a shell in a worktree branch's container (interactive fuzzy picker if omitted) |
 | `$ cella down --branch <name> [--rm]` | Stop (or remove) a worktree container |
 | `$ cella up --branch <name>` | Start or restart a worktree container |
 | `$ cella prune [--all] [--dry-run]` | Remove stale worktrees and their containers |
@@ -178,6 +178,10 @@ Use `exec` for scripted or automated commands. The exit code from the command is
 Open an interactive shell in another branch's container.
 
 ```sh
+# Host (interactive fuzzy picker if no branch given)
+$ cella switch [<name>] [-s <shell>]
+
+# In-container (branch is required)
 container$ cella switch <branch>
 ```
 

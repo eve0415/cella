@@ -243,13 +243,14 @@ V ALLOWED: https://github.com/user/repo
 
 ### `cella network log`
 
-View the proxy's blocked-request log from a running container.
+Tail the proxy's blocked-request log from a running container.
 
 ```sh
-# Inside the container
-$ cat /tmp/.cella/proxy.log
-
 # From the host
+$ cella network log
+
+# Or read the raw file directly (inside the container, or via exec)
+$ cat /tmp/.cella/proxy.log
 $ cella exec -- cat /tmp/.cella/proxy.log
 ```
 
