@@ -78,7 +78,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | Runtime dependency | None | Node.js 14+ |
 | `stop` / `down` command | Yes | No ([cli#386](https://github.com/devcontainers/cli/issues/386)) |
 | Port forwarding | Automatic (daemon + in-container agent) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/22) ([cli#186](https://github.com/devcontainers/cli/issues/186)) |
-| SSH agent forwarding | Platform-aware (Docker Desktop, OrbStack, Linux) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/441) |
+| SSH agent forwarding | Platform-aware (Docker Desktop, OrbStack, Colima, Linux) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/441) |
 | Git credential forwarding | gh CLI via socket + TCP, auto-on | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/4202) |
 | BROWSER interception | Host browser opens for OAuth | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/9935) |
 | Container listing | `cella list` | No ([cli#843](https://github.com/devcontainers/cli/issues/843)) |
@@ -107,6 +107,8 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/worktrees.md)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
 - [x] Feature management (`cella features edit`, `cella features list`, `cella features update`)
+- [x] Template management (`cella template new`, `cella template list`, `cella template edit`)
+- [x] Global config management (`cella config show`, `global`, `dotfiles`, `agent`, `validate`)
 - [x] Project initialization (`cella init`) — interactive wizard with OCI template/feature selection
 - [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
@@ -115,12 +117,14 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Environment & Credentials
 
-- [x] SSH agent forwarding (Docker Desktop, OrbStack, Linux)
+- [x] SSH agent forwarding (Docker Desktop, OrbStack, Colima, Linux)
 - [x] Git config forwarding
 - [x] gh CLI credential forwarding (auto-on)
 - [x] AI agent config forwarding (Claude Code, Codex, Gemini CLI)
+- [x] AI provider API key forwarding (read live from the host on every exec/shell — never baked into the container)
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
+- [x] Bubblewrap installed for Codex sandbox support
 
 ### Spec Compliance
 
@@ -152,6 +156,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] `cella code` — open VS Code connected to the container
 - [x] `cella nvim` — open Neovim connected to the container
 - [x] `cella tmux` — open tmux session inside the container
+- [x] Terminal title integration (sets the host terminal title to reflect the active container/branch)
 
 ### Runtime Support
 
@@ -166,8 +171,6 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
-- [ ] Template management (`cella template new/list/edit`)
-- [ ] Global config management (`cella config show/global/dotfiles/agent`)
 - [ ] Podman backend
 - [ ] Colima / Lima support
 
@@ -205,11 +208,18 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 | `cella features list` | List installed and available devcontainer features |
 | `cella features edit` | Add, remove, or modify features in devcontainer.json |
 | `cella features update` | Update features to latest versions |
+| `cella template new` | Create a new dev container template |
+| `cella template list` | List available dev container templates |
+| `cella template edit` | Edit an existing dev container template |
 
 ### Configuration & Diagnostics
 
 | Command | Description |
 |---------|-------------|
+| `cella config show` | Show the resolved configuration |
+| `cella config global` | Edit global cella settings |
+| `cella config dotfiles` | Manage dotfile symlinks |
+| `cella config agent` | Configure agent presets |
 | `cella config validate` | Validate a devcontainer.json file |
 | `cella read-configuration` | Output resolved devcontainer config as JSON |
 | `cella doctor` | Check system dependencies and configuration |
