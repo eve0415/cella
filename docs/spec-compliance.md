@@ -37,7 +37,11 @@ Date: 2026-04-19
 | `templates generate-docs` | Generate docs | Not implemented | MISSING |
 
 ### Cella-Specific Commands (beyond spec, keep as-is)
-`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config`, `down`, `daemon`, `features edit`, `features list`, `features update`, `template new`, `template list`, `template edit`, `completions`
+`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config validate`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completions`
+
+### CLI surface reserved for future work (stubs present, not yet implemented)
+
+`cella config show`, `cella config global`, `cella config dotfiles`, `cella config agent`, `cella template new`, `cella template list`, `cella template edit` — these subcommands parse successfully at the CLI layer but return `"not yet implemented"` at runtime. They are kept visible so the flag shape and routing are stable when the implementation lands.
 
 ---
 

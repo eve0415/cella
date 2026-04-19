@@ -107,8 +107,6 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/worktrees.md)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
 - [x] Feature management (`cella features edit`, `cella features list`, `cella features update`)
-- [x] Template management (`cella template new`, `cella template list`, `cella template edit`)
-- [x] Global config management (`cella config show`, `global`, `dotfiles`, `agent`, `validate`)
 - [x] Project initialization (`cella init`) — interactive wizard with OCI template/feature selection
 - [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
@@ -171,6 +169,8 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Planned
 
+- [ ] `cella template new/list/edit` — template authoring (subcommands exist as stubs, not yet implemented)
+- [ ] `cella config show/global/dotfiles/agent` — global/dotfiles/agent config management (subcommands exist as stubs, not yet implemented; only `cella config validate` is live)
 - [ ] Podman backend
 - [ ] Colima / Lima support
 
@@ -208,18 +208,11 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 | `cella features list` | List installed and available devcontainer features |
 | `cella features edit` | Add, remove, or modify features in devcontainer.json |
 | `cella features update` | Update features to latest versions |
-| `cella template new` | Create a new dev container template |
-| `cella template list` | List available dev container templates |
-| `cella template edit` | Edit an existing dev container template |
 
 ### Configuration & Diagnostics
 
 | Command | Description |
 |---------|-------------|
-| `cella config show` | Show the resolved configuration |
-| `cella config global` | Edit global cella settings |
-| `cella config dotfiles` | Manage dotfile symlinks |
-| `cella config agent` | Configure agent presets |
 | `cella config validate` | Validate a devcontainer.json file |
 | `cella read-configuration` | Output resolved devcontainer config as JSON |
 | `cella doctor` | Check system dependencies and configuration |
