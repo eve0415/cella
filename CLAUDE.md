@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```sh
 cargo fmt --all -- --check                                            # format check
-cargo clippy --workspace --all-targets -- -D warnings -D clippy::all  # lint (all warnings are errors)
+cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::all  # lint (all warnings are errors)
 cargo test --workspace                                                # unit tests
 cargo insta test --workspace --check --unreferenced=reject            # snapshot tests
 ```
@@ -55,7 +55,7 @@ Always research before suggesting changes or asking the user questions. Use `/sp
 
 ## Architecture
 
-Rust workspace (edition 2024, MSRV 1.94.0) with 19 crates in `crates/`. Three-tier structure:
+Rust workspace (edition 2024, MSRV 1.94.1) with 19 crates in `crates/`. Three-tier structure:
 
 - **Tier 1 (CLI):** cella-cli — binary entry point, delegates to library crates
 - **Tier 2 (Domain):** cella-docker, cella-compose, cella-orchestrator, cella-config, cella-features, cella-git, cella-daemon, cella-agent, cella-env, cella-doctor, cella-container, cella-templates
@@ -67,7 +67,8 @@ Key runtime constraints:
 - The `cella-agent` Docker volume is shared across ALL containers — changes affect every running container
 - Daemon state (port allocations, registrations) is in-memory only, lost on daemon restart
 - Docker container labels and env vars are immutable after creation — don't design around updating them
-- The agent entrypoint runs in a restart loop; `restart_agent_in_container()` just sends pkill and the loop handles restart
+- The agent entrypoint runs in a restart loop in newer containers; `restart_agent_in_container()` sends `pkill -f 'cella-agent daemon'`, sleeps, then checks `pgrep` and only manually spawns the daemon if nothing came back (backward-compat fallback for containers created before the restart loop existed)
+- The agent reconnects indefinitely on initial daemon miss and after daemon restart/binary upgrade — don't assume a fresh agent means a fresh daemon
 
 ## Commits & PRs
 
