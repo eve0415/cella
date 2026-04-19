@@ -233,7 +233,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 
 ## Architecture
 
-cella is a Rust workspace with 18 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 19 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```mermaid
 graph TD
@@ -262,12 +262,14 @@ graph TD
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
+        jsonc[cella-jsonc<br><i>JSONC preprocessor</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
     docker & container --> backend
     agent & daemon --> port
     config --> codegen
+    config & templates --> jsonc
     agent & config & env & orchestrator --> network
     templates --> features
     port --> protocol

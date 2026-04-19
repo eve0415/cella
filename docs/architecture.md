@@ -29,6 +29,7 @@ graph TD
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
+        jsonc[cella-jsonc<br><i>JSONC preprocessor</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
@@ -37,6 +38,7 @@ graph TD
     agent & daemon --> port
     port --> protocol
     config --> codegen
+    config & templates --> jsonc
     agent & config & env & orchestrator --> network
 ```
 
@@ -44,7 +46,7 @@ graph TD
 
 **Tier 2 — Domain:** The crates that implement cella's core functionality. Each owns a distinct domain: container runtime, compose orchestration, git worktrees, environment forwarding, host daemon, system diagnostics, worktree orchestration, in-container agent, configuration parsing, and feature resolution.
 
-**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, and network proxy.
+**Tier 3 — Foundation:** Shared infrastructure crates. Backend trait abstraction, IPC protocol, code generation, network proxy, and JSONC preprocessing.
 
 ## Crate Responsibilities
 
@@ -111,6 +113,10 @@ Build-time code generator. Transforms the devcontainer JSON Schema into typed Ru
 ### cella-protocol
 
 IPC wire format definitions for agent<->daemon and CLI<->daemon communication. Defines the newline-delimited JSON message types (`AgentMessage`, `DaemonMessage`, `ManagementRequest`, `ManagementResponse`), connection handshake (`AgentHello`, `DaemonHello`), and git credential helper format. Not a runtime logic crate — it only defines types and serialization.
+
+### cella-jsonc
+
+JSONC (JSON with Comments) preprocessor. Strips `//` and `/* */` comments and trailing commas from JSONC source, returning strict JSON with byte offsets preserved (`output.len() == input.len()`). Used by cella-config and cella-templates to parse devcontainer.json files while keeping source positions accurate for miette diagnostics.
 
 ## Dependency Graph
 
