@@ -932,7 +932,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut buf = vec![0u8; 18];
+        let mut buf = vec![0u8; 17];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(
             &buf, b"immediate-payload",
