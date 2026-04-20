@@ -58,6 +58,20 @@ fn write_control_file(
 pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), CellaDaemonError> {
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
+    // Prepare the SSH-agent proxy run directory and sweep any stale sockets
+    // left by a previous daemon. Failure here is logged but non-fatal; the
+    // proxy is colima-only and the daemon should still start for other uses.
+    let ssh_proxy_run_dir = socket_path
+        .parent()
+        .map_or_else(|| PathBuf::from("/tmp/cella-run"), |home| home.join("run"));
+    if let Err(e) = crate::ssh_proxy::init_run_dir(&ssh_proxy_run_dir) {
+        warn!(
+            "ssh-agent proxy: init {} failed (non-fatal): {e}",
+            ssh_proxy_run_dir.display()
+        );
+    }
+    // (auth_token is loaded a few lines down; defer construction.)
+
     // Load persisted auth token (or generate + persist a new one).
     // Persisting the token across daemon restarts ensures existing containers
     // (which have the token baked into CELLA_DAEMON_TOKEN) can still connect.
@@ -74,6 +88,16 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     // Persist port+token to daemon.control for reclaiming on restart
     let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
+
+    let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir, auth_token.clone());
+    // Reclaim bridge ports from previous daemon run so containers
+    // with a baked-in CELLA_SSH_AGENT_BRIDGE env var keep working
+    // across daemon restarts.
+    ssh_proxy_manager
+        .lock()
+        .await
+        .reclaim_from_state_file()
+        .await;
 
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();
@@ -115,6 +139,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         shutdown_tx,
         auth_token,
         control_port,
+        ssh_proxy_manager,
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown

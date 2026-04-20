@@ -199,6 +199,20 @@ pub enum ManagementRequest {
         container_id: String,
         container_ip: Option<String>,
     },
+    /// Register a per-workspace SSH-agent proxy. The daemon binds a Unix
+    /// socket under `~/.cella/run/`, bidirectionally forwards bytes to
+    /// `upstream_socket` (the host's `$SSH_AUTH_SOCK`), and returns the
+    /// proxy socket path that the caller should bind-mount into the
+    /// container. Refcounted by `workspace`: subsequent registrations for
+    /// the same workspace bump the count and return the existing socket.
+    RegisterSshAgentProxy {
+        workspace: String,
+        upstream_socket: String,
+    },
+    /// Decrement the SSH-agent proxy refcount for `workspace`. Tears down
+    /// the listener and unlinks the socket file when the count reaches
+    /// zero. No-op for an unknown workspace.
+    ReleaseSshAgentProxy { workspace: String },
     /// Request graceful shutdown of the daemon.
     Shutdown,
 }
@@ -240,6 +254,18 @@ pub enum ManagementResponse {
     ContainerIpUpdated { container_id: String },
     /// Pong response.
     Pong,
+    /// SSH-agent bridge registered (or refcount bumped). `bridge_port` is
+    /// the localhost TCP port the in-container `cella-agent` should
+    /// connect to (reachable from the container as `host.docker.internal`,
+    /// `host.local`, or the equivalent host-gateway hostname). `refcount`
+    /// is the post-register count; `1` means a fresh bridge was created,
+    /// `>1` means an existing one was reused.
+    SshAgentProxyRegistered { bridge_port: u16, refcount: usize },
+    /// SSH-agent proxy refcount decremented. `torn_down` is true when the
+    /// refcount reached zero and the listener was actually destroyed; false
+    /// when the proxy is still in use by another container in the same
+    /// workspace, or when the workspace was never registered.
+    SshAgentProxyReleased { torn_down: bool },
     /// Error response.
     Error { message: String },
 }
@@ -897,6 +923,67 @@ mod tests {
         assert!(json.contains("\"type\":\"shutdown\""));
         let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, ManagementRequest::Shutdown));
+    }
+
+    #[test]
+    fn roundtrip_register_ssh_agent_proxy_request() {
+        let req = ManagementRequest::RegisterSshAgentProxy {
+            workspace: "/Users/me/proj".to_string(),
+            upstream_socket: "/Users/me/.1password/agent.sock".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"register_ssh_agent_proxy\""));
+        let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementRequest::RegisterSshAgentProxy { ref workspace, ref upstream_socket }
+                if workspace == "/Users/me/proj"
+                    && upstream_socket == "/Users/me/.1password/agent.sock"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_release_ssh_agent_proxy_request() {
+        let req = ManagementRequest::ReleaseSshAgentProxy {
+            workspace: "/Users/me/proj".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"release_ssh_agent_proxy\""));
+        let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementRequest::ReleaseSshAgentProxy { ref workspace }
+                if workspace == "/Users/me/proj"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_ssh_agent_proxy_registered_response() {
+        let resp = ManagementResponse::SshAgentProxyRegistered {
+            bridge_port: 54321,
+            refcount: 1,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"ssh_agent_proxy_registered\""));
+        let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementResponse::SshAgentProxyRegistered { refcount: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_ssh_agent_proxy_released_response() {
+        for torn_down in [true, false] {
+            let resp = ManagementResponse::SshAgentProxyReleased { torn_down };
+            let json = serde_json::to_string(&resp).unwrap();
+            assert!(json.contains("\"type\":\"ssh_agent_proxy_released\""));
+            let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+            assert!(matches!(
+                decoded,
+                ManagementResponse::SshAgentProxyReleased { torn_down: t } if t == torn_down
+            ));
+        }
     }
 
     #[test]

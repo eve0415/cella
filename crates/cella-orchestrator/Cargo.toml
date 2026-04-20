@@ -8,6 +8,7 @@ license.workspace = true
 cella-backend.workspace = true
 cella-compose.workspace = true
 cella-config.workspace = true
+cella-daemon.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
 cella-protocol.workspace = true
@@ -22,6 +23,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -50,6 +50,26 @@ pub struct FileUpload {
     pub mode: u32,
 }
 
+/// Pending request for the orchestrator to materialize a daemon-managed
+/// SSH-agent proxy on colima.
+///
+/// Returned via `EnvForwarding` because `cella-env` (Tier 3) must not
+/// depend on the daemon RPC client; the orchestrator (Tier 2) inspects
+/// the request, calls into the daemon, receives the host-side proxy
+/// socket path, and appends the resulting mount + env entries itself.
+#[derive(Debug, Clone)]
+pub struct SshAgentProxyRequest {
+    /// Upstream socket the proxy should bridge to — usually the host's
+    /// `$SSH_AUTH_SOCK` (e.g. 1Password's sandboxed agent socket).
+    pub upstream_socket: std::path::PathBuf,
+    /// Container-side path the orchestrator will use as the bind-mount
+    /// target (and as the value of `SSH_AUTH_SOCK` inside the container).
+    pub mount_target: String,
+    /// `SSH_AUTH_SOCK` value to set in the container — usually identical
+    /// to `mount_target`.
+    pub env_value: String,
+}
+
 /// Result of preparing environment forwarding.
 ///
 /// Split into two phases:
@@ -63,6 +83,11 @@ pub struct EnvForwarding {
     pub env: Vec<ForwardEnv>,
     /// Post-start injection (after container start + UID remap).
     pub post_start: PostStartInjection,
+    /// On colima only: deferred SSH-agent proxy request the orchestrator
+    /// must resolve via the daemon before mounting. `None` for runtimes
+    /// where the SSH agent is forwarded directly via host bind-mount or
+    /// the magic VM socket (already pushed into `mounts` and `env`).
+    pub ssh_agent_proxy_request: Option<SshAgentProxyRequest>,
 }
 
 /// Post-start injection commands and files.
@@ -79,25 +104,47 @@ pub struct PostStartInjection {
 }
 
 /// Apply SSH agent forwarding to the environment.
+///
+/// For most runtimes this synchronously appends the mount and env entries.
+/// For colima, the daemon must materialize a proxy socket first — we set
+/// `ssh_agent_proxy_request` and let the orchestrator resolve it.
 fn apply_ssh_agent_forwarding(
     fwd: &mut EnvForwarding,
     runtime: &DockerRuntime,
     config: &serde_json::Value,
 ) {
-    if let Some(ssh) = ssh_agent::ssh_agent_forwarding(runtime, config) {
-        tracing::info!(
-            "SSH agent forwarding: {} -> {}",
-            ssh.mount_source,
-            ssh.mount_target
-        );
-        fwd.mounts.push(ForwardMount {
-            source: ssh.mount_source,
-            target: ssh.mount_target,
-        });
-        fwd.env.push(ForwardEnv {
-            key: "SSH_AUTH_SOCK".to_string(),
-            value: ssh.env_value,
-        });
+    match ssh_agent::ssh_agent_request(runtime, config) {
+        Some(ssh_agent::SshAgentRequest::Direct(ssh)) => {
+            tracing::info!(
+                "SSH agent forwarding: {} -> {}",
+                ssh.mount_source,
+                ssh.mount_target
+            );
+            fwd.mounts.push(ForwardMount {
+                source: ssh.mount_source,
+                target: ssh.mount_target,
+            });
+            fwd.env.push(ForwardEnv {
+                key: "SSH_AUTH_SOCK".to_string(),
+                value: ssh.env_value,
+            });
+        }
+        Some(ssh_agent::SshAgentRequest::ProxyOnColima {
+            upstream_socket,
+            mount_target,
+            env_value,
+        }) => {
+            tracing::info!(
+                "SSH agent forwarding (colima proxy): bridging {} via daemon",
+                upstream_socket.display()
+            );
+            fwd.ssh_agent_proxy_request = Some(SshAgentProxyRequest {
+                upstream_socket,
+                mount_target,
+                env_value,
+            });
+        }
+        None => {}
     }
 }
 

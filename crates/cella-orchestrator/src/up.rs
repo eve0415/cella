@@ -121,6 +121,7 @@ struct ImageConfig {
 struct CreateResult {
     container_id: String,
     remote_user: String,
+    ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
 }
 
 async fn run_step_result<F, T, E>(progress: &ProgressSender, label: &str, future: F) -> Result<T, E>
@@ -443,6 +444,7 @@ impl EnsureUpContext<'_> {
             remote_user: remote_user.to_string(),
             workspace_folder: self.workspace_folder_str().to_string(),
             outcome: UpOutcome::Running,
+            ssh_agent_proxy: None,
         })
     }
 
@@ -574,6 +576,17 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
+        // Don't re-register here. The container's CELLA_SSH_AGENT_BRIDGE
+        // env var was baked at create time and can't be updated, so a
+        // fresh register on a new port wouldn't help. The daemon reclaims
+        // bridge ports from its state file on startup instead (see
+        // SshProxyManager::reclaim_from_state_file), which typically
+        // lets the stopped-container restart path work transparently.
+        // If the daemon's reclaim fails (port taken by something else,
+        // stale state file, etc.), recovery requires `cella down &&
+        // cella up`.
+        let ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus> = None;
+
         let step = self.progress.step("Starting container...");
         let start_result = self.client.start_container(&container.id).await;
         if start_result.is_ok() {
@@ -631,6 +644,7 @@ impl EnsureUpContext<'_> {
                     remote_user: remote_user.to_string(),
                     workspace_folder: self.workspace_folder_str().to_string(),
                     outcome: UpOutcome::Started,
+                    ssh_agent_proxy,
                 }))
             }
             Err(e) => {
@@ -737,6 +751,43 @@ impl EnsureUpContext<'_> {
 
         labels.extend(self.config.extra_labels.clone());
         labels
+    }
+
+    /// If `env_fwd` carries a deferred colima SSH-agent proxy request,
+    /// resolve it via the daemon and append the resulting bind-mount and
+    /// `SSH_AUTH_SOCK` env entries. Returns the status for the CLI to
+    /// render. `None` means the proxy code path was not exercised at all
+    /// (no request from `cella-env`).
+    async fn resolve_ssh_agent_proxy(
+        &self,
+        env_fwd: &mut cella_env::EnvForwarding,
+    ) -> Option<crate::result::SshAgentProxyStatus> {
+        let request = env_fwd.ssh_agent_proxy_request.take()?;
+        let Some(daemon_sock) = cella_env::paths::daemon_socket_path() else {
+            return Some(crate::result::SshAgentProxyStatus::Skipped {
+                reason: "daemon socket path could not be determined".to_string(),
+            });
+        };
+        let host_gateway = self.client.host_gateway();
+        match crate::ssh_proxy_client::register_proxy(
+            &daemon_sock,
+            &self.config.resolved.workspace_root,
+            host_gateway,
+            &request,
+        )
+        .await
+        {
+            Some(resolved) => {
+                env_fwd.env.extend(resolved.env);
+                Some(crate::result::SshAgentProxyStatus::Bridged {
+                    host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
+                    refcount: resolved.refcount,
+                })
+            }
+            None => Some(crate::result::SshAgentProxyStatus::Skipped {
+                reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
+            }),
+        }
     }
 
     async fn apply_env_and_mounts(
@@ -1286,7 +1337,7 @@ impl EnsureUpContext<'_> {
         let ImageConfig {
             image_env,
             remote_user,
-            env_fwd,
+            mut env_fwd,
             mut create_opts,
         } = self.resolve_image_config(
             &img_name,
@@ -1294,6 +1345,8 @@ impl EnsureUpContext<'_> {
             resolved_features.as_ref(),
             &agent_arch,
         );
+
+        let ssh_agent_proxy = self.resolve_ssh_agent_proxy(&mut env_fwd).await;
 
         self.maybe_remap_uid(
             config,
@@ -1350,6 +1403,7 @@ impl EnsureUpContext<'_> {
         Ok(CreateResult {
             container_id,
             remote_user,
+            ssh_agent_proxy,
         })
     }
 
@@ -1413,6 +1467,7 @@ impl EnsureUpContext<'_> {
             remote_user: create_result.remote_user,
             workspace_folder: self.workspace_folder_str().to_string(),
             outcome: UpOutcome::Created,
+            ssh_agent_proxy: create_result.ssh_agent_proxy,
         })
     }
 }

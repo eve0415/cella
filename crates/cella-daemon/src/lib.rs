@@ -15,6 +15,7 @@ pub mod orbstack;
 pub mod port_manager;
 pub mod proxy;
 pub mod shared;
+pub mod ssh_proxy;
 pub mod stream_bridge;
 pub mod task_manager;
 

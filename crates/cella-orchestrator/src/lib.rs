@@ -22,6 +22,7 @@ pub mod progress;
 pub mod prune;
 pub mod result;
 pub mod shell_detect;
+pub mod ssh_proxy_client;
 pub mod tool_install;
 pub mod uid_image;
 pub mod up;
@@ -32,5 +33,6 @@ pub use config::{
 pub use error::OrchestratorError;
 pub use progress::{PhaseChildHandle, PhaseHandle, ProgressEvent, ProgressSender, StepHandle};
 pub use result::{
-    BranchResult, ExecResult, PruneResult, PrunedEntry, UpOutcome, UpResult, WorktreeStatus,
+    BranchResult, ExecResult, PruneResult, PrunedEntry, SshAgentProxyStatus, UpOutcome, UpResult,
+    WorktreeStatus,
 };

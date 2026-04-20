@@ -160,6 +160,7 @@ impl CodeArgs {
                     &container_id,
                     &result.remote_user,
                     &result.workspace_folder,
+                    result.ssh_agent_proxy.as_ref(),
                 );
             }
         }

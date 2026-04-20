@@ -497,6 +497,7 @@ pub struct UpResult {
     pub remote_user: String,
     pub outcome: String,
     pub workspace_folder: String,
+    pub ssh_agent_proxy: Option<cella_orchestrator::SshAgentProxyStatus>,
 }
 
 struct CliUpHooks<'a> {
@@ -706,6 +707,7 @@ impl UpContext {
                 cella_orchestrator::UpOutcome::Created => "created".to_string(),
             },
             workspace_folder: result.workspace_folder,
+            ssh_agent_proxy: result.ssh_agent_proxy,
         })
     }
 }
@@ -772,6 +774,7 @@ impl UpArgs {
             &result.container_id,
             &result.remote_user,
             &result.workspace_folder,
+            result.ssh_agent_proxy.as_ref(),
         );
         Ok(())
     }
@@ -809,6 +812,7 @@ impl UpArgs {
             &result.container_id,
             &result.remote_user,
             &result.workspace_folder,
+            result.ssh_agent_proxy.as_ref(),
         );
         Ok(())
     }
@@ -835,20 +839,83 @@ pub fn output_result(
     container_id: &str,
     remote_user: &str,
     workspace_folder: &str,
+    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
 ) {
+    let rendered = render_up_result(
+        format,
+        outcome,
+        container_id,
+        remote_user,
+        workspace_folder,
+        ssh_agent_proxy,
+    );
+    match format {
+        OutputFormat::Text => eprint!("{rendered}"),
+        OutputFormat::Json => println!("{rendered}"),
+    }
+}
+
+/// Pure formatter for the `cella up` success output. Returns the exact
+/// bytes that `output_result` would write (Text → trailing newlines
+/// included; Json → single-line, no trailing newline) so unit tests can
+/// snapshot the output without capturing stderr/stdout.
+pub fn render_up_result(
+    format: &OutputFormat,
+    outcome: &str,
+    container_id: &str,
+    remote_user: &str,
+    workspace_folder: &str,
+    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
+) -> String {
     match format {
         OutputFormat::Text => {
             let short_id = &container_id[..12.min(container_id.len())];
-            eprintln!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}");
+            let mut out =
+                format!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}\n");
+            if let Some(status) = ssh_agent_proxy {
+                match status {
+                    cella_orchestrator::SshAgentProxyStatus::Bridged {
+                        host_endpoint,
+                        refcount,
+                    } => {
+                        use std::fmt::Write;
+                        let _ = writeln!(
+                            out,
+                            "ssh-agent proxy: bridged via {host_endpoint} (refcount {refcount})"
+                        );
+                    }
+                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
+                        use std::fmt::Write;
+                        let _ = writeln!(out, "ssh-agent proxy: skipped — {reason}");
+                    }
+                }
+            }
+            out
         }
         OutputFormat::Json => {
-            let output = json!({
-                "outcome": outcome,
-                "containerId": container_id,
-                "remoteUser": remote_user,
-                "remoteWorkspaceFolder": workspace_folder,
-            });
-            println!("{}", serde_json::to_string(&output).unwrap_or_default());
+            let mut output = serde_json::Map::new();
+            output.insert("outcome".to_string(), json!(outcome));
+            output.insert("containerId".to_string(), json!(container_id));
+            output.insert("remoteUser".to_string(), json!(remote_user));
+            output.insert("remoteWorkspaceFolder".to_string(), json!(workspace_folder));
+            if let Some(status) = ssh_agent_proxy {
+                let value = match status {
+                    cella_orchestrator::SshAgentProxyStatus::Bridged {
+                        host_endpoint,
+                        refcount,
+                    } => json!({
+                        "state": "bridged",
+                        "hostEndpoint": host_endpoint,
+                        "refcount": refcount,
+                    }),
+                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => json!({
+                        "state": "skipped",
+                        "reason": reason,
+                    }),
+                };
+                output.insert("sshAgentProxy".to_string(), value);
+            }
+            serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
         }
     }
 }
@@ -1046,6 +1113,7 @@ mod tests {
             "abcdef123456",
             "vscode",
             "/workspaces/test",
+            None,
         );
     }
 
@@ -1058,6 +1126,151 @@ mod tests {
             "abcdef123456",
             "vscode",
             "/workspaces/test",
+            None,
+        );
+    }
+
+    // ── render_up_result snapshots (Phase 5) ───────────────────────
+    //
+    // Snapshot the exact bytes that `output_result` writes so a future
+    // change to the user-facing string (or its JSON shape) shows up as
+    // a review-time diff rather than a silent UX regression.
+
+    #[test]
+    fn render_up_result_text_no_ssh_agent_proxy() {
+        // The trailing newline is load-bearing: without it, the next
+        // shell prompt would consume the status line. Snapshot the full
+        // string (newline included) to lock that property in.
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            None,
+        );
+        insta::assert_snapshot!(
+            out,
+            @"Container created. ID: abcdef123456 Workspace: /workspaces/test\n"
+        );
+    }
+
+    #[test]
+    fn render_up_result_text_bridged_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
+            host_endpoint: "host.docker.internal:54321".to_string(),
+            refcount: 1,
+        };
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        // Both lines end with `\n`; final newline is load-bearing.
+        insta::assert_snapshot!(out, @r"
+        Container created. ID: abcdef123456 Workspace: /workspaces/test
+        ssh-agent proxy: bridged via host.docker.internal:54321 (refcount 1)
+        ");
+    }
+
+    #[test]
+    fn render_up_result_text_skipped_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
+            reason: "daemon socket not found".to_string(),
+        };
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        insta::assert_snapshot!(out, @r"
+        Container created. ID: abcdef123456 Workspace: /workspaces/test
+        ssh-agent proxy: skipped — daemon socket not found
+        ");
+
+        // Verify the renderer ends Text output with `\n` (separately
+        // asserted because the indented multi-line snapshot above
+        // normalizes whitespace and would mask a missing trailing
+        // newline).
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn render_up_result_text_uses_short_container_id() {
+        // Long container IDs are truncated to 12 hex chars for the
+        // status line — matches docker's own short-id convention.
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef0123456789cafef00ddeadbeef",
+            "vscode",
+            "/workspaces/test",
+            None,
+        );
+        insta::assert_snapshot!(
+            out,
+            @"Container created. ID: abcdef012345 Workspace: /workspaces/test\n"
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_no_ssh_agent_proxy() {
+        let out = render_up_result(
+            &OutputFormat::Json,
+            "running",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            None,
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"running","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test"}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_bridged_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
+            host_endpoint: "host.docker.internal:54321".to_string(),
+            refcount: 2,
+        };
+        let out = render_up_result(
+            &OutputFormat::Json,
+            "started",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"started","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"hostEndpoint":"host.docker.internal:54321","refcount":2,"state":"bridged"}}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_skipped_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
+            reason: "host SSH_AUTH_SOCK unset".to_string(),
+        };
+        let out = render_up_result(
+            &OutputFormat::Json,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"created","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"reason":"host SSH_AUTH_SOCK unset","state":"skipped"}}"#
         );
     }
 
