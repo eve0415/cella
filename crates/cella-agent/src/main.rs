@@ -20,6 +20,7 @@ mod port_proxy;
 mod port_watcher;
 mod proxy_config;
 mod reconnecting_client;
+mod ssh_agent_bridge;
 mod state;
 
 use std::time::Duration;
@@ -266,6 +267,24 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let watcher_handle = tokio::spawn(async move {
         port_watcher::run(poll_interval, ctrl, pd, pm, rc, Some(sw_for_watcher)).await;
     });
+
+    // Spawn the SSH-agent bridge if the orchestrator injected bridge
+    // env vars. On colima (and anywhere else the daemon sets these),
+    // this binds a Unix socket at CELLA_SSH_AGENT_TARGET in the
+    // container and forwards each connection back to the daemon's
+    // TCP bridge at CELLA_SSH_AGENT_BRIDGE. No bind-mount involved.
+    if let Some((target, endpoint, token)) = ssh_agent_bridge::config_from_env() {
+        info!(
+            "ssh-agent bridge: forwarding {} -> {}",
+            target.display(),
+            endpoint
+        );
+        tokio::spawn(async move {
+            if let Err(e) = ssh_agent_bridge::run_bridge(target, endpoint, token).await {
+                tracing::warn!("ssh-agent bridge: fatal startup error: {e}");
+            }
+        });
+    }
 
     // Spawn plugin manifest sync watcher (reverse-rewrites paths back to host)
     let container_home = std::env::var("HOME").unwrap_or_default();
