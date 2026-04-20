@@ -841,25 +841,56 @@ pub fn output_result(
     workspace_folder: &str,
     ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
 ) {
+    let rendered = render_up_result(
+        format,
+        outcome,
+        container_id,
+        remote_user,
+        workspace_folder,
+        ssh_agent_proxy,
+    );
+    match format {
+        OutputFormat::Text => eprint!("{rendered}"),
+        OutputFormat::Json => println!("{rendered}"),
+    }
+}
+
+/// Pure formatter for the `cella up` success output. Returns the exact
+/// bytes that `output_result` would write (Text → trailing newlines
+/// included; Json → single-line, no trailing newline) so unit tests can
+/// snapshot the output without capturing stderr/stdout.
+pub fn render_up_result(
+    format: &OutputFormat,
+    outcome: &str,
+    container_id: &str,
+    remote_user: &str,
+    workspace_folder: &str,
+    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
+) -> String {
     match format {
         OutputFormat::Text => {
             let short_id = &container_id[..12.min(container_id.len())];
-            eprintln!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}");
+            let mut out =
+                format!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}\n");
             if let Some(status) = ssh_agent_proxy {
                 match status {
                     cella_orchestrator::SshAgentProxyStatus::Bridged {
                         proxy_socket,
                         refcount,
                     } => {
-                        eprintln!(
+                        use std::fmt::Write;
+                        let _ = writeln!(
+                            out,
                             "ssh-agent proxy: bridged via {proxy_socket} (refcount {refcount})"
                         );
                     }
                     cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
-                        eprintln!("ssh-agent proxy: skipped — {reason}");
+                        use std::fmt::Write;
+                        let _ = writeln!(out, "ssh-agent proxy: skipped — {reason}");
                     }
                 }
             }
+            out
         }
         OutputFormat::Json => {
             let mut output = serde_json::Map::new();
@@ -884,10 +915,7 @@ pub fn output_result(
                 };
                 output.insert("sshAgentProxy".to_string(), value);
             }
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
-            );
+            serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
         }
     }
 }
@@ -1102,36 +1130,35 @@ mod tests {
         );
     }
 
+    // ── render_up_result snapshots (Phase 5) ───────────────────────
+    //
+    // Snapshot the exact bytes that `output_result` writes so a future
+    // change to the user-facing string (or its JSON shape) shows up as
+    // a review-time diff rather than a silent UX regression.
+
     #[test]
-    fn output_result_with_bridged_ssh_agent_proxy_does_not_panic() {
-        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
-            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
-            refcount: 1,
-        };
-        output_result(
+    fn render_up_result_text_no_ssh_agent_proxy() {
+        let out = render_up_result(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
             "vscode",
             "/workspaces/test",
-            Some(&status),
+            None,
         );
-        output_result(
-            &OutputFormat::Json,
-            "created",
-            "abcdef123456",
-            "vscode",
-            "/workspaces/test",
-            Some(&status),
+        insta::assert_snapshot!(
+            out.trim_end(),
+            @"Container created. ID: abcdef123456 Workspace: /workspaces/test"
         );
     }
 
     #[test]
-    fn output_result_with_skipped_ssh_agent_proxy_does_not_panic() {
-        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
-            reason: "daemon socket not found".to_string(),
+    fn render_up_result_text_bridged_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
+            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
+            refcount: 1,
         };
-        output_result(
+        let out = render_up_result(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
@@ -1139,13 +1166,101 @@ mod tests {
             "/workspaces/test",
             Some(&status),
         );
-        output_result(
+        insta::assert_snapshot!(out.trim_end(), @r"
+        Container created. ID: abcdef123456 Workspace: /workspaces/test
+        ssh-agent proxy: bridged via /Users/me/.cella/run/ssh-agent-deadbeef.sock (refcount 1)
+        ");
+    }
+
+    #[test]
+    fn render_up_result_text_skipped_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
+            reason: "daemon socket not found".to_string(),
+        };
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        insta::assert_snapshot!(out.trim_end(), @r"
+        Container created. ID: abcdef123456 Workspace: /workspaces/test
+        ssh-agent proxy: skipped — daemon socket not found
+        ");
+    }
+
+    #[test]
+    fn render_up_result_text_uses_short_container_id() {
+        // Long container IDs are truncated to 12 hex chars for the
+        // status line — matches docker's own short-id convention.
+        let out = render_up_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef0123456789cafef00ddeadbeef",
+            "vscode",
+            "/workspaces/test",
+            None,
+        );
+        insta::assert_snapshot!(
+            out.trim_end(),
+            @"Container created. ID: abcdef012345 Workspace: /workspaces/test"
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_no_ssh_agent_proxy() {
+        let out = render_up_result(
+            &OutputFormat::Json,
+            "running",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            None,
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"running","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test"}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_bridged_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
+            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
+            refcount: 2,
+        };
+        let out = render_up_result(
+            &OutputFormat::Json,
+            "started",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"started","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"proxySocket":"/Users/me/.cella/run/ssh-agent-deadbeef.sock","refcount":2,"state":"bridged"}}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_skipped_ssh_agent_proxy() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
+            reason: "host SSH_AUTH_SOCK unset".to_string(),
+        };
+        let out = render_up_result(
             &OutputFormat::Json,
             "created",
             "abcdef123456",
             "vscode",
             "/workspaces/test",
             Some(&status),
+        );
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abcdef123456","outcome":"created","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"reason":"host SSH_AUTH_SOCK unset","state":"skipped"}}"#
         );
     }
 
