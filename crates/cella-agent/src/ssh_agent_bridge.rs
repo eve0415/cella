@@ -200,9 +200,11 @@ mod tests {
                         return;
                     }
                     // After auth, echo bytes until the client closes.
-                    let mut inner = reader.into_inner();
+                    // Keep using `reader` (the BufReader) — `read_line`
+                    // may have buffered bytes past the `\n` that we must
+                    // still forward.
                     let mut buf = [0u8; 4096];
-                    while let Ok(n) = inner.read(&mut buf).await {
+                    while let Ok(n) = reader.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
