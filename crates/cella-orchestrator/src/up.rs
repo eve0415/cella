@@ -576,15 +576,16 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        // Re-register the SSH-agent proxy before docker start so the
-        // existing bind mount resolves to a live socket. This recovers
-        // from a daemon restart that swept the proxy socket file: the
-        // socket path is deterministic (sha256(workspace)[..16]), so a
-        // fresh registration recreates it at the same path the
-        // container is already bound to. If the host has no agent or
-        // the daemon is unreachable we silently leave the mount stale
-        // — same observability cliff as a fresh `cella up` skip.
-        let ssh_agent_proxy = self.reregister_ssh_agent_proxy_for_restart().await;
+        // Do not re-register the SSH-agent bridge here. With the TCP
+        // bridge design, each register allocates a FRESH loopback port,
+        // but the container's CELLA_SSH_AGENT_BRIDGE env var was baked
+        // in at create time and Docker makes container env immutable.
+        // A re-register would open a new listener that nothing in the
+        // container can reach. Daemon-restart recovery therefore needs
+        // `cella down && cella up` to recreate the container with
+        // fresh env vars. Surface `None` so the CLI doesn't claim a
+        // working bridge when there isn't one.
+        let ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus> = None;
 
         let step = self.progress.step("Starting container...");
         let start_result = self.client.start_container(&container.id).await;
@@ -750,58 +751,6 @@ impl EnsureUpContext<'_> {
 
         labels.extend(self.config.extra_labels.clone());
         labels
-    }
-
-    /// Re-register the SSH-agent proxy for an existing-but-stopped
-    /// container before `docker start`. The container's bind mount
-    /// source path is deterministic (`~/.cella/run/ssh-agent-<sha256
-    /// (workspace)[..16]>.sock`), so as long as the daemon recreates
-    /// the socket file at that path, the existing mount works again.
-    ///
-    /// Recovers from a daemon restart that swept the proxy socket file
-    /// while the container was stopped. Returns `None` when the
-    /// devcontainer config doesn't request SSH-agent forwarding (e.g.
-    /// non-colima runtime, host `SSH_AUTH_SOCK` unset, user override).
-    async fn reregister_ssh_agent_proxy_for_restart(
-        &self,
-    ) -> Option<crate::result::SshAgentProxyStatus> {
-        let runtime = cella_env::platform::detect_runtime();
-        let request = match cella_env::ssh_agent::ssh_agent_request(&runtime, self.config_json())? {
-            cella_env::ssh_agent::SshAgentRequest::ProxyOnColima {
-                upstream_socket,
-                mount_target,
-                env_value,
-            } => cella_env::SshAgentProxyRequest {
-                upstream_socket,
-                mount_target,
-                env_value,
-            },
-            // Non-proxy paths don't need re-registration on restart —
-            // direct bind mounts are stable across daemon restarts.
-            cella_env::ssh_agent::SshAgentRequest::Direct(_) => return None,
-        };
-        let Some(daemon_sock) = cella_env::paths::daemon_socket_path() else {
-            return Some(crate::result::SshAgentProxyStatus::Skipped {
-                reason: "daemon socket path could not be determined".to_string(),
-            });
-        };
-        let host_gateway = self.client.host_gateway();
-        match crate::ssh_proxy_client::register_proxy(
-            &daemon_sock,
-            &self.config.resolved.workspace_root,
-            host_gateway,
-            &request,
-        )
-        .await
-        {
-            Some(resolved) => Some(crate::result::SshAgentProxyStatus::Bridged {
-                host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
-                refcount: resolved.refcount,
-            }),
-            None => Some(crate::result::SshAgentProxyStatus::Skipped {
-                reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
-            }),
-        }
     }
 
     /// If `env_fwd` carries a deferred colima SSH-agent proxy request,

@@ -362,11 +362,18 @@ async fn proxy_one_connection(
         return;
     }
 
-    let (down_read, down_write) = downstream.into_split();
+    let (down_read, mut down_writer) = downstream.into_split();
+    // BufReader owns its internal buffer; we must keep using it as the
+    // read side of the copy because `read_line` may pull bytes past the
+    // newline into that buffer (a client that sends "token\n<agent
+    // bytes>" in a single packet is routine). Calling `into_inner()`
+    // here and reading from the raw socket would drop those bytes and
+    // corrupt the ssh-agent protocol stream.
     let mut down_reader = BufReader::new(down_read);
-    let mut down_writer = down_write;
 
-    // Read auth line.
+    // Read auth line. read_line stops at \n but leaves trailing bytes
+    // in the BufReader's internal buffer, which the subsequent copy
+    // will consume transparently.
     let mut auth_line = String::new();
     match down_reader.read_line(&mut auth_line).await {
         Ok(0) => {
@@ -397,12 +404,9 @@ async fn proxy_one_connection(
     };
     let (up_read, up_write) = upstream.into_split();
 
-    // Reassemble the buffered downstream reader's parts for copy.
-    let mut down_read_inner = down_reader.into_inner();
-
     let down_to_up = async {
         let mut up_write = up_write;
-        let _ = tokio::io::copy(&mut down_read_inner, &mut up_write).await;
+        let _ = tokio::io::copy(&mut down_reader, &mut up_write).await;
         let _ = up_write.shutdown().await;
     };
     let up_to_down = async {
@@ -658,6 +662,40 @@ mod tests {
         let mut buf = vec![0u8; 11];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn bridge_does_not_drop_bytes_that_follow_auth_token_in_same_packet() {
+        // Regression: the old implementation called BufReader::into_inner
+        // after read_line, throwing away any bytes the BufReader had
+        // already pulled past the newline. Real ssh-agent clients send
+        // `token\n<request-bytes>` in a single packet — those request
+        // bytes MUST reach the upstream agent. This test proves they do.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = manager(dir.path());
+        let port = m
+            .register(PathBuf::from("/Users/me/proj"), upstream)
+            .await
+            .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Send the token AND the payload in a single write — the OS
+        // will almost certainly bundle them into one packet, which is
+        // exactly the case where the bug manifests.
+        client
+            .write_all(b"test-token\nimmediate-payload")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 18];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf, b"immediate-payload",
+            "bytes sent in the same packet as the auth token must forward intact"
+        );
     }
 
     #[tokio::test]
