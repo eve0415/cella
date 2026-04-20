@@ -30,6 +30,7 @@ pub type SharedSshProxyManager = Arc<Mutex<SshProxyManager>>;
 /// Refcount-keyed registry of per-workspace SSH-agent proxies.
 pub struct SshProxyManager {
     run_dir: PathBuf,
+    daemon_pid: u32,
     proxies: HashMap<PathBuf, ProxyEntry>,
 }
 
@@ -41,11 +42,21 @@ struct ProxyEntry {
 }
 
 impl SshProxyManager {
-    /// Create a new manager that places proxy sockets under `run_dir`.
+    /// Create a new manager that places proxy sockets under `run_dir`. The
+    /// `daemon_pid` is recorded in the persisted state file so external
+    /// readers (e.g. a future `cella doctor` probe) can verify liveness.
     #[must_use]
     pub fn new(run_dir: PathBuf) -> Self {
+        Self::with_pid(run_dir, std::process::id())
+    }
+
+    /// Construct a manager with an explicit `daemon_pid`. Tests use this so
+    /// state-file assertions are stable across runs.
+    #[must_use]
+    pub fn with_pid(run_dir: PathBuf, daemon_pid: u32) -> Self {
         Self {
             run_dir,
+            daemon_pid,
             proxies: HashMap::new(),
         }
     }
@@ -74,7 +85,9 @@ impl SshProxyManager {
     ) -> Result<PathBuf, CellaDaemonError> {
         if let Some(entry) = self.proxies.get_mut(&workspace) {
             entry.refcount += 1;
-            return Ok(entry.proxy_socket.clone());
+            let path = entry.proxy_socket.clone();
+            self.persist_state();
+            return Ok(path);
         }
 
         let proxy_socket = self.proxy_socket_path(&workspace);
@@ -106,6 +119,7 @@ impl SshProxyManager {
             accept_task: task.abort_handle(),
         };
         self.proxies.insert(workspace, entry);
+        self.persist_state();
         Ok(proxy_socket)
     }
 
@@ -117,6 +131,7 @@ impl SshProxyManager {
         let entry = self.proxies.get_mut(workspace)?;
         entry.refcount = entry.refcount.saturating_sub(1);
         if entry.refcount > 0 {
+            self.persist_state();
             return None;
         }
         let removed = self.proxies.remove(workspace)?;
@@ -127,6 +142,7 @@ impl SshProxyManager {
             proxy = %removed.proxy_socket.display(),
             "ssh-agent proxy: torn down"
         );
+        self.persist_state();
         Some(removed.proxy_socket)
     }
 
@@ -147,6 +163,48 @@ impl SshProxyManager {
     fn proxy_socket_path(&self, workspace: &Path) -> PathBuf {
         let hash = workspace_hash(workspace);
         self.run_dir.join(format!("ssh-agent-{hash}.sock"))
+    }
+
+    /// Path to the JSON snapshot of live proxy state.
+    pub fn state_file_path(&self) -> PathBuf {
+        self.run_dir.join("ssh-agent.state")
+    }
+
+    /// Serialize the current proxy registry to `ssh-agent.state`. Best-effort:
+    /// failures are logged but never propagated, so a busted filesystem can't
+    /// take down register/release.
+    fn persist_state(&self) {
+        let proxies: Vec<serde_json::Value> = self
+            .proxies
+            .iter()
+            .map(|(workspace, entry)| {
+                serde_json::json!({
+                    "workspace": workspace.to_string_lossy(),
+                    "upstream_socket": entry.upstream_socket.to_string_lossy(),
+                    "proxy_socket": entry.proxy_socket.to_string_lossy(),
+                    "refcount": entry.refcount,
+                })
+            })
+            .collect();
+
+        let snapshot = serde_json::json!({
+            "daemon_pid": self.daemon_pid,
+            "written_at_unix_sec": crate::shared::current_time_secs(),
+            "proxies": proxies,
+        });
+
+        let path = self.state_file_path();
+        match serde_json::to_vec_pretty(&snapshot) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    warn!(
+                        "ssh-agent proxy: state-file write {} failed: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => warn!("ssh-agent proxy: state-file serialize failed: {e}"),
+        }
     }
 }
 
@@ -538,6 +596,83 @@ mod tests {
 
         init_run_dir(&run).unwrap();
         assert!(!stale.exists(), "stale ssh-agent socket must be unlinked");
+    }
+
+    // -----------------------------------------------------------------
+    // State-file persistence.
+    // -----------------------------------------------------------------
+
+    fn read_state(run_dir: &Path) -> serde_json::Value {
+        let bytes = std::fs::read(run_dir.join("ssh-agent.state")).expect("state file missing");
+        serde_json::from_slice(&bytes).expect("state file is valid JSON")
+    }
+
+    #[tokio::test]
+    async fn state_file_written_on_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::with_pid(dir.path().to_path_buf(), 7777);
+        m.register(PathBuf::from("/Users/me/proj"), upstream.clone())
+            .unwrap();
+
+        let snap = read_state(dir.path());
+        assert_eq!(snap["daemon_pid"], 7777);
+        let proxies = snap["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0]["workspace"], "/Users/me/proj");
+        assert_eq!(
+            proxies[0]["upstream_socket"],
+            serde_json::Value::String(upstream.to_string_lossy().into_owned())
+        );
+        assert_eq!(proxies[0]["refcount"], 1);
+    }
+
+    #[tokio::test]
+    async fn state_file_reflects_refcount_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::with_pid(dir.path().to_path_buf(), 1);
+        let workspace = PathBuf::from("/Users/me/proj");
+        m.register(workspace.clone(), upstream.clone()).unwrap();
+        m.register(workspace, upstream).unwrap();
+
+        let snap = read_state(dir.path());
+        assert_eq!(snap["proxies"][0]["refcount"], 2);
+    }
+
+    #[tokio::test]
+    async fn state_file_drops_entry_on_full_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::with_pid(dir.path().to_path_buf(), 1);
+        let workspace = PathBuf::from("/Users/me/proj");
+        m.register(workspace.clone(), upstream).unwrap();
+        m.release(&workspace);
+
+        let snap = read_state(dir.path());
+        assert_eq!(snap["proxies"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn state_file_decrements_on_partial_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::with_pid(dir.path().to_path_buf(), 1);
+        let workspace = PathBuf::from("/Users/me/proj");
+        m.register(workspace.clone(), upstream.clone()).unwrap();
+        m.register(workspace.clone(), upstream).unwrap();
+        m.release(&workspace);
+
+        let snap = read_state(dir.path());
+        assert_eq!(snap["proxies"][0]["refcount"], 1);
     }
 
     #[test]
