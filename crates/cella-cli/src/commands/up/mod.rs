@@ -1138,6 +1138,9 @@ mod tests {
 
     #[test]
     fn render_up_result_text_no_ssh_agent_proxy() {
+        // The trailing newline is load-bearing: without it, the next
+        // shell prompt would consume the status line. Snapshot the full
+        // string (newline included) to lock that property in.
         let out = render_up_result(
             &OutputFormat::Text,
             "created",
@@ -1147,8 +1150,8 @@ mod tests {
             None,
         );
         insta::assert_snapshot!(
-            out.trim_end(),
-            @"Container created. ID: abcdef123456 Workspace: /workspaces/test"
+            out,
+            @"Container created. ID: abcdef123456 Workspace: /workspaces/test\n"
         );
     }
 
@@ -1166,7 +1169,8 @@ mod tests {
             "/workspaces/test",
             Some(&status),
         );
-        insta::assert_snapshot!(out.trim_end(), @r"
+        // Both lines end with `\n`; final newline is load-bearing.
+        insta::assert_snapshot!(out, @r"
         Container created. ID: abcdef123456 Workspace: /workspaces/test
         ssh-agent proxy: bridged via /Users/me/.cella/run/ssh-agent-deadbeef.sock (refcount 1)
         ");
@@ -1185,10 +1189,16 @@ mod tests {
             "/workspaces/test",
             Some(&status),
         );
-        insta::assert_snapshot!(out.trim_end(), @r"
+        insta::assert_snapshot!(out, @r"
         Container created. ID: abcdef123456 Workspace: /workspaces/test
         ssh-agent proxy: skipped — daemon socket not found
         ");
+
+        // Verify the renderer ends Text output with `\n` (separately
+        // asserted because the indented multi-line snapshot above
+        // normalizes whitespace and would mask a missing trailing
+        // newline).
+        assert!(out.ends_with('\n'));
     }
 
     #[test]
@@ -1204,8 +1214,8 @@ mod tests {
             None,
         );
         insta::assert_snapshot!(
-            out.trim_end(),
-            @"Container created. ID: abcdef012345 Workspace: /workspaces/test"
+            out,
+            @"Container created. ID: abcdef012345 Workspace: /workspaces/test\n"
         );
     }
 

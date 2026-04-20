@@ -45,27 +45,10 @@ const VM_HOST_SERVICES_SSH_SOCK: &str = "/run/host-services/ssh-auth.sock";
 /// Container-side socket path for direct bind-mount forwarding.
 const CONTAINER_SSH_SOCK: &str = "/tmp/cella-ssh-agent.sock";
 
-/// macOS App Sandbox directory markers. Paths inside these roots are
-/// not reachable from Lima-class VMs (e.g. colima): macOS blocks the
-/// virtiofs layer from stat'ing sandboxed files, which surfaces as
-/// `operation not supported` from the Docker daemon on bind-mount.
-const MACOS_SANDBOX_DIR_MARKERS: &[&str] = &["/Library/Group Containers/", "/Library/Containers/"];
-
-/// Returns `true` if `path` — after symlink resolution — sits under a
-/// macOS App Sandbox directory. 1Password 8 exposes a stable symlink at
-/// `~/.1password/agent.sock` pointing into `~/Library/Group Containers/…`,
-/// so canonicalization is required to catch both forms.
-fn is_macos_sandboxed_path(path: &str) -> bool {
-    let canonical = std::fs::canonicalize(path)
-        .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned());
-    MACOS_SANDBOX_DIR_MARKERS
-        .iter()
-        .any(|marker| canonical.contains(marker))
-}
-
 /// SSH agent forwarding for runtimes whose VM exposes the host agent at the
 /// Docker Desktop / Lima magic path `/run/host-services/ssh-auth.sock`.
-/// Used for Docker Desktop, `OrbStack`, and colima-with-`forwardAgent`.
+/// Used for Docker Desktop and `OrbStack`. Colima goes through the
+/// daemon-managed proxy via `colima_proxy_request` instead.
 fn vm_host_services_ssh_forwarding(
     runtime: &DockerRuntime,
     host_socket: Option<&String>,
@@ -84,17 +67,15 @@ fn vm_host_services_ssh_forwarding(
 
 /// SSH agent forwarding via direct bind-mount of the host socket.
 ///
-/// Only reached when the dispatcher in `ssh_agent_forwarding` couldn't
-/// satisfy the request from a VM-side magic path: for colima this means
-/// `forwardAgent` is OFF in colima.yaml, so we fall back to attempting a
-/// direct bind-mount of the host socket. If that host path is under a
-/// macOS App Sandbox dir (the 1Password case), Lima's virtiofs cannot
-/// stat it and the bind-mount would fail at container-create with
-/// `operation not supported`; short-circuit here with a warning that
-/// tells the user exactly which colima knob to flip to get full
-/// host-agent forwarding on the next up.
+/// Used as the fallback in `ssh_agent_request` for runtimes that aren't
+/// `DockerDesktop` / `OrbStack` / `Colima` — typically `LinuxNative`
+/// Docker, Podman, or Rancher Desktop. macOS sandboxed-path concerns
+/// don't apply: `DockerDesktop` and `OrbStack` take the magic-socket
+/// path above; `Colima` takes the daemon-managed proxy path below.
+/// Anything reaching here has direct filesystem access from the docker
+/// daemon to the host socket.
 fn direct_ssh_forwarding(
-    runtime: &DockerRuntime,
+    _runtime: &DockerRuntime,
     host_socket: Option<String>,
 ) -> Option<SshAgentForwarding> {
     let host_socket = host_socket?;
@@ -102,13 +83,6 @@ fn direct_ssh_forwarding(
     if !std::path::Path::new(&host_socket).exists() {
         warn!(
             "SSH_AUTH_SOCK points to {host_socket} which does not exist, skipping SSH agent forwarding"
-        );
-        return None;
-    }
-
-    if matches!(runtime, DockerRuntime::Colima) && is_macos_sandboxed_path(&host_socket) {
-        warn!(
-            "SSH_AUTH_SOCK at {host_socket} sits in a macOS sandboxed directory that colima's Lima VM cannot stat; skipping SSH agent mount. Restart colima with `colima start --ssh-agent` and cella will pick up the host agent from /run/host-services/ssh-auth.sock on the next up."
         );
         return None;
     }
@@ -402,135 +376,18 @@ mod tests {
     }
 
     #[test]
-    fn is_macos_sandboxed_path_matches_group_containers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sandboxed = tmp
-            .path()
-            .join("Library/Group Containers/2BUA8C4S2C.com.1password/t");
-        std::fs::create_dir_all(&sandboxed).unwrap();
-        let sock = sandboxed.join("agent.sock");
-        std::fs::File::create(&sock).unwrap();
-        assert!(is_macos_sandboxed_path(sock.to_str().unwrap()));
-    }
-
-    #[test]
-    fn is_macos_sandboxed_path_matches_containers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sandboxed = tmp.path().join("Library/Containers/com.example.app/Data");
-        std::fs::create_dir_all(&sandboxed).unwrap();
-        let sock = sandboxed.join("agent.sock");
-        std::fs::File::create(&sock).unwrap();
-        assert!(is_macos_sandboxed_path(sock.to_str().unwrap()));
-    }
-
-    #[test]
-    fn is_macos_sandboxed_path_rejects_tmp_socket() {
+    fn direct_ssh_forwarding_passes_through_existing_socket() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("ssh.sock");
-        std::fs::File::create(&sock).unwrap();
-        assert!(!is_macos_sandboxed_path(sock.to_str().unwrap()));
-    }
-
-    #[test]
-    fn is_macos_sandboxed_path_handles_missing_path_via_literal_match() {
-        // canonicalize fails on missing paths — we fall back to the literal
-        // string, so the sandbox marker still matches (or doesn't).
-        assert!(is_macos_sandboxed_path(
-            "/does/not/exist/Library/Group Containers/x/sock"
-        ));
-        assert!(!is_macos_sandboxed_path("/does/not/exist/ssh.sock"));
-    }
-
-    #[test]
-    fn is_macos_sandboxed_path_resolves_symlink_into_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real_dir = tmp.path().join("Library/Group Containers/vendor.app/t");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        let real_sock = real_dir.join("agent.sock");
-        std::fs::File::create(&real_sock).unwrap();
-
-        let link_dir = tmp.path().join("home/.1password");
-        std::fs::create_dir_all(&link_dir).unwrap();
-        let link = link_dir.join("agent.sock");
-        std::os::unix::fs::symlink(&real_sock, &link).unwrap();
-
-        assert!(is_macos_sandboxed_path(link.to_str().unwrap()));
-    }
-
-    #[test]
-    fn direct_ssh_forwarding_colima_skips_group_containers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sandboxed = tmp
-            .path()
-            .join("Library/Group Containers/2BUA8C4S2C.com.1password/t");
-        std::fs::create_dir_all(&sandboxed).unwrap();
-        let sock = sandboxed.join("agent.sock");
-        std::fs::File::create(&sock).unwrap();
-
-        let result = direct_ssh_forwarding(
-            &DockerRuntime::Colima,
-            Some(sock.to_string_lossy().into_owned()),
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn direct_ssh_forwarding_colima_allows_tmp_socket() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("ssh.sock");
-        std::fs::File::create(&sock).unwrap();
-
-        let result = direct_ssh_forwarding(
-            &DockerRuntime::Colima,
-            Some(sock.to_string_lossy().into_owned()),
-        );
-        let fwd = result.expect("non-sandboxed path should mount on colima");
-        assert_eq!(fwd.mount_target, CONTAINER_SSH_SOCK);
-    }
-
-    #[test]
-    fn direct_ssh_forwarding_linux_native_allows_sandboxed_path() {
-        // On Linux there's no VM, so sandbox-marker paths are fine
-        // (a Linux user with a literal "Library/Group Containers" dir
-        // on their filesystem isn't affected by the colima limitation).
-        let tmp = tempfile::tempdir().unwrap();
-        let sandboxed = tmp.path().join("Library/Group Containers/whatever/t");
-        std::fs::create_dir_all(&sandboxed).unwrap();
-        let sock = sandboxed.join("agent.sock");
         std::fs::File::create(&sock).unwrap();
 
         let result = direct_ssh_forwarding(
             &DockerRuntime::LinuxNative,
             Some(sock.to_string_lossy().into_owned()),
         );
-        assert!(
-            result.is_some(),
-            "LinuxNative should not apply the colima sandbox skip"
-        );
-    }
-
-    #[test]
-    fn direct_ssh_forwarding_colima_resolves_symlink_before_skip() {
-        // Simulates 1Password's ~/.1password/agent.sock → Group Containers
-        // symlink. Canonicalization must resolve it so the skip fires.
-        let tmp = tempfile::tempdir().unwrap();
-        let real_dir = tmp.path().join("Library/Group Containers/vendor.app/t");
-        std::fs::create_dir_all(&real_dir).unwrap();
-        let real_sock = real_dir.join("agent.sock");
-        std::fs::File::create(&real_sock).unwrap();
-
-        let link_dir = tmp.path().join("home/.1password");
-        std::fs::create_dir_all(&link_dir).unwrap();
-        let link = link_dir.join("agent.sock");
-        std::os::unix::fs::symlink(&real_sock, &link).unwrap();
-
-        let result = direct_ssh_forwarding(
-            &DockerRuntime::Colima,
-            Some(link.to_string_lossy().into_owned()),
-        );
-        assert!(
-            result.is_none(),
-            "symlink pointing into Group Containers must be skipped on colima"
-        );
+        let fwd = result.expect("existing socket path should mount");
+        assert_eq!(fwd.mount_source, sock.to_string_lossy());
+        assert_eq!(fwd.mount_target, CONTAINER_SSH_SOCK);
+        assert_eq!(fwd.env_value, CONTAINER_SSH_SOCK);
     }
 }
