@@ -563,6 +563,7 @@ dependencies = [
  "cella-backend",
  "cella-compose",
  "cella-config",
+ "cella-daemon",
  "cella-env",
  "cella-features",
  "cella-git",

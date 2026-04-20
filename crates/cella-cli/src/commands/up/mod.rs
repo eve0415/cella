@@ -497,6 +497,7 @@ pub struct UpResult {
     pub remote_user: String,
     pub outcome: String,
     pub workspace_folder: String,
+    pub ssh_agent_proxy: Option<cella_orchestrator::SshAgentProxyStatus>,
 }
 
 struct CliUpHooks<'a> {
@@ -706,6 +707,7 @@ impl UpContext {
                 cella_orchestrator::UpOutcome::Created => "created".to_string(),
             },
             workspace_folder: result.workspace_folder,
+            ssh_agent_proxy: result.ssh_agent_proxy,
         })
     }
 }
@@ -772,6 +774,7 @@ impl UpArgs {
             &result.container_id,
             &result.remote_user,
             &result.workspace_folder,
+            result.ssh_agent_proxy.as_ref(),
         );
         Ok(())
     }
@@ -809,6 +812,7 @@ impl UpArgs {
             &result.container_id,
             &result.remote_user,
             &result.workspace_folder,
+            result.ssh_agent_proxy.as_ref(),
         );
         Ok(())
     }
@@ -835,20 +839,55 @@ pub fn output_result(
     container_id: &str,
     remote_user: &str,
     workspace_folder: &str,
+    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
 ) {
     match format {
         OutputFormat::Text => {
             let short_id = &container_id[..12.min(container_id.len())];
             eprintln!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}");
+            if let Some(status) = ssh_agent_proxy {
+                match status {
+                    cella_orchestrator::SshAgentProxyStatus::Bridged {
+                        proxy_socket,
+                        refcount,
+                    } => {
+                        eprintln!(
+                            "ssh-agent proxy: bridged via {proxy_socket} (refcount {refcount})"
+                        );
+                    }
+                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
+                        eprintln!("ssh-agent proxy: skipped — {reason}");
+                    }
+                }
+            }
         }
         OutputFormat::Json => {
-            let output = json!({
-                "outcome": outcome,
-                "containerId": container_id,
-                "remoteUser": remote_user,
-                "remoteWorkspaceFolder": workspace_folder,
-            });
-            println!("{}", serde_json::to_string(&output).unwrap_or_default());
+            let mut output = serde_json::Map::new();
+            output.insert("outcome".to_string(), json!(outcome));
+            output.insert("containerId".to_string(), json!(container_id));
+            output.insert("remoteUser".to_string(), json!(remote_user));
+            output.insert("remoteWorkspaceFolder".to_string(), json!(workspace_folder));
+            if let Some(status) = ssh_agent_proxy {
+                let value = match status {
+                    cella_orchestrator::SshAgentProxyStatus::Bridged {
+                        proxy_socket,
+                        refcount,
+                    } => json!({
+                        "state": "bridged",
+                        "proxySocket": proxy_socket,
+                        "refcount": refcount,
+                    }),
+                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => json!({
+                        "state": "skipped",
+                        "reason": reason,
+                    }),
+                };
+                output.insert("sshAgentProxy".to_string(), value);
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
+            );
         }
     }
 }
@@ -1046,6 +1085,7 @@ mod tests {
             "abcdef123456",
             "vscode",
             "/workspaces/test",
+            None,
         );
     }
 
@@ -1058,6 +1098,54 @@ mod tests {
             "abcdef123456",
             "vscode",
             "/workspaces/test",
+            None,
+        );
+    }
+
+    #[test]
+    fn output_result_with_bridged_ssh_agent_proxy_does_not_panic() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
+            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
+            refcount: 1,
+        };
+        output_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        output_result(
+            &OutputFormat::Json,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+    }
+
+    #[test]
+    fn output_result_with_skipped_ssh_agent_proxy_does_not_panic() {
+        let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
+            reason: "daemon socket not found".to_string(),
+        };
+        output_result(
+            &OutputFormat::Text,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
+        );
+        output_result(
+            &OutputFormat::Json,
+            "created",
+            "abcdef123456",
+            "vscode",
+            "/workspaces/test",
+            Some(&status),
         );
     }
 

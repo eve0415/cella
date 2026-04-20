@@ -18,6 +18,28 @@ pub struct UpResult {
 
     /// What happened during the up operation.
     pub outcome: UpOutcome,
+
+    /// SSH-agent proxy status, when an SSH-agent forwarding decision
+    /// was actually surfaced for this container. `None` means the
+    /// proxy code path was not exercised (no host agent, user override,
+    /// or non-colima runtime that uses direct mount).
+    pub ssh_agent_proxy: Option<SshAgentProxyStatus>,
+}
+
+/// Outcome of the SSH-agent proxy resolution at `cella up`. Cella-cli
+/// renders this as a one-line status under the container info.
+#[derive(Debug, Clone)]
+pub enum SshAgentProxyStatus {
+    /// Daemon-managed proxy was registered. `proxy_socket` is the host
+    /// path mounted into the container; `refcount` is post-register.
+    Bridged {
+        proxy_socket: String,
+        refcount: usize,
+    },
+    /// Proxy was requested (colima with `SSH_AUTH_SOCK` set) but the
+    /// daemon RPC failed; SSH forwarding was skipped. `reason` is a
+    /// short human-readable explanation.
+    Skipped { reason: String },
 }
 
 /// What the up pipeline did.

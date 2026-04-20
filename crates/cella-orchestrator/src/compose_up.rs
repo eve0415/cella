@@ -65,6 +65,10 @@ pub struct ComposeUpResult {
     pub workspace_folder: String,
     /// Whether the container was freshly created or already running.
     pub outcome: ComposeUpOutcome,
+    /// SSH-agent proxy status, when an SSH-agent forwarding decision
+    /// was actually surfaced for this container. `None` when the proxy
+    /// code path was not exercised.
+    pub ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
 }
 
 /// Whether the compose container was created fresh or was already running.
@@ -218,29 +222,66 @@ pub async fn compose_up(
     }
 
     // 5-13. Prepare environment, write override, start services
-    let (remote_user, resolved_features, agent_arch) = prepare_and_start(&ctx, &project).await?;
+    let (remote_user, resolved_features, agent_arch, ssh_agent_proxy) =
+        prepare_and_start(&ctx, &project).await?;
 
     // 14-20. Post-start: find container, setup, lifecycle, output
-    finalize_compose(
+    let mut result = finalize_compose(
         &ctx,
         &project,
         &remote_user,
         resolved_features.as_ref(),
         &agent_arch,
     )
-    .await
+    .await?;
+    result.ssh_agent_proxy = ssh_agent_proxy;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
 // Prepare and start (steps 5-13)
 // ---------------------------------------------------------------------------
 
+/// Resolve any deferred colima SSH-agent proxy request via the daemon
+/// and append the resulting bind-mount and `SSH_AUTH_SOCK` env entries
+/// to `env_fwd`. Mirrors `Up::resolve_ssh_agent_proxy` for the compose
+/// path (compose has no `Self`, so it lives as a free function).
+async fn resolve_ssh_agent_proxy_for_compose(
+    env_fwd: &mut cella_env::EnvForwarding,
+    workspace_root: &Path,
+) -> Option<crate::result::SshAgentProxyStatus> {
+    let request = env_fwd.ssh_agent_proxy_request.take()?;
+    let Some(daemon_sock) = cella_env::paths::daemon_socket_path() else {
+        return Some(crate::result::SshAgentProxyStatus::Skipped {
+            reason: "daemon socket path could not be determined".to_string(),
+        });
+    };
+    match crate::ssh_proxy_client::register_proxy(&daemon_sock, workspace_root, &request).await {
+        Some(resolved) => {
+            env_fwd.mounts.push(resolved.mount);
+            env_fwd.env.push(resolved.env);
+            Some(crate::result::SshAgentProxyStatus::Bridged {
+                proxy_socket: resolved.proxy_socket,
+                refcount: resolved.refcount,
+            })
+        }
+        None => Some(crate::result::SshAgentProxyStatus::Skipped {
+            reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
+        }),
+    }
+}
+
 /// Prepare environment, write override YAML, and start compose services.
 async fn prepare_and_start(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
 ) -> Result<
-    (String, Option<cella_features::ResolvedFeatures>, String),
+    (
+        String,
+        Option<cella_features::ResolvedFeatures>,
+        String,
+        Option<crate::result::SshAgentProxyStatus>,
+    ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
@@ -314,8 +355,11 @@ async fn prepare_and_start(
     let (image_user, image_meta_user) =
         resolve_compose_image_info(client, project, features_build.as_ref(), progress).await;
     let remote_user = resolve_remote_user(config, image_meta_user.as_ref(), &image_user);
-    let env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    let mut env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
+
+    let ssh_agent_proxy =
+        resolve_ssh_agent_proxy_for_compose(&mut env_fwd, cfg.workspace_root).await;
 
     // 11-12. Build extra env vars and labels for the primary service.
     let managed = client.capabilities().managed_agent;
@@ -366,7 +410,7 @@ async fn prepare_and_start(
     .await?;
 
     let resolved_features = features_build.map(|b| b.resolved_features);
-    Ok((remote_user, resolved_features, agent_arch))
+    Ok((remote_user, resolved_features, agent_arch, ssh_agent_proxy))
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +495,7 @@ async fn finalize_compose(
         remote_user: remote_user.to_string(),
         workspace_folder: project.workspace_folder.clone(),
         outcome: ComposeUpOutcome::Created,
+        ssh_agent_proxy: None,
     })
 }
 
@@ -556,6 +601,7 @@ async fn handle_compose_running(
         remote_user,
         workspace_folder: project.workspace_folder.clone(),
         outcome: ComposeUpOutcome::Running,
+        ssh_agent_proxy: None,
     })
 }
 

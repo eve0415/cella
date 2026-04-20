@@ -227,6 +227,21 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
     if let Err(e) = cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
         debug!("Failed to deregister container with daemon: {e}");
     }
+
+    // Release the per-workspace SSH-agent proxy refcount. The daemon
+    // refcounts internally — the listener is torn down only when the
+    // count hits zero, so this is safe to call once per `cella down`
+    // even when other containers in the same workspace are still up.
+    if let Some(workspace) = container.labels.get("dev.cella.workspace_path") {
+        let release = cella_protocol::ManagementRequest::ReleaseSshAgentProxy {
+            workspace: workspace.clone(),
+        };
+        if let Err(e) =
+            cella_daemon::management::send_management_request(&mgmt_sock, &release).await
+        {
+            debug!("Failed to release ssh-agent proxy with daemon: {e}");
+        }
+    }
 }
 
 /// Print the outcome in the requested output format.

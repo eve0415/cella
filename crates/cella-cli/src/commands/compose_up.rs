@@ -51,6 +51,7 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error 
         &result.container_id,
         &result.remote_user,
         &result.workspace_folder,
+        result.ssh_agent_proxy.as_ref(),
     );
 
     Ok(())
