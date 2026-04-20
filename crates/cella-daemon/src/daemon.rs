@@ -61,15 +61,16 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     // Prepare the SSH-agent proxy run directory and sweep any stale sockets
     // left by a previous daemon. Failure here is logged but non-fatal; the
     // proxy is colima-only and the daemon should still start for other uses.
-    if let Some(home) = socket_path.parent() {
-        let run_dir = home.join("run");
-        if let Err(e) = crate::ssh_proxy::init_run_dir(&run_dir) {
-            warn!(
-                "ssh-agent proxy: init {} failed (non-fatal): {e}",
-                run_dir.display()
-            );
-        }
+    let ssh_proxy_run_dir = socket_path
+        .parent()
+        .map_or_else(|| PathBuf::from("/tmp/cella-run"), |home| home.join("run"));
+    if let Err(e) = crate::ssh_proxy::init_run_dir(&ssh_proxy_run_dir) {
+        warn!(
+            "ssh-agent proxy: init {} failed (non-fatal): {e}",
+            ssh_proxy_run_dir.display()
+        );
     }
+    let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir);
 
     // Load persisted auth token (or generate + persist a new one).
     // Persisting the token across daemon restarts ensures existing containers
@@ -128,6 +129,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         shutdown_tx,
         auth_token,
         control_port,
+        ssh_proxy_manager,
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown

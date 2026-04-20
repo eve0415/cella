@@ -34,6 +34,7 @@ pub(crate) struct ManagementContext {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub auth_token: String,
     pub control_port: u16,
+    pub ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -246,6 +247,16 @@ async fn handle_management_request(
             }
         }
         ManagementRequest::Ping => ManagementResponse::Pong,
+        ManagementRequest::RegisterSshAgentProxy {
+            workspace,
+            upstream_socket,
+        } => {
+            handle_register_ssh_agent_proxy(&workspace, &upstream_socket, &ctx.ssh_proxy_manager)
+                .await
+        }
+        ManagementRequest::ReleaseSshAgentProxy { workspace } => {
+            handle_release_ssh_agent_proxy(&workspace, &ctx.ssh_proxy_manager).await
+        }
         ManagementRequest::Shutdown => {
             let pid = std::process::id();
             info!("Shutdown requested, sending signal");
@@ -253,6 +264,50 @@ async fn handle_management_request(
             ManagementResponse::ShuttingDown { pid }
         }
     }
+}
+
+async fn handle_register_ssh_agent_proxy(
+    workspace: &str,
+    upstream_socket: &str,
+    manager: &crate::ssh_proxy::SharedSshProxyManager,
+) -> ManagementResponse {
+    let workspace_path = std::path::PathBuf::from(workspace);
+    let upstream_path = std::path::PathBuf::from(upstream_socket);
+    let result = {
+        let mut mgr = manager.lock().await;
+        mgr.register(workspace_path.clone(), upstream_path)
+            .map(|proxy_socket| (proxy_socket, mgr.refcount_for(&workspace_path)))
+    };
+    match result {
+        Ok((proxy_socket, refcount)) => {
+            info!(
+                "Registered ssh-agent proxy for {workspace} (refcount={refcount}, socket={})",
+                proxy_socket.display()
+            );
+            ManagementResponse::SshAgentProxyRegistered {
+                proxy_socket: proxy_socket.to_string_lossy().into_owned(),
+                refcount,
+            }
+        }
+        Err(e) => {
+            warn!("ssh-agent proxy register failed for {workspace}: {e}");
+            ManagementResponse::Error {
+                message: format!("ssh-agent proxy register failed: {e}"),
+            }
+        }
+    }
+}
+
+async fn handle_release_ssh_agent_proxy(
+    workspace: &str,
+    manager: &crate::ssh_proxy::SharedSshProxyManager,
+) -> ManagementResponse {
+    let workspace_path = std::path::PathBuf::from(workspace);
+    let torn_down = manager.lock().await.release(&workspace_path).is_some();
+    if torn_down {
+        info!("Released ssh-agent proxy for {workspace} (torn down)");
+    }
+    ManagementResponse::SshAgentProxyReleased { torn_down }
 }
 
 /// Data for a container registration request.
@@ -487,6 +542,7 @@ mod tests {
         ctrl_port: u16,
     ) -> (ManagementContext, tokio::sync::watch::Receiver<bool>) {
         let (stx, srx) = tokio::sync::watch::channel(false);
+        let tmp = tempfile::tempdir().unwrap();
         let ctx = ManagementContext {
             last_activity: Arc::new(AtomicU64::new(0)),
             port_manager: Arc::new(Mutex::new(PortManager::new(false))),
@@ -498,6 +554,7 @@ mod tests {
             shutdown_tx: stx,
             auth_token: "test-token".to_string(),
             control_port: ctrl_port,
+            ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep()),
         };
         (ctx, srx)
     }
@@ -622,6 +679,220 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// Stand up an echo server on `path` to mimic an upstream ssh-agent.
+    fn spawn_echo_upstream(path: &Path) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+        let listener = UnixListener::bind(path).expect("bind upstream");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// Spawn a management server bound to `socket_path`, returning a join
+    /// handle to abort. Blocks until the socket file appears so the caller
+    /// can immediately send requests.
+    async fn spawn_management_server(socket_path: &Path) -> tokio::task::JoinHandle<()> {
+        let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = ctrl_listener.local_addr().unwrap().port();
+        let sock = socket_path.to_path_buf();
+        let handle = tokio::spawn({
+            let (ctx, srx) = test_management_context(ctrl_port);
+            async move {
+                let _ = run_management_server(&sock, ctx, srx, ctrl_listener).await;
+            }
+        });
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        handle
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_register_returns_socket_with_refcount_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let upstream_path = dir.path().join("upstream.sock");
+        let _upstream = spawn_echo_upstream(&upstream_path);
+        let server = spawn_management_server(&socket_path).await;
+
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::RegisterSshAgentProxy {
+                workspace: "/Users/me/proj".to_string(),
+                upstream_socket: upstream_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match resp {
+            ManagementResponse::SshAgentProxyRegistered {
+                proxy_socket,
+                refcount,
+            } => {
+                assert_eq!(refcount, 1);
+                assert!(Path::new(&proxy_socket).exists());
+            }
+            other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_second_register_reuses_socket_and_bumps_refcount() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let upstream_path = dir.path().join("upstream.sock");
+        let _upstream = spawn_echo_upstream(&upstream_path);
+        let server = spawn_management_server(&socket_path).await;
+
+        let workspace = "/Users/me/proj".to_string();
+        let upstream = upstream_path.to_string_lossy().into_owned();
+
+        let req = ManagementRequest::RegisterSshAgentProxy {
+            workspace: workspace.clone(),
+            upstream_socket: upstream,
+        };
+        let first = send_management_request(&socket_path, &req).await.unwrap();
+        let second = send_management_request(&socket_path, &req).await.unwrap();
+
+        let (s1, _) = match first {
+            ManagementResponse::SshAgentProxyRegistered {
+                proxy_socket,
+                refcount,
+            } => (proxy_socket, refcount),
+            other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
+        };
+        match second {
+            ManagementResponse::SshAgentProxyRegistered {
+                proxy_socket: s2,
+                refcount,
+            } => {
+                assert_eq!(refcount, 2);
+                assert_eq!(s2, s1);
+            }
+            other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_socket_forwards_bytes_to_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let upstream_path = dir.path().join("upstream.sock");
+        let _upstream = spawn_echo_upstream(&upstream_path);
+        let server = spawn_management_server(&socket_path).await;
+
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::RegisterSshAgentProxy {
+                workspace: "/Users/me/proj".to_string(),
+                upstream_socket: upstream_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let proxy = match resp {
+            ManagementResponse::SshAgentProxyRegistered { proxy_socket, .. } => proxy_socket,
+            other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
+        };
+
+        let mut client = UnixStream::connect(&proxy).await.unwrap();
+        client.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_release_decrements_then_tears_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let upstream_path = dir.path().join("upstream.sock");
+        let _upstream = spawn_echo_upstream(&upstream_path);
+        let server = spawn_management_server(&socket_path).await;
+
+        let workspace = "/Users/me/proj".to_string();
+        let upstream = upstream_path.to_string_lossy().into_owned();
+        let register = ManagementRequest::RegisterSshAgentProxy {
+            workspace: workspace.clone(),
+            upstream_socket: upstream,
+        };
+        let release = ManagementRequest::ReleaseSshAgentProxy {
+            workspace: workspace.clone(),
+        };
+
+        send_management_request(&socket_path, &register)
+            .await
+            .unwrap();
+        send_management_request(&socket_path, &register)
+            .await
+            .unwrap();
+
+        let resp = send_management_request(&socket_path, &release)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resp,
+            ManagementResponse::SshAgentProxyReleased { torn_down: false }
+        ));
+        let resp = send_management_request(&socket_path, &release)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resp,
+            ManagementResponse::SshAgentProxyReleased { torn_down: true }
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_release_unknown_workspace_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let server = spawn_management_server(&socket_path).await;
+
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::ReleaseSshAgentProxy {
+                workspace: "/never/registered".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp,
+            ManagementResponse::SshAgentProxyReleased { torn_down: false }
+        ));
+
+        server.abort();
     }
 
     #[cfg(feature = "integration-tests")]
