@@ -202,6 +202,54 @@ pub fn new_shared(run_dir: PathBuf) -> SharedSshProxyManager {
     Arc::new(Mutex::new(SshProxyManager::new(run_dir)))
 }
 
+/// Ensure the SSH-proxy run directory exists and is free of stale sockets
+/// from previous daemon runs.
+///
+/// Creates `run_dir` (recursively) if missing, then unlinks any
+/// `ssh-agent-*.sock` files left behind by a daemon that exited without
+/// teardown — a fresh daemon owns no proxies, so any pre-existing sockets
+/// are guaranteed stale and would refuse `bind` on a future register.
+///
+/// # Errors
+///
+/// Returns `CellaDaemonError::Socket` if the directory cannot be created.
+pub fn init_run_dir(run_dir: &Path) -> Result<(), CellaDaemonError> {
+    std::fs::create_dir_all(run_dir).map_err(|e| CellaDaemonError::Socket {
+        message: format!(
+            "ssh-agent proxy: create dir {} failed: {e}",
+            run_dir.display()
+        ),
+    })?;
+    sweep_stale_sockets(run_dir);
+    Ok(())
+}
+
+/// Unlink any `ssh-agent-*.sock` files in `run_dir`. Failures are logged at
+/// `warn` and otherwise ignored — best-effort cleanup.
+fn sweep_stale_sockets(run_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let ext_is_sock = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sock"));
+        if name.starts_with("ssh-agent-") && ext_is_sock {
+            match std::fs::remove_file(&path) {
+                Ok(()) => debug!("ssh-agent proxy: swept stale socket {}", path.display()),
+                Err(e) => warn!(
+                    "ssh-agent proxy: could not sweep stale socket {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +505,58 @@ mod tests {
         for _ in 0..3 {
             rx.recv().await.expect("client task completed");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Run-dir initialization & stale-socket sweep.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn init_run_dir_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        assert!(!run.exists());
+        init_run_dir(&run).unwrap();
+        assert!(run.is_dir());
+    }
+
+    #[test]
+    fn init_run_dir_is_idempotent_when_dir_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("run")).unwrap();
+        init_run_dir(&dir.path().join("run")).unwrap();
+    }
+
+    #[test]
+    fn init_run_dir_sweeps_existing_ssh_agent_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let stale = run.join("ssh-agent-deadbeefcafef00d.sock");
+        std::fs::write(&stale, b"junk").unwrap();
+        assert!(stale.exists());
+
+        init_run_dir(&run).unwrap();
+        assert!(!stale.exists(), "stale ssh-agent socket must be unlinked");
+    }
+
+    #[test]
+    fn init_run_dir_leaves_unrelated_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+
+        let unrelated = run.join("daemon.token");
+        std::fs::write(&unrelated, b"keep me").unwrap();
+        let prefix_only = run.join("ssh-agent-without-suffix");
+        std::fs::write(&prefix_only, b"keep me too").unwrap();
+        let suffix_only = run.join("other.sock");
+        std::fs::write(&suffix_only, b"keep me three").unwrap();
+
+        init_run_dir(&run).unwrap();
+        assert!(unrelated.exists());
+        assert!(prefix_only.exists());
+        assert!(suffix_only.exists());
     }
 
     #[tokio::test]

@@ -58,6 +58,19 @@ fn write_control_file(
 pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), CellaDaemonError> {
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
+    // Prepare the SSH-agent proxy run directory and sweep any stale sockets
+    // left by a previous daemon. Failure here is logged but non-fatal; the
+    // proxy is colima-only and the daemon should still start for other uses.
+    if let Some(home) = socket_path.parent() {
+        let run_dir = home.join("run");
+        if let Err(e) = crate::ssh_proxy::init_run_dir(&run_dir) {
+            warn!(
+                "ssh-agent proxy: init {} failed (non-fatal): {e}",
+                run_dir.display()
+            );
+        }
+    }
+
     // Load persisted auth token (or generate + persist a new one).
     // Persisting the token across daemon restarts ensures existing containers
     // (which have the token baked into CELLA_DAEMON_TOKEN) can still connect.
