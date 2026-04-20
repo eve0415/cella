@@ -116,34 +116,65 @@ impl SshProxyManager {
     /// On first registration this binds a `TcpListener` on `127.0.0.1:0`
     /// and spawns an accept-loop that, for each connection accepted from
     /// the in-container agent, opens a fresh `UnixStream::connect(upstream
-    /// _socket)` and bidirectionally copies bytes between the two. If a
-    /// bridge already exists for `workspace`, the refcount is incremented
-    /// and the existing TCP port is returned. The `upstream_socket`
-    /// argument is honored only on the first registration; subsequent
-    /// calls reuse the original upstream.
+    /// _socket)` and bidirectionally copies bytes between the two.
+    ///
+    /// Subsequent register behavior depends on whether the `upstream_socket`
+    /// matches the existing entry:
+    /// - **Same upstream**: refcount is incremented and the existing TCP
+    ///   port is returned. Normal case (N containers sharing one workspace).
+    /// - **Different upstream**: treat the existing entry as stale (the
+    ///   reclaimed-from-state-file case where the user's `$SSH_AUTH_SOCK`
+    ///   changed between daemon runs, or a `cella up --rebuild` after a
+    ///   daemon bounce). Tear down the stale bridge and rebind. Prefer
+    ///   the same port so any lingering container with the old baked
+    ///   env var still resolves; if the port can't be re-grabbed in the
+    ///   tight window after teardown, fall through to a fresh port.
     ///
     /// # Errors
     ///
-    /// Returns `CellaDaemonError::Socket` if the TCP listener cannot be
+    /// Returns `CellaDaemonError::Socket` if no TCP listener can be
     /// bound (extremely unlikely for `127.0.0.1:0`).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in normal operation. `expect("just indexed")`
+    /// on the stale-upstream branch is proven unreachable by the
+    /// preceding `HashMap::get` returning `Some`.
     pub async fn register(
         &mut self,
         workspace: PathBuf,
         upstream_socket: PathBuf,
     ) -> Result<u16, CellaDaemonError> {
-        if let Some(entry) = self.bridges.get_mut(&workspace) {
-            entry.refcount += 1;
-            let port = entry.bridge_port;
-            self.persist_state();
-            return Ok(port);
-        }
+        // Three cases: reuse (same upstream), replace (different upstream),
+        // fresh (no entry). Compute once to avoid overlapping get/get_mut.
+        let preferred_port = match self.bridges.get(&workspace) {
+            Some(entry) if entry.upstream_socket == upstream_socket => {
+                let port = entry.bridge_port;
+                if let Some(e) = self.bridges.get_mut(&workspace) {
+                    e.refcount += 1;
+                }
+                self.persist_state();
+                return Ok(port);
+            }
+            Some(entry) => {
+                // Stale upstream — tear down so we can rebind fresh.
+                let preferred = entry.bridge_port;
+                let removed = self.bridges.remove(&workspace).expect("just indexed");
+                warn!(
+                    workspace = %workspace.display(),
+                    port = preferred,
+                    old_upstream = %removed.upstream_socket.display(),
+                    new_upstream = %upstream_socket.display(),
+                    "ssh-agent bridge: upstream changed, recreating bridge"
+                );
+                let _ = removed.shutdown_tx.send(true);
+                removed.accept_task.abort();
+                Some(preferred)
+            }
+            None => None,
+        };
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0")
-                .await
-                .map_err(|e| CellaDaemonError::Socket {
-                    message: format!("ssh-agent bridge: bind 127.0.0.1:0 failed: {e}"),
-                })?;
+        let listener = bind_preferred_or_random(preferred_port).await?;
         let bridge_port =
             listener
                 .local_addr()
@@ -303,6 +334,24 @@ pub fn workspace_hash(workspace: &Path) -> String {
     hasher.update(workspace.as_os_str().as_encoded_bytes());
     let digest = hex::encode(hasher.finalize());
     digest[..16].to_string()
+}
+
+/// Try binding `127.0.0.1:<preferred>` first; if that fails (e.g. the
+/// port just got released and the OS is still holding it in `TIME_WAIT`,
+/// or another process grabbed it), fall through to a random port.
+/// Returns the bound `TcpListener`; surfaces `CellaDaemonError::Socket`
+/// only when neither attempt succeeds.
+async fn bind_preferred_or_random(preferred: Option<u16>) -> Result<TcpListener, CellaDaemonError> {
+    if let Some(port) = preferred
+        && let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{port}")).await
+    {
+        return Ok(listener);
+    }
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("ssh-agent bridge: bind 127.0.0.1:0 failed: {e}"),
+        })
 }
 
 /// Accept TCP connections on `listener` and proxy each one to
@@ -733,6 +782,100 @@ mod tests {
         // Listener is gone (give the runtime a tick to close).
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_with_same_upstream_bumps_refcount_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+
+        let first_port = m
+            .register(workspace.clone(), upstream.clone())
+            .await
+            .unwrap();
+        let second_port = m.register(workspace.clone(), upstream).await.unwrap();
+
+        assert_eq!(first_port, second_port);
+        assert_eq!(m.refcount_for(&workspace), 2);
+    }
+
+    #[tokio::test]
+    async fn register_with_new_upstream_replaces_stale_bridge() {
+        // Regression: on a rebuild after daemon-restart reclaim, the
+        // reclaimed entry's upstream may be stale (user rotated
+        // $SSH_AUTH_SOCK). A fresh register must NOT just bump
+        // refcount — that would forward bytes to the stale agent.
+        // It must tear down and rebind with the current upstream.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream_old = dir.path().join("upstream-old.sock");
+        let upstream_new = dir.path().join("upstream-new.sock");
+        let _up_old = spawn_echo_upstream(&upstream_old);
+        // upstream_new is a distinct echo server so we can assert
+        // traffic is flowing to IT, not the old one.
+        let new_listener = UnixListener::bind(&upstream_new).unwrap();
+        let new_marker = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let new_marker_for_task = new_marker.clone();
+        let _up_new = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = new_listener.accept().await {
+                let marker = new_marker_for_task.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        marker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+
+        // First register pins the old upstream.
+        let port_old = m.register(workspace.clone(), upstream_old).await.unwrap();
+
+        // Second register (rebuild) with a different upstream: triggers
+        // the teardown-and-rebind path. Refcount resets to 1 on
+        // replacement — the reclaimed/stale entry's count is not
+        // carried forward, because it may have been a lie.
+        let port_new = m
+            .register(workspace.clone(), upstream_new.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            m.refcount_for(&workspace),
+            1,
+            "rebuild must reset refcount, not carry stale count"
+        );
+        assert_eq!(
+            m.upstream_for(&workspace),
+            Some(upstream_new.as_path()),
+            "upstream must be updated on replacement"
+        );
+
+        // Port preservation: best effort. Usually the same port rebinds
+        // successfully because the OS releases it immediately after
+        // shutdown on loopback. We only assert traffic goes to the NEW
+        // upstream — which port it's on is a secondary concern.
+        let _ = port_old; // silence clippy, we don't strictly need it.
+        let mut client = connect_and_authenticate(port_new, "test-token").await;
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert!(
+            new_marker.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "replaced bridge must forward bytes to the NEW upstream, not the stale one"
+        );
     }
 
     #[tokio::test]
