@@ -170,8 +170,11 @@ impl SshProxyManager {
         self.run_dir.join("ssh-agent.state")
     }
 
-    /// Serialize the current proxy registry to `ssh-agent.state`. Best-effort:
-    /// failures are logged but never propagated, so a busted filesystem can't
+    /// Serialize the current proxy registry to `ssh-agent.state` atomically:
+    /// write to `<path>.tmp` first, then rename onto `<path>`. POSIX rename
+    /// is atomic, so a daemon crash mid-write can never leave readers staring
+    /// at a half-written file. Best-effort: serialization or filesystem
+    /// failures log at warn and never propagate, so a busted filesystem can't
     /// take down register/release.
     fn persist_state(&self) {
         let proxies: Vec<serde_json::Value> = self
@@ -188,25 +191,43 @@ impl SshProxyManager {
             .collect();
 
         let snapshot = serde_json::json!({
+            "schema_version": STATE_FILE_SCHEMA_VERSION,
             "daemon_pid": self.daemon_pid,
             "written_at_unix_sec": crate::shared::current_time_secs(),
             "proxies": proxies,
         });
 
         let path = self.state_file_path();
-        match serde_json::to_vec_pretty(&snapshot) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(&path, &bytes) {
-                    warn!(
-                        "ssh-agent proxy: state-file write {} failed: {e}",
-                        path.display()
-                    );
-                }
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("ssh-agent proxy: state-file serialize failed: {e}");
+                return;
             }
-            Err(e) => warn!("ssh-agent proxy: state-file serialize failed: {e}"),
+        };
+
+        let tmp = path.with_extension("state.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            warn!(
+                "ssh-agent proxy: state-file write {} failed: {e}",
+                tmp.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            warn!(
+                "ssh-agent proxy: state-file rename to {} failed: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }
+
+/// Schema version stamped into the persisted state file. Bump whenever the
+/// JSON shape changes in a backward-incompatible way; readers should refuse
+/// versions they don't understand.
+pub const STATE_FILE_SCHEMA_VERSION: u32 = 1;
 
 /// Stable, short hex hash of a workspace path used to build the proxy socket
 /// filename. Truncated SHA-256 to 16 hex chars (64 bits) — collision risk is
@@ -618,6 +639,7 @@ mod tests {
             .unwrap();
 
         let snap = read_state(dir.path());
+        assert_eq!(snap["schema_version"], STATE_FILE_SCHEMA_VERSION);
         assert_eq!(snap["daemon_pid"], 7777);
         let proxies = snap["proxies"].as_array().expect("proxies array");
         assert_eq!(proxies.len(), 1);
@@ -627,6 +649,20 @@ mod tests {
             serde_json::Value::String(upstream.to_string_lossy().into_owned())
         );
         assert_eq!(proxies[0]["refcount"], 1);
+    }
+
+    #[tokio::test]
+    async fn state_file_write_does_not_leave_tmp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::with_pid(dir.path().to_path_buf(), 1);
+        m.register(PathBuf::from("/Users/me/proj"), upstream)
+            .unwrap();
+
+        let tmp = dir.path().join("ssh-agent.state.tmp");
+        assert!(!tmp.exists(), "tmp file must be renamed away, not stranded");
     }
 
     #[tokio::test]
