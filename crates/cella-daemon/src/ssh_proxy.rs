@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 
@@ -39,6 +39,11 @@ struct ProxyEntry {
     proxy_socket: PathBuf,
     refcount: usize,
     accept_task: AbortHandle,
+    /// Broadcast channel that signals teardown to the accept loop and to
+    /// every spawned per-connection bridge. Sending `true` causes the
+    /// accept loop and any in-flight bridges to drop their streams, which
+    /// closes the corresponding fds and EOFs both peers.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl SshProxyManager {
@@ -109,14 +114,18 @@ impl SshProxyManager {
             "ssh-agent proxy: bound listener"
         );
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let upstream_for_task = upstream_socket.clone();
-        let task = tokio::spawn(async move { run_accept_loop(listener, upstream_for_task).await });
+        let task = tokio::spawn(async move {
+            run_accept_loop(listener, upstream_for_task, shutdown_rx).await;
+        });
 
         let entry = ProxyEntry {
             upstream_socket,
             proxy_socket: proxy_socket.clone(),
             refcount: 1,
             accept_task: task.abort_handle(),
+            shutdown_tx,
         };
         self.proxies.insert(workspace, entry);
         self.persist_state();
@@ -135,6 +144,10 @@ impl SshProxyManager {
             return None;
         }
         let removed = self.proxies.remove(workspace)?;
+        // Signal in-flight bridges to drop their streams (which EOFs both
+        // peers) BEFORE aborting the accept loop. send() returns Err only
+        // when there are no receivers — we don't care.
+        let _ = removed.shutdown_tx.send(true);
         removed.accept_task.abort();
         let _ = std::fs::remove_file(&removed.proxy_socket);
         debug!(
@@ -240,26 +253,53 @@ fn workspace_hash(workspace: &Path) -> String {
 }
 
 /// Accept connections on `listener` and proxy each one to `upstream_socket`.
-/// Loops until the listener errors or the task is aborted.
-async fn run_accept_loop(listener: UnixListener, upstream_socket: PathBuf) {
+/// Loops until the listener errors, the task is aborted, or `shutdown` fires.
+/// Each spawned per-connection bridge inherits the same shutdown receiver
+/// so teardown propagates to in-flight transfers.
+async fn run_accept_loop(
+    listener: UnixListener,
+    upstream_socket: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if *shutdown.borrow() {
+        return;
+    }
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let upstream = upstream_socket.clone();
-                tokio::spawn(async move { proxy_one_connection(stream, upstream).await });
-            }
-            Err(e) => {
-                warn!("ssh-agent proxy: accept failed, exiting loop: {e}");
-                break;
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, _)) => {
+                        let upstream = upstream_socket.clone();
+                        let child_shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            proxy_one_connection(stream, upstream, child_shutdown).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!("ssh-agent proxy: accept failed, exiting loop: {e}");
+                        return;
+                    }
+                }
             }
         }
     }
 }
 
 /// Bridge a single accepted client to a fresh upstream connection. Bytes
-/// flow until either side closes. SSH-agent protocol is opaque to us; this
-/// is pure bidirectional copy.
-async fn proxy_one_connection(mut downstream: UnixStream, upstream_socket: PathBuf) {
+/// flow until either side closes or `shutdown` fires. When shutdown wins,
+/// `downstream` and `upstream` are dropped, which closes their fds and
+/// EOFs both peers — SSH-agent clients inside the container observe this
+/// as a connection close, not as a hung-on-read.
+async fn proxy_one_connection(
+    mut downstream: UnixStream,
+    upstream_socket: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if *shutdown.borrow() {
+        return;
+    }
     let mut upstream = match UnixStream::connect(&upstream_socket).await {
         Ok(s) => s,
         Err(e) => {
@@ -270,8 +310,16 @@ async fn proxy_one_connection(mut downstream: UnixStream, upstream_socket: PathB
             return;
         }
     };
-    if let Err(e) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
-        debug!("ssh-agent proxy: connection ended with: {e}");
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => {
+            debug!("ssh-agent proxy: shutdown signaled, closing in-flight bridge");
+        }
+        res = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {
+            if let Err(e) = res {
+                debug!("ssh-agent proxy: connection ended with: {e}");
+            }
+        }
     }
 }
 
@@ -728,6 +776,43 @@ mod tests {
         assert!(unrelated.exists());
         assert!(prefix_only.exists());
         assert!(suffix_only.exists());
+    }
+
+    #[tokio::test]
+    async fn release_closes_in_flight_bridge_connections() {
+        // Regression: prior to per-connection shutdown propagation, release
+        // aborted only the accept loop and unlinked the socket file, leaving
+        // already-accepted bridge tasks running until the client side
+        // disconnected. SSH-agent clients in the container would hang on
+        // read indefinitely. After the fix, release must close in-flight
+        // bridges so peers observe EOF promptly.
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = SshProxyManager::new(dir.path().to_path_buf());
+        let workspace = PathBuf::from("/Users/me/proj");
+        let proxy = m.register(workspace.clone(), upstream).unwrap();
+
+        // Open a client and round-trip a byte to prove the bridge is live.
+        let mut client = UnixStream::connect(&proxy).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [b'x']);
+
+        // Release while the client connection is still open and idle.
+        m.release(&workspace);
+
+        // The proxy must close our connection. read() should return 0
+        // (EOF) within a couple seconds, not hang forever.
+        let read_result = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        let n = read_result
+            .expect("bridge must EOF in-flight connections within 2s of release")
+            .expect("read after release should not error");
+        assert_eq!(n, 0, "expected EOF (read=0) after teardown, got {n} bytes");
     }
 
     #[tokio::test]
