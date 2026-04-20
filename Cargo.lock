@@ -439,10 +439,12 @@ version = "0.0.29"
 dependencies = [
  "cella-port",
  "cella-protocol",
+ "hex",
  "miette",
  "nix 0.31.2",
  "portable-pty",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
