@@ -24,10 +24,15 @@ pub enum SshAgentRequest {
     /// `OrbStack` (magic VM socket) and for Linux/Podman direct host
     /// bind-mount. Ready to be mounted as-is.
     Direct(SshAgentForwarding),
-    /// Colima needs a host-side proxy because lima's OpenSSH-protocol
-    /// `forwardAgent` degenerates with sandboxed agents (1Password). The
-    /// orchestrator must call `RegisterSshAgentProxy` on the daemon to
-    /// get back a real bind-mount source.
+    /// Colima needs a host-side proxy for two converging reasons: lima's
+    /// OpenSSH-protocol `forwardAgent` degenerates with sandboxed agents
+    /// (1Password), AND directly bind-mounting `~/Library/Group Containers/
+    /// .../agent.sock` fails at the docker daemon with `mkdir <source>:
+    /// operation not supported` (virtiofs returns EOPNOTSUPP for mkdir
+    /// under macOS sandbox dirs, blocking docker's source-precreate
+    /// fallback). The orchestrator must call `RegisterSshAgentProxy` on
+    /// the daemon to get a host path under `~/.cella/run/` (outside the
+    /// sandbox) that's safe to bind-mount.
     ProxyOnColima {
         upstream_socket: PathBuf,
         mount_target: String,
@@ -69,11 +74,12 @@ fn vm_host_services_ssh_forwarding(
 ///
 /// Used as the fallback in `ssh_agent_request` for runtimes that aren't
 /// `DockerDesktop` / `OrbStack` / `Colima` — typically `LinuxNative`
-/// Docker, Podman, or Rancher Desktop. macOS sandboxed-path concerns
-/// don't apply: `DockerDesktop` and `OrbStack` take the magic-socket
-/// path above; `Colima` takes the daemon-managed proxy path below.
-/// Anything reaching here has direct filesystem access from the docker
-/// daemon to the host socket.
+/// Docker, Podman, or Rancher Desktop. macOS sandbox-dir concerns
+/// don't apply on these runtimes (no Lima virtiofs in the path), so
+/// the host socket is reachable from the docker daemon as-is. (For
+/// `Colima` direct mount fails — Docker's mkdir-source-if-missing
+/// returns EOPNOTSUPP under macOS sandbox dirs — which is why colima
+/// takes the daemon-managed proxy path instead.)
 fn direct_ssh_forwarding(
     _runtime: &DockerRuntime,
     host_socket: Option<String>,
@@ -129,14 +135,29 @@ pub fn ssh_agent_request(
 }
 
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
-/// proxy. Bypasses lima's OpenSSH `forwardAgent` mechanism entirely
-/// because that mechanism silently degenerates with sandboxed agents
-/// (1Password) and routes to a connectable-but-empty agent socket.
+/// proxy. Two reasons direct mount can't be used here:
+///
+/// 1. Lima's OpenSSH-protocol `forwardAgent` mechanism silently
+///    degenerates with sandboxed agents (1Password) and routes
+///    `/run/host-services/ssh-auth.sock` to a connectable-but-empty
+///    agent. Confirmed by side-by-side tests against VS Code, which
+///    also avoids this socket.
+/// 2. Bind-mounting the host's `$SSH_AUTH_SOCK` directly fails when
+///    that path is in a macOS sandbox dir: docker daemon precreates
+///    a missing mount source via mkdir, which virtiofs rejects with
+///    `operation not supported` for paths under `~/Library/Group
+///    Containers/`. Confirmed by `docker run -v "$SSH_AUTH_SOCK":/x
+///    alpine` returning that exact error on a 1Password setup.
+///
+/// The daemon-managed proxy sidesteps both: it puts the bind-mount
+/// source under `~/.cella/run/` (a normal home path), and the
+/// daemon — running in the user's macOS context — opens the sandbox
+/// socket directly to bridge bytes. Same workaround as VS Code's
+/// per-session `/tmp/vscode-ssh-auth-<uuid>.sock`.
 ///
 /// Returns `None` when `SSH_AUTH_SOCK` is unset on the host — the proxy
 /// has nothing to bridge to, and the orchestrator should skip forwarding
-/// rather than mount a dead socket. (`colima_forward_agent_enabled()` is
-/// no longer consulted here; the daemon-owned bridge supersedes it.)
+/// rather than mount a dead socket.
 fn colima_proxy_request(host_socket: Option<&str>) -> Option<SshAgentRequest> {
     let upstream = host_socket?;
     Some(SshAgentRequest::ProxyOnColima {

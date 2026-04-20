@@ -1,12 +1,24 @@
 //! Per-workspace SSH-agent proxy.
 //!
 //! Bridges the host's `$SSH_AUTH_SOCK` into a path under `~/.cella/run/` that
-//! cella mounts into containers on colima. On colima the VM-side magic socket
-//! `/run/host-services/ssh-auth.sock` is created by lima's OpenSSH agent
-//! forwarding, which silently degenerates with sandboxed agents (1Password)
-//! and can route to a connectable-but-empty agent. Owning the bridge here
-//! removes that fragility — the daemon runs in the user's macOS context and
-//! has full access to the real agent socket regardless of sandboxing.
+//! cella mounts into containers on colima. Two failure modes converge here:
+//!
+//! 1. **Lima's `forwardAgent` socket is unreliable.** On colima the VM-side
+//!    `/run/host-services/ssh-auth.sock` is created by lima's OpenSSH-protocol
+//!    agent forwarding, which silently degenerates with sandboxed agents
+//!    (1Password) and can route to a connectable-but-empty agent.
+//! 2. **Direct bind-mount of the host socket fails on macOS sandbox dirs.**
+//!    1Password's socket lives at `~/Library/Group Containers/.../agent.sock`.
+//!    Bind-mounting that path errors at the docker daemon: `mkdir <source>:
+//!    operation not supported` — Docker's mkdir-source-if-missing fallback
+//!    runs through virtiofs, which returns EOPNOTSUPP under macOS sandbox
+//!    dirs, killing the mount before it begins.
+//!
+//! The proxy socket lives under `~/.cella/run/` — a normal user-home path
+//! virtiofs handles fine — and bridges bytes back to the real agent socket
+//! via the daemon process, which runs in the user's macOS context and can
+//! open the sandbox-dir socket directly. Same workaround vector as VS Code's
+//! `/tmp/vscode-ssh-auth-<uuid>.sock`.
 //!
 //! Lifecycle: refcounted per workspace folder. First `cella up` for a
 //! workspace creates the proxy socket; subsequent ups for the same workspace
