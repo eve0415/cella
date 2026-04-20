@@ -878,24 +878,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn upstream_first_registration_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let upstream_a = dir.path().join("first.sock");
-        let upstream_b = dir.path().join("second.sock");
-        let _up_a = spawn_echo_upstream(&upstream_a);
-        let _up_b = spawn_echo_upstream(&upstream_b);
-
-        let mut m = manager(dir.path());
-        let workspace = PathBuf::from("/Users/me/proj");
-
-        m.register(workspace.clone(), upstream_a.clone())
-            .await
-            .unwrap();
-        m.register(workspace.clone(), upstream_b).await.unwrap();
-
-        assert_eq!(m.upstream_for(&workspace), Some(upstream_a.as_path()));
-    }
+    // (The inverse — "first registration wins" — was explicitly
+    // undone by the stale-reclaim fix; see
+    // `register_with_new_upstream_replaces_stale_bridge` above for
+    // the current semantic: different upstream → rebuild bridge.)
 
     // ---------------------------------------------------------------
     // End-to-end byte-fidelity tests through the bridge.
