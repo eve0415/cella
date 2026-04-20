@@ -24,15 +24,18 @@ pub enum SshAgentRequest {
     /// `OrbStack` (magic VM socket) and for Linux/Podman direct host
     /// bind-mount. Ready to be mounted as-is.
     Direct(SshAgentForwarding),
-    /// Colima needs a host-side proxy for two converging reasons: lima's
-    /// OpenSSH-protocol `forwardAgent` degenerates with sandboxed agents
-    /// (1Password), AND directly bind-mounting `~/Library/Group Containers/
-    /// .../agent.sock` fails at the docker daemon with `mkdir <source>:
-    /// operation not supported` (virtiofs returns EOPNOTSUPP for mkdir
-    /// under macOS sandbox dirs, blocking docker's source-precreate
-    /// fallback). The orchestrator must call `RegisterSshAgentProxy` on
-    /// the daemon to get a host path under `~/.cella/run/` (outside the
-    /// sandbox) that's safe to bind-mount.
+    /// **Known broken on colima — see `cella_daemon::ssh_proxy` module
+    /// docs.** Lima's OpenSSH-protocol `forwardAgent` degenerates with
+    /// sandboxed agents (1Password) AND direct bind-mount of
+    /// `~/Library/Group Containers/.../agent.sock` fails at docker
+    /// `mkdir <source>: operation not supported`. The daemon-managed
+    /// proxy was meant to fix this by mounting a socket under
+    /// `~/.cella/run/` instead — but virtiofs rejects mkdir for that
+    /// path too (Phase 1 probe failed). The orchestrator currently
+    /// requests this variant, the daemon RPC succeeds, and the bind
+    /// mount then fails at container create. Affected users should
+    /// switch to `OrbStack` or Docker Desktop until a VM-side helper
+    /// design lands.
     ProxyOnColima {
         upstream_socket: PathBuf,
         mount_target: String,
@@ -135,29 +138,33 @@ pub fn ssh_agent_request(
 }
 
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
-/// proxy. Two reasons direct mount can't be used here:
+/// proxy. **The proxy itself is currently broken on colima — see
+/// `cella_daemon::ssh_proxy` module docs for the empirical evidence.**
+/// Two reasons direct mount cannot be used:
 ///
 /// 1. Lima's OpenSSH-protocol `forwardAgent` mechanism silently
 ///    degenerates with sandboxed agents (1Password) and routes
 ///    `/run/host-services/ssh-auth.sock` to a connectable-but-empty
-///    agent. Confirmed by side-by-side tests against VS Code, which
-///    also avoids this socket.
+///    agent. Confirmed by side-by-side tests against VS Code.
 /// 2. Bind-mounting the host's `$SSH_AUTH_SOCK` directly fails when
 ///    that path is in a macOS sandbox dir: docker daemon precreates
 ///    a missing mount source via mkdir, which virtiofs rejects with
 ///    `operation not supported` for paths under `~/Library/Group
-///    Containers/`. Confirmed by `docker run -v "$SSH_AUTH_SOCK":/x
-///    alpine` returning that exact error on a 1Password setup.
+///    Containers/`.
 ///
-/// The daemon-managed proxy sidesteps both: it puts the bind-mount
-/// source under `~/.cella/run/` (a normal home path), and the
-/// daemon — running in the user's macOS context — opens the sandbox
-/// socket directly to bridge bytes. Same workaround as VS Code's
-/// per-session `/tmp/vscode-ssh-auth-<uuid>.sock`.
+/// We routed colima through a daemon-managed proxy under `~/.cella/run/`
+/// expecting that to sidestep both issues. It does not — the same
+/// `mkdir <source>: operation not supported` error fires for the
+/// `~/.cella/run/` socket too. Virtiofs rejects mkdir for any Unix
+/// socket path created on the macOS host, not just sandboxed ones.
+/// VS Code works because its `/tmp/vscode-ssh-auth-<uuid>.sock` is
+/// created INSIDE the colima VM (via Remote-SSH), not on the host.
 ///
 /// Returns `None` when `SSH_AUTH_SOCK` is unset on the host — the proxy
 /// has nothing to bridge to, and the orchestrator should skip forwarding
-/// rather than mount a dead socket.
+/// rather than mount a dead socket. (Even when `Some(...)` is returned,
+/// the resulting mount will currently fail at docker container create
+/// time on colima.)
 fn colima_proxy_request(host_socket: Option<&str>) -> Option<SshAgentRequest> {
     let upstream = host_socket?;
     Some(SshAgentRequest::ProxyOnColima {
