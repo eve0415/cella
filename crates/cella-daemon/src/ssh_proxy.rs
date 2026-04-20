@@ -430,6 +430,119 @@ pub fn new_shared(state_dir: PathBuf, auth_token: String) -> SharedSshProxyManag
     Arc::new(Mutex::new(SshProxyManager::new(state_dir, auth_token)))
 }
 
+impl SshProxyManager {
+    /// Reclaim bridges from the persisted state file.
+    ///
+    /// Runs at daemon startup so containers created before the daemon
+    /// bounced — whose `CELLA_SSH_AGENT_BRIDGE` env var is baked in at
+    /// create time and points at a specific loopback port — keep
+    /// working instead of hanging on a dead port. For each entry in
+    /// the state file we try to `TcpListener::bind` on the exact same
+    /// port; if it's still free (usually is, since the old daemon
+    /// released it on shutdown), we spawn a fresh accept loop bridging
+    /// to the original upstream socket. The in-container agent's
+    /// baked-in `host.docker.internal:<port>` keeps resolving to a
+    /// working bridge.
+    ///
+    /// Refcount is reset to 1 on reclaim — we have no authoritative
+    /// way to tell how many containers are using the bridge after a
+    /// restart. Subsequent register/release calls correct the count
+    /// over time.
+    ///
+    /// Best-effort: ports that can't be reclaimed (already in use by
+    /// another process, state-file corrupt, etc.) are logged and
+    /// skipped; the affected containers will need `cella down &&
+    /// cella up` to recover.
+    pub async fn reclaim_from_state_file(&mut self) {
+        let path = self.state_file_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!(
+                    "ssh-agent bridge: state-file read {} failed: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let snapshot: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "ssh-agent bridge: state-file parse {} failed: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        if snapshot["schema_version"].as_u64() != Some(u64::from(STATE_FILE_SCHEMA_VERSION)) {
+            debug!(
+                "ssh-agent bridge: state-file schema mismatch, skipping reclaim ({} vs {})",
+                snapshot["schema_version"], STATE_FILE_SCHEMA_VERSION
+            );
+            return;
+        }
+        let Some(bridges) = snapshot["bridges"].as_array() else {
+            return;
+        };
+        for entry in bridges {
+            self.reclaim_one(entry).await;
+        }
+        self.persist_state();
+    }
+
+    async fn reclaim_one(&mut self, entry: &serde_json::Value) {
+        let (Some(workspace), Some(upstream), Some(port)) = (
+            entry["workspace"].as_str().map(PathBuf::from),
+            entry["upstream_socket"].as_str().map(PathBuf::from),
+            entry["bridge_port"]
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok()),
+        ) else {
+            warn!("ssh-agent bridge: state-file entry missing required fields, skipping");
+            return;
+        };
+
+        let addr = format!("127.0.0.1:{port}");
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    "ssh-agent bridge: could not reclaim port {port} for workspace {}: {e}",
+                    workspace.display()
+                );
+                return;
+            }
+        };
+
+        debug!(
+            workspace = %workspace.display(),
+            port,
+            upstream = %upstream.display(),
+            "ssh-agent bridge: reclaimed TCP listener from state file"
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let upstream_for_task = upstream.clone();
+        let auth_for_task = self.auth_token.clone();
+        let task = tokio::spawn(async move {
+            run_accept_loop(listener, upstream_for_task, auth_for_task, shutdown_rx).await;
+        });
+
+        self.bridges.insert(
+            workspace,
+            BridgeEntry {
+                upstream_socket: upstream,
+                bridge_port: port,
+                refcount: 1,
+                accept_task: task.abort_handle(),
+                shutdown_tx,
+            },
+        );
+    }
+}
+
 /// Ensure the state directory exists.
 ///
 /// Stale state-file is left in place (it'll be overwritten on the next
@@ -796,6 +909,133 @@ mod tests {
     // ---------------------------------------------------------------
     // Run-dir initialization & legacy sweep.
     // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Reclaim from state file (daemon-restart recovery).
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reclaim_rebinds_previously_registered_ports() {
+        // Write a state file manually, then construct a fresh manager
+        // and prove reclaim puts a working bridge on the recorded port.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        // First, figure out an available port by binding then dropping.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // Hand-craft a state file that claims the bridge was running
+        // for workspace /Users/me/proj on that port.
+        let state = serde_json::json!({
+            "schema_version": STATE_FILE_SCHEMA_VERSION,
+            "daemon_pid": 0,
+            "written_at_unix_sec": 0,
+            "bridges": [{
+                "workspace": "/Users/me/proj",
+                "upstream_socket": upstream.to_string_lossy(),
+                "bridge_port": port,
+                "refcount": 1,
+            }],
+        });
+        std::fs::write(
+            dir.path().join("ssh-agent.state"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut m = manager(dir.path());
+        m.reclaim_from_state_file().await;
+
+        let workspace = PathBuf::from("/Users/me/proj");
+        assert_eq!(m.bridge_port_for(&workspace), Some(port));
+        assert_eq!(m.refcount_for(&workspace), 1);
+
+        // The reclaimed listener accepts connections on the SAME port
+        // — crucial for stopped containers whose baked-in env var
+        // points here.
+        let mut client = connect_and_authenticate(port, "test-token").await;
+        client.write_all(b"roundtrip").await.unwrap();
+        let mut buf = [0u8; 9];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"roundtrip");
+    }
+
+    #[tokio::test]
+    async fn reclaim_skips_entries_whose_port_is_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        // Bind a listener to hold the port — reclaim must skip gracefully.
+        let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_port = held.local_addr().unwrap().port();
+
+        let state = serde_json::json!({
+            "schema_version": STATE_FILE_SCHEMA_VERSION,
+            "daemon_pid": 0,
+            "written_at_unix_sec": 0,
+            "bridges": [{
+                "workspace": "/Users/me/proj",
+                "upstream_socket": upstream.to_string_lossy(),
+                "bridge_port": held_port,
+                "refcount": 1,
+            }],
+        });
+        std::fs::write(
+            dir.path().join("ssh-agent.state"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut m = manager(dir.path());
+        m.reclaim_from_state_file().await;
+
+        // Port was taken → no bridge reclaimed for that workspace.
+        assert_eq!(
+            m.refcount_for(&PathBuf::from("/Users/me/proj")),
+            0,
+            "reclaim must skip when port is already in use"
+        );
+
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn reclaim_is_noop_when_state_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager(dir.path());
+        // Must not panic, must not create anything.
+        m.reclaim_from_state_file().await;
+        assert_eq!(m.refcount_for(Path::new("/x")), 0);
+    }
+
+    #[tokio::test]
+    async fn reclaim_skips_state_file_with_wrong_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({
+            "schema_version": 999,
+            "daemon_pid": 0,
+            "written_at_unix_sec": 0,
+            "bridges": [{
+                "workspace": "/Users/me/proj",
+                "upstream_socket": "/nonexistent.sock",
+                "bridge_port": 12345,
+                "refcount": 1,
+            }],
+        });
+        std::fs::write(
+            dir.path().join("ssh-agent.state"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut m = manager(dir.path());
+        m.reclaim_from_state_file().await;
+        assert_eq!(m.refcount_for(Path::new("/Users/me/proj")), 0);
+    }
 
     #[test]
     fn init_run_dir_creates_missing_directory() {

@@ -90,6 +90,14 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
 
     let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir, auth_token.clone());
+    // Reclaim bridge ports from previous daemon run so containers
+    // with a baked-in CELLA_SSH_AGENT_BRIDGE env var keep working
+    // across daemon restarts.
+    ssh_proxy_manager
+        .lock()
+        .await
+        .reclaim_from_state_file()
+        .await;
 
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();

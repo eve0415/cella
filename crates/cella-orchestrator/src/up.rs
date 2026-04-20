@@ -576,15 +576,15 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        // Do not re-register the SSH-agent bridge here. With the TCP
-        // bridge design, each register allocates a FRESH loopback port,
-        // but the container's CELLA_SSH_AGENT_BRIDGE env var was baked
-        // in at create time and Docker makes container env immutable.
-        // A re-register would open a new listener that nothing in the
-        // container can reach. Daemon-restart recovery therefore needs
-        // `cella down && cella up` to recreate the container with
-        // fresh env vars. Surface `None` so the CLI doesn't claim a
-        // working bridge when there isn't one.
+        // Don't re-register here. The container's CELLA_SSH_AGENT_BRIDGE
+        // env var was baked at create time and can't be updated, so a
+        // fresh register on a new port wouldn't help. The daemon reclaims
+        // bridge ports from its state file on startup instead (see
+        // SshProxyManager::reclaim_from_state_file), which typically
+        // lets the stopped-container restart path work transparently.
+        // If the daemon's reclaim fails (port taken by something else,
+        // stale state file, etc.), recovery requires `cella down &&
+        // cella up`.
         let ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus> = None;
 
         let step = self.progress.step("Starting container...");
