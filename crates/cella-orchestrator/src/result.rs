@@ -26,17 +26,18 @@ pub struct UpResult {
     pub ssh_agent_proxy: Option<SshAgentProxyStatus>,
 }
 
-/// Outcome of the SSH-agent proxy resolution at `cella up`. Cella-cli
+/// Outcome of the SSH-agent bridge resolution at `cella up`. Cella-cli
 /// renders this as a one-line status under the container info.
 #[derive(Debug, Clone)]
 pub enum SshAgentProxyStatus {
-    /// Daemon-managed proxy was registered. `proxy_socket` is the host
-    /// path mounted into the container; `refcount` is post-register.
+    /// Daemon-managed bridge was registered. `host_endpoint` is the
+    /// `host:port` the in-container agent will bridge to; `refcount`
+    /// is the post-register count.
     Bridged {
-        proxy_socket: String,
+        host_endpoint: String,
         refcount: usize,
     },
-    /// Proxy was requested (colima with `SSH_AUTH_SOCK` set) but the
+    /// Bridge was requested (colima with `SSH_AUTH_SOCK` set) but the
     /// daemon RPC failed; SSH forwarding was skipped. `reason` is a
     /// short human-readable explanation.
     Skipped { reason: String },

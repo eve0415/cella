@@ -1,32 +1,37 @@
-//! Daemon RPC for SSH-agent proxy registration.
+//! Daemon RPC for SSH-agent TCP-bridge registration.
 //!
 //! Bridges `cella_env::SshAgentProxyRequest` (a Tier-3 description of a
-//! pending colima proxy) into a daemon-managed proxy socket the
-//! orchestrator can bind-mount into the container. Cella-env (Tier 3)
-//! cannot depend on the daemon RPC client; the orchestrator (Tier 2)
-//! makes the call here and converts the response back into the standard
-//! `ForwardMount` / `ForwardEnv` entries that the rest of the up pipeline
-//! consumes.
+//! pending colima proxy) into a daemon-managed TCP listener that the
+//! in-container `cella-agent` connects to. Cella-env (Tier 3) cannot
+//! depend on the daemon RPC client; the orchestrator (Tier 2) makes the
+//! call here and converts the response into the env vars the rest of
+//! the up pipeline needs (`SSH_AUTH_SOCK` for the container's view,
+//! `CELLA_SSH_AGENT_BRIDGE` so the in-container agent knows where to
+//! connect).
+//!
+//! The earlier design (host-side Unix socket bind-mounted into the
+//! container) failed empirically on colima because virtiofs rejects
+//! `mkdir` on any host-side socket path. TCP sidesteps that entire
+//! mount layer.
 
 use std::path::Path;
 
-use cella_env::{ForwardEnv, ForwardMount, SshAgentProxyRequest};
+use cella_env::{ForwardEnv, SshAgentProxyRequest};
 use cella_protocol::{ManagementRequest, ManagementResponse};
 use tracing::warn;
 
-/// Outcome of a successful proxy registration.
+/// Outcome of a successful bridge registration.
 pub struct ResolvedSshProxy {
-    /// Mount entry to append to `EnvForwarding::mounts` — bind-mounts the
-    /// daemon-supplied host socket into the container.
-    pub mount: ForwardMount,
-    /// `SSH_AUTH_SOCK` env var to set in the container.
-    pub env: ForwardEnv,
-    /// Refcount returned by the daemon; `1` means a fresh proxy was
+    /// Env vars to inject into the container so consumers see a normal
+    /// `SSH_AUTH_SOCK` and the in-container agent knows which TCP port
+    /// to bridge through.
+    pub env: Vec<ForwardEnv>,
+    /// Refcount returned by the daemon; `1` means a fresh bridge was
     /// created, `>1` means an existing one was reused.
     pub refcount: usize,
-    /// Host-side proxy socket path the daemon bound — useful for the
-    /// CLI status print (`ssh-agent proxy: bridged to <path>`).
-    pub proxy_socket: String,
+    /// Localhost TCP port the daemon bound the bridge on. Used for
+    /// the CLI status print (`ssh-agent proxy: bridged via host:<port>`).
+    pub bridge_port: u16,
 }
 
 /// Resolve a colima proxy request via the daemon. Returns `None` when:
@@ -34,11 +39,16 @@ pub struct ResolvedSshProxy {
 /// - The daemon's RPC handler returns an error or unexpected variant
 ///
 /// Per the design, a `None` here causes the orchestrator to skip SSH
-/// forwarding entirely rather than mount a dead socket. The caller
-/// should log the underlying reason via the warnings emitted here.
+/// forwarding entirely rather than ship the container half a setup. The
+/// caller should log the underlying reason via the warnings emitted here.
+///
+/// `host_gateway` is the hostname the container uses to reach the daemon
+/// — typically `host.docker.internal` (Docker Desktop, `OrbStack`, recent
+/// colima) or `host.local` (Apple Container).
 pub async fn register_proxy(
     daemon_socket: &Path,
     workspace: &Path,
+    host_gateway: &str,
     request: &SshAgentProxyRequest,
 ) -> Option<ResolvedSshProxy> {
     let req = ManagementRequest::RegisterSshAgentProxy {
@@ -50,7 +60,7 @@ pub async fn register_proxy(
             Ok(r) => r,
             Err(e) => {
                 warn!(
-                    "ssh-agent proxy: daemon RegisterSshAgentProxy failed for {}: {e}",
+                    "ssh-agent bridge: daemon RegisterSshAgentProxy failed for {}: {e}",
                     workspace.display()
                 );
                 return None;
@@ -58,26 +68,32 @@ pub async fn register_proxy(
         };
     match response {
         ManagementResponse::SshAgentProxyRegistered {
-            proxy_socket,
+            bridge_port,
             refcount,
         } => Some(ResolvedSshProxy {
-            mount: ForwardMount {
-                source: proxy_socket.clone(),
-                target: request.mount_target.clone(),
-            },
-            env: ForwardEnv {
-                key: "SSH_AUTH_SOCK".to_string(),
-                value: request.env_value.clone(),
-            },
+            env: vec![
+                ForwardEnv {
+                    key: "SSH_AUTH_SOCK".to_string(),
+                    value: request.env_value.clone(),
+                },
+                ForwardEnv {
+                    key: "CELLA_SSH_AGENT_BRIDGE".to_string(),
+                    value: format!("{host_gateway}:{bridge_port}"),
+                },
+                ForwardEnv {
+                    key: "CELLA_SSH_AGENT_TARGET".to_string(),
+                    value: request.mount_target.clone(),
+                },
+            ],
             refcount,
-            proxy_socket,
+            bridge_port,
         }),
         ManagementResponse::Error { message } => {
-            warn!("ssh-agent proxy: daemon refused register: {message}");
+            warn!("ssh-agent bridge: daemon refused register: {message}");
             None
         }
         other => {
-            warn!("ssh-agent proxy: daemon returned unexpected response: {other:?}");
+            warn!("ssh-agent bridge: daemon returned unexpected response: {other:?}");
             None
         }
     }
@@ -91,7 +107,7 @@ pub async fn release_proxy(daemon_socket: &Path, workspace: &Path) {
     };
     if let Err(e) = cella_daemon::management::send_management_request(daemon_socket, &req).await {
         warn!(
-            "ssh-agent proxy: daemon ReleaseSshAgentProxy failed for {}: {e}",
+            "ssh-agent bridge: daemon ReleaseSshAgentProxy failed for {}: {e}",
             workspace.display()
         );
     }
@@ -146,38 +162,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_proxy_translates_response_into_resolved_proxy() {
+    async fn register_proxy_translates_response_into_env_vars() {
         let dir = tempfile::tempdir().unwrap();
         let daemon_sock = dir.path().join("daemon.sock");
         let (received, task) = spawn_mock_daemon(
             &daemon_sock,
             ManagementResponse::SshAgentProxyRegistered {
-                proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeefcafef00d.sock".to_string(),
+                bridge_port: 54321,
                 refcount: 1,
             },
         );
 
         let workspace = PathBuf::from("/Users/me/proj");
         let req = sample_request();
-        let resolved = register_proxy(&daemon_sock, &workspace, &req)
+        let resolved = register_proxy(&daemon_sock, &workspace, "host.docker.internal", &req)
             .await
             .expect("happy-path register must return Some");
 
-        // Response shape preserved.
-        assert_eq!(
-            resolved.proxy_socket,
-            "/Users/me/.cella/run/ssh-agent-deadbeefcafef00d.sock"
-        );
+        assert_eq!(resolved.bridge_port, 54321);
         assert_eq!(resolved.refcount, 1);
 
-        // Mount + env entries built from request + response.
+        // The three injected env vars: SSH_AUTH_SOCK (consumer-facing),
+        // CELLA_SSH_AGENT_BRIDGE (where to connect), CELLA_SSH_AGENT_TARGET
+        // (where the in-container agent should bind the unix socket).
+        let by_key: std::collections::HashMap<_, _> = resolved
+            .env
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
         assert_eq!(
-            resolved.mount.source,
-            "/Users/me/.cella/run/ssh-agent-deadbeefcafef00d.sock"
+            by_key.get("SSH_AUTH_SOCK").map(String::as_str),
+            Some("/run/host-services/ssh-auth.sock")
         );
-        assert_eq!(resolved.mount.target, "/run/host-services/ssh-auth.sock");
-        assert_eq!(resolved.env.key, "SSH_AUTH_SOCK");
-        assert_eq!(resolved.env.value, "/run/host-services/ssh-auth.sock");
+        assert_eq!(
+            by_key.get("CELLA_SSH_AGENT_BRIDGE").map(String::as_str),
+            Some("host.docker.internal:54321")
+        );
+        assert_eq!(
+            by_key.get("CELLA_SSH_AGENT_TARGET").map(String::as_str),
+            Some("/run/host-services/ssh-auth.sock")
+        );
 
         // Outgoing JSON shape matches the protocol contract — guards
         // against silent serde renames in cella-protocol.
@@ -204,7 +228,13 @@ mod tests {
             },
         );
 
-        let resolved = register_proxy(&daemon_sock, &PathBuf::from("/x"), &sample_request()).await;
+        let resolved = register_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            "host.docker.internal",
+            &sample_request(),
+        )
+        .await;
         assert!(
             resolved.is_none(),
             "Error response must surface as None so orchestrator skips forwarding"
@@ -219,7 +249,13 @@ mod tests {
         let daemon_sock = dir.path().join("daemon.sock");
         let (_received, task) = spawn_mock_daemon(&daemon_sock, ManagementResponse::Pong);
 
-        let resolved = register_proxy(&daemon_sock, &PathBuf::from("/x"), &sample_request()).await;
+        let resolved = register_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            "host.docker.internal",
+            &sample_request(),
+        )
+        .await;
         assert!(
             resolved.is_none(),
             "wrong response variant must surface as None"
@@ -232,9 +268,13 @@ mod tests {
     async fn register_proxy_returns_none_when_daemon_socket_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         let daemon_sock = dir.path().join("nonexistent.sock");
-        // No spawn_mock_daemon — socket does not exist.
-
-        let resolved = register_proxy(&daemon_sock, &PathBuf::from("/x"), &sample_request()).await;
+        let resolved = register_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            "host.docker.internal",
+            &sample_request(),
+        )
+        .await;
         assert!(
             resolved.is_none(),
             "daemon-not-running must surface as None"
@@ -267,7 +307,6 @@ mod tests {
     async fn release_proxy_does_not_panic_when_daemon_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         let daemon_sock = dir.path().join("nonexistent.sock");
-        // Must not panic, must not return an error to caller — best-effort.
         release_proxy(&daemon_sock, &PathBuf::from("/x")).await;
     }
 }

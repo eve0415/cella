@@ -785,15 +785,17 @@ impl EnsureUpContext<'_> {
                 reason: "daemon socket path could not be determined".to_string(),
             });
         };
+        let host_gateway = self.client.host_gateway();
         match crate::ssh_proxy_client::register_proxy(
             &daemon_sock,
             &self.config.resolved.workspace_root,
+            host_gateway,
             &request,
         )
         .await
         {
             Some(resolved) => Some(crate::result::SshAgentProxyStatus::Bridged {
-                proxy_socket: resolved.proxy_socket,
+                host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
                 refcount: resolved.refcount,
             }),
             None => Some(crate::result::SshAgentProxyStatus::Skipped {
@@ -817,18 +819,19 @@ impl EnsureUpContext<'_> {
                 reason: "daemon socket path could not be determined".to_string(),
             });
         };
+        let host_gateway = self.client.host_gateway();
         match crate::ssh_proxy_client::register_proxy(
             &daemon_sock,
             &self.config.resolved.workspace_root,
+            host_gateway,
             &request,
         )
         .await
         {
             Some(resolved) => {
-                env_fwd.mounts.push(resolved.mount);
-                env_fwd.env.push(resolved.env);
+                env_fwd.env.extend(resolved.env);
                 Some(crate::result::SshAgentProxyStatus::Bridged {
-                    proxy_socket: resolved.proxy_socket,
+                    host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
                     refcount: resolved.refcount,
                 })
             }

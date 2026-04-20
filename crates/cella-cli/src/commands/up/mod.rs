@@ -875,13 +875,13 @@ pub fn render_up_result(
             if let Some(status) = ssh_agent_proxy {
                 match status {
                     cella_orchestrator::SshAgentProxyStatus::Bridged {
-                        proxy_socket,
+                        host_endpoint,
                         refcount,
                     } => {
                         use std::fmt::Write;
                         let _ = writeln!(
                             out,
-                            "ssh-agent proxy: bridged via {proxy_socket} (refcount {refcount})"
+                            "ssh-agent proxy: bridged via {host_endpoint} (refcount {refcount})"
                         );
                     }
                     cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
@@ -901,11 +901,11 @@ pub fn render_up_result(
             if let Some(status) = ssh_agent_proxy {
                 let value = match status {
                     cella_orchestrator::SshAgentProxyStatus::Bridged {
-                        proxy_socket,
+                        host_endpoint,
                         refcount,
                     } => json!({
                         "state": "bridged",
-                        "proxySocket": proxy_socket,
+                        "hostEndpoint": host_endpoint,
                         "refcount": refcount,
                     }),
                     cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => json!({
@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn render_up_result_text_bridged_ssh_agent_proxy() {
         let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
-            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
+            host_endpoint: "host.docker.internal:54321".to_string(),
             refcount: 1,
         };
         let out = render_up_result(
@@ -1172,7 +1172,7 @@ mod tests {
         // Both lines end with `\n`; final newline is load-bearing.
         insta::assert_snapshot!(out, @r"
         Container created. ID: abcdef123456 Workspace: /workspaces/test
-        ssh-agent proxy: bridged via /Users/me/.cella/run/ssh-agent-deadbeef.sock (refcount 1)
+        ssh-agent proxy: bridged via host.docker.internal:54321 (refcount 1)
         ");
     }
 
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     fn render_up_result_json_bridged_ssh_agent_proxy() {
         let status = cella_orchestrator::SshAgentProxyStatus::Bridged {
-            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeef.sock".to_string(),
+            host_endpoint: "host.docker.internal:54321".to_string(),
             refcount: 2,
         };
         let out = render_up_result(
@@ -1251,7 +1251,7 @@ mod tests {
         );
         insta::assert_snapshot!(
             out,
-            @r#"{"containerId":"abcdef123456","outcome":"started","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"proxySocket":"/Users/me/.cella/run/ssh-agent-deadbeef.sock","refcount":2,"state":"bridged"}}"#
+            @r#"{"containerId":"abcdef123456","outcome":"started","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"hostEndpoint":"host.docker.internal:54321","refcount":2,"state":"bridged"}}"#
         );
     }
 

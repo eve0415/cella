@@ -273,26 +273,27 @@ async fn handle_register_ssh_agent_proxy(
 ) -> ManagementResponse {
     let workspace_path = std::path::PathBuf::from(workspace);
     let upstream_path = std::path::PathBuf::from(upstream_socket);
-    let result = {
+    let result: Result<(u16, usize), CellaDaemonError> = {
         let mut mgr = manager.lock().await;
-        mgr.register(workspace_path.clone(), upstream_path)
-            .map(|proxy_socket| (proxy_socket, mgr.refcount_for(&workspace_path)))
+        match mgr.register(workspace_path.clone(), upstream_path).await {
+            Ok(port) => Ok((port, mgr.refcount_for(&workspace_path))),
+            Err(e) => Err(e),
+        }
     };
     match result {
-        Ok((proxy_socket, refcount)) => {
+        Ok((bridge_port, refcount)) => {
             info!(
-                "Registered ssh-agent proxy for {workspace} (refcount={refcount}, socket={})",
-                proxy_socket.display()
+                "Registered ssh-agent bridge for {workspace} (refcount={refcount}, port={bridge_port})"
             );
             ManagementResponse::SshAgentProxyRegistered {
-                proxy_socket: proxy_socket.to_string_lossy().into_owned(),
+                bridge_port,
                 refcount,
             }
         }
         Err(e) => {
-            warn!("ssh-agent proxy register failed for {workspace}: {e}");
+            warn!("ssh-agent bridge register failed for {workspace}: {e}");
             ManagementResponse::Error {
-                message: format!("ssh-agent proxy register failed: {e}"),
+                message: format!("ssh-agent bridge register failed: {e}"),
             }
         }
     }
@@ -303,9 +304,9 @@ async fn handle_release_ssh_agent_proxy(
     manager: &crate::ssh_proxy::SharedSshProxyManager,
 ) -> ManagementResponse {
     let workspace_path = std::path::PathBuf::from(workspace);
-    let torn_down = manager.lock().await.release(&workspace_path).is_some();
+    let torn_down = manager.lock().await.release(&workspace_path);
     if torn_down {
-        info!("Released ssh-agent proxy for {workspace} (torn down)");
+        info!("Released ssh-agent bridge for {workspace} (torn down)");
     }
     ManagementResponse::SshAgentProxyReleased { torn_down }
 }
@@ -554,7 +555,7 @@ mod tests {
             shutdown_tx: stx,
             auth_token: "test-token".to_string(),
             control_port: ctrl_port,
-            ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep()),
+            ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep(), "test-token".to_string()),
         };
         (ctx, srx)
     }
@@ -745,11 +746,15 @@ mod tests {
 
         match resp {
             ManagementResponse::SshAgentProxyRegistered {
-                proxy_socket,
+                bridge_port,
                 refcount,
             } => {
                 assert_eq!(refcount, 1);
-                assert!(Path::new(&proxy_socket).exists());
+                // Returned port must accept TCP connections from the
+                // would-be in-container agent.
+                let _client = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port))
+                    .await
+                    .unwrap();
             }
             other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
         }
@@ -758,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssh_agent_proxy_second_register_reuses_socket_and_bumps_refcount() {
+    async fn ssh_agent_proxy_second_register_reuses_port_and_bumps_refcount() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("mgmt.sock");
         let upstream_path = dir.path().join("upstream.sock");
@@ -775,20 +780,20 @@ mod tests {
         let first = send_management_request(&socket_path, &req).await.unwrap();
         let second = send_management_request(&socket_path, &req).await.unwrap();
 
-        let (s1, _) = match first {
+        let (p1, _) = match first {
             ManagementResponse::SshAgentProxyRegistered {
-                proxy_socket,
+                bridge_port,
                 refcount,
-            } => (proxy_socket, refcount),
+            } => (bridge_port, refcount),
             other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
         };
         match second {
             ManagementResponse::SshAgentProxyRegistered {
-                proxy_socket: s2,
+                bridge_port: p2,
                 refcount,
             } => {
                 assert_eq!(refcount, 2);
-                assert_eq!(s2, s1);
+                assert_eq!(p2, p1);
             }
             other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
         }
@@ -797,9 +802,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssh_agent_proxy_socket_forwards_bytes_to_upstream() {
+    async fn ssh_agent_proxy_tcp_bridge_forwards_bytes_to_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
+        use tokio::net::TcpStream;
 
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("mgmt.sock");
@@ -816,12 +821,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let proxy = match resp {
-            ManagementResponse::SshAgentProxyRegistered { proxy_socket, .. } => proxy_socket,
+        let bridge_port = match resp {
+            ManagementResponse::SshAgentProxyRegistered { bridge_port, .. } => bridge_port,
             other => panic!("expected SshAgentProxyRegistered, got {other:?}"),
         };
 
-        let mut client = UnixStream::connect(&proxy).await.unwrap();
+        // The TCP bridge requires an auth-token handshake on the first
+        // line — `test_management_context` uses "test-token".
+        let mut client = TcpStream::connect(("127.0.0.1", bridge_port))
+            .await
+            .unwrap();
+        client.write_all(b"test-token\n").await.unwrap();
         client.write_all(b"hi").await.unwrap();
         let mut buf = [0u8; 2];
         client.read_exact(&mut buf).await.unwrap();

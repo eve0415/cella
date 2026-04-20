@@ -70,7 +70,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
             ssh_proxy_run_dir.display()
         );
     }
-    let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir);
+    // (auth_token is loaded a few lines down; defer construction.)
 
     // Load persisted auth token (or generate + persist a new one).
     // Persisting the token across daemon restarts ensures existing containers
@@ -88,6 +88,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     // Persist port+token to daemon.control for reclaiming on restart
     let control_file_path = write_control_file(socket_path, control_port, &auth_token)?;
+
+    let ssh_proxy_manager = crate::ssh_proxy::new_shared(ssh_proxy_run_dir, auth_token.clone());
 
     let last_activity = Arc::new(AtomicU64::new(current_time_secs()));
     let is_orbstack = orbstack::is_orbstack();

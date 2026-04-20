@@ -254,14 +254,13 @@ pub enum ManagementResponse {
     ContainerIpUpdated { container_id: String },
     /// Pong response.
     Pong,
-    /// SSH-agent proxy registered (or refcount bumped). `proxy_socket` is
-    /// the host path the caller should bind-mount into the container.
-    /// `refcount` is the post-register count; `1` means a fresh proxy was
-    /// created, `>1` means an existing one was reused.
-    SshAgentProxyRegistered {
-        proxy_socket: String,
-        refcount: usize,
-    },
+    /// SSH-agent bridge registered (or refcount bumped). `bridge_port` is
+    /// the localhost TCP port the in-container `cella-agent` should
+    /// connect to (reachable from the container as `host.docker.internal`,
+    /// `host.local`, or the equivalent host-gateway hostname). `refcount`
+    /// is the post-register count; `1` means a fresh bridge was created,
+    /// `>1` means an existing one was reused.
+    SshAgentProxyRegistered { bridge_port: u16, refcount: usize },
     /// SSH-agent proxy refcount decremented. `torn_down` is true when the
     /// refcount reached zero and the listener was actually destroyed; false
     /// when the proxy is still in use by another container in the same
@@ -961,7 +960,7 @@ mod tests {
     #[test]
     fn roundtrip_ssh_agent_proxy_registered_response() {
         let resp = ManagementResponse::SshAgentProxyRegistered {
-            proxy_socket: "/Users/me/.cella/run/ssh-agent-deadbeefcafe1234.sock".to_string(),
+            bridge_port: 54321,
             refcount: 1,
         };
         let json = serde_json::to_string(&resp).unwrap();

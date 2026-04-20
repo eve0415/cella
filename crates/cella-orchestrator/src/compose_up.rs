@@ -243,12 +243,14 @@ pub async fn compose_up(
 // ---------------------------------------------------------------------------
 
 /// Resolve any deferred colima SSH-agent proxy request via the daemon
-/// and append the resulting bind-mount and `SSH_AUTH_SOCK` env entries
-/// to `env_fwd`. Mirrors `Up::resolve_ssh_agent_proxy` for the compose
-/// path (compose has no `Self`, so it lives as a free function).
+/// and append the resulting `SSH_AUTH_SOCK` / `CELLA_SSH_AGENT_BRIDGE`
+/// / `CELLA_SSH_AGENT_TARGET` env entries to `env_fwd`. Mirrors
+/// `Up::resolve_ssh_agent_proxy` for the compose path (compose has no
+/// `Self`, so it lives as a free function).
 async fn resolve_ssh_agent_proxy_for_compose(
     env_fwd: &mut cella_env::EnvForwarding,
     workspace_root: &Path,
+    host_gateway: &str,
 ) -> Option<crate::result::SshAgentProxyStatus> {
     let request = env_fwd.ssh_agent_proxy_request.take()?;
     let Some(daemon_sock) = cella_env::paths::daemon_socket_path() else {
@@ -256,12 +258,18 @@ async fn resolve_ssh_agent_proxy_for_compose(
             reason: "daemon socket path could not be determined".to_string(),
         });
     };
-    match crate::ssh_proxy_client::register_proxy(&daemon_sock, workspace_root, &request).await {
+    match crate::ssh_proxy_client::register_proxy(
+        &daemon_sock,
+        workspace_root,
+        host_gateway,
+        &request,
+    )
+    .await
+    {
         Some(resolved) => {
-            env_fwd.mounts.push(resolved.mount);
-            env_fwd.env.push(resolved.env);
+            env_fwd.env.extend(resolved.env);
             Some(crate::result::SshAgentProxyStatus::Bridged {
-                proxy_socket: resolved.proxy_socket,
+                host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
                 refcount: resolved.refcount,
             })
         }
@@ -269,6 +277,35 @@ async fn resolve_ssh_agent_proxy_for_compose(
             reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
         }),
     }
+}
+
+/// Resolve the compose project's remote user, env-forwarding plan,
+/// and ssh-agent proxy status. Extracted from `prepare_and_start` to
+/// keep that function under the `clippy::too_many_lines` ceiling.
+async fn resolve_user_and_env(
+    client: &dyn ContainerBackend,
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+) -> (
+    String,
+    String,
+    cella_env::EnvForwarding,
+    Option<crate::result::SshAgentProxyStatus>,
+) {
+    let cfg = ctx.cfg;
+    let progress = ctx.progress;
+    let (image_user, image_meta_user) =
+        resolve_compose_image_info(client, project, features_build, progress).await;
+    let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
+    let mut env_fwd = cella_env::prepare_env_forwarding(cfg.config, &remote_user, None);
+    let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
+        &mut env_fwd,
+        cfg.workspace_root,
+        client.host_gateway(),
+    )
+    .await;
+    (remote_user, image_user, env_fwd, ssh_agent_proxy)
 }
 
 /// Prepare environment, write override YAML, and start compose services.
@@ -351,15 +388,10 @@ async fn prepare_and_start(
     )
     .await?;
 
-    // 10. Resolve remote user from built image metadata.
-    let (image_user, image_meta_user) =
-        resolve_compose_image_info(client, project, features_build.as_ref(), progress).await;
-    let remote_user = resolve_remote_user(config, image_meta_user.as_ref(), &image_user);
-    let mut env_fwd = cella_env::prepare_env_forwarding(config, &remote_user, None);
+    // 10. Resolve remote user, env forwarding, and ssh-agent proxy.
+    let (remote_user, image_user, env_fwd, ssh_agent_proxy) =
+        resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
-
-    let ssh_agent_proxy =
-        resolve_ssh_agent_proxy_for_compose(&mut env_fwd, cfg.workspace_root).await;
 
     // 11-12. Build extra env vars and labels for the primary service.
     let managed = client.capabilities().managed_agent;
