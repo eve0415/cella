@@ -1,5 +1,8 @@
+pub mod cella_config;
 pub mod devcontainer;
 pub mod settings;
+
+pub use cella_config::CellaConfig;
 
 /// Types and validators generated from the devcontainer JSON Schema.
 #[allow(

@@ -207,7 +207,7 @@ async fn run_status(
         std::env::current_dir()?
     };
 
-    let settings = cella_config::settings::Settings::load(&cwd);
+    let settings = cella_config::CellaConfig::load(&cwd, None)?;
     eprintln!();
     eprintln!("Settings:");
     eprintln!(

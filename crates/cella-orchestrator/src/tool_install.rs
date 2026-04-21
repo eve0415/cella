@@ -644,7 +644,7 @@ pub async fn setup_plugin_manifests(
 /// Returns a [`Vec<MountSpec>`] rather than mutating [`cella_backend::CreateContainerOptions`]
 /// so that both the single-container and compose paths can reuse the same decision logic.
 pub fn build_tool_config_mount_specs(
-    settings: &cella_config::settings::Settings,
+    settings: &cella_config::CellaConfig,
     remote_user: &str,
 ) -> Vec<MountSpec> {
     let mut out = Vec::new();
@@ -1004,7 +1004,7 @@ pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
-    settings: &cella_config::settings::Settings,
+    settings: &cella_config::CellaConfig,
     probed_env: Option<&ProbedEnv>,
     progress: &ProgressSender,
 ) {
@@ -1495,7 +1495,7 @@ mod tests {
 
     #[test]
     fn build_tool_config_mount_specs_returns_empty_when_disabled() {
-        let mut settings = cella_config::settings::Settings::default();
+        let mut settings = cella_config::CellaConfig::default();
         settings.tools.claude_code.forward_config = false;
         settings.tools.codex.forward_config = false;
         settings.tools.gemini.forward_config = false;

@@ -13,6 +13,7 @@ fn default_stable() -> String {
 /// Controls config forwarding and on-demand installation version for nvim
 /// inside dev containers.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Nvim {
     /// Forward nvim config from host into the container (default: true).
     #[serde(default = "default_true")]

@@ -19,7 +19,34 @@ pub fn check_config(ctx: &CheckContext) -> CategoryReport {
         return CategoryReport::new("Configuration", checks);
     };
 
-    // Discover devcontainer.json
+    check_devcontainer(workspace, &mut checks);
+    check_cella_config(workspace, &mut checks);
+
+    CategoryReport::new("Configuration", checks)
+}
+
+fn check_cella_config(workspace: &std::path::Path, checks: &mut Vec<CheckResult>) {
+    match cella_config::CellaConfig::load(workspace, None) {
+        Ok(cfg) => {
+            checks.push(CheckResult {
+                name: "cella config".into(),
+                severity: Severity::Pass,
+                detail: format!("loaded (security: {})", cfg.security.mode),
+                fix_hint: None,
+            });
+        }
+        Err(e) => {
+            checks.push(CheckResult {
+                name: "cella config".into(),
+                severity: Severity::Error,
+                detail: format!("{e}"),
+                fix_hint: Some("Check ~/.cella/config.toml and .devcontainer/cella.toml".into()),
+            });
+        }
+    }
+}
+
+fn check_devcontainer(workspace: &std::path::Path, checks: &mut Vec<CheckResult>) {
     match discover::config(workspace) {
         Ok(config_path) => {
             checks.push(CheckResult {
@@ -102,8 +129,6 @@ pub fn check_config(ctx: &CheckContext) -> CategoryReport {
             });
         }
     }
-
-    CategoryReport::new("Configuration", checks)
 }
 
 #[cfg(test)]

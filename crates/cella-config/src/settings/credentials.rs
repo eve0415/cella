@@ -8,6 +8,7 @@ const fn default_true() -> bool {
 
 /// Credential forwarding settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Credentials {
     /// Forward gh CLI credentials into containers (default: true).
     #[serde(default = "default_true")]

@@ -409,6 +409,7 @@ name = "cella-config"
 version = "0.0.31"
 dependencies = [
  "cella-codegen",
+ "cella-env",
  "cella-jsonc",
  "cella-network",
  "hex",

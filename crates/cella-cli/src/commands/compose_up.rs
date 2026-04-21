@@ -121,7 +121,10 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
         Box::pin(async move {
             let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
-            let settings = cella_config::settings::Settings::load(workspace_root);
+            // Trait method can't return Result; fall back to defaults on config error.
+            let settings =
+                cella_config::CellaConfig::load(workspace_root, Some(&self.ctx.resolved))
+                    .unwrap_or_default();
             let (_probed_env, lifecycle_env) = self
                 .ctx
                 .post_create_setup(container_id, remote_user, &env_fwd, &settings, remote_env)

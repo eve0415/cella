@@ -8,6 +8,7 @@ const fn default_true() -> bool {
 ///
 /// Controls config forwarding for tmux inside dev containers.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tmux {
     /// Forward tmux config from host into the container (default: true).
     #[serde(default = "default_true")]

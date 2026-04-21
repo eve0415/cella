@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-env.workspace = true
 cella-jsonc.workspace = true
 cella-network.workspace = true
 hex.workspace = true

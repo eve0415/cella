@@ -177,6 +177,8 @@ impl UpContext {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
+        let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
+
         Ok(Self {
             resolved,
             client,
@@ -187,8 +189,8 @@ impl UpContext {
             progress,
             output: args.output.clone(),
             remove_container,
-            build_no_cache: args.build.build_no_cache,
-            skip_checksum: args.skip_checksum,
+            build_no_cache: args.build.build_no_cache || cella_cfg.cli.build.no_cache,
+            skip_checksum: args.skip_checksum || cella_cfg.cli.skip_checksum,
             pull_policy: args
                 .build
                 .pull
@@ -196,7 +198,7 @@ impl UpContext {
                 .map(ImagePullPolicy::as_str)
                 .map(String::from),
             extra_labels: std::collections::HashMap::new(),
-            network_rules: if args.no_network_rules {
+            network_rules: if args.no_network_rules || cella_cfg.cli.no_network_rules {
                 NetworkRulePolicy::Skip
             } else {
                 NetworkRulePolicy::Enforce
@@ -353,7 +355,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -473,7 +475,7 @@ impl UpContext {
         &self,
         container_id: &str,
         remote_user: &str,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
