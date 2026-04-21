@@ -398,7 +398,7 @@ async fn prepare_and_start(
     let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env, managed);
     let mut labels = build_compose_labels(cfg, project, &remote_user);
 
-    let settings = cella_config::settings::Settings::load(cfg.workspace_root);
+    let settings = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
     insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
 
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
@@ -581,7 +581,7 @@ async fn handle_compose_running(
     // Mount-input drift (settings, env forwarding, parent-git) — catches
     // mount-affecting changes that `config_hash` does not cover.
     let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
-    let settings_now = cella_config::settings::Settings::load(cfg.workspace_root);
+    let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
     let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
         &settings_now,
         &env_fwd_now,
@@ -938,7 +938,7 @@ fn build_extra_env(
 /// env-forwarding, or parent-git state that `config_hash` does not cover.
 fn insert_mount_input_fingerprint_label(
     labels: &mut BTreeMap<String, String>,
-    settings: &cella_config::settings::Settings,
+    settings: &cella_config::CellaConfig,
     env_fwd: &cella_env::EnvForwarding,
     workspace_root: &Path,
 ) {
@@ -954,7 +954,7 @@ fn insert_mount_input_fingerprint_label(
 /// Parameters for `build_compose_mount_specs`.
 struct ComposeMountParams<'a> {
     workspace_root: &'a Path,
-    settings: &'a cella_config::settings::Settings,
+    settings: &'a cella_config::CellaConfig,
     remote_user: &'a str,
     env_fwd: &'a cella_env::EnvForwarding,
     project: &'a ComposeProject,

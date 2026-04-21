@@ -253,7 +253,7 @@ async fn install_nvim(
 
     // Resolve version from settings
     let settings =
-        cella_config::settings::Settings::load(&std::env::current_dir().unwrap_or_default());
+        cella_config::CellaConfig::load(&std::env::current_dir().unwrap_or_default(), None)?;
     let version = &settings.tools.nvim.version;
 
     let version_tag = normalize_version_tag(version);

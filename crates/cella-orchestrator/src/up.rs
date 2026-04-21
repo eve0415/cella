@@ -229,10 +229,13 @@ impl EnsureUpContext<'_> {
         &self,
         container_id: &str,
         remote_user: &str,
-    ) -> (
-        Option<std::collections::HashMap<String, String>>,
-        Vec<String>,
-    ) {
+    ) -> Result<
+        (
+            Option<std::collections::HashMap<String, String>>,
+            Vec<String>,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let config = self.config_json();
 
         let mut env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
@@ -272,7 +275,10 @@ impl EnsureUpContext<'_> {
         .ok()
         .flatten();
 
-        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::CellaConfig::load(
+            &self.config.resolved.workspace_root,
+            Some(self.config.resolved),
+        )?;
         if settings.tools.claude_code.forward_config {
             crate::tool_install::create_claude_home_symlink(self.client, container_id, remote_user)
                 .await;
@@ -319,7 +325,7 @@ impl EnsureUpContext<'_> {
             |probed| cella_env::user_env_probe::merge_env(probed, self.config.remote_env),
         );
 
-        (final_probed, lifecycle_env)
+        Ok((final_probed, lifecycle_env))
     }
 
     /// For prebuilt images: check lifecycle state and run `onCreateCommand` if
@@ -410,8 +416,9 @@ impl EnsureUpContext<'_> {
             self.ensure_agent_registered(&container.id).await;
         }
 
-        let (_probed_env, lifecycle_env) =
-            self.prepare_container_env(&container.id, remote_user).await;
+        let (_probed_env, lifecycle_env) = self
+            .prepare_container_env(&container.id, remote_user)
+            .await?;
 
         let metadata = container.labels.get("devcontainer.metadata");
 
@@ -455,8 +462,9 @@ impl EnsureUpContext<'_> {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (_probed_env, lifecycle_env) =
-            self.prepare_container_env(&container.id, remote_user).await;
+        let (_probed_env, lifecycle_env) = self
+            .prepare_container_env(&container.id, remote_user)
+            .await?;
         let metadata = container.labels.get("devcontainer.metadata");
 
         if let Some(meta) = metadata {
@@ -796,7 +804,7 @@ impl EnsureUpContext<'_> {
         env_fwd: &cella_env::EnvForwarding,
         image_env: &[String],
         remote_user: &str,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         agent_arch: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let capabilities = self.client.capabilities();
@@ -949,7 +957,7 @@ impl EnsureUpContext<'_> {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -1041,7 +1049,7 @@ impl EnsureUpContext<'_> {
         &self,
         container_id: &str,
         remote_user: &str,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         shell: &str,
         probed_env: Option<std::collections::HashMap<String, String>>,
         remote_env: &[String],
@@ -1104,7 +1112,7 @@ impl EnsureUpContext<'_> {
         base_image_details: ImageDetails,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
         agent_arch: &str,
-    ) -> ImageConfig {
+    ) -> Result<ImageConfig, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
         let image_env = base_image_details.env;
         let image_meta_user = base_image_details
@@ -1117,7 +1125,10 @@ impl EnsureUpContext<'_> {
             &base_image_details.user,
         );
 
-        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::CellaConfig::load(
+            &self.config.resolved.workspace_root,
+            Some(self.config.resolved),
+        )?;
         let toml_net = settings.network.to_network_config();
         let toml_mode_override = settings.network.mode_override();
         let dc_net = config
@@ -1194,12 +1205,12 @@ impl EnsureUpContext<'_> {
             agent_arch,
         });
 
-        ImageConfig {
+        Ok(ImageConfig {
             image_env,
             remote_user,
             env_fwd,
             create_opts,
-        }
+        })
     }
 
     /// Run lifecycle phases and write tracking state after container creation.
@@ -1344,7 +1355,7 @@ impl EnsureUpContext<'_> {
             base_image_details,
             resolved_features.as_ref(),
             &agent_arch,
-        );
+        )?;
 
         let ssh_agent_proxy = self.resolve_ssh_agent_proxy(&mut env_fwd).await;
 
@@ -1357,7 +1368,10 @@ impl EnsureUpContext<'_> {
         )
         .await?;
 
-        let settings = cella_config::settings::Settings::load(&self.config.resolved.workspace_root);
+        let settings = cella_config::CellaConfig::load(
+            &self.config.resolved.workspace_root,
+            Some(self.config.resolved),
+        )?;
         self.apply_env_and_mounts(
             &mut create_opts,
             &env_fwd,

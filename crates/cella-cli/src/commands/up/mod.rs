@@ -353,7 +353,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
@@ -473,7 +473,7 @@ impl UpContext {
         &self,
         container_id: &str,
         remote_user: &str,
-        settings: &cella_config::settings::Settings,
+        settings: &cella_config::CellaConfig,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);

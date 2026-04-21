@@ -960,7 +960,7 @@ pub fn env_fwd_to_mount_specs(fwd: &EnvForwarding) -> Vec<MountSpec> {
 /// The hash is order-dependent and deterministic: same inputs always produce
 /// the same hex string.
 pub fn compute_mount_input_fingerprint(
-    settings: &cella_config::settings::Settings,
+    settings: &cella_config::CellaConfig,
     env_fwd: &EnvForwarding,
     workspace_root: &Path,
 ) -> String {
@@ -1019,7 +1019,7 @@ pub fn compute_mount_input_fingerprint(
 ///
 /// Called from [`compute_mount_input_fingerprint`]. Extracted into a helper to
 /// keep that function within clippy's `too_many_lines` limit.
-fn hash_tool_host_paths(hasher: &mut Sha256, settings: &cella_config::settings::Settings) {
+fn hash_tool_host_paths(hasher: &mut Sha256, settings: &cella_config::CellaConfig) {
     let t = &settings.tools;
 
     if t.claude_code.forward_config {
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn mount_input_fingerprint_stable_across_calls() {
-        let settings = cella_config::settings::Settings::default();
+        let settings = cella_config::CellaConfig::default();
         let env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
         let fp1 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn mount_input_fingerprint_changes_on_forward_config_toggle() {
-        let mut settings = cella_config::settings::Settings::default();
+        let mut settings = cella_config::CellaConfig::default();
         let env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
         let fp_before = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
@@ -1777,7 +1777,7 @@ mod tests {
 
     #[test]
     fn mount_input_fingerprint_changes_on_env_fwd_mount_change() {
-        let settings = cella_config::settings::Settings::default();
+        let settings = cella_config::CellaConfig::default();
         let mut env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
         let fp_before = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
@@ -2670,12 +2670,12 @@ mod tests {
         let env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-should-not-exist-cella-xyz");
 
-        let mut settings_a = cella_config::settings::Settings::default();
+        let mut settings_a = cella_config::CellaConfig::default();
         settings_a.tools.nvim.forward_config = true;
         // config_path = None → host_nvim_config_dir checks default ~/.config/nvim
         let fp_a = compute_mount_input_fingerprint(&settings_a, &env_fwd, ws);
 
-        let mut settings_b = cella_config::settings::Settings::default();
+        let mut settings_b = cella_config::CellaConfig::default();
         settings_b.tools.nvim.forward_config = true;
         // config_path = Some fake path → different input to host_nvim_config_dir
         settings_b.tools.nvim.config_path = Some("/tmp/fake-nvim-config".to_string());
@@ -2696,7 +2696,7 @@ mod tests {
         // With a non-existent workspace root, `parent_git_dir` returns None and
         // `canonicalize()` is never called, but the fingerprint must still be
         // deterministic across calls (the fallback path is identical).
-        let settings = cella_config::settings::Settings::default();
+        let settings = cella_config::CellaConfig::default();
         let env_fwd = EnvForwarding::default();
         let ws = Path::new("/tmp/nowhere-cella-canonicalize-test-xyz");
         let fp1 = compute_mount_input_fingerprint(&settings, &env_fwd, ws);
