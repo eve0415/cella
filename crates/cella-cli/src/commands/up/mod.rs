@@ -177,6 +177,9 @@ impl UpContext {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
+        let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))
+            .unwrap_or_default();
+
         Ok(Self {
             resolved,
             client,
@@ -187,8 +190,8 @@ impl UpContext {
             progress,
             output: args.output.clone(),
             remove_container,
-            build_no_cache: args.build.build_no_cache,
-            skip_checksum: args.skip_checksum,
+            build_no_cache: args.build.build_no_cache || cella_cfg.cli.build.no_cache,
+            skip_checksum: args.skip_checksum || cella_cfg.cli.skip_checksum,
             pull_policy: args
                 .build
                 .pull
@@ -196,7 +199,7 @@ impl UpContext {
                 .map(ImagePullPolicy::as_str)
                 .map(String::from),
             extra_labels: std::collections::HashMap::new(),
-            network_rules: if args.no_network_rules {
+            network_rules: if args.no_network_rules || cella_cfg.cli.no_network_rules {
                 NetworkRulePolicy::Skip
             } else {
                 NetworkRulePolicy::Enforce
