@@ -344,13 +344,27 @@ mod tests {
 
     #[tokio::test]
     async fn bind_tcp_reclaim_preferred_port_works() {
-        // First bind to get a free port, then drop and reclaim it.
-        let first = bind_tcp_reclaim(0).await.unwrap();
-        let port = first.local_addr().unwrap().port();
-        drop(first);
+        // Between `drop(first)` and the second bind, any other
+        // tokio::test in this binary that binds 127.0.0.1:0 could
+        // have the kernel hand it the freed port. The production
+        // function handles that by falling back to a new port, but
+        // this test is asserting the happy path. Retry to outlast
+        // the race — five attempts drops the effective flake rate
+        // below any practical threshold.
+        let mut last_mismatch = None;
+        for _ in 0..5 {
+            let first = bind_tcp_reclaim(0).await.unwrap();
+            let port = first.local_addr().unwrap().port();
+            drop(first);
 
-        let second = bind_tcp_reclaim(port).await.unwrap();
-        assert_eq!(second.local_addr().unwrap().port(), port);
+            let second = bind_tcp_reclaim(port).await.unwrap();
+            let got = second.local_addr().unwrap().port();
+            if got == port {
+                return;
+            }
+            last_mismatch = Some((port, got));
+        }
+        panic!("preferred port not reclaimed in 5 attempts (last {last_mismatch:?})");
     }
 
     #[tokio::test]

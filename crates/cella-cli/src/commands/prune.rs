@@ -5,6 +5,7 @@ use clap::Args;
 use std::future::Future;
 use std::pin::Pin;
 
+use cella_backend::{ManagedNetwork, RemovalOutcome};
 use cella_orchestrator::prune::{PruneCandidate, PruneHooks};
 
 use super::OutputFormat;
@@ -25,9 +26,8 @@ pub struct PruneArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Include unmerged worktrees (not just merged ones).
-    #[arg(long)]
-    all: bool,
+    #[command(flatten)]
+    scope: PruneScope,
 
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
@@ -37,12 +37,36 @@ pub struct PruneArgs {
     output: OutputFormat,
 }
 
+/// Mutually-exclusive scope selectors for `cella prune`.
+///
+/// Separated from [`PruneArgs`] to keep its bool-field count under
+/// `clippy::struct_excessive_bools`.
+#[derive(Args)]
+struct PruneScope {
+    /// Include unmerged worktrees (not just merged ones).
+    #[arg(long)]
+    all: bool,
+
+    /// Sweep cella-managed Docker networks with zero attached containers.
+    ///
+    /// In this mode worktrees are NOT touched. Scans the host for every
+    /// network labeled `dev.cella.managed=true` and removes those that
+    /// no container is currently attached to. Safe: never force-
+    /// disconnects endpoints.
+    #[arg(long, conflicts_with = "all")]
+    networks: bool,
+}
+
 impl PruneArgs {
     const fn is_json(&self) -> bool {
         matches!(self.output, OutputFormat::Json)
     }
 
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.scope.networks {
+            return self.execute_networks_sweep().await;
+        }
+
         // 1. Discover git repo
         let cwd = std::env::current_dir()?;
         let repo_info = cella_git::discover(&cwd)?;
@@ -53,14 +77,17 @@ impl PruneArgs {
         if !self.is_json() {
             eprintln!("Fetching remote refs...");
         }
-        let candidates =
-            cella_orchestrator::prune::build_prune_candidates(repo_root, client.as_ref(), self.all)
-                .await?;
+        let candidates = cella_orchestrator::prune::build_prune_candidates(
+            repo_root,
+            client.as_ref(),
+            self.scope.all,
+        )
+        .await?;
 
         if candidates.is_empty() {
             if self.is_json() {
                 print_json_result(&[], &[]);
-            } else if self.all {
+            } else if self.scope.all {
                 eprintln!("Nothing to prune. No linked worktrees found.");
             } else {
                 eprintln!("Nothing to prune. No merged or gone worktrees found.");
@@ -95,7 +122,7 @@ impl PruneArgs {
         }
 
         if !self.force && !self.is_json() {
-            let unmerged = if self.all {
+            let unmerged = if self.scope.all {
                 " (including unmerged)"
             } else {
                 ""
@@ -140,6 +167,86 @@ impl PruneArgs {
                 "\nPruned {count} worktree{}",
                 if count == 1 { "" } else { "s" }
             );
+        }
+        Ok(())
+    }
+
+    async fn execute_networks_sweep(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.backend.resolve_client().await?;
+        let all = client.list_managed_networks().await?;
+        let orphans: Vec<ManagedNetwork> =
+            all.into_iter().filter(|n| n.container_count == 0).collect();
+
+        if orphans.is_empty() {
+            if self.is_json() {
+                print_networks_json_result(&[], &[], &[]);
+            } else {
+                eprintln!("Nothing to prune. No orphan cella networks found.");
+            }
+            return Ok(());
+        }
+
+        if !self.is_json() {
+            eprint!("{}", format_orphan_networks(&orphans));
+        }
+
+        if self.dry_run {
+            if self.is_json() {
+                let would: Vec<&str> = orphans.iter().map(|n| n.name.as_str()).collect();
+                print_networks_json_result(&would, &[], &[]);
+            } else {
+                eprintln!("\nDry run — no changes made.");
+            }
+            return Ok(());
+        }
+
+        if !self.force && !self.is_json() {
+            let plural = if orphans.len() == 1 { "" } else { "s" };
+            eprint!("\nRemove {} network{plural}? [y/N] ", orphans.len());
+            io::stderr().flush()?;
+
+            let stdin = io::stdin();
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                eprintln!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        let mut removed = Vec::new();
+        let mut skipped = Vec::new();
+        let mut errors = Vec::new();
+        for net in &orphans {
+            match client.remove_network_if_orphan(&net.name).await {
+                // NotFound means another caller beat us to it — same end
+                // state, treat as success.
+                Ok(RemovalOutcome::Removed | RemovalOutcome::NotFound) => {
+                    removed.push(net.name.clone());
+                }
+                Ok(RemovalOutcome::SkippedInUse) => skipped.push(net.name.clone()),
+                Err(e) => errors.push(format!("{}: {e}", net.name)),
+            }
+        }
+
+        if self.is_json() {
+            let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
+            let skipped_refs: Vec<&str> = skipped.iter().map(String::as_str).collect();
+            print_networks_json_result(&removed_refs, &skipped_refs, &errors);
+        } else {
+            for err in &errors {
+                eprintln!("error: {err}");
+            }
+            let count = removed.len();
+            let plural = if count == 1 { "" } else { "s" };
+            eprintln!("\nRemoved {count} network{plural}");
+            if !skipped.is_empty() {
+                eprintln!(
+                    "Skipped {} in-use network{}",
+                    skipped.len(),
+                    if skipped.len() == 1 { "" } else { "s" }
+                );
+            }
         }
         Ok(())
     }
@@ -224,6 +331,35 @@ fn format_candidates(candidates: &[PruneCandidate]) -> String {
 
 fn print_candidates(candidates: &[PruneCandidate]) {
     eprint!("{}", format_candidates(candidates));
+}
+
+fn print_networks_json_result(removed: &[&str], skipped: &[&str], errors: &[String]) {
+    let result = serde_json::json!({
+        "removed": removed,
+        "skipped": skipped,
+        "errors": errors,
+    });
+    println!("{result}");
+}
+
+fn format_orphan_networks(networks: &[ManagedNetwork]) -> String {
+    use crate::table::{Column, Table};
+
+    let mut table = Table::new(vec![
+        Column::fixed("NAME"),
+        Column::shrinkable("REPO"),
+        Column::fixed("CREATED"),
+    ]);
+
+    for net in networks {
+        table.add_row(vec![
+            net.name.clone(),
+            net.repo_path.clone().unwrap_or_else(|| "-".to_string()),
+            net.created_at.clone().unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+
+    table.render()
 }
 
 #[cfg(test)]
@@ -361,5 +497,103 @@ mod tests {
         assert_eq!(PruneReason::Merged.as_str(), "merged");
         assert_eq!(PruneReason::Gone.as_str(), "gone");
         assert_eq!(PruneReason::Unmerged.as_str(), "unmerged");
+    }
+
+    // -----------------------------------------------------------------------
+    // --networks flag and sweep output tests
+    // -----------------------------------------------------------------------
+
+    fn make_network(name: &str, repo: Option<&str>, created: Option<&str>) -> ManagedNetwork {
+        ManagedNetwork {
+            name: name.to_string(),
+            repo_path: repo.map(String::from),
+            container_count: 0,
+            created_at: created.map(String::from),
+            labels: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn prune_args_networks_flag_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "prune", "--networks"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert!(args.scope.networks);
+            assert!(!args.scope.all);
+        } else {
+            panic!("expected Prune subcommand");
+        }
+    }
+
+    #[test]
+    fn prune_args_networks_conflicts_with_all() {
+        use clap::Parser;
+        let result = crate::Cli::try_parse_from(["cella", "prune", "--networks", "--all"]);
+        assert!(
+            result.is_err(),
+            "--networks and --all must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn prune_args_networks_default_false() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "prune"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert!(!args.scope.networks);
+        } else {
+            panic!("expected Prune subcommand");
+        }
+    }
+
+    #[test]
+    fn format_orphan_networks_with_repo_and_timestamp() {
+        let networks = vec![
+            make_network(
+                "cella-net-abcdef123456",
+                Some("/workspaces/cella"),
+                Some("2026-04-01T12:00:00Z"),
+            ),
+            make_network("cella", None, Some("2026-03-15T08:30:00Z")),
+        ];
+        let output = format_orphan_networks(&networks);
+        insta::assert_snapshot!(output, @"
+        NAME                    REPO               CREATED
+        cella-net-abcdef123456  /workspaces/cella  2026-04-01T12:00:00Z
+        cella                   -                  2026-03-15T08:30:00Z
+        ");
+    }
+
+    #[test]
+    fn format_orphan_networks_missing_metadata() {
+        let networks = vec![make_network("cella-net-deadbeef0000", None, None)];
+        let output = format_orphan_networks(&networks);
+        assert!(output.contains("cella-net-deadbeef0000"));
+        assert!(
+            output.contains(" -   ") || output.contains(" - "),
+            "missing metadata should render as '-': {output}"
+        );
+    }
+
+    #[test]
+    fn format_orphan_networks_empty() {
+        let networks: Vec<ManagedNetwork> = vec![];
+        let output = format_orphan_networks(&networks);
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.starts_with("NAME"));
+    }
+
+    #[test]
+    fn print_networks_json_result_empty() {
+        print_networks_json_result(&[], &[], &[]);
+    }
+
+    #[test]
+    fn print_networks_json_result_with_all_categories() {
+        print_networks_json_result(
+            &["cella-net-aaa"],
+            &["cella"],
+            &["cella-net-bbb: permission denied".to_string()],
+        );
     }
 }

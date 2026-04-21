@@ -13,3 +13,6 @@ pub mod volume;
 pub use client::DockerClient;
 pub use config_map::to_bollard_config;
 pub use error::CellaDockerError;
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod integration_tests;

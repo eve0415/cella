@@ -1045,51 +1045,62 @@ mod tests {
 
     #[tokio::test]
     async fn reclaim_rebinds_previously_registered_ports() {
-        // Write a state file manually, then construct a fresh manager
-        // and prove reclaim puts a working bridge on the recorded port.
+        // Retry against parallel-test port races: between dropping the
+        // probe and reclaim_from_state_file binding that same port, any
+        // other tokio::test in this binary that binds 127.0.0.1:0 may
+        // get handed the freed port by the kernel. Production falls back
+        // to a new port in that case, but this test is asserting the
+        // happy path where the port is still free at bind time.
         let dir = tempfile::tempdir().unwrap();
         let upstream = dir.path().join("upstream.sock");
         let _up = spawn_echo_upstream(&upstream);
-
-        // First, figure out an available port by binding then dropping.
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        // Hand-craft a state file that claims the bridge was running
-        // for workspace /Users/me/proj on that port.
-        let state = serde_json::json!({
-            "schema_version": STATE_FILE_SCHEMA_VERSION,
-            "daemon_pid": 0,
-            "written_at_unix_sec": 0,
-            "bridges": [{
-                "workspace": "/Users/me/proj",
-                "upstream_socket": upstream.to_string_lossy(),
-                "bridge_port": port,
-                "refcount": 1,
-            }],
-        });
-        std::fs::write(
-            dir.path().join("ssh-agent.state"),
-            serde_json::to_vec_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let mut m = manager(dir.path());
-        m.reclaim_from_state_file().await;
-
         let workspace = PathBuf::from("/Users/me/proj");
-        assert_eq!(m.bridge_port_for(&workspace), Some(port));
-        assert_eq!(m.refcount_for(&workspace), 1);
 
-        // The reclaimed listener accepts connections on the SAME port
-        // — crucial for stopped containers whose baked-in env var
-        // points here.
-        let mut client = connect_and_authenticate(port, "test-token").await;
-        client.write_all(b"roundtrip").await.unwrap();
-        let mut buf = [0u8; 9];
-        client.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"roundtrip");
+        let mut last_mismatch: Option<(u16, Option<u16>)> = None;
+        for _ in 0..5 {
+            // Fresh port + fresh state file + fresh manager per attempt.
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let state = serde_json::json!({
+                "schema_version": STATE_FILE_SCHEMA_VERSION,
+                "daemon_pid": 0,
+                "written_at_unix_sec": 0,
+                "bridges": [{
+                    "workspace": "/Users/me/proj",
+                    "upstream_socket": upstream.to_string_lossy(),
+                    "bridge_port": port,
+                    "refcount": 1,
+                }],
+            });
+            std::fs::write(
+                dir.path().join("ssh-agent.state"),
+                serde_json::to_vec_pretty(&state).unwrap(),
+            )
+            .unwrap();
+
+            let mut m = manager(dir.path());
+            m.reclaim_from_state_file().await;
+
+            let got = m.bridge_port_for(&workspace);
+            if got != Some(port) {
+                last_mismatch = Some((port, got));
+                continue;
+            }
+            assert_eq!(m.refcount_for(&workspace), 1);
+
+            // The reclaimed listener accepts connections on the SAME
+            // port — crucial for stopped containers whose baked-in env
+            // var points here.
+            let mut client = connect_and_authenticate(port, "test-token").await;
+            client.write_all(b"roundtrip").await.unwrap();
+            let mut buf = [0u8; 9];
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"roundtrip");
+            return;
+        }
+        panic!("port not reclaimed after 5 attempts (last {last_mismatch:?})");
     }
 
     #[tokio::test]

@@ -222,6 +222,23 @@ pub async fn execute_prune(
                         container = %container.name,
                         "removed container"
                     );
+                    // Best-effort per-workspace network cleanup. Non-compose
+                    // containers get a deterministic `cella-net-{hash}` on
+                    // `cella up`; without this the network would linger.
+                    match client
+                        .remove_workspace_network(&candidate.worktree_path)
+                        .await
+                    {
+                        Ok(outcome) => debug!(
+                            branch = %candidate.branch,
+                            ?outcome,
+                            "workspace network cleanup"
+                        ),
+                        Err(e) => debug!(
+                            branch = %candidate.branch,
+                            "workspace network cleanup failed (non-fatal): {e}"
+                        ),
+                    }
                 }
             }
         }

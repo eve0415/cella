@@ -9,6 +9,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use crate::error::BackendError;
+use crate::network::{ManagedNetwork, RemovalOutcome};
 use crate::types::{
     BackendKind, BuildOptions, ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult,
     FileToUpload, ImageDetails, InteractiveExecOptions,
@@ -202,6 +203,62 @@ pub trait ContainerBackend: Send + Sync {
         &'a self,
         container_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, BackendError>>;
+
+    /// List all networks labeled `dev.cella.managed=true`, including the
+    /// shared `cella` network and any per-workspace `cella-net-*`
+    /// networks. Each entry reports its current attached-endpoint count.
+    ///
+    /// Returns `NotSupported` on backends that don't use Docker networks
+    /// (e.g. apple-container).
+    fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
+        let kind = self.kind();
+        Box::pin(async move {
+            Err(BackendError::NotSupported {
+                backend: kind.to_string(),
+                operation: "list_managed_networks".to_string(),
+            })
+        })
+    }
+
+    /// Remove the named network if it has zero attached containers.
+    ///
+    /// Intended for orphan sweeps and workspace teardown. Callers never
+    /// force-disconnect endpoints; a network in use is left alone.
+    ///
+    /// Returns `NotSupported` on backends that don't use Docker networks.
+    fn remove_network_if_orphan<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        let kind = self.kind();
+        Box::pin(async move {
+            let _ = name;
+            Err(BackendError::NotSupported {
+                backend: kind.to_string(),
+                operation: "remove_network_if_orphan".to_string(),
+            })
+        })
+    }
+
+    /// Remove the per-workspace network derived from `workspace_root`,
+    /// if it has zero attached containers. Convenience wrapper over
+    /// [`Self::remove_network_if_orphan`] that computes the deterministic
+    /// network name from the workspace path.
+    ///
+    /// Returns `NotSupported` on backends that don't use Docker networks.
+    fn remove_workspace_network<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        let kind = self.kind();
+        Box::pin(async move {
+            let _ = workspace_root;
+            Err(BackendError::NotSupported {
+                backend: kind.to_string(),
+                operation: "remove_workspace_network".to_string(),
+            })
+        })
+    }
 
     // -- Agent provisioning --
 

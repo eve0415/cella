@@ -6,7 +6,7 @@ use std::path::Path;
 use cella_backend::{
     BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
-    InteractiveExecOptions, Platform,
+    InteractiveExecOptions, ManagedNetwork, Platform, RemovalOutcome,
 };
 
 use crate::client::DockerClient;
@@ -341,6 +341,37 @@ impl ContainerBackend for DockerClient {
     ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
         Box::pin(async move {
             Ok(crate::network::get_container_cella_ip(self.inner(), container_id).await)
+        })
+    }
+
+    fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
+        Box::pin(async move {
+            crate::network::list_managed_networks(self.inner())
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
+    fn remove_network_if_orphan<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            crate::network::remove_network_if_orphan(self.inner(), name)
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
+    fn remove_workspace_network<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            let name = crate::network::workspace_network_name(workspace_root);
+            crate::network::remove_network_if_orphan(self.inner(), &name)
+                .await
+                .map_err(BackendError::from)
         })
     }
 
