@@ -11,6 +11,7 @@ use serde::Deserialize;
 /// Thin wrapper around `cella_network::NetworkConfig` to keep
 /// the settings crate's deserialization self-contained.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Network {
     /// Blocking mode: "denylist" or "allowlist".
     /// `None` when the user didn't set `[network].mode` in their TOML config,
@@ -38,6 +39,7 @@ pub enum NetworkMode {
 
 /// Proxy settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxySettings {
     /// Whether proxy forwarding is enabled.
     #[serde(default = "default_true")]
@@ -79,6 +81,7 @@ impl Default for ProxySettings {
 
 /// A network blocking rule.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkRule {
     /// Domain glob pattern.
     pub domain: String,

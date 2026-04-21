@@ -13,6 +13,7 @@ fn default_latest() -> String {
 /// Controls automatic installation and config forwarding of Claude Code
 /// into dev containers.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaudeCode {
     /// Install Claude Code in the container (default: true).
     #[serde(default = "default_true")]

@@ -13,6 +13,7 @@ fn default_latest() -> String {
 /// Controls automatic installation and config forwarding of the Codex CLI
 /// into dev containers.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Codex {
     /// Install Codex in the container (default: true).
     #[serde(default = "default_true")]
