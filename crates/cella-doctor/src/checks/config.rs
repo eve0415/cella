@@ -103,6 +103,25 @@ pub fn check_config(ctx: &CheckContext) -> CategoryReport {
         }
     }
 
+    match cella_config::CellaConfig::load(workspace, None) {
+        Ok(cfg) => {
+            checks.push(CheckResult {
+                name: "cella config".into(),
+                severity: Severity::Pass,
+                detail: format!("loaded (security: {})", cfg.security.mode),
+                fix_hint: None,
+            });
+        }
+        Err(e) => {
+            checks.push(CheckResult {
+                name: "cella config".into(),
+                severity: Severity::Error,
+                detail: format!("{e}"),
+                fix_hint: Some("Check ~/.cella/config.toml and .devcontainer/cella.toml".into()),
+            });
+        }
+    }
+
     CategoryReport::new("Configuration", checks)
 }
 
