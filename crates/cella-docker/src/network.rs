@@ -3,13 +3,22 @@
 //! Creates and manages the `cella` bridge network that enables
 //! container-to-container communication via Docker DNS.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use bollard::Docker;
+use cella_backend::{ManagedNetwork, RemovalOutcome};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::CellaDockerError;
+
+/// Label that marks a Docker network as cella-managed.
+const MANAGED_LABEL: &str = "dev.cella.managed";
+/// Label value required on `MANAGED_LABEL` for cella-managed networks.
+const MANAGED_VALUE: &str = "true";
+/// Label that carries the workspace path on per-repo networks.
+const REPO_LABEL: &str = "dev.cella.repo";
 
 /// Default network name for cella containers.
 pub const CELLA_NETWORK_NAME: &str = "cella";
@@ -130,6 +139,20 @@ pub fn repo_network_name(repo_path: &Path) -> String {
     format!("cella-net-{short}")
 }
 
+/// Canonicalize a path for network identity, falling back to the
+/// original path if canonicalization fails (e.g. path doesn't exist).
+///
+/// Must be applied consistently at every network-op boundary so that
+/// `cella down --rm` and `cella prune` hash to the same name the
+/// container was created with. `container_labels` already canonicalizes
+/// the `dev.cella.workspace_path` label, so this keeps network names
+/// aligned with that source of truth.
+fn canonicalize_for_network(repo_path: &Path) -> PathBuf {
+    repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf())
+}
+
 /// Ensure a per-repository bridge network exists and connect the container.
 ///
 /// # Errors
@@ -140,7 +163,8 @@ pub async fn ensure_repo_network(
     container_id: &str,
     repo_path: &Path,
 ) -> Result<String, CellaDockerError> {
-    let net_name = repo_network_name(repo_path);
+    let canonical = canonicalize_for_network(repo_path);
+    let net_name = repo_network_name(&canonical);
 
     // Check if network already exists
     match docker.inspect_network(&net_name, None).await {
@@ -156,10 +180,10 @@ pub async fn ensure_repo_network(
                 labels: Some(
                     [
                         ("dev.cella.tool".to_string(), "cella".to_string()),
-                        ("dev.cella.managed".to_string(), "true".to_string()),
+                        (MANAGED_LABEL.to_string(), MANAGED_VALUE.to_string()),
                         (
-                            "dev.cella.repo".to_string(),
-                            repo_path.to_string_lossy().to_string(),
+                            REPO_LABEL.to_string(),
+                            canonical.to_string_lossy().to_string(),
                         ),
                     ]
                     .into_iter()
@@ -182,6 +206,116 @@ pub async fn ensure_repo_network(
     debug!("Connected container {container_id} to repo network '{net_name}'");
 
     Ok(net_name)
+}
+
+/// Derive the workspace network name the same way `cella up` does, so
+/// `cella down --rm` / `cella prune` target the matching network.
+pub fn workspace_network_name(workspace_root: &Path) -> String {
+    repo_network_name(&canonicalize_for_network(workspace_root))
+}
+
+/// Return `true` when a network's labels + endpoint count indicate it's
+/// a cella-managed orphan (safe to remove).
+fn is_orphan(labels: &HashMap<String, String>, container_count: usize) -> bool {
+    labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_VALUE) && container_count == 0
+}
+
+/// List every Docker network labeled `dev.cella.managed=true` with its
+/// current endpoint count.
+///
+/// Issues one `list_networks` call plus one `inspect_network` per match
+/// (endpoint counts only come from inspect). Networks that vanish between
+/// list and inspect are silently skipped.
+///
+/// # Errors
+///
+/// Returns error if the Docker `list_networks` call fails.
+pub async fn list_managed_networks(
+    docker: &Docker,
+) -> Result<Vec<ManagedNetwork>, CellaDockerError> {
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "label".to_string(),
+        vec![format!("{MANAGED_LABEL}={MANAGED_VALUE}")],
+    )]);
+    let options = bollard::query_parameters::ListNetworksOptions {
+        filters: Some(filters),
+    };
+    let networks = docker.list_networks(Some(options)).await?;
+
+    let mut out = Vec::with_capacity(networks.len());
+    for net in networks {
+        let Some(name) = net.name else { continue };
+
+        // list_networks doesn't include endpoint counts, so inspect each.
+        let inspected = match docker.inspect_network(&name, None).await {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        let labels = inspected.labels.unwrap_or_default();
+        let container_count = inspected.containers.as_ref().map_or(0, HashMap::len);
+        let repo_path = labels.get(REPO_LABEL).cloned();
+        let created_at = inspected.created.as_ref().map(ToString::to_string);
+
+        out.push(ManagedNetwork {
+            name,
+            repo_path,
+            container_count,
+            created_at,
+            labels,
+        });
+    }
+    Ok(out)
+}
+
+/// Remove `name` if it's cella-managed AND has zero attached containers.
+///
+/// Never force-disconnects endpoints. A 404 on either inspect or remove
+/// is treated as success (already gone). Networks missing the
+/// `dev.cella.managed=true` label are treated as "in use" from the
+/// caller's perspective: we refuse to touch them and return
+/// `SkippedInUse`.
+///
+/// # Errors
+///
+/// Returns error for any Docker API error other than 404 during inspect
+/// or remove.
+pub async fn remove_network_if_orphan(
+    docker: &Docker,
+    name: &str,
+) -> Result<RemovalOutcome, CellaDockerError> {
+    let inspect = match docker.inspect_network(name, None).await {
+        Ok(n) => n,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => return Ok(RemovalOutcome::NotFound),
+        Err(e) => return Err(e.into()),
+    };
+
+    let labels = inspect.labels.unwrap_or_default();
+    let container_count = inspect.containers.as_ref().map_or(0, HashMap::len);
+
+    if !is_orphan(&labels, container_count) {
+        debug!(
+            network = name,
+            container_count, "network not an orphan, leaving in place"
+        );
+        return Ok(RemovalOutcome::SkippedInUse);
+    }
+
+    match docker.remove_network(name).await {
+        Ok(()) => {
+            info!("Removed Docker network '{name}'");
+            Ok(RemovalOutcome::Removed)
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(RemovalOutcome::NotFound),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Get the container's IP address on the cella network.
@@ -324,5 +458,65 @@ mod tests {
             CELLA_NETWORK_NAME.chars().all(|c| c.is_ascii_lowercase()),
             "network name should be all lowercase"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan predicate tests
+    // -----------------------------------------------------------------------
+
+    fn labels_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn is_orphan_requires_managed_label() {
+        let labels = labels_from(&[("dev.cella.tool", "cella")]);
+        assert!(!is_orphan(&labels, 0));
+    }
+
+    #[test]
+    fn is_orphan_requires_managed_label_value_true() {
+        let labels = labels_from(&[(MANAGED_LABEL, "false")]);
+        assert!(!is_orphan(&labels, 0));
+    }
+
+    #[test]
+    fn is_orphan_managed_label_is_case_sensitive() {
+        let labels = labels_from(&[(MANAGED_LABEL, "True")]);
+        assert!(
+            !is_orphan(&labels, 0),
+            "label value comparison must be exact: 'True' != 'true'"
+        );
+    }
+
+    #[test]
+    fn is_orphan_requires_zero_containers() {
+        let labels = labels_from(&[(MANAGED_LABEL, MANAGED_VALUE)]);
+        assert!(!is_orphan(&labels, 1));
+        assert!(!is_orphan(&labels, 5));
+    }
+
+    #[test]
+    fn is_orphan_managed_and_empty_is_orphan() {
+        let labels = labels_from(&[(MANAGED_LABEL, MANAGED_VALUE)]);
+        assert!(is_orphan(&labels, 0));
+    }
+
+    #[test]
+    fn is_orphan_managed_with_repo_label_and_empty_is_orphan() {
+        let labels = labels_from(&[
+            (MANAGED_LABEL, MANAGED_VALUE),
+            (REPO_LABEL, "/home/user/foo"),
+        ]);
+        assert!(is_orphan(&labels, 0));
+    }
+
+    #[test]
+    fn is_orphan_empty_labels_is_not_orphan() {
+        let labels = HashMap::new();
+        assert!(!is_orphan(&labels, 0));
     }
 }
