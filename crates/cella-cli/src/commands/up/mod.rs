@@ -177,8 +177,7 @@ impl UpContext {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))
-            .unwrap_or_default();
+        let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
 
         Ok(Self {
             resolved,
