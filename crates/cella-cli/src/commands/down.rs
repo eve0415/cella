@@ -197,6 +197,8 @@ impl DownArgs {
                 .remove_container(&container.id, self.volumes)
                 .await?;
 
+            cleanup_workspace_network(client.as_ref(), &container).await;
+
             if let Some(ref branch_name) = self.branch {
                 remove_worktree(branch_name)?;
             }
@@ -210,6 +212,28 @@ impl DownArgs {
         cleanup_daemon();
 
         Ok(())
+    }
+}
+
+/// Remove the per-workspace `cella-net-*` network if no containers are
+/// attached. Best-effort: errors are logged at debug and never surfaced
+/// to the caller, because the container is already gone and the
+/// enclosing `cella down --rm` has succeeded.
+///
+/// The `dev.cella.workspace_path` label is set from the canonicalized
+/// workspace path at container creation, matching the input
+/// `ensure_repo_network` hashes — so the derived network name lines up.
+async fn cleanup_workspace_network(
+    client: &dyn cella_backend::ContainerBackend,
+    container: &ContainerInfo,
+) {
+    let Some(workspace) = container.labels.get("dev.cella.workspace_path") else {
+        return;
+    };
+    let workspace_path = PathBuf::from(workspace);
+    match client.remove_workspace_network(&workspace_path).await {
+        Ok(outcome) => debug!(?outcome, "workspace network cleanup"),
+        Err(e) => debug!("workspace network cleanup failed (non-fatal): {e}"),
     }
 }
 
