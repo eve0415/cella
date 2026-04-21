@@ -20,5 +20,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[features]
+integration-tests = []
+
 [lints]
 workspace = true
