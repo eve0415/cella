@@ -75,30 +75,6 @@ pub async fn connect_container(
     Ok(())
 }
 
-/// Remove the cella network.
-///
-/// Only call from `cella prune --networks`. Does NOT remove on `cella down`
-/// because other containers may be using the network.
-///
-/// # Errors
-///
-/// Returns error if the Docker API call fails.
-pub async fn remove_network(docker: &Docker) -> Result<(), CellaDockerError> {
-    match docker.remove_network(CELLA_NETWORK_NAME).await {
-        Ok(()) => {
-            info!("Removed Docker network '{CELLA_NETWORK_NAME}'");
-            Ok(())
-        }
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {
-            debug!("Network '{CELLA_NETWORK_NAME}' doesn't exist, nothing to remove");
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Check if a container is already connected to the cella network.
 ///
 /// # Errors
