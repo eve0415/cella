@@ -4,6 +4,8 @@
 
 # Claude
 .claude/*.local.*
+.claude/memory/
+.claude/plans/
 .claude/worktrees/
 docs/superpowers/
 
@@ -12,4 +14,3 @@ docs/superpowers/
 
 # Insta pending snapshots (review via `cargo insta review` on host)
 **/*.snap.new
-
