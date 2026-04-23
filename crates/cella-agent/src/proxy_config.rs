@@ -235,4 +235,42 @@ mod tests {
         // Should not panic even if log file is available or not.
         config.log_blocked("evil.com", "/", "test reason");
     }
+
+    #[test]
+    fn from_json_with_custom_log_path_writes_blocked_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("proxy.log");
+        let json = make_json(
+            "denylist",
+            "",
+            &format!(r#","log_path":"{}""#, path.display()),
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        config.log_blocked("blocked.example", "/secret", "matched deny rule");
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\tBLOCKED\tblocked.example\t/secret\tmatched deny rule"));
+    }
+
+    #[test]
+    fn log_blocked_appends_to_existing_custom_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        std::fs::write(&path, "existing\n").unwrap();
+        let json = make_json(
+            "denylist",
+            "",
+            &format!(r#","log_path":"{}""#, path.display()),
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        config.log_blocked("one.example", "/", "first");
+        config.log_blocked("two.example", "/two", "second");
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.starts_with("existing\n"));
+        assert!(log.contains("\tBLOCKED\tone.example\t/\tfirst"));
+        assert!(log.contains("\tBLOCKED\ttwo.example\t/two\tsecond"));
+    }
 }
