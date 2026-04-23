@@ -384,7 +384,7 @@ async fn prepare_and_start(
     run_step_result(
         progress,
         "Building compose services...",
-        compose_cmd.build(None),
+        compose_cmd.build(None, cfg.build_no_cache),
     )
     .await?;
 

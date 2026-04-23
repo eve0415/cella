@@ -166,9 +166,16 @@ impl ComposeCommand {
     ///
     /// Returns an error if the `docker compose` CLI is not found or if the
     /// command exits with a non-zero status.
-    pub async fn build(&self, services: Option<&[String]>) -> Result<(), CellaComposeError> {
+    pub async fn build(
+        &self,
+        services: Option<&[String]>,
+        no_cache: bool,
+    ) -> Result<(), CellaComposeError> {
         let mut cmd = self.base_command();
         cmd.arg("build");
+        if no_cache {
+            cmd.arg("--no-cache");
+        }
         if let Some(ref policy) = self.pull_policy
             && policy == "always"
         {

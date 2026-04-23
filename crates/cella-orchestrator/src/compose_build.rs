@@ -113,12 +113,11 @@ pub async fn compose_build(
 
     // Run docker compose build
     let compose_cmd = cella_compose::ComposeCommand::new(&project);
-    compose_cmd
-        .build(None)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    compose_cmd.build(None, false).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("docker compose build failed: {e}").into()
-        })?;
+        },
+    )?;
 
     let had_features = features_build.is_some();
     let image_name = features_build
