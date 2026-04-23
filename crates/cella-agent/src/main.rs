@@ -14,6 +14,8 @@ mod cli;
 mod control;
 mod credential;
 mod forward_proxy;
+#[cfg(all(test, feature = "integration-tests"))]
+mod integration_tests;
 mod mitm;
 mod plugin_sync;
 mod port_proxy;
