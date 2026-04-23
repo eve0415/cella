@@ -375,6 +375,33 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn connect_to_network<'a>(
+        &'a self,
+        container_id: &'a str,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            crate::network::connect_container_to_named_network(
+                self.inner(),
+                container_id,
+                network_name,
+            )
+            .await
+            .map_err(BackendError::from)
+        })
+    }
+
+    fn network_exists<'a>(
+        &'a self,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BackendError>> {
+        Box::pin(async move {
+            crate::network::named_network_exists(self.inner(), network_name)
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
     // -- Agent provisioning --
 
     fn ensure_agent_provisioned<'a>(
