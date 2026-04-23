@@ -85,7 +85,7 @@ impl BranchArgs {
         let extra_labels = worktree_labels(&self.name, repo_root);
 
         // Create the container using the up pipeline
-        let ctx = UpContext::for_workspace(
+        let mut ctx = UpContext::for_workspace(
             wt_path,
             &self.backend,
             extra_labels,
@@ -120,7 +120,11 @@ impl BranchArgs {
             let _ = ctx.client.remove_container(&existing.id, false).await;
         }
 
-        let create_result = ctx.ensure_up(false, &[]).await?;
+        let create_result = if ctx.is_compose() {
+            run_compose_branch(&mut ctx, repo_root, progress, false, &[]).await?
+        } else {
+            ctx.ensure_up(false, &[]).await?
+        };
 
         // If --exec provided, run the command in the new container
         if let Some(ref exec_cmd) = self.exec_cmd {
@@ -167,4 +171,88 @@ impl BranchArgs {
 
         Ok(())
     }
+}
+
+/// Build compose image, create a standalone container, and connect to the
+/// parent project's compose network.
+///
+/// Used by both `cella branch` and `cella up --branch` for compose projects.
+pub(super) async fn run_compose_branch(
+    ctx: &mut UpContext,
+    repo_root: &std::path::Path,
+    progress: &crate::progress::Progress,
+    build_no_cache: bool,
+    strict: &[super::StrictnessLevel],
+) -> Result<super::up::UpResult, Box<dyn std::error::Error + Send + Sync>> {
+    let project = cella_compose::ComposeProject::from_resolved(
+        ctx.config(),
+        &ctx.resolved.config_path,
+        &ctx.resolved.workspace_root,
+    )?;
+    let service = project.primary_service.clone();
+
+    let step = progress.step("Building compose image...");
+    let compose_cmd = cella_compose::ComposeCommand::without_override(&project);
+    compose_cmd
+        .build(Some(std::slice::from_ref(&service)), build_no_cache)
+        .await?;
+    step.finish();
+
+    let resolved_compose = compose_cmd.config().await?;
+    let build_info = cella_compose::extract_service_build_info(&resolved_compose, &service)?;
+    let is_local_image = matches!(&build_info, cella_compose::ServiceBuildInfo::Build { .. });
+    let image_name = match &build_info {
+        cella_compose::ServiceBuildInfo::Image { image } => image.clone(),
+        cella_compose::ServiceBuildInfo::Build { .. } => {
+            format!("{}-{}", project.project_name, service)
+        }
+    };
+
+    let parent_config_name = ctx
+        .config()
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let parent_project_name =
+        cella_backend::compose_project_name(repo_root, parent_config_name.as_deref());
+    let parent_network = format!("{parent_project_name}_default");
+
+    let network_ok = ctx
+        .client
+        .network_exists(&parent_network)
+        .await
+        .unwrap_or(false);
+    if !network_ok {
+        progress.warn(&format!(
+            "Parent compose network '{parent_network}' not found. \
+             Run `cella up` first to create it."
+        ));
+    }
+
+    // Swap the config to an image-based one so ensure_up creates a standalone
+    // container instead of rejecting the compose config.
+    let obj = ctx
+        .resolved
+        .config
+        .as_object_mut()
+        .expect("config is an object");
+    obj.remove("dockerComposeFile");
+    obj.remove("service");
+    obj.insert("image".to_string(), serde_json::Value::String(image_name));
+
+    // Register the parent compose network so the orchestrator connects
+    // the container before lifecycle hooks run.
+    if network_ok {
+        ctx.extra_networks.push(parent_network);
+    }
+
+    if build_no_cache {
+        ctx.remove_container = true;
+    }
+    // Local-only images (from build:) must not be pulled. Registry
+    // images (from image:) need normal pull behavior.
+    if is_local_image {
+        ctx.pull_policy = Some("never".to_string());
+    }
+    ctx.ensure_up(build_no_cache, strict).await
 }

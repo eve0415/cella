@@ -937,6 +937,12 @@ impl EnsureUpContext<'_> {
             warn!("Failed to connect container to networks: {e}");
         }
 
+        for net in &self.config.extra_networks {
+            if let Err(e) = self.client.connect_to_network(container_id, net).await {
+                warn!("Failed to connect container to extra network '{net}': {e}");
+            }
+        }
+
         let container_ip = self
             .client
             .get_container_ip(container_id)

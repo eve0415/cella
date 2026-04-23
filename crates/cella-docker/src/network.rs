@@ -73,15 +73,7 @@ pub async fn connect_container(
     docker: &Docker,
     container_id: &str,
 ) -> Result<(), CellaDockerError> {
-    let config = bollard::models::NetworkConnectRequest {
-        container: container_id.to_string(),
-        ..Default::default()
-    };
-
-    docker.connect_network(CELLA_NETWORK_NAME, config).await?;
-
-    debug!("Connected container {container_id} to '{CELLA_NETWORK_NAME}' network");
-    Ok(())
+    connect_container_to_named_network(docker, container_id, CELLA_NETWORK_NAME).await
 }
 
 /// Check if a container is already connected to the cella network.
@@ -314,6 +306,43 @@ pub async fn remove_network_if_orphan(
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(RemovalOutcome::NotFound),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Connect a container to an arbitrary named network.
+///
+/// # Errors
+///
+/// Returns error if the Docker API call fails.
+pub async fn connect_container_to_named_network(
+    docker: &Docker,
+    container_id: &str,
+    network_name: &str,
+) -> Result<(), CellaDockerError> {
+    let config = bollard::models::NetworkConnectRequest {
+        container: container_id.to_string(),
+        ..Default::default()
+    };
+    docker.connect_network(network_name, config).await?;
+    debug!("Connected container {container_id} to network '{network_name}'");
+    Ok(())
+}
+
+/// Check whether a named Docker network exists.
+///
+/// # Errors
+///
+/// Returns error if the Docker API call fails (other than 404).
+pub async fn named_network_exists(
+    docker: &Docker,
+    network_name: &str,
+) -> Result<bool, CellaDockerError> {
+    match docker.inspect_network(network_name, None).await {
+        Ok(_) => Ok(true),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }

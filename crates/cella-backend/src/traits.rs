@@ -260,6 +260,41 @@ pub trait ContainerBackend: Send + Sync {
         })
     }
 
+    /// Connect a container to a named Docker network.
+    ///
+    /// Returns `NotSupported` on backends that don't use Docker networks.
+    fn connect_to_network<'a>(
+        &'a self,
+        container_id: &'a str,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let kind = self.kind();
+        Box::pin(async move {
+            let _ = (container_id, network_name);
+            Err(BackendError::NotSupported {
+                backend: kind.to_string(),
+                operation: "connect_to_network".to_string(),
+            })
+        })
+    }
+
+    /// Check whether a named Docker network exists.
+    ///
+    /// Returns `NotSupported` on backends that don't use Docker networks.
+    fn network_exists<'a>(
+        &'a self,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BackendError>> {
+        let kind = self.kind();
+        Box::pin(async move {
+            let _ = network_name;
+            Err(BackendError::NotSupported {
+                backend: kind.to_string(),
+                operation: "network_exists".to_string(),
+            })
+        })
+    }
+
     // -- Agent provisioning --
 
     /// Ensure the cella-agent binary is available for containers.

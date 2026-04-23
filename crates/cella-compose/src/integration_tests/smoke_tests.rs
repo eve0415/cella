@@ -54,7 +54,7 @@ async fn plain_compose_lifecycle() {
     let cmd = ComposeCommand::new(&project);
 
     // Build (pulls images)
-    cmd.build(None).await.expect("compose build failed");
+    cmd.build(None, false).await.expect("compose build failed");
 
     // Up
     cmd.up(None, false).await.expect("compose up failed");

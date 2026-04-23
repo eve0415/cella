@@ -14,11 +14,14 @@ use cella_orchestrator::compose_up::{ComposeUpConfig, ComposeUpHooks, ComposeUpO
 
 use super::up::{UpContext, output_result};
 
-/// Run the Docker Compose orchestration flow.
+/// Ensure the compose stack is up and return the result without printing.
 ///
-/// Called from `UpArgs::execute()` when the resolved config contains `dockerComposeFile`.
-pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let hooks = CliComposeUpHooks { ctx: &ctx };
+/// Used by `nvim`, `code`, `tmux`, and `up --branch` to auto-up compose
+/// projects the same way `ensure_up` does for Dockerfile-based ones.
+pub async fn compose_ensure_up(
+    ctx: &UpContext,
+) -> Result<super::up::UpResult, Box<dyn std::error::Error + Send + Sync>> {
+    let hooks = CliComposeUpHooks { ctx };
     let cfg = ComposeUpConfig {
         config: ctx.config(),
         config_path: &ctx.resolved.config_path,
@@ -41,19 +44,31 @@ pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error 
     let _ = renderer.await;
     let result = result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-    let outcome = match result.outcome {
-        ComposeUpOutcome::Created => "created",
-        ComposeUpOutcome::Running => "running",
-    };
+    Ok(super::up::UpResult {
+        container_id: result.container_id,
+        remote_user: result.remote_user,
+        workspace_folder: result.workspace_folder,
+        outcome: match result.outcome {
+            ComposeUpOutcome::Created => "created".to_string(),
+            ComposeUpOutcome::Running => "running".to_string(),
+        },
+        ssh_agent_proxy: result.ssh_agent_proxy,
+    })
+}
+
+/// Run the Docker Compose orchestration flow.
+///
+/// Called from `UpArgs::execute()` when the resolved config contains `dockerComposeFile`.
+pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = compose_ensure_up(&ctx).await?;
     output_result(
         &ctx.output,
-        outcome,
+        &result.outcome,
         &result.container_id,
         &result.remote_user,
         &result.workspace_folder,
         result.ssh_agent_proxy.as_ref(),
     );
-
     Ok(())
 }
 
