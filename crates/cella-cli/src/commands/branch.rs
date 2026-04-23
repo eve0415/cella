@@ -245,12 +245,12 @@ pub(super) async fn run_compose_branch(
         ctx.extra_networks.push(parent_network);
     }
 
-    // The compose build already handled --no-cache. Pass false so
-    // ensure_up doesn't try to pull the local-only compose image.
-    // Force container recreation when no-cache was requested so the
-    // fresh image is picked up.
+    // The compose image is local-only — prevent ensure_up from
+    // trying to pull it. build_no_cache still flows through so the
+    // features layer rebuilds without cache when requested.
     if build_no_cache {
         ctx.remove_container = true;
     }
-    ctx.ensure_up(false, strict).await
+    ctx.pull_policy = Some("never".to_string());
+    ctx.ensure_up(build_no_cache, strict).await
 }
