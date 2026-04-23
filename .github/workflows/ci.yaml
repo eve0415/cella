@@ -119,6 +119,7 @@ jobs:
           -p cella-features
           -p cella-daemon
           -p cella-compose
+          -p cella-agent
           --features integration-tests
 
       - name: Generate combined coverage report
