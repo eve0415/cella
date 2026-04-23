@@ -34,6 +34,9 @@ pub struct UpConfig<'a> {
     pub pull_policy: Option<&'a str>,
     /// `BuildKit` secrets to inject during image builds.
     pub build_secrets: Vec<BuildSecret>,
+    /// Extra Docker networks to connect the container to after start,
+    /// before lifecycle hooks run (e.g. parent compose network for worktrees).
+    pub extra_networks: Vec<String>,
 }
 
 /// How the up pipeline should handle the container image.
