@@ -204,7 +204,7 @@ async fn maybe_start_forward_proxy(proxy_config_json: Option<String>) {
             Ok(config) => {
                 let config = std::sync::Arc::new(config);
                 match forward_proxy::start_forward_proxy(config).await {
-                    Ok(_handle) => info!("Forward proxy started"),
+                    Ok(handle) => info!("Forward proxy started on {}", handle.local_addr),
                     Err(e) => error!("Failed to start forward proxy: {e}"),
                 }
             }

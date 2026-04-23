@@ -4,6 +4,7 @@
 //! and builds the rule matcher for request evaluation.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
@@ -60,7 +61,7 @@ impl AgentProxyConfig {
         let matcher = RuleMatcher::new(&net_config);
 
         // Open log file.
-        let log_file = open_log_file();
+        let log_file = open_log_file(raw.log_path.as_deref());
 
         Ok(Self {
             listen_port: raw.listen_port,
@@ -88,10 +89,13 @@ impl AgentProxyConfig {
     }
 }
 
-fn open_log_file() -> Option<std::fs::File> {
-    let log_dir = "/tmp/.cella";
-    let _ = std::fs::create_dir_all(log_dir);
-    let path = format!("{log_dir}/proxy.log");
+fn open_log_file(log_path: Option<&str>) -> Option<std::fs::File> {
+    let path = log_path.map_or_else(|| PathBuf::from("/tmp/.cella/proxy.log"), PathBuf::from);
+    if let Some(parent) = path.parent()
+        && parent != Path::new("")
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -108,6 +112,7 @@ struct ProxyConfigJson {
     upstream_proxy: Option<String>,
     ca_cert_pem: Option<String>,
     ca_key_pem: Option<String>,
+    log_path: Option<String>,
 }
 
 /// A rule in the JSON config.
