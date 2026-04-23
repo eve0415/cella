@@ -49,7 +49,11 @@ impl TmuxArgs {
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
         let ctx = UpContext::new(&up, progress).await?;
-        let result = ctx.ensure_up(build_no_cache, &strict).await?;
+        let result = if ctx.is_compose() {
+            super::compose_up::compose_ensure_up(&ctx).await?
+        } else {
+            ctx.ensure_up(build_no_cache, &strict).await?
+        };
         let container_id = if self.service.is_some() {
             let c = ctx.client.inspect_container(&result.container_id).await?;
             super::resolve_service_container(ctx.client.as_ref(), c, self.service.as_deref())
@@ -85,36 +89,13 @@ impl TmuxArgs {
 
         let container = ctx.client.inspect_container(&container_id).await?;
         let title_guard = push_for_container(&container, self.service.as_deref(), "tmux");
-        let label_env: Vec<String> = container
-            .labels
-            .get("dev.cella.remote_env")
-            .and_then(|v| serde_json::from_str(v).ok())
-            .unwrap_or_default();
-
-        let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
+        let env = super::build_container_env(
             ctx.client.as_ref(),
+            &container,
             &container_id,
             &result.remote_user,
-        )
-        .await
-        {
-            cella_env::user_env_probe::merge_env(&probed, &label_env)
-        } else {
-            label_env
-        };
-        let mut env = base_env;
-        cella_orchestrator::env_cache::ensure_ssh_auth_sock(
-            ctx.client.as_ref(),
-            &container_id,
-            &result.remote_user,
-            &mut env,
         )
         .await;
-        for var in super::TERMINAL_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                env.push(format!("{var}={val}"));
-            }
-        }
 
         let cmd = if self.extra_args.is_empty() {
             // Default: attach-or-create named session

@@ -84,7 +84,11 @@ impl CodeArgs {
                 "cella code requires the Docker backend (VS Code attach is Docker-specific)".into(),
             );
         }
-        let result = ctx.ensure_up(build_no_cache, &strict).await?;
+        let result = if ctx.is_compose() {
+            super::compose_up::compose_ensure_up(&ctx).await?
+        } else {
+            ctx.ensure_up(build_no_cache, &strict).await?
+        };
 
         // 4. Resolve compose service if needed
         let container_id = if self.service.is_some() {
