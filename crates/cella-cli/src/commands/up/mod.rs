@@ -128,6 +128,8 @@ pub struct UpContext {
     pub(crate) compose_pull_policy: Option<String>,
     /// `BuildKit` secrets for image builds.
     build_secrets: Vec<BuildSecret>,
+    /// Extra Docker networks to connect after container start (before lifecycle hooks).
+    pub(crate) extra_networks: Vec<String>,
 }
 
 impl UpContext {
@@ -208,6 +210,7 @@ impl UpContext {
             compose_env_files: args.env_file.clone(),
             compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
+            extra_networks: Vec::new(),
         })
     }
 
@@ -275,11 +278,16 @@ impl UpContext {
             compose_env_files: Vec::new(),
             compose_pull_policy: None,
             build_secrets: vec![],
+            extra_networks: Vec::new(),
         })
     }
 
     pub(crate) const fn config(&self) -> &serde_json::Value {
         &self.resolved.config
+    }
+
+    pub(crate) fn is_compose(&self) -> bool {
+        self.config().get("dockerComposeFile").is_some()
     }
 
     pub(crate) fn workspace_folder(&self) -> Option<&str> {
@@ -688,6 +696,7 @@ impl UpContext {
             network_rule_policy: self.network_rules,
             pull_policy: self.pull_policy.as_deref(),
             build_secrets: self.build_secrets.clone(),
+            extra_networks: self.extra_networks.clone(),
         };
 
         let result =
@@ -767,9 +776,20 @@ impl UpArgs {
             NetworkRulePolicy::Enforce
         };
 
-        let result = ctx
-            .ensure_up(self.build.build_no_cache, &self.strict)
-            .await?;
+        let result = if ctx.is_compose() {
+            let progress = ctx.progress.clone();
+            super::branch::run_compose_branch(
+                &mut ctx,
+                &repo_info.root,
+                &progress,
+                self.build.build_no_cache,
+                &self.strict,
+            )
+            .await?
+        } else {
+            ctx.ensure_up(self.build.build_no_cache, &self.strict)
+                .await?
+        };
         output_result(
             &ctx.output,
             &result.outcome,

@@ -335,6 +335,45 @@ pub const TERMINAL_ENV_VARS: &[&str] = &[
     "LINES",
 ];
 
+/// Build the container environment for interactive sessions (nvim, tmux, etc.).
+///
+/// Merges label env, probed env cache, SSH auth sock, and host terminal vars.
+pub async fn build_container_env(
+    client: &dyn cella_backend::ContainerBackend,
+    container: &cella_backend::ContainerInfo,
+    container_id: &str,
+    remote_user: &str,
+) -> Vec<String> {
+    let label_env: Vec<String> = container
+        .labels
+        .get("dev.cella.remote_env")
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+
+    let base_env = if let Some(probed) =
+        cella_orchestrator::env_cache::read_probed_env_cache(client, container_id, remote_user)
+            .await
+    {
+        cella_env::user_env_probe::merge_env(&probed, &label_env)
+    } else {
+        label_env
+    };
+    let mut env = base_env;
+    cella_orchestrator::env_cache::ensure_ssh_auth_sock(
+        client,
+        container_id,
+        remote_user,
+        &mut env,
+    )
+    .await;
+    for var in TERMINAL_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            env.push(format!("{var}={val}"));
+        }
+    }
+    env
+}
+
 /// Ensure the cella daemon is running and version-compatible.
 ///
 /// Starts it as a background process if not already running.
