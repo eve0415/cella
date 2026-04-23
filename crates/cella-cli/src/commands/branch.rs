@@ -200,6 +200,7 @@ pub(super) async fn run_compose_branch(
 
     let resolved_compose = compose_cmd.config().await?;
     let build_info = cella_compose::extract_service_build_info(&resolved_compose, &service)?;
+    let is_local_image = matches!(&build_info, cella_compose::ServiceBuildInfo::Build { .. });
     let image_name = match &build_info {
         cella_compose::ServiceBuildInfo::Image { image } => image.clone(),
         cella_compose::ServiceBuildInfo::Build { .. } => {
@@ -245,12 +246,13 @@ pub(super) async fn run_compose_branch(
         ctx.extra_networks.push(parent_network);
     }
 
-    // The compose image is local-only — prevent ensure_up from
-    // trying to pull it. build_no_cache still flows through so the
-    // features layer rebuilds without cache when requested.
     if build_no_cache {
         ctx.remove_container = true;
     }
-    ctx.pull_policy = Some("never".to_string());
+    // Local-only images (from build:) must not be pulled. Registry
+    // images (from image:) need normal pull behavior.
+    if is_local_image {
+        ctx.pull_policy = Some("never".to_string());
+    }
     ctx.ensure_up(build_no_cache, strict).await
 }
