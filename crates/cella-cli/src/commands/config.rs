@@ -94,3 +94,68 @@ fn validate(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cella-config-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn validate_accepts_minimal_devcontainer_file() {
+        let path = temp_config(
+            r#"{
+                "image": "mcr.microsoft.com/devcontainers/base:ubuntu"
+            }"#,
+        );
+
+        let result = validate(Some(path.clone()), false);
+
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_reports_missing_file_path() {
+        let path = std::env::temp_dir().join("cella-config-test-missing-devcontainer.json");
+
+        let err = validate(Some(path.clone()), false).expect_err("missing file should fail");
+
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_json() {
+        let path = temp_config("{ invalid json");
+
+        let err = validate(Some(path.clone()), false).expect_err("invalid json should fail");
+
+        let _ = std::fs::remove_file(path);
+        assert!(err.to_string().contains("validation failed"));
+    }
+
+    #[test]
+    fn unimplemented_config_commands_return_error() {
+        for command in [
+            ConfigCommand::Show,
+            ConfigCommand::Global,
+            ConfigCommand::Dotfiles,
+            ConfigCommand::Agent,
+        ] {
+            let result = ConfigArgs { command }.execute();
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().to_string(), "not yet implemented");
+        }
+    }
+}

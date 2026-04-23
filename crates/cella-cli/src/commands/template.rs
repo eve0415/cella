@@ -33,3 +33,27 @@ impl TemplateArgs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_commands_return_not_implemented() {
+        let commands = [
+            TemplateCommand::New {
+                name: "rust".to_string(),
+            },
+            TemplateCommand::List,
+            TemplateCommand::Edit {
+                name: "node".to_string(),
+            },
+        ];
+
+        for command in commands {
+            let result = TemplateArgs { command }.execute();
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().to_string(), "not yet implemented");
+        }
+    }
+}

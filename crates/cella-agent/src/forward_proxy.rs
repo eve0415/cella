@@ -5,6 +5,7 @@
 //! Evaluates blocking rules against each request.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
@@ -13,6 +14,15 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::proxy_config::AgentProxyConfig;
+
+/// Running forward proxy listener.
+pub struct ForwardProxyHandle {
+    /// Address the proxy actually bound to.
+    pub local_addr: SocketAddr,
+    /// Background accept-loop task.
+    #[allow(dead_code)]
+    pub task: JoinHandle<()>,
+}
 
 /// Start the forward proxy server.
 ///
@@ -24,12 +34,13 @@ use crate::proxy_config::AgentProxyConfig;
 /// Returns an error if binding fails.
 pub async fn start_forward_proxy(
     config: Arc<AgentProxyConfig>,
-) -> Result<JoinHandle<()>, io::Error> {
+) -> Result<ForwardProxyHandle, io::Error> {
     let port = config.listen_port;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    info!("Forward proxy listening on 127.0.0.1:{port}");
+    let local_addr = listener.local_addr()?;
+    info!("Forward proxy listening on {local_addr}");
 
-    let handle = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -44,7 +55,7 @@ pub async fn start_forward_proxy(
         }
     });
 
-    Ok(handle)
+    Ok(ForwardProxyHandle { local_addr, task })
 }
 
 /// Handle a single proxy connection.

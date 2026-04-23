@@ -72,7 +72,10 @@ fn is_remote_docker_host(host: &str) -> bool {
     }
     if let Some(rest) = host.strip_prefix("tcp://") {
         let authority = rest.split('/').next().unwrap_or(rest);
-        let hostname = authority.split(':').next().unwrap_or(authority);
+        let hostname = authority
+            .strip_prefix('[')
+            .and_then(|h| h.split_once(']').map(|(host, _)| host))
+            .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority));
         return !matches!(hostname, "localhost" | "127.0.0.1" | "::1" | "[::1]");
     }
     // Unknown scheme — assume remote to be safe
@@ -308,4 +311,119 @@ fn print_container_ports(containers: &[ContainerInfo], is_orbstack: bool) {
     }
 
     table.eprint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cella_backend::{BackendKind, ContainerState, PortBinding};
+    use std::collections::HashMap;
+
+    fn container(
+        name: &str,
+        workspace_path: Option<&str>,
+        ports: Vec<PortBinding>,
+    ) -> ContainerInfo {
+        let mut labels = HashMap::new();
+        if let Some(path) = workspace_path {
+            labels.insert("dev.cella.workspace_path".to_string(), path.to_string());
+        }
+        ContainerInfo {
+            id: format!("{name}-id"),
+            name: name.to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports,
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: BackendKind::Docker,
+        }
+    }
+
+    fn port(container_port: u16, host_port: Option<u16>, protocol: &str) -> PortBinding {
+        PortBinding {
+            container_port,
+            host_port,
+            protocol: protocol.to_string(),
+        }
+    }
+
+    #[test]
+    fn remote_docker_host_detects_local_aliases() {
+        assert!(!is_remote_docker_host("unix:///var/run/docker.sock"));
+        assert!(!is_remote_docker_host("npipe:////./pipe/docker_engine"));
+        assert!(!is_remote_docker_host("tcp://localhost:2375"));
+        assert!(!is_remote_docker_host("tcp://127.0.0.1:2375"));
+        assert!(!is_remote_docker_host("tcp://[::1]:2375"));
+    }
+
+    #[test]
+    fn remote_docker_host_detects_remote_or_unknown_hosts() {
+        assert!(is_remote_docker_host("tcp://docker.example.com:2375"));
+        assert!(is_remote_docker_host("ssh://docker.example.com"));
+        assert!(is_remote_docker_host("http://localhost:2375"));
+    }
+
+    #[test]
+    fn print_daemon_ports_handles_multiple_rows() {
+        let ports = vec![
+            cella_protocol::ForwardedPortDetail {
+                container_name: "app".to_string(),
+                container_port: 3000,
+                host_port: 49152,
+                protocol: cella_protocol::PortProtocol::Tcp,
+                process: Some("node".to_string()),
+                url: "localhost:49152".to_string(),
+            },
+            cella_protocol::ForwardedPortDetail {
+                container_name: "api".to_string(),
+                container_port: 8080,
+                host_port: 49153,
+                protocol: cella_protocol::PortProtocol::Tcp,
+                process: None,
+                url: "localhost:49153".to_string(),
+            },
+        ];
+
+        print_daemon_ports(&ports);
+    }
+
+    #[test]
+    fn print_backend_ports_non_orbstack_handles_hostless_and_bound_ports() {
+        let containers = vec![container(
+            "cella-project",
+            Some("/workspaces/project"),
+            vec![port(3000, Some(49152), "tcp"), port(9229, None, "tcp")],
+        )];
+
+        print_all_container_ports(&containers, false);
+        print_container_ports(&containers, false);
+    }
+
+    #[test]
+    fn print_backend_ports_orbstack_uses_container_local_urls() {
+        let containers = vec![container(
+            "cella-project",
+            Some("/workspaces/project"),
+            vec![port(3000, Some(49152), "tcp")],
+        )];
+
+        print_all_container_ports(&containers, true);
+        print_container_ports(&containers, true);
+    }
+
+    #[test]
+    fn print_all_container_ports_falls_back_to_container_name_without_workspace_label() {
+        let containers = vec![container(
+            "unnamed-workspace",
+            None,
+            vec![port(8080, Some(49153), "tcp")],
+        )];
+
+        print_all_container_ports(&containers, false);
+    }
 }

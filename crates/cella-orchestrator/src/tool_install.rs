@@ -1185,13 +1185,27 @@ mod tests {
     /// Minimal mock that replays pre-configured `exec_command` responses in order.
     struct MockBackend {
         responses: Mutex<VecDeque<Result<ExecResult, BackendError>>>,
+        calls: Mutex<Vec<RecordedExec>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedExec {
+        cmd: Vec<String>,
+        user: Option<String>,
+        env: Option<Vec<String>>,
+        working_dir: Option<String>,
     }
 
     impl MockBackend {
         fn new(responses: Vec<Result<ExecResult, BackendError>>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn calls(&self) -> Vec<RecordedExec> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -1274,8 +1288,14 @@ mod tests {
         fn exec_command<'a>(
             &'a self,
             _container_id: &'a str,
-            _opts: &'a ExecOptions,
+            opts: &'a ExecOptions,
         ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            self.calls.lock().unwrap().push(RecordedExec {
+                cmd: opts.cmd.clone(),
+                user: opts.user.clone(),
+                env: opts.env.clone(),
+                working_dir: opts.working_dir.clone(),
+            });
             let response = self
                 .responses
                 .lock()
@@ -1491,6 +1511,373 @@ mod tests {
         ]);
         let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn ensure_node_available_uses_existing_npm_on_probed_path() {
+        let mut env = ProbedEnv::new();
+        env.insert(
+            "PATH".to_string(),
+            "/home/vscode/.npm/bin:/usr/bin".to_string(),
+        );
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        assert!(ensure_node_available(&backend, "test-container", Some(&env)).await);
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].cmd, vec!["sh", "-c", "command -v npm"]);
+        assert_eq!(
+            calls[0].env,
+            Some(vec!["PATH=/home/vscode/.npm/bin:/usr/bin".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_node_available_installs_with_apt_on_non_alpine() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // npm not found
+            Ok(ok_exit(1)), // not Alpine
+            Ok(ok_exit(0)), // apt-get install succeeds
+        ]);
+
+        assert!(ensure_node_available(&backend, "test-container", None).await);
+
+        let calls = backend.calls();
+        assert_eq!(calls[0].cmd, vec!["sh", "-l", "-c", "command -v npm"]);
+        assert_eq!(
+            calls[2].cmd,
+            vec![
+                "sh",
+                "-c",
+                "apt-get update -qq && apt-get install -y -qq nodejs npm"
+            ]
+        );
+        assert_eq!(calls[2].user.as_deref(), Some("root"));
+    }
+
+    #[tokio::test]
+    async fn ensure_node_available_installs_with_apk_on_alpine() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // npm not found
+            Ok(ok_exit(0)), // Alpine
+            Ok(ok_exit(0)), // apk install succeeds
+        ]);
+
+        assert!(ensure_node_available(&backend, "test-container", None).await);
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls[2].cmd,
+            vec!["sh", "-c", "apk add --no-cache nodejs npm"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_node_available_returns_false_when_install_fails() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)),                        // npm not found
+            Ok(ok_exit(1)),                        // not Alpine
+            Ok(fail_exit(100, "apt unavailable")), // install fails
+        ]);
+
+        assert!(!ensure_node_available(&backend, "test-container", None).await);
+    }
+
+    #[tokio::test]
+    async fn claude_code_install_probe_accepts_latest_and_pinned_versions() {
+        let latest_backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 9.9.9\n"))]);
+        assert!(
+            is_claude_code_installed(&latest_backend, "test-container", "vscode", "latest", None)
+                .await
+        );
+
+        let pinned_backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 1.2.3\n"))]);
+        assert!(
+            is_claude_code_installed(&pinned_backend, "test-container", "vscode", "1.2.3", None)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_install_probe_rejects_mismatched_version() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 1.2.3\n"))]);
+        assert!(
+            !is_claude_code_installed(&backend, "test-container", "vscode", "2.0.0", None).await
+        );
+    }
+
+    #[tokio::test]
+    async fn install_claude_code_short_circuits_when_requested_version_exists() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 1.2.3\n"))]);
+        let settings = cella_config::settings::ClaudeCode {
+            enabled: true,
+            version: "1.2.3".to_string(),
+            forward_config: false,
+        };
+
+        let result =
+            install_claude_code(&backend, "test-container", "vscode", &settings, None).await;
+
+        assert!(result.is_none());
+        assert_eq!(backend.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_claude_code_installs_alpine_deps_then_native_installer() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // claude --version not installed
+            Ok(ok_exit(0)), // Alpine detected
+            Ok(ok_exit(0)), // apk deps install
+            Ok(ok_exit(0)), // native installer
+        ]);
+        let settings = cella_config::settings::ClaudeCode {
+            enabled: true,
+            version: "stable".to_string(),
+            forward_config: false,
+        };
+
+        let result = install_claude_code(&backend, "test-container", "vscode", &settings, None)
+            .await
+            .expect("installer should run");
+
+        assert_eq!(result.exit_code, 0);
+        let calls = backend.calls();
+        assert_eq!(
+            calls[2].cmd,
+            vec!["sh", "-c", "apk add --no-cache libgcc libstdc++ ripgrep"]
+        );
+        assert_eq!(
+            calls[3].cmd,
+            vec![
+                "sh",
+                "-c",
+                "curl -fsSL https://claude.ai/install.sh | bash -s stable"
+            ]
+        );
+        assert_eq!(
+            calls[3].env,
+            Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn run_claude_install_preserves_probed_path_and_alpine_flag() {
+        let mut env = ProbedEnv::new();
+        env.insert("PATH".to_string(), "/opt/tools/bin:/usr/bin".to_string());
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+
+        let result = run_claude_install(
+            &backend,
+            "test-container",
+            "vscode",
+            "1.0.0",
+            true,
+            Some(&env),
+        )
+        .await;
+
+        assert_eq!(result.exit_code, 0);
+        let calls = backend.calls();
+        assert_eq!(
+            calls[0].env,
+            Some(vec![
+                "PATH=/opt/tools/bin:/usr/bin".to_string(),
+                "USE_BUILTIN_RIPGREP=0".to_string()
+            ])
+        );
+        assert_eq!(calls[0].user.as_deref(), Some("vscode"));
+    }
+
+    #[tokio::test]
+    async fn npm_tool_probe_accepts_latest_and_pinned_versions() {
+        let latest_backend = MockBackend::new(vec![Ok(ok_stdout(0, "0.99.0\n"))]);
+        assert!(
+            is_npm_tool_installed(
+                &latest_backend,
+                "test-container",
+                "vscode",
+                "codex",
+                "latest",
+                None
+            )
+            .await
+        );
+
+        let pinned_backend = MockBackend::new(vec![Ok(ok_stdout(0, "codex 0.42.0\n"))]);
+        assert!(
+            is_npm_tool_installed(
+                &pinned_backend,
+                "test-container",
+                "vscode",
+                "codex",
+                "0.42.0",
+                None
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_tool_probe_rejects_nonzero_and_mismatched_versions() {
+        let nonzero_backend = MockBackend::new(vec![Ok(ok_exit(127))]);
+        assert!(
+            !is_npm_tool_installed(
+                &nonzero_backend,
+                "test-container",
+                "vscode",
+                "gemini",
+                "latest",
+                None,
+            )
+            .await
+        );
+
+        let mismatch_backend = MockBackend::new(vec![Ok(ok_stdout(0, "0.1.0\n"))]);
+        assert!(
+            !is_npm_tool_installed(
+                &mismatch_backend,
+                "test-container",
+                "vscode",
+                "gemini",
+                "0.2.0",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_install_global_omits_latest_suffix_and_pins_specific_version() {
+        let latest_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        npm_install_global(
+            &latest_backend,
+            "test-container",
+            "vscode",
+            "@openai/codex",
+            "latest",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            latest_backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", "npm install -g @openai/codex"]
+        );
+
+        let pinned_backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        npm_install_global(
+            &pinned_backend,
+            "test-container",
+            "vscode",
+            "@google/gemini-cli",
+            "1.2.3",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pinned_backend.calls()[0].cmd,
+            vec!["sh", "-l", "-c", "npm install -g @google/gemini-cli@1.2.3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_codex_installs_deps_then_npm_package_when_missing() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(1)), // not Alpine
+            Ok(ok_exit(0)), // apt bubblewrap install succeeds
+            Ok(ok_exit(1)), // codex --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+        ]);
+        let settings = cella_config::settings::Codex {
+            enabled: true,
+            version: "0.42.0".to_string(),
+            forward_config: false,
+        };
+
+        let result = install_codex(&backend, "test-container", "vscode", &settings, None)
+            .await
+            .expect("npm should run");
+
+        assert_eq!(result.exit_code, 0);
+        let calls = backend.calls();
+        assert_eq!(
+            calls[2].cmd,
+            vec![
+                "sh",
+                "-c",
+                "apt-get update -qq && apt-get install -y -qq bubblewrap"
+            ]
+        );
+        assert_eq!(
+            calls[4].cmd,
+            vec!["sh", "-l", "-c", "npm install -g @openai/codex@0.42.0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_codex_short_circuits_when_requested_version_exists() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // bwrap already installed
+            Ok(ok_stdout(0, "codex 0.42.0\n")),
+        ]);
+        let settings = cella_config::settings::Codex {
+            enabled: true,
+            version: "0.42.0".to_string(),
+            forward_config: false,
+        };
+
+        let result = install_codex(&backend, "test-container", "vscode", &settings, None).await;
+
+        assert!(result.is_none());
+        assert_eq!(backend.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn install_gemini_installs_when_missing() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // gemini --version missing
+            Ok(ok_exit(0)), // npm install succeeds
+        ]);
+        let settings = cella_config::settings::Gemini {
+            enabled: true,
+            version: "latest".to_string(),
+            forward_config: false,
+        };
+
+        let result = install_gemini(&backend, "test-container", "vscode", &settings, None)
+            .await
+            .expect("npm should run");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            backend.calls()[1].cmd,
+            vec!["sh", "-l", "-c", "npm install -g @google/gemini-cli"]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_gemini_flattens_backend_error_into_exec_result() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // gemini --version missing
+            Err(BackendError::ContainerNotFound {
+                identifier: "gone".into(),
+            }),
+        ]);
+        let settings = cella_config::settings::Gemini {
+            enabled: true,
+            version: "latest".to_string(),
+            forward_config: false,
+        };
+
+        let result = install_gemini(&backend, "test-container", "vscode", &settings, None)
+            .await
+            .expect("error should be flattened");
+
+        assert_eq!(result.exit_code, -1);
+        assert!(result.stderr.contains("gone"));
     }
 
     #[test]

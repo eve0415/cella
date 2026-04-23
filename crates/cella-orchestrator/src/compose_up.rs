@@ -1238,6 +1238,103 @@ mod tests {
     }
 
     #[test]
+    fn build_compose_labels_include_runtime_project_and_spec_identity() {
+        let config = serde_json::json!({});
+        let config_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let cfg = ComposeUpConfig {
+            config: &config,
+            config_path: &config_path,
+            workspace_root: workspace_dir.path(),
+            container_name: "test-container",
+            remote_env: &[],
+            remove_container: false,
+            build_no_cache: false,
+            skip_checksum: false,
+            profiles: vec![],
+            env_files: vec![],
+            pull_policy: None,
+        };
+        let project = ComposeProject {
+            project_name: "cella-test-project".to_string(),
+            compose_files: vec![config_dir.path().join("docker-compose.yml")],
+            override_file: config_dir.path().join("docker-compose.cella.yml"),
+            primary_service: "web".to_string(),
+            run_services: Some(vec!["web".to_string(), "worker".to_string()]),
+            shutdown_action: cella_compose::ShutdownAction::StopCompose,
+            override_command: false,
+            workspace_folder: "/workspace/project".to_string(),
+            config_dir: config_dir.path().to_path_buf(),
+            workspace_root: workspace_dir.path().to_path_buf(),
+            config_hash: "hash456".to_string(),
+            profiles: vec!["dev".to_string()],
+            env_files: vec![config_dir.path().join(".env")],
+            pull_policy: Some("missing".to_string()),
+        };
+
+        let labels = build_compose_labels(&cfg, &project, "node");
+
+        assert_eq!(
+            labels.get("dev.cella.compose_project").map(String::as_str),
+            Some("cella-test-project")
+        );
+        assert_eq!(
+            labels.get("dev.cella.primary_service").map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            labels.get("dev.cella.workspace_folder").map(String::as_str),
+            Some("/workspace/project")
+        );
+        assert_eq!(
+            labels.get("dev.cella.remote_user").map(String::as_str),
+            Some("node")
+        );
+        assert_eq!(
+            labels.get("devcontainer.local_folder"),
+            labels.get("dev.cella.workspace_path")
+        );
+        assert_eq!(
+            labels.get("devcontainer.config_file"),
+            labels.get("dev.cella.config_path")
+        );
+        assert!(labels.contains_key("dev.cella.docker_runtime"));
+    }
+
+    #[test]
+    fn insert_mount_input_fingerprint_label_changes_with_forwarded_mounts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+        let mut labels = BTreeMap::new();
+        let env_fwd = cella_env::EnvForwarding::default();
+
+        insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, workspace.path());
+        let base = labels
+            .get("dev.cella.mount_input_fingerprint")
+            .cloned()
+            .expect("fingerprint label");
+
+        let mut changed_env_fwd = cella_env::EnvForwarding::default();
+        changed_env_fwd.mounts.push(cella_env::ForwardMount {
+            source: workspace.path().join("sock").to_string_lossy().into_owned(),
+            target: "/tmp/socket".to_string(),
+        });
+        insert_mount_input_fingerprint_label(
+            &mut labels,
+            &settings,
+            &changed_env_fwd,
+            workspace.path(),
+        );
+        let changed = labels
+            .get("dev.cella.mount_input_fingerprint")
+            .expect("updated fingerprint label");
+
+        assert_ne!(&base, changed);
+    }
+
+    #[test]
     fn build_extra_env_preserves_precedence_order() {
         // daemon_env first, then env_fwd, then remote_env, then agent vars.
         let env_fwd = cella_env::EnvForwarding {

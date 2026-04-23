@@ -1599,5 +1599,46 @@ mod tests {
             .await;
         hooks.on_container_stopping("test-container").await;
         assert!(hooks.daemon_env("test", "host").await.is_empty());
+        assert!(hooks.update_container_ip("container-123", None).await);
+    }
+
+    #[tokio::test]
+    async fn run_step_result_emits_completed_event_on_success() {
+        use crate::progress::{ProgressEvent, ProgressSender};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(8);
+        let progress = ProgressSender::new(tx, false);
+
+        let value = run_step_result(&progress, "Doing work...", async {
+            Ok::<_, std::convert::Infallible>("done")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(value, "done");
+        let first = rx.try_recv().expect("phase started");
+        let second = rx.try_recv().expect("phase completed");
+        assert!(matches!(first, ProgressEvent::StepStarted { .. }));
+        assert!(matches!(second, ProgressEvent::StepCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn run_step_result_emits_failed_event_on_error() {
+        use crate::progress::{ProgressEvent, ProgressSender};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(8);
+        let progress = ProgressSender::new(tx, false);
+
+        let result =
+            run_step_result(&progress, "Doing work...", async { Err::<(), _>("boom") }).await;
+
+        assert_eq!(result, Err("boom"));
+        let first = rx.try_recv().expect("phase started");
+        let second = rx.try_recv().expect("phase failed");
+        assert!(matches!(first, ProgressEvent::StepStarted { .. }));
+        assert!(matches!(
+            second,
+            ProgressEvent::StepFailed { message, .. } if message == "boom"
+        ));
     }
 }

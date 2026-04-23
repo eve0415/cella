@@ -119,6 +119,27 @@ jobs:
           -p cella-features
           -p cella-daemon
           -p cella-compose
+          -p cella-agent
+          --features integration-tests
+
+      - name: Run Docker integration tests with coverage
+        run: >
+          cargo llvm-cov --no-report
+          -p cella-docker
+          --features integration-tests
+          -- --ignored --test-threads=1
+
+      - name: Run Compose integration tests with coverage
+        run: >
+          cargo llvm-cov --no-report
+          -p cella-compose
+          --features integration-tests
+          -- --ignored --test-threads=1
+
+      - name: Run template registry integration tests with coverage
+        run: >
+          cargo llvm-cov --no-report
+          -p cella-templates
           --features integration-tests
 
       - name: Generate combined coverage report
