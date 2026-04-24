@@ -298,7 +298,10 @@ async fn resolve_user_and_env(
     let (image_user, image_meta_user) =
         resolve_compose_image_info(client, project, features_build, progress).await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
-    let mut env_fwd = cella_env::prepare_env_forwarding(cfg.config, &remote_user, None);
+    let managed_agent = client.capabilities().managed_agent;
+    let proxy_fwd = build_proxy_forwarding_config(cfg.config, cfg.workspace_root, managed_agent);
+    let mut env_fwd =
+        cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
         &mut env_fwd,
         cfg.workspace_root,
@@ -1157,6 +1160,44 @@ where
             Err(error)
         }
     }
+}
+
+/// Build proxy forwarding config from devcontainer.json and cella.toml network settings.
+///
+/// Mirrors the network config resolution in `Up::resolve_image_config` (up.rs).
+/// Used by both the orchestrator's `resolve_user_and_env` and the CLI's `post_create_setup`.
+pub fn build_proxy_forwarding_config(
+    config: &serde_json::Value,
+    workspace_root: &Path,
+    managed_agent: bool,
+) -> Option<cella_env::ProxyForwardingConfig> {
+    let settings = cella_config::CellaConfig::load(workspace_root, None).unwrap_or_default();
+    let toml_net = settings.network.to_network_config();
+    let toml_mode_override = settings.network.mode_override();
+    let dc_net = config
+        .get("customizations")
+        .and_then(|c| c.get("cella"))
+        .and_then(|c| c.get("network"))
+        .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
+    let merged =
+        cella_network::merge_network_configs(dc_net.as_ref(), Some(&toml_net), toml_mode_override);
+    let net_config = cella_network::NetworkConfig {
+        mode: merged.mode,
+        proxy: merged.proxy,
+        rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
+    };
+    let has_rules = net_config.has_rules();
+
+    Some(cella_env::ProxyForwardingConfig {
+        proxy: net_config.proxy.clone(),
+        has_blocking_rules: has_rules && managed_agent,
+        full_config: if has_rules && managed_agent {
+            Some(net_config)
+        } else {
+            None
+        },
+        container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
+    })
 }
 
 #[cfg(test)]

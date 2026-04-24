@@ -127,7 +127,7 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
 
     fn post_create_setup<'a>(
         &'a self,
-        _client: &'a dyn ContainerBackend,
+        client: &'a dyn ContainerBackend,
         container_id: &'a str,
         remote_user: &'a str,
         config: &'a serde_json::Value,
@@ -135,7 +135,14 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
         remote_env: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
         Box::pin(async move {
-            let env_fwd = cella_env::prepare_env_forwarding(config, remote_user, None);
+            let managed_agent = client.capabilities().managed_agent;
+            let proxy_fwd = cella_orchestrator::compose_up::build_proxy_forwarding_config(
+                config,
+                workspace_root,
+                managed_agent,
+            );
+            let env_fwd =
+                cella_env::prepare_env_forwarding(config, remote_user, proxy_fwd.as_ref());
             // Trait method can't return Result; fall back to defaults on config error.
             let settings =
                 cella_config::CellaConfig::load(workspace_root, Some(&self.ctx.resolved))
