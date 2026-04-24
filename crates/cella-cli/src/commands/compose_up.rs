@@ -34,6 +34,7 @@ pub async fn compose_ensure_up(
         profiles: ctx.compose_profiles.clone(),
         env_files: ctx.compose_env_files.clone(),
         pull_policy: ctx.compose_pull_policy.clone(),
+        network_rule_policy: ctx.network_rules,
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
@@ -136,10 +137,12 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
         Box::pin(async move {
             let managed_agent = client.capabilities().managed_agent;
+            let skip_rules = self.ctx.network_rules == cella_orchestrator::NetworkRulePolicy::Skip;
             let proxy_fwd = cella_orchestrator::compose_up::build_proxy_forwarding_config(
                 config,
                 workspace_root,
                 managed_agent,
+                skip_rules,
             );
             let env_fwd =
                 cella_env::prepare_env_forwarding(config, remote_user, proxy_fwd.as_ref());

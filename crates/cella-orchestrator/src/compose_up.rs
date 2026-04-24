@@ -49,6 +49,8 @@ pub struct ComposeUpConfig<'a> {
     pub env_files: Vec<PathBuf>,
     /// Pull policy for docker compose up/build (`--pull` flag).
     pub pull_policy: Option<String>,
+    /// Network rule enforcement policy.
+    pub network_rule_policy: crate::NetworkRulePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +301,9 @@ async fn resolve_user_and_env(
         resolve_compose_image_info(client, project, features_build, progress).await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
-    let proxy_fwd = build_proxy_forwarding_config(cfg.config, cfg.workspace_root, managed_agent);
+    let skip_rules = cfg.network_rule_policy == crate::NetworkRulePolicy::Skip;
+    let proxy_fwd =
+        build_proxy_forwarding_config(cfg.config, cfg.workspace_root, managed_agent, skip_rules);
     let mut env_fwd =
         cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
@@ -1170,6 +1174,7 @@ pub fn build_proxy_forwarding_config(
     config: &serde_json::Value,
     workspace_root: &Path,
     managed_agent: bool,
+    skip_rules: bool,
 ) -> Option<cella_env::ProxyForwardingConfig> {
     let settings = cella_config::CellaConfig::load(workspace_root, None).unwrap_or_default();
     let toml_net = settings.network.to_network_config();
@@ -1186,7 +1191,7 @@ pub fn build_proxy_forwarding_config(
         proxy: merged.proxy,
         rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
     };
-    let has_rules = net_config.has_rules();
+    let has_rules = net_config.has_rules() && !skip_rules;
 
     Some(cella_env::ProxyForwardingConfig {
         proxy: net_config.proxy.clone(),
@@ -1253,6 +1258,7 @@ mod tests {
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
+            network_rule_policy: crate::NetworkRulePolicy::Enforce,
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1297,6 +1303,7 @@ mod tests {
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
+            network_rule_policy: crate::NetworkRulePolicy::Enforce,
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),
