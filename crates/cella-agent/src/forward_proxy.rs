@@ -112,7 +112,11 @@ async fn handle_connection(stream: TcpStream, config: Arc<AgentProxyConfig>) {
 /// CONNECT requests look like: `CONNECT host:port HTTP/1.1`
 /// We evaluate domain blocking rules before establishing the tunnel.
 /// For domains with path-level rules, we defer to MITM TLS interception.
-async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: &AgentProxyConfig) {
+async fn handle_connect(
+    mut client: BufReader<TcpStream>,
+    target: &str,
+    config: &Arc<AgentProxyConfig>,
+) {
     // Parse host:port from CONNECT target.
     let Some((host, port)) = parse_host_port(target) else {
         let _ = client
@@ -137,7 +141,7 @@ async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: 
         {
             return;
         }
-        crate::mitm::intercept_tls(client_tcp, &host, port, config).await;
+        crate::mitm::intercept_tls(client_tcp, &host, port, config.clone()).await;
         return;
     }
 
@@ -189,7 +193,9 @@ async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: 
 
     // Tunnel bidirectionally.
     let mut upstream = upstream;
-    let _ = copy_bidirectional(&mut client_tcp, &mut upstream).await;
+    if let Err(e) = copy_bidirectional(&mut client_tcp, &mut upstream).await {
+        debug!("Tunnel to {host}:{port} ended: {e}");
+    }
 }
 
 /// Handle direct HTTP proxy request (non-CONNECT).
@@ -244,7 +250,9 @@ async fn handle_direct_http(
 
     // Bidirectional copy for the rest (request body + response).
     let mut client_tcp = client.into_inner();
-    let _ = copy_bidirectional(&mut client_tcp, &mut upstream).await;
+    if let Err(e) = copy_bidirectional(&mut client_tcp, &mut upstream).await {
+        debug!("Direct HTTP tunnel to {host}:{port} ended: {e}");
+    }
 }
 
 /// Connect to the target, either directly or through an upstream proxy.
