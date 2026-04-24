@@ -526,6 +526,46 @@ async fn proxy_connect_tls_and_request(
     Ok(String::from_utf8_lossy(&full_response).to_string())
 }
 
+async fn start_h2_tls_upstream(ca: &TestCa, domain: &str) -> TlsUpstreamServer {
+    use http_body_util::Full as FullBody;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let svc = hyper::service::service_fn(|_req| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(FullBody::new(
+                        Bytes::from("h2 upstream ok"),
+                    )))
+                });
+                let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                let _ = builder.serve_connection(TokioIo::new(tls), svc).await;
+            });
+        }
+    });
+
+    TlsUpstreamServer { addr, task }
+}
+
 fn simple_200_handler() -> (u16, Vec<u8>) {
     (200, b"upstream ok".to_vec())
 }
@@ -607,7 +647,12 @@ async fn mitm_relays_large_response() {
     let log_path = log_dir.path().join("proxy.log");
 
     let upstream = start_tls_upstream(ca, "localhost", large_body_handler).await;
-    let config_json = mitm_proxy_config_json("denylist", &[], &log_path, ca);
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
     let proxy = start_proxy(&config_json).await;
 
     let resp = proxy_connect_tls_and_request(
@@ -641,7 +686,12 @@ async fn mitm_handles_many_keepalive_cycles() {
     let log_path = log_dir.path().join("proxy.log");
 
     let upstream = start_tls_upstream(ca, "localhost", simple_200_handler).await;
-    let config_json = mitm_proxy_config_json("denylist", &[], &log_path, ca);
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
     let proxy = start_proxy(&config_json).await;
 
     let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
@@ -706,6 +756,42 @@ async fn mitm_handles_many_keepalive_cycles() {
             tls.read_exact(&mut body).await.unwrap();
         }
     }
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_relays_through_h2_upstream() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_h2_tls_upstream(ca, "localhost").await;
+    // Path rule triggers MITM interception (domain-only rules skip MITM).
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/api/test",
+        ca,
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.contains("200"), "expected 200, got {resp:?}");
+    assert!(
+        resp.contains("h2 upstream ok"),
+        "expected h2 body, got {resp:?}"
+    );
 
     proxy.task.abort();
     upstream.task.abort();

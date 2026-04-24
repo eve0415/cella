@@ -164,6 +164,7 @@ async fn handle_request(
         return Ok(resp);
     }
 
+    let req = prepare_forwarded_request(req, host);
     let mut upstream = sender.lock().await;
     match upstream.send_request(req).await {
         Ok(resp) => Ok(resp.map(|body| body.map_err(Into::into).boxed())),
@@ -176,6 +177,43 @@ async fn handle_request(
             Ok(resp)
         }
     }
+}
+
+fn prepare_forwarded_request(req: Request<Incoming>, host: &str) -> Request<Incoming> {
+    let (mut parts, body) = req.into_parts();
+
+    // Set URI authority+scheme when missing (h1 origin-form → h2 needs these).
+    if parts.uri.authority().is_none() {
+        let pq = parts
+            .uri
+            .path_and_query()
+            .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+        if let Ok(uri) = hyper::Uri::builder()
+            .scheme("https")
+            .authority(host)
+            .path_and_query(pq)
+            .build()
+        {
+            parts.uri = uri;
+        }
+    }
+
+    // Strip hop-by-hop headers (RFC 7230 §6.1) — these are per-connection,
+    // not end-to-end, and invalid in HTTP/2.
+    for name in &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        parts.headers.remove(*name);
+    }
+
+    Request::from_parts(parts, body)
 }
 
 fn full(data: &'static str) -> BoxBody {
