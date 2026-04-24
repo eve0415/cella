@@ -40,95 +40,15 @@ pub async fn intercept_tls(
     port: u16,
     config: Arc<AgentProxyConfig>,
 ) {
-    let tls_config = match generate_server_config(host, &config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("Failed to generate MITM cert for {host}: {e}");
-            config.log_error(host, &format!("MITM cert generation failed: {e}"));
-            return;
-        }
+    let Some(client_tls) = accept_client_tls(client, host, &config).await else {
+        return;
     };
-
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let client_tls = match acceptor.accept(client).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("TLS handshake failed for {host}: {e}");
-            config.log_error(host, &format!("TLS handshake failed: {e}"));
-            return;
-        }
-    };
-
-    let upstream_tcp =
-        match super::forward_proxy::connect_upstream_for_mitm(host, port, &config).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to connect to {host}:{port}: {e}");
-                config.log_error(host, &format!("upstream connect failed: {e}"));
-                return;
-            }
-        };
-
-    let extra = config.ca_cert_der.as_ref().map(std::slice::from_ref);
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(extra)));
-    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
-        Ok(sn) => sn,
-        Err(e) => {
-            warn!("Invalid server name {host}: {e}");
-            return;
-        }
-    };
-
-    let upstream_tls = match connector.connect(server_name, upstream_tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Upstream TLS handshake failed for {host}: {e}");
-            config.log_error(host, &format!("upstream TLS failed: {e}"));
-            return;
-        }
-    };
-
-    let is_h2 = upstream_tls
-        .get_ref()
-        .1
-        .alpn_protocol()
-        .is_some_and(|p| p == b"h2");
-
-    let upstream_io = TokioIo::new(upstream_tls);
-    let sender = if is_h2 {
-        let (sender, conn) =
-            match hyper::client::conn::http2::handshake(TokioExecutor::new(), upstream_io).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("Upstream HTTP/2 handshake failed for {host}: {e}");
-                    return;
-                }
-            };
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                debug!("Upstream h2 connection ended: {e}");
-            }
-        });
-        UpstreamSender::Http2(sender)
-    } else {
-        let (sender, conn) = match hyper::client::conn::http1::handshake(upstream_io).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("Upstream HTTP/1.1 handshake failed for {host}: {e}");
-                return;
-            }
-        };
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                debug!("Upstream h1 connection ended: {e}");
-            }
-        });
-        UpstreamSender::Http1(sender)
+    let Some(sender) = connect_upstream_tls(host, port, &config).await else {
+        return;
     };
 
     let sender = Arc::new(Mutex::new(sender));
     let host_owned: Arc<str> = host.into();
-
     let client_io = TokioIo::new(client_tls);
 
     let svc = service_fn(move |req: Request<Incoming>| {
@@ -141,6 +61,103 @@ pub async fn intercept_tls(
     let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     if let Err(e) = builder.serve_connection(client_io, svc).await {
         debug!("MITM server for {host} ended: {e}");
+    }
+}
+
+async fn accept_client_tls(
+    client: TcpStream,
+    host: &str,
+    config: &AgentProxyConfig,
+) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+    let tls_config = match generate_server_config(host, config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to generate MITM cert for {host}: {e}");
+            config.log_error(host, &format!("MITM cert generation failed: {e}"));
+            return None;
+        }
+    };
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    match acceptor.accept(client).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("TLS handshake failed for {host}: {e}");
+            config.log_error(host, &format!("TLS handshake failed: {e}"));
+            None
+        }
+    }
+}
+
+async fn connect_upstream_tls(
+    host: &str,
+    port: u16,
+    config: &AgentProxyConfig,
+) -> Option<UpstreamSender> {
+    let upstream_tcp =
+        match super::forward_proxy::connect_upstream_for_mitm(host, port, config).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to connect to {host}:{port}: {e}");
+                config.log_error(host, &format!("upstream connect failed: {e}"));
+                return None;
+            }
+        };
+
+    let extra = config.ca_cert_der.as_ref().map(std::slice::from_ref);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(extra)));
+    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(sn) => sn,
+        Err(e) => {
+            warn!("Invalid server name {host}: {e}");
+            return None;
+        }
+    };
+
+    let upstream_tls = match connector.connect(server_name, upstream_tcp).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Upstream TLS handshake failed for {host}: {e}");
+            config.log_error(host, &format!("upstream TLS failed: {e}"));
+            return None;
+        }
+    };
+
+    let is_h2 = upstream_tls
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .is_some_and(|p| p == b"h2");
+    let upstream_io = TokioIo::new(upstream_tls);
+
+    if is_h2 {
+        let (sender, conn) =
+            match hyper::client::conn::http2::handshake(TokioExecutor::new(), upstream_io).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Upstream HTTP/2 handshake failed for {host}: {e}");
+                    return None;
+                }
+            };
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Upstream h2 connection ended: {e}");
+            }
+        });
+        Some(UpstreamSender::Http2(sender))
+    } else {
+        let (sender, conn) = match hyper::client::conn::http1::handshake(upstream_io).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("Upstream HTTP/1.1 handshake failed for {host}: {e}");
+                return None;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("Upstream h1 connection ended: {e}");
+            }
+        });
+        Some(UpstreamSender::Http1(sender))
     }
 }
 
