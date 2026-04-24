@@ -382,6 +382,22 @@ impl UpContext {
             )
             .await;
 
+        // The agent daemon was launched at container start (or by launch_agent
+        // in the compose flow) before proxy-config.json existed on disk. If
+        // this run just uploaded it, restart the daemon so it re-reads
+        // CELLA_PROXY_CONFIG and actually binds the forward-proxy port —
+        // otherwise every request through HTTP_PROXY is ECONNREFUSED.
+        if env_fwd
+            .post_start
+            .file_uploads
+            .iter()
+            .any(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH)
+            && self.client.capabilities().managed_agent
+        {
+            cella_orchestrator::up::restart_agent_in_container(self.client.as_ref(), container_id)
+                .await;
+        }
+
         // Add /cella/bin to PATH in shell profiles so `cella` CLI is discoverable.
         inject_cella_path(self.client.as_ref(), container_id, remote_user).await;
 

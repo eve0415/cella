@@ -981,6 +981,17 @@ impl EnsureUpContext<'_> {
         })
         .await;
 
+        // The container's entrypoint launches `cella-agent daemon` immediately,
+        // before this post-start step uploads `proxy-config.json`. The daemon
+        // therefore reads `CELLA_PROXY_CONFIG`, finds no file, and gives up
+        // without binding port 18080 — leaving every connection through
+        // `HTTP_PROXY` to ECONNREFUSED. Restart the daemon now that the file
+        // exists so the entrypoint's restart loop respawns it against a
+        // populated config.
+        if injected_proxy_config(&env_fwd.post_start) && self.client.capabilities().managed_agent {
+            restart_agent_in_container(self.client, container_id).await;
+        }
+
         crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
 
         if settings.credentials.gh {
@@ -1537,6 +1548,16 @@ pub async fn ensure_up(
     })
 }
 
+/// Returns `true` if the post-start injection includes the cella-agent
+/// proxy config upload. Used by the create flow to decide whether to
+/// restart the agent so it picks up the now-present config file.
+fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
+    post_start
+        .file_uploads
+        .iter()
+        .any(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH)
+}
+
 /// Restart the in-container agent daemon.
 ///
 /// Kills only the `cella-agent daemon` process (not credential or browser
@@ -1589,6 +1610,34 @@ mod tests {
     #[test]
     fn network_rule_policy_skip_eq() {
         assert_eq!(NetworkRulePolicy::Skip, NetworkRulePolicy::Skip);
+    }
+
+    #[test]
+    fn injected_proxy_config_detects_upload() {
+        let mut post_start = cella_env::PostStartInjection::default();
+        post_start.file_uploads.push(cella_env::FileUpload {
+            container_path: cella_env::PROXY_CONFIG_PATH.to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        });
+        assert!(injected_proxy_config(&post_start));
+    }
+
+    #[test]
+    fn injected_proxy_config_false_when_only_other_uploads() {
+        let mut post_start = cella_env::PostStartInjection::default();
+        post_start.file_uploads.push(cella_env::FileUpload {
+            container_path: "/etc/some-other-file".to_string(),
+            content: b"x".to_vec(),
+            mode: 0o644,
+        });
+        assert!(!injected_proxy_config(&post_start));
+    }
+
+    #[test]
+    fn injected_proxy_config_false_when_empty() {
+        let post_start = cella_env::PostStartInjection::default();
+        assert!(!injected_proxy_config(&post_start));
     }
 
     #[tokio::test]
