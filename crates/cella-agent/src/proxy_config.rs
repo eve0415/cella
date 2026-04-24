@@ -3,6 +3,7 @@
 //! Deserializes the proxy config passed via `--proxy-config` JSON argument
 //! and builds the rule matcher for request evaluation.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -29,6 +30,9 @@ pub struct AgentProxyConfig {
 
     /// Log file for blocked requests.
     log_file: Mutex<Option<std::fs::File>>,
+
+    /// Domains already warned about missing MITM (prevents log spam).
+    warned_no_mitm: Mutex<HashSet<String>>,
 }
 
 impl AgentProxyConfig {
@@ -70,6 +74,7 @@ impl AgentProxyConfig {
             ca_cert_pem: raw.ca_cert_pem,
             ca_key_pem: raw.ca_key_pem,
             log_file: Mutex::new(log_file),
+            warned_no_mitm: Mutex::new(HashSet::new()),
         })
     }
 
@@ -86,6 +91,14 @@ impl AgentProxyConfig {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let _ = writeln!(file, "{timestamp}\tBLOCKED\t{domain}\t{path}\t{reason}");
+    }
+
+    /// Returns `true` the first time a domain is seen (caller should log the warning).
+    pub fn warn_no_mitm_once(&self, domain: &str) -> bool {
+        let Ok(mut set) = self.warned_no_mitm.lock() else {
+            return false;
+        };
+        set.insert(domain.to_string())
     }
 }
 
@@ -272,5 +285,14 @@ mod tests {
         assert!(log.starts_with("existing\n"));
         assert!(log.contains("\tBLOCKED\tone.example\t/\tfirst"));
         assert!(log.contains("\tBLOCKED\ttwo.example\t/two\tsecond"));
+    }
+
+    #[test]
+    fn warn_no_mitm_once_deduplicates() {
+        let json = make_json("denylist", "", "");
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+        assert!(config.warn_no_mitm_once("example.com"));
+        assert!(!config.warn_no_mitm_once("example.com"));
+        assert!(config.warn_no_mitm_once("other.com"));
     }
 }
