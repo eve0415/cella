@@ -2,8 +2,10 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use rcgen::{CertificateParams, DnType, DnValue, IsCa, Issuer, KeyPair, SanType};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -312,4 +314,710 @@ async fn connect_domain_block_still_enforced_without_mitm() {
     );
 
     proxy.task.abort();
+}
+
+// ---- MITM integration test infrastructure ----
+
+struct TestCa {
+    cert_pem: String,
+    key_pem: String,
+    key: KeyPair,
+    params: CertificateParams,
+}
+
+static TEST_CA: OnceLock<TestCa> = OnceLock::new();
+
+fn test_ca() -> &'static TestCa {
+    TEST_CA.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let key = KeyPair::generate().unwrap();
+        let params = cella_network::ca::ca_certificate_params();
+        let cert = params.self_signed(&key).unwrap();
+
+        TestCa {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            key,
+            params,
+        }
+    })
+}
+
+fn generate_server_cert(
+    ca: &TestCa,
+    domain: &str,
+) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let issuer = Issuer::from_params(&ca.params, &ca.key);
+    let server_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::NoCa;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, DnValue::Utf8String(domain.to_string()));
+    params
+        .subject_alt_names
+        .push(SanType::DnsName(domain.to_string().try_into().unwrap()));
+    let cert = params.signed_by(&server_key, &issuer).unwrap();
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
+    (vec![cert_der], key_der)
+}
+
+struct TlsUpstreamServer {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+async fn start_tls_upstream(
+    ca: &TestCa,
+    domain: &str,
+    handler: fn() -> (u16, Vec<u8>),
+) -> TlsUpstreamServer {
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                loop {
+                    let mut headers = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        if tls.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        headers.push(byte[0]);
+                        if headers.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let (status, body) = handler();
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if tls.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if tls.write_all(&body).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    TlsUpstreamServer { addr, task }
+}
+
+fn mitm_proxy_config_json(mode: &str, rules: &[Value], log_path: &Path, ca: &TestCa) -> String {
+    serde_json::json!({
+        "listen_port": 0,
+        "mode": mode,
+        "rules": rules,
+        "upstream_proxy": null,
+        "ca_cert_pem": ca.cert_pem,
+        "ca_key_pem": ca.key_pem,
+        "log_path": log_path.to_string_lossy().into_owned(),
+    })
+    .to_string()
+}
+
+async fn proxy_connect_tls_and_request(
+    proxy_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    path: &str,
+    ca: &TestCa,
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let connect_req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .map_err(|e| format!("write CONNECT: {e}"))?;
+
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let connect_resp = String::from_utf8_lossy(&headers).to_string();
+    if !connect_resp.starts_with("HTTP/1.1 200") {
+        return Ok(connect_resp);
+    }
+
+    let cert_der = CertificateDer::from(
+        ca.params
+            .clone()
+            .self_signed(&ca.key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    );
+    let mut root_store = rustls::RootCertStore::empty();
+    let _ = root_store.add(cert_der);
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| format!("client TLS: {e}"))?;
+
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    tls.write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write request: {e}"))?;
+
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while tls.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let headers_str = String::from_utf8_lossy(&headers).to_string();
+    let cl = headers_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let mut body = vec![0u8; cl];
+    if cl > 0 {
+        tls.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read body: {e}"))?;
+    }
+
+    let mut full_response = headers;
+    full_response.extend_from_slice(&body);
+    Ok(String::from_utf8_lossy(&full_response).to_string())
+}
+
+async fn start_h2_tls_upstream(ca: &TestCa, domain: &str) -> TlsUpstreamServer {
+    use http_body_util::Full as FullBody;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let svc = hyper::service::service_fn(|_req| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(FullBody::new(
+                        Bytes::from("h2 upstream ok"),
+                    )))
+                });
+                let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                let _ = builder.serve_connection(TokioIo::new(tls), svc).await;
+            });
+        }
+    });
+
+    TlsUpstreamServer { addr, task }
+}
+
+async fn start_tls_upgrade_upstream(ca: &TestCa, domain: &str) -> TlsUpstreamServer {
+    let (certs, key) = generate_server_cert(ca, domain);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut headers = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read_exact(&mut byte).await.is_ok() {
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers_str = String::from_utf8_lossy(&headers);
+                let has_upgrade = headers_str
+                    .lines()
+                    .any(|l| l.to_ascii_lowercase().starts_with("upgrade:"));
+                if has_upgrade {
+                    let resp = "HTTP/1.1 101 Switching Protocols\r\n\
+                        Upgrade: websocket\r\n\
+                        Connection: Upgrade\r\n\r\n";
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let _ = tls.write_all(&buf[..n]).await;
+                            }
+                        }
+                    }
+                } else {
+                    let body = b"no upgrade";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.write_all(body).await;
+                }
+            });
+        }
+    });
+
+    TlsUpstreamServer { addr, task }
+}
+
+fn simple_200_handler() -> (u16, Vec<u8>) {
+    (200, b"upstream ok".to_vec())
+}
+
+fn large_body_handler() -> (u16, Vec<u8>) {
+    (200, vec![0x42; 256 * 1024])
+}
+
+#[tokio::test]
+async fn mitm_allows_and_relays_response() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upstream(ca, "localhost", simple_200_handler).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/blocked/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/allowed",
+        ca,
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.contains("200"), "expected 200, got {resp:?}");
+    assert!(resp.contains("upstream ok"), "expected body, got {resp:?}");
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_blocks_matching_path() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upstream(ca, "localhost", simple_200_handler).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/blocked/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/blocked/secret",
+        ca,
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.contains("403"), "expected 403, got {resp:?}");
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("BLOCKED\tlocalhost\t/blocked/secret"));
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_relays_large_response() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upstream(ca, "localhost", large_body_handler).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/large",
+        ca,
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.contains("200"), "expected 200, got {resp:?}");
+    let body_start = resp.find("\r\n\r\n").unwrap() + 4;
+    let body = &resp.as_bytes()[body_start..];
+    assert_eq!(
+        body.len(),
+        256 * 1024,
+        "expected 256KB body, got {} bytes",
+        body.len()
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_handles_many_keepalive_cycles() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upstream(ca, "localhost", simple_200_handler).await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let connect_req = format!(
+        "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        upstream.addr.port(),
+        upstream.addr.port(),
+    );
+    stream.write_all(connect_req.as_bytes()).await.unwrap();
+
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let cert_der = CertificateDer::from(
+        ca.params
+            .clone()
+            .self_signed(&ca.key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    );
+    let mut root_store = rustls::RootCertStore::empty();
+    let _ = root_store.add(cert_der);
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls = connector.connect(server_name, stream).await.unwrap();
+
+    for i in 0..20 {
+        let req = format!("GET /req/{i} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+
+        let mut resp_headers = Vec::new();
+        let mut b = [0u8; 1];
+        while tls.read_exact(&mut b).await.is_ok() {
+            resp_headers.push(b[0]);
+            if resp_headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let resp_str = String::from_utf8_lossy(&resp_headers);
+        assert!(resp_str.contains("200"), "request {i} failed: {resp_str}");
+
+        let cl = resp_str
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if cl > 0 {
+            let mut body = vec![0u8; cl];
+            tls.read_exact(&mut body).await.unwrap();
+        }
+    }
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_relays_through_h2_upstream() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_h2_tls_upstream(ca, "localhost").await;
+    // Path rule triggers MITM interception (domain-only rules skip MITM).
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/never-block-this/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let resp = proxy_connect_tls_and_request(
+        proxy.local_addr,
+        "localhost",
+        upstream.addr.port(),
+        "/api/test",
+        ca,
+    )
+    .await
+    .unwrap();
+
+    assert!(resp.contains("200"), "expected 200, got {resp:?}");
+    assert!(
+        resp.contains("h2 upstream ok"),
+        "expected h2 body, got {resp:?}"
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_relays_websocket_upgrade() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upgrade_upstream(ca, "localhost").await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/blocked/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let connect_req = format!(
+        "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        upstream.addr.port()
+    );
+    stream.write_all(connect_req.as_bytes()).await.unwrap();
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let connect_resp = String::from_utf8_lossy(&headers);
+    assert!(
+        connect_resp.starts_with("HTTP/1.1 200"),
+        "CONNECT failed: {connect_resp:?}"
+    );
+
+    let cert_der = CertificateDer::from(
+        ca.params
+            .clone()
+            .self_signed(&ca.key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    );
+    let mut root_store = rustls::RootCertStore::empty();
+    let _ = root_store.add(cert_der);
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls = connector.connect(server_name, stream).await.unwrap();
+
+    let req = "GET /allowed HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Upgrade: websocket\r\n\
+        Connection: Upgrade\r\n\r\n";
+    tls.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp_headers = Vec::new();
+    while tls.read_exact(&mut byte).await.is_ok() {
+        resp_headers.push(byte[0]);
+        if resp_headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp_str = String::from_utf8_lossy(&resp_headers);
+    assert!(resp_str.contains("101"), "expected 101, got {resp_str:?}");
+
+    let test_data = b"hello websocket";
+    tls.write_all(test_data).await.unwrap();
+    let mut echoed = vec![0u8; test_data.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tls.read_exact(&mut echoed),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&echoed, test_data, "echoed data mismatch");
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn mitm_blocks_upgrade_on_blocked_path() {
+    let ca = test_ca();
+    let log_dir = TempDir::new().unwrap();
+    let log_path = log_dir.path().join("proxy.log");
+
+    let upstream = start_tls_upgrade_upstream(ca, "localhost").await;
+    let config_json = mitm_proxy_config_json(
+        "denylist",
+        &[rule("localhost", &["/blocked/**"], "block")],
+        &log_path,
+        ca,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let mut stream = TcpStream::connect(proxy.local_addr).await.unwrap();
+    let connect_req = format!(
+        "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        upstream.addr.port()
+    );
+    stream.write_all(connect_req.as_bytes()).await.unwrap();
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let connect_resp = String::from_utf8_lossy(&headers);
+    assert!(
+        connect_resp.starts_with("HTTP/1.1 200"),
+        "CONNECT failed: {connect_resp:?}"
+    );
+
+    let cert_der = CertificateDer::from(
+        ca.params
+            .clone()
+            .self_signed(&ca.key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    );
+    let mut root_store = rustls::RootCertStore::empty();
+    let _ = root_store.add(cert_der);
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls = connector.connect(server_name, stream).await.unwrap();
+
+    let req = "GET /blocked/ws HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Upgrade: websocket\r\n\
+        Connection: Upgrade\r\n\r\n";
+    tls.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp_headers = Vec::new();
+    while tls.read_exact(&mut byte).await.is_ok() {
+        resp_headers.push(byte[0]);
+        if resp_headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp_str = String::from_utf8_lossy(&resp_headers);
+    assert!(
+        resp_str.contains("403"),
+        "expected 403 for blocked path, got {resp_str:?}"
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
 }
