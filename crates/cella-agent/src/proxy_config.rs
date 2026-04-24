@@ -4,12 +4,13 @@
 //! and builds the rule matcher for request evaluation.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction};
 use cella_network::rules::RuleMatcher;
+use rustls::pki_types::CertificateDer;
 
 /// Runtime configuration for the forward proxy.
 pub struct AgentProxyConfig {
@@ -27,6 +28,9 @@ pub struct AgentProxyConfig {
 
     /// PEM-encoded CA private key for MITM TLS interception.
     pub ca_key_pem: Option<String>,
+
+    /// Parsed CA certificate DER (for upstream TLS trust).
+    pub ca_cert_der: Option<CertificateDer<'static>>,
 
     /// Log file for blocked requests.
     log_file: Mutex<Option<std::fs::File>>,
@@ -67,12 +71,18 @@ impl AgentProxyConfig {
         // Open log file.
         let log_file = open_log_file(raw.log_path.as_deref());
 
+        let ca_cert_der = raw.ca_cert_pem.as_deref().and_then(|pem| {
+            let mut reader = BufReader::new(pem.as_bytes());
+            rustls_pemfile::certs(&mut reader).find_map(Result::ok)
+        });
+
         Ok(Self {
             listen_port: raw.listen_port,
             matcher,
             upstream_proxy: raw.upstream_proxy,
             ca_cert_pem: raw.ca_cert_pem,
             ca_key_pem: raw.ca_key_pem,
+            ca_cert_der,
             log_file: Mutex::new(log_file),
             warned_no_mitm: Mutex::new(HashSet::new()),
         })

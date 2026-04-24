@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
 use http_body_util::{BodyExt, Full};
@@ -16,7 +15,8 @@ use tracing::{debug, warn};
 
 use crate::proxy_config::AgentProxyConfig;
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+type BoxBody =
+    http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 static NATIVE_ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
 
@@ -69,7 +69,8 @@ pub async fn intercept_tls(
             }
         };
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(None)));
+    let extra = config.ca_cert_der.as_ref().map(std::slice::from_ref);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(extra)));
     let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
         Ok(sn) => sn,
         Err(e) => {
@@ -148,7 +149,7 @@ async fn handle_request(
     host: &str,
     config: &AgentProxyConfig,
     sender: &Mutex<UpstreamSender>,
-) -> Result<Response<BoxBody>, Infallible> {
+) -> Result<Response<BoxBody>, std::convert::Infallible> {
     let path = super::forward_proxy::strip_query(req.uri().path());
     let verdict = config.matcher.evaluate(host, path);
 
@@ -165,7 +166,7 @@ async fn handle_request(
 
     let mut upstream = sender.lock().await;
     match upstream.send_request(req).await {
-        Ok(resp) => Ok(resp.map(|body| body.map_err(|_: hyper::Error| unreachable!()).boxed())),
+        Ok(resp) => Ok(resp.map(|body| body.map_err(Into::into).boxed())),
         Err(e) => {
             warn!("Upstream request to {host} failed: {e}");
             let resp = Response::builder()
@@ -178,7 +179,9 @@ async fn handle_request(
 }
 
 fn full(data: &'static str) -> BoxBody {
-    Full::new(Bytes::from(data)).boxed()
+    Full::new(Bytes::from(data))
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 fn generate_server_config(domain: &str, config: &AgentProxyConfig) -> Result<ServerConfig, String> {
@@ -246,17 +249,18 @@ fn cached_native_roots() -> Arc<rustls::RootCertStore> {
         .clone()
 }
 
-pub fn upstream_tls_config(custom_roots: Option<&[CertificateDer<'_>]>) -> rustls::ClientConfig {
-    let root_store = custom_roots.map_or_else(cached_native_roots, |roots| {
-        let mut store = rustls::RootCertStore::empty();
+pub fn upstream_tls_config(
+    additional_roots: Option<&[CertificateDer<'_>]>,
+) -> rustls::ClientConfig {
+    let mut root_store = (*cached_native_roots()).clone();
+    if let Some(roots) = additional_roots {
         for cert in roots {
-            let _ = store.add(cert.clone());
+            let _ = root_store.add(cert.clone());
         }
-        Arc::new(store)
-    });
+    }
 
     let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates((*root_store).clone())
+        .with_root_certificates(root_store)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config
