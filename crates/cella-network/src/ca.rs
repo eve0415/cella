@@ -79,12 +79,16 @@ pub fn ensure_ca() -> Result<CaCertificate, CaError> {
     generate_ca(&ca_dir)
 }
 
-/// Generate a new CA certificate and save to disk.
-fn generate_ca(ca_dir: &Path) -> Result<CaCertificate, CaError> {
-    std::fs::create_dir_all(ca_dir)?;
-
-    let key_pair = KeyPair::generate().map_err(CaError::KeyGeneration)?;
-
+/// Build the `CertificateParams` used for the cella MITM CA.
+///
+/// Used both when first creating the CA on disk and when re-loading it inside
+/// `cella-agent` to sign per-domain leaf certificates. The two call sites
+/// MUST produce identical params — otherwise leaf certs end up with an
+/// `Issuer` DN that doesn't match the CA's `Subject` DN, and TLS chain
+/// validation in the container fails (every MITM'd request gets a
+/// connection reset).
+#[must_use]
+pub fn ca_certificate_params() -> CertificateParams {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
@@ -93,6 +97,16 @@ fn generate_ca(ca_dir: &Path) -> Result<CaCertificate, CaError> {
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Cella");
+    params
+}
+
+/// Generate a new CA certificate and save to disk.
+fn generate_ca(ca_dir: &Path) -> Result<CaCertificate, CaError> {
+    std::fs::create_dir_all(ca_dir)?;
+
+    let key_pair = KeyPair::generate().map_err(CaError::KeyGeneration)?;
+
+    let params = ca_certificate_params();
 
     let cert = params
         .self_signed(&key_pair)
