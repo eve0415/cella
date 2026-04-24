@@ -30,6 +30,7 @@ pub async fn intercept_tls(client: TcpStream, host: &str, port: u16, config: &Ag
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to generate MITM cert for {host}: {e}");
+            config.log_error(host, &format!("MITM cert generation failed: {e}"));
             return;
         }
     };
@@ -39,7 +40,8 @@ pub async fn intercept_tls(client: TcpStream, host: &str, port: u16, config: &Ag
     let tls_stream = match acceptor.accept(client).await {
         Ok(s) => s,
         Err(e) => {
-            debug!("TLS handshake failed for {host}: {e}");
+            warn!("TLS handshake failed for {host}: {e}");
+            config.log_error(host, &format!("TLS handshake failed: {e}"));
             return;
         }
     };
