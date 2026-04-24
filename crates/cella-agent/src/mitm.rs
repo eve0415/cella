@@ -330,6 +330,7 @@ fn prepare_forwarded_request(
             "proxy-authorization",
             "te",
             "trailer",
+            "transfer-encoding",
         ]
     } else {
         &[
