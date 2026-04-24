@@ -55,7 +55,7 @@ pub async fn intercept_tls(
         let sender = sender.clone();
         let host = host_owned.clone();
         let config = config.clone();
-        async move { handle_request(req, &host, &config, &sender).await }
+        async move { handle_request(req, &host, port, &config, &sender).await }
     });
 
     let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -173,9 +173,96 @@ fn is_upgrade_request<B>(req: &Request<B>) -> bool {
             })
 }
 
+async fn connect_h1_upstream(
+    host: &str,
+    port: u16,
+    config: &AgentProxyConfig,
+) -> Result<hyper::client::conn::http1::SendRequest<Incoming>, String> {
+    let upstream_tcp = super::forward_proxy::connect_upstream_for_mitm(host, port, config)
+        .await
+        .map_err(|e| format!("upstream connect: {e}"))?;
+
+    let extra = config.ca_cert_der.as_ref().map(std::slice::from_ref);
+    let mut tls_config = upstream_tls_config(extra);
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid server name: {e}"))?;
+    let upstream_tls = connector
+        .connect(server_name, upstream_tcp)
+        .await
+        .map_err(|e| format!("upstream TLS: {e}"))?;
+
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(upstream_tls))
+        .await
+        .map_err(|e| format!("upstream h1 handshake: {e}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            debug!("Upgrade upstream connection ended: {e}");
+        }
+    });
+    Ok(sender)
+}
+
+async fn handle_upgrade_request(
+    mut req: Request<Incoming>,
+    host: &str,
+    port: u16,
+    config: &AgentProxyConfig,
+) -> Result<Response<BoxBody>, std::convert::Infallible> {
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    let req = prepare_forwarded_request(req, host, true);
+
+    let mut sender = match connect_h1_upstream(host, port, config).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Upgrade upstream connection to {host} failed: {e}");
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .body(full("Bad Gateway"))
+                .expect("building 502"));
+        }
+    };
+
+    let mut resp = match sender.send_request(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Upgrade request to {host} failed: {e}");
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .body(full("Bad Gateway"))
+                .expect("building 502"));
+        }
+    };
+
+    if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(resp.map(|body| body.map_err(Into::into).boxed()));
+    }
+
+    let upstream_upgrade = hyper::upgrade::on(&mut resp);
+    let host_owned = host.to_string();
+    tokio::spawn(async move {
+        let (client_io, upstream_io) = match tokio::join!(client_upgrade, upstream_upgrade) {
+            (Ok(c), Ok(u)) => (c, u),
+            (Err(e), _) | (_, Err(e)) => {
+                debug!("Upgrade for {host_owned} failed: {e}");
+                return;
+            }
+        };
+        let mut client_io = TokioIo::new(client_io);
+        let mut upstream_io = TokioIo::new(upstream_io);
+        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
+            debug!("Upgraded connection to {host_owned} ended: {e}");
+        }
+    });
+
+    Ok(resp.map(|body| body.map_err(Into::into).boxed()))
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     host: &str,
+    port: u16,
     config: &AgentProxyConfig,
     sender: &Mutex<UpstreamSender>,
 ) -> Result<Response<BoxBody>, std::convert::Infallible> {
@@ -194,7 +281,7 @@ async fn handle_request(
     }
 
     if is_upgrade_request(&req) {
-        debug!("Upgrade request for {host}{path}");
+        return handle_upgrade_request(req, host, port, config).await;
     }
 
     let req = prepare_forwarded_request(req, host, false);
