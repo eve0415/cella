@@ -430,14 +430,8 @@ fn load_ca_materials(config: &AgentProxyConfig) -> Result<CaIssuerMaterials, Str
 
     let ca_key_pair = KeyPair::from_pem(ca_key_pem).map_err(|e| format!("parse CA key: {e}"))?;
 
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "Cella Dev Container CA");
-
     Ok(CaIssuerMaterials {
-        params: ca_params,
+        params: cella_network::ca::ca_certificate_params(),
         key_pair: ca_key_pair,
     })
 }
