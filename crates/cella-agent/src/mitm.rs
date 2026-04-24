@@ -59,7 +59,7 @@ pub async fn intercept_tls(
     });
 
     let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    if let Err(e) = builder.serve_connection(client_io, svc).await {
+    if let Err(e) = builder.serve_connection_with_upgrades(client_io, svc).await {
         debug!("MITM server for {host} ended: {e}");
     }
 }
@@ -161,6 +161,18 @@ async fn connect_upstream_tls(
     }
 }
 
+fn is_upgrade_request<B>(req: &Request<B>) -> bool {
+    req.headers().get("upgrade").is_some()
+        && req
+            .headers()
+            .get("connection")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+            })
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     host: &str,
@@ -181,7 +193,11 @@ async fn handle_request(
         return Ok(resp);
     }
 
-    let req = prepare_forwarded_request(req, host);
+    if is_upgrade_request(&req) {
+        debug!("Upgrade request for {host}{path}");
+    }
+
+    let req = prepare_forwarded_request(req, host, false);
     let mut upstream = sender.lock().await;
     match upstream.send_request(req).await {
         Ok(resp) => Ok(resp.map(|body| body.map_err(Into::into).boxed())),
@@ -196,10 +212,13 @@ async fn handle_request(
     }
 }
 
-fn prepare_forwarded_request(req: Request<Incoming>, host: &str) -> Request<Incoming> {
+fn prepare_forwarded_request(
+    req: Request<Incoming>,
+    host: &str,
+    preserve_upgrade: bool,
+) -> Request<Incoming> {
     let (mut parts, body) = req.into_parts();
 
-    // Set URI authority+scheme when missing (h1 origin-form → h2 needs these).
     if parts.uri.authority().is_none() {
         let pq = parts
             .uri
@@ -215,18 +234,27 @@ fn prepare_forwarded_request(req: Request<Incoming>, host: &str) -> Request<Inco
         }
     }
 
-    // Strip hop-by-hop headers (RFC 7230 §6.1) — these are per-connection,
-    // not end-to-end, and invalid in HTTP/2.
-    for name in &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ] {
+    let hop_by_hop: &[&str] = if preserve_upgrade {
+        &[
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+        ]
+    } else {
+        &[
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ]
+    };
+    for name in hop_by_hop {
         parts.headers.remove(*name);
     }
 
@@ -375,5 +403,44 @@ mod tests {
             config.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+    }
+
+    #[test]
+    fn detects_websocket_upgrade_request() {
+        let req = Request::builder()
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(())
+            .unwrap();
+        assert!(is_upgrade_request(&req));
+    }
+
+    #[test]
+    fn detects_upgrade_in_multi_value_connection() {
+        let req = Request::builder()
+            .header("upgrade", "websocket")
+            .header("connection", "keep-alive, Upgrade")
+            .body(())
+            .unwrap();
+        assert!(is_upgrade_request(&req));
+    }
+
+    #[test]
+    fn rejects_request_without_upgrade_header() {
+        let req = Request::builder()
+            .header("connection", "keep-alive")
+            .body(())
+            .unwrap();
+        assert!(!is_upgrade_request(&req));
+    }
+
+    #[test]
+    fn rejects_upgrade_without_connection_token() {
+        let req = Request::builder()
+            .header("upgrade", "websocket")
+            .header("connection", "keep-alive")
+            .body(())
+            .unwrap();
+        assert!(!is_upgrade_request(&req));
     }
 }
