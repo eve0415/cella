@@ -93,6 +93,21 @@ impl AgentProxyConfig {
         let _ = writeln!(file, "{timestamp}\tBLOCKED\t{domain}\t{path}\t{reason}");
     }
 
+    /// Log an error (e.g. TLS handshake failure) to the proxy log file.
+    pub fn log_error(&self, domain: &str, error: &str) {
+        let Ok(mut guard) = self.log_file.lock() else {
+            return;
+        };
+        let Some(ref mut file) = *guard else {
+            return;
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{timestamp}\tERROR\t{domain}\t{error}");
+    }
+
     /// Returns `true` the first time a domain is seen (caller should log the warning).
     pub fn warn_no_mitm_once(&self, domain: &str) -> bool {
         let Ok(mut set) = self.warned_no_mitm.lock() else {
@@ -285,6 +300,23 @@ mod tests {
         assert!(log.starts_with("existing\n"));
         assert!(log.contains("\tBLOCKED\tone.example\t/\tfirst"));
         assert!(log.contains("\tBLOCKED\ttwo.example\t/two\tsecond"));
+    }
+
+    #[test]
+    fn log_error_writes_to_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.log");
+        let json = make_json(
+            "denylist",
+            "",
+            &format!(r#","log_path":"{}""#, path.display()),
+        );
+        let config = AgentProxyConfig::from_json(&json).unwrap();
+
+        config.log_error("example.com", "TLS handshake failed: test error");
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\tERROR\texample.com\tTLS handshake failed: test error"));
     }
 
     #[test]

@@ -144,6 +144,20 @@ async fn main() {
         .compact()
         .init();
 
+    // rustls 0.23 refuses to pick a default crypto provider when both `ring`
+    // and `aws-lc-rs` end up in the dependency graph — it panics on first use
+    // (acceptor.accept, connector.connect) from inside a spawned task where
+    // the panic goes only to stderr, which the entrypoint redirects to
+    // /dev/null. Without this call, every MITM'd HTTPS request silently
+    // aborts. Install ring explicitly so the behaviour is deterministic
+    // regardless of what other workspace crates enable.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Already installed by some earlier code path — harmless.
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

@@ -25,6 +25,13 @@ pub use error::CellaEnvError;
 pub use git_config::GitConfigEntry;
 pub use platform::DockerRuntime;
 
+/// In-container path of the cella-agent proxy config file.
+///
+/// Uploaded post-start by the orchestrator (contains the MITM CA private key,
+/// so it must not live in an image layer or env var) and read by `cella-agent`
+/// at daemon startup via the `CELLA_PROXY_CONFIG` env var.
+pub const PROXY_CONFIG_PATH: &str = "/tmp/.cella/proxy-config.json";
+
 /// A bind mount to add to the container at creation time.
 #[derive(Debug, Clone)]
 pub struct ForwardMount {
@@ -255,15 +262,14 @@ pub fn prepare_env_forwarding(
             && let Some(ref net_full) = net_config.full_config
         {
             let json = proxy::build_agent_proxy_config_json(net_full);
-            let config_path = "/tmp/.cella/proxy-config.json";
             fwd.post_start.file_uploads.push(FileUpload {
-                container_path: config_path.to_string(),
+                container_path: PROXY_CONFIG_PATH.to_string(),
                 content: json.into_bytes(),
                 mode: 0o600,
             });
             fwd.env.push(ForwardEnv {
                 key: "CELLA_PROXY_CONFIG".to_string(),
-                value: config_path.to_string(),
+                value: PROXY_CONFIG_PATH.to_string(),
             });
         }
 
