@@ -141,27 +141,24 @@ async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: 
         return;
     }
 
-    if needs_path_inspection {
-        // Path-level rules but MITM unavailable — can't inspect paths without
-        // TLS interception. Warn once per domain and allow through.
-        if config.warn_no_mitm_once(&host) {
-            warn!(
-                "CONNECT to {host}: path-level rules exist but MITM is unavailable; \
-                 allowing connection (path blocking requires TLS interception)"
-            );
-        }
-    } else {
-        // Domain-only rules — evaluate without path inspection.
-        let verdict = config.matcher.evaluate(&host, "/");
-        if !verdict.allowed {
-            info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
-            config.log_blocked(&host, "/", &verdict.reason);
-            let _ = client
-                .get_mut()
-                .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                .await;
-            return;
-        }
+    if needs_path_inspection && config.warn_no_mitm_once(&host) {
+        warn!(
+            "CONNECT to {host}: path-level rules exist but MITM is unavailable; \
+             path blocking disabled (requires TLS interception)"
+        );
+    }
+
+    // Evaluate domain-level rules. The "/" path won't trigger path-specific
+    // rules, so domain blocks still apply even without MITM.
+    let verdict = config.matcher.evaluate(&host, "/");
+    if !verdict.allowed {
+        info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
+        config.log_blocked(&host, "/", &verdict.reason);
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await;
+        return;
     }
 
     // Tunnel without MITM.

@@ -288,3 +288,28 @@ async fn connect_with_path_rules_but_no_mitm_allows_through() {
     proxy.task.abort();
     upstream.task.abort();
 }
+
+#[tokio::test]
+async fn connect_domain_block_still_enforced_without_mitm() {
+    let log_dir = TempDir::new().expect("temp log dir");
+    let log_path = log_dir.path().join("proxy.log");
+    // Domain has both a domain-level block AND a path-level rule.
+    // Without MITM, path rules can't fire but the domain block must.
+    let config_json = proxy_config_json(
+        "denylist",
+        &[
+            rule("127.0.0.1", &[], "block"),
+            rule("127.0.0.1", &["/secret/**"], "block"),
+        ],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let blocked = proxy_connect_request(proxy.local_addr, 9).await;
+    assert!(
+        blocked.starts_with("HTTP/1.1 403 Forbidden"),
+        "domain block should still apply without MITM, got {blocked:?}"
+    );
+
+    proxy.task.abort();
+}
