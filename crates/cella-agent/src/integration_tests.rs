@@ -890,6 +890,11 @@ async fn mitm_relays_websocket_upgrade() {
             break;
         }
     }
+    let connect_resp = String::from_utf8_lossy(&headers);
+    assert!(
+        connect_resp.starts_with("HTTP/1.1 200"),
+        "CONNECT failed: {connect_resp:?}"
+    );
 
     let cert_der = CertificateDer::from(
         ca.params
@@ -970,6 +975,11 @@ async fn mitm_blocks_upgrade_on_blocked_path() {
             break;
         }
     }
+    let connect_resp = String::from_utf8_lossy(&headers);
+    assert!(
+        connect_resp.starts_with("HTTP/1.1 200"),
+        "CONNECT failed: {connect_resp:?}"
+    );
 
     let cert_der = CertificateDer::from(
         ca.params
