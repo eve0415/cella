@@ -8,7 +8,7 @@
 //! 4. Evaluate blocking rules against domain + path for every request
 //! 5. If allowed, relay to upstream; if blocked, send 403
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rcgen::{CertificateParams, DnType, DnValue, IsCa, Issuer, KeyPair, SanType};
 use rustls::ServerConfig;
@@ -19,6 +19,8 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::proxy_config::AgentProxyConfig;
+
+static NATIVE_ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
 
 /// Perform MITM interception on a CONNECT tunnel.
 ///
@@ -83,7 +85,7 @@ pub async fn intercept_tls(client: TcpStream, host: &str, port: u16, config: &Ag
         };
 
     // Establish TLS to upstream.
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config()));
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(upstream_tls_config(None)));
     let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
         Ok(sn) => sn,
         Err(e) => {
@@ -413,10 +415,12 @@ fn generate_server_config(domain: &str, config: &AgentProxyConfig) -> Result<Ser
     let cert_der = CertificateDer::from(domain_cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(domain_key.serialize_der()));
 
-    ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
-        .map_err(|e| format!("server config: {e}"))
+        .map_err(|e| format!("server config: {e}"))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 struct CaIssuerMaterials {
@@ -438,17 +442,33 @@ fn load_ca_materials(config: &AgentProxyConfig) -> Result<CaIssuerMaterials, Str
     })
 }
 
-fn upstream_tls_config() -> rustls::ClientConfig {
-    let mut root_store = rustls::RootCertStore::empty();
+fn cached_native_roots() -> Arc<rustls::RootCertStore> {
+    NATIVE_ROOTS
+        .get_or_init(|| {
+            let mut root_store = rustls::RootCertStore::empty();
+            let native = rustls_native_certs::load_native_certs();
+            for cert in native.certs {
+                let _ = root_store.add(cert);
+            }
+            Arc::new(root_store)
+        })
+        .clone()
+}
 
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = root_store.add(cert);
-    }
+pub fn upstream_tls_config(custom_roots: Option<&[CertificateDer<'_>]>) -> rustls::ClientConfig {
+    let root_store = custom_roots.map_or_else(cached_native_roots, |roots| {
+        let mut store = rustls::RootCertStore::empty();
+        for cert in roots {
+            let _ = store.add(cert.clone());
+        }
+        Arc::new(store)
+    });
 
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates((*root_store).clone())
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
 }
 
 #[cfg(test)]
