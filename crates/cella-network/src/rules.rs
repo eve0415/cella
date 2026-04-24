@@ -119,6 +119,50 @@ impl RuleMatcher {
         }
     }
 
+    /// Evaluate only domain-level rules (rules without path patterns).
+    ///
+    /// Used for CONNECT requests when MITM is unavailable — path-level rules
+    /// are skipped entirely rather than evaluated against a fake path.
+    pub fn evaluate_domain_only(&self, domain: &str) -> RuleVerdict {
+        let domain_lower = domain.to_ascii_lowercase();
+
+        for rule in &self.rules {
+            if !rule.path_patterns.is_empty() {
+                continue;
+            }
+            if !match_domain(&rule.domain_parts, &domain_lower) {
+                continue;
+            }
+
+            let allowed = rule.action == RuleAction::Allow;
+            return RuleVerdict {
+                allowed,
+                reason: format!(
+                    "{} by rule: {}",
+                    if allowed { "allowed" } else { "blocked" },
+                    rule.pattern_display,
+                ),
+                matched_rule: Some(rule.pattern_display.clone()),
+                source: Some(rule.source.clone()),
+            };
+        }
+
+        match self.mode {
+            NetworkMode::Denylist => RuleVerdict {
+                allowed: true,
+                reason: "allowed (no matching deny rule)".to_string(),
+                matched_rule: None,
+                source: None,
+            },
+            NetworkMode::Allowlist => RuleVerdict {
+                allowed: false,
+                reason: "blocked (no matching allow rule)".to_string(),
+                matched_rule: None,
+                source: None,
+            },
+        }
+    }
+
     /// Check whether any rule for the given domain requires path inspection.
     ///
     /// If `true`, MITM TLS interception is needed for this domain.
@@ -533,5 +577,54 @@ mod tests {
 
         let v = matcher.evaluate("example.com", "");
         assert!(!v.allowed);
+    }
+
+    #[test]
+    fn evaluate_domain_only_skips_path_rules() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules: vec![NetworkRule {
+                domain: "example.com".to_string(),
+                paths: vec!["/**".to_string()],
+                action: RuleAction::Block,
+            }],
+            ..Default::default()
+        };
+        let matcher = RuleMatcher::new(&config);
+
+        // Full evaluate with "/" matches the "/**" path rule → blocked.
+        assert!(!matcher.evaluate("example.com", "/").allowed);
+        // Domain-only skips the path rule → allowed (denylist default).
+        assert!(matcher.evaluate_domain_only("example.com").allowed);
+    }
+
+    #[test]
+    fn evaluate_domain_only_still_blocks_domain_rules() {
+        let config = NetworkConfig {
+            mode: NetworkMode::Denylist,
+            rules: vec![
+                NetworkRule {
+                    domain: "evil.com".to_string(),
+                    paths: vec![],
+                    action: RuleAction::Block,
+                },
+                NetworkRule {
+                    domain: "mixed.com".to_string(),
+                    paths: vec!["/secret/**".to_string()],
+                    action: RuleAction::Block,
+                },
+                NetworkRule {
+                    domain: "mixed.com".to_string(),
+                    paths: vec![],
+                    action: RuleAction::Block,
+                },
+            ],
+            ..Default::default()
+        };
+        let matcher = RuleMatcher::new(&config);
+
+        assert!(!matcher.evaluate_domain_only("evil.com").allowed);
+        assert!(!matcher.evaluate_domain_only("mixed.com").allowed);
+        assert!(matcher.evaluate_domain_only("good.com").allowed);
     }
 }

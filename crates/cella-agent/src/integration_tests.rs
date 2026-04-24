@@ -132,6 +132,59 @@ async fn proxy_connect_request(proxy_addr: SocketAddr, port: u16) -> String {
     String::from_utf8(response).expect("utf8 CONNECT response")
 }
 
+/// Send CONNECT, then tunnel an HTTP GET through the established connection.
+/// Returns the CONNECT status line if it fails (e.g. 403), or the tunneled
+/// HTTP response body if the tunnel is established.
+async fn proxy_connect_and_tunnel(
+    proxy_addr: SocketAddr,
+    upstream_addr: SocketAddr,
+    path: &str,
+) -> String {
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    let connect_req = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        upstream_addr.port(),
+        upstream_addr.port(),
+    );
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .expect("write CONNECT");
+
+    // Read CONNECT response headers.
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    while stream.read_exact(&mut byte).await.is_ok() {
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let connect_response = String::from_utf8_lossy(&headers).to_string();
+    if !connect_response.starts_with("HTTP/1.1 200") {
+        return connect_response;
+    }
+
+    // Tunnel is open — send plain HTTP through it.
+    let http_req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        upstream_addr.port(),
+    );
+    stream
+        .write_all(http_req.as_bytes())
+        .await
+        .expect("write HTTP through tunnel");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read tunneled response");
+    String::from_utf8(response).expect("utf8 tunneled response")
+}
+
 #[tokio::test]
 async fn denylist_path_rule_blocks_matching_http_request() {
     let log_dir = TempDir::new().expect("temp log dir");
@@ -207,6 +260,56 @@ async fn connect_domain_rule_is_blocked_before_upstream_connection() {
 
     let log = std::fs::read_to_string(&log_path).expect("blocked-request log");
     assert!(log.contains("BLOCKED\t127.0.0.1\t/"));
+
+    proxy.task.abort();
+}
+
+#[tokio::test]
+async fn connect_with_path_rules_but_no_mitm_allows_through() {
+    let log_dir = TempDir::new().expect("temp log dir");
+    let log_path = log_dir.path().join("proxy.log");
+    let upstream = start_upstream_server().await;
+    // Path-level rule but no ca_cert_pem/ca_key_pem → no MITM available.
+    let config_json = proxy_config_json(
+        "denylist",
+        &[rule("127.0.0.1", &["/blocked/**"], "block")],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    // CONNECT should succeed (200) and tunnel to upstream, not 403.
+    let response =
+        proxy_connect_and_tunnel(proxy.local_addr, upstream.addr, "/blocked/secret").await;
+    assert!(
+        response.contains("upstream ok"),
+        "expected tunnel passthrough, got {response:?}"
+    );
+
+    proxy.task.abort();
+    upstream.task.abort();
+}
+
+#[tokio::test]
+async fn connect_domain_block_still_enforced_without_mitm() {
+    let log_dir = TempDir::new().expect("temp log dir");
+    let log_path = log_dir.path().join("proxy.log");
+    // Domain has both a domain-level block AND a path-level rule.
+    // Without MITM, path rules can't fire but the domain block must.
+    let config_json = proxy_config_json(
+        "denylist",
+        &[
+            rule("127.0.0.1", &[], "block"),
+            rule("127.0.0.1", &["/secret/**"], "block"),
+        ],
+        &log_path,
+    );
+    let proxy = start_proxy(&config_json).await;
+
+    let blocked = proxy_connect_request(proxy.local_addr, 9).await;
+    assert!(
+        blocked.starts_with("HTTP/1.1 403 Forbidden"),
+        "domain block should still apply without MITM, got {blocked:?}"
+    );
 
     proxy.task.abort();
 }

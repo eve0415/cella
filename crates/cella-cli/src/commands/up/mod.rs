@@ -117,7 +117,7 @@ pub struct UpContext {
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
     /// Network rule enforcement policy.
-    network_rules: NetworkRulePolicy,
+    pub(crate) network_rules: NetworkRulePolicy,
     /// Docker host override (forwarded to daemon registration).
     docker_host: Option<String>,
     /// Docker Compose profiles to activate.

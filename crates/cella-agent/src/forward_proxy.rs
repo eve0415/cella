@@ -141,8 +141,19 @@ async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: 
         return;
     }
 
-    // No MITM available or no path-level rules — evaluate domain-level only.
-    let verdict = config.matcher.evaluate(&host, "/");
+    // When MITM is unavailable, evaluate domain-level rules only — path
+    // rules are skipped entirely rather than matched against a fake path.
+    let verdict = if needs_path_inspection {
+        if config.warn_no_mitm_once(&host) {
+            warn!(
+                "CONNECT to {host}: path-level rules exist but MITM is unavailable; \
+                 path blocking disabled (requires TLS interception)"
+            );
+        }
+        config.matcher.evaluate_domain_only(&host)
+    } else {
+        config.matcher.evaluate(&host, "/")
+    };
     if !verdict.allowed {
         info!("BLOCKED CONNECT to {host}:{port} - {}", verdict.reason);
         config.log_blocked(&host, "/", &verdict.reason);
@@ -153,7 +164,7 @@ async fn handle_connect(mut client: BufReader<TcpStream>, target: &str, config: 
         return;
     }
 
-    // No path-level rules — just tunnel without MITM.
+    // Tunnel without MITM.
     let upstream = match connect_upstream(&host, port, config).await {
         Ok(s) => s,
         Err(e) => {
