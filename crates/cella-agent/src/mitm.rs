@@ -280,6 +280,8 @@ async fn handle_request(
         return Ok(resp);
     }
 
+    // HTTP/2 clients use Extended CONNECT (RFC 8441) instead of Upgrade headers,
+    // so this only triggers for HTTP/1.1 clients.
     if is_upgrade_request(&req) {
         return handle_upgrade_request(req, host, port, config).await;
     }
