@@ -622,6 +622,66 @@ mod tests {
     }
 
     #[test]
+    fn pick_ip_falls_back_when_cella_ip_is_empty() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            CELLA_NETWORK_NAME.to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "compose_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.19.0.3".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.19.0.3".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_falls_back_when_cella_ip_is_none() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            CELLA_NETWORK_NAME.to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: None,
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "compose_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.19.0.4".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.19.0.4".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_returns_none_when_all_ips_empty() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "net1".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "net2".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), None);
+    }
+
+    #[test]
     fn pick_ip_returns_none_when_no_networks() {
         let networks = HashMap::new();
         assert_eq!(pick_container_ip(&networks), None);

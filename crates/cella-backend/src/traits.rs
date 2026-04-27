@@ -198,7 +198,7 @@ pub trait ContainerBackend: Send + Sync {
         repo_path: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// Return the container's IP on the cella bridge network, if connected.
+    /// Return the container's IP, preferring the cella bridge network.
     fn get_container_ip<'a>(
         &'a self,
         container_id: &'a str,
