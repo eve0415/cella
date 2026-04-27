@@ -339,9 +339,9 @@ impl ContainerBackend for DockerClient {
         &'a self,
         container_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
-        Box::pin(async move {
-            Ok(crate::network::get_container_cella_ip(self.inner(), container_id).await)
-        })
+        Box::pin(
+            async move { Ok(crate::network::get_container_ip(self.inner(), container_id).await) },
+        )
     }
 
     fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
