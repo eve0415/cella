@@ -347,19 +347,34 @@ pub async fn named_network_exists(
     }
 }
 
-/// Get the container's IP address on the cella network.
+fn pick_container_ip(
+    networks: &HashMap<String, bollard::models::EndpointSettings>,
+) -> Option<String> {
+    if let Some(ip) = networks
+        .get(CELLA_NETWORK_NAME)
+        .and_then(|n| n.ip_address.as_ref())
+        .filter(|ip| !ip.is_empty())
+    {
+        return Some(ip.clone());
+    }
+
+    for (name, endpoint) in networks {
+        if let Some(ip) = endpoint.ip_address.as_ref().filter(|ip| !ip.is_empty()) {
+            debug!("Container not on '{CELLA_NETWORK_NAME}' network, using IP {ip} from '{name}'");
+            return Some(ip.clone());
+        }
+    }
+
+    None
+}
+
+/// Get the container's IP address, preferring the cella network.
 ///
-/// Returns `None` if the container is not connected to the cella network
-/// or if the IP address cannot be determined.
-pub async fn get_container_cella_ip(docker: &Docker, container_id: &str) -> Option<String> {
+/// Returns `None` if the container has no IP on any Docker network.
+pub async fn get_container_ip(docker: &Docker, container_id: &str) -> Option<String> {
     let inspect = docker.inspect_container(container_id, None).await.ok()?;
     let networks = inspect.network_settings?.networks?;
-    let cella_net = networks.get(CELLA_NETWORK_NAME)?;
-    let ip = cella_net.ip_address.as_ref()?;
-    if ip.is_empty() {
-        return None;
-    }
-    Some(ip.clone())
+    pick_container_ip(&networks)
 }
 
 #[cfg(test)]
@@ -547,5 +562,128 @@ mod tests {
     fn is_orphan_empty_labels_is_not_orphan() {
         let labels = HashMap::new();
         assert!(!is_orphan(&labels, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // pick_container_ip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pick_ip_prefers_cella_network() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            CELLA_NETWORK_NAME.to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.18.0.2".to_string()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "compose_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.19.0.3".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.18.0.2".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_falls_back_to_other_network() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "myproject_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.20.0.5".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.20.0.5".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_skips_empty_addresses() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "net1".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "net2".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.21.0.2".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.21.0.2".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_falls_back_when_cella_ip_is_empty() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            CELLA_NETWORK_NAME.to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "compose_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.19.0.3".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.19.0.3".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_falls_back_when_cella_ip_is_none() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            CELLA_NETWORK_NAME.to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: None,
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "compose_default".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some("172.19.0.4".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), Some("172.19.0.4".to_string()));
+    }
+
+    #[test]
+    fn pick_ip_returns_none_when_all_ips_empty() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "net1".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        networks.insert(
+            "net2".to_string(),
+            bollard::models::EndpointSettings {
+                ip_address: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(pick_container_ip(&networks), None);
+    }
+
+    #[test]
+    fn pick_ip_returns_none_when_no_networks() {
+        let networks = HashMap::new();
+        assert_eq!(pick_container_ip(&networks), None);
     }
 }
