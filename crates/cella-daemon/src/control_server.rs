@@ -67,6 +67,8 @@ pub struct ContainerHandle {
     pub backend_kind: Option<String>,
     /// Docker host override used when the container was created.
     pub docker_host: Option<String>,
+    /// Channel for sending daemon-initiated messages to the connected agent.
+    pub agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
 }
 
 /// Spawn a handler task for a new agent TCP connection.
@@ -281,85 +283,103 @@ async fn handle_agent_connection(
 
     info!("Agent connected for container {}", hs.container_name);
 
-    // --- Message loop ---
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| CellaDaemonError::Socket {
-                message: format!("read error: {e}"),
-            })?;
+    let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
-        if n == 0 {
-            break; // Connection closed
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let msg: AgentMessage =
-            serde_json::from_str(trimmed).map_err(|e| CellaDaemonError::Protocol {
-                message: format!("invalid agent message: {e}"),
-            })?;
-
-        // Worktree/exec/task operations need writer access for multi-message responses.
-        // Handle them directly before falling through to the single-response handler.
-        if matches!(
-            &msg,
-            AgentMessage::BranchRequest { .. }
-                | AgentMessage::ListRequest { .. }
-                | AgentMessage::ExecRequest { .. }
-                | AgentMessage::PruneRequest { .. }
-                | AgentMessage::DownRequest { .. }
-                | AgentMessage::UpRequest { .. }
-                | AgentMessage::TaskRunRequest { .. }
-                | AgentMessage::TaskListRequest { .. }
-                | AgentMessage::TaskLogsRequest { .. }
-                | AgentMessage::TaskWaitRequest { .. }
-                | AgentMessage::TaskStopRequest { .. }
-                | AgentMessage::SwitchRequest { .. }
-        ) {
-            handle_worktree_message(
-                msg,
-                WorktreeHandlerCtx {
-                    workspace_path: hs.workspace_path.as_deref(),
-                    cella_bin: &ctx.cella_bin,
-                    task_mgr: &ctx.task_manager,
-                    container_handles: &ctx.container_handles,
-                    container_name: &hs.container_name,
-                },
-                &mut writer,
-            )
-            .await?;
-            continue;
-        }
-
-        let handler_ctx = AgentHandlerContext {
-            port_manager: &ctx.port_manager,
-            browser_handler: &ctx.browser_handler,
-            container_id: Some(&hs.container_id),
-            proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
-            container_ip: hs.container_ip.as_deref(),
-        };
-        let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
-
-        if let Some(resp) = response {
-            send_message(&mut writer, &resp).await?;
+    {
+        let mut handles = ctx.container_handles.lock().await;
+        if let Some(handle) = handles.get_mut(&hs.container_name) {
+            handle.agent_tx = Some(daemon_tx);
         }
     }
 
+    // --- Message loop ---
+    let result: Result<(), CellaDaemonError> = loop {
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let n = result.map_err(|e| CellaDaemonError::Socket {
+                    message: format!("read error: {e}"),
+                })?;
+
+                if n == 0 {
+                    break Ok(());
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    line.clear();
+                    continue;
+                }
+
+                let msg: AgentMessage =
+                    serde_json::from_str(trimmed).map_err(|e| CellaDaemonError::Protocol {
+                        message: format!("invalid agent message: {e}"),
+                    })?;
+                line.clear();
+
+                if matches!(
+                    &msg,
+                    AgentMessage::BranchRequest { .. }
+                        | AgentMessage::ListRequest { .. }
+                        | AgentMessage::ExecRequest { .. }
+                        | AgentMessage::PruneRequest { .. }
+                        | AgentMessage::DownRequest { .. }
+                        | AgentMessage::UpRequest { .. }
+                        | AgentMessage::TaskRunRequest { .. }
+                        | AgentMessage::TaskListRequest { .. }
+                        | AgentMessage::TaskLogsRequest { .. }
+                        | AgentMessage::TaskWaitRequest { .. }
+                        | AgentMessage::TaskStopRequest { .. }
+                        | AgentMessage::SwitchRequest { .. }
+                ) {
+                    handle_worktree_message(
+                        msg,
+                        WorktreeHandlerCtx {
+                            workspace_path: hs.workspace_path.as_deref(),
+                            cella_bin: &ctx.cella_bin,
+                            task_mgr: &ctx.task_manager,
+                            container_handles: &ctx.container_handles,
+                            container_name: &hs.container_name,
+                        },
+                        &mut writer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let handler_ctx = AgentHandlerContext {
+                    port_manager: &ctx.port_manager,
+                    browser_handler: &ctx.browser_handler,
+                    container_id: Some(&hs.container_id),
+                    proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
+                    container_ip: hs.container_ip.as_deref(),
+                };
+                let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
+
+                if let Some(resp) = response {
+                    send_message(&mut writer, &resp).await?;
+                }
+            }
+            Some(msg) = daemon_rx.recv() => {
+                send_message(&mut writer, &msg).await?;
+            }
+        }
+    };
+
     // Connection closed — clear live state so status queries don't report
     // stale version/connectivity info for this container.
+    {
+        let mut handles = ctx.container_handles.lock().await;
+        if let Some(handle) = handles.get_mut(&hs.container_name) {
+            handle.agent_tx = None;
+        }
+    }
     hs.agent_state.connected.store(false, Ordering::Relaxed);
     if let Ok(mut v) = hs.agent_state.agent_version.lock() {
         *v = None;
     }
     info!("Agent disconnected for container {}", hs.container_name);
 
-    Ok(())
+    result
 }
 
 /// Per-connection context shared across agent message handlers.
@@ -2227,6 +2247,7 @@ mod tests {
             agent_state: Arc::new(AgentConnectionState::new()),
             backend_kind: Some("docker".into()),
             docker_host: None,
+            agent_tx: None,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
@@ -2264,6 +2285,7 @@ mod tests {
                     agent_state: agent_state.clone(),
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    agent_tx: None,
                 },
             );
             Arc::new(Mutex::new(map))

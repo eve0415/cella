@@ -369,6 +369,7 @@ async fn handle_register(
                 agent_state: Arc::new(AgentConnectionState::new()),
                 backend_kind: reg.backend_kind,
                 docker_host: reg.docker_host,
+                agent_tx: None,
             },
         );
     }
