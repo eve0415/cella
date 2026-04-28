@@ -164,11 +164,13 @@ fn base_name(container: &cella_backend::ContainerInfo) -> &str {
 
 impl Drop for TitleGuard {
     fn drop(&mut self) {
-        TITLE_ACTIVE.store(false, Ordering::Release);
         let tmux = in_tmux();
         let mut stderr = io::stderr().lock();
         let _ = emit_restore(&mut stderr, tmux);
         let _ = stderr.flush();
+        // Clear after writing so a signal during Drop still triggers the handler.
+        // Worst case both paths emit — a harmless double-pop that the shell prompt resets.
+        TITLE_ACTIVE.store(false, Ordering::Release);
     }
 }
 
@@ -199,6 +201,8 @@ fn emit_set(w: &mut impl Write, title: &str, in_tmux: bool) -> io::Result<()> {
     }
 }
 
+// Empty title first so terminals without title-stack support (WezTerm, kitty)
+// still clear the title; the subsequent pop handles stack-supporting terminals.
 fn emit_restore(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
     emit_set(w, "", in_tmux)?;
     emit_pop(w, in_tmux)
@@ -230,6 +234,12 @@ fn tmux_wrap(inner: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Install SIGINT/SIGTERM handlers that restore the terminal title before the
+/// process exits. Call once, early in `main`, before any `TitleGuard` is created.
+///
+/// Uses `SA_RESETHAND` so the handler fires at most once, then re-raises the
+/// signal with the default disposition — preserving exit status 128+signum for
+/// parent processes.
 pub fn install_signal_handlers() {
     use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 
@@ -257,7 +267,7 @@ extern "C" fn restore_title_on_signal(sig: nix::libc::c_int) {
         #[allow(unsafe_code)]
         // SAFETY: libc::write on STDERR_FILENO is async-signal-safe.
         unsafe {
-            nix::libc::write(nix::libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+            let _ = nix::libc::write(nix::libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
         }
     }
     #[allow(unsafe_code)]
