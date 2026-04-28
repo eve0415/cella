@@ -47,6 +47,7 @@ pub struct ReconnectingClient {
     reconnected: bool,
     /// The `DaemonHello` received during the most recent handshake.
     daemon_hello: Option<DaemonHello>,
+    tunnel_config: Option<crate::tunnel::TunnelConfig>,
 }
 
 /// How often to surface a progress log while the initial connect retries.
@@ -70,8 +71,13 @@ impl ReconnectingClient {
 
         loop {
             match ControlClient::connect(&addr, container_name, &token).await {
-                Ok((client, hello)) => {
+                Ok((mut client, hello)) => {
                     info!("Connected to daemon at {addr}");
+                    let tunnel_config = Some(crate::tunnel::TunnelConfig {
+                        daemon_addr: addr.clone(),
+                        auth_token: token.clone(),
+                    });
+                    client.start_reader(tunnel_config.clone());
                     return Self {
                         addr,
                         container_name: container_name.to_string(),
@@ -79,6 +85,7 @@ impl ReconnectingClient {
                         inner: Some(client),
                         reconnected: false,
                         daemon_hello: Some(hello),
+                        tunnel_config,
                     };
                 }
                 Err(e) => {
@@ -140,16 +147,22 @@ impl ReconnectingClient {
     /// future inline reconnects use the new values.
     pub fn install_connection(
         &mut self,
-        client: ControlClient,
+        mut client: ControlClient,
         hello: DaemonHello,
         new_addr: String,
         new_token: String,
     ) {
+        let tunnel_config = Some(crate::tunnel::TunnelConfig {
+            daemon_addr: new_addr.clone(),
+            auth_token: new_token.clone(),
+        });
+        client.start_reader(tunnel_config.clone());
         self.inner = Some(client);
         self.daemon_hello = Some(hello);
         self.addr = new_addr;
         self.auth_token = new_token;
         self.reconnected = true;
+        self.tunnel_config = tunnel_config;
     }
 
     /// Send a message, attempting a single reconnect on failure.
@@ -206,11 +219,17 @@ impl ReconnectingClient {
     async fn try_reconnect(&mut self) -> Result<(), CellaPortError> {
         // 1. Try the current address
         match ControlClient::connect(&self.addr, &self.container_name, &self.auth_token).await {
-            Ok((client, hello)) => {
+            Ok((mut client, hello)) => {
                 info!("Reconnected to daemon at {}", self.addr);
+                let tunnel_config = Some(crate::tunnel::TunnelConfig {
+                    daemon_addr: self.addr.clone(),
+                    auth_token: self.auth_token.clone(),
+                });
+                client.start_reader(tunnel_config.clone());
                 self.inner = Some(client);
                 self.daemon_hello = Some(hello);
                 self.reconnected = true;
+                self.tunnel_config = tunnel_config;
                 return Ok(());
             }
             Err(e) => {
@@ -227,13 +246,19 @@ impl ReconnectingClient {
                 self.addr, info.addr
             );
             match ControlClient::connect(&info.addr, &self.container_name, &info.token).await {
-                Ok((client, hello)) => {
+                Ok((mut client, hello)) => {
                     info!("Reconnected to daemon at {} (from .daemon_addr)", info.addr);
+                    let tunnel_config = Some(crate::tunnel::TunnelConfig {
+                        daemon_addr: info.addr.clone(),
+                        auth_token: info.token.clone(),
+                    });
+                    client.start_reader(tunnel_config.clone());
                     self.addr = info.addr;
                     self.auth_token = info.token;
                     self.inner = Some(client);
                     self.daemon_hello = Some(hello);
                     self.reconnected = true;
+                    self.tunnel_config = tunnel_config;
                     return Ok(());
                 }
                 Err(e) => {
@@ -364,6 +389,7 @@ mod tests {
             inner: None,
             reconnected: true,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         assert!(client.take_reconnected());
@@ -379,6 +405,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         let msg = AgentMessage::Health {
@@ -398,6 +425,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         let result = client.recv().await;
@@ -415,6 +443,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
         assert!(!client.take_reconnected());
     }
@@ -428,6 +457,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
         let result = client.try_reconnect().await;
         assert!(result.is_err());
@@ -444,6 +474,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         let msg = AgentMessage::Health {
@@ -465,6 +496,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         let (addr, name, token) = client.connection_params();
@@ -482,6 +514,7 @@ mod tests {
             inner: None,
             reconnected: false,
             daemon_hello: None,
+            tunnel_config: None,
         };
 
         assert!(client.inner.is_none());
