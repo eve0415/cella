@@ -13,8 +13,9 @@ use crate::health::run_health_monitor;
 use crate::management::{ManagementContext, run_management_server};
 use crate::orbstack;
 use crate::port_manager::PortManager;
-use crate::proxy::run_proxy_coordinator;
+use crate::proxy::{ProxyCoordinatorContext, run_proxy_coordinator};
 use crate::shared::{cleanup_files, current_time_secs, read_pid_file, set_socket_permissions};
+use crate::tunnel::TunnelBroker;
 
 /// Write the PID file and ensure the parent directory exists.
 fn write_pid_and_ensure_dir(socket_path: &Path, pid_path: &Path) -> Result<u32, CellaDaemonError> {
@@ -114,11 +115,25 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         run_health_monitor(health_activity, &health_pid, &health_socket).await;
     });
 
-    // Spawn proxy coordinator
+    // Create shared tunnel broker and container handles at daemon level
+    let tunnel_broker = Arc::new(TunnelBroker::new());
+    let container_handles: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, crate::control_server::ContainerHandle>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Spawn proxy coordinator with tunnel context
     let (proxy_cmd_tx, proxy_cmd_rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move {
-        run_proxy_coordinator(proxy_cmd_rx).await;
-    });
+    {
+        let proxy_ctx = ProxyCoordinatorContext {
+            tunnel_broker: tunnel_broker.clone(),
+            container_handles: container_handles.clone(),
+        };
+        tokio::spawn(async move {
+            run_proxy_coordinator(proxy_cmd_rx, Some(proxy_ctx)).await;
+        });
+    }
 
     let start_time = std::time::Instant::now();
     let daemon_started_at = std::time::SystemTime::now()
@@ -140,6 +155,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         auth_token,
         control_port,
         ssh_proxy_manager,
+        container_handles,
+        tunnel_broker,
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown

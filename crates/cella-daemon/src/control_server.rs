@@ -391,6 +391,8 @@ async fn handle_agent_connection_after_hello(
                     container_id: Some(&hs.container_id),
                     proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
                     container_ip: hs.container_ip.as_deref(),
+                    container_name: Some(&hs.container_name),
+                    is_orbstack: ctx.is_orbstack,
                 };
                 let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
 
@@ -428,23 +430,25 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub container_id: Option<&'a str>,
     pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
     pub container_ip: Option<&'a str>,
+    pub container_name: Option<&'a str>,
+    pub is_orbstack: bool,
 }
+
+use crate::proxy::ProxyStartTarget;
 
 /// Start a TCP proxy for a forwarded port and verify it bound successfully.
 ///
 /// Returns `false` if the proxy bind failed and the allocation should be rolled back.
 async fn start_port_proxy(
     host_port: u16,
-    container_ip: &str,
-    target_port: u16,
+    target: ProxyStartTarget,
     proxy_cmd_tx: &tokio::sync::mpsc::Sender<ProxyCommand>,
 ) -> bool {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let _ = proxy_cmd_tx
         .send(ProxyCommand::Start {
             host_port,
-            container_ip: container_ip.to_string(),
-            container_port: target_port,
+            target,
             result_tx: Some(result_tx),
         })
         .await;
@@ -452,10 +456,7 @@ async fn start_port_proxy(
     match result_rx.await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            warn!(
-                "Proxy bind failed for port {host_port} (container port {target_port}): {e}. \
-                 Rolling back allocation."
-            );
+            warn!("Proxy bind failed for port {host_port}: {e}. Rolling back allocation.");
             false
         }
         Err(_) => {
@@ -484,11 +485,32 @@ async fn handle_port_open(
 
     let target_port = proxy_port.unwrap_or(port);
 
-    if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip)
-        && !start_port_proxy(hp, ip, target_port, tx).await
-    {
-        ctx.port_manager.lock().await.handle_port_closed(&cid, port);
-        return None;
+    if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
+        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let target = if use_direct_ip {
+            if let Some(ip) = ctx.container_ip {
+                ProxyStartTarget::DirectIp {
+                    ip: ip.to_string(),
+                    port: target_port,
+                }
+            } else {
+                warn!("No container IP for direct proxy, skipping port {port}");
+                return None;
+            }
+        } else if let Some(name) = ctx.container_name {
+            ProxyStartTarget::AgentTunnel {
+                container_name: name.to_string(),
+                port: target_port,
+            }
+        } else {
+            warn!("No container name for tunnel proxy, skipping port {port}");
+            return None;
+        };
+
+        if !start_port_proxy(hp, target, tx).await {
+            ctx.port_manager.lock().await.handle_port_closed(&cid, port);
+            return None;
+        }
     }
 
     host_port.map(|hp| DaemonMessage::PortMapping {
@@ -2977,6 +2999,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::Health {
@@ -3008,6 +3032,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::PortClosed {
@@ -3033,6 +3059,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         // Use an unknown operation so it fails fast without needing real git
@@ -3072,6 +3100,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::Health {
@@ -3139,6 +3169,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::PortOpen {
