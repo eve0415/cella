@@ -221,8 +221,7 @@ pub fn pid_alive(pid: u32) -> bool {
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -322,7 +321,7 @@ mod tests {
             path.clone(),
             "0.0.28".to_string(),
             AgentState::Disconnected,
-            Duration::from_secs(60), // long interval — force write via update
+            Duration::from_mins(1), // long interval — force write via update
         );
 
         // Wait for the initial write.
@@ -377,7 +376,7 @@ mod tests {
             path.clone(),
             "0.0.28".to_string(),
             AgentState::Disconnected,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
 
         for _ in 0..100 {

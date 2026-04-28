@@ -14,9 +14,9 @@ use crate::control::ControlClient;
 /// Timeout for fast operations (list, task list, task stop).
 const TIMEOUT_FAST: Duration = Duration::from_secs(30);
 /// Timeout for medium operations (down, exec, prune, task logs/wait).
-const TIMEOUT_MEDIUM: Duration = Duration::from_secs(120);
+const TIMEOUT_MEDIUM: Duration = Duration::from_mins(2);
 /// Timeout for slow operations (branch, up, task run).
-const TIMEOUT_SLOW: Duration = Duration::from_secs(600);
+const TIMEOUT_SLOW: Duration = Duration::from_mins(10);
 
 /// Receive a message with a timeout that resets on each message in the loop.
 async fn recv_timeout(
@@ -478,8 +478,7 @@ fn format_main_agent_status(
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -1855,12 +1854,12 @@ mod tests {
 
     #[test]
     fn timeout_medium_is_120s() {
-        assert_eq!(TIMEOUT_MEDIUM, Duration::from_secs(120));
+        assert_eq!(TIMEOUT_MEDIUM, Duration::from_mins(2));
     }
 
     #[test]
     fn timeout_slow_is_600s() {
-        assert_eq!(TIMEOUT_SLOW, Duration::from_secs(600));
+        assert_eq!(TIMEOUT_SLOW, Duration::from_mins(10));
     }
 
     #[test]
