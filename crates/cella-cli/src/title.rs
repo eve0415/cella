@@ -15,6 +15,13 @@
 //! actually updates.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TITLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NEEDS_TMUX_WRAP: AtomicBool = AtomicBool::new(false);
+
+const RESTORE_PLAIN: &[u8] = b"\x1b]0;\x07\x1b[23;0t";
+const RESTORE_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b]0;\x07\x1b\\\x1bPtmux;\x1b\x1b[23;0t\x1b\\";
 
 /// Strip the `"cella-"` prefix so the title doesn't repeat the brand already
 /// present in the `" \u{2014} cella <subcommand>"` suffix. No-op if the prefix
@@ -88,6 +95,8 @@ impl TitleGuard {
         let _ = emit_push(&mut stderr, tmux);
         let _ = emit_set(&mut stderr, &content.format(), tmux);
         let _ = stderr.flush();
+        NEEDS_TMUX_WRAP.store(tmux, Ordering::Release);
+        TITLE_ACTIVE.store(true, Ordering::Release);
         Some(Self(()))
     }
 }
@@ -157,8 +166,11 @@ impl Drop for TitleGuard {
     fn drop(&mut self) {
         let tmux = in_tmux();
         let mut stderr = io::stderr().lock();
-        let _ = emit_pop(&mut stderr, tmux);
+        let _ = emit_restore(&mut stderr, tmux);
         let _ = stderr.flush();
+        // Clear after writing so a signal during Drop still triggers the handler.
+        // Worst case both paths emit — a harmless double-pop that the shell prompt resets.
+        TITLE_ACTIVE.store(false, Ordering::Release);
     }
 }
 
@@ -189,6 +201,13 @@ fn emit_set(w: &mut impl Write, title: &str, in_tmux: bool) -> io::Result<()> {
     }
 }
 
+// Empty title first so terminals without title-stack support (WezTerm, kitty)
+// still clear the title; the subsequent pop handles stack-supporting terminals.
+fn emit_restore(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
+    emit_set(w, "", in_tmux)?;
+    emit_pop(w, in_tmux)
+}
+
 fn emit_pop(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
     // CSI 23 ; 0 t — restore icon name and window title from the stack.
     let bytes: &[u8] = b"\x1b[23;0t";
@@ -213,6 +232,50 @@ fn tmux_wrap(inner: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+/// Install SIGINT/SIGTERM handlers that restore the terminal title before the
+/// process exits. Call once, early in `main`, before any `TitleGuard` is created.
+///
+/// Uses `SA_RESETHAND` so the handler fires at most once, then re-raises the
+/// signal with the default disposition — preserving exit status 128+signum for
+/// parent processes.
+pub fn install_signal_handlers() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+
+    let action = SigAction::new(
+        SigHandler::Handler(restore_title_on_signal),
+        SaFlags::SA_RESETHAND,
+        SigSet::empty(),
+    );
+    #[allow(unsafe_code)]
+    // SAFETY: sigaction is async-signal-safe; the handler only uses
+    // async-signal-safe operations (atomic loads + libc::write + libc::raise).
+    unsafe {
+        let _ = sigaction(Signal::SIGINT, &action);
+        let _ = sigaction(Signal::SIGTERM, &action);
+    }
+}
+
+extern "C" fn restore_title_on_signal(sig: nix::libc::c_int) {
+    if TITLE_ACTIVE.load(Ordering::Acquire) {
+        let bytes = if NEEDS_TMUX_WRAP.load(Ordering::Acquire) {
+            RESTORE_TMUX
+        } else {
+            RESTORE_PLAIN
+        };
+        #[allow(unsafe_code)]
+        // SAFETY: libc::write on STDERR_FILENO is async-signal-safe.
+        unsafe {
+            let _ = nix::libc::write(nix::libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+        }
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: raise is async-signal-safe. SA_RESETHAND already restored the
+    // default disposition, so this re-delivers the signal with SIG_DFL.
+    unsafe {
+        nix::libc::raise(sig);
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +549,40 @@ mod tests {
     fn no_branch_without_explicit_or_label() {
         // Plain `cella up` in a non-worktree with no existing container.
         assert_eq!(effective_branch(None, None), None);
+    }
+
+    // ── emit_restore ─────────────────────────────────────────────────
+
+    #[test]
+    fn emit_restore_plain_emits_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, false).unwrap();
+        assert_eq!(out, b"\x1b]0;\x07\x1b[23;0t");
+    }
+
+    #[test]
+    fn emit_restore_tmux_emits_wrapped_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, true).unwrap();
+        let mut expected = tmux_wrap(b"\x1b]0;\x07");
+        expected.extend_from_slice(&tmux_wrap(b"\x1b[23;0t"));
+        assert_eq!(out, expected);
+    }
+
+    // ── signal handler constants ───────────────────────────────────────
+
+    #[test]
+    fn restore_plain_matches_emit_restore_output() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, false).unwrap();
+        assert_eq!(out.as_slice(), RESTORE_PLAIN);
+    }
+
+    #[test]
+    fn restore_tmux_matches_emit_restore_output() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, true).unwrap();
+        assert_eq!(out.as_slice(), RESTORE_TMUX);
     }
 
     // ── public API reachability ──────────────────────────────────────

@@ -27,6 +27,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    title::install_signal_handlers();
+
     // Install miette's graphical error handler for pretty diagnostics
     miette::set_hook(Box::new(|_| {
         Box::new(miette::GraphicalReportHandler::new_themed(
