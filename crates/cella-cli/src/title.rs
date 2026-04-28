@@ -157,7 +157,7 @@ impl Drop for TitleGuard {
     fn drop(&mut self) {
         let tmux = in_tmux();
         let mut stderr = io::stderr().lock();
-        let _ = emit_pop(&mut stderr, tmux);
+        let _ = emit_restore(&mut stderr, tmux);
         let _ = stderr.flush();
     }
 }
@@ -187,6 +187,11 @@ fn emit_set(w: &mut impl Write, title: &str, in_tmux: bool) -> io::Result<()> {
     } else {
         w.write_all(&bytes)
     }
+}
+
+fn emit_restore(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
+    emit_set(w, "", in_tmux)?;
+    emit_pop(w, in_tmux)
 }
 
 fn emit_pop(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
@@ -486,6 +491,24 @@ mod tests {
     fn no_branch_without_explicit_or_label() {
         // Plain `cella up` in a non-worktree with no existing container.
         assert_eq!(effective_branch(None, None), None);
+    }
+
+    // ── emit_restore ─────────────────────────────────────────────────
+
+    #[test]
+    fn emit_restore_plain_emits_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, false).unwrap();
+        assert_eq!(out, b"\x1b]0;\x07\x1b[23;0t");
+    }
+
+    #[test]
+    fn emit_restore_tmux_emits_wrapped_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, true).unwrap();
+        let mut expected = tmux_wrap(b"\x1b]0;\x07");
+        expected.extend_from_slice(&tmux_wrap(b"\x1b[23;0t"));
+        assert_eq!(out, expected);
     }
 
     // ── public API reachability ──────────────────────────────────────
