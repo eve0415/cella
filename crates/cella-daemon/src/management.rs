@@ -92,6 +92,8 @@ pub(crate) async fn run_management_server(
             proxy_cmd_tx: ctx.proxy_cmd_tx.clone(),
             task_manager: crate::task_manager::new_shared(),
             cella_bin: crate::control_server::resolve_cella_binary(),
+            tunnel_broker: Arc::new(crate::tunnel::TunnelBroker::new()),
+            is_orbstack: ctx.is_orbstack,
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(

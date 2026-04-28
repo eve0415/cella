@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cella_protocol::{
     AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol,
+    TunnelHandshake,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -21,6 +22,7 @@ use crate::browser::BrowserHandler;
 use crate::credential::invoke_git_credential;
 use crate::port_manager::PortManager;
 use crate::proxy::ProxyCommand;
+use crate::tunnel::TunnelBroker;
 
 /// Shared context for the control server and its connection handlers.
 pub(crate) struct ControlContext {
@@ -33,6 +35,8 @@ pub(crate) struct ControlContext {
     /// Host-native cella binary, resolved and snapshotted at daemon startup so
     /// that in-container `cargo build` cannot clobber it via the bind mount.
     pub cella_bin: std::path::PathBuf,
+    pub tunnel_broker: Arc<TunnelBroker>,
+    pub is_orbstack: bool,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -71,11 +75,11 @@ pub struct ContainerHandle {
     pub agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
 }
 
-/// Spawn a handler task for a new agent TCP connection.
-fn spawn_agent_handler(stream: tokio::net::TcpStream, ctx: Arc<ControlContext>) {
+/// Spawn a handler task for a new TCP connection (agent or tunnel).
+fn spawn_connection_handler(stream: tokio::net::TcpStream, ctx: Arc<ControlContext>) {
     tokio::spawn(async move {
-        if let Err(e) = handle_agent_connection(stream, &ctx).await {
-            warn!("Agent connection error: {e}");
+        if let Err(e) = handle_incoming_connection(stream, &ctx).await {
+            warn!("Connection handler error: {e}");
         }
     });
 }
@@ -89,12 +93,70 @@ fn handle_accept_result(
     match result {
         Ok((stream, peer)) => {
             last_activity.store(current_time_secs(), Ordering::Relaxed);
-            debug!("Agent TCP connection from {peer}");
-            spawn_agent_handler(stream, ctx.clone());
+            debug!("TCP connection from {peer}");
+            spawn_connection_handler(stream, ctx.clone());
         }
         Err(e) => {
             warn!("Control server accept error: {e}");
         }
+    }
+}
+
+/// Discriminate the first message to determine connection type.
+async fn handle_incoming_connection(
+    stream: tokio::net::TcpStream,
+    ctx: &ControlContext,
+) -> Result<(), CellaDaemonError> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("first message read error: {e}"),
+        })?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let trimmed = line.trim();
+
+    if let Ok(tunnel_hs) = serde_json::from_str::<TunnelHandshake>(trimmed) {
+        handle_tunnel_connection(tunnel_hs, reader, writer, ctx).await;
+        return Ok(());
+    }
+
+    if let Ok(agent_hello) = serde_json::from_str::<AgentHello>(trimmed) {
+        return handle_agent_connection_after_hello(agent_hello, reader, writer, ctx).await;
+    }
+
+    warn!("Unrecognized first message, closing connection");
+    send_reject(&mut writer, "unrecognized first message".to_string()).await;
+    Ok(())
+}
+
+/// Handle a validated tunnel handshake: deliver the stream to the broker.
+async fn handle_tunnel_connection(
+    hs: TunnelHandshake,
+    reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    ctx: &ControlContext,
+) {
+    if hs.auth_token != ctx.auth_token {
+        warn!("Tunnel connection rejected: invalid auth token");
+        return;
+    }
+
+    let stream = reader.into_inner().unsplit(writer);
+    if !ctx.tunnel_broker.deliver(hs.connection_id, stream).await {
+        warn!(
+            "Tunnel connection {}: no pending request (timed out or spurious)",
+            hs.connection_id
+        );
+    } else {
+        debug!("Tunnel connection {} delivered", hs.connection_id);
     }
 }
 
@@ -151,35 +213,15 @@ struct HandshakeResult {
     workspace_path: Option<String>,
 }
 
-/// Perform the hello handshake: read `AgentHello`, validate, look up container.
+/// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
 ///
 /// Returns `Ok(None)` if the connection should be cleanly closed (rejection sent).
 /// Returns `Ok(Some(..))` on success with validated handshake data.
-async fn perform_handshake<R, W>(
-    reader: &mut R,
+async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
+    agent_hello: AgentHello,
     writer: &mut W,
-    line: &mut String,
     ctx: &ControlContext,
-) -> Result<Option<HandshakeResult>, CellaDaemonError>
-where
-    R: AsyncBufReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let n = reader
-        .read_line(line)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("hello read error: {e}"),
-        })?;
-    if n == 0 {
-        return Ok(None);
-    }
-
-    let Ok(agent_hello) = serde_json::from_str::<AgentHello>(line.trim()) else {
-        send_reject(writer, "Hello required as first message".to_string()).await;
-        return Ok(None);
-    };
-
+) -> Result<Option<HandshakeResult>, CellaDaemonError> {
     if agent_hello.protocol_version != PROTOCOL_VERSION {
         send_reject(
             writer,
@@ -213,7 +255,6 @@ where
         pm.container_ip(&container_id).map(String::from)
     };
 
-    // Store the live agent version for status queries.
     if let Ok(mut v) = agent_state.agent_version.lock() {
         *v = Some(agent_hello.agent_version.clone());
     }
@@ -226,7 +267,6 @@ where
         );
     }
 
-    // Send DaemonHello success with workspace metadata from container labels.
     let labels = lookup_container_labels(&container_id, &ctx.container_handles).await;
     let hello = DaemonHello {
         protocol_version: PROTOCOL_VERSION,
@@ -268,18 +308,17 @@ where
     }))
 }
 
-/// Handle a single agent TCP connection (newline-delimited JSON).
-async fn handle_agent_connection(
-    stream: tokio::net::TcpStream,
+/// Handle an agent TCP connection after the `AgentHello` has been parsed.
+async fn handle_agent_connection_after_hello(
+    agent_hello: AgentHello,
+    mut reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    mut writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
     ctx: &ControlContext,
 ) -> Result<(), CellaDaemonError> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    let Some(hs) = perform_handshake(&mut reader, &mut writer, &mut line, ctx).await? else {
+    let Some(hs) = validate_agent_hello(agent_hello, &mut writer, ctx).await? else {
         return Ok(());
     };
+    let mut line = String::new();
 
     info!("Agent connected for container {}", hs.container_name);
 
@@ -2268,13 +2307,13 @@ mod tests {
             proxy_cmd_tx: proxy_tx,
             task_manager: crate::task_manager::new_shared(),
             cella_bin: std::path::PathBuf::from("/nonexistent"),
+            tunnel_broker: Arc::new(TunnelBroker::new()),
+            is_orbstack: false,
         }
     }
 
     #[tokio::test]
-    async fn perform_handshake_marks_connected_without_follow_up_message() {
-        use tokio::io::AsyncWriteExt;
-
+    async fn validate_agent_hello_marks_connected() {
         let agent_state = Arc::new(AgentConnectionState::new());
         let handles = {
             let mut map = HashMap::new();
@@ -2292,28 +2331,22 @@ mod tests {
         };
         let ctx = test_control_context(handles, "test-token");
 
-        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
-        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
-        let mut daemon_reader = BufReader::new(daemon_r);
-
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
             agent_version: "0.0.28".to_string(),
             container_name: "test-container".to_string(),
             auth_token: "test-token".to_string(),
         };
-        let mut json = serde_json::to_string(&hello).unwrap();
-        json.push('\n');
-        agent_side.write_all(json.as_bytes()).await.unwrap();
-        agent_side.flush().await.unwrap();
 
         assert!(
             !agent_state.connected.load(Ordering::Relaxed),
             "pre-condition: connected starts false"
         );
 
-        let mut line = String::new();
-        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+        let (_daemon_side, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        let result = validate_agent_hello(hello, &mut w, &ctx).await;
 
         let hs = result
             .expect("handshake should not error")
@@ -2321,7 +2354,7 @@ mod tests {
         assert_eq!(hs.container_name, "test-container");
         assert!(
             agent_state.connected.load(Ordering::Relaxed),
-            "connected must be true immediately after handshake, before any message"
+            "connected must be true immediately after handshake"
         );
         assert_ne!(
             agent_state.last_seen_secs.load(Ordering::Relaxed),
@@ -2416,15 +2449,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_handshake_unknown_container_does_not_mark_connected() {
-        use tokio::io::AsyncWriteExt;
-
+    async fn validate_agent_hello_unknown_container_rejects() {
         let handles = Arc::new(Mutex::new(HashMap::new()));
         let ctx = test_control_context(handles, "test-token");
-
-        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
-        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
-        let mut daemon_reader = BufReader::new(daemon_r);
 
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
@@ -2432,13 +2459,11 @@ mod tests {
             container_name: "not-registered".to_string(),
             auth_token: "test-token".to_string(),
         };
-        let mut json = serde_json::to_string(&hello).unwrap();
-        json.push('\n');
-        agent_side.write_all(json.as_bytes()).await.unwrap();
-        agent_side.flush().await.unwrap();
 
-        let mut line = String::new();
-        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+        let (_daemon_side, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        let result = validate_agent_hello(hello, &mut w, &ctx).await;
 
         assert!(
             matches!(result, Ok(None)),
