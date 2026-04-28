@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust toolchain** — install via [rustup](https://rustup.rs/). Cella's MSRV is **1.94.1** (edition 2024), pinned in the workspace `Cargo.toml`.
+- **Rust toolchain** — install via [rustup](https://rustup.rs/). Cella's MSRV is **1.95.0** (edition 2024), pinned in the workspace `Cargo.toml`.
 - **Docker** — needed for integration tests and for running cella itself. Unit tests do not require it.
 
 ## Building

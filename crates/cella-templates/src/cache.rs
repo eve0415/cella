@@ -16,10 +16,10 @@ use crate::error::TemplateError;
 use crate::{FeatureCollectionIndex, TemplateCollectionIndex};
 
 /// How long a cached collection index is considered fresh.
-const COLLECTION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const COLLECTION_TTL: Duration = Duration::from_hours(24);
 
 /// How long cached image tags are considered fresh.
-const IMAGE_TAG_TTL: Duration = Duration::from_secs(60 * 60);
+const IMAGE_TAG_TTL: Duration = Duration::from_hours(1);
 
 /// On-disk cache for template collections and artifacts.
 #[derive(Debug, Clone)]

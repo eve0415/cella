@@ -18,7 +18,7 @@ use crate::types::DevcontainerIndex;
 const INDEX_URL: &str = "https://containers.dev/static/devcontainer-index.json";
 
 /// Cache TTL for the aggregated index (same 24h as collection cache).
-const INDEX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const INDEX_TTL: Duration = Duration::from_hours(24);
 
 /// OCI reference prefix for official devcontainer collections.
 const OFFICIAL_PREFIX: &str = "ghcr.io/devcontainers/";

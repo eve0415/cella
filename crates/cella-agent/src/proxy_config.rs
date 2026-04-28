@@ -98,8 +98,7 @@ impl AgentProxyConfig {
         };
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let _ = writeln!(file, "{timestamp}\tBLOCKED\t{domain}\t{path}\t{reason}");
     }
 
@@ -113,8 +112,7 @@ impl AgentProxyConfig {
         };
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let _ = writeln!(file, "{timestamp}\tERROR\t{domain}\t{error}");
     }
 
@@ -167,7 +165,7 @@ mod tests {
     use super::*;
 
     fn make_json(mode: &str, rules: &str, extras: &str) -> String {
-        format!(r#"{{"listen_port":8080,"mode":"{mode}","rules":[{rules}]{extras}}}"#,)
+        format!(r#"{{"listen_port":8080,"mode":"{mode}","rules":[{rules}]{extras}}}"#)
     }
 
     #[test]

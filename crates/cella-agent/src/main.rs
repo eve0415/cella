@@ -315,7 +315,7 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     let rc = reconnecting.clone();
     let sw_for_health = state_writer.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
         loop {
             interval.tick().await;
             let uptime = start.elapsed().as_secs();

@@ -16,13 +16,13 @@ use crate::control::ControlClient;
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Duration of the initial burst phase with exponential backoff.
-const BURST_DURATION: Duration = Duration::from_secs(5 * 60);
+const BURST_DURATION: Duration = Duration::from_mins(5);
 
 /// Maximum backoff during the burst phase.
 const MAX_BURST_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Backoff interval after the burst phase.
-const SLOW_BACKOFF: Duration = Duration::from_secs(60);
+const SLOW_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Base interval for exponential backoff.
 const BASE_BACKOFF: Duration = Duration::from_secs(2);
@@ -564,8 +564,8 @@ mod tests {
     #[test]
     fn next_backoff_slow_after_burst() {
         let past_burst = Duration::from_secs(5 * 60 + 1);
-        assert_eq!(next_backoff(0, past_burst), Duration::from_secs(60));
-        assert_eq!(next_backoff(5, past_burst), Duration::from_secs(60));
+        assert_eq!(next_backoff(0, past_burst), Duration::from_mins(1));
+        assert_eq!(next_backoff(5, past_burst), Duration::from_mins(1));
     }
 
     #[test]

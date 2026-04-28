@@ -322,7 +322,7 @@ async fn poll_vscode_server(
 ) -> bool {
     let step = progress.step("Waiting for VS Code to connect...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(60);
+    let timeout = Duration::from_mins(1);
     let interval = Duration::from_secs(2);
 
     loop {

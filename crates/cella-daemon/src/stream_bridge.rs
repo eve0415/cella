@@ -76,7 +76,7 @@ pub fn start_stream_bridge(
 /// Returns the exit code (0 on clean disconnect, 1 on error).
 fn run_bridge(listener: &TcpListener, master: &(dyn MasterPty + Send)) -> i32 {
     // Wait for agent to connect (with timeout).
-    let Some(stream) = accept_with_timeout(listener, Duration::from_secs(60)) else {
+    let Some(stream) = accept_with_timeout(listener, Duration::from_mins(1)) else {
         error!("stream bridge: no connection within 60s");
         return 1;
     };
