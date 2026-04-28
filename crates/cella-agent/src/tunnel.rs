@@ -1,4 +1,4 @@
-//! Reverse tunnel handler: responds to daemon TunnelRequest messages by opening
+//! Reverse tunnel handler: responds to daemon `TunnelRequest` messages by opening
 //! a TCP connection back to the daemon and relaying to a local service.
 
 use cella_protocol::TunnelHandshake;
@@ -13,7 +13,7 @@ pub struct TunnelConfig {
     pub auth_token: String,
 }
 
-/// Handle a single TunnelRequest by connecting back to the daemon and relaying
+/// Handle a single `TunnelRequest` by connecting back to the daemon and relaying
 /// to the local service.
 pub async fn handle_tunnel_request(connection_id: u64, target_port: u16, config: &TunnelConfig) {
     debug!("Tunnel request: connection_id={connection_id} target_port={target_port}");
@@ -65,13 +65,17 @@ pub async fn handle_tunnel_request(connection_id: u64, target_port: u16, config:
 mod tests {
     use super::*;
 
+    fn clone_config(c: &TunnelConfig) -> TunnelConfig {
+        c.clone()
+    }
+
     #[test]
     fn tunnel_config_clone() {
         let config = TunnelConfig {
             daemon_addr: "127.0.0.1:5000".to_string(),
             auth_token: "secret".to_string(),
         };
-        let cloned = config.clone();
+        let cloned = clone_config(&config);
         assert_eq!(cloned.daemon_addr, "127.0.0.1:5000");
         assert_eq!(cloned.auth_token, "secret");
     }

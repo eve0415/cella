@@ -29,7 +29,7 @@ pub enum ProxyCommand {
 /// Target specification for starting a proxy.
 #[derive(Debug, Clone)]
 pub enum ProxyStartTarget {
-    /// Connect directly to an IP:port (OrbStack, Linux native).
+    /// Connect directly to an `IP:port` (`OrbStack`, Linux native).
     DirectIp { ip: String, port: u16 },
     /// Tunnel through the agent via a reverse TCP connection.
     AgentTunnel { container_name: String, port: u16 },
@@ -53,7 +53,7 @@ pub struct ProxyCoordinatorContext {
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
 }
 
-/// Start a direct-IP TCP proxy from `host_port` to the given IP:port.
+/// Start a direct-IP TCP proxy from `host_port` to the given `IP:port`.
 async fn start_direct_proxy(
     host_port: u16,
     ip: String,

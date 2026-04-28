@@ -150,13 +150,13 @@ async fn handle_tunnel_connection(
     }
 
     let stream = reader.into_inner().unsplit(writer);
-    if !ctx.tunnel_broker.deliver(hs.connection_id, stream).await {
+    if ctx.tunnel_broker.deliver(hs.connection_id, stream).await {
+        debug!("Tunnel connection {} delivered", hs.connection_id);
+    } else {
         warn!(
             "Tunnel connection {}: no pending request (timed out or spurious)",
             hs.connection_id
         );
-    } else {
-        debug!("Tunnel connection {} delivered", hs.connection_id);
     }
 }
 
@@ -2406,6 +2406,7 @@ mod tests {
                     agent_state: agent_state.clone(),
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    agent_tx: None,
                 },
             );
             Arc::new(Mutex::new(map))

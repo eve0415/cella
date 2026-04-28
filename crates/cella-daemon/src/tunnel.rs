@@ -15,6 +15,12 @@ pub struct TunnelBroker {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<TcpStream>>>>,
 }
 
+impl Default for TunnelBroker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TunnelBroker {
     pub fn new() -> Self {
         Self {
@@ -35,12 +41,11 @@ impl TunnelBroker {
     ///
     /// Returns `false` if no pending request matches (timed out or spurious).
     pub async fn deliver(&self, connection_id: u64, stream: TcpStream) -> bool {
-        let tx = self.pending.lock().await.remove(&connection_id);
-        if let Some(tx) = tx {
-            tx.send(stream).is_ok()
-        } else {
-            false
-        }
+        self.pending
+            .lock()
+            .await
+            .remove(&connection_id)
+            .is_some_and(|tx| tx.send(stream).is_ok())
     }
 
     /// Remove a timed-out pending request.
