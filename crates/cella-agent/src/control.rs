@@ -135,21 +135,42 @@ impl ControlClient {
 
     /// Read a response message from the daemon.
     ///
+    /// Uses the background reader channel if `start_reader()` was called,
+    /// otherwise reads directly from the TCP stream (for one-shot clients).
+    ///
     /// # Errors
     ///
     /// Returns error on I/O or deserialization failure.
     pub async fn recv(&mut self) -> Result<DaemonMessage, CellaPortError> {
         if let Some(ref mut rx) = self.response_rx {
-            rx.recv()
+            return rx
+                .recv()
                 .await
                 .ok_or_else(|| CellaPortError::ControlSocket {
                     message: "connection closed".to_string(),
-                })
-        } else {
-            Err(CellaPortError::ControlSocket {
-                message: "reader not started".to_string(),
-            })
+                });
         }
+
+        if let Some(ref mut reader) = self.reader {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| CellaPortError::ControlSocket {
+                    message: format!("read error: {e}"),
+                })?;
+            if line.is_empty() {
+                return Err(CellaPortError::ControlSocket {
+                    message: "connection closed".to_string(),
+                });
+            }
+            let msg: DaemonMessage = serde_json::from_str(&line)?;
+            return Ok(msg);
+        }
+
+        Err(CellaPortError::ControlSocket {
+            message: "not connected".to_string(),
+        })
     }
 }
 
@@ -438,5 +459,52 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn recv_works_without_start_reader_for_oneshot_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: None,
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+
+            let mut msg_buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut msg_buf).await;
+
+            let response = DaemonMessage::Ack {
+                id: Some("oneshot-1".to_string()),
+            };
+            let mut resp_json = serde_json::to_string(&response).unwrap();
+            resp_json.push('\n');
+            stream.write_all(resp_json.as_bytes()).await.unwrap();
+        });
+
+        let (mut client, _hello) =
+            ControlClient::connect(&addr.to_string(), "test-container", "token")
+                .await
+                .unwrap();
+
+        let msg = AgentMessage::Health {
+            uptime_secs: 1,
+            ports_detected: 0,
+        };
+        client.send(&msg).await.unwrap();
+
+        let resp = client.recv().await.unwrap();
+        assert!(matches!(resp, DaemonMessage::Ack { id } if id.as_deref() == Some("oneshot-1")));
     }
 }
