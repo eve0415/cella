@@ -66,7 +66,7 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
             let mut reports = Vec::new();
             for container in &containers {
                 let name = format!("Container: {}", container.name);
-                let checks = check_single_container(client, &container.id, &container.name).await;
+                let checks = check_single_container(client, &container.id).await;
                 reports.push(CategoryReport::new(name, checks));
             }
             reports
@@ -111,7 +111,7 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
-            let checks = check_single_container(client, &container.id, &container.name).await;
+            let checks = check_single_container(client, &container.id).await;
             vec![CategoryReport::new(name, checks)]
         }
         Err(_) => {
@@ -131,7 +131,6 @@ async fn check_workspace_container(
 async fn check_single_container(
     client: &dyn ContainerBackend,
     container_id: &str,
-    container_name: &str,
 ) -> Vec<CheckResult> {
     let mut checks = Vec::new();
 
@@ -144,7 +143,7 @@ async fn check_single_container(
     });
 
     // Version skew check
-    check_version_skew(client, container_id, &mut checks, container_name).await;
+    check_version_skew(client, container_id, &mut checks).await;
 
     // Agent/port checks only apply to backends with managed agents
     if client.capabilities().managed_agent {
@@ -165,7 +164,6 @@ async fn check_version_skew(
     client: &dyn ContainerBackend,
     container_id: &str,
     checks: &mut Vec<CheckResult>,
-    container_name: &str,
 ) {
     let cli_version = env!("CARGO_PKG_VERSION");
 
