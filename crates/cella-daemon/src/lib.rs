@@ -18,5 +18,6 @@ pub mod shared;
 pub mod ssh_proxy;
 pub mod stream_bridge;
 pub mod task_manager;
+pub mod tunnel;
 
 pub use error::CellaDaemonError;

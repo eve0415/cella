@@ -35,6 +35,8 @@ pub(crate) struct ManagementContext {
     pub auth_token: String,
     pub control_port: u16,
     pub ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
+    pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    pub tunnel_broker: Arc<crate::tunnel::TunnelBroker>,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -75,9 +77,7 @@ pub(crate) async fn run_management_server(
 ) -> Result<(), CellaDaemonError> {
     let listener = bind_management_socket(socket_path)?;
 
-    let container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
+    let container_handles = ctx.container_handles.clone();
     let ctx = Arc::new(ctx);
 
     // Spawn the unified TCP control server for agent connections
@@ -92,6 +92,8 @@ pub(crate) async fn run_management_server(
             proxy_cmd_tx: ctx.proxy_cmd_tx.clone(),
             task_manager: crate::task_manager::new_shared(),
             cella_bin: crate::control_server::resolve_cella_binary(),
+            tunnel_broker: ctx.tunnel_broker.clone(),
+            is_orbstack: ctx.is_orbstack,
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(
@@ -369,6 +371,7 @@ async fn handle_register(
                 agent_state: Arc::new(AgentConnectionState::new()),
                 backend_kind: reg.backend_kind,
                 docker_host: reg.docker_host,
+                agent_tx: None,
             },
         );
     }
@@ -556,6 +559,8 @@ mod tests {
             auth_token: "test-token".to_string(),
             control_port: ctrl_port,
             ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep(), "test-token".to_string()),
+            container_handles: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_broker: Arc::new(crate::tunnel::TunnelBroker::new()),
         };
         (ctx, srx)
     }

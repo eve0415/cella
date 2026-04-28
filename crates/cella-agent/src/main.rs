@@ -24,6 +24,7 @@ mod proxy_config;
 mod reconnecting_client;
 mod ssh_agent_bridge;
 mod state;
+mod tunnel;
 
 use std::time::Duration;
 

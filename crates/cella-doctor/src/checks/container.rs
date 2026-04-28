@@ -66,7 +66,7 @@ async fn check_all_containers(client: &dyn ContainerBackend) -> Vec<CategoryRepo
             let mut reports = Vec::new();
             for container in &containers {
                 let name = format!("Container: {}", container.name);
-                let checks = check_single_container(client, &container.id, &container.name).await;
+                let checks = check_single_container(client, &container.id).await;
                 reports.push(CategoryReport::new(name, checks));
             }
             reports
@@ -111,7 +111,7 @@ async fn check_workspace_container(
     match target.resolve(client, false).await {
         Ok(container) => {
             let name = format!("Container: {}", container.name);
-            let checks = check_single_container(client, &container.id, &container.name).await;
+            let checks = check_single_container(client, &container.id).await;
             vec![CategoryReport::new(name, checks)]
         }
         Err(_) => {
@@ -131,7 +131,6 @@ async fn check_workspace_container(
 async fn check_single_container(
     client: &dyn ContainerBackend,
     container_id: &str,
-    container_name: &str,
 ) -> Vec<CheckResult> {
     let mut checks = Vec::new();
 
@@ -144,18 +143,18 @@ async fn check_single_container(
     });
 
     // Version skew check
-    check_version_skew(client, container_id, &mut checks, container_name).await;
+    check_version_skew(client, container_id, &mut checks).await;
 
     // Agent/port checks only apply to backends with managed agents
     if client.capabilities().managed_agent {
         // Agent connectivity via daemon
-        check_agent_connectivity(&mut checks, container_name).await;
+        check_agent_connectivity(&mut checks, container_id).await;
 
         // Credential forwarding
         check_credentials(client, container_id, &mut checks).await;
 
         // Port forwarding
-        check_ports(&mut checks, container_name).await;
+        check_ports(&mut checks, container_id).await;
     }
 
     checks
@@ -165,14 +164,13 @@ async fn check_version_skew(
     client: &dyn ContainerBackend,
     container_id: &str,
     checks: &mut Vec<CheckResult>,
-    container_name: &str,
 ) {
     let cli_version = env!("CARGO_PKG_VERSION");
 
     // Prefer the live agent version from the daemon handshake.
     // Fall back to the Docker label when the agent isn't connected
     // (unmanaged backend, agent crashed, etc.).
-    let agent_version = query_live_agent_version(container_name).await;
+    let agent_version = query_live_agent_version(container_id).await;
 
     match agent_version.as_deref() {
         Some(v) if v == cli_version => {
@@ -220,7 +218,7 @@ async fn check_version_skew(
 }
 
 /// Query the daemon for a container's live agent version.
-async fn query_live_agent_version(container_name: &str) -> Option<String> {
+async fn query_live_agent_version(container_id: &str) -> Option<String> {
     let data_dir = cella_env::paths::cella_data_dir()?;
     let mgmt_socket = data_dir.join("daemon.sock");
     if !mgmt_socket.exists() {
@@ -237,14 +235,14 @@ async fn query_live_agent_version(container_name: &str) -> Option<String> {
     if let ManagementResponse::Status { containers, .. } = resp {
         containers
             .into_iter()
-            .find(|c| c.container_name == container_name && c.agent_connected)
+            .find(|c| c.container_id == container_id && c.agent_connected)
             .and_then(|c| c.agent_version)
     } else {
         None
     }
 }
 
-async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name: &str) {
+async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_id: &str) {
     let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         return;
     };
@@ -259,7 +257,7 @@ async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_name:
         Ok(ManagementResponse::Status { containers, .. }) => {
             let found = containers
                 .iter()
-                .any(|c| c.container_name == container_name && c.agent_connected);
+                .any(|c| c.container_id == container_id && c.agent_connected);
             if found {
                 checks.push(CheckResult {
                     name: "agent".into(),
@@ -335,7 +333,7 @@ async fn check_credentials(
     }
 }
 
-async fn check_ports(checks: &mut Vec<CheckResult>, container_name: &str) {
+async fn check_ports(checks: &mut Vec<CheckResult>, container_id: &str) {
     let Some(data_dir) = cella_env::paths::cella_data_dir() else {
         return;
     };
@@ -343,15 +341,15 @@ async fn check_ports(checks: &mut Vec<CheckResult>, container_name: &str) {
 
     match cella_daemon::management::send_management_request(
         &mgmt_socket,
-        &ManagementRequest::QueryPorts,
+        &ManagementRequest::QueryStatus,
     )
     .await
     {
-        Ok(ManagementResponse::Ports { ports }) => {
-            let port_count = ports
+        Ok(ManagementResponse::Status { containers, .. }) => {
+            let port_count = containers
                 .iter()
-                .filter(|p| p.container_name == container_name)
-                .count();
+                .find(|c| c.container_id == container_id)
+                .map_or(0, |c| c.forwarded_port_count);
             checks.push(CheckResult {
                 name: "forwarded ports".into(),
                 severity: Severity::Info,

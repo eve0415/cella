@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cella_protocol::{
     AgentHello, AgentMessage, DaemonHello, DaemonMessage, PROTOCOL_VERSION, PortProtocol,
+    TunnelHandshake,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -21,6 +22,7 @@ use crate::browser::BrowserHandler;
 use crate::credential::invoke_git_credential;
 use crate::port_manager::PortManager;
 use crate::proxy::ProxyCommand;
+use crate::tunnel::TunnelBroker;
 
 /// Shared context for the control server and its connection handlers.
 pub(crate) struct ControlContext {
@@ -33,6 +35,8 @@ pub(crate) struct ControlContext {
     /// Host-native cella binary, resolved and snapshotted at daemon startup so
     /// that in-container `cargo build` cannot clobber it via the bind mount.
     pub cella_bin: std::path::PathBuf,
+    pub tunnel_broker: Arc<TunnelBroker>,
+    pub is_orbstack: bool,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -67,13 +71,15 @@ pub struct ContainerHandle {
     pub backend_kind: Option<String>,
     /// Docker host override used when the container was created.
     pub docker_host: Option<String>,
+    /// Channel for sending daemon-initiated messages to the connected agent.
+    pub agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
 }
 
-/// Spawn a handler task for a new agent TCP connection.
-fn spawn_agent_handler(stream: tokio::net::TcpStream, ctx: Arc<ControlContext>) {
+/// Spawn a handler task for a new TCP connection (agent or tunnel).
+fn spawn_connection_handler(stream: tokio::net::TcpStream, ctx: Arc<ControlContext>) {
     tokio::spawn(async move {
-        if let Err(e) = handle_agent_connection(stream, &ctx).await {
-            warn!("Agent connection error: {e}");
+        if let Err(e) = handle_incoming_connection(stream, &ctx).await {
+            warn!("Connection handler error: {e}");
         }
     });
 }
@@ -87,12 +93,70 @@ fn handle_accept_result(
     match result {
         Ok((stream, peer)) => {
             last_activity.store(current_time_secs(), Ordering::Relaxed);
-            debug!("Agent TCP connection from {peer}");
-            spawn_agent_handler(stream, ctx.clone());
+            debug!("TCP connection from {peer}");
+            spawn_connection_handler(stream, ctx.clone());
         }
         Err(e) => {
             warn!("Control server accept error: {e}");
         }
+    }
+}
+
+/// Discriminate the first message to determine connection type.
+async fn handle_incoming_connection(
+    stream: tokio::net::TcpStream,
+    ctx: &ControlContext,
+) -> Result<(), CellaDaemonError> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| CellaDaemonError::Socket {
+            message: format!("first message read error: {e}"),
+        })?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let trimmed = line.trim();
+
+    if let Ok(tunnel_hs) = serde_json::from_str::<TunnelHandshake>(trimmed) {
+        handle_tunnel_connection(tunnel_hs, reader, writer, ctx).await;
+        return Ok(());
+    }
+
+    if let Ok(agent_hello) = serde_json::from_str::<AgentHello>(trimmed) {
+        return handle_agent_connection_after_hello(agent_hello, reader, writer, ctx).await;
+    }
+
+    warn!("Unrecognized first message, closing connection");
+    send_reject(&mut writer, "unrecognized first message".to_string()).await;
+    Ok(())
+}
+
+/// Handle a validated tunnel handshake: deliver the stream to the broker.
+async fn handle_tunnel_connection(
+    hs: TunnelHandshake,
+    reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    ctx: &ControlContext,
+) {
+    if hs.auth_token != ctx.auth_token {
+        warn!("Tunnel connection rejected: invalid auth token");
+        return;
+    }
+
+    let stream = reader.into_inner().unsplit(writer);
+    if ctx.tunnel_broker.deliver(hs.connection_id, stream).await {
+        debug!("Tunnel connection {} delivered", hs.connection_id);
+    } else {
+        warn!(
+            "Tunnel connection {}: no pending request (timed out or spurious)",
+            hs.connection_id
+        );
     }
 }
 
@@ -149,35 +213,15 @@ struct HandshakeResult {
     workspace_path: Option<String>,
 }
 
-/// Perform the hello handshake: read `AgentHello`, validate, look up container.
+/// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
 ///
 /// Returns `Ok(None)` if the connection should be cleanly closed (rejection sent).
 /// Returns `Ok(Some(..))` on success with validated handshake data.
-async fn perform_handshake<R, W>(
-    reader: &mut R,
+async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
+    agent_hello: AgentHello,
     writer: &mut W,
-    line: &mut String,
     ctx: &ControlContext,
-) -> Result<Option<HandshakeResult>, CellaDaemonError>
-where
-    R: AsyncBufReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let n = reader
-        .read_line(line)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("hello read error: {e}"),
-        })?;
-    if n == 0 {
-        return Ok(None);
-    }
-
-    let Ok(agent_hello) = serde_json::from_str::<AgentHello>(line.trim()) else {
-        send_reject(writer, "Hello required as first message".to_string()).await;
-        return Ok(None);
-    };
-
+) -> Result<Option<HandshakeResult>, CellaDaemonError> {
     if agent_hello.protocol_version != PROTOCOL_VERSION {
         send_reject(
             writer,
@@ -211,7 +255,6 @@ where
         pm.container_ip(&container_id).map(String::from)
     };
 
-    // Store the live agent version for status queries.
     if let Ok(mut v) = agent_state.agent_version.lock() {
         *v = Some(agent_hello.agent_version.clone());
     }
@@ -224,7 +267,6 @@ where
         );
     }
 
-    // Send DaemonHello success with workspace metadata from container labels.
     let labels = lookup_container_labels(&container_id, &ctx.container_handles).await;
     let hello = DaemonHello {
         protocol_version: PROTOCOL_VERSION,
@@ -266,100 +308,119 @@ where
     }))
 }
 
-/// Handle a single agent TCP connection (newline-delimited JSON).
-async fn handle_agent_connection(
-    stream: tokio::net::TcpStream,
+/// Handle an agent TCP connection after the `AgentHello` has been parsed.
+async fn handle_agent_connection_after_hello(
+    agent_hello: AgentHello,
+    mut reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    mut writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
     ctx: &ControlContext,
 ) -> Result<(), CellaDaemonError> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    let Some(hs) = perform_handshake(&mut reader, &mut writer, &mut line, ctx).await? else {
+    let Some(hs) = validate_agent_hello(agent_hello, &mut writer, ctx).await? else {
         return Ok(());
     };
+    let mut line = String::new();
 
     info!("Agent connected for container {}", hs.container_name);
 
-    // --- Message loop ---
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| CellaDaemonError::Socket {
-                message: format!("read error: {e}"),
-            })?;
+    let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
-        if n == 0 {
-            break; // Connection closed
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let msg: AgentMessage =
-            serde_json::from_str(trimmed).map_err(|e| CellaDaemonError::Protocol {
-                message: format!("invalid agent message: {e}"),
-            })?;
-
-        // Worktree/exec/task operations need writer access for multi-message responses.
-        // Handle them directly before falling through to the single-response handler.
-        if matches!(
-            &msg,
-            AgentMessage::BranchRequest { .. }
-                | AgentMessage::ListRequest { .. }
-                | AgentMessage::ExecRequest { .. }
-                | AgentMessage::PruneRequest { .. }
-                | AgentMessage::DownRequest { .. }
-                | AgentMessage::UpRequest { .. }
-                | AgentMessage::TaskRunRequest { .. }
-                | AgentMessage::TaskListRequest { .. }
-                | AgentMessage::TaskLogsRequest { .. }
-                | AgentMessage::TaskWaitRequest { .. }
-                | AgentMessage::TaskStopRequest { .. }
-                | AgentMessage::SwitchRequest { .. }
-        ) {
-            handle_worktree_message(
-                msg,
-                WorktreeHandlerCtx {
-                    workspace_path: hs.workspace_path.as_deref(),
-                    cella_bin: &ctx.cella_bin,
-                    task_mgr: &ctx.task_manager,
-                    container_handles: &ctx.container_handles,
-                    container_name: &hs.container_name,
-                },
-                &mut writer,
-            )
-            .await?;
-            continue;
-        }
-
-        let handler_ctx = AgentHandlerContext {
-            port_manager: &ctx.port_manager,
-            browser_handler: &ctx.browser_handler,
-            container_id: Some(&hs.container_id),
-            proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
-            container_ip: hs.container_ip.as_deref(),
-        };
-        let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
-
-        if let Some(resp) = response {
-            send_message(&mut writer, &resp).await?;
+    {
+        let mut handles = ctx.container_handles.lock().await;
+        if let Some(handle) = handles.get_mut(&hs.container_name) {
+            handle.agent_tx = Some(daemon_tx);
         }
     }
 
+    // --- Message loop ---
+    let result: Result<(), CellaDaemonError> = loop {
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let n = result.map_err(|e| CellaDaemonError::Socket {
+                    message: format!("read error: {e}"),
+                })?;
+
+                if n == 0 {
+                    break Ok(());
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    line.clear();
+                    continue;
+                }
+
+                let msg: AgentMessage =
+                    serde_json::from_str(trimmed).map_err(|e| CellaDaemonError::Protocol {
+                        message: format!("invalid agent message: {e}"),
+                    })?;
+                line.clear();
+
+                if matches!(
+                    &msg,
+                    AgentMessage::BranchRequest { .. }
+                        | AgentMessage::ListRequest { .. }
+                        | AgentMessage::ExecRequest { .. }
+                        | AgentMessage::PruneRequest { .. }
+                        | AgentMessage::DownRequest { .. }
+                        | AgentMessage::UpRequest { .. }
+                        | AgentMessage::TaskRunRequest { .. }
+                        | AgentMessage::TaskListRequest { .. }
+                        | AgentMessage::TaskLogsRequest { .. }
+                        | AgentMessage::TaskWaitRequest { .. }
+                        | AgentMessage::TaskStopRequest { .. }
+                        | AgentMessage::SwitchRequest { .. }
+                ) {
+                    handle_worktree_message(
+                        msg,
+                        WorktreeHandlerCtx {
+                            workspace_path: hs.workspace_path.as_deref(),
+                            cella_bin: &ctx.cella_bin,
+                            task_mgr: &ctx.task_manager,
+                            container_handles: &ctx.container_handles,
+                            container_name: &hs.container_name,
+                        },
+                        &mut writer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let handler_ctx = AgentHandlerContext {
+                    port_manager: &ctx.port_manager,
+                    browser_handler: &ctx.browser_handler,
+                    container_id: Some(&hs.container_id),
+                    proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
+                    container_ip: hs.container_ip.as_deref(),
+                    container_name: Some(&hs.container_name),
+                    is_orbstack: ctx.is_orbstack,
+                };
+                let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
+
+                if let Some(resp) = response {
+                    send_message(&mut writer, &resp).await?;
+                }
+            }
+            Some(msg) = daemon_rx.recv() => {
+                send_message(&mut writer, &msg).await?;
+            }
+        }
+    };
+
     // Connection closed — clear live state so status queries don't report
     // stale version/connectivity info for this container.
+    {
+        let mut handles = ctx.container_handles.lock().await;
+        if let Some(handle) = handles.get_mut(&hs.container_name) {
+            handle.agent_tx = None;
+        }
+    }
     hs.agent_state.connected.store(false, Ordering::Relaxed);
     if let Ok(mut v) = hs.agent_state.agent_version.lock() {
         *v = None;
     }
     info!("Agent disconnected for container {}", hs.container_name);
 
-    Ok(())
+    result
 }
 
 /// Per-connection context shared across agent message handlers.
@@ -369,23 +430,25 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub container_id: Option<&'a str>,
     pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
     pub container_ip: Option<&'a str>,
+    pub container_name: Option<&'a str>,
+    pub is_orbstack: bool,
 }
+
+use crate::proxy::ProxyStartTarget;
 
 /// Start a TCP proxy for a forwarded port and verify it bound successfully.
 ///
 /// Returns `false` if the proxy bind failed and the allocation should be rolled back.
 async fn start_port_proxy(
     host_port: u16,
-    container_ip: &str,
-    target_port: u16,
+    target: ProxyStartTarget,
     proxy_cmd_tx: &tokio::sync::mpsc::Sender<ProxyCommand>,
 ) -> bool {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let _ = proxy_cmd_tx
         .send(ProxyCommand::Start {
             host_port,
-            container_ip: container_ip.to_string(),
-            container_port: target_port,
+            target,
             result_tx: Some(result_tx),
         })
         .await;
@@ -393,10 +456,7 @@ async fn start_port_proxy(
     match result_rx.await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            warn!(
-                "Proxy bind failed for port {host_port} (container port {target_port}): {e}. \
-                 Rolling back allocation."
-            );
+            warn!("Proxy bind failed for port {host_port}: {e}. Rolling back allocation.");
             false
         }
         Err(_) => {
@@ -425,11 +485,32 @@ async fn handle_port_open(
 
     let target_port = proxy_port.unwrap_or(port);
 
-    if let (Some(hp), Some(tx), Some(ip)) = (host_port, ctx.proxy_cmd_tx, ctx.container_ip)
-        && !start_port_proxy(hp, ip, target_port, tx).await
-    {
-        ctx.port_manager.lock().await.handle_port_closed(&cid, port);
-        return None;
+    if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
+        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let target = if use_direct_ip {
+            if let Some(ip) = ctx.container_ip {
+                ProxyStartTarget::DirectIp {
+                    ip: ip.to_string(),
+                    port: target_port,
+                }
+            } else {
+                warn!("No container IP for direct proxy, skipping port {port}");
+                return None;
+            }
+        } else if let Some(name) = ctx.container_name {
+            ProxyStartTarget::AgentTunnel {
+                container_name: name.to_string(),
+                port: target_port,
+            }
+        } else {
+            warn!("No container name for tunnel proxy, skipping port {port}");
+            return None;
+        };
+
+        if !start_port_proxy(hp, target, tx).await {
+            ctx.port_manager.lock().await.handle_port_closed(&cid, port);
+            return None;
+        }
     }
 
     host_port.map(|hp| DaemonMessage::PortMapping {
@@ -2227,6 +2308,7 @@ mod tests {
             agent_state: Arc::new(AgentConnectionState::new()),
             backend_kind: Some("docker".into()),
             docker_host: None,
+            agent_tx: None,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
@@ -2247,13 +2329,13 @@ mod tests {
             proxy_cmd_tx: proxy_tx,
             task_manager: crate::task_manager::new_shared(),
             cella_bin: std::path::PathBuf::from("/nonexistent"),
+            tunnel_broker: Arc::new(TunnelBroker::new()),
+            is_orbstack: false,
         }
     }
 
     #[tokio::test]
-    async fn perform_handshake_marks_connected_without_follow_up_message() {
-        use tokio::io::AsyncWriteExt;
-
+    async fn validate_agent_hello_marks_connected() {
         let agent_state = Arc::new(AgentConnectionState::new());
         let handles = {
             let mut map = HashMap::new();
@@ -2264,15 +2346,12 @@ mod tests {
                     agent_state: agent_state.clone(),
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    agent_tx: None,
                 },
             );
             Arc::new(Mutex::new(map))
         };
         let ctx = test_control_context(handles, "test-token");
-
-        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
-        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
-        let mut daemon_reader = BufReader::new(daemon_r);
 
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
@@ -2280,18 +2359,16 @@ mod tests {
             container_name: "test-container".to_string(),
             auth_token: "test-token".to_string(),
         };
-        let mut json = serde_json::to_string(&hello).unwrap();
-        json.push('\n');
-        agent_side.write_all(json.as_bytes()).await.unwrap();
-        agent_side.flush().await.unwrap();
 
         assert!(
             !agent_state.connected.load(Ordering::Relaxed),
             "pre-condition: connected starts false"
         );
 
-        let mut line = String::new();
-        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+        let (_daemon_side, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        let result = validate_agent_hello(hello, &mut w, &ctx).await;
 
         let hs = result
             .expect("handshake should not error")
@@ -2299,7 +2376,7 @@ mod tests {
         assert_eq!(hs.container_name, "test-container");
         assert!(
             agent_state.connected.load(Ordering::Relaxed),
-            "connected must be true immediately after handshake, before any message"
+            "connected must be true immediately after handshake"
         );
         assert_ne!(
             agent_state.last_seen_secs.load(Ordering::Relaxed),
@@ -2329,6 +2406,7 @@ mod tests {
                     agent_state: agent_state.clone(),
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    agent_tx: None,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -2394,15 +2472,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_handshake_unknown_container_does_not_mark_connected() {
-        use tokio::io::AsyncWriteExt;
-
+    async fn validate_agent_hello_unknown_container_rejects() {
         let handles = Arc::new(Mutex::new(HashMap::new()));
         let ctx = test_control_context(handles, "test-token");
-
-        let (mut agent_side, daemon_side) = tokio::io::duplex(4096);
-        let (daemon_r, mut daemon_w) = tokio::io::split(daemon_side);
-        let mut daemon_reader = BufReader::new(daemon_r);
 
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
@@ -2410,13 +2482,11 @@ mod tests {
             container_name: "not-registered".to_string(),
             auth_token: "test-token".to_string(),
         };
-        let mut json = serde_json::to_string(&hello).unwrap();
-        json.push('\n');
-        agent_side.write_all(json.as_bytes()).await.unwrap();
-        agent_side.flush().await.unwrap();
 
-        let mut line = String::new();
-        let result = perform_handshake(&mut daemon_reader, &mut daemon_w, &mut line, &ctx).await;
+        let (_daemon_side, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        let result = validate_agent_hello(hello, &mut w, &ctx).await;
 
         assert!(
             matches!(result, Ok(None)),
@@ -2930,6 +3000,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::Health {
@@ -2961,6 +3033,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::PortClosed {
@@ -2986,6 +3060,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         // Use an unknown operation so it fails fast without needing real git
@@ -3025,6 +3101,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::Health {
@@ -3092,6 +3170,8 @@ branch refs/heads/feat-b
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
+            container_name: None,
+            is_orbstack: false,
         };
 
         let msg = AgentMessage::PortOpen {

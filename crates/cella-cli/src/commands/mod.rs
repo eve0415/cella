@@ -551,6 +551,17 @@ async fn re_register_containers(
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
+        if let Some(workspace_path) = container.labels.get("dev.cella.workspace_path")
+            && let Err(e) = client
+                .ensure_container_network(&container.id, std::path::Path::new(workspace_path))
+                .await
+        {
+            tracing::debug!(
+                "Failed to connect container {} to cella network: {e}",
+                container.name
+            );
+        }
+
         let container_ip = client.get_container_ip(&container.id).await.unwrap_or(None);
 
         // Read ports_attributes from container label

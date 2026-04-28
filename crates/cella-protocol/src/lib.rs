@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version for the agent↔daemon handshake.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Sent by an agent on a new TCP connection to identify it as a reverse tunnel
+/// for an active port-forward. Discriminated from [`AgentHello`] by the
+/// `connection_id` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelHandshake {
+    pub auth_token: String,
+    pub connection_id: u64,
+}
+
 /// Sent by the agent as the first message after connecting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentHello {
@@ -313,6 +322,11 @@ pub enum DaemonMessage {
     },
     /// Port mapping notification: tells the agent which host port was allocated.
     PortMapping { container_port: u16, host_port: u16 },
+    /// Request the agent to open a reverse tunnel for a new forwarded connection.
+    TunnelRequest {
+        connection_id: u64,
+        target_port: u16,
+    },
 
     // -- Worktree operation responses (daemon → in-container agent) ---------
     /// Progress update for a long-running operation (branch creation, etc.).
@@ -686,6 +700,64 @@ mod tests {
                 host_port: 3001
             }
         ));
+    }
+
+    #[test]
+    fn roundtrip_tunnel_handshake() {
+        let hs = TunnelHandshake {
+            auth_token: "secret".to_string(),
+            connection_id: 42,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(json.contains("\"connection_id\":42"));
+        assert!(json.contains("\"auth_token\":\"secret\""));
+        let decoded: TunnelHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.connection_id, 42);
+        assert_eq!(decoded.auth_token, "secret");
+    }
+
+    #[test]
+    fn roundtrip_tunnel_request() {
+        let msg = DaemonMessage::TunnelRequest {
+            connection_id: 99,
+            target_port: 3000,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"tunnel_request\""));
+        assert!(json.contains("\"connection_id\":99"));
+        assert!(json.contains("\"target_port\":3000"));
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::TunnelRequest {
+                connection_id: 99,
+                target_port: 3000
+            }
+        ));
+    }
+
+    #[test]
+    fn tunnel_handshake_not_parseable_as_agent_hello() {
+        let hs = TunnelHandshake {
+            auth_token: "token".to_string(),
+            connection_id: 1,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let result = serde_json::from_str::<AgentHello>(&json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_hello_not_parseable_as_tunnel_handshake() {
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.1.0".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        let result = serde_json::from_str::<TunnelHandshake>(&json);
+        assert!(result.is_err());
     }
 
     #[test]

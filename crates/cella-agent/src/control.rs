@@ -7,8 +7,13 @@ use tokio::net::TcpStream;
 
 /// Client for sending messages to the host daemon via TCP.
 pub struct ControlClient {
-    reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: tokio::io::WriteHalf<TcpStream>,
+    /// After `start_reader()`, messages arrive via this channel instead of the
+    /// raw TCP reader. `None` before `start_reader()` is called.
+    response_rx: Option<tokio::sync::mpsc::Receiver<DaemonMessage>>,
+    /// Direct reader, used only during handshake and before `start_reader()`.
+    reader: Option<BufReader<tokio::io::ReadHalf<TcpStream>>>,
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ControlClient {
@@ -31,9 +36,12 @@ impl ControlClient {
             })?;
 
         let (reader, writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
         let mut client = Self {
-            reader: BufReader::new(reader),
             writer,
+            response_rx: None,
+            reader: None,
+            reader_handle: None,
         };
 
         // Perform Hello handshake
@@ -62,8 +70,7 @@ impl ControlClient {
 
         // Read DaemonHello response
         let mut line = String::new();
-        client
-            .reader
+        reader
             .read_line(&mut line)
             .await
             .map_err(|e| CellaPortError::ControlSocket {
@@ -81,7 +88,27 @@ impl ControlClient {
             });
         }
 
+        client.reader = Some(reader);
         Ok((client, daemon_hello))
+    }
+
+    /// Spawn a background reader task that dispatches `TunnelRequest` messages
+    /// to the tunnel handler and forwards everything else to the response channel.
+    pub fn start_reader(&mut self, tunnel_config: Option<crate::tunnel::TunnelConfig>) {
+        let Some(reader) = self.reader.take() else {
+            return;
+        };
+
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        self.response_rx = Some(rx);
+
+        self.reader_handle = Some(tokio::spawn(async move {
+            run_reader_loop(reader, tx, tunnel_config).await;
+        }));
     }
 
     /// Send a message to the daemon (newline-delimited JSON).
@@ -108,26 +135,83 @@ impl ControlClient {
 
     /// Read a response message from the daemon.
     ///
+    /// Uses the background reader channel if `start_reader()` was called,
+    /// otherwise reads directly from the TCP stream (for one-shot clients).
+    ///
     /// # Errors
     ///
     /// Returns error on I/O or deserialization failure.
     pub async fn recv(&mut self) -> Result<DaemonMessage, CellaPortError> {
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| CellaPortError::ControlSocket {
-                message: format!("read error: {e}"),
-            })?;
-
-        if line.is_empty() {
-            return Err(CellaPortError::ControlSocket {
-                message: "connection closed".to_string(),
-            });
+        if let Some(ref mut rx) = self.response_rx {
+            return rx
+                .recv()
+                .await
+                .ok_or_else(|| CellaPortError::ControlSocket {
+                    message: "connection closed".to_string(),
+                });
         }
 
-        let msg: DaemonMessage = serde_json::from_str(&line)?;
-        Ok(msg)
+        if let Some(ref mut reader) = self.reader {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| CellaPortError::ControlSocket {
+                    message: format!("read error: {e}"),
+                })?;
+            if line.is_empty() {
+                return Err(CellaPortError::ControlSocket {
+                    message: "connection closed".to_string(),
+                });
+            }
+            let msg: DaemonMessage = serde_json::from_str(&line)?;
+            return Ok(msg);
+        }
+
+        Err(CellaPortError::ControlSocket {
+            message: "not connected".to_string(),
+        })
+    }
+}
+
+impl Drop for ControlClient {
+    fn drop(&mut self) {
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn run_reader_loop(
+    mut reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
+    response_tx: tokio::sync::mpsc::Sender<DaemonMessage>,
+    tunnel_config: Option<crate::tunnel::TunnelConfig>,
+) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(msg) = serde_json::from_str::<DaemonMessage>(line.trim()) else {
+            tracing::warn!("Invalid daemon message, skipping");
+            continue;
+        };
+        if let DaemonMessage::TunnelRequest {
+            connection_id,
+            target_port,
+        } = msg
+        {
+            if let Some(ref config) = tunnel_config {
+                let config = config.clone();
+                tokio::spawn(async move {
+                    crate::tunnel::handle_tunnel_request(connection_id, target_port, &config).await;
+                });
+            }
+        } else if response_tx.send(msg).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -325,6 +409,7 @@ mod tests {
             ControlClient::connect(&addr.to_string(), "test-container", "token")
                 .await
                 .unwrap();
+        client.start_reader(None);
 
         // Send a message.
         let msg = AgentMessage::Health {
@@ -368,10 +453,58 @@ mod tests {
             ControlClient::connect(&addr.to_string(), "test-container", "token")
                 .await
                 .unwrap();
+        client.start_reader(None);
 
         let result = client.recv().await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn recv_works_without_start_reader_for_oneshot_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let hello = DaemonHello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "0.1.0".to_string(),
+                error: None,
+                workspace_path: None,
+                parent_repo: None,
+                is_worktree: false,
+            };
+            let mut json = serde_json::to_string(&hello).unwrap();
+            json.push('\n');
+            stream.write_all(json.as_bytes()).await.unwrap();
+
+            let mut msg_buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut msg_buf).await;
+
+            let response = DaemonMessage::Ack {
+                id: Some("oneshot-1".to_string()),
+            };
+            let mut resp_json = serde_json::to_string(&response).unwrap();
+            resp_json.push('\n');
+            stream.write_all(resp_json.as_bytes()).await.unwrap();
+        });
+
+        let (mut client, _hello) =
+            ControlClient::connect(&addr.to_string(), "test-container", "token")
+                .await
+                .unwrap();
+
+        let msg = AgentMessage::Health {
+            uptime_secs: 1,
+            ports_detected: 0,
+        };
+        client.send(&msg).await.unwrap();
+
+        let resp = client.recv().await.unwrap();
+        assert!(matches!(resp, DaemonMessage::Ack { id } if id.as_deref() == Some("oneshot-1")));
     }
 }
