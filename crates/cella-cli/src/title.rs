@@ -15,6 +15,13 @@
 //! actually updates.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TITLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NEEDS_TMUX_WRAP: AtomicBool = AtomicBool::new(false);
+
+const RESTORE_PLAIN: &[u8] = b"\x1b]0;\x07\x1b[23;0t";
+const RESTORE_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b]0;\x07\x1b\\\x1bPtmux;\x1b\x1b[23;0t\x1b\\";
 
 /// Strip the `"cella-"` prefix so the title doesn't repeat the brand already
 /// present in the `" \u{2014} cella <subcommand>"` suffix. No-op if the prefix
@@ -88,6 +95,8 @@ impl TitleGuard {
         let _ = emit_push(&mut stderr, tmux);
         let _ = emit_set(&mut stderr, &content.format(), tmux);
         let _ = stderr.flush();
+        NEEDS_TMUX_WRAP.store(tmux, Ordering::Release);
+        TITLE_ACTIVE.store(true, Ordering::Release);
         Some(Self(()))
     }
 }
@@ -155,6 +164,7 @@ fn base_name(container: &cella_backend::ContainerInfo) -> &str {
 
 impl Drop for TitleGuard {
     fn drop(&mut self) {
+        TITLE_ACTIVE.store(false, Ordering::Release);
         let tmux = in_tmux();
         let mut stderr = io::stderr().lock();
         let _ = emit_restore(&mut stderr, tmux);
@@ -218,6 +228,44 @@ fn tmux_wrap(inner: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+pub fn install_signal_handlers() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+
+    let action = SigAction::new(
+        SigHandler::Handler(restore_title_on_signal),
+        SaFlags::SA_RESETHAND,
+        SigSet::empty(),
+    );
+    #[allow(unsafe_code)]
+    // SAFETY: sigaction is async-signal-safe; the handler only uses
+    // async-signal-safe operations (atomic loads + libc::write + libc::raise).
+    unsafe {
+        let _ = sigaction(Signal::SIGINT, &action);
+        let _ = sigaction(Signal::SIGTERM, &action);
+    }
+}
+
+extern "C" fn restore_title_on_signal(sig: nix::libc::c_int) {
+    if TITLE_ACTIVE.load(Ordering::Acquire) {
+        let bytes = if NEEDS_TMUX_WRAP.load(Ordering::Acquire) {
+            RESTORE_TMUX
+        } else {
+            RESTORE_PLAIN
+        };
+        #[allow(unsafe_code)]
+        // SAFETY: libc::write on STDERR_FILENO is async-signal-safe.
+        unsafe {
+            nix::libc::write(nix::libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+        }
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: raise is async-signal-safe. SA_RESETHAND already restored the
+    // default disposition, so this re-delivers the signal with SIG_DFL.
+    unsafe {
+        nix::libc::raise(sig);
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +557,22 @@ mod tests {
         let mut expected = tmux_wrap(b"\x1b]0;\x07");
         expected.extend_from_slice(&tmux_wrap(b"\x1b[23;0t"));
         assert_eq!(out, expected);
+    }
+
+    // ── signal handler constants ───────────────────────────────────────
+
+    #[test]
+    fn restore_plain_matches_emit_restore_output() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, false).unwrap();
+        assert_eq!(out.as_slice(), RESTORE_PLAIN);
+    }
+
+    #[test]
+    fn restore_tmux_matches_emit_restore_output() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, true).unwrap();
+        assert_eq!(out.as_slice(), RESTORE_TMUX);
     }
 
     // ── public API reachability ──────────────────────────────────────
