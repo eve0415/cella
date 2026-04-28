@@ -27,6 +27,7 @@ clap.workspace = true
 clap_complete.workspace = true
 inquire.workspace = true
 miette.workspace = true
+nix.workspace = true
 owo-colors.workspace = true
 serde_json.workspace = true
 terminal_size.workspace = true
