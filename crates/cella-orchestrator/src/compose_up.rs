@@ -20,6 +20,7 @@ use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuild
 use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
 use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
 use crate::progress::ProgressSender;
+use crate::up::restart_agent_in_container;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -482,6 +483,14 @@ async fn finalize_compose(
     // 15. Verify primary container is running
     verify_container_running(client, &primary.id).await?;
 
+    // 15b. Connect to cella network for daemon port-forwarding reachability
+    if let Err(e) = client
+        .ensure_container_network(&primary.id, cfg.workspace_root)
+        .await
+    {
+        warn!("Failed to connect container to cella network: {e}");
+    }
+
     // 16. Register with daemon (primary container only)
     hooks
         .register_container(client, &primary.id, config, cfg.container_name)
@@ -601,6 +610,14 @@ async fn handle_compose_running(
         progress.hint("Run `cella up --rebuild` to recreate with the updated mounts.");
     }
 
+    // Ensure container is on cella network (may have been created before this was added)
+    if let Err(e) = client
+        .ensure_container_network(&container.id, cfg.workspace_root)
+        .await
+    {
+        warn!("Failed to connect container to cella network: {e}");
+    }
+
     // Re-register with daemon in case it restarted
     hooks
         .register_container(client, &container.id, config, cfg.container_name)
@@ -610,6 +627,10 @@ async fn handle_compose_running(
     // running inside the already-up container can follow a daemon port
     // change since the last `cella up` (e.g., daemon binary update).
     hooks.sync_agent_runtime(client).await;
+
+    // Restart the agent so it reconnects and re-reports ports with the
+    // (potentially updated) cella network IP.
+    restart_agent_in_container(client, &container.id).await;
 
     if let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()

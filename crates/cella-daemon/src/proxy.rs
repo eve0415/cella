@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
@@ -73,6 +73,7 @@ pub async fn start_proxy(host_port: u16, target: ProxyTarget) -> Result<ProxyHan
                             }
                             Err(e) => {
                                 warn!("Proxy connect to {ip}:{port} failed: {e}");
+                                let _ = inbound.shutdown().await;
                             }
                         }
                     }
