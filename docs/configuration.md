@@ -255,21 +255,17 @@ Network proxy and blocking settings. See [Network Proxy](network-proxy.md) for f
 
 ### `[cli]`
 
-Controls CLI behavior defaults. These are equivalent to command-line flags but persisted in config.
+Persisted defaults for CLI flags.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `verbose` | bool | `false` | Enable verbose output |
-| `output` | string | `"text"` | Output format: `"text"` or `"json"` |
-| `pull` | string | `"missing"` | Image pull policy: `"always"`, `"missing"`, `"never"`, or `"build"` |
 | `skip_checksum` | bool | `false` | Skip agent binary checksum verification |
 | `no_network_rules` | bool | `false` | Disable all network blocking rules |
 
 ```toml
 [cli]
-verbose = false
-output = "text"
-pull = "missing"
+skip_checksum = false
+no_network_rules = false
 ```
 
 #### `[cli.build]`
@@ -279,15 +275,10 @@ Build-specific CLI defaults.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `no_cache` | bool | `false` | Disable Docker build cache |
-| `profiles` | array of strings | `[]` | Compose profiles to activate |
-| `env_files` | array of strings | `[]` | Additional env files to load |
-| `pull_policy` | string | `"missing"` | Build-time pull policy: `"always"`, `"missing"`, `"never"`, or `"build"` |
 
 ```toml
 [cli.build]
 no_cache = false
-profiles = ["debug"]
-env_files = [".env.local"]
 ```
 
 ## Validation
