@@ -215,6 +215,24 @@ async fn run_reader_loop(
     }
 }
 
+/// Resolve daemon connection info: `.daemon_addr` file first (authoritative),
+/// env vars as fallback (may be stale after container restart).
+pub fn resolve_daemon_connection() -> Result<(String, String), CellaPortError> {
+    if let Some(info) = read_daemon_addr_file() {
+        return Ok((info.addr, info.token));
+    }
+    if let (Ok(addr), Ok(token)) = (
+        std::env::var("CELLA_DAEMON_ADDR"),
+        std::env::var("CELLA_DAEMON_TOKEN"),
+    ) {
+        return Ok((addr, token));
+    }
+    Err(CellaPortError::ControlSocket {
+        message: "no daemon connection info available (env vars not set, .daemon_addr not found)"
+            .to_string(),
+    })
+}
+
 /// Daemon connection info read from the shared volume file.
 pub struct DaemonAddrInfo {
     pub addr: String,
