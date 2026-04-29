@@ -626,6 +626,11 @@ pub(crate) async fn handle_agent_message(
             None
         }
 
+        AgentMessage::ClipboardCopy { .. } | AgentMessage::ClipboardPaste { .. } => {
+            debug!("Clipboard message received (handler not yet wired)");
+            None
+        }
+
         // Worktree/exec/task operations are handled in the message loop via
         // handle_worktree_message() which has writer access for streaming.
         AgentMessage::BranchRequest { .. }
