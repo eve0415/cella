@@ -3075,6 +3075,117 @@ branch refs/heads/feat-b
     }
 
     // ---------------------------------------------------------------
+    // handle_agent_message — Clipboard variants
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_clipboard_copy_returns_none() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
+        let state = Arc::new(AgentConnectionState::new());
+        state.connected.store(true, Ordering::Relaxed);
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            clipboard_handler: &clipboard,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+            container_name: None,
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::ClipboardCopy {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "text/plain".to_string(),
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_clipboard_copy_invalid_base64_returns_none() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
+        let state = Arc::new(AgentConnectionState::new());
+        state.connected.store(true, Ordering::Relaxed);
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            clipboard_handler: &clipboard,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+            container_name: None,
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::ClipboardCopy {
+            data: "!!! not base64 !!!".to_string(),
+            mime_type: "text/plain".to_string(),
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_clipboard_paste_returns_content() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
+        let state = Arc::new(AgentConnectionState::new());
+        state.connected.store(true, Ordering::Relaxed);
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            clipboard_handler: &clipboard,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+            container_name: None,
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::ClipboardPaste {
+            mime_type: Some("text/plain".to_string()),
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        assert!(matches!(
+            result,
+            Some(DaemonMessage::ClipboardContent { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_clipboard_paste_no_mime_defaults_to_text() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
+        let state = Arc::new(AgentConnectionState::new());
+        state.connected.store(true, Ordering::Relaxed);
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            clipboard_handler: &clipboard,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+            container_name: None,
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::ClipboardPaste { mime_type: None };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+        if let Some(DaemonMessage::ClipboardContent { mime_type, .. }) = result {
+            assert_eq!(mime_type, "text/plain");
+        } else {
+            panic!("expected ClipboardContent response");
+        }
+    }
+
+    // ---------------------------------------------------------------
     // handle_agent_message — PortClosed variant
     // ---------------------------------------------------------------
 

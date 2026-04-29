@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use base64::Engine;
 use cella_port::CellaPortError;
 use cella_protocol::{AgentMessage, DaemonMessage};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::control::ControlClient;
 
@@ -93,7 +93,11 @@ async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), Cella
                 });
             }
             if filter {
-                let _ = std::io::stdout().write_all(&buf);
+                std::io::stdout()
+                    .write_all(&buf)
+                    .map_err(|e| CellaPortError::ControlSocket {
+                        message: format!("failed to write stdout: {e}"),
+                    })?;
             }
             send_clipboard_copy(&buf, &mime_type).await
         }
@@ -138,6 +142,7 @@ async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortEr
                 message: format!("invalid base64 clipboard data: {e}"),
             })
     } else {
+        warn!("Unexpected daemon response for clipboard paste: {response:?}");
         Ok(Vec::new())
     }
 }
