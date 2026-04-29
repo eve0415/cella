@@ -7,9 +7,15 @@ pub struct ClipboardHandler {
 }
 
 trait ClipboardBackend: Send + Sync {
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
     fn copy(&self, data: &[u8], mime_type: &str) -> Result<(), String>;
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String>;
+}
+
+impl Default for ClipboardHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClipboardHandler {
@@ -29,6 +35,9 @@ impl ClipboardHandler {
         self.backend.name()
     }
 
+    /// # Errors
+    ///
+    /// Returns error if the clipboard backend fails to write.
     pub async fn copy(&self, data: &[u8], mime_type: &str) -> Result<(), String> {
         let backend = self.backend.clone();
         let data = data.to_vec();
@@ -38,6 +47,9 @@ impl ClipboardHandler {
             .map_err(|e| format!("clipboard task join: {e}"))?
     }
 
+    /// # Errors
+    ///
+    /// Returns error if the clipboard backend fails to read.
     pub async fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
         let backend = self.backend.clone();
         let mime = mime_type.to_string();
@@ -82,7 +94,7 @@ fn which_exists(cmd: &str) -> bool {
 struct NullBackend;
 
 impl ClipboardBackend for NullBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "null"
     }
 
@@ -98,7 +110,7 @@ impl ClipboardBackend for NullBackend {
 struct PbcopyBackend;
 
 impl ClipboardBackend for PbcopyBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "pbcopy"
     }
 
@@ -115,7 +127,7 @@ impl ClipboardBackend for PbcopyBackend {
 struct WlClipboardBackend;
 
 impl ClipboardBackend for WlClipboardBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "wl-clipboard"
     }
 
@@ -132,7 +144,7 @@ impl ClipboardBackend for WlClipboardBackend {
 struct XselBackend;
 
 impl ClipboardBackend for XselBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "xsel"
     }
 
@@ -149,7 +161,7 @@ impl ClipboardBackend for XselBackend {
 struct XclipBackend;
 
 impl ClipboardBackend for XclipBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "xclip"
     }
 
@@ -173,7 +185,7 @@ impl ClipboardBackend for XclipBackend {
 struct Osc52Backend;
 
 impl ClipboardBackend for Osc52Backend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "osc52"
     }
 

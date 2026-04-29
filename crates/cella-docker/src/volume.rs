@@ -304,18 +304,18 @@ async fn populate_volume(
     skip_checksum: bool,
 ) -> Result<(), CellaDockerError> {
     let agent_bytes = get_agent_binary_bytes(docker, arch, skip_checksum).await?;
-    let browser_script = browser_helper_script();
-    let xsel_script = xsel_helper_script();
-    let xclip_script = xclip_helper_script();
+    let scripts = VolumeTarScripts {
+        browser: &browser_helper_script(),
+        xsel: &xsel_helper_script(),
+        xclip: &xclip_helper_script(),
+    };
 
     upload_to_volume(
         docker,
         version,
         arch,
         &agent_bytes,
-        &browser_script,
-        &xsel_script,
-        &xclip_script,
+        &scripts,
         expected_marker,
     )
     .await
@@ -844,9 +844,7 @@ async fn upload_to_volume(
     version: &str,
     arch: &str,
     agent_bytes: &[u8],
-    browser_script: &[u8],
-    xsel_script: &[u8],
-    xclip_script: &[u8],
+    scripts: &VolumeTarScripts<'_>,
     version_marker: &str,
 ) -> Result<(), CellaDockerError> {
     ensure_image_pulled(docker, "alpine:3").await?;
@@ -894,15 +892,7 @@ async fn upload_to_volume(
         .await?;
 
     // Build tar archive with all files
-    let tar_bytes = build_volume_tar(
-        version,
-        arch,
-        agent_bytes,
-        browser_script,
-        xsel_script,
-        xclip_script,
-        version_marker,
-    )?;
+    let tar_bytes = build_volume_tar(version, arch, agent_bytes, scripts, version_marker)?;
 
     // Upload to container
     docker
@@ -936,16 +926,22 @@ async fn upload_to_volume(
     Ok(())
 }
 
-/// Build a tar archive containing agent binary, browser helper, and version marker.
+struct VolumeTarScripts<'a> {
+    browser: &'a [u8],
+    xsel: &'a [u8],
+    xclip: &'a [u8],
+}
+
 fn build_volume_tar(
     version: &str,
     arch: &str,
     agent_bytes: &[u8],
-    browser_script: &[u8],
-    xsel_script: &[u8],
-    xclip_script: &[u8],
+    scripts: &VolumeTarScripts<'_>,
     version_marker: &str,
 ) -> Result<Vec<u8>, CellaDockerError> {
+    let browser_script = scripts.browser;
+    let xsel_script = scripts.xsel;
+    let xclip_script = scripts.xclip;
     let mut buf = Vec::new();
     {
         let mut archive = tar::Builder::new(&mut buf);
@@ -1432,9 +1428,11 @@ mod tests {
             "0.1.0",
             "aarch64",
             agent_bytes,
-            browser_bytes,
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
             marker,
         )
         .unwrap();
@@ -1487,9 +1485,11 @@ mod tests {
             "0.1.0",
             "x86_64",
             agent_bytes,
-            browser_bytes,
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
             marker,
         )
         .unwrap();
@@ -1530,9 +1530,11 @@ mod tests {
             "0.1.0",
             "x86_64",
             agent_bytes,
-            browser_bytes,
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
             marker,
         )
         .unwrap();
@@ -1817,9 +1819,11 @@ abc333  artifact-c
             "1.0.0",
             "x86_64",
             agent_bytes,
-            browser_bytes,
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
             marker,
         )
         .unwrap();
@@ -1840,8 +1844,18 @@ abc333  artifact-c
 
     #[test]
     fn build_volume_tar_browser_script_is_executable() {
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", b"agent", b"#!/bin/sh", b"s", b"s", "m").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "m",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1896,9 +1910,11 @@ abc333  artifact-c
             "2.0.0",
             "aarch64",
             b"binary",
-            b"#!/bin/sh",
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+            },
             "2.0.0/aarch64\n",
         )
         .unwrap();
@@ -1929,9 +1945,11 @@ abc333  artifact-c
             "1.0.0",
             "x86_64",
             agent_content,
-            b"script",
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
             "marker",
         )
         .unwrap();
@@ -1957,9 +1975,11 @@ abc333  artifact-c
             "1.0.0",
             "x86_64",
             b"agent",
-            browser_content,
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: browser_content,
+                xsel: b"s",
+                xclip: b"s",
+            },
             "marker",
         )
         .unwrap();
@@ -1984,9 +2004,11 @@ abc333  artifact-c
             "1.0.0",
             "x86_64",
             b"agent",
-            b"script",
-            b"s",
-            b"s",
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
             "1.0.0/x86_64\n",
         )
         .unwrap();
@@ -2010,8 +2032,18 @@ abc333  artifact-c
     #[test]
     fn build_volume_tar_with_empty_agent_bytes() {
         // Should still produce a valid archive even with zero-length agent binary
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", b"", b"script", b"s", b"s", "marker").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"",
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "marker",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let entries: Vec<String> = archive

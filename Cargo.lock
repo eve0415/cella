@@ -301,6 +301,7 @@ dependencies = [
 name = "cella-agent"
 version = "0.0.39"
 dependencies = [
+ "base64 0.22.1",
  "cella-network",
  "cella-port",
  "cella-protocol",
@@ -443,6 +444,7 @@ dependencies = [
 name = "cella-daemon"
 version = "0.0.39"
 dependencies = [
+ "base64 0.22.1",
  "cella-port",
  "cella-protocol",
  "hex",

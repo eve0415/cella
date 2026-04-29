@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 
 use base64::Engine;
 use cella_port::CellaPortError;
@@ -24,7 +24,6 @@ pub fn parse_xsel_args(args: &[String]) -> ClipboardOp {
             "-i" | "--input" => mode = Some("input"),
             "-o" | "--output" => mode = Some("output"),
             "-c" | "--clear" => return ClipboardOp::Clear,
-            "-b" | "--clipboard" | "-p" | "--primary" | "-s" | "--secondary" => {}
             _ => {}
         }
     }
@@ -49,13 +48,12 @@ pub fn parse_xclip_args(args: &[String]) -> ClipboardOp {
             "-target" => {
                 i += 1;
                 if let Some(t) = args.get(i) {
-                    mime_type = t.clone();
+                    mime_type.clone_from(t);
                 }
             }
             "-selection" => {
                 i += 1;
             }
-            "-f" | "-filter" => {}
             _ => {}
         }
         i += 1;
@@ -95,14 +93,12 @@ async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), Cella
                 });
             }
             if filter {
-                use std::io::Write;
                 let _ = std::io::stdout().write_all(&buf);
             }
             send_clipboard_copy(&buf, &mime_type).await
         }
         ClipboardOp::Paste { mime_type } => {
             let data = request_clipboard_paste(&mime_type).await?;
-            use std::io::Write;
             std::io::stdout()
                 .write_all(&data)
                 .map_err(|e| CellaPortError::ControlSocket {
@@ -250,9 +246,9 @@ mod tests {
 
     #[test]
     fn parse_xclip_filter_detected() {
-        let args = vec!["-f".to_string()];
+        let args = ["-f".to_string()];
         assert!(args.iter().any(|a| a == "-f" || a == "-filter"));
-        let args2 = vec!["-filter".to_string()];
+        let args2 = ["-filter".to_string()];
         assert!(args2.iter().any(|a| a == "-f" || a == "-filter"));
     }
 }
