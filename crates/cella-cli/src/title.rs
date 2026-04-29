@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static TITLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEEDS_TMUX_WRAP: AtomicBool = AtomicBool::new(false);
 
-const RESTORE_PLAIN: &[u8] = b"\x1b]0;\x07\x1b[23;0t";
-const RESTORE_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b]0;\x07\x1b\\\x1bPtmux;\x1b\x1b[23;0t\x1b\\";
+const RESTORE_PLAIN: &[u8] = b"\x1b[23;0t";
+const RESTORE_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b[23;0t\x1b\\";
 
 /// Strip the `"cella-"` prefix so the title doesn't repeat the brand already
 /// present in the `" \u{2014} cella <subcommand>"` suffix. No-op if the prefix
@@ -201,10 +201,10 @@ fn emit_set(w: &mut impl Write, title: &str, in_tmux: bool) -> io::Result<()> {
     }
 }
 
-// Empty title first so terminals without title-stack support (WezTerm, kitty)
-// still clear the title; the subsequent pop handles stack-supporting terminals.
+// Pop the title stack. Terminals with stack support (xterm, kitty, iTerm2)
+// restore the prior title; terminals without (WezTerm) silently ignore the
+// pop and leave the cella title until the shell prompt overwrites it.
 fn emit_restore(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
-    emit_set(w, "", in_tmux)?;
     emit_pop(w, in_tmux)
 }
 
@@ -554,19 +554,17 @@ mod tests {
     // ── emit_restore ─────────────────────────────────────────────────
 
     #[test]
-    fn emit_restore_plain_emits_reset_then_pop() {
+    fn emit_restore_plain_emits_pop_only() {
         let mut out = Vec::new();
         emit_restore(&mut out, false).unwrap();
-        assert_eq!(out, b"\x1b]0;\x07\x1b[23;0t");
+        assert_eq!(out, b"\x1b[23;0t");
     }
 
     #[test]
-    fn emit_restore_tmux_emits_wrapped_reset_then_pop() {
+    fn emit_restore_tmux_emits_wrapped_pop_only() {
         let mut out = Vec::new();
         emit_restore(&mut out, true).unwrap();
-        let mut expected = tmux_wrap(b"\x1b]0;\x07");
-        expected.extend_from_slice(&tmux_wrap(b"\x1b[23;0t"));
-        assert_eq!(out, expected);
+        assert_eq!(out, tmux_wrap(b"\x1b[23;0t"));
     }
 
     // ── signal handler constants ───────────────────────────────────────
