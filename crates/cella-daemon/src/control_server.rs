@@ -29,6 +29,7 @@ pub(crate) struct ControlContext {
     pub auth_token: String,
     pub port_manager: Arc<Mutex<PortManager>>,
     pub browser_handler: Arc<BrowserHandler>,
+    pub clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub proxy_cmd_tx: tokio::sync::mpsc::Sender<ProxyCommand>,
     pub task_manager: crate::task_manager::SharedTaskManager,
@@ -388,6 +389,7 @@ async fn handle_agent_connection_after_hello(
                 let handler_ctx = AgentHandlerContext {
                     port_manager: &ctx.port_manager,
                     browser_handler: &ctx.browser_handler,
+                    clipboard_handler: &ctx.clipboard_handler,
                     container_id: Some(&hs.container_id),
                     proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
                     container_ip: hs.container_ip.as_deref(),
@@ -427,6 +429,7 @@ async fn handle_agent_connection_after_hello(
 pub(crate) struct AgentHandlerContext<'a> {
     pub port_manager: &'a Arc<Mutex<PortManager>>,
     pub browser_handler: &'a Arc<BrowserHandler>,
+    pub clipboard_handler: &'a Arc<crate::clipboard::ClipboardHandler>,
     pub container_id: Option<&'a str>,
     pub proxy_cmd_tx: Option<&'a tokio::sync::mpsc::Sender<ProxyCommand>>,
     pub container_ip: Option<&'a str>,
@@ -587,6 +590,43 @@ async fn handle_credential_request(
     }
 }
 
+async fn handle_clipboard_copy(data: String, mime_type: String, ctx: &AgentHandlerContext<'_>) {
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(&data) {
+        Ok(bytes) => {
+            debug!("Clipboard copy: {} bytes, mime={mime_type}", bytes.len());
+            if let Err(e) = ctx.clipboard_handler.copy(&bytes, &mime_type).await {
+                warn!("Clipboard copy failed: {e}");
+            }
+        }
+        Err(e) => warn!("Invalid base64 clipboard data: {e}"),
+    }
+}
+
+async fn handle_clipboard_paste(
+    mime_type: Option<String>,
+    ctx: &AgentHandlerContext<'_>,
+) -> DaemonMessage {
+    use base64::Engine;
+    let mime = mime_type.as_deref().unwrap_or("text/plain");
+    match ctx.clipboard_handler.paste(mime).await {
+        Ok((data, actual_mime)) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+            DaemonMessage::ClipboardContent {
+                data: encoded,
+                mime_type: actual_mime,
+            }
+        }
+        Err(e) => {
+            warn!("Clipboard paste failed: {e}");
+            DaemonMessage::ClipboardContent {
+                data: String::new(),
+                mime_type: mime.to_string(),
+            }
+        }
+    }
+}
+
 /// Route an agent message to the appropriate handler.
 pub(crate) async fn handle_agent_message(
     msg: AgentMessage,
@@ -626,9 +666,12 @@ pub(crate) async fn handle_agent_message(
             None
         }
 
-        AgentMessage::ClipboardCopy { .. } | AgentMessage::ClipboardPaste { .. } => {
-            debug!("Clipboard message received (handler not yet wired)");
+        AgentMessage::ClipboardCopy { data, mime_type } => {
+            handle_clipboard_copy(data, mime_type, ctx).await;
             None
+        }
+        AgentMessage::ClipboardPaste { mime_type } => {
+            Some(handle_clipboard_paste(mime_type, ctx).await)
         }
 
         // Worktree/exec/task operations are handled in the message loop via
@@ -2339,6 +2382,7 @@ mod tests {
             auth_token: auth_token.to_string(),
             port_manager: Arc::new(Mutex::new(PortManager::new(false))),
             browser_handler: Arc::new(BrowserHandler::new()),
+            clipboard_handler: Arc::new(crate::clipboard::ClipboardHandler::null()),
             container_handles: handles,
             proxy_cmd_tx: proxy_tx,
             task_manager: crate::task_manager::new_shared(),
@@ -3005,12 +3049,14 @@ branch refs/heads/feat-b
     async fn handle_health_message_returns_none() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         // Post-handshake invariant: connected is owned by perform_handshake.
         state.connected.store(true, Ordering::Relaxed);
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
@@ -3040,10 +3086,12 @@ branch refs/heads/feat-b
             guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
         }
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
@@ -3067,10 +3115,12 @@ branch refs/heads/feat-b
     async fn handle_credential_request_returns_response() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
@@ -3104,6 +3154,7 @@ branch refs/heads/feat-b
     async fn handle_agent_message_updates_last_seen_preserves_connected() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         // Simulate post-handshake invariant: connected is owned by perform_handshake.
         state.connected.store(true, Ordering::Relaxed);
@@ -3112,6 +3163,7 @@ branch refs/heads/feat-b
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
@@ -3177,10 +3229,12 @@ branch refs/heads/feat-b
             guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
         }
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: None,
@@ -3227,10 +3281,12 @@ branch refs/heads/feat-b
             );
         }
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: None,
             container_ip: Some("172.20.0.5"),
@@ -3261,11 +3317,13 @@ branch refs/heads/feat-b
             guard.register_container("c1", "test", None, vec![], None);
         }
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let (proxy_tx, _proxy_rx) = tokio::sync::mpsc::channel(1);
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: Some(&proxy_tx),
             container_ip: None,
@@ -3300,6 +3358,7 @@ branch refs/heads/feat-b
                 .update_container_ip("c1", Some("172.20.0.9".to_string()))
         );
         let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
         let state = Arc::new(AgentConnectionState::new());
         let (proxy_tx, mut proxy_rx) = tokio::sync::mpsc::channel(1);
         let proxy_assertion = tokio::spawn(async move {
@@ -3329,6 +3388,7 @@ branch refs/heads/feat-b
         let ctx = AgentHandlerContext {
             port_manager: &pm,
             browser_handler: &browser,
+            clipboard_handler: &clipboard,
             container_id: Some("c1"),
             proxy_cmd_tx: Some(&proxy_tx),
             // Simulates an agent connection that handshook before the CLI
