@@ -482,20 +482,28 @@ async fn handle_port_open(
         let mut pm = ctx.port_manager.lock().await;
         pm.handle_port_open(&cid, port, protocol, process)
     };
+    let Some(hp) = host_port else {
+        return Some(DaemonMessage::Ack { id: None });
+    };
 
     let target_port = proxy_port.unwrap_or(port);
+    let current_container_ip = {
+        let pm = ctx.port_manager.lock().await;
+        pm.container_ip(&cid).map(str::to_string)
+    };
 
-    if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
+    if let Some(tx) = ctx.proxy_cmd_tx {
         let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
         let target = if use_direct_ip {
-            if let Some(ip) = ctx.container_ip {
+            if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
                 ProxyStartTarget::DirectIp {
                     ip: ip.to_string(),
                     port: target_port,
                 }
             } else {
                 warn!("No container IP for direct proxy, skipping port {port}");
-                return None;
+                ctx.port_manager.lock().await.handle_port_closed(&cid, port);
+                return Some(DaemonMessage::Ack { id: None });
             }
         } else if let Some(name) = ctx.container_name {
             ProxyStartTarget::AgentTunnel {
@@ -504,16 +512,17 @@ async fn handle_port_open(
             }
         } else {
             warn!("No container name for tunnel proxy, skipping port {port}");
-            return None;
+            ctx.port_manager.lock().await.handle_port_closed(&cid, port);
+            return Some(DaemonMessage::Ack { id: None });
         };
 
         if !start_port_proxy(hp, target, tx).await {
             ctx.port_manager.lock().await.handle_port_closed(&cid, port);
-            return None;
+            return Some(DaemonMessage::Ack { id: None });
         }
     }
 
-    host_port.map(|hp| DaemonMessage::PortMapping {
+    Some(DaemonMessage::PortMapping {
         container_port: port,
         host_port: hp,
     })
@@ -3193,6 +3202,159 @@ branch refs/heads/feat-b
             }
             other => panic!("Expected PortMapping, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_port_open_acknowledges_ignored_port() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container(
+                "c1",
+                "test",
+                Some("172.20.0.5".to_string()),
+                vec![cella_protocol::PortAttributes {
+                    port: cella_protocol::PortPattern::Single(9229),
+                    on_auto_forward: cella_protocol::OnAutoForward::Ignore,
+                    ..cella_protocol::PortAttributes::default()
+                }],
+                None,
+            );
+        }
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: Some("172.20.0.5"),
+            container_name: Some("test"),
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::PortOpen {
+            port: 9229,
+            protocol: PortProtocol::Tcp,
+            process: None,
+            bind: cella_protocol::BindAddress::Localhost,
+            proxy_port: None,
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+
+        assert!(
+            matches!(result, Some(DaemonMessage::Ack { id: None })),
+            "ignored ports must be acknowledged so the agent watcher keeps scanning"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_port_open_acknowledges_missing_container_ip() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container("c1", "test", None, vec![], None);
+        }
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let (proxy_tx, _proxy_rx) = tokio::sync::mpsc::channel(1);
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: Some(&proxy_tx),
+            container_ip: None,
+            container_name: Some("test"),
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::PortOpen {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+            process: None,
+            bind: cella_protocol::BindAddress::Localhost,
+            proxy_port: None,
+        };
+        let result = handle_agent_message(msg, &ctx, &state).await;
+
+        assert!(
+            matches!(result, Some(DaemonMessage::Ack { id: None })),
+            "unforwardable ports must be acknowledged so the agent watcher keeps scanning"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_port_open_uses_updated_container_ip_after_handshake() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        pm.lock()
+            .await
+            .register_container("c1", "test", None, vec![], None);
+        assert!(
+            pm.lock()
+                .await
+                .update_container_ip("c1", Some("172.20.0.9".to_string()))
+        );
+        let browser = Arc::new(BrowserHandler::new());
+        let state = Arc::new(AgentConnectionState::new());
+        let (proxy_tx, mut proxy_rx) = tokio::sync::mpsc::channel(1);
+        let proxy_assertion = tokio::spawn(async move {
+            let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), proxy_rx.recv())
+                .await
+                .expect("proxy start command should be sent")
+                .expect("proxy channel should stay open");
+            match cmd {
+                ProxyCommand::Start {
+                    host_port,
+                    target,
+                    result_tx,
+                } => {
+                    assert_eq!(host_port, 3000);
+                    assert!(matches!(
+                        target,
+                        ProxyStartTarget::DirectIp { ref ip, port: 3000 } if ip == "172.20.0.9"
+                    ));
+                    result_tx
+                        .expect("proxy start should request bind result")
+                        .send(Ok(()))
+                        .expect("port handler should wait for proxy result");
+                }
+                ProxyCommand::Stop { .. } => panic!("expected proxy start command"),
+            }
+        });
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            container_id: Some("c1"),
+            proxy_cmd_tx: Some(&proxy_tx),
+            // Simulates an agent connection that handshook before the CLI
+            // updated the daemon's container IP state.
+            container_ip: None,
+            container_name: Some("test"),
+            is_orbstack: false,
+        };
+
+        let msg = AgentMessage::PortOpen {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+            process: None,
+            bind: cella_protocol::BindAddress::Localhost,
+            proxy_port: None,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_agent_message(msg, &ctx, &state),
+        )
+        .await
+        .expect("port open handler should not hang");
+
+        assert!(matches!(
+            result,
+            Some(DaemonMessage::PortMapping {
+                container_port: 3000,
+                host_port: 3000
+            })
+        ));
+        proxy_assertion.await.unwrap();
     }
 
     // ---------------------------------------------------------------

@@ -104,19 +104,26 @@ async fn record_port_mapping(port_map: &PortMap, container_port: u16, host_port:
 async fn process_port_open_response(
     response: Result<DaemonMessage, cella_port::CellaPortError>,
     port_map: &PortMap,
-) {
+) -> bool {
     match response {
         Ok(DaemonMessage::PortMapping {
             container_port,
             host_port,
         }) => {
             record_port_mapping(port_map, container_port, host_port).await;
+            true
+        }
+        Ok(DaemonMessage::Ack { .. }) => {
+            debug!("PortOpen acknowledged without host port mapping");
+            true
         }
         Ok(_) => {
             debug!("Unexpected response to PortOpen (no mapping allocated)");
+            false
         }
         Err(e) => {
             debug!("No response to PortOpen: {e}");
+            false
         }
     }
 }
@@ -159,8 +166,7 @@ async fn send_port_open_and_record(
 
     let response = ctrl.recv().await;
     drop(ctrl);
-    process_port_open_response(response, ctx.port_map).await;
-    true
+    process_port_open_response(response, ctx.port_map).await
 }
 
 /// Handle a single newly-detected listener: start proxy if needed, report to daemon,
@@ -438,5 +444,38 @@ mod tests {
         let closed = collect_closed_keys(&known, &current);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0], (8080, PortProtocol::Udp));
+    }
+
+    #[tokio::test]
+    async fn process_port_open_response_ack_is_success_without_mapping() {
+        let port_map = Arc::new(Mutex::new(HashMap::new()));
+
+        let handled =
+            process_port_open_response(Ok(DaemonMessage::Ack { id: None }), &port_map).await;
+
+        assert!(handled, "Ack means the daemon handled the port report");
+        assert!(
+            port_map.lock().await.is_empty(),
+            "Ack does not publish a host port mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_port_open_response_unrelated_message_is_not_success() {
+        let port_map = Arc::new(Mutex::new(HashMap::new()));
+
+        let handled = process_port_open_response(
+            Ok(DaemonMessage::Config {
+                poll_interval_ms: 1000,
+                proxy_localhost: true,
+            }),
+            &port_map,
+        )
+        .await;
+
+        assert!(
+            !handled,
+            "unrelated daemon messages should not mark the listener as reported"
+        );
     }
 }
