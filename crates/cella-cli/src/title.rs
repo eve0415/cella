@@ -590,6 +590,40 @@ mod tests {
         assert_eq!(out.as_slice(), RESTORE_TMUX);
     }
 
+    // ── full push/set/restore lifecycle ─────────────────────────────
+
+    #[test]
+    fn full_push_set_restore_lifecycle_plain() {
+        let mut out = Vec::new();
+        emit_push(&mut out, false).unwrap();
+        emit_set(&mut out, "x \u{2014} cella exec", false).unwrap();
+        emit_restore(&mut out, false).unwrap();
+
+        let expected = [
+            b"\x1b[22;0t".as_slice(),
+            b"\x1b]0;x \xe2\x80\x94 cella exec\x07".as_slice(),
+            b"\x1b[23;0t".as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn full_push_set_restore_lifecycle_tmux() {
+        let mut out = Vec::new();
+        emit_push(&mut out, true).unwrap();
+        emit_set(&mut out, "x", true).unwrap();
+        emit_restore(&mut out, true).unwrap();
+
+        let expected = [
+            tmux_wrap(b"\x1b[22;0t").as_slice(),
+            tmux_wrap(b"\x1b]0;x\x07").as_slice(),
+            tmux_wrap(b"\x1b[23;0t").as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
     // ── public API reachability ──────────────────────────────────────
 
     #[test]
