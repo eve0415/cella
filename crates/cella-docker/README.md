@@ -45,7 +45,6 @@ Implements the container lifecycle portions of the [Dev Container specification]
 | `image` | Image building via Docker build API |
 | `network` | Network creation and configuration |
 | `volume` | Volume and mount management |
-| `uid` | UID remapping for `updateRemoteUserUID` |
 | `upload` | File upload to running containers via tar streaming |
 
 ## Crate Dependencies

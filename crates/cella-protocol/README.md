@@ -8,7 +8,7 @@ Part of the [cella](../../README.md) workspace.
 
 cella-protocol defines the message types and serialization format shared across cella's IPC boundaries. Three communication layers use this crate:
 
-1. **Agent ↔ Daemon** (TCP) — the in-container agent reports port changes, credential requests, and browser opens to the host daemon; the daemon sends configuration, credential responses, and port mappings back. Worktree operations (branch, exec, prune, etc.) and background tasks are also routed through this channel.
+1. **Agent ↔ Daemon** (TCP) — the in-container agent reports port changes, credential requests, clipboard operations, and browser opens to the host daemon; the daemon sends configuration, credential responses, clipboard content, port mappings, and reverse tunnel requests back. Worktree operations (branch, exec, prune, etc.) and background tasks are also routed through this channel.
 2. **CLI ↔ Daemon** (Unix socket) — the CLI registers/deregisters containers, queries port status, and manages daemon lifecycle.
 3. **Git credential helper** — key=value field parsing/formatting compatible with the git credential helper protocol.
 

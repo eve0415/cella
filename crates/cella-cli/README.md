@@ -8,7 +8,7 @@ Part of the [cella](../../README.md) workspace.
 
 cella-cli is the binary frontend for cella. It defines the `cella` binary, parses CLI arguments via clap, and dispatches each subcommand to the appropriate library crate. No business logic lives here — every command handler delegates to library crates for the actual work.
 
-Error reporting uses miette's graphical handler for source-positioned diagnostics. Tracing is configured via the `RUST_LOG` environment variable.
+Error reporting uses miette's graphical handler for source-positioned diagnostics. Tracing is configured via the `RUST_LOG` environment variable. Terminal window titles are updated via OSC escape sequences for the duration of long-running commands and restored on exit.
 
 ## Commands
 
@@ -58,7 +58,7 @@ Hidden internal commands: `daemon`.
 | Module | Purpose |
 |--------|---------|
 | `commands/mod.rs` | `Command` enum and dispatch logic |
-| `commands/up.rs` | Container startup orchestration (largest command — handles single-container and compose paths) |
+| `commands/up/` | Container startup orchestration (largest command — handles single-container and compose paths) |
 | `commands/compose_up.rs` | Docker Compose orchestration (called by `up` when `dockerComposeFile` is present) |
 | `commands/down.rs` | Container teardown |
 | `commands/shell.rs` | Interactive shell attach |
@@ -73,7 +73,7 @@ Hidden internal commands: `daemon`.
 | `commands/config.rs` | Configuration management |
 | `commands/read_configuration.rs` | Resolved devcontainer config output (JSON, compatible with devcontainer CLI) |
 | `commands/template.rs` | Template management |
-| `commands/init.rs` | Repository initialization |
+| `commands/init/` | Interactive project initialization wizard (mod.rs, wizard.rs, noninteractive.rs, summary.rs) |
 | `commands/code.rs` | VS Code container connection (attached-container URI, auto-up, fork support) |
 | `commands/nvim.rs` | Neovim container connection |
 | `commands/tmux.rs` | tmux session management (attach-or-create, config forwarding) |
@@ -81,8 +81,6 @@ Hidden internal commands: `daemon`.
 | `commands/credential.rs` | Credential forwarding management |
 | `commands/daemon.rs` | Daemon lifecycle management (hidden) |
 | `commands/network.rs` | Network proxy management |
-| `commands/env_cache.rs` | Environment cache management (internal helper) |
-| `commands/image.rs` | Image inspection (internal helper) |
 | `commands/completions.rs` | Shell completion generation |
 | `commands/features/` | Feature management (mod.rs, edit.rs, jsonc_edit.rs, list.rs, prompts.rs, resolve.rs, update.rs) |
 | `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
@@ -90,6 +88,7 @@ Hidden internal commands: `daemon`.
 | `progress.rs` | Progress reporting (indicatif spinners, verbosity) |
 | `style.rs` | Output styling and colors |
 | `table.rs` | Table formatting for list output |
+| `title.rs` | Terminal title integration (sets/restores window title via OSC escape sequences, tmux-aware) |
 
 Each command file defines an args struct and an `execute()` method.
 
