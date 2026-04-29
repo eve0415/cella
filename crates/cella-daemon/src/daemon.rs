@@ -106,6 +106,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         PortManager::new(is_orbstack).with_port_checker(crate::port_manager::is_host_port_free),
     ));
     let browser_handler = Arc::new(BrowserHandler::new());
+    let clipboard_handler = Arc::new(crate::clipboard::ClipboardHandler::new());
 
     // Spawn health monitor
     let health_activity = last_activity.clone();
@@ -147,6 +148,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         last_activity,
         port_manager,
         browser_handler,
+        clipboard_handler,
         proxy_cmd_tx,
         start_time,
         is_orbstack,

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
 cella-port.workspace = true
 cella-protocol.workspace = true
 hex.workspace = true

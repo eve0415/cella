@@ -180,6 +180,34 @@ exec "{agent_path}" browser-open "$1"
     script.into_bytes()
 }
 
+/// Generate the xsel shim script content.
+///
+/// Placed at `/cella/bin/xsel` to shadow the real xsel binary.
+/// Forwards all arguments to the agent's clipboard handler.
+pub fn xsel_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" xsel "$@"
+"#
+    )
+    .into_bytes()
+}
+
+/// Generate the xclip shim script content.
+///
+/// Placed at `/cella/bin/xclip` to shadow the real xclip binary.
+/// Forwards all arguments to the agent's clipboard handler.
+pub fn xclip_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" xclip "$@"
+"#
+    )
+    .into_bytes()
+}
+
 /// Version marker file path inside the volume.
 pub const fn version_marker_path() -> &'static str {
     "/cella/.version"
@@ -276,14 +304,18 @@ async fn populate_volume(
     skip_checksum: bool,
 ) -> Result<(), CellaDockerError> {
     let agent_bytes = get_agent_binary_bytes(docker, arch, skip_checksum).await?;
-    let browser_script = browser_helper_script();
+    let scripts = VolumeTarScripts {
+        browser: &browser_helper_script(),
+        xsel: &xsel_helper_script(),
+        xclip: &xclip_helper_script(),
+    };
 
     upload_to_volume(
         docker,
         version,
         arch,
         &agent_bytes,
-        &browser_script,
+        &scripts,
         expected_marker,
     )
     .await
@@ -812,7 +844,7 @@ async fn upload_to_volume(
     version: &str,
     arch: &str,
     agent_bytes: &[u8],
-    browser_script: &[u8],
+    scripts: &VolumeTarScripts<'_>,
     version_marker: &str,
 ) -> Result<(), CellaDockerError> {
     ensure_image_pulled(docker, "alpine:3").await?;
@@ -860,7 +892,7 @@ async fn upload_to_volume(
         .await?;
 
     // Build tar archive with all files
-    let tar_bytes = build_volume_tar(version, arch, agent_bytes, browser_script, version_marker)?;
+    let tar_bytes = build_volume_tar(version, arch, agent_bytes, scripts, version_marker)?;
 
     // Upload to container
     docker
@@ -894,14 +926,22 @@ async fn upload_to_volume(
     Ok(())
 }
 
-/// Build a tar archive containing agent binary, browser helper, and version marker.
+struct VolumeTarScripts<'a> {
+    browser: &'a [u8],
+    xsel: &'a [u8],
+    xclip: &'a [u8],
+}
+
 fn build_volume_tar(
     version: &str,
     arch: &str,
     agent_bytes: &[u8],
-    browser_script: &[u8],
+    scripts: &VolumeTarScripts<'_>,
     version_marker: &str,
 ) -> Result<Vec<u8>, CellaDockerError> {
+    let browser_script = scripts.browser;
+    let xsel_script = scripts.xsel;
+    let xclip_script = scripts.xclip;
     let mut buf = Vec::new();
     {
         let mut archive = tar::Builder::new(&mut buf);
@@ -927,6 +967,28 @@ fn build_volume_tar(
             .append_data(&mut header, "cella/bin/cella-browser", browser_script)
             .map_err(|e| CellaDockerError::AgentVolume {
                 message: format!("tar append browser: {e}"),
+            })?;
+
+        // xsel shim: /cella/bin/xsel
+        let mut header = tar::Header::new_gnu();
+        header.set_size(xsel_script.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cella/bin/xsel", xsel_script)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append xsel: {e}"),
+            })?;
+
+        // xclip shim: /cella/bin/xclip
+        let mut header = tar::Header::new_gnu();
+        header.set_size(xclip_script.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cella/bin/xclip", xclip_script)
+            .map_err(|e| CellaDockerError::AgentVolume {
+                message: format!("tar append xclip: {e}"),
             })?;
 
         // Stable agent symlink: /cella/bin/cella-agent -> versioned binary
@@ -1362,8 +1424,18 @@ mod tests {
         let browser_bytes = b"#!/bin/sh\necho browser";
         let marker = "0.1.0/aarch64\n";
 
-        let tar_bytes =
-            build_volume_tar("0.1.0", "aarch64", agent_bytes, browser_bytes, marker).unwrap();
+        let tar_bytes = build_volume_tar(
+            "0.1.0",
+            "aarch64",
+            agent_bytes,
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
+            marker,
+        )
+        .unwrap();
 
         // Verify tar contains expected entries
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
@@ -1379,8 +1451,15 @@ mod tests {
         assert!(entries.iter().any(|e| e.contains("cella-agent")));
         assert!(entries.iter().any(|e| e.contains("cella-browser")));
         assert!(entries.iter().any(|e| e.contains(".version")));
-        // CLI symlink: cella/bin/cella
         assert!(entries.iter().any(|e| e == "cella/bin/cella"));
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/xsel"),
+            "tar must contain xsel shim"
+        );
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/xclip"),
+            "tar must contain xclip shim"
+        );
     }
 
     #[test]
@@ -1402,8 +1481,18 @@ mod tests {
         let browser_bytes = b"#!/bin/sh";
         let marker = "0.1.0/x86_64\n";
 
-        let tar_bytes =
-            build_volume_tar("0.1.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+        let tar_bytes = build_volume_tar(
+            "0.1.0",
+            "x86_64",
+            agent_bytes,
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
+            marker,
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let mut found_agent_symlink = false;
@@ -1437,8 +1526,18 @@ mod tests {
         let browser_bytes = b"#!/bin/sh";
         let marker = "0.1.0/x86_64\n";
 
-        let tar_bytes =
-            build_volume_tar("0.1.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+        let tar_bytes = build_volume_tar(
+            "0.1.0",
+            "x86_64",
+            agent_bytes,
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
+            marker,
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1585,6 +1684,34 @@ mod tests {
     }
 
     #[test]
+    fn xsel_helper_script_starts_with_shebang() {
+        let script = xsel_helper_script();
+        assert!(String::from_utf8_lossy(&script).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn xsel_helper_script_execs_agent_xsel() {
+        let bytes = xsel_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("xsel"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
+    fn xclip_helper_script_starts_with_shebang() {
+        let bytes = xclip_helper_script();
+        assert!(String::from_utf8_lossy(&bytes).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn xclip_helper_script_execs_agent_xclip() {
+        let bytes = xclip_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("xclip"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
     fn version_marker_path_is_under_cella() {
         let path = version_marker_path();
         assert_eq!(path, "/cella/.version");
@@ -1688,8 +1815,18 @@ abc333  artifact-c
         let browser_bytes = b"browser";
         let marker = "1.0.0/x86_64\n";
 
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", agent_bytes, browser_bytes, marker).unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            agent_bytes,
+            &VolumeTarScripts {
+                browser: browser_bytes,
+                xsel: b"s",
+                xclip: b"s",
+            },
+            marker,
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1707,7 +1844,18 @@ abc333  artifact-c
 
     #[test]
     fn build_volume_tar_browser_script_is_executable() {
-        let tar_bytes = build_volume_tar("1.0.0", "x86_64", b"agent", b"#!/bin/sh", "m").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "m",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1757,12 +1905,16 @@ abc333  artifact-c
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_volume_tar_contains_exactly_five_entries() {
+    fn build_volume_tar_contains_exactly_seven_entries() {
         let tar_bytes = build_volume_tar(
             "2.0.0",
             "aarch64",
             b"binary",
-            b"#!/bin/sh",
+            &VolumeTarScripts {
+                browser: b"#!/bin/sh",
+                xsel: b"s",
+                xclip: b"s",
+            },
             "2.0.0/aarch64\n",
         )
         .unwrap();
@@ -1777,11 +1929,11 @@ abc333  artifact-c
             })
             .collect();
 
-        // Should contain: agent binary, browser script, agent symlink, cella symlink, .version
+        // agent binary, browser script, xsel shim, xclip shim, agent symlink, cella symlink, .version
         assert_eq!(
             entries.len(),
-            5,
-            "expected 5 entries in volume tar, got {}: {entries:?}",
+            7,
+            "expected 7 entries in volume tar, got {}: {entries:?}",
             entries.len()
         );
     }
@@ -1789,8 +1941,18 @@ abc333  artifact-c
     #[test]
     fn build_volume_tar_agent_binary_has_correct_content() {
         let agent_content = b"this is the agent binary content";
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", agent_content, b"script", "marker").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            agent_content,
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "marker",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1809,8 +1971,18 @@ abc333  artifact-c
     #[test]
     fn build_volume_tar_browser_script_has_correct_content() {
         let browser_content = b"#!/bin/sh\necho browser";
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", b"agent", browser_content, "marker").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: browser_content,
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "marker",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1828,8 +2000,18 @@ abc333  artifact-c
 
     #[test]
     fn build_volume_tar_version_marker_mode_is_644() {
-        let tar_bytes =
-            build_volume_tar("1.0.0", "x86_64", b"agent", b"script", "1.0.0/x86_64\n").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"agent",
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "1.0.0/x86_64\n",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         for entry in archive.entries().unwrap() {
@@ -1850,7 +2032,18 @@ abc333  artifact-c
     #[test]
     fn build_volume_tar_with_empty_agent_bytes() {
         // Should still produce a valid archive even with zero-length agent binary
-        let tar_bytes = build_volume_tar("1.0.0", "x86_64", b"", b"script", "marker").unwrap();
+        let tar_bytes = build_volume_tar(
+            "1.0.0",
+            "x86_64",
+            b"",
+            &VolumeTarScripts {
+                browser: b"script",
+                xsel: b"s",
+                xclip: b"s",
+            },
+            "marker",
+        )
+        .unwrap();
 
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let entries: Vec<String> = archive
@@ -1861,7 +2054,7 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 7);
     }
 
     // -----------------------------------------------------------------------

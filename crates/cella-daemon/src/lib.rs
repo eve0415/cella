@@ -4,6 +4,7 @@
 //! browser-open requests from in-container agents.
 
 pub mod browser;
+pub mod clipboard;
 pub mod control_server;
 pub mod credential;
 pub mod daemon;

@@ -71,6 +71,19 @@ pub enum AgentMessage {
     PortClosed { port: u16, protocol: PortProtocol },
     /// Request to open a URL in the host browser.
     BrowserOpen { url: String },
+    /// Copy data to the host clipboard.
+    ClipboardCopy {
+        /// Base64-encoded clipboard content.
+        data: String,
+        /// MIME type of the content (e.g. "text/plain", "image/png").
+        mime_type: String,
+    },
+    /// Request clipboard content from the host.
+    ClipboardPaste {
+        /// Requested MIME type (None = default text/plain).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        mime_type: Option<String>,
+    },
     /// Git credential request forwarded from the container.
     CredentialRequest {
         /// Unique request ID for correlating responses.
@@ -314,6 +327,13 @@ pub enum DaemonMessage {
     CredentialResponse {
         id: String,
         fields: std::collections::HashMap<String, String>,
+    },
+    /// Clipboard content response.
+    ClipboardContent {
+        /// Base64-encoded clipboard content.
+        data: String,
+        /// MIME type of the content.
+        mime_type: String,
     },
     /// Configuration update from the daemon.
     Config {
@@ -664,6 +684,52 @@ mod tests {
         assert!(
             matches!(decoded, AgentMessage::BrowserOpen { url } if url == "https://github.com/login")
         );
+    }
+
+    #[test]
+    fn roundtrip_clipboard_copy() {
+        let msg = AgentMessage::ClipboardCopy {
+            data: "aGVsbG8gd29ybGQ=".to_string(),
+            mime_type: "text/plain".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"clipboard_copy\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, AgentMessage::ClipboardCopy { mime_type, .. } if mime_type == "text/plain")
+        );
+    }
+
+    #[test]
+    fn roundtrip_clipboard_paste() {
+        let msg = AgentMessage::ClipboardPaste {
+            mime_type: Some("text/plain".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"clipboard_paste\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, AgentMessage::ClipboardPaste { mime_type: Some(ref m), .. } if m == "text/plain")
+        );
+    }
+
+    #[test]
+    fn roundtrip_clipboard_paste_no_mime() {
+        let msg = AgentMessage::ClipboardPaste { mime_type: None };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("mime_type"));
+    }
+
+    #[test]
+    fn roundtrip_clipboard_content() {
+        let msg = DaemonMessage::ClipboardContent {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "text/plain".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"clipboard_content\""));
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, DaemonMessage::ClipboardContent { .. }));
     }
 
     #[test]
