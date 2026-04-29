@@ -96,6 +96,24 @@ for supported runtimes (Docker Desktop, OrbStack).
 On OrbStack, `container.orb.local:PORT` also works as an alternative via
 OrbStack's built-in DNS.
 
+### Reverse Tunnel (Colima, Docker Desktop for Mac)
+
+On runtimes where the host cannot directly reach container IPs, the daemon
+uses reverse tunnels instead of direct TCP proxies. The flow:
+
+1. Host-side proxy accepts a connection on `127.0.0.1:HOST_PORT`
+2. Daemon sends `TunnelRequest { connection_id, port }` to the agent
+   via the control connection
+3. Agent opens a new TCP connection back to the daemon with a
+   `TunnelHandshake { auth_token, connection_id }`
+4. Daemon's tunnel broker matches the connection by ID
+5. Bytes flow bidirectionally: host client ↔ daemon ↔ agent ↔ container
+   service
+
+This reverses the connection direction so the container connects to the
+host rather than the other way around, working around the lack of direct
+IP routing.
+
 ### Browser URL rewriting
 
 When the agent requests `BrowserOpen`, the daemon rewrites the URL if the

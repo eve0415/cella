@@ -3,8 +3,9 @@
 ## Lifecycle
 
 The cella daemon is a long-running host process that manages port
-forwarding, credential forwarding, and browser integration for all active
-devcontainers.
+forwarding, credential forwarding, browser integration, clipboard
+forwarding, reverse tunnel port forwarding, and SSH agent bridging for
+all active devcontainers.
 
 ### Startup
 
@@ -103,6 +104,50 @@ bidirectionally proxies bytes between the accepted TCP stream and a
 PTY master. Used by `cella switch` so in-container users get a full
 PTY-backed shell in the target container via the agent → daemon →
 docker-exec path.
+
+### Clipboard Handler (`clipboard.rs`)
+
+Handles `ClipboardCopy` and `ClipboardPaste` messages from agents.
+Auto-detects the host clipboard backend at startup:
+
+- **macOS**: `pbcopy`/`pbpaste`
+- **Wayland**: `wl-copy`/`wl-paste`
+- **X11**: `xsel`
+
+Copy operations receive base64-encoded data from the agent, decode it,
+and write to the host clipboard. Paste operations read from the host
+clipboard and return the content as a `ClipboardContent` message with
+base64-encoded data.
+
+### Tunnel Broker (`tunnel.rs`)
+
+Manages reverse tunnel connections for runtimes without direct
+container-IP routing (Colima, Docker Desktop for Mac). Instead of the
+daemon connecting directly to `CONTAINER_IP:PORT`, the daemon:
+
+1. Allocates a connection ID via the `TunnelBroker`
+2. Sends `DaemonMessage::TunnelRequest { connection_id, port }` to the
+   agent over the control connection
+3. The agent opens a new TCP connection back to the daemon with a
+   `TunnelHandshake`
+4. The broker matches the connection by ID and returns the TCP stream
+   to the proxy coordinator
+
+This reverses the connection direction, working around the lack of
+direct container-IP routing on non-Linux Docker hosts.
+
+### SSH Proxy (`ssh_proxy.rs`)
+
+Per-workspace TCP listener that bridges the host's `SSH_AUTH_SOCK` to
+in-container agents. Each accepted TCP connection:
+
+1. Reads the auth token line
+2. Opens a `UnixStream` to the host's `$SSH_AUTH_SOCK`
+3. Bidirectionally copies SSH agent protocol bytes
+
+The bridge port is communicated to the agent at registration time.
+Required for Colima where bind-mounting host Unix sockets fails due to
+virtiofs limitations.
 
 ## OrbStack Detection
 
