@@ -567,6 +567,13 @@ mod tests {
         assert_eq!(out, tmux_wrap(b"\x1b[23;0t"));
     }
 
+    #[test]
+    fn emit_restore_plain_does_not_contain_osc_set() {
+        let mut out = Vec::new();
+        emit_restore(&mut out, false).unwrap();
+        assert!(!out.windows(3).any(|w| w == b"\x1b]0"));
+    }
+
     // ── signal handler constants ───────────────────────────────────────
 
     #[test]
