@@ -2,7 +2,7 @@
 
 Audit of cella against the official devcontainer specification (containers.dev) and reference CLI (devcontainers/cli).
 
-Date: 2026-04-19
+Date: 2026-04-29
 
 ## Legend
 
