@@ -3286,11 +3286,14 @@ branch refs/heads/feat-b
     #[tokio::test]
     async fn handle_port_open_uses_updated_container_ip_after_handshake() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
-        {
-            let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", None, vec![], None);
-            assert!(guard.update_container_ip("c1", Some("172.20.0.9".to_string())));
-        }
+        pm.lock()
+            .await
+            .register_container("c1", "test", None, vec![], None);
+        assert!(
+            pm.lock()
+                .await
+                .update_container_ip("c1", Some("172.20.0.9".to_string()))
+        );
         let browser = Arc::new(BrowserHandler::new());
         let state = Arc::new(AgentConnectionState::new());
         let (proxy_tx, mut proxy_rx) = tokio::sync::mpsc::channel(1);
