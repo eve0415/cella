@@ -11,6 +11,7 @@
 
 mod browser;
 mod cli;
+mod clipboard;
 mod control;
 mod credential;
 mod forward_proxy;
@@ -47,6 +48,10 @@ enum AgentCommand {
     BrowserOpen { url: String },
     /// Handle a git credential request.
     Credential { operation: String },
+    /// Handle xsel-compatible clipboard command.
+    Xsel { args: Vec<String> },
+    /// Handle xclip-compatible clipboard command.
+    Xclip { args: Vec<String> },
 }
 
 fn parse_args() -> Result<AgentArgs, String> {
@@ -107,6 +112,16 @@ fn parse_args_from(args: &[String]) -> Result<AgentArgs, String> {
                 command: AgentCommand::Credential { operation },
             })
         }
+        "xsel" => Ok(AgentArgs {
+            command: AgentCommand::Xsel {
+                args: args[2..].to_vec(),
+            },
+        }),
+        "xclip" => Ok(AgentArgs {
+            command: AgentCommand::Xclip {
+                args: args[2..].to_vec(),
+            },
+        }),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -184,6 +199,18 @@ async fn main() {
         AgentCommand::Credential { operation } => {
             if let Err(e) = credential::handle_credential(&operation).await {
                 error!("Credential error: {e}");
+                std::process::exit(1);
+            }
+        }
+        AgentCommand::Xsel { args } => {
+            if let Err(e) = clipboard::handle_xsel(&args).await {
+                error!("Clipboard (xsel) error: {e}");
+                std::process::exit(1);
+            }
+        }
+        AgentCommand::Xclip { args } => {
+            if let Err(e) = clipboard::handle_xclip(&args).await {
+                error!("Clipboard (xclip) error: {e}");
                 std::process::exit(1);
             }
         }
@@ -466,6 +493,39 @@ mod tests {
         let result = parse_args_from(&args(&["cella-agent", "credential"]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing operation"));
+    }
+
+    #[test]
+    fn parse_xsel_command() {
+        let a = parse_args_from(&args(&["cella-agent", "xsel", "-i"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::Xsel { args } if args == vec!["-i"]));
+    }
+
+    #[test]
+    fn parse_xclip_command() {
+        let a = parse_args_from(&args(&["cella-agent", "xclip", "-o"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::Xclip { args } if args == vec!["-o"]));
+    }
+
+    #[test]
+    fn parse_xsel_no_extra_args() {
+        let a = parse_args_from(&args(&["cella-agent", "xsel"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::Xsel { args } if args.is_empty()));
+    }
+
+    #[test]
+    fn parse_xclip_multiple_args() {
+        let a = parse_args_from(&args(&[
+            "cella-agent",
+            "xclip",
+            "-selection",
+            "clipboard",
+            "-target",
+            "image/png",
+            "-i",
+        ]))
+        .unwrap();
+        assert!(matches!(a.command, AgentCommand::Xclip { args } if args.len() == 5));
     }
 
     #[test]

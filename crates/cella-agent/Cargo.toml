@@ -9,6 +9,7 @@ name = "cella-agent"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 cella-network.workspace = true
 cella-port.workspace = true
 miette.workspace = true
