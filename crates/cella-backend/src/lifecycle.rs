@@ -428,6 +428,10 @@ pub fn lifecycle_entries_for_phase(
 }
 
 /// Run a devcontainer.json config phase with progress output.
+///
+/// # Errors
+///
+/// Returns an error if the lifecycle command fails.
 pub async fn run_config_phase_with_output(
     lc_ctx: &LifecycleContext<'_>,
     phase: &str,
@@ -447,6 +451,10 @@ pub async fn run_config_phase_with_output(
 }
 
 /// Run a sequence of origin-tracked lifecycle entries with progress tracking.
+///
+/// # Errors
+///
+/// Returns an error if any lifecycle entry's command fails.
 pub async fn run_lifecycle_entries(
     ctx: &LifecycleContext<'_>,
     phase: &str,
@@ -504,6 +512,10 @@ fn resolve_entries_with_metadata(
 }
 
 /// Run all lifecycle phases for a first-create scenario.
+///
+/// # Errors
+///
+/// Returns an error if any lifecycle command fails.
 pub async fn run_all_lifecycle_phases(
     lc_ctx: &LifecycleContext<'_>,
     config: &Value,
@@ -589,6 +601,10 @@ impl WaitForPhase {
 }
 
 /// Run lifecycle phases up to `wait_for`, then spawn remaining phases in background.
+///
+/// # Errors
+///
+/// Returns an error if any foreground lifecycle command fails.
 pub async fn run_lifecycle_phases_with_wait_for(
     lc_ctx: &LifecycleContext<'_>,
     config: &Value,
@@ -704,6 +720,10 @@ fn entry_to_shell_command(entry: &cella_features::LifecycleEntry) -> String {
 }
 
 /// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
+///
+/// # Errors
+///
+/// Returns an error if any re-run lifecycle command fails.
 pub async fn check_and_run_content_update(
     lc_ctx: &LifecycleContext<'_>,
     config: &Value,
