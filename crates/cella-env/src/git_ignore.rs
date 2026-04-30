@@ -261,4 +261,10 @@ mod tests {
         let content = fs::read_to_string(&cella_ignore).unwrap();
         assert_eq!(content, "# --- forwarded from host ---\n*.log\n");
     }
+
+    #[cfg(feature = "integration-tests")]
+    #[test]
+    fn resolve_from_real_git_config() {
+        let _ = resolve_host_gitignore_path();
+    }
 }
