@@ -26,8 +26,9 @@ impl DaemonClient {
 
     /// Send a raw management request and return the raw response.
     ///
-    /// This is intentionally kept for callers that still need to match on
-    /// protocol variants directly during migration.
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure.
     pub async fn request(
         &self,
         request: &ManagementRequest,
@@ -36,14 +37,22 @@ impl DaemonClient {
     }
 
     /// Ping the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or unexpected response.
     pub async fn ping(&self) -> Result<(), DaemonClientError> {
         match self.request(&ManagementRequest::Ping).await? {
             ManagementResponse::Pong => Ok(()),
-            response => Err(DaemonClientError::unexpected("pong", response)),
+            response => Err(DaemonClientError::unexpected("pong", &response)),
         }
     }
 
     /// Query daemon status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or unexpected response.
     pub async fn query_status(&self) -> Result<DaemonStatus, DaemonClientError> {
         match self.request(&ManagementRequest::QueryStatus).await? {
             ManagementResponse::Status {
@@ -67,19 +76,27 @@ impl DaemonClient {
                 control_port,
                 control_token,
             }),
-            response => Err(DaemonClientError::unexpected("status", response)),
+            response => Err(DaemonClientError::unexpected("status", &response)),
         }
     }
 
     /// Query all daemon-managed forwarded ports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or unexpected response.
     pub async fn query_ports(&self) -> Result<Vec<ForwardedPortDetail>, DaemonClientError> {
         match self.request(&ManagementRequest::QueryPorts).await? {
             ManagementResponse::Ports { ports } => Ok(ports),
-            response => Err(DaemonClientError::unexpected("ports", response)),
+            response => Err(DaemonClientError::unexpected("ports", &response)),
         }
     }
 
     /// Register a container with the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn register_container(
         &self,
         data: ContainerRegistrationData,
@@ -92,12 +109,16 @@ impl DaemonClient {
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
                 "container_registered",
-                response,
+                &response,
             )),
         }
     }
 
     /// Deregister a container from the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn deregister_container(
         &self,
         container_name: impl Into<String>,
@@ -112,12 +133,16 @@ impl DaemonClient {
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
                 "container_deregistered",
-                response,
+                &response,
             )),
         }
     }
 
     /// Update a previously registered container IP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn update_container_ip(
         &self,
         container_id: impl Into<String>,
@@ -134,12 +159,16 @@ impl DaemonClient {
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
                 "container_ip_updated",
-                response,
+                &response,
             )),
         }
     }
 
     /// Register an SSH-agent proxy and return bridge details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn register_ssh_agent_proxy(
         &self,
         workspace: impl Into<String>,
@@ -162,12 +191,16 @@ impl DaemonClient {
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
                 "ssh_agent_proxy_registered",
-                response,
+                &response,
             )),
         }
     }
 
     /// Release one SSH-agent proxy reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn release_ssh_agent_proxy(
         &self,
         workspace: impl Into<String>,
@@ -182,17 +215,21 @@ impl DaemonClient {
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
                 "ssh_agent_proxy_released",
-                response,
+                &response,
             )),
         }
     }
 
     /// Ask the daemon to shut down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error.
     pub async fn shutdown(&self) -> Result<u32, DaemonClientError> {
         match self.request(&ManagementRequest::Shutdown).await? {
             ManagementResponse::ShuttingDown { pid } => Ok(pid),
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
-            response => Err(DaemonClientError::unexpected("shutting_down", response)),
+            response => Err(DaemonClientError::unexpected("shutting_down", &response)),
         }
     }
 }
@@ -246,7 +283,7 @@ pub enum DaemonClientError {
 }
 
 impl DaemonClientError {
-    fn unexpected(expected: &'static str, response: ManagementResponse) -> Self {
+    fn unexpected(expected: &'static str, response: &ManagementResponse) -> Self {
         Self::UnexpectedResponse {
             expected,
             actual: format!("{response:?}"),
@@ -255,6 +292,10 @@ impl DaemonClientError {
 }
 
 /// Send a management request to the daemon and receive the response.
+///
+/// # Errors
+///
+/// Returns an error on connection, I/O, or protocol failure.
 pub async fn send_management_request(
     socket_path: &Path,
     request: &ManagementRequest,
