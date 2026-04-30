@@ -195,6 +195,27 @@ fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
     })
 }
 
+fn compute_default_workspace_folder(
+    workspace_root: &std::path::Path,
+    host_mount_folder: &std::path::Path,
+) -> String {
+    let mount_basename = host_mount_folder.file_name().map_or_else(
+        || "workspace".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
+    let container_mount_folder = format!("/workspaces/{mount_basename}");
+    if host_mount_folder == workspace_root {
+        return container_mount_folder;
+    }
+    if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
+        let rel_posix = rel.to_string_lossy().replace('\\', "/");
+        if !rel_posix.is_empty() {
+            return format!("{container_mount_folder}/{rel_posix}");
+        }
+    }
+    container_mount_folder
+}
+
 use cella_orchestrator::NetworkRulePolicy;
 
 /// Resolved mount configuration for an `up` invocation.
@@ -272,11 +293,12 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |n| n.to_string_lossy().to_string(),
+        let host_mount_folder = cella_git::find_git_root_folder(
+            &resolved.workspace_root,
+            args.mounts.mount_workspace_git_root,
         );
-        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+        let default_workspace_folder =
+            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
 
         let build_secrets = args
             .build
@@ -375,11 +397,9 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
-        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+        let host_mount_folder = cella_git::find_git_root_folder(&resolved.workspace_root, true);
+        let default_workspace_folder =
+            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
 
         Ok(Self {
             resolved,
