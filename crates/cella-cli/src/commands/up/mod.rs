@@ -6,7 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat, StrictnessLevel};
+use super::{ComposePullPolicy, ImagePullPolicy, MountConsistency, OutputFormat, StrictnessLevel};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, MountConfig, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -94,6 +94,10 @@ pub struct UpArgs {
     /// Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]
     #[arg(long = "mount")]
     pub(crate) mount: Vec<String>,
+
+    /// Workspace mount consistency (ignored on Linux).
+    #[arg(long, value_enum, default_value = "cached")]
+    pub(crate) workspace_mount_consistency: MountConsistency,
 }
 
 impl UpArgs {
@@ -210,6 +214,8 @@ pub struct UpContext {
     pub(crate) extra_networks: Vec<String>,
     /// Additional CLI-specified mounts (`--mount` flag).
     additional_cli_mounts: Vec<MountConfig>,
+    /// Workspace mount consistency mode.
+    workspace_mount_consistency: Option<String>,
 }
 
 impl UpContext {
@@ -299,6 +305,9 @@ impl UpContext {
             build_secrets,
             extra_networks: Vec::new(),
             additional_cli_mounts,
+            workspace_mount_consistency: Some(
+                args.workspace_mount_consistency.as_str().to_string(),
+            ),
         })
     }
 
@@ -368,6 +377,7 @@ impl UpContext {
             build_secrets: vec![],
             extra_networks: Vec::new(),
             additional_cli_mounts: Vec::new(),
+            workspace_mount_consistency: None,
         })
     }
 
@@ -755,6 +765,7 @@ impl UpContext {
             build_secrets: self.build_secrets.clone(),
             extra_networks: self.extra_networks.clone(),
             additional_cli_mounts: &self.additional_cli_mounts,
+            workspace_mount_consistency: self.workspace_mount_consistency.as_deref(),
         };
 
         let result =

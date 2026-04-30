@@ -1257,6 +1257,7 @@ impl EnsureUpContext<'_> {
             feature_config: effective_feature_config,
             image_env: &image_env,
             agent_arch,
+            workspace_mount_consistency: self.config.workspace_mount_consistency,
         });
 
         Ok(ImageConfig {

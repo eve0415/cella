@@ -40,6 +40,8 @@ pub struct UpConfig<'a> {
     pub extra_networks: Vec<String>,
     /// Additional mount points from CLI `--mount` flags.
     pub additional_cli_mounts: &'a [cella_backend::MountConfig],
+    /// Workspace mount consistency mode (e.g. "cached", "delegated").
+    pub workspace_mount_consistency: Option<&'a str>,
 }
 
 /// How the up pipeline should handle the container image.

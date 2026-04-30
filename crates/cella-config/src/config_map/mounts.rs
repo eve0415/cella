@@ -6,6 +6,7 @@ pub(super) fn map_workspace_mount(
     config: &serde_json::Value,
     workspace_root: &Path,
     workspace_folder: &str,
+    consistency: Option<&str>,
 ) -> Option<MountConfig> {
     if let Some(mount_str) = config.get("workspaceMount").and_then(|v| v.as_str()) {
         if mount_str.is_empty() {
@@ -14,7 +15,8 @@ pub(super) fn map_workspace_mount(
         return parse_mount_string(mount_str);
     }
 
-    // Default workspace mount
+    // Default workspace mount — consistency is skipped on Linux (Podman
+    // rejects it; native Docker ignores it).
     Some(MountConfig {
         mount_type: "bind".to_string(),
         source: workspace_root
@@ -23,7 +25,11 @@ pub(super) fn map_workspace_mount(
             .to_string_lossy()
             .to_string(),
         target: workspace_folder.to_string(),
-        consistency: Some("cached".to_string()),
+        consistency: if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(consistency.unwrap_or("cached").to_string())
+        },
         read_only: false,
         external: false,
     })
@@ -152,14 +158,14 @@ mod tests {
     #[test]
     fn map_workspace_mount_explicitly_disabled() {
         let config = json!({"workspaceMount": ""});
-        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
         assert!(result.is_none());
     }
 
     #[test]
     fn map_workspace_mount_custom() {
         let config = json!({"workspaceMount": "type=bind,source=/host/code,target=/code"});
-        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
         let mount = result.unwrap();
         assert_eq!(mount.mount_type, "bind");
         assert_eq!(mount.source, "/host/code");

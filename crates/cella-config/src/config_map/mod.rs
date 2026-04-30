@@ -28,6 +28,10 @@ pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
     pub feature_config: Option<&'a FeatureContainerConfig>,
     pub image_env: &'a [String],
     pub agent_arch: &'a str,
+    /// Workspace mount consistency mode (e.g. "cached", "delegated").
+    /// `None` means use the default ("cached"), except on Linux where
+    /// consistency is always omitted.
+    pub workspace_mount_consistency: Option<&'a str>,
 }
 
 /// Map a resolved devcontainer config to container creation options.
@@ -43,6 +47,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         feature_config,
         image_env,
         agent_arch,
+        workspace_mount_consistency,
     } = params;
     let workspace_basename = workspace_root.file_name().map_or_else(
         || "workspace".to_string(),
@@ -54,7 +59,12 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .and_then(|v| v.as_str())
         .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
 
-    let workspace_mount = map_workspace_mount(config, workspace_root, &workspace_folder);
+    let workspace_mount = map_workspace_mount(
+        config,
+        workspace_root,
+        &workspace_folder,
+        workspace_mount_consistency,
+    );
     let mounts = map_merged_mounts(config, feature_config);
     let env = map_merged_env(config, image_env);
     let remote_env = map_remote_env(config);
@@ -309,6 +319,7 @@ mod tests {
             feature_config,
             image_env,
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         })
     }
 
@@ -328,6 +339,7 @@ mod tests {
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.image, "ubuntu");
@@ -350,6 +362,7 @@ mod tests {
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
@@ -458,6 +471,7 @@ mod tests {
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
@@ -747,6 +761,7 @@ mod tests {
             feature_config: Some(&substituted),
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.mounts.len(), 1);
