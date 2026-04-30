@@ -104,7 +104,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
 }
 
 /// Build mounts from feature config (includes user mounts via merge) or directly from config.
-pub(crate) fn map_merged_mounts(
+pub fn map_merged_mounts(
     config: &serde_json::Value,
     feature_config: Option<&FeatureContainerConfig>,
 ) -> Vec<MountConfig> {
