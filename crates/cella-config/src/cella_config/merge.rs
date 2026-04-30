@@ -1,5 +1,11 @@
 use serde_json::Value;
 
+/// Deep-merge `overlay` into `base`.
+///
+/// - Objects: recursively merge matching keys; new keys inserted.
+/// - Arrays: overlay items are prepended (higher-priority layers match first
+///   in first-match rule engines like network rules).
+/// - Scalars: overlay replaces base.
 pub fn deep_merge(base: &mut Value, overlay: &Value) {
     match (base.as_object_mut(), overlay.as_object()) {
         (Some(base_obj), Some(overlay_obj)) => {
@@ -8,7 +14,9 @@ pub fn deep_merge(base: &mut Value, overlay: &Value) {
                     if let (Some(base_arr), Some(overlay_arr)) =
                         (base_value.as_array_mut(), overlay_value.as_array())
                     {
-                        base_arr.extend(overlay_arr.iter().cloned());
+                        let mut merged = overlay_arr.clone();
+                        merged.append(base_arr);
+                        *base_arr = merged;
                     } else {
                         deep_merge(base_value, overlay_value);
                     }
@@ -53,10 +61,10 @@ mod tests {
     }
 
     #[test]
-    fn array_concat() {
+    fn array_prepend_overlay() {
         let mut base = json!({"a": [1, 2]});
         deep_merge(&mut base, &json!({"a": [3, 4]}));
-        assert_eq!(base["a"], json!([1, 2, 3, 4]));
+        assert_eq!(base["a"], json!([3, 4, 1, 2]));
     }
 
     #[test]
@@ -146,6 +154,9 @@ mod tests {
         let result = merge_layers(&layers);
         let rules = result["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0]["domain"], "c.com");
+        assert_eq!(rules[1]["domain"], "b.com");
+        assert_eq!(rules[2]["domain"], "a.com");
     }
 
     #[test]
