@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod mount;
 pub mod names;
 pub mod network;
+pub mod progress;
 pub mod resolve;
 pub mod traits;
 pub mod types;

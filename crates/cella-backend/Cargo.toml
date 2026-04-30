@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+tokio.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 miette.workspace = true

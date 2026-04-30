@@ -19,7 +19,7 @@ pub mod error;
 pub mod host_requirements;
 pub mod image;
 pub mod lifecycle;
-pub mod progress;
+pub use cella_backend::progress;
 pub mod prune;
 pub mod result;
 pub mod shell_detect;
