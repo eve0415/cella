@@ -25,6 +25,8 @@ pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
     pub image_name: &'a str,
     pub labels: HashMap<String, String, S>,
     pub workspace_root: &'a Path,
+    /// The host directory to mount (git root or workspace root).
+    pub host_mount_folder: &'a Path,
     pub feature_config: Option<&'a FeatureContainerConfig>,
     pub image_env: &'a [String],
     pub agent_arch: &'a str,
@@ -44,25 +46,44 @@ pub fn map_config<S: std::hash::BuildHasher>(
         image_name,
         labels,
         workspace_root,
+        host_mount_folder,
         feature_config,
         image_env,
         agent_arch,
         workspace_mount_consistency,
     } = params;
-    let workspace_basename = workspace_root.file_name().map_or_else(
+
+    let mount_basename = host_mount_folder.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
     );
+    let container_mount_folder = format!("/workspaces/{mount_basename}");
 
     let workspace_folder = config
         .get("workspaceFolder")
         .and_then(|v| v.as_str())
-        .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
+        .map_or_else(
+            || {
+                if host_mount_folder == workspace_root {
+                    container_mount_folder.clone()
+                } else if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
+                    let rel_posix = rel.to_string_lossy().replace('\\', "/");
+                    if rel_posix.is_empty() {
+                        container_mount_folder.clone()
+                    } else {
+                        format!("{container_mount_folder}/{rel_posix}")
+                    }
+                } else {
+                    container_mount_folder.clone()
+                }
+            },
+            String::from,
+        );
 
     let workspace_mount = map_workspace_mount(
         config,
-        workspace_root,
-        &workspace_folder,
+        host_mount_folder,
+        &container_mount_folder,
         workspace_mount_consistency,
     );
     let mounts = map_merged_mounts(config, feature_config);
@@ -316,6 +337,7 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/test"),
+            host_mount_folder: Path::new("/tmp/test"),
             feature_config,
             image_env,
             agent_arch: "x86_64",
@@ -336,6 +358,7 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
@@ -359,6 +382,7 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
@@ -468,6 +492,7 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
@@ -758,6 +783,7 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/home/user/myproject"),
+            host_mount_folder: Path::new("/home/user/myproject"),
             feature_config: Some(&substituted),
             image_env: &[],
             agent_arch: "x86_64",

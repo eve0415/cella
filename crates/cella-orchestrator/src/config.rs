@@ -42,6 +42,8 @@ pub struct UpConfig<'a> {
     pub additional_cli_mounts: &'a [cella_backend::MountConfig],
     /// Workspace mount consistency mode (e.g. "cached", "delegated").
     pub workspace_mount_consistency: Option<&'a str>,
+    /// Whether to mount the git root instead of the workspace folder.
+    pub mount_workspace_git_root: bool,
 }
 
 /// How the up pipeline should handle the container image.

@@ -38,6 +38,18 @@ pub fn discover(path: &Path) -> Result<RepoInfo, CellaGitError> {
     Ok(RepoInfo { root, head_branch })
 }
 
+/// Find the git root directory containing `path`.
+///
+/// Returns the git root if `mount_git_root` is true and the path is inside
+/// a git repository. Falls back to `path` itself if not in a git repo or
+/// if `mount_git_root` is false.
+pub fn find_git_root_folder(path: &Path, mount_git_root: bool) -> PathBuf {
+    if !mount_git_root {
+        return path.to_path_buf();
+    }
+    discover(path).map_or_else(|_| path.to_path_buf(), |info| info.root)
+}
+
 /// Detect the default branch name (main, master, etc.).
 ///
 /// Resolution priority:

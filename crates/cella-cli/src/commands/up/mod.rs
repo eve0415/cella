@@ -98,6 +98,10 @@ pub struct UpArgs {
     /// Workspace mount consistency (ignored on Linux).
     #[arg(long, value_enum, default_value = "cached")]
     pub(crate) workspace_mount_consistency: MountConsistency,
+
+    /// Mount the workspace using its Git root (default: true).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub(crate) mount_workspace_git_root: bool,
 }
 
 impl UpArgs {
@@ -216,6 +220,8 @@ pub struct UpContext {
     additional_cli_mounts: Vec<MountConfig>,
     /// Workspace mount consistency mode.
     workspace_mount_consistency: Option<String>,
+    /// Whether to mount the git root instead of the workspace folder.
+    mount_workspace_git_root: bool,
 }
 
 impl UpContext {
@@ -308,6 +314,7 @@ impl UpContext {
             workspace_mount_consistency: Some(
                 args.workspace_mount_consistency.as_str().to_string(),
             ),
+            mount_workspace_git_root: args.mount_workspace_git_root,
         })
     }
 
@@ -378,6 +385,7 @@ impl UpContext {
             extra_networks: Vec::new(),
             additional_cli_mounts: Vec::new(),
             workspace_mount_consistency: None,
+            mount_workspace_git_root: true,
         })
     }
 
@@ -766,6 +774,7 @@ impl UpContext {
             extra_networks: self.extra_networks.clone(),
             additional_cli_mounts: &self.additional_cli_mounts,
             workspace_mount_consistency: self.workspace_mount_consistency.as_deref(),
+            mount_workspace_git_root: self.mount_workspace_git_root,
         };
 
         let result =

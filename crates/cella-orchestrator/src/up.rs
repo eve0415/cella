@@ -1248,12 +1248,18 @@ impl EnsureUpContext<'_> {
             .as_ref()
             .or(image_meta_config.as_ref());
 
+        let host_mount_folder = cella_git::find_git_root_folder(
+            &self.config.resolved.workspace_root,
+            self.config.mount_workspace_git_root,
+        );
+
         let create_opts = crate::config_map::map_config(crate::config_map::MapConfigParams {
             config,
             container_name: self.config.container_name,
             image_name: img_name,
             labels,
             workspace_root: &self.config.resolved.workspace_root,
+            host_mount_folder: &host_mount_folder,
             feature_config: effective_feature_config,
             image_env: &image_env,
             agent_arch,
