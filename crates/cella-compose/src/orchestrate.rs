@@ -1370,6 +1370,7 @@ mod tests {
             config_path: config_path.clone(),
             workspace_root: workspace_root.clone(),
             config_hash: String::new(),
+            devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
         };
@@ -1424,6 +1425,7 @@ mod tests {
             config_path: config_path.clone(),
             workspace_root: workspace_dir.path().to_path_buf(),
             config_hash: String::new(),
+            devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
         };

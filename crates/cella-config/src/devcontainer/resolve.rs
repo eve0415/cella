@@ -23,6 +23,8 @@ pub struct ResolvedConfig {
     pub workspace_root: PathBuf,
     /// SHA256 hex of the canonical JSON serialization of the merged config.
     pub config_hash: String,
+    /// Spec-compliant devcontainer ID (52-char base-32 string).
+    pub devcontainer_id: String,
     /// Diagnostics (warnings) from parsing.
     pub warnings: Vec<Diagnostic>,
     /// Typed representation of the merged config, if validation succeeded.
@@ -241,6 +243,7 @@ pub fn config(
         config_path,
         workspace_root: workspace_root.to_path_buf(),
         config_hash: hash,
+        devcontainer_id,
         warnings,
         typed,
     })
@@ -479,6 +482,20 @@ mod tests {
         let id = spec_devcontainer_id(&labels);
         assert_eq!(id.len(), 52);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn resolved_config_exposes_devcontainer_id() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert_eq!(resolved.devcontainer_id.len(), 52);
+        assert!(
+            resolved
+                .devcontainer_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric())
+        );
     }
 
     #[test]
