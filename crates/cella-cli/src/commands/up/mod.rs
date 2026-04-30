@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat, StrictnessLevel};
 
-use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
+use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, MountConfig, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::shell_detect::detect_shell;
@@ -89,12 +89,90 @@ pub struct UpArgs {
     /// Pull policy for Docker Compose services.
     #[arg(long = "pull-policy", value_enum)]
     pub(crate) pull_policy: Option<ComposePullPolicy>,
+
+    /// Additional mount point(s).
+    /// Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]
+    #[arg(long = "mount")]
+    pub(crate) mount: Vec<String>,
 }
 
 impl UpArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Text)
     }
+}
+
+fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
+    let mut mount_type = None;
+    let mut source = None;
+    let mut target = None;
+    let mut external = false;
+
+    for part in s.split(',') {
+        if let Some((key, value)) = part.split_once('=') {
+            match key {
+                "type" => {
+                    if value != "bind" && value != "volume" {
+                        return Err(format!(
+                            "invalid mount type '{value}': expected 'bind' or 'volume'\n\
+                             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+                        ));
+                    }
+                    mount_type = Some(value.to_string());
+                }
+                "source" | "src" => source = Some(value.to_string()),
+                "target" | "dst" | "destination" => target = Some(value.to_string()),
+                "external" => match value {
+                    "true" => external = true,
+                    "false" => {}
+                    _ => {
+                        return Err(format!(
+                            "invalid external value '{value}': expected 'true' or 'false'"
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(format!(
+                        "unknown mount key '{key}'\n\
+                         Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+                    ));
+                }
+            }
+        } else {
+            return Err(format!(
+                "invalid mount format: {s}\n\
+                 Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+            ));
+        }
+    }
+
+    let Some(mount_type) = mount_type else {
+        return Err(format!(
+            "missing 'type' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+    let Some(source) = source else {
+        return Err(format!(
+            "missing 'source' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+    let Some(target) = target else {
+        return Err(format!(
+            "missing 'target' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+
+    Ok(MountConfig {
+        mount_type,
+        source,
+        target,
+        consistency: None,
+        read_only: false,
+        external,
+    })
 }
 
 use cella_orchestrator::NetworkRulePolicy;
@@ -130,6 +208,8 @@ pub struct UpContext {
     build_secrets: Vec<BuildSecret>,
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
+    /// Additional CLI-specified mounts (`--mount` flag).
+    additional_cli_mounts: Vec<MountConfig>,
 }
 
 impl UpContext {
@@ -181,6 +261,13 @@ impl UpContext {
 
         let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
 
+        let additional_cli_mounts = args
+            .mount
+            .iter()
+            .map(|s| parse_cli_mount(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
         Ok(Self {
             resolved,
             client,
@@ -211,6 +298,7 @@ impl UpContext {
             compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
             extra_networks: Vec::new(),
+            additional_cli_mounts,
         })
     }
 
@@ -279,6 +367,7 @@ impl UpContext {
             compose_pull_policy: None,
             build_secrets: vec![],
             extra_networks: Vec::new(),
+            additional_cli_mounts: Vec::new(),
         })
     }
 
@@ -665,6 +754,7 @@ impl UpContext {
             pull_policy: self.pull_policy.as_deref(),
             build_secrets: self.build_secrets.clone(),
             extra_networks: self.extra_networks.clone(),
+            additional_cli_mounts: &self.additional_cli_mounts,
         };
 
         let result =
@@ -1046,6 +1136,81 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_cli_mount ────────────────────────────────────────────
+
+    #[test]
+    fn parse_cli_mount_bind() {
+        let m = parse_cli_mount("type=bind,source=/host,target=/container").unwrap();
+        assert_eq!(m.mount_type, "bind");
+        assert_eq!(m.source, "/host");
+        assert_eq!(m.target, "/container");
+        assert!(!m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_volume() {
+        let m = parse_cli_mount("type=volume,source=mydata,target=/data").unwrap();
+        assert_eq!(m.mount_type, "volume");
+        assert_eq!(m.source, "mydata");
+        assert_eq!(m.target, "/data");
+    }
+
+    #[test]
+    fn parse_cli_mount_with_external_true() {
+        let m = parse_cli_mount("type=volume,source=ext-vol,target=/ext,external=true").unwrap();
+        assert!(m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_with_external_false() {
+        let m = parse_cli_mount("type=volume,source=vol,target=/vol,external=false").unwrap();
+        assert!(!m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_type() {
+        assert!(parse_cli_mount("source=/a,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_source() {
+        assert!(parse_cli_mount("type=bind,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_target() {
+        assert!(parse_cli_mount("type=bind,source=/a").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_invalid_type() {
+        let err = parse_cli_mount("type=tmpfs,source=/a,target=/b").unwrap_err();
+        assert!(err.contains("invalid mount type"));
+    }
+
+    #[test]
+    fn parse_cli_mount_invalid_format() {
+        let err = parse_cli_mount("garbage").unwrap_err();
+        assert!(err.contains("invalid mount format"));
+    }
+
+    #[test]
+    fn parse_cli_mount_clap_flag() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "up",
+            "--mount",
+            "type=bind,source=/a,target=/b",
+            "--mount",
+            "type=volume,source=vol,target=/c",
+        ])
+        .unwrap();
+        if let crate::commands::Command::Up(args) = &cli.command {
+            assert_eq!(args.mount.len(), 2);
+        }
+    }
 
     // ── map_env_object ─────────────────────────────────────────────
 

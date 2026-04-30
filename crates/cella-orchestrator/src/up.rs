@@ -939,6 +939,10 @@ impl EnsureUpContext<'_> {
             });
         }
 
+        for m in self.config.additional_cli_mounts {
+            create_opts.mounts.push(m.clone());
+        }
+
         let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
         if capabilities.managed_agent && !vol_name.is_empty() {
             create_opts.mounts.push(MountConfig {

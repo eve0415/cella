@@ -38,6 +38,8 @@ pub struct UpConfig<'a> {
     /// Extra Docker networks to connect the container to after start,
     /// before lifecycle hooks run (e.g. parent compose network for worktrees).
     pub extra_networks: Vec<String>,
+    /// Additional mount points from CLI `--mount` flags.
+    pub additional_cli_mounts: &'a [cella_backend::MountConfig],
 }
 
 /// How the up pipeline should handle the container image.

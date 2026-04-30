@@ -420,7 +420,7 @@ mod tests {
                     target: "/shared-target".to_string(),
                     consistency: None,
                     read_only: false,
-                external: false,
+                    external: false,
                 },
                 MountConfig {
                     mount_type: "bind".to_string(),
@@ -428,7 +428,7 @@ mod tests {
                     target: "/shared-target".to_string(),
                     consistency: None,
                     read_only: false,
-                external: false,
+                    external: false,
                 },
             ],
             port_bindings: HashMap::new(),
@@ -465,7 +465,7 @@ mod tests {
                 target: "/workspace".to_string(),
                 consistency: Some("cached".to_string()),
                 read_only: false,
-            external: false,
+                external: false,
             }),
             mounts: vec![MountConfig {
                 mount_type: "bind".to_string(),
@@ -473,7 +473,7 @@ mod tests {
                 target: "/workspace".to_string(),
                 consistency: None,
                 read_only: false,
-            external: false,
+                external: false,
             }],
             port_bindings: HashMap::new(),
             entrypoint: None,
@@ -649,7 +649,7 @@ mod tests {
             target: "/data".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::VOLUME));
@@ -663,7 +663,7 @@ mod tests {
             target: "/tmp".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::TMPFS));
@@ -677,7 +677,7 @@ mod tests {
             target: "/container".to_string(),
             consistency: Some("cached".to_string()),
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
@@ -692,7 +692,7 @@ mod tests {
             target: "//./pipe/docker_engine".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(
@@ -710,7 +710,7 @@ mod tests {
             target: "/b".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         assert!(
             to_bollard_mount(&m).is_none(),
@@ -727,7 +727,7 @@ mod tests {
             target: "/container/data".to_string(),
             consistency: None,
             read_only: true,
-        external: false,
+            external: false,
         };
         let rw = MountConfig {
             mount_type: "bind".to_string(),
@@ -735,7 +735,7 @@ mod tests {
             target: "/container/data".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         assert_eq!(
             to_bollard_mount(&ro).unwrap().read_only,
@@ -1410,7 +1410,7 @@ mod tests {
             target: "/container".to_string(),
             consistency: None,
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert!(bollard_mount.consistency.is_none());
@@ -1424,7 +1424,7 @@ mod tests {
             target: "/container".to_string(),
             consistency: Some("delegated".to_string()),
             read_only: false,
-        external: false,
+            external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(bollard_mount.consistency, Some("delegated".to_string()));
@@ -1443,7 +1443,7 @@ mod tests {
             target: "/workspace".to_string(),
             consistency: Some("cached".to_string()),
             read_only: false,
-        external: false,
+            external: false,
         });
         let config = to_bollard_config(&opts);
         let hc = config.host_config.unwrap();
