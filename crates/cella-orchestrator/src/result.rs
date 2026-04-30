@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+pub use cella_backend::SshAgentProxyStatus;
+
 /// Result of the container-up pipeline.
 pub struct UpResult {
     /// Docker container ID.
@@ -19,28 +21,7 @@ pub struct UpResult {
     /// What happened during the up operation.
     pub outcome: UpOutcome,
 
-    /// SSH-agent proxy status, when an SSH-agent forwarding decision
-    /// was actually surfaced for this container. `None` means the
-    /// proxy code path was not exercised (no host agent, user override,
-    /// or non-colima runtime that uses direct mount).
     pub ssh_agent_proxy: Option<SshAgentProxyStatus>,
-}
-
-/// Outcome of the SSH-agent bridge resolution at `cella up`. Cella-cli
-/// renders this as a one-line status under the container info.
-#[derive(Debug, Clone)]
-pub enum SshAgentProxyStatus {
-    /// Daemon-managed bridge was registered. `host_endpoint` is the
-    /// `host:port` the in-container agent will bridge to; `refcount`
-    /// is the post-register count.
-    Bridged {
-        host_endpoint: String,
-        refcount: usize,
-    },
-    /// Bridge was requested (colima with `SSH_AUTH_SOCK` set) but the
-    /// daemon RPC failed; SSH forwarding was skipped. `reason` is a
-    /// short human-readable explanation.
-    Skipped { reason: String },
 }
 
 /// What the up pipeline did.

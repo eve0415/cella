@@ -28,5 +28,5 @@ pub use types::{
     BackendKind, BuildOptions, BuildSecret, ContainerInfo, ContainerState, CreateContainerOptions,
     DeviceSpec, ExecOptions, ExecResult, FileToUpload, GpuRequest, ImageDetails,
     InteractiveExecOptions, MountConfig, MountInfo, PortBinding, PortForward, RunArgsOverrides,
-    UlimitSpec,
+    SshAgentProxyStatus, UlimitSpec,
 };

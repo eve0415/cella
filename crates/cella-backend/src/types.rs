@@ -462,3 +462,18 @@ pub struct RunArgsOverrides {
     /// Flags not recognized by the parser (emitted as warnings).
     pub unrecognized: Vec<String>,
 }
+
+// ---------------------------------------------------------------------------
+// SSH agent proxy status
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum SshAgentProxyStatus {
+    Bridged {
+        host_endpoint: String,
+        refcount: usize,
+    },
+    Skipped {
+        reason: String,
+    },
+}
