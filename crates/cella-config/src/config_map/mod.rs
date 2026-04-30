@@ -691,4 +691,43 @@ mod tests {
         substitute_lifecycle_entries(&mut entries, &ctx);
         assert_eq!(entries[0].command, json!("echo test-id-52chars"));
     }
+
+    #[test]
+    fn end_to_end_feature_mount_devcontainer_id_substituted() {
+        let devcontainer_id = "0000000000000000abcdef1234567890abcdef12345678";
+        let feature_config = FeatureContainerConfig {
+            mounts: vec![
+                "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/home/user/myproject"),
+            Some("/workspaces/myproject"),
+            devcontainer_id,
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/myproject"),
+            feature_config: Some(&substituted),
+            image_env: &[],
+            agent_arch: "x86_64",
+        });
+
+        assert_eq!(opts.mounts.len(), 1);
+        assert_eq!(
+            opts.mounts[0].source,
+            format!("dind-var-lib-docker-{devcontainer_id}")
+        );
+        assert_eq!(opts.mounts[0].target, "/var/lib/docker");
+    }
 }

@@ -1236,4 +1236,64 @@ mod tests {
         assert_eq!(entries[1].origin, "devcontainer.json");
         assert_eq!(entries[1].command, json!("echo user"));
     }
+
+    #[tokio::test]
+    async fn resolve_features_preserves_devcontainer_id_variable_in_mounts() {
+        let feature_dir = tempfile::tempdir().unwrap();
+        let feature_path = feature_dir.path().join("dind-test");
+        std::fs::create_dir_all(&feature_path).unwrap();
+        std::fs::write(
+            feature_path.join("devcontainer-feature.json"),
+            r#"{
+                "id": "dind-test",
+                "version": "1.0.0",
+                "mounts": [
+                    {
+                        "source": "dind-var-lib-docker-${devcontainerId}",
+                        "target": "/var/lib/docker",
+                        "type": "volume"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(feature_path.join("install.sh"), "#!/bin/sh\necho ok").unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": { "./dind-test": {} }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .container_config
+                .mounts
+                .iter()
+                .any(|m| m.contains("${devcontainerId}")),
+            "mounts should contain raw ${{devcontainerId}} before orchestrator substitution: {:?}",
+            result.container_config.mounts
+        );
+    }
 }
