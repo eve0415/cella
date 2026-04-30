@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn is_ssh_mount_error_no_match_different_path() {
-        let msg = r#"bind source path does not exist: /some/other/path"#;
+        let msg = r"bind source path does not exist: /some/other/path";
         assert!(!is_ssh_mount_error(
             msg,
             Some("/run/host-services/ssh-auth.sock")

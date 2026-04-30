@@ -124,6 +124,18 @@ struct CreateResult {
     ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
 }
 
+/// Remove the current SSH agent mount and env var from container create options.
+fn remove_ssh_from_create_opts(
+    create_opts: &mut cella_backend::CreateContainerOptions,
+    env_fwd: &mut cella_env::EnvForwarding,
+) {
+    if let Some(ref source) = env_fwd.ssh_agent_mount_source {
+        create_opts.mounts.retain(|m| m.source != *source);
+    }
+    create_opts.env.retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+    env_fwd.ssh_agent_mount_source = None;
+}
+
 async fn run_step_result<F, T, E>(progress: &ProgressSender, label: &str, future: F) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
@@ -1284,6 +1296,61 @@ impl EnsureUpContext<'_> {
         }
     }
 
+    /// Try creating the container. If it fails with an SSH agent bind-mount
+    /// error, try fallback strategies, then skip SSH forwarding entirely.
+    async fn create_container_with_ssh_fallback(
+        &self,
+        create_opts: &mut cella_backend::CreateContainerOptions,
+        env_fwd: &mut cella_env::EnvForwarding,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match self.create_container(create_opts).await {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if !cella_env::ssh_agent::is_ssh_mount_error(
+                        &err_msg,
+                        env_fwd.ssh_agent_mount_source.as_deref(),
+                    ) {
+                        return Err(e);
+                    }
+
+                    remove_ssh_from_create_opts(create_opts, env_fwd);
+
+                    if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
+                        env_fwd.ssh_agent_fallbacks.remove(0);
+                        if let cella_env::ssh_agent::SshAgentRequest::Direct(ssh) = next {
+                            info!(
+                                "SSH agent mount failed, trying fallback: {} -> {}",
+                                ssh.mount_source, ssh.mount_target
+                            );
+                            env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
+                            create_opts.mounts.push(MountConfig {
+                                mount_type: "bind".to_string(),
+                                source: ssh.mount_source,
+                                target: ssh.mount_target.clone(),
+                                consistency: None,
+                                read_only: false,
+                            });
+                            create_opts
+                                .env
+                                .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
+                            continue;
+                        }
+                    }
+
+                    let runtime = env_fwd
+                        .ssh_agent_runtime
+                        .as_ref()
+                        .unwrap_or(&cella_env::DockerRuntime::Unknown);
+                    self.progress
+                        .warn(&cella_env::ssh_agent::ssh_skip_warning(runtime));
+                    return self.create_container(create_opts).await;
+                }
+            }
+        }
+    }
+
     /// Build a UID-remapped image and update `create_opts.image` if needed.
     async fn maybe_remap_uid(
         &self,
@@ -1382,7 +1449,9 @@ impl EnsureUpContext<'_> {
         )
         .await?;
 
-        let container_id = self.create_container(&create_opts).await?;
+        let container_id = self
+            .create_container_with_ssh_fallback(&mut create_opts, &mut env_fwd)
+            .await?;
 
         self.start_and_notify(&container_id).await?;
 
