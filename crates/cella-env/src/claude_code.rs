@@ -58,17 +58,7 @@ pub fn rewrite_claude_home(content: &str, from_home: &str, to_home: &str) -> Str
     )
 }
 
-/// Get the host home directory.
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
-}
+use crate::paths::home_dir;
 
 #[cfg(test)]
 mod tests {

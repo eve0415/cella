@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use crate::claude_code::container_home;
+use crate::paths::{expand_tilde, home_dir};
 
 /// Host-side nvim config directory.
 ///
@@ -29,21 +30,6 @@ pub fn host_nvim_config_dir(config_path: Option<&str>) -> Option<PathBuf> {
 /// Container-side `~/.config/nvim` directory path.
 pub fn container_nvim_config_dir(remote_user: &str) -> String {
     format!("{}/.config/nvim", container_home(remote_user))
-}
-
-/// Expand a leading `~` to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(path)
-}
-
-/// Get the host home directory.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
 }
 
 #[cfg(test)]

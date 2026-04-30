@@ -2,6 +2,28 @@
 
 use std::path::PathBuf;
 
+/// Get the current user's home directory.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE").ok().map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    }
+}
+
+/// Expand a leading `~` in a path string to the user's home directory.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
 /// Get the cella data directory (`~/.cella/`).
 pub fn cella_data_dir() -> Option<PathBuf> {
     std::env::var("HOME")
