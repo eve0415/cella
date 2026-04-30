@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "cella-agent"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "base64 0.22.1",
  "cella-network",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "cella-backend"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-env",
  "cella-features",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "cella-cli"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "cella-codegen"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "heck",
  "indexmap",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "cella-compose"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "cella-config"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-codegen",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "cella-container"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "serde",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "base64 0.22.1",
  "cella-daemon-client",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "cella-daemon-client"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-env",
  "cella-protocol",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "cella-docker"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "bollard",
  "cella-backend",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "cella-doctor"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-config",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "cella-env"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-network",
  "miette",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "cella-features"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-oci",
  "dirs",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "cella-git"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "insta",
  "miette",
@@ -576,14 +576,14 @@ dependencies = [
 
 [[package]]
 name = "cella-jsonc"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cella-network"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "base64 0.22.1",
  "miette",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "cella-oci"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "cella-orchestrator"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-compose",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "cella-port"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-protocol",
  "miette",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "cella-protocol"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "serde",
  "serde_json",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cella-templates"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "cella-tool-install"
-version = "0.0.39"
+version = "0.0.40"
 dependencies = [
  "cella-backend",
  "cella-config",
