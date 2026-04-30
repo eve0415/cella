@@ -46,6 +46,8 @@ Container and image naming conventions live here so that all backends use consis
 | `agent` | Agent environment variable generation for in-container agent |
 | `lifecycle` | Lifecycle command parsing and execution (`LifecycleContext`, `OutputCallback`, `ParsedLifecycle`) |
 | `resolve` | Container target resolution (`ContainerTarget`) |
+| `mount` | Mount specification types and helpers |
+| `network` | Network configuration types |
 
 ## Crate Dependencies
 

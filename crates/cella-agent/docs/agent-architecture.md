@@ -3,8 +3,9 @@
 ## Overview
 
 The cella agent runs inside each devcontainer, providing port detection,
-credential forwarding, and browser integration by communicating with the
-host daemon.
+credential forwarding, browser integration, bidirectional clipboard
+forwarding, reverse tunnel port forwarding, and SSH agent bridging by
+communicating with the host daemon.
 
 ## Modes
 
@@ -23,7 +24,20 @@ from `/cella/.daemon_addr`), the agent retries the connection
    host browser (for OAuth callbacks, etc.)
 4. **Health reporter** — sends periodic heartbeats with uptime and
    port count
-5. **Worktree/task proxy** — in CLI mode (see below) forwards
+5. **Clipboard forwarder** — intercepts `xsel`/`xclip` invocations
+   (agent binary is symlinked as both) and forwards clipboard
+   copy/paste operations to the daemon via `ClipboardCopy`/`ClipboardPaste`
+   messages
+6. **Reverse tunnel handler** — responds to `TunnelRequest` messages
+   from the daemon by opening a TCP connection back to the daemon and
+   relaying to the local service, enabling port forwarding on runtimes
+   without direct container-IP routing (Colima, Docker Desktop for Mac)
+7. **SSH agent bridge** — listens on a Unix socket inside the container
+   (`/run/host-services/ssh-auth.sock`) and bridges each connection
+   over TCP to the daemon, which connects to the host's real
+   `SSH_AUTH_SOCK`. Required for Colima where bind-mounting host Unix
+   sockets fails due to virtiofs limitations
+8. **Worktree/task proxy** — in CLI mode (see below) forwards
    `branch`, `exec`, `prune`, `down`, `up`, `switch`, and `task run/list/
    logs/wait/stop` commands to the daemon for host-side execution
 
@@ -132,6 +146,58 @@ Configuration sources, in priority order:
 2. **`/cella/.daemon_addr`** file, refreshed by the CLI on every
    `cella up` so agents that were running before a daemon restart pick
    up the new address without intervention.
+
+## Clipboard Forwarding (`clipboard.rs`)
+
+The agent binary is symlinked as `/cella/bin/xsel` and `/cella/bin/xclip`
+inside the container. When invoked under either name, it parses the
+command-line arguments to determine the clipboard operation:
+
+- **Copy** (`xsel -i` / `xclip -i`): reads stdin (up to 10 MiB),
+  base64-encodes it, and sends `AgentMessage::ClipboardCopy` to the daemon
+- **Paste** (`xsel -o` / `xclip -o`): sends `AgentMessage::ClipboardPaste`
+  to the daemon, receives `DaemonMessage::ClipboardContent`, base64-decodes,
+  and writes to stdout
+- **Clear** (`xsel -c`): sends a zero-length copy
+
+The daemon handles the actual clipboard access on the host using
+platform-specific backends (pbcopy/pbpaste on macOS, wl-copy/wl-paste
+on Wayland, xsel on X11).
+
+## Reverse Tunnel (`tunnel.rs`)
+
+For runtimes where the host cannot directly reach container IPs (Colima,
+Docker Desktop for Mac), the daemon sends `DaemonMessage::TunnelRequest`
+messages to the agent instead of opening a direct TCP proxy. The agent
+handles each request by:
+
+1. Opening a new TCP connection back to the daemon's control port
+2. Sending a `TunnelHandshake` with the auth token and connection ID
+3. Connecting to `127.0.0.1:<target_port>` inside the container
+4. Bidirectionally copying bytes between the daemon tunnel and the local
+   service
+
+This reverses the connection direction: instead of the daemon connecting
+to the container, the container connects back to the daemon, working
+around the lack of direct IP routing.
+
+## SSH Agent Bridge (`ssh_agent_bridge.rs`)
+
+Bridges the host's SSH agent into the container over TCP. Needed for
+Colima where bind-mounting host Unix sockets fails (`mkdir` on virtiofs
+rejects socket paths).
+
+The bridge:
+1. Creates a Unix socket at `/run/host-services/ssh-auth.sock` (or the
+   configured path) with mode 0666
+2. Accepts connections from `ssh-add`, `git`, etc.
+3. For each connection, opens a TCP connection to
+   `host.docker.internal:<bridge_port>`, sends the auth token, then
+   bidirectionally copies SSH agent protocol bytes
+
+The daemon side (`ssh_proxy.rs`) accepts these TCP connections and
+forwards each to the host's real `SSH_AUTH_SOCK` via a Unix socket
+connection.
 
 ## CLI Mode
 

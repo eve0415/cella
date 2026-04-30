@@ -14,8 +14,11 @@ cella-agent is a binary that runs inside dev containers started by cella. It is 
 4. **MITM proxy** — HTTPS interception proxy for path-level blocking rules (works alongside the forward proxy via `mitm`)
 5. **Browser interception** — handles `BROWSER` environment variable calls, forwarding URL open requests to the host (enables OAuth callbacks)
 6. **Credential forwarding** — forwards git credential requests to the host daemon for transparent authentication
-7. **Plugin synchronization** — synchronizes editor plugin/extension manifests between host and container
-8. **CLI mode** — when invoked as `cella` (via symlink, `cella` -> `cella-agent`), provides in-container CLI commands that delegate to the host daemon
+7. **Clipboard forwarding** — bidirectional clipboard sync (xsel/xclip) between container and host
+8. **Plugin synchronization** — synchronizes editor plugin/extension manifests between host and container
+9. **Reverse tunnels** — handles daemon tunnel requests by connecting back and relaying to local services
+10. **SSH agent bridge** — bridges a container-local Unix socket to the host's SSH agent over TCP, enabling transparent SSH signing (e.g. via 1Password)
+11. **CLI mode** — when invoked as `cella` (via symlink, `cella` -> `cella-agent`), provides in-container CLI commands that delegate to the host daemon
 
 The agent communicates with the host-side cella-daemon over a TCP control connection. When a daemon address is configured, the agent retries the initial connection indefinitely and transparently reconnects after daemon restarts or binary upgrades — it never gives up. A lightweight standalone mode (port watching and localhost→all-interfaces proxying only, no host-side forwarding) is used only when no daemon address is configured at all.
 
@@ -50,11 +53,15 @@ cella-agent credential <operation>           # Handle git credential request (ge
 | `mitm` | MITM proxy for HTTPS interception and path-level blocking |
 | `plugin_sync` | Plugin/extension synchronization for editors |
 | `proxy_config` | Network proxy configuration parsing and rule matching |
+| `clipboard` | Bidirectional clipboard forwarding — intercepts xsel/xclip calls and relays copy/paste/clear to the host daemon |
+| `tunnel` | Reverse tunnel handler — responds to daemon `TunnelRequest` messages by connecting back and relaying to local services |
+| `ssh_agent_bridge` | Unix-socket-to-TCP bridge for SSH agent forwarding — lets in-container SSH clients use the host's real agent (e.g. 1Password) |
+| `state` | Agent state snapshot file for the in-container doctor — writes PID, transport state, and heartbeat to a JSON file |
 | `reconnecting_client` | Resilient connection management with retry logic and automatic reconnection |
 
 ## Crate Dependencies
 
-**Depends on:** [cella-network](../cella-network), [cella-port](../cella-port)
+**Depends on:** [cella-network](../cella-network), [cella-port](../cella-port), [cella-protocol](../cella-protocol)
 
 **Depended on by:** none (standalone binary uploaded into containers)
 

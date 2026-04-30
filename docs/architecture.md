@@ -25,7 +25,7 @@ graph TD
 
     subgraph "Tier 3 — Foundation"
         backend[cella-backend<br><i>backend trait</i>]
-        port[cella-port<br><i>IPC protocol</i>]
+        port[cella-port<br><i>port allocation</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
@@ -33,7 +33,7 @@ graph TD
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
-    docker & container --> backend
+    docker & container & compose --> backend
     templates --> features
     agent & daemon --> port
     port --> protocol
@@ -76,11 +76,11 @@ Environment forwarding orchestration. Detects the host environment (SSH agent, g
 
 ### cella-daemon
 
-Unified host-side daemon for credential forwarding, port management, browser handling, worktree operations, and background tasks. Runs as a background process, accepting TCP connections from in-container agents and Unix-socket connections from the CLI. Includes OrbStack-specific port coordination, health monitoring, auth token management, file-based logging, a per-exec TCP stream bridge for TTY forwarding (used by `cella switch`), and a task manager that tracks `cella task run` background processes with live output broadcast.
+Unified host-side daemon for credential forwarding, port management, browser handling, clipboard forwarding, reverse tunnel port forwarding, SSH proxying, worktree operations, and background tasks. Runs as a background process, accepting TCP connections from in-container agents and Unix-socket connections from the CLI. Includes OrbStack-specific port coordination, health monitoring, auth token management, file-based logging, a per-exec TCP stream bridge for TTY forwarding (used by `cella switch`), a bidirectional clipboard bridge (xsel/xclip), reverse tunnel server for Colima and Docker Desktop for Mac, an SSH proxy for Colima SSH-agent forwarding via TCP bridge, and a task manager that tracks `cella task run` background processes with live output broadcast.
 
 ### cella-agent
 
-In-container binary uploaded during `cella up`. Polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding. Proxies localhost-bound applications to `0.0.0.0`, handles `BROWSER` environment variable interception for OAuth callbacks, and forwards git credential requests to the host. The initial daemon connect retries indefinitely (so containers that start before the daemon is ready eventually reconnect), and the agent transparently reconnects after daemon restarts (including binary upgrades). When the binary is invoked as `cella` via an in-container symlink, it enters CLI mode instead of daemon mode — worktree and task commands inside the container delegate to the host daemon over the existing TCP control connection. Uses manual argument parsing (no clap) to minimize binary size.
+In-container binary uploaded during `cella up`. Polls `/proc/net/tcp` for new listeners and reports them to the host daemon for automatic port forwarding. Proxies localhost-bound applications to `0.0.0.0`, handles `BROWSER` environment variable interception for OAuth callbacks, forwards git credential requests to the host, provides bidirectional clipboard forwarding (xsel/xclip shims), bridges SSH-agent connections for Colima via TCP, and opens reverse tunnels for port forwarding through environments without direct container-IP routing. The initial daemon connect retries indefinitely (so containers that start before the daemon is ready eventually reconnect), and the agent transparently reconnects after daemon restarts (including binary upgrades). When the binary is invoked as `cella` via an in-container symlink, it enters CLI mode instead of daemon mode — worktree and task commands inside the container delegate to the host daemon over the existing TCP control connection. Uses manual argument parsing (no clap) to minimize binary size.
 
 ### cella-doctor
 

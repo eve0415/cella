@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/eve0415/cella/main/install.sh | sh
 
 ### From source
 
-Requires a [Rust toolchain](https://rustup.rs/) (1.94+).
+Requires a [Rust toolchain](https://rustup.rs/) (1.95+).
 
 ```sh
 cargo install --git https://github.com/eve0415/cella cella-cli
@@ -81,13 +81,14 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | SSH agent forwarding | Platform-aware (Docker Desktop, OrbStack, Colima, Linux) | No — [VS Code extension only](https://github.com/devcontainers/cli/issues/441) |
 | Git credential forwarding | gh CLI via socket + TCP, auto-on | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/4202) |
 | BROWSER interception | Host browser opens for OAuth | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/9935) |
+| Clipboard forwarding | Bidirectional (xsel/xclip) | No — VS Code extension only |
 | Container listing | `cella list` | No ([cli#843](https://github.com/devcontainers/cli/issues/843)) |
 | `runArgs` | 30+ docker create flags parsed | Yes |
 | `hostRequirements` | CPU/memory/storage/GPU validation | Partial (informational only) |
 | `waitFor` | Return after specified lifecycle phase | No |
 | Config validation | Source-positioned diagnostics | Basic |
 | Docker Compose | Yes | Yes |
-| Container backends | Docker, Apple Container (experimental) | Docker, Podman |
+| Container backends | Docker, Apple Container (experimental), Colima (experimental) | Docker, Podman |
 | Podman | Not yet | Yes |
 | Editor requirement | None (any terminal) | VS Code for full feature set |
 
@@ -122,6 +123,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] AI provider API key forwarding (read live from the host on every exec/shell — never baked into the container)
 - [x] Environment variable forwarding (remoteEnv, containerEnv)
 - [x] User environment probing
+- [x] Bidirectional clipboard forwarding (xsel/xclip)
 - [x] Bubblewrap installed for Codex sandbox support
 
 ### Spec Compliance
@@ -139,6 +141,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Automatic port detection via /proc/net/tcp
 - [x] Host daemon + in-container agent
 - [x] BROWSER interception (OAuth callbacks)
+- [x] Reverse tunnel port forwarding (Colima, Docker Desktop for Mac)
 - [x] OrbStack-aware port handling
 
 ### Network Proxy
@@ -160,8 +163,8 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 - [x] Docker Engine
 - [x] OrbStack
+- [x] Colima / Lima (experimental — reverse tunnel port forwarding)
 - [ ] Podman
-- [ ] Colima / Lima
 
 ### Experimental Backends
 
@@ -172,7 +175,6 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [ ] `cella template new/list/edit` — template authoring (subcommands exist as stubs, not yet implemented)
 - [ ] `cella config show/global/dotfiles/agent` — global/dotfiles/agent config management (subcommands exist as stubs, not yet implemented; only `cella config validate` is live)
 - [ ] Podman backend
-- [ ] Colima / Lima support
 
 ## Commands
 
@@ -261,7 +263,7 @@ graph TD
 
     subgraph "Tier 3 — Foundation"
         backend[cella-backend<br><i>backend trait</i>]
-        port[cella-port<br><i>IPC protocol</i>]
+        port[cella-port<br><i>port allocation</i>]
         codegen[cella-codegen<br><i>schema codegen</i>]
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
@@ -269,7 +271,7 @@ graph TD
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
-    docker & container --> backend
+    docker & container & compose --> backend
     agent & daemon --> port
     config --> codegen
     config & templates --> jsonc

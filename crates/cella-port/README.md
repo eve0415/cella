@@ -1,14 +1,14 @@
 # cella-port
 
-> Port allocation, detection, and IPC protocol for dev container port forwarding.
+> Port allocation and detection for dev container port forwarding.
 
 Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-port handles three aspects of port management: detecting listening ports inside containers, allocating host ports to avoid conflicts across concurrent containers, and defining the IPC protocol used between the host daemon and the in-container agent.
+cella-port handles two aspects of port management: detecting listening ports inside containers and allocating host ports to avoid conflicts across concurrent containers.
 
-Port detection works by parsing `/proc/net/tcp` and `/proc/net/tcp6` inside the container to discover processes in the LISTEN state. The allocation table tracks which host ports are in use across all active containers to prevent collisions when multiple dev containers run simultaneously. The protocol module defines the message format for the daemon-agent communication channel.
+Port detection works by parsing `/proc/net/tcp` and `/proc/net/tcp6` inside the container to discover processes in the LISTEN state. The allocation table tracks which host ports are in use across all active containers to prevent collisions when multiple dev containers run simultaneously.
 
 ### Spec Coverage
 

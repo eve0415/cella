@@ -62,6 +62,19 @@ Sent by the daemon in response to `AgentHello`. Not internally tagged.
 {"protocol_version":1,"daemon_version":"0.1.0","workspace_path":"/home/user/project","parent_repo":null,"is_worktree":false}
 ```
 
+#### TunnelHandshake
+
+Sent by the agent as the first message on a **reverse tunnel** TCP connection (separate from the control connection). Discriminated from `AgentHello` by the `connection_id` field. Not internally tagged.
+
+| Field | Type | Description |
+|---|---|---|
+| `auth_token` | `string` | Auth token for validating the connection |
+| `connection_id` | `u64` | Connection ID assigned by the daemon's tunnel broker (matches the `TunnelRequest.connection_id` that triggered this connection) |
+
+```json
+{"auth_token":"abc123","connection_id":42}
+```
+
 ### Agent -> Daemon Messages (`AgentMessage`)
 
 All variants are tagged with `"type"` in snake_case.
@@ -103,6 +116,29 @@ All variants are tagged with `"type"` in snake_case.
 
 ```json
 {"type":"browser_open","url":"https://github.com/login"}
+```
+
+#### Clipboard
+
+**`clipboard_copy`** -- Copy data to the host clipboard.
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `string` | Base64-encoded clipboard content |
+| `mime_type` | `string` | MIME type of the content (e.g. `"text/plain"`, `"image/png"`) |
+
+```json
+{"type":"clipboard_copy","data":"aGVsbG8gd29ybGQ=","mime_type":"text/plain"}
+```
+
+**`clipboard_paste`** -- Request clipboard content from the host.
+
+| Field | Type | Description |
+|---|---|---|
+| `mime_type` | `string?` | Requested MIME type (omitted for default `text/plain`) |
+
+```json
+{"type":"clipboard_paste","mime_type":"text/plain"}
 ```
 
 #### Git Credentials
@@ -307,6 +343,19 @@ All variants are tagged with `"type"` in snake_case.
 {"type":"config","poll_interval_ms":2000,"proxy_localhost":true}
 ```
 
+#### Clipboard
+
+**`clipboard_content`** -- Clipboard content response (reply to `clipboard_paste`).
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `string` | Base64-encoded clipboard content |
+| `mime_type` | `string` | MIME type of the content |
+
+```json
+{"type":"clipboard_content","data":"aGVsbG8gd29ybGQ=","mime_type":"text/plain"}
+```
+
 #### Git Credentials
 
 **`credential_response`** -- Response to a credential request.
@@ -332,6 +381,21 @@ All variants are tagged with `"type"` in snake_case.
 ```json
 {"type":"port_mapping","container_port":3000,"host_port":3001}
 ```
+
+#### Reverse Tunnel
+
+**`tunnel_request`** -- Request the agent to open a reverse tunnel for a new forwarded connection. Used on runtimes without direct container-IP routing (Colima, Docker Desktop for Mac).
+
+| Field | Type | Description |
+|---|---|---|
+| `connection_id` | `u64` | Unique connection ID assigned by the daemon's tunnel broker |
+| `target_port` | `u16` | Port on the container to connect to |
+
+```json
+{"type":"tunnel_request","connection_id":42,"target_port":3000}
+```
+
+The agent responds by opening a **new** TCP connection to the daemon's control port and sending a `TunnelHandshake` with the matching `connection_id`. The daemon's tunnel broker matches the connection and uses it to relay bytes between the host client and the container service.
 
 #### Operation Results
 
@@ -699,6 +763,27 @@ All variants are tagged with `"type"` in snake_case.
 {"type":"update_container_ip","container_id":"abc123","container_ip":"172.20.0.5"}
 ```
 
+**`register_ssh_agent_proxy`** -- Register a per-workspace SSH-agent TCP bridge. The daemon binds a localhost TCP listener, bidirectionally forwards bytes to the host's `SSH_AUTH_SOCK`, and returns the bridge port. Refcounted by workspace: subsequent registrations bump the count and return the existing port.
+
+| Field | Type | Description |
+|---|---|---|
+| `workspace` | `string` | Workspace path (used as refcount key) |
+| `upstream_socket` | `string` | Host-side `SSH_AUTH_SOCK` path to forward to |
+
+```json
+{"type":"register_ssh_agent_proxy","workspace":"/Users/me/proj","upstream_socket":"/Users/me/.1password/agent.sock"}
+```
+
+**`release_ssh_agent_proxy`** -- Decrement the SSH-agent proxy refcount for a workspace. Tears down the listener when the count reaches zero. No-op for an unknown workspace.
+
+| Field | Type | Description |
+|---|---|---|
+| `workspace` | `string` | Workspace path |
+
+```json
+{"type":"release_ssh_agent_proxy","workspace":"/Users/me/proj"}
+```
+
 **`shutdown`** -- Request graceful shutdown of the daemon. No fields.
 
 ```json
@@ -782,6 +867,27 @@ All variants are tagged with `"type"` in snake_case.
 
 ```json
 {"type":"pong"}
+```
+
+**`ssh_agent_proxy_registered`** -- SSH-agent bridge registered (or refcount bumped).
+
+| Field | Type | Description |
+|---|---|---|
+| `bridge_port` | `u16` | Localhost TCP port the in-container agent should connect to (reachable via `host.docker.internal` or equivalent) |
+| `refcount` | `usize` | Post-register count; `1` means a fresh bridge was created, `>1` means an existing one was reused |
+
+```json
+{"type":"ssh_agent_proxy_registered","bridge_port":54321,"refcount":1}
+```
+
+**`ssh_agent_proxy_released`** -- SSH-agent proxy refcount decremented.
+
+| Field | Type | Description |
+|---|---|---|
+| `torn_down` | `bool` | `true` when the refcount reached zero and the listener was destroyed; `false` when still in use by another container |
+
+```json
+{"type":"ssh_agent_proxy_released","torn_down":true}
 ```
 
 **`error`** -- Error response.

@@ -35,6 +35,7 @@ Templates are fetched from OCI registries (default: `ghcr.io/devcontainers/templ
 | `index` | Aggregated devcontainer index from containers.dev with offline fallback |
 | `apply` | Template application: option substitution, feature merging, JSONC/JSON generation |
 | `options` | Option validation and resolution (boolean, string, enum, proposals) |
+| `tags` | Image tag fetching, filtering, and sorting from OCI registries for version pinning |
 | `error` | `TemplateError` enum with thiserror |
 
 ## Crate Dependencies
