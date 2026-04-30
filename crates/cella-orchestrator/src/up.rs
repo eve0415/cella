@@ -939,7 +939,7 @@ impl EnsureUpContext<'_> {
             });
         }
 
-        for m in self.config.additional_cli_mounts {
+        for m in self.config.mount_flags.additional_cli_mounts {
             create_opts.mounts.push(m.clone());
         }
 
@@ -1250,10 +1250,17 @@ impl EnsureUpContext<'_> {
 
         let host_mount_folder = cella_git::find_git_root_folder(
             &self.config.resolved.workspace_root,
-            self.config.mount_workspace_git_root,
+            self.config.mount_flags.mount_workspace_git_root,
         );
 
-        let create_opts = crate::config_map::map_config(crate::config_map::MapConfigParams {
+        let worktree_result = resolve_worktree_common_dir(
+            &host_mount_folder,
+            self.config.mount_flags.mount_workspace_git_root,
+            self.config.mount_flags.mount_git_worktree_common_dir,
+            self.config.mount_flags.workspace_mount_consistency,
+        );
+
+        let mut create_opts = crate::config_map::map_config(crate::config_map::MapConfigParams {
             config,
             container_name: self.config.container_name,
             image_name: img_name,
@@ -1263,8 +1270,12 @@ impl EnsureUpContext<'_> {
             feature_config: effective_feature_config,
             image_env: &image_env,
             agent_arch,
-            workspace_mount_consistency: self.config.workspace_mount_consistency,
+            workspace_mount_consistency: self.config.mount_flags.workspace_mount_consistency,
         });
+
+        if let Some(wt) = worktree_result {
+            create_opts.mounts.push(wt.mount);
+        }
 
         Ok(ImageConfig {
             image_env,
@@ -1657,6 +1668,104 @@ pub async fn ensure_up(
     .map_err(|e| OrchestratorError::Other {
         message: e.to_string(),
     })
+}
+
+struct WorktreeCommonDirResult {
+    mount: MountConfig,
+}
+
+fn resolve_worktree_common_dir(
+    host_mount_folder: &std::path::Path,
+    mount_workspace_git_root: bool,
+    mount_git_worktree_common_dir: bool,
+    consistency: Option<&str>,
+) -> Option<WorktreeCommonDirResult> {
+    if !(mount_workspace_git_root && mount_git_worktree_common_dir) {
+        return None;
+    }
+
+    let dot_git = host_mount_folder.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = content.strip_prefix("gitdir: ")?.trim();
+
+    let gitdir_path = std::path::Path::new(gitdir);
+    if gitdir_path.is_absolute() {
+        return None;
+    }
+
+    // Compute the git common dir (two levels up from gitdir).
+    // e.g. gitdir: ../../.git/worktrees/my-wt → common dir = ../../.git → resolved
+    let resolved_gitdir = host_mount_folder.join(gitdir);
+    let git_common_dir = resolved_gitdir.parent()?.parent()?.to_path_buf();
+    let git_common_dir = git_common_dir.canonicalize().unwrap_or(git_common_dir);
+
+    // Collect path segments from host_mount_folder up to where git_common_dir is reachable
+    let mut segments = Vec::new();
+    let mut current = host_mount_folder.to_path_buf();
+    loop {
+        if git_common_dir.starts_with(&current) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        if let Some(name) = current.file_name() {
+            segments.insert(0, name.to_string_lossy().to_string());
+        }
+        current = parent.to_path_buf();
+    }
+
+    let container_mount_folder = format!("/workspaces/{}", segments.join("/"));
+
+    // Compute container git common dir by resolving the relative gitdir from
+    // the container mount folder
+    let container_gitdir = std::path::PathBuf::from(&container_mount_folder).join(gitdir);
+    let container_git_common = container_gitdir.parent()?.parent()?.to_path_buf();
+    // Normalize the path (remove . and ..)
+    let container_git_common_str = normalize_path_string(&container_git_common.to_string_lossy());
+
+    let cons = if cfg!(target_os = "linux") {
+        None
+    } else {
+        Some(consistency.unwrap_or("consistent").to_string())
+    };
+
+    Some(WorktreeCommonDirResult {
+        mount: MountConfig {
+            mount_type: "bind".to_string(),
+            source: git_common_dir.to_string_lossy().to_string(),
+            target: container_git_common_str,
+            consistency: cons,
+            read_only: false,
+            external: false,
+        },
+    })
+}
+
+fn normalize_path_string(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(component),
+        }
+    }
+    let normalized = parts.join("/");
+    if path.starts_with('/') {
+        format!("/{normalized}")
+    } else {
+        normalized
+    }
 }
 
 /// Returns `true` if the post-start injection includes the cella-agent

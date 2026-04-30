@@ -38,6 +38,28 @@ pub struct UpBuildArgs {
     pub(crate) secrets: Vec<String>,
 }
 
+/// Mount-related flags for an `up` invocation.
+#[derive(Args)]
+pub struct UpMountArgs {
+    /// Additional mount point(s).
+    /// Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]
+    #[arg(long = "mount")]
+    pub(crate) mount: Vec<String>,
+
+    /// Workspace mount consistency (ignored on Linux).
+    #[arg(long, value_enum, default_value = "cached")]
+    pub(crate) workspace_mount_consistency: MountConsistency,
+
+    /// Mount the workspace using its Git root (default: true).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub(crate) mount_workspace_git_root: bool,
+
+    /// Mount the Git worktree common dir for Git operations in the container.
+    /// Requires the worktree to be created with relative paths.
+    #[arg(long)]
+    pub(crate) mount_git_worktree_common_dir: bool,
+}
+
 /// Start a dev container for the current workspace.
 #[derive(Args)]
 pub struct UpArgs {
@@ -90,18 +112,8 @@ pub struct UpArgs {
     #[arg(long = "pull-policy", value_enum)]
     pub(crate) pull_policy: Option<ComposePullPolicy>,
 
-    /// Additional mount point(s).
-    /// Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]
-    #[arg(long = "mount")]
-    pub(crate) mount: Vec<String>,
-
-    /// Workspace mount consistency (ignored on Linux).
-    #[arg(long, value_enum, default_value = "cached")]
-    pub(crate) workspace_mount_consistency: MountConsistency,
-
-    /// Mount the workspace using its Git root (default: true).
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-    pub(crate) mount_workspace_git_root: bool,
+    #[command(flatten)]
+    pub(crate) mounts: UpMountArgs,
 }
 
 impl UpArgs {
@@ -185,6 +197,14 @@ fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
 
 use cella_orchestrator::NetworkRulePolicy;
 
+/// Resolved mount configuration for an `up` invocation.
+struct ResolvedMountConfig {
+    additional_cli_mounts: Vec<MountConfig>,
+    workspace_mount_consistency: Option<String>,
+    mount_workspace_git_root: bool,
+    mount_git_worktree_common_dir: bool,
+}
+
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
     pub(crate) resolved: ResolvedConfig,
@@ -216,12 +236,7 @@ pub struct UpContext {
     build_secrets: Vec<BuildSecret>,
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
-    /// Additional CLI-specified mounts (`--mount` flag).
-    additional_cli_mounts: Vec<MountConfig>,
-    /// Workspace mount consistency mode.
-    workspace_mount_consistency: Option<String>,
-    /// Whether to mount the git root instead of the workspace folder.
-    mount_workspace_git_root: bool,
+    mount_config: ResolvedMountConfig,
 }
 
 impl UpContext {
@@ -274,6 +289,7 @@ impl UpContext {
         let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
 
         let additional_cli_mounts = args
+            .mounts
             .mount
             .iter()
             .map(|s| parse_cli_mount(s))
@@ -310,11 +326,14 @@ impl UpContext {
             compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
             extra_networks: Vec::new(),
-            additional_cli_mounts,
-            workspace_mount_consistency: Some(
-                args.workspace_mount_consistency.as_str().to_string(),
-            ),
-            mount_workspace_git_root: args.mount_workspace_git_root,
+            mount_config: ResolvedMountConfig {
+                additional_cli_mounts,
+                workspace_mount_consistency: Some(
+                    args.mounts.workspace_mount_consistency.as_str().to_string(),
+                ),
+                mount_workspace_git_root: args.mounts.mount_workspace_git_root,
+                mount_git_worktree_common_dir: args.mounts.mount_git_worktree_common_dir,
+            },
         })
     }
 
@@ -383,9 +402,12 @@ impl UpContext {
             compose_pull_policy: None,
             build_secrets: vec![],
             extra_networks: Vec::new(),
-            additional_cli_mounts: Vec::new(),
-            workspace_mount_consistency: None,
-            mount_workspace_git_root: true,
+            mount_config: ResolvedMountConfig {
+                additional_cli_mounts: Vec::new(),
+                workspace_mount_consistency: None,
+                mount_workspace_git_root: true,
+                mount_git_worktree_common_dir: false,
+            },
         })
     }
 
@@ -772,9 +794,15 @@ impl UpContext {
             pull_policy: self.pull_policy.as_deref(),
             build_secrets: self.build_secrets.clone(),
             extra_networks: self.extra_networks.clone(),
-            additional_cli_mounts: &self.additional_cli_mounts,
-            workspace_mount_consistency: self.workspace_mount_consistency.as_deref(),
-            mount_workspace_git_root: self.mount_workspace_git_root,
+            mount_flags: cella_orchestrator::MountFlags {
+                additional_cli_mounts: &self.mount_config.additional_cli_mounts,
+                workspace_mount_consistency: self
+                    .mount_config
+                    .workspace_mount_consistency
+                    .as_deref(),
+                mount_workspace_git_root: self.mount_config.mount_workspace_git_root,
+                mount_git_worktree_common_dir: self.mount_config.mount_git_worktree_common_dir,
+            },
         };
 
         let result =
@@ -1228,7 +1256,7 @@ mod tests {
         ])
         .unwrap();
         if let crate::commands::Command::Up(args) = &cli.command {
-            assert_eq!(args.mount.len(), 2);
+            assert_eq!(args.mounts.mount.len(), 2);
         }
     }
 
