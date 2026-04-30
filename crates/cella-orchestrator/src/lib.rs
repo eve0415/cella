@@ -23,7 +23,7 @@ pub use cella_backend::progress;
 pub mod prune;
 pub mod result;
 pub mod shell_detect;
-pub mod ssh_proxy_client;
+pub use cella_daemon_client::ssh_proxy as ssh_proxy_client;
 pub mod tool_install;
 pub use cella_backend::uid_image;
 pub mod up;

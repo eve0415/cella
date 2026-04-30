@@ -472,11 +472,13 @@ dependencies = [
 name = "cella-daemon-client"
 version = "0.0.39"
 dependencies = [
+ "cella-env",
  "cella-protocol",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

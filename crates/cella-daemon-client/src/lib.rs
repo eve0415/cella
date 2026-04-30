@@ -1,5 +1,7 @@
 //! Client for the daemon management Unix socket.
 
+pub mod ssh_proxy;
+
 use std::path::{Path, PathBuf};
 
 use cella_protocol::{
