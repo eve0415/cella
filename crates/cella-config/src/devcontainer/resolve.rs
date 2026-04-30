@@ -208,6 +208,9 @@ pub fn config(
         .get("workspaceFolder")
         .and_then(|v| v.as_str())
         .map(|raw| {
+            if !raw.contains("${") {
+                return raw.to_string();
+            }
             let pre_ctx = super::subst::SubstitutionContext::new(
                 workspace_root,
                 None,

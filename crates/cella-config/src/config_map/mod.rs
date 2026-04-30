@@ -702,6 +702,23 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_entries_object_command_substituted() {
+        let mut entries = vec![cella_features::LifecycleEntry {
+            origin: "feature".into(),
+            command: json!({"setup": "echo ${devcontainerId}", "init": "/run/${devcontainerId}.sh"}),
+        }];
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        substitute_lifecycle_entries(&mut entries, &ctx);
+        assert_eq!(entries[0].command["setup"], "echo abc123");
+        assert_eq!(entries[0].command["init"], "/run/abc123.sh");
+    }
+
+    #[test]
     fn end_to_end_feature_mount_devcontainer_id_substituted() {
         let devcontainer_id = "0000000000000000abcdef1234567890abcdef12345678";
         let feature_config = FeatureContainerConfig {
