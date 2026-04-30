@@ -458,6 +458,7 @@ impl EnsureUpContext<'_> {
 
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         let subst = crate::subst_ctx(self.config.resolved);
+        let subst_clone = subst.clone();
         check_and_run_content_update(
             &lc_ctx_content,
             self.config_json(),
@@ -465,7 +466,7 @@ impl EnsureUpContext<'_> {
             &self.config.resolved.workspace_root,
             &self.progress,
             Some(&move |entries| {
-                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+                crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
             }),
         )
         .await?;
@@ -475,10 +476,7 @@ impl EnsureUpContext<'_> {
             self.config_json(),
             "postAttachCommand",
         );
-        crate::config_map::substitute_lifecycle_entries(
-            &mut entries,
-            &crate::subst_ctx(self.config.resolved),
-        );
+        crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
@@ -510,7 +508,8 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-        let content_subst = crate::subst_ctx(self.config.resolved);
+        let subst = crate::subst_ctx(self.config.resolved);
+        let subst_clone = subst.clone();
         check_and_run_content_update(
             &lc_ctx,
             self.config_json(),
@@ -518,11 +517,10 @@ impl EnsureUpContext<'_> {
             &self.config.resolved.workspace_root,
             &self.progress,
             Some(&move |entries| {
-                crate::config_map::substitute_lifecycle_entries(entries, &content_subst);
+                crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
             }),
         )
         .await?;
-        let subst = crate::subst_ctx(self.config.resolved);
         for phase in ["postStartCommand", "postAttachCommand"] {
             let mut entries = lifecycle_entries_for_phase(
                 metadata.map(String::as_str),

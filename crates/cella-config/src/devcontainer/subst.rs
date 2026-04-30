@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Context for resolving devcontainer variable expressions.
+#[derive(Clone)]
 pub struct SubstitutionContext {
     local_env: HashMap<String, String>,
     local_workspace_folder: String,
