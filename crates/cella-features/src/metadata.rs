@@ -29,6 +29,18 @@ pub fn parse_feature_metadata(json: &str) -> Result<FeatureMetadata, FeatureErro
     dto.into_metadata()
 }
 
+/// Mount object from `devcontainer-feature.json`.
+///
+/// Per the feature schema (`additionalProperties: false`), only object format
+/// is valid — string-format mounts are a `devcontainer.json`-only construct.
+#[derive(Deserialize)]
+struct FeatureMountDto {
+    #[serde(rename = "type")]
+    mount_type: String,
+    source: Option<String>,
+    target: String,
+}
+
 /// Internal DTO that maps camelCase JSON field names to Rust fields.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,7 +56,7 @@ struct FeatureMetadataDto {
     container_user: Option<String>,
     entrypoint: Option<String>,
     #[serde(default)]
-    mounts: Vec<String>,
+    mounts: Vec<FeatureMountDto>,
     #[serde(default)]
     cap_add: Vec<String>,
     #[serde(default)]
@@ -103,6 +115,19 @@ impl FeatureMetadataDto {
             );
         }
 
+        let mounts = self
+            .mounts
+            .into_iter()
+            .map(|m| {
+                format!(
+                    "type={},source={},target={}",
+                    m.mount_type,
+                    m.source.as_deref().unwrap_or(""),
+                    m.target,
+                )
+            })
+            .collect();
+
         Ok(FeatureMetadata {
             id: self.id,
             version: self.version,
@@ -112,7 +137,7 @@ impl FeatureMetadataDto {
             installs_after: self.installs_after,
             container_user: self.container_user,
             entrypoint: self.entrypoint,
-            mounts: self.mounts,
+            mounts,
             cap_add: self.cap_add,
             security_opt: self.security_opt,
             privileged: self.privileged,
@@ -185,7 +210,7 @@ mod tests {
             "installsAfter": ["ghcr.io/devcontainers/features/common-utils"],
             "containerUser": "node",
             "entrypoint": "/usr/local/share/nvm-entrypoint.sh",
-            "mounts": ["source=node-modules,target=/usr/local/lib/node_modules,type=volume"],
+            "mounts": [{"source": "node-modules", "target": "/usr/local/lib/node_modules", "type": "volume"}],
             "capAdd": ["SYS_PTRACE"],
             "securityOpt": ["seccomp=unconfined"],
             "privileged": false,
@@ -241,7 +266,7 @@ mod tests {
         );
         assert_eq!(
             meta.mounts,
-            vec!["source=node-modules,target=/usr/local/lib/node_modules,type=volume"]
+            vec!["type=volume,source=node-modules,target=/usr/local/lib/node_modules"]
         );
         assert_eq!(meta.cap_add, vec!["SYS_PTRACE"]);
         assert_eq!(meta.security_opt, vec!["seccomp=unconfined"]);
@@ -403,5 +428,62 @@ mod tests {
         }"#;
         let meta = parse_feature_metadata(json).unwrap();
         assert_eq!(meta.id, "test");
+    }
+
+    #[test]
+    fn object_format_mounts_parsed() {
+        let json = r#"{
+            "id": "docker-in-docker",
+            "version": "2.16.1",
+            "mounts": [
+                {
+                    "source": "dind-var-lib-docker-${devcontainerId}",
+                    "target": "/var/lib/docker",
+                    "type": "volume"
+                }
+            ]
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse object mounts");
+        assert_eq!(meta.mounts.len(), 1);
+        assert_eq!(
+            meta.mounts[0],
+            "type=volume,source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker"
+        );
+    }
+
+    #[test]
+    fn string_format_mounts_rejected_in_feature() {
+        let json = r#"{
+            "id": "test",
+            "version": "1.0.0",
+            "mounts": ["type=volume,src=v,dst=/v"]
+        }"#;
+        let result = parse_feature_metadata(json);
+        assert!(
+            result.is_err(),
+            "string-format mounts should be rejected in feature metadata"
+        );
+    }
+
+    #[test]
+    fn mount_object_without_source() {
+        let json = r#"{
+            "id": "test",
+            "version": "1.0.0",
+            "mounts": [{"type": "volume", "target": "/data"}]
+        }"#;
+        let meta = parse_feature_metadata(json).expect("mount without source should parse");
+        assert_eq!(meta.mounts[0], "type=volume,source=,target=/data");
+    }
+
+    #[test]
+    fn docker_in_docker_real_manifest() {
+        let json = include_str!("../tests/fixtures/docker-in-docker.json");
+        let meta = parse_feature_metadata(json).expect("docker-in-docker manifest should parse");
+        assert_eq!(meta.id, "docker-in-docker");
+        assert_eq!(meta.mounts.len(), 1);
+        assert!(meta.mounts[0].contains("target=/var/lib/docker"));
+        assert!(meta.mounts[0].contains("type=volume"));
+        assert_eq!(meta.privileged, Some(true));
     }
 }

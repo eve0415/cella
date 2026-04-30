@@ -216,6 +216,11 @@ These flags are cella-only. They do not conflict with any spec flag name and can
 - **Cella**: Runs on container creation, rebuild, and when the container is already running (`handle_running` fast path)
 - **Status**: PASS
 
+### 3.15 Feature Mount Format
+- **Spec**: Feature `mounts` is `Mount[]` (objects with `type`, `source?`, `target`); `devcontainer.json` mounts accept both objects and strings
+- **Cella**: Feature mounts parsed as objects, normalized to CSV strings (`type=X,source=Y,target=Z`) during metadata parsing
+- **Status**: PASS
+
 ---
 
 ## 4. Missing Features
@@ -235,6 +240,7 @@ These flags are cella-only. They do not conflict with any spec flag name and can
 | Feature authoring | test/package/publish/info/resolve-deps/generate-docs | Low |
 | Template commands | apply/publish/metadata/generate-docs | Low |
 | Git root mount | `--mount-workspace-git-root` | Medium |
+| Variable substitution | `${devcontainerId}`, `${localEnv:...}`, `${localWorkspaceFolder}`, etc. | High |
 
 ---
 
