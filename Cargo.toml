@@ -8,6 +8,7 @@ members = [
     "crates/cella-config",
     "crates/cella-container",
     "crates/cella-daemon",
+    "crates/cella-daemon-client",
     "crates/cella-doctor",
     "crates/cella-docker",
     "crates/cella-env",
@@ -156,6 +157,7 @@ cella-config = { path = "crates/cella-config" }
 cella-jsonc = { path = "crates/cella-jsonc" }
 cella-container = { path = "crates/cella-container" }
 cella-daemon = { path = "crates/cella-daemon" }
+cella-daemon-client = { path = "crates/cella-daemon-client" }
 cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }

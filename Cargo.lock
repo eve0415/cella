@@ -462,6 +462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-daemon-client"
+version = "0.0.39"
+dependencies = [
+ "cella-protocol",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "cella-docker"
 version = "0.0.39"
 dependencies = [
