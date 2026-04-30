@@ -367,8 +367,12 @@ impl EnsureUpContext<'_> {
             return Ok(());
         }
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
-        let entries =
+        let mut entries =
             lifecycle_entries_for_phase(Some(metadata), self.config_json(), "onCreateCommand");
+        crate::config_map::substitute_lifecycle_entries(
+            &mut entries,
+            &crate::subst_ctx(self.config.resolved),
+        );
         run_lifecycle_entries(&lc_ctx, "onCreateCommand", &entries, &self.progress).await?;
         let new_state = LifecycleState {
             oncreate_done: true,
@@ -453,19 +457,27 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
         check_and_run_content_update(
             &lc_ctx_content,
             self.config_json(),
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            Some(&|entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+            }),
         )
         .await?;
 
-        let entries = lifecycle_entries_for_phase(
+        let mut entries = lifecycle_entries_for_phase(
             metadata.map(String::as_str),
             self.config_json(),
             "postAttachCommand",
+        );
+        crate::config_map::substitute_lifecycle_entries(
+            &mut entries,
+            &crate::subst_ctx(self.config.resolved),
         );
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
@@ -498,21 +510,25 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
         check_and_run_content_update(
             &lc_ctx,
             self.config_json(),
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            Some(&|entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+            }),
         )
         .await?;
-
         for phase in ["postStartCommand", "postAttachCommand"] {
-            let entries = lifecycle_entries_for_phase(
+            let mut entries = lifecycle_entries_for_phase(
                 metadata.map(String::as_str),
                 self.config_json(),
                 phase,
             );
+            crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
             run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
         }
         Ok(())
@@ -1257,6 +1273,7 @@ impl EnsureUpContext<'_> {
         let config = self.config_json();
         let wait_for = WaitForPhase::from_config(config);
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
         run_lifecycle_phases_with_wait_for(
             &lc_ctx,
             config,
@@ -1264,6 +1281,9 @@ impl EnsureUpContext<'_> {
             image_metadata,
             &self.progress,
             wait_for,
+            Some(&|entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+            }),
         )
         .await?;
 

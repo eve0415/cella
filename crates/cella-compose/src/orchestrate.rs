@@ -488,6 +488,12 @@ async fn finalize_compose(
 
     // 20. Run lifecycle phases (primary service only)
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
+    let subst_ctx = cella_config::devcontainer::subst::SubstitutionContext::new(
+        cfg.workspace_root,
+        cfg.config.get("workspaceFolder").and_then(|v| v.as_str()),
+        &cfg.resolved.devcontainer_id,
+        std::env::vars().collect(),
+    );
     for phase in [
         "onCreateCommand",
         "updateContentCommand",
@@ -495,7 +501,8 @@ async fn finalize_compose(
         "postStartCommand",
         "postAttachCommand",
     ] {
-        let entries = lifecycle_entries_for_phase(metadata, config, phase);
+        let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
+        cella_config::config_map::substitute_lifecycle_entries(&mut entries, &subst_ctx);
         let lc_ctx = build_lifecycle_ctx(
             client,
             &primary.id,

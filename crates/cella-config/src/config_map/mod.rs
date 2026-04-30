@@ -258,6 +258,16 @@ pub fn substitute_feature_config(
     config
 }
 
+/// Substitute devcontainer variables in lifecycle entry commands.
+pub fn substitute_lifecycle_entries(
+    entries: &mut [cella_features::LifecycleEntry],
+    ctx: &crate::devcontainer::subst::SubstitutionContext,
+) {
+    for entry in entries {
+        ctx.substitute_value(&mut entry.command);
+    }
+}
+
 fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
     config
         .get(key)
@@ -664,5 +674,21 @@ mod tests {
         assert_eq!(substituted.mounts[0], "source=/host,target=/container");
         assert_eq!(substituted.entrypoints[0], "/init.sh");
         assert_eq!(substituted.container_env.get("FOO").unwrap(), "bar");
+    }
+
+    #[test]
+    fn lifecycle_entries_from_metadata_substituted() {
+        let mut entries = vec![cella_features::LifecycleEntry {
+            origin: "dind".into(),
+            command: json!("echo ${devcontainerId}"),
+        }];
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "test-id-52chars",
+            HashMap::new(),
+        );
+        substitute_lifecycle_entries(&mut entries, &ctx);
+        assert_eq!(entries[0].command, json!("echo test-id-52chars"));
     }
 }
