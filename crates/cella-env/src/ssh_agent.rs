@@ -23,8 +23,8 @@ pub struct SshAgentForwarding {
 #[derive(Debug, Clone)]
 pub enum SshAgentRequest {
     /// Direct mount of an existing socket — used for Docker Desktop and
-    /// `OrbStack` (magic VM socket) and for Linux/Podman direct host
-    /// bind-mount. Ready to be mounted as-is.
+    /// `OrbStack` (magic VM socket), Linux native (host bind-mount), and
+    /// as a fallback for VM-based runtimes. Ready to be mounted as-is.
     Direct(SshAgentForwarding),
     /// **Known broken on colima — see `cella_daemon::ssh_proxy` module
     /// docs.** Lima's OpenSSH-protocol `forwardAgent` degenerates with
@@ -77,14 +77,10 @@ fn vm_host_services_ssh_forwarding(
 
 /// SSH agent forwarding via direct bind-mount of the host socket.
 ///
-/// Used as the fallback in `ssh_agent_request` for runtimes that aren't
-/// `DockerDesktop` / `OrbStack` / `Colima` — typically `LinuxNative`
-/// Docker, Podman, or Rancher Desktop. macOS sandbox-dir concerns
-/// don't apply on these runtimes (no Lima virtiofs in the path), so
-/// the host socket is reachable from the docker daemon as-is. (For
-/// `Colima` direct mount fails — Docker's mkdir-source-if-missing
-/// returns EOPNOTSUPP under macOS sandbox dirs — which is why colima
-/// takes the daemon-managed proxy path instead.)
+/// Used for `LinuxNative` Docker where the docker daemon runs on the
+/// same host, so the host socket is reachable as-is. Also used as a
+/// fallback strategy for VM-based runtimes (Rancher Desktop, Podman,
+/// Unknown) when the magic VM socket is not available.
 fn direct_ssh_forwarding(
     _runtime: &DockerRuntime,
     host_socket: Option<String>,
