@@ -482,4 +482,15 @@ mod tests {
         let result = ctx.substitute_str("${containerEnv:SOME_VAR:default_value}");
         assert_eq!(result, "default_value");
     }
+
+    #[test]
+    fn substituted_values_not_rescanned() {
+        let mut env = HashMap::new();
+        env.insert("TRICKY".to_string(), "${localWorkspaceFolder}".to_string());
+        let ctx = SubstitutionContext::new(Path::new("/tmp/ws"), None, "id123", env);
+        assert_eq!(
+            ctx.substitute_str("${localEnv:TRICKY}"),
+            "${localWorkspaceFolder}"
+        );
+    }
 }
