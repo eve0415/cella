@@ -106,6 +106,9 @@ pub struct PostStartInjection {
     /// Git config commands to execute inside the container as `remote_user`.
     /// Each entry is a full command (e.g., `["git", "config", "--global", "user.name", "John"]`).
     pub git_config_commands: Vec<Vec<String>>,
+    /// Shell commands to execute as `remote_user` after file uploads,
+    /// before git config commands (e.g., gitignore merge scripts).
+    pub user_commands: Vec<Vec<String>>,
     /// Commands that require root privileges (e.g., CA trust store updates).
     /// Executed as root after file uploads.
     pub root_commands: Vec<Vec<String>>,
@@ -218,6 +221,33 @@ fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
     ]);
 }
 
+fn apply_global_gitignore(fwd: &mut EnvForwarding, remote_user: &str) {
+    let Some(content) = git_ignore::read_host_gitignore() else {
+        return;
+    };
+
+    let upload_path = git_ignore::host_upload_path();
+    fwd.post_start.file_uploads.push(FileUpload {
+        container_path: upload_path.to_string(),
+        content: content.into_bytes(),
+        mode: 0o644,
+    });
+
+    fwd.post_start
+        .user_commands
+        .extend(git_ignore::build_merge_commands(remote_user, upload_path));
+
+    let cella_path = git_ignore::cella_ignore_path(remote_user);
+    tracing::info!("Forwarding host global gitignore to {cella_path}");
+    fwd.post_start.git_config_commands.push(vec![
+        "git".to_string(),
+        "config".to_string(),
+        "--global".to_string(),
+        "core.excludesFile".to_string(),
+        cella_path,
+    ]);
+}
+
 /// Network configuration for proxy forwarding.
 pub struct ProxyForwardingConfig {
     /// Proxy configuration from cella settings.
@@ -253,6 +283,7 @@ pub fn prepare_env_forwarding(
     apply_git_config(&mut fwd);
     apply_safe_directory(&mut fwd);
     apply_credential_forwarding(&mut fwd);
+    apply_global_gitignore(&mut fwd, remote_user);
 
     if let Some(net_config) = network {
         proxy::apply_proxy_env(&mut fwd, &net_config.proxy, net_config.has_blocking_rules);
@@ -356,6 +387,10 @@ mod tests {
         assert!(
             fwd.post_start.git_config_commands.is_empty(),
             "default git_config_commands should be empty"
+        );
+        assert!(
+            fwd.post_start.user_commands.is_empty(),
+            "default user_commands should be empty"
         );
         assert!(
             fwd.post_start.root_commands.is_empty(),
