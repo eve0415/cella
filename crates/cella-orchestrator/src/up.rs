@@ -5,6 +5,7 @@ use std::pin::Pin;
 
 use tracing::{debug, info, warn};
 
+use cella_backend::agent::restart_agent_in_container;
 use cella_backend::{
     BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
     LifecycleContext, MountConfig, agent_env_vars, container_labels,
@@ -1635,37 +1636,6 @@ fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
 /// if nothing came back. This avoids double-launching the daemon on
 /// containers with the restart loop while remaining backward compatible
 /// with containers created before it was introduced.
-pub async fn restart_agent_in_container(client: &dyn ContainerBackend, container_id: &str) {
-    let agent_path = "/cella/bin/cella-agent";
-    // Kill the daemon, wait for the restart loop (if any) to bring it back,
-    // then spawn only if no daemon process is running.
-    // The bracket trick `[c]ella-agent` prevents pgrep -f from matching the
-    // sh -c wrapper itself (the bracket changes the literal string).
-    let script = format!(
-        "pkill -f 'cella-agent daemon' 2>/dev/null; \
-         sleep 1; \
-         pgrep -f '[c]ella-agent daemon' >/dev/null 2>&1 || \
-         \"{agent_path}\" daemon \
-         --poll-interval \"${{CELLA_PORT_POLL_INTERVAL:-1000}}\" &"
-    );
-
-    match client
-        .exec_detached(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), script],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-    {
-        Ok(_) => info!("Agent restart triggered in container {container_id}"),
-        Err(e) => warn!("Failed to restart agent in container: {e}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

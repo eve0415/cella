@@ -21,7 +21,7 @@ use cella_config::devcontainer::resolve::ResolvedConfig;
 use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
 use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
 use crate::progress::ProgressSender;
-use crate::up::restart_agent_in_container;
+use cella_backend::agent::restart_agent_in_container;
 
 // ---------------------------------------------------------------------------
 // Configuration

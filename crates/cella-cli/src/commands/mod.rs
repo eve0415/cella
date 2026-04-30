@@ -591,7 +591,7 @@ async fn restart_agents_in_all_containers(client: &dyn cella_backend::ContainerB
     };
 
     for container in &containers {
-        cella_orchestrator::up::restart_agent_in_container(client, &container.id).await;
+        cella_backend::agent::restart_agent_in_container(client, &container.id).await;
     }
 }
 
