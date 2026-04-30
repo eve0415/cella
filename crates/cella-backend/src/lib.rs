@@ -9,6 +9,7 @@ pub mod progress;
 pub mod resolve;
 pub mod traits;
 pub mod types;
+pub mod uid_image;
 
 pub use agent::agent_env_vars;
 pub use error::BackendError;

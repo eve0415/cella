@@ -25,7 +25,7 @@ pub mod result;
 pub mod shell_detect;
 pub mod ssh_proxy_client;
 pub mod tool_install;
-pub mod uid_image;
+pub use cella_backend::uid_image;
 pub mod up;
 
 pub use config::{
