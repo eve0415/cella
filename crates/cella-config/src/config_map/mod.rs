@@ -234,6 +234,21 @@ fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverr
     })
 }
 
+/// Build a [`SubstitutionContext`] from a resolved devcontainer config.
+pub fn subst_ctx(
+    resolved: &crate::devcontainer::resolve::ResolvedConfig,
+) -> crate::devcontainer::subst::SubstitutionContext {
+    crate::devcontainer::subst::SubstitutionContext::new(
+        &resolved.workspace_root,
+        resolved
+            .config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str()),
+        &resolved.devcontainer_id,
+        std::env::vars().collect(),
+    )
+}
+
 /// Substitute devcontainer variables in feature-provided config fields.
 ///
 /// Per spec, feature metadata supports `${devcontainerId}` in `entrypoint`,
@@ -243,16 +258,10 @@ pub fn substitute_feature_config(
     ctx: &crate::devcontainer::subst::SubstitutionContext,
 ) -> FeatureContainerConfig {
     for mount in &mut config.mounts {
-        let substituted = ctx.substitute_str(mount);
-        if *mount != substituted {
-            *mount = substituted;
-        }
+        *mount = ctx.substitute_str(mount);
     }
     for ep in &mut config.entrypoints {
-        let substituted = ctx.substitute_str(ep);
-        if *ep != substituted {
-            *ep = substituted;
-        }
+        *ep = ctx.substitute_str(ep);
     }
     ctx.substitute_value(&mut config.customizations);
     config

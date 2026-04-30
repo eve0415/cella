@@ -488,12 +488,7 @@ async fn finalize_compose(
 
     // 20. Run lifecycle phases (primary service only)
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
-    let subst_ctx = cella_config::devcontainer::subst::SubstitutionContext::new(
-        cfg.workspace_root,
-        cfg.config.get("workspaceFolder").and_then(|v| v.as_str()),
-        &cfg.resolved.devcontainer_id,
-        std::env::vars().collect(),
-    );
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     for phase in [
         "onCreateCommand",
         "updateContentCommand",
@@ -866,12 +861,7 @@ async fn build_override_and_start(
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
-    let subst_ctx = cella_config::devcontainer::subst::SubstitutionContext::new(
-        cfg.workspace_root,
-        cfg.config.get("workspaceFolder").and_then(|v| v.as_str()),
-        &cfg.resolved.devcontainer_id,
-        std::env::vars().collect(),
-    );
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
         workspace_root: cfg.workspace_root,
         settings: &settings,
