@@ -1146,23 +1146,7 @@ impl EnsureUpContext<'_> {
             &self.config.resolved.workspace_root,
             Some(self.config.resolved),
         )?;
-        let toml_net = settings.network.to_network_config();
-        let toml_mode_override = settings.network.mode_override();
-        let dc_net = config
-            .get("customizations")
-            .and_then(|c| c.get("cella"))
-            .and_then(|c| c.get("network"))
-            .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
-        let merged = cella_network::merge_network_configs(
-            dc_net.as_ref(),
-            Some(&toml_net),
-            toml_mode_override,
-        );
-        let net_config = cella_network::NetworkConfig {
-            mode: merged.mode,
-            proxy: merged.proxy,
-            rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
-        };
+        let net_config = settings.network.to_network_config();
         let skip_rules = self.config.network_rule_policy == NetworkRulePolicy::Skip;
         let has_rules = net_config.has_rules() && !skip_rules;
 

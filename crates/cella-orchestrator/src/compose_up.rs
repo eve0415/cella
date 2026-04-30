@@ -306,13 +306,7 @@ async fn resolve_user_and_env(
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == crate::NetworkRulePolicy::Skip;
-    let proxy_fwd = build_proxy_forwarding_config(
-        cfg.config,
-        cfg.workspace_root,
-        cfg.resolved,
-        managed_agent,
-        skip_rules,
-    );
+    let proxy_fwd = build_proxy_forwarding_config(cfg.resolved, managed_agent, skip_rules);
     let mut env_fwd =
         cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
@@ -1195,33 +1189,15 @@ where
     }
 }
 
-/// Build proxy forwarding config from devcontainer.json and cella.toml network settings.
-///
-/// Mirrors the network config resolution in `Up::resolve_image_config` (up.rs).
-/// Used by both the orchestrator's `resolve_user_and_env` and the CLI's `post_create_setup`.
+/// Build proxy forwarding config from merged cella settings.
 pub fn build_proxy_forwarding_config(
-    config: &serde_json::Value,
-    workspace_root: &Path,
     resolved: &ResolvedConfig,
     managed_agent: bool,
     skip_rules: bool,
 ) -> Option<cella_env::ProxyForwardingConfig> {
-    let settings =
-        cella_config::CellaConfig::load(workspace_root, Some(resolved)).unwrap_or_default();
-    let toml_net = settings.network.to_network_config();
-    let toml_mode_override = settings.network.mode_override();
-    let dc_net = config
-        .get("customizations")
-        .and_then(|c| c.get("cella"))
-        .and_then(|c| c.get("network"))
-        .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
-    let merged =
-        cella_network::merge_network_configs(dc_net.as_ref(), Some(&toml_net), toml_mode_override);
-    let net_config = cella_network::NetworkConfig {
-        mode: merged.mode,
-        proxy: merged.proxy,
-        rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
-    };
+    let settings = cella_config::CellaConfig::load(&resolved.workspace_root, Some(resolved))
+        .unwrap_or_default();
+    let net_config = settings.network.to_network_config();
     let has_rules = net_config.has_rules() && !skip_rules;
 
     Some(cella_env::ProxyForwardingConfig {
