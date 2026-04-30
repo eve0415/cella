@@ -1498,7 +1498,7 @@ pub async fn ensure_up(
     hooks: &dyn UpHooks,
     progress: ProgressSender,
 ) -> Result<UpResult, OrchestratorError> {
-    if config.resolved.host_requirements().is_some() {
+    if config.resolved.config.get("hostRequirements").is_some() {
         let result = crate::host_requirements::validate(
             &config.resolved.config,
             &config.resolved.workspace_root,
