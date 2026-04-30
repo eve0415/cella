@@ -234,6 +234,30 @@ fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverr
     })
 }
 
+/// Substitute devcontainer variables in feature-provided config fields.
+///
+/// Per spec, feature metadata supports `${devcontainerId}` in `entrypoint`,
+/// `mounts`, and `customizations`.
+pub fn substitute_feature_config(
+    mut config: FeatureContainerConfig,
+    ctx: &crate::devcontainer::subst::SubstitutionContext,
+) -> FeatureContainerConfig {
+    for mount in &mut config.mounts {
+        let substituted = ctx.substitute_str(mount);
+        if *mount != substituted {
+            *mount = substituted;
+        }
+    }
+    for ep in &mut config.entrypoints {
+        let substituted = ctx.substitute_str(ep);
+        if *ep != substituted {
+            *ep = substituted;
+        }
+    }
+    ctx.substitute_value(&mut config.customizations);
+    config
+}
+
 fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
     config
         .get(key)
@@ -563,5 +587,82 @@ mod tests {
         assert!(opts.env.contains(&"HOME=/root".to_string()));
         assert!(opts.env.contains(&"FOO=bar".to_string()));
         assert_eq!(opts.env.len(), 3);
+    }
+
+    #[test]
+    fn feature_mounts_with_devcontainer_id_substituted() {
+        let feature_config = FeatureContainerConfig {
+            mounts: vec![
+                "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123def456",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(
+            substituted.mounts[0],
+            "source=dind-var-lib-docker-abc123def456,target=/var/lib/docker,type=volume"
+        );
+    }
+
+    #[test]
+    fn feature_entrypoints_substituted() {
+        let feature_config = FeatureContainerConfig {
+            entrypoints: vec!["/init-${devcontainerId}.sh".to_string()],
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(substituted.entrypoints[0], "/init-abc123.sh");
+    }
+
+    #[test]
+    fn feature_customizations_substituted() {
+        let feature_config = FeatureContainerConfig {
+            customizations: json!({"vscode": {"settings": {"id": "${devcontainerId}"}}}),
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(
+            substituted.customizations["vscode"]["settings"]["id"],
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn feature_config_without_variables_unchanged() {
+        let feature_config = FeatureContainerConfig {
+            mounts: vec!["source=/host,target=/container".to_string()],
+            entrypoints: vec!["/init.sh".to_string()],
+            container_env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(substituted.mounts[0], "source=/host,target=/container");
+        assert_eq!(substituted.entrypoints[0], "/init.sh");
+        assert_eq!(substituted.container_env.get("FOO").unwrap(), "bar");
     }
 }

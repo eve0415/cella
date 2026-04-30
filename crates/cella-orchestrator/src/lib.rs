@@ -28,6 +28,21 @@ pub use cella_daemon_client::ssh_proxy as ssh_proxy_client;
 pub use cella_tool_install as tool_install;
 pub mod up;
 
+/// Build a [`SubstitutionContext`] from a resolved config.
+fn subst_ctx(
+    resolved: &cella_config::devcontainer::resolve::ResolvedConfig,
+) -> cella_config::devcontainer::subst::SubstitutionContext {
+    cella_config::devcontainer::subst::SubstitutionContext::new(
+        &resolved.workspace_root,
+        resolved
+            .config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str()),
+        &resolved.devcontainer_id,
+        std::env::vars().collect(),
+    )
+}
+
 pub use config::{
     BranchConfig, HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, PruneConfig, UpConfig,
 };

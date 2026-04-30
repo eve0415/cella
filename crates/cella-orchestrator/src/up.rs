@@ -1210,16 +1210,21 @@ impl EnsureUpContext<'_> {
             &remote_user,
         );
 
-        let feature_config = resolved_features.map(|r| &r.container_config);
-        let image_meta_config = if feature_config.is_none() {
-            base_image_details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).0)
+        let subst_ctx = crate::subst_ctx(self.config.resolved);
+        let substituted_feature_config = resolved_features.map(|r| {
+            crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
+        });
+        let image_meta_config = if substituted_feature_config.is_none() {
+            base_image_details.metadata.as_deref().map(|m| {
+                let cfg = cella_features::parse_image_metadata(m).0;
+                crate::config_map::substitute_feature_config(cfg, &subst_ctx)
+            })
         } else {
             None
         };
-        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
+        let effective_feature_config = substituted_feature_config
+            .as_ref()
+            .or(image_meta_config.as_ref());
 
         let create_opts = crate::config_map::map_config(crate::config_map::MapConfigParams {
             config,
