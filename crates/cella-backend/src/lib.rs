@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod container_setup;
 pub mod error;
 pub mod lifecycle;
 pub mod mount;

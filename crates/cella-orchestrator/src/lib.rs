@@ -11,7 +11,7 @@ pub mod compose_mounts;
 pub mod compose_up;
 pub mod config;
 pub mod config_map;
-pub mod container_setup;
+pub use cella_backend::container_setup;
 pub mod daemon_registration;
 pub mod docker_helpers;
 pub mod env_cache;

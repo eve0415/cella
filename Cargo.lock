@@ -329,6 +329,8 @@ dependencies = [
 name = "cella-backend"
 version = "0.0.39"
 dependencies = [
+ "cella-env",
+ "cella-features",
  "chrono",
  "futures-util",
  "hex",
