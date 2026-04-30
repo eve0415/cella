@@ -124,10 +124,12 @@ fn classify_ssh_socket(path: &str) -> &'static str {
     let lower = path.to_lowercase();
     if lower.contains("orbstack") {
         "OrbStack"
-    } else if lower.contains("docker-desktop") || lower.contains("com.apple.launchd") {
+    } else if lower.contains("docker-desktop") {
         "Docker Desktop VM"
     } else if lower.contains("colima") {
         "Colima"
+    } else if lower.contains("com.apple.launchd") {
+        "macOS system"
     } else {
         "host-native"
     }
@@ -157,7 +159,7 @@ mod tests {
         );
         assert_eq!(
             classify_ssh_socket("/private/tmp/com.apple.launchd.xxx/Listeners"),
-            "Docker Desktop VM"
+            "macOS system"
         );
     }
 
@@ -215,7 +217,7 @@ mod tests {
         );
         assert_eq!(
             classify_ssh_socket("/private/tmp/com.apple.launchd.xyz/Listeners"),
-            "Docker Desktop VM"
+            "macOS system"
         );
     }
 
