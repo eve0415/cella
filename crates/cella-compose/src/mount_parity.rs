@@ -1280,6 +1280,7 @@ mod tests {
             target: "/c".to_string(),
             consistency: None,
             read_only: false,
+        external: false,
         }];
         let specs = mount_configs_to_specs(&configs);
         assert_eq!(specs.len(), 1);
@@ -1296,6 +1297,7 @@ mod tests {
             target: "/container/data".to_string(),
             consistency: None,
             read_only: true,
+        external: false,
         };
         let spec = MountSpec::from_mount_config(&config).unwrap();
         assert!(

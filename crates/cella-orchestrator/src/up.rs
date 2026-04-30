@@ -856,6 +856,7 @@ impl EnsureUpContext<'_> {
                 target: m.target.clone(),
                 consistency: None,
                 read_only: false,
+                external: false,
             });
         }
 
@@ -934,6 +935,7 @@ impl EnsureUpContext<'_> {
                 target: path_str,
                 consistency: None,
                 read_only: false,
+                external: false,
             });
         }
 
@@ -945,6 +947,7 @@ impl EnsureUpContext<'_> {
                 target: vol_target,
                 consistency: None,
                 read_only: false,
+                external: false,
             });
         }
 
@@ -1371,6 +1374,7 @@ impl EnsureUpContext<'_> {
                                     target: ssh.mount_target.clone(),
                                     consistency: None,
                                     read_only: false,
+                                    external: false,
                                 });
                                 create_opts
                                     .env

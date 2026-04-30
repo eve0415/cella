@@ -94,6 +94,7 @@ impl MountSpec {
             target: self.target.clone(),
             consistency: self.consistency.clone(),
             read_only: self.read_only,
+            external: false,
         }
     }
 
@@ -203,6 +204,7 @@ mod tests {
             target: "/b".into(),
             consistency: Some("cached".into()),
             read_only: false,
+            external: false,
         };
         let spec = MountSpec::from_mount_config(&mc).unwrap();
         assert_eq!(spec.kind, MountKind::Bind);
@@ -219,6 +221,7 @@ mod tests {
             target: "/data".into(),
             consistency: None,
             read_only: false,
+            external: false,
         };
         assert!(
             MountSpec::from_mount_config(&mc).is_none(),
@@ -234,6 +237,7 @@ mod tests {
             target: r"//./pipe/docker_engine".into(),
             consistency: None,
             read_only: false,
+            external: false,
         };
         let spec = MountSpec::from_mount_config(&mc).unwrap();
         assert_eq!(spec.kind, MountKind::NamedPipe);

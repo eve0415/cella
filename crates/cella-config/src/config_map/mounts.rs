@@ -25,6 +25,7 @@ pub(super) fn map_workspace_mount(
         target: workspace_folder.to_string(),
         consistency: Some("cached".to_string()),
         read_only: false,
+        external: false,
     })
 }
 
@@ -68,6 +69,7 @@ pub fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
                     target,
                     consistency: None,
                     read_only,
+                    external: false,
                 })
             }
             _ => None,
@@ -81,6 +83,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
     let mut target = String::new();
     let mut consistency = None;
     let mut read_only = false;
+    let mut external = false;
 
     for part in s.split(',') {
         let trimmed = part.trim();
@@ -91,6 +94,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
                 "source" | "src" => source = value.to_string(),
                 "target" | "dst" | "destination" => target = value.to_string(),
                 "consistency" => consistency = Some(value.to_string()),
+                "external" => external = value == "true",
                 _ => {}
             }
         } else {
@@ -112,6 +116,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
         target,
         consistency,
         read_only,
+        external,
     })
 }
 
