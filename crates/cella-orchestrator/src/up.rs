@@ -124,15 +124,27 @@ struct CreateResult {
     ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
 }
 
-/// Remove the current SSH agent mount and env var from container create options.
+/// Remove the current SSH agent mount, env var, and label entry from
+/// container create options. Also clears `env_fwd` so downstream label
+/// readers (`cella exec`, `cella shell`) don't inject a stale socket path.
 fn remove_ssh_from_create_opts(
     create_opts: &mut cella_backend::CreateContainerOptions,
     env_fwd: &mut cella_env::EnvForwarding,
 ) {
     if let Some(ref source) = env_fwd.ssh_agent_mount_source {
         create_opts.mounts.retain(|m| m.source != *source);
+        env_fwd.mounts.retain(|m| m.source != *source);
     }
     create_opts.env.retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+    env_fwd.env.retain(|e| e.key != "SSH_AUTH_SOCK");
+
+    if let Some(label) = create_opts.labels.get_mut("dev.cella.remote_env")
+        && let Ok(mut entries) = serde_json::from_str::<Vec<String>>(label)
+    {
+        entries.retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+        *label = serde_json::to_string(&entries).unwrap_or_default();
+    }
+
     env_fwd.ssh_agent_mount_source = None;
 }
 

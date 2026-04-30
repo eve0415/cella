@@ -935,10 +935,12 @@ async fn compose_up_with_ssh_fallback(
 
                 if let Some(ref source) = env_fwd.ssh_agent_mount_source {
                     ov_ctx.extra_volumes.retain(|m| m.source != *source);
+                    env_fwd.mounts.retain(|m| m.source != *source);
                 }
                 ov_ctx
                     .extra_env
                     .retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+                env_fwd.env.retain(|e| e.key != "SSH_AUTH_SOCK");
                 env_fwd.ssh_agent_mount_source = None;
 
                 if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
