@@ -37,9 +37,8 @@ fn resolve_from_git_config() -> Option<PathBuf> {
 }
 
 fn resolve_gitignore_from_xdg(xdg_config_home: Option<&str>, home: &str) -> Option<PathBuf> {
-    let config_base = xdg_config_home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(home).join(".config"));
+    let config_base =
+        xdg_config_home.map_or_else(|| PathBuf::from(home).join(".config"), PathBuf::from);
 
     let path = config_base.join("git/ignore");
     if path.is_file() { Some(path) } else { None }
@@ -65,7 +64,7 @@ pub fn cella_ignore_path(remote_user: &str) -> String {
     format!("{}/.config/git/cella-ignore", container_home(remote_user))
 }
 
-pub fn host_upload_path() -> &'static str {
+pub const fn host_upload_path() -> &'static str {
     HOST_UPLOAD_PATH
 }
 
@@ -75,20 +74,16 @@ fn build_merge_script(
     cella_ignore: &str,
     upload_path: &str,
 ) -> String {
+    let marker = HOST_MARKER;
     format!(
-        r#"mkdir -p {git_config_dir}
+        r"mkdir -p {git_config_dir}
 {{
 if [ -f {container_ignore} ]; then
 sed '/{marker}/,$d' {container_ignore}
 fi
 printf '%s\n' '{marker}'
 cat {upload_path}
-}} > {cella_ignore}"#,
-        git_config_dir = git_config_dir,
-        container_ignore = container_ignore,
-        cella_ignore = cella_ignore,
-        marker = HOST_MARKER,
-        upload_path = upload_path,
+}} > {cella_ignore}"
     )
 }
 
