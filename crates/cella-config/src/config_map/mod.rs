@@ -234,6 +234,49 @@ fn parse_run_args_from_config(config: &serde_json::Value) -> Option<RunArgsOverr
     })
 }
 
+/// Build a [`SubstitutionContext`] from a resolved devcontainer config.
+pub fn subst_ctx(
+    resolved: &crate::devcontainer::resolve::ResolvedConfig,
+) -> crate::devcontainer::subst::SubstitutionContext {
+    crate::devcontainer::subst::SubstitutionContext::new(
+        &resolved.workspace_root,
+        resolved
+            .config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str()),
+        &resolved.devcontainer_id,
+        std::env::vars().collect(),
+    )
+}
+
+/// Substitute devcontainer variables in feature-provided config fields.
+///
+/// Per spec, feature metadata supports `${devcontainerId}` in `entrypoint`,
+/// `mounts`, and `customizations`.
+pub fn substitute_feature_config(
+    mut config: FeatureContainerConfig,
+    ctx: &crate::devcontainer::subst::SubstitutionContext,
+) -> FeatureContainerConfig {
+    for mount in &mut config.mounts {
+        *mount = ctx.substitute_str(mount);
+    }
+    for ep in &mut config.entrypoints {
+        *ep = ctx.substitute_str(ep);
+    }
+    ctx.substitute_value(&mut config.customizations);
+    config
+}
+
+/// Substitute devcontainer variables in lifecycle entry commands.
+pub fn substitute_lifecycle_entries(
+    entries: &mut [cella_features::LifecycleEntry],
+    ctx: &crate::devcontainer::subst::SubstitutionContext,
+) {
+    for entry in entries {
+        ctx.substitute_value(&mut entry.command);
+    }
+}
+
 fn map_string_array(config: &serde_json::Value, key: &str) -> Vec<String> {
     config
         .get(key)
@@ -563,5 +606,154 @@ mod tests {
         assert!(opts.env.contains(&"HOME=/root".to_string()));
         assert!(opts.env.contains(&"FOO=bar".to_string()));
         assert_eq!(opts.env.len(), 3);
+    }
+
+    #[test]
+    fn feature_mounts_with_devcontainer_id_substituted() {
+        let feature_config = FeatureContainerConfig {
+            mounts: vec![
+                "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123def456",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(
+            substituted.mounts[0],
+            "source=dind-var-lib-docker-abc123def456,target=/var/lib/docker,type=volume"
+        );
+    }
+
+    #[test]
+    fn feature_entrypoints_substituted() {
+        let feature_config = FeatureContainerConfig {
+            entrypoints: vec!["/init-${devcontainerId}.sh".to_string()],
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(substituted.entrypoints[0], "/init-abc123.sh");
+    }
+
+    #[test]
+    fn feature_customizations_substituted() {
+        let feature_config = FeatureContainerConfig {
+            customizations: json!({"vscode": {"settings": {"id": "${devcontainerId}"}}}),
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(
+            substituted.customizations["vscode"]["settings"]["id"],
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn feature_config_without_variables_unchanged() {
+        let feature_config = FeatureContainerConfig {
+            mounts: vec!["source=/host,target=/container".to_string()],
+            entrypoints: vec!["/init.sh".to_string()],
+            container_env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            ..Default::default()
+        };
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+        assert_eq!(substituted.mounts[0], "source=/host,target=/container");
+        assert_eq!(substituted.entrypoints[0], "/init.sh");
+        assert_eq!(substituted.container_env.get("FOO").unwrap(), "bar");
+    }
+
+    #[test]
+    fn lifecycle_entries_from_metadata_substituted() {
+        let mut entries = vec![cella_features::LifecycleEntry {
+            origin: "dind".into(),
+            command: json!("echo ${devcontainerId}"),
+        }];
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "test-id-52chars",
+            HashMap::new(),
+        );
+        substitute_lifecycle_entries(&mut entries, &ctx);
+        assert_eq!(entries[0].command, json!("echo test-id-52chars"));
+    }
+
+    #[test]
+    fn lifecycle_entries_object_command_substituted() {
+        let mut entries = vec![cella_features::LifecycleEntry {
+            origin: "feature".into(),
+            command: json!({"setup": "echo ${devcontainerId}", "init": "/run/${devcontainerId}.sh"}),
+        }];
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/tmp/ws"),
+            None,
+            "abc123",
+            HashMap::new(),
+        );
+        substitute_lifecycle_entries(&mut entries, &ctx);
+        assert_eq!(entries[0].command["setup"], "echo abc123");
+        assert_eq!(entries[0].command["init"], "/run/abc123.sh");
+    }
+
+    #[test]
+    fn end_to_end_feature_mount_devcontainer_id_substituted() {
+        let devcontainer_id = "0000000000000000abcdef1234567890abcdef12345678";
+        let feature_config = FeatureContainerConfig {
+            mounts: vec![
+                "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let ctx = crate::devcontainer::subst::SubstitutionContext::new(
+            Path::new("/home/user/myproject"),
+            Some("/workspaces/myproject"),
+            devcontainer_id,
+            HashMap::new(),
+        );
+        let substituted = substitute_feature_config(feature_config, &ctx);
+
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/myproject"),
+            feature_config: Some(&substituted),
+            image_env: &[],
+            agent_arch: "x86_64",
+        });
+
+        assert_eq!(opts.mounts.len(), 1);
+        assert_eq!(
+            opts.mounts[0].source,
+            format!("dind-var-lib-docker-{devcontainer_id}")
+        );
+        assert_eq!(opts.mounts[0].target, "/var/lib/docker");
     }
 }

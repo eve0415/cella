@@ -14,6 +14,9 @@ use crate::progress::{ProgressSender, format_elapsed};
 use crate::traits::ContainerBackend;
 use crate::types::{ExecOptions, ExecResult};
 
+/// Callback applied to lifecycle entries after resolution, before execution.
+pub type PostResolveFn = dyn Fn(&mut Vec<cella_features::LifecycleEntry>) + Send + Sync;
+
 /// Parsed lifecycle command.
 pub enum ParsedLifecycle {
     /// Sequential commands.
@@ -522,6 +525,7 @@ pub async fn run_all_lifecycle_phases(
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     image_metadata: Option<&str>,
     progress: &ProgressSender,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases = [
         "onCreateCommand",
@@ -532,8 +536,11 @@ pub async fn run_all_lifecycle_phases(
     ];
 
     for phase in phases {
-        let entries =
+        let mut entries =
             resolve_entries_with_metadata(resolved_features, image_metadata, config, phase);
+        if let Some(f) = post_resolve {
+            f(&mut entries);
+        }
         run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
     }
 
@@ -612,6 +619,7 @@ pub async fn run_lifecycle_phases_with_wait_for(
     image_metadata: Option<&str>,
     progress: &ProgressSender,
     wait_for: WaitForPhase,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases: &[&str] = &[
         "onCreateCommand",
@@ -630,8 +638,11 @@ pub async fn run_lifecycle_phases_with_wait_for(
 
     for (i, &phase) in phases.iter().enumerate() {
         let is_foreground = i < wait_index;
-        let entries =
+        let mut entries =
             resolve_entries_with_metadata(resolved_features, image_metadata, config, phase);
+        if let Some(f) = post_resolve {
+            f(&mut entries);
+        }
 
         if is_foreground {
             run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
@@ -730,6 +741,7 @@ pub async fn check_and_run_content_update(
     metadata: Option<&str>,
     workspace_root: &std::path::Path,
     progress: &ProgressSender,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current_hash = cella_git::content_hash::compute(workspace_root);
 
@@ -758,7 +770,10 @@ pub async fn check_and_run_content_update(
     progress.println("  Content changed, re-running updateContentCommand + postCreateCommand...");
 
     for phase in ["updateContentCommand", "postCreateCommand"] {
-        let entries = lifecycle_entries_for_phase(metadata, config, phase);
+        let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
+        if let Some(f) = post_resolve {
+            f(&mut entries);
+        }
         run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
 
         if entries.is_empty()

@@ -488,6 +488,7 @@ async fn finalize_compose(
 
     // 20. Run lifecycle phases (primary service only)
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     for phase in [
         "onCreateCommand",
         "updateContentCommand",
@@ -495,7 +496,8 @@ async fn finalize_compose(
         "postStartCommand",
         "postAttachCommand",
     ] {
-        let entries = lifecycle_entries_for_phase(metadata, config, phase);
+        let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
+        cella_config::config_map::substitute_lifecycle_entries(&mut entries, &subst_ctx);
         let lc_ctx = build_lifecycle_ctx(
             client,
             &primary.id,
@@ -859,6 +861,7 @@ async fn build_override_and_start(
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
+    let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
         workspace_root: cfg.workspace_root,
         settings: &settings,
@@ -867,6 +870,7 @@ async fn build_override_and_start(
         project,
         config,
         resolved_features: features_build.map(|fb| &fb.resolved_features),
+        subst_ctx: &subst_ctx,
         agent_vol_target: &agent_vol_target,
         agent_vol_name: &agent_vol_name,
     })
@@ -1106,6 +1110,7 @@ struct ComposeMountParams<'a> {
     project: &'a ComposeProject,
     config: &'a serde_json::Value,
     resolved_features: Option<&'a cella_features::ResolvedFeatures>,
+    subst_ctx: &'a cella_config::devcontainer::subst::SubstitutionContext,
     /// Agent volume mount target (e.g., `/cella`). Mounts targeting this path
     /// or any descendant are rejected to protect the managed agent.
     agent_vol_target: &'a str,
@@ -1150,8 +1155,14 @@ async fn build_compose_mount_specs(
     // uses `container_config.mounts` (which already includes both feature and
     // user mounts after `merge_with_devcontainer`); otherwise it falls back to
     // `map_additional_mounts` on the raw config.
-    let feature_config = p.resolved_features.map(|rf| &rf.container_config);
-    let user_feature_mounts = crate::mount_parity::map_merged_mounts(p.config, feature_config);
+    let substituted_fc = p.resolved_features.map(|rf| {
+        cella_config::config_map::substitute_feature_config(
+            rf.container_config.clone(),
+            p.subst_ctx,
+        )
+    });
+    let user_feature_mounts =
+        crate::mount_parity::map_merged_mounts(p.config, substituted_fc.as_ref());
     let mut user_feature_specs = crate::mount_parity::mount_configs_to_specs(&user_feature_mounts);
     // Absolutize relative bind sources before emission. Docker Compose resolves
     // relative paths relative to the compose file's parent directory, but cella
@@ -1370,6 +1381,7 @@ mod tests {
             config_path: config_path.clone(),
             workspace_root: workspace_root.clone(),
             config_hash: String::new(),
+            devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
         };
@@ -1424,6 +1436,7 @@ mod tests {
             config_path: config_path.clone(),
             workspace_root: workspace_dir.path().to_path_buf(),
             config_hash: String::new(),
+            devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
         };

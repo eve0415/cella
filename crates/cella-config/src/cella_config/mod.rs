@@ -105,6 +105,7 @@ mod tests {
             config_path: std::path::PathBuf::new(),
             workspace_root: std::path::PathBuf::new(),
             config_hash: String::new(),
+            devcontainer_id: String::new(),
             warnings: vec![],
             typed,
         }

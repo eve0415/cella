@@ -28,6 +28,8 @@ pub use cella_daemon_client::ssh_proxy as ssh_proxy_client;
 pub use cella_tool_install as tool_install;
 pub mod up;
 
+use crate::config_map::subst_ctx;
+
 pub use config::{
     BranchConfig, HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, PruneConfig, UpConfig,
 };

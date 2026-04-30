@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Context for resolving devcontainer variable expressions.
+#[derive(Clone)]
 pub struct SubstitutionContext {
     local_env: HashMap<String, String>,
     local_workspace_folder: String,
@@ -481,5 +482,16 @@ mod tests {
         let ctx = spec_default_ctx();
         let result = ctx.substitute_str("${containerEnv:SOME_VAR:default_value}");
         assert_eq!(result, "default_value");
+    }
+
+    #[test]
+    fn substituted_values_not_rescanned() {
+        let mut env = HashMap::new();
+        env.insert("TRICKY".to_string(), "${localWorkspaceFolder}".to_string());
+        let ctx = SubstitutionContext::new(Path::new("/tmp/ws"), None, "id123", env);
+        assert_eq!(
+            ctx.substitute_str("${localEnv:TRICKY}"),
+            "${localWorkspaceFolder}"
+        );
     }
 }

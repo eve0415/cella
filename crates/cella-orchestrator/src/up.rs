@@ -367,8 +367,12 @@ impl EnsureUpContext<'_> {
             return Ok(());
         }
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
-        let entries =
+        let mut entries =
             lifecycle_entries_for_phase(Some(metadata), self.config_json(), "onCreateCommand");
+        crate::config_map::substitute_lifecycle_entries(
+            &mut entries,
+            &crate::subst_ctx(self.config.resolved),
+        );
         run_lifecycle_entries(&lc_ctx, "onCreateCommand", &entries, &self.progress).await?;
         let new_state = LifecycleState {
             oncreate_done: true,
@@ -453,20 +457,26 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
+        let subst_clone = subst.clone();
         check_and_run_content_update(
             &lc_ctx_content,
             self.config_json(),
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            Some(&move |entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
+            }),
         )
         .await?;
 
-        let entries = lifecycle_entries_for_phase(
+        let mut entries = lifecycle_entries_for_phase(
             metadata.map(String::as_str),
             self.config_json(),
             "postAttachCommand",
         );
+        crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
 
@@ -498,21 +508,26 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
+        let subst_clone = subst.clone();
         check_and_run_content_update(
             &lc_ctx,
             self.config_json(),
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            Some(&move |entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
+            }),
         )
         .await?;
-
         for phase in ["postStartCommand", "postAttachCommand"] {
-            let entries = lifecycle_entries_for_phase(
+            let mut entries = lifecycle_entries_for_phase(
                 metadata.map(String::as_str),
                 self.config_json(),
                 phase,
             );
+            crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
             run_lifecycle_entries(&lc_ctx, phase, &entries, &self.progress).await?;
         }
         Ok(())
@@ -1210,16 +1225,21 @@ impl EnsureUpContext<'_> {
             &remote_user,
         );
 
-        let feature_config = resolved_features.map(|r| &r.container_config);
-        let image_meta_config = if feature_config.is_none() {
-            base_image_details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).0)
+        let subst_ctx = crate::subst_ctx(self.config.resolved);
+        let substituted_feature_config = resolved_features.map(|r| {
+            crate::config_map::substitute_feature_config(r.container_config.clone(), &subst_ctx)
+        });
+        let image_meta_config = if substituted_feature_config.is_none() {
+            base_image_details.metadata.as_deref().map(|m| {
+                let cfg = cella_features::parse_image_metadata(m).0;
+                crate::config_map::substitute_feature_config(cfg, &subst_ctx)
+            })
         } else {
             None
         };
-        let effective_feature_config = feature_config.or(image_meta_config.as_ref());
+        let effective_feature_config = substituted_feature_config
+            .as_ref()
+            .or(image_meta_config.as_ref());
 
         let create_opts = crate::config_map::map_config(crate::config_map::MapConfigParams {
             config,
@@ -1252,6 +1272,7 @@ impl EnsureUpContext<'_> {
         let config = self.config_json();
         let wait_for = WaitForPhase::from_config(config);
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
+        let subst = crate::subst_ctx(self.config.resolved);
         run_lifecycle_phases_with_wait_for(
             &lc_ctx,
             config,
@@ -1259,6 +1280,9 @@ impl EnsureUpContext<'_> {
             image_metadata,
             &self.progress,
             wait_for,
+            Some(&move |entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+            }),
         )
         .await?;
 

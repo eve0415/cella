@@ -23,6 +23,8 @@ pub struct ResolvedConfig {
     pub workspace_root: PathBuf,
     /// SHA256 hex of the canonical JSON serialization of the merged config.
     pub config_hash: String,
+    /// Spec-compliant devcontainer ID (52-char base-32 string).
+    pub devcontainer_id: String,
     /// Diagnostics (warnings) from parsing.
     pub warnings: Vec<Diagnostic>,
     /// Typed representation of the merged config, if validation succeeded.
@@ -198,14 +200,30 @@ pub fn config(
         merge::layers(&mut config, &local_value);
     }
 
-    // Substitute variables after merge, before hash
-    let container_wf = config.get("workspaceFolder").and_then(|v| v.as_str());
+    // Two-pass substitution: resolve workspaceFolder first so
+    // ${containerWorkspaceFolder} uses the substituted value everywhere else.
     let devcontainer_id = devcontainer_id(workspace_root, &config_path);
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let container_wf = config
+        .get("workspaceFolder")
+        .and_then(|v| v.as_str())
+        .map(|raw| {
+            if !raw.contains("${") {
+                return raw.to_string();
+            }
+            let pre_ctx = super::subst::SubstitutionContext::new(
+                workspace_root,
+                None,
+                &devcontainer_id,
+                env.clone(),
+            );
+            pre_ctx.substitute_str(raw)
+        });
     let ctx = super::subst::SubstitutionContext::new(
         workspace_root,
-        container_wf,
+        container_wf.as_deref(),
         &devcontainer_id,
-        std::env::vars().collect(),
+        env,
     );
     ctx.substitute_value(&mut config);
 
@@ -241,6 +259,7 @@ pub fn config(
         config_path,
         workspace_root: workspace_root.to_path_buf(),
         config_hash: hash,
+        devcontainer_id,
         warnings,
         typed,
     })
@@ -479,6 +498,48 @@ mod tests {
         let id = spec_devcontainer_id(&labels);
         assert_eq!(id.len(), 52);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn resolved_config_exposes_devcontainer_id() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert_eq!(resolved.devcontainer_id.len(), 52);
+        assert!(
+            resolved
+                .devcontainer_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric())
+        );
+    }
+
+    #[test]
+    fn resolve_container_workspace_folder_substituted_in_mount() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{
+                "image": "ubuntu",
+                "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+                "mounts": ["source=data,target=${containerWorkspaceFolder}/data,type=volume"]
+            }"#,
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        let mount = resolved.config["mounts"][0].as_str().unwrap();
+        let basename = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let expected_target = format!("/workspaces/{basename}/data");
+        assert!(
+            mount.contains(&expected_target),
+            "mount should contain substituted containerWorkspaceFolder, got: {mount}"
+        );
     }
 
     #[test]
