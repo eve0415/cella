@@ -331,6 +331,7 @@ version = "0.0.39"
 dependencies = [
  "cella-env",
  "cella-features",
+ "cella-git",
  "chrono",
  "futures-util",
  "hex",

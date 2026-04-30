@@ -18,7 +18,7 @@ pub mod env_cache;
 pub mod error;
 pub mod host_requirements;
 pub mod image;
-pub mod lifecycle;
+pub use cella_backend::lifecycle;
 pub use cella_backend::progress;
 pub mod prune;
 pub mod result;
