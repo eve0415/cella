@@ -1,0 +1,28 @@
+---
+source: crates/cella-codegen/src/emit/accessors.rs
+assertion_line: 305
+expression: fmt(&tokens)
+---
+impl Root {
+    pub fn common(&self) -> &RootCommon {
+        match self {
+            Self::RootVariant0(v) => &v.root_common,
+            Self::RootCommon(c) => c,
+        }
+    }
+    pub fn name(&self) -> Option<&str> {
+        self.common().name.as_deref()
+    }
+    pub fn privileged(&self) -> Option<bool> {
+        self.common().privileged
+    }
+    pub fn mounts(&self) -> Option<&[String]> {
+        self.common().mounts.as_deref()
+    }
+    pub fn features(&self) -> Option<&Features> {
+        self.common().features.as_ref()
+    }
+    pub fn remote_env(&self) -> Option<&HashMap<String, Option<String>>> {
+        self.common().remote_env.as_ref()
+    }
+}

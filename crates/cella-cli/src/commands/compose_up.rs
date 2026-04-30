@@ -23,6 +23,7 @@ pub async fn compose_ensure_up(
 ) -> Result<super::up::UpResult, Box<dyn std::error::Error + Send + Sync>> {
     let hooks = CliComposeUpHooks { ctx };
     let cfg = ComposeUpConfig {
+        resolved: &ctx.resolved,
         config: ctx.config(),
         config_path: &ctx.resolved.config_path,
         workspace_root: &ctx.resolved.workspace_root,
@@ -139,8 +140,7 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
             let managed_agent = client.capabilities().managed_agent;
             let skip_rules = self.ctx.network_rules == cella_orchestrator::NetworkRulePolicy::Skip;
             let proxy_fwd = cella_orchestrator::compose_up::build_proxy_forwarding_config(
-                config,
-                workspace_root,
+                &self.ctx.resolved,
                 managed_agent,
                 skip_rules,
             );

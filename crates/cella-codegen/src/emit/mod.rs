@@ -1,3 +1,4 @@
+pub mod accessors;
 pub mod format;
 #[cfg(test)]
 mod test_utils;
@@ -23,11 +24,14 @@ pub fn emit_all(ir_types: &[IrType], config: &CodegenConfig) -> TokenStream {
         impl_tokens.push(validate::emit_validate(ir));
     }
 
+    let accessor_tokens = accessors::emit_accessors(ir_types, config);
+
     quote! {
         #preamble
         #infra
         #(#type_tokens)*
         #(#impl_tokens)*
+        #accessor_tokens
     }
 }
 

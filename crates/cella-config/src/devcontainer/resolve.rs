@@ -25,6 +25,57 @@ pub struct ResolvedConfig {
     pub config_hash: String,
     /// Diagnostics (warnings) from parsing.
     pub warnings: Vec<Diagnostic>,
+    /// Typed representation of the merged config, if validation succeeded.
+    pub typed: Option<crate::schema::DevContainer>,
+}
+
+impl ResolvedConfig {
+    fn config_string(&self, key: &str) -> Option<&str> {
+        self.config.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.typed
+            .as_ref()
+            .and_then(|t| t.name())
+            .or_else(|| self.config_string("name"))
+    }
+
+    pub fn remote_user(&self) -> Option<&str> {
+        self.typed
+            .as_ref()
+            .and_then(|t| t.remote_user())
+            .or_else(|| self.config_string("remoteUser"))
+    }
+
+    pub fn container_user(&self) -> Option<&str> {
+        self.typed
+            .as_ref()
+            .and_then(|t| t.container_user())
+            .or_else(|| self.config_string("containerUser"))
+    }
+
+    pub fn features(&self) -> Option<&crate::schema::DevContainerCommonFeatures> {
+        self.typed.as_ref().and_then(|t| t.features())
+    }
+
+    pub fn remote_env(&self) -> Option<&std::collections::HashMap<String, Option<String>>> {
+        self.typed.as_ref().and_then(|t| t.remote_env())
+    }
+
+    pub fn mounts(&self) -> Option<&[crate::schema::DevContainerCommonMountsItem]> {
+        self.typed.as_ref().and_then(|t| t.mounts())
+    }
+
+    pub fn initialize_command(
+        &self,
+    ) -> Option<&crate::schema::DevContainerCommonInitializeCommand> {
+        self.typed.as_ref().and_then(|t| t.initialize_command())
+    }
+
+    pub fn host_requirements(&self) -> Option<&crate::schema::DevContainerCommonHostRequirements> {
+        self.typed.as_ref().and_then(|t| t.host_requirements())
+    }
 }
 
 /// Compute the spec-compliant `devcontainerId`.
@@ -174,12 +225,24 @@ pub fn config(
     let canonical = serde_json::to_string(&config)?;
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
 
+    let typed = match crate::schema::DevContainer::validate(&config, "") {
+        Ok(t) => Some(t),
+        Err(errs) => {
+            debug!(
+                "typed DevContainer validation failed ({} errors); typed accessors will return None",
+                errs.len()
+            );
+            None
+        }
+    };
+
     Ok(ResolvedConfig {
         config,
         config_path,
         workspace_root: workspace_root.to_path_buf(),
         config_hash: hash,
         warnings,
+        typed,
     })
 }
 
@@ -416,5 +479,22 @@ mod tests {
         let id = spec_devcontainer_id(&labels);
         assert_eq!(id.len(), 52);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn typed_populated_for_valid_config() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "name": "test"}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(resolved.typed.is_some());
+        assert_eq!(resolved.typed.as_ref().unwrap().name(), Some("test"));
+    }
+
+    #[test]
+    fn typed_populated_with_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "unknownField": true}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(resolved.typed.is_some());
     }
 }

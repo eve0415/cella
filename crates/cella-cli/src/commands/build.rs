@@ -76,7 +76,7 @@ impl BuildArgs {
         }
 
         let config = &resolved.config;
-        let config_name = config.get("name").and_then(|v| v.as_str());
+        let config_name = resolved.name();
         let fallback_name = container_name(&resolved.workspace_root, config_name);
         let secrets: Vec<BuildSecret> = self
             .secrets

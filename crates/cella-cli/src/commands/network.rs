@@ -36,7 +36,8 @@ impl NetworkArgs {
 
 fn execute_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_root = std::env::current_dir()?;
-    let settings = cella_config::CellaConfig::load(&workspace_root, None)?;
+    let resolved = cella_config::devcontainer::resolve::config(&workspace_root, None).ok();
+    let settings = cella_config::CellaConfig::load(&workspace_root, resolved.as_ref())?;
     let net_config = settings.network.to_network_config();
 
     if !net_config.proxy.enabled {
@@ -98,7 +99,8 @@ fn execute_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn execute_test(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace_root = std::env::current_dir()?;
-    let settings = cella_config::CellaConfig::load(&workspace_root, None)?;
+    let resolved = cella_config::devcontainer::resolve::config(&workspace_root, None).ok();
+    let settings = cella_config::CellaConfig::load(&workspace_root, resolved.as_ref())?;
     let net_config = settings.network.to_network_config();
 
     if !net_config.has_rules() {

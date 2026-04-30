@@ -305,8 +305,9 @@ pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<
         return;
     };
 
-    let Ok(settings) = cella_config::CellaConfig::load(std::path::Path::new(workspace_path), None)
-    else {
+    let workspace = std::path::Path::new(workspace_path);
+    let resolved = cella_config::devcontainer::resolve::config(workspace, None).ok();
+    let Ok(settings) = cella_config::CellaConfig::load(workspace, resolved.as_ref()) else {
         return;
     };
     let ai = &settings.credentials.ai;

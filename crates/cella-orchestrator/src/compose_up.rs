@@ -16,6 +16,7 @@ use cella_backend::{
     run_lifecycle_phase,
 };
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
+use cella_config::devcontainer::resolve::ResolvedConfig;
 
 use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
 use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
@@ -28,6 +29,8 @@ use crate::up::restart_agent_in_container;
 
 /// Configuration for a compose up invocation.
 pub struct ComposeUpConfig<'a> {
+    /// Fully resolved devcontainer configuration.
+    pub resolved: &'a ResolvedConfig,
     /// Parsed devcontainer JSON.
     pub config: &'a serde_json::Value,
     /// Path to devcontainer.json.
@@ -303,8 +306,7 @@ async fn resolve_user_and_env(
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == crate::NetworkRulePolicy::Skip;
-    let proxy_fwd =
-        build_proxy_forwarding_config(cfg.config, cfg.workspace_root, managed_agent, skip_rules);
+    let proxy_fwd = build_proxy_forwarding_config(cfg.resolved, managed_agent, skip_rules);
     let mut env_fwd =
         cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
@@ -406,7 +408,7 @@ async fn prepare_and_start(
     let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env, managed);
     let mut labels = build_compose_labels(cfg, project, &remote_user);
 
-    let settings = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
+    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
 
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
@@ -597,7 +599,7 @@ async fn handle_compose_running(
     // Mount-input drift (settings, env forwarding, parent-git) — catches
     // mount-affecting changes that `config_hash` does not cover.
     let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
-    let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
+    let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
         &settings_now,
         &env_fwd_now,
@@ -1187,31 +1189,15 @@ where
     }
 }
 
-/// Build proxy forwarding config from devcontainer.json and cella.toml network settings.
-///
-/// Mirrors the network config resolution in `Up::resolve_image_config` (up.rs).
-/// Used by both the orchestrator's `resolve_user_and_env` and the CLI's `post_create_setup`.
+/// Build proxy forwarding config from merged cella settings.
 pub fn build_proxy_forwarding_config(
-    config: &serde_json::Value,
-    workspace_root: &Path,
+    resolved: &ResolvedConfig,
     managed_agent: bool,
     skip_rules: bool,
 ) -> Option<cella_env::ProxyForwardingConfig> {
-    let settings = cella_config::CellaConfig::load(workspace_root, None).unwrap_or_default();
-    let toml_net = settings.network.to_network_config();
-    let toml_mode_override = settings.network.mode_override();
-    let dc_net = config
-        .get("customizations")
-        .and_then(|c| c.get("cella"))
-        .and_then(|c| c.get("network"))
-        .and_then(|n| serde_json::from_value::<cella_network::NetworkConfig>(n.clone()).ok());
-    let merged =
-        cella_network::merge_network_configs(dc_net.as_ref(), Some(&toml_net), toml_mode_override);
-    let net_config = cella_network::NetworkConfig {
-        mode: merged.mode,
-        proxy: merged.proxy,
-        rules: merged.rules.into_iter().map(|lr| lr.rule).collect(),
-    };
+    let settings = cella_config::CellaConfig::load(&resolved.workspace_root, Some(resolved))
+        .unwrap_or_default();
+    let net_config = settings.network.to_network_config();
     let has_rules = net_config.has_rules() && !skip_rules;
 
     Some(cella_env::ProxyForwardingConfig {
@@ -1267,7 +1253,16 @@ mod tests {
         let config = serde_json::json!({});
         let config_path = PathBuf::from("/tmp/devcontainer.json");
         let workspace_root = PathBuf::from("/tmp/workspace");
+        let resolved = ResolvedConfig {
+            config: config.clone(),
+            config_path: config_path.clone(),
+            workspace_root: workspace_root.clone(),
+            config_hash: String::new(),
+            warnings: vec![],
+            typed: None,
+        };
         let cfg = ComposeUpConfig {
+            resolved: &resolved,
             config: &config,
             config_path: &config_path,
             workspace_root: &workspace_root,
@@ -1312,7 +1307,16 @@ mod tests {
         let workspace_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("devcontainer.json");
         std::fs::write(&config_path, "{}").unwrap();
+        let resolved = ResolvedConfig {
+            config: config.clone(),
+            config_path: config_path.clone(),
+            workspace_root: workspace_dir.path().to_path_buf(),
+            config_hash: String::new(),
+            warnings: vec![],
+            typed: None,
+        };
         let cfg = ComposeUpConfig {
+            resolved: &resolved,
             config: &config,
             config_path: &config_path,
             workspace_root: workspace_dir.path(),
