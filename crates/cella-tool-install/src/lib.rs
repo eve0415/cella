@@ -1026,7 +1026,7 @@ pub async fn install_tools(
         client,
         container_id,
         remote_user,
-        shell: &shell,
+        shell,
         probed_env,
     };
 

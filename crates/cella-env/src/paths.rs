@@ -16,10 +16,10 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Expand a leading `~` in a path string to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
