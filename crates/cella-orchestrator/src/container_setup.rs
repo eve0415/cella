@@ -264,9 +264,9 @@ pub async fn config_exists_in_container(
 
 /// Inject post-start environment forwarding into a running container.
 ///
-/// Uploads SSH config files, sets git config, and runs privileged root
-/// commands. Never fails -- individual steps log warnings and are skipped
-/// on error.
+/// Uploads files, runs user commands (e.g., gitignore merge), sets git
+/// config, and runs privileged root commands. Never fails -- individual
+/// steps log warnings and are skipped on error.
 pub async fn inject_post_start(
     client: &dyn ContainerBackend,
     container_id: &str,
