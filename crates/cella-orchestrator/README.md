@@ -45,6 +45,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 | `config` | Input configuration types (`UpConfig`, `ImageStrategy`, `HostRequirementPolicy`, `BranchConfig`, `PruneConfig`) |
 | `config_map` | Maps devcontainer.json to `CreateContainerOptions` (submodules: env, mounts, ports, run_args) |
 | `container_setup` | Post-creation container setup (user resolution, lifecycle commands, SSH/git injection) |
+| `daemon_registration` | Builds daemon container-registration payloads from devcontainer config or existing container labels |
 | `result` | Output types (`UpResult`, `BranchResult`, `PruneResult`, `ExecResult`, `WorktreeStatus`) |
 | `error` | `OrchestratorError` unified error type |
 | `progress` | Channel-based progress reporting (`ProgressSender`, `ProgressEvent`, handle types) |

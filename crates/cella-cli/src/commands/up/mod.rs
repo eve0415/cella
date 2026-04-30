@@ -317,39 +317,20 @@ impl UpContext {
             return;
         }
 
-        let forward_ports: Vec<u16> = config
-            .get("forwardPorts")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
-        let other_ports_attrs =
-            cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
-        let shutdown_action = config
-            .get("shutdownAction")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
-            cella_protocol::ContainerRegistrationData {
-                container_id: container_id.to_string(),
-                container_name: self.container_nm.clone(),
-                container_ip,
-                ports_attributes: ports_attrs,
-                other_ports_attributes: other_ports_attrs,
-                forward_ports,
-                shutdown_action,
-                backend_kind: Some(self.client.kind().to_string()),
-                docker_host: self.docker_host.clone(),
-            },
-        ));
-        match cella_daemon_client::send_management_request(&mgmt_sock, &req).await {
-            Ok(resp) => {
-                debug!("Container registered with daemon: {resp:?}");
+        let registration = cella_orchestrator::daemon_registration::from_devcontainer_config(
+            config,
+            container_id,
+            self.container_nm.clone(),
+            container_ip,
+            Some(self.client.kind().to_string()),
+            self.docker_host.clone(),
+        );
+        match cella_daemon_client::DaemonClient::new(&mgmt_sock)
+            .register_container(registration)
+            .await
+        {
+            Ok(container_name) => {
+                debug!("Container registered with daemon: {container_name}");
             }
             Err(e) => {
                 warn!("Failed to register container with daemon: {e}");
@@ -566,38 +547,17 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                 return;
             }
 
-            let forward_ports: Vec<u16> = config
-                .get("forwardPorts")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let ports_attrs = cella_orchestrator::config_map::ports::parse_ports_attributes(config);
-            let other_ports_attrs =
-                cella_orchestrator::config_map::ports::parse_other_ports_attributes(config);
-            let shutdown_action = config
-                .get("shutdownAction")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            let req = cella_protocol::ManagementRequest::RegisterContainer(Box::new(
-                cella_protocol::ContainerRegistrationData {
-                    container_id,
-                    container_name,
-                    container_ip,
-                    ports_attributes: ports_attrs,
-                    other_ports_attributes: other_ports_attrs,
-                    forward_ports,
-                    shutdown_action,
-                    backend_kind: Some(backend_kind),
-                    docker_host,
-                },
-            ));
-            let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
+            let registration = cella_orchestrator::daemon_registration::from_devcontainer_config(
+                config,
+                container_id,
+                container_name,
+                container_ip,
+                Some(backend_kind),
+                docker_host,
+            );
+            let _ = cella_daemon_client::DaemonClient::new(&mgmt_sock)
+                .register_container(registration)
+                .await;
         })
     }
 
