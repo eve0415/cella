@@ -183,11 +183,10 @@ impl EnsureUpContext<'_> {
     }
 
     async fn resolve_remote_user_from_container(&self, container: &ContainerInfo) -> String {
-        let config = self.config_json();
-        if let Some(u) = config.get("remoteUser").and_then(|v| v.as_str()) {
+        if let Some(u) = self.config.resolved.remote_user() {
             return u.to_string();
         }
-        if let Some(u) = config.get("containerUser").and_then(|v| v.as_str()) {
+        if let Some(u) = self.config.resolved.container_user() {
             return u.to_string();
         }
 
@@ -1329,7 +1328,7 @@ impl EnsureUpContext<'_> {
                 client: self.client,
                 config,
                 workspace_root: &self.config.resolved.workspace_root,
-                config_name: config.get("name").and_then(|v| v.as_str()),
+                config_name: self.config.resolved.name(),
                 config_path: &self.config.resolved.config_path,
                 no_cache: build_no_cache,
                 pull_policy: self.config.pull_policy,
@@ -1499,7 +1498,7 @@ pub async fn ensure_up(
     hooks: &dyn UpHooks,
     progress: ProgressSender,
 ) -> Result<UpResult, OrchestratorError> {
-    if config.resolved.config.get("hostRequirements").is_some() {
+    if config.resolved.host_requirements().is_some() {
         let result = crate::host_requirements::validate(
             &config.resolved.config,
             &config.resolved.workspace_root,
