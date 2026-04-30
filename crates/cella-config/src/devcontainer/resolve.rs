@@ -258,7 +258,7 @@ fn read_jsonc_value(path: &Path) -> Result<serde_json::Value, CellaConfigError> 
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    cella_env::paths::home_dir()
 }
 
 #[cfg(test)]

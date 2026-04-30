@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+cella-oci.workspace = true
 dirs.workspace = true
 futures-util.workspace = true
 flate2.workspace = true

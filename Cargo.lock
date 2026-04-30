@@ -329,15 +329,20 @@ dependencies = [
 name = "cella-backend"
 version = "0.0.39"
 dependencies = [
+ "cella-env",
+ "cella-features",
+ "cella-git",
  "chrono",
  "futures-util",
  "hex",
  "insta",
  "miette",
+ "nix 0.31.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -350,6 +355,7 @@ dependencies = [
  "cella-config",
  "cella-container",
  "cella-daemon",
+ "cella-daemon-client",
  "cella-docker",
  "cella-doctor",
  "cella-env",
@@ -397,9 +403,18 @@ name = "cella-compose"
 version = "0.0.39"
 dependencies = [
  "cella-backend",
+ "cella-config",
+ "cella-daemon-client",
+ "cella-env",
+ "cella-features",
+ "cella-git",
+ "cella-network",
+ "cella-protocol",
+ "cella-tool-install",
  "hex",
  "insta",
  "miette",
+ "nix 0.31.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -414,10 +429,13 @@ dependencies = [
 name = "cella-config"
 version = "0.0.39"
 dependencies = [
+ "cella-backend",
  "cella-codegen",
  "cella-env",
+ "cella-features",
  "cella-jsonc",
  "cella-network",
+ "cella-protocol",
  "hex",
  "miette",
  "serde",
@@ -446,6 +464,7 @@ name = "cella-daemon"
 version = "0.0.39"
 dependencies = [
  "base64 0.22.1",
+ "cella-daemon-client",
  "cella-port",
  "cella-protocol",
  "hex",
@@ -459,6 +478,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cella-daemon-client"
+version = "0.0.39"
+dependencies = [
+ "cella-env",
+ "cella-protocol",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -488,6 +520,7 @@ dependencies = [
  "cella-backend",
  "cella-config",
  "cella-daemon",
+ "cella-daemon-client",
  "cella-docker",
  "cella-env",
  "cella-protocol",
@@ -514,6 +547,7 @@ name = "cella-features"
 version = "0.0.39"
 dependencies = [
  "base64 0.22.1",
+ "cella-oci",
  "dirs",
  "flate2",
  "futures-util",
@@ -566,18 +600,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-oci"
+version = "0.0.39"
+dependencies = [
+ "base64 0.22.1",
+ "dirs",
+ "flate2",
+ "oci-distribution",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "cella-orchestrator"
 version = "0.0.39"
 dependencies = [
  "cella-backend",
  "cella-compose",
  "cella-config",
- "cella-daemon",
+ "cella-daemon-client",
  "cella-env",
  "cella-features",
  "cella-git",
  "cella-network",
  "cella-protocol",
+ "cella-tool-install",
  "hex",
  "miette",
  "nix 0.31.2",
@@ -613,8 +663,8 @@ dependencies = [
 name = "cella-templates"
 version = "0.0.39"
 dependencies = [
- "cella-features",
  "cella-jsonc",
+ "cella-oci",
  "dirs",
  "filetime",
  "flate2",
@@ -629,6 +679,17 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cella-tool-install"
+version = "0.0.39"
+dependencies = [
+ "cella-backend",
+ "cella-config",
+ "cella-env",
  "tokio",
  "tracing",
 ]

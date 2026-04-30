@@ -92,6 +92,16 @@ pub enum CellaComposeError {
         message: String,
     },
 
+    /// Configuration error during compose orchestration.
+    #[error("compose config error: {message}")]
+    #[diagnostic(code(cella::compose::config))]
+    Config { message: String },
+
+    /// Container backend error.
+    #[error(transparent)]
+    #[diagnostic(code(cella::compose::backend))]
+    Backend(#[from] cella_backend::BackendError),
+
     /// I/O error (reading compose files, writing override files).
     #[error(transparent)]
     #[diagnostic(code(cella::compose::io))]

@@ -207,3 +207,10 @@ enabled = false
         assert!(!config.proxy.enabled);
     }
 }
+
+/// Whether network blocking rules are enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkRulePolicy {
+    Enforce,
+    Skip,
+}

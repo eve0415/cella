@@ -1,4 +1,5 @@
 pub mod cella_config;
+pub mod config_map;
 pub mod devcontainer;
 pub mod settings;
 

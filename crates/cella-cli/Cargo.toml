@@ -14,6 +14,7 @@ cella-compose.workspace = true
 cella-config.workspace = true
 cella-jsonc.workspace = true
 cella-daemon.workspace = true
+cella-daemon-client.workspace = true
 cella-doctor.workspace = true
 cella-docker.workspace = true
 cella-orchestrator.workspace = true

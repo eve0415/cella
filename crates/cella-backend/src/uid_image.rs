@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use tracing::{debug, info, warn};
 
-use cella_backend::{BuildOptions, ContainerBackend};
-
 use crate::progress::{ProgressSender, format_elapsed};
+use crate::traits::ContainerBackend;
+use crate::types::BuildOptions;
 
 /// The Dockerfile content for UID remapping.
 ///

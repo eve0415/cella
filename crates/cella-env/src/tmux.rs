@@ -6,11 +6,9 @@
 use std::path::PathBuf;
 
 use crate::claude_code::container_home;
+use crate::paths::{expand_tilde, home_dir};
 
 /// Host-side tmux config file (`~/.tmux.conf`).
-///
-/// If `config_path` is provided and points to a file, returns that.
-/// Otherwise checks `~/.tmux.conf`.
 pub fn host_tmux_conf(config_path: Option<&str>) -> Option<PathBuf> {
     if let Some(custom) = config_path {
         let expanded = expand_tilde(custom);
@@ -25,9 +23,6 @@ pub fn host_tmux_conf(config_path: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Host-side tmux XDG config directory (`~/.config/tmux/`).
-///
-/// If `config_path` is provided and points to a directory, returns that.
-/// Otherwise checks `~/.config/tmux/`.
 pub fn host_tmux_config_dir(config_path: Option<&str>) -> Option<PathBuf> {
     if let Some(custom) = config_path {
         let expanded = expand_tilde(custom);
@@ -49,21 +44,6 @@ pub fn container_tmux_conf(remote_user: &str) -> String {
 /// Container-side `~/.config/tmux/` directory path.
 pub fn container_tmux_config_dir(remote_user: &str) -> String {
     format!("{}/.config/tmux", container_home(remote_user))
-}
-
-/// Expand a leading `~` to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(path)
-}
-
-/// Get the host home directory.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
 }
 
 #[cfg(test)]

@@ -80,7 +80,7 @@ async fn run_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Try to query daemon for detailed status via management socket
     if socket_path.exists() {
-        let result = cella_daemon::management::send_management_request(
+        let result = cella_daemon_client::send_management_request(
             &socket_path,
             &cella_protocol::ManagementRequest::QueryStatus,
         )

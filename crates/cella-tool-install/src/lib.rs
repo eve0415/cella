@@ -6,11 +6,10 @@
 
 use std::collections::HashMap;
 
+use cella_backend::container_setup::chown_in_container;
+use cella_backend::progress::{PhaseChildHandle, ProgressSender};
 use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountSpec};
 use tracing::{debug, warn};
-
-use crate::progress::{PhaseChildHandle, ProgressSender};
-use crate::shell_detect::detect_shell;
 
 /// Probed user environment (e.g. from `userEnvProbe`).
 ///
@@ -633,8 +632,7 @@ pub async fn setup_plugin_manifests(
         )
         .await;
 
-    crate::container_setup::chown_in_container(client, container_id, remote_user, &plugins_dir)
-        .await;
+    chown_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
 // ── Tool config mounts ───────────────────────────────────────────────────────
@@ -1004,11 +1002,11 @@ pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
+    shell: &str,
     settings: &cella_config::CellaConfig,
     probed_env: Option<&ProbedEnv>,
     progress: &ProgressSender,
 ) {
-    // Sequential prerequisite: ensure Node.js/npm once for all npm tools
     let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
     let node_available = if needs_npm {
         ensure_node_available(client, container_id, probed_env).await
@@ -1024,14 +1022,11 @@ pub async fn install_tools(
         return;
     }
 
-    // Detect shell once — verify_tool_callable and cella exec both use `-lc`
-    // wrapping through this shell, so the decision stays consistent.
-    let shell = detect_shell(client, container_id, remote_user).await;
     let ctx = InstallCtx {
         client,
         container_id,
         remote_user,
-        shell: &shell,
+        shell,
         probed_env,
     };
 
@@ -2043,7 +2038,7 @@ mod tests {
 
     #[tokio::test]
     async fn verified_install_step_installer_nonzero_exits_short_circuits_to_fail() {
-        use crate::progress::{ProgressEvent, ProgressSender};
+        use cella_backend::progress::{ProgressEvent, ProgressSender};
 
         // Empty MockBackend: short-circuit must not issue any exec calls.
         let backend = MockBackend::new(vec![]);

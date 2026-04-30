@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cella-env.workspace = true
+cella-features.workspace = true
+cella-git.workspace = true
 chrono.workspace = true
+nix.workspace = true
+tokio.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 miette.workspace = true

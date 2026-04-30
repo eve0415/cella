@@ -114,7 +114,7 @@ impl BranchArgs {
                 let req = cella_protocol::ManagementRequest::DeregisterContainer {
                     container_name: existing.name.clone(),
                 };
-                let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+                let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
             }
             let _ = ctx.client.stop_container(&existing.id).await;
             let _ = ctx.client.remove_container(&existing.id, false).await;

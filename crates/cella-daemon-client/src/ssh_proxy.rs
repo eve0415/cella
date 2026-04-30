@@ -17,8 +17,9 @@
 use std::path::Path;
 
 use cella_env::{ForwardEnv, SshAgentProxyRequest};
-use cella_protocol::{ManagementRequest, ManagementResponse};
 use tracing::warn;
+
+use crate::DaemonClient;
 
 /// Outcome of a successful bridge registration.
 pub struct ResolvedSshProxy {
@@ -51,26 +52,15 @@ pub async fn register_proxy(
     host_gateway: &str,
     request: &SshAgentProxyRequest,
 ) -> Option<ResolvedSshProxy> {
-    let req = ManagementRequest::RegisterSshAgentProxy {
-        workspace: workspace.to_string_lossy().into_owned(),
-        upstream_socket: request.upstream_socket.to_string_lossy().into_owned(),
-    };
-    let response =
-        match cella_daemon::management::send_management_request(daemon_socket, &req).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    "ssh-agent bridge: daemon RegisterSshAgentProxy failed for {}: {e}",
-                    workspace.display()
-                );
-                return None;
-            }
-        };
-    match response {
-        ManagementResponse::SshAgentProxyRegistered {
-            bridge_port,
-            refcount,
-        } => Some(ResolvedSshProxy {
+    let client = DaemonClient::new(daemon_socket);
+    match client
+        .register_ssh_agent_proxy(
+            workspace.to_string_lossy().into_owned(),
+            request.upstream_socket.to_string_lossy().into_owned(),
+        )
+        .await
+    {
+        Ok(registration) => Some(ResolvedSshProxy {
             env: vec![
                 ForwardEnv {
                     key: "SSH_AUTH_SOCK".to_string(),
@@ -78,22 +68,21 @@ pub async fn register_proxy(
                 },
                 ForwardEnv {
                     key: "CELLA_SSH_AGENT_BRIDGE".to_string(),
-                    value: format!("{host_gateway}:{bridge_port}"),
+                    value: format!("{host_gateway}:{}", registration.bridge_port),
                 },
                 ForwardEnv {
                     key: "CELLA_SSH_AGENT_TARGET".to_string(),
                     value: request.mount_target.clone(),
                 },
             ],
-            refcount,
-            bridge_port,
+            refcount: registration.refcount,
+            bridge_port: registration.bridge_port,
         }),
-        ManagementResponse::Error { message } => {
-            warn!("ssh-agent bridge: daemon refused register: {message}");
-            None
-        }
-        other => {
-            warn!("ssh-agent bridge: daemon returned unexpected response: {other:?}");
+        Err(e) => {
+            warn!(
+                "ssh-agent bridge: daemon RegisterSshAgentProxy failed for {}: {e}",
+                workspace.display()
+            );
             None
         }
     }
@@ -102,10 +91,11 @@ pub async fn register_proxy(
 /// Decrement the refcount for `workspace`. Best-effort: never fails the
 /// caller's down flow even if the daemon is unreachable.
 pub async fn release_proxy(daemon_socket: &Path, workspace: &Path) {
-    let req = ManagementRequest::ReleaseSshAgentProxy {
-        workspace: workspace.to_string_lossy().into_owned(),
-    };
-    if let Err(e) = cella_daemon::management::send_management_request(daemon_socket, &req).await {
+    let client = DaemonClient::new(daemon_socket);
+    if let Err(e) = client
+        .release_ssh_agent_proxy(workspace.to_string_lossy().into_owned())
+        .await
+    {
         warn!(
             "ssh-agent bridge: daemon ReleaseSshAgentProxy failed for {}: {e}",
             workspace.display()
@@ -120,6 +110,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use cella_protocol::ManagementResponse;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;

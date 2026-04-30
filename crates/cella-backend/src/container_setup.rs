@@ -4,7 +4,7 @@
 //! and devcontainer config values. They have no CLI or progress-reporting
 //! dependencies.
 
-use cella_backend::{
+use crate::{
     BackendError, ContainerBackend, ContainerState, ExecOptions, ExecResult, FileToUpload,
 };
 use tracing::{debug, info, warn};

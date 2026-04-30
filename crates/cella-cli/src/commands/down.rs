@@ -248,7 +248,7 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
     let req = cella_protocol::ManagementRequest::DeregisterContainer {
         container_name: container.name.clone(),
     };
-    if let Err(e) = cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
+    if let Err(e) = cella_daemon_client::send_management_request(&mgmt_sock, &req).await {
         debug!("Failed to deregister container with daemon: {e}");
     }
 
@@ -260,9 +260,7 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
         let release = cella_protocol::ManagementRequest::ReleaseSshAgentProxy {
             workspace: workspace.clone(),
         };
-        if let Err(e) =
-            cella_daemon::management::send_management_request(&mgmt_sock, &release).await
-        {
+        if let Err(e) = cella_daemon_client::send_management_request(&mgmt_sock, &release).await {
             debug!("Failed to release ssh-agent proxy with daemon: {e}");
         }
     }

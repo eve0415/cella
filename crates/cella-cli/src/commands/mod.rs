@@ -419,7 +419,7 @@ async fn check_daemon_needs_restart(control_socket_path: &std::path::Path) -> Op
         return None;
     }
 
-    let resp = cella_daemon::management::send_management_request(
+    let resp = cella_daemon_client::send_management_request(
         control_socket_path,
         &ManagementRequest::QueryStatus,
     )
@@ -512,11 +512,9 @@ async fn graceful_shutdown_daemon(pid_path: &std::path::Path, socket_path: &std:
     use cella_protocol::ManagementRequest;
 
     if socket_path.exists() {
-        let _ = cella_daemon::management::send_management_request(
-            socket_path,
-            &ManagementRequest::Shutdown,
-        )
-        .await;
+        let _ =
+            cella_daemon_client::send_management_request(socket_path, &ManagementRequest::Shutdown)
+                .await;
     }
 
     for _ in 0..50 {
@@ -547,8 +545,6 @@ async fn re_register_containers(
     socket_path: &std::path::Path,
     client: &dyn cella_backend::ContainerBackend,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use cella_protocol::ManagementRequest;
-
     let containers = client.list_cella_containers(true).await?;
 
     for container in &containers {
@@ -565,34 +561,18 @@ async fn re_register_containers(
 
         let container_ip = client.get_container_ip(&container.id).await.unwrap_or(None);
 
-        // Read ports_attributes from container label
-        let (ports_attrs, other_ports_attrs) = container
-            .labels
-            .get("dev.cella.ports_attributes")
-            .map(|label| {
-                cella_orchestrator::config_map::ports::deserialize_ports_attributes_label(label)
-            })
-            .unwrap_or_default();
+        let registration = cella_orchestrator::daemon_registration::from_container_labels(
+            container,
+            container_ip,
+            std::env::var("DOCKER_HOST").ok(),
+        );
 
-        let shutdown_action = container.labels.get("dev.cella.shutdown_action").cloned();
-
-        let req = ManagementRequest::RegisterContainer(Box::new(
-            cella_protocol::ContainerRegistrationData {
-                container_id: container.id.clone(),
-                container_name: container.name.clone(),
-                container_ip,
-                ports_attributes: ports_attrs,
-                other_ports_attributes: other_ports_attrs,
-                forward_ports: vec![],
-                shutdown_action,
-                backend_kind: container.labels.get(cella_backend::BACKEND_LABEL).cloned(),
-                docker_host: std::env::var("DOCKER_HOST").ok(),
-            },
-        ));
-
-        match cella_daemon::management::send_management_request(socket_path, &req).await {
-            Ok(resp) => {
-                tracing::debug!("Re-registered container {}: {resp:?}", container.name);
+        match cella_daemon_client::DaemonClient::new(socket_path)
+            .register_container(registration)
+            .await
+        {
+            Ok(container_name) => {
+                tracing::debug!("Re-registered container {container_name}");
             }
             Err(e) => {
                 warn!("Failed to re-register container {}: {e}", container.name);
@@ -611,7 +591,7 @@ async fn restart_agents_in_all_containers(client: &dyn cella_backend::ContainerB
     };
 
     for container in &containers {
-        cella_orchestrator::up::restart_agent_in_container(client, &container.id).await;
+        cella_backend::agent::restart_agent_in_container(client, &container.id).await;
     }
 }
 

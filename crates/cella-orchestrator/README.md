@@ -45,6 +45,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 | `config` | Input configuration types (`UpConfig`, `ImageStrategy`, `HostRequirementPolicy`, `BranchConfig`, `PruneConfig`) |
 | `config_map` | Maps devcontainer.json to `CreateContainerOptions` (submodules: env, mounts, ports, run_args) |
 | `container_setup` | Post-creation container setup (user resolution, lifecycle commands, SSH/git injection) |
+| `daemon_registration` | Builds daemon container-registration payloads from devcontainer config or existing container labels |
 | `result` | Output types (`UpResult`, `BranchResult`, `PruneResult`, `ExecResult`, `WorktreeStatus`) |
 | `error` | `OrchestratorError` unified error type |
 | `progress` | Channel-based progress reporting (`ProgressSender`, `ProgressEvent`, handle types) |
@@ -62,7 +63,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-protocol](../cella-protocol)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-daemon-client](../cella-daemon-client), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-protocol](../cella-protocol)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 

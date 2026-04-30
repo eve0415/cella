@@ -490,59 +490,10 @@ async fn handle_query_status(
     }
 }
 
-/// Send a management request to the daemon and receive the response.
-///
-/// Used by CLI commands to communicate with the running daemon.
-///
-/// # Errors
-///
-/// Returns error if the daemon is unreachable or the response is invalid.
-pub async fn send_management_request(
-    socket_path: &Path,
-    request: &ManagementRequest,
-) -> Result<ManagementResponse, CellaDaemonError> {
-    let stream = tokio::net::UnixStream::connect(socket_path)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!(
-                "failed to connect to management socket {}: {e}",
-                socket_path.display()
-            ),
-        })?;
-
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-
-    let mut json = serde_json::to_string(request).map_err(|e| CellaDaemonError::Protocol {
-        message: format!("serialize request: {e}"),
-    })?;
-    json.push('\n');
-    writer
-        .write_all(json.as_bytes())
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("write request: {e}"),
-        })?;
-    writer.flush().await.map_err(|e| CellaDaemonError::Socket {
-        message: format!("flush request: {e}"),
-    })?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .await
-        .map_err(|e| CellaDaemonError::Socket {
-            message: format!("read response: {e}"),
-        })?;
-
-    serde_json::from_str(response_line.trim()).map_err(|e| CellaDaemonError::Protocol {
-        message: format!("parse response: {e}"),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_daemon_client::send_management_request;
 
     fn test_management_context(
         ctrl_port: u16,

@@ -179,6 +179,13 @@ pub fn worktree_labels(branch_name: &str, parent_repo: &Path) -> HashMap<String,
     labels
 }
 
+/// Compute a SHA-256 digest of the features config for image tagging.
+pub fn compute_features_digest(config: &serde_json::Value) -> String {
+    let features = config.get("features").unwrap_or(&serde_json::Value::Null);
+    let canonical = serde_json::to_string(features).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

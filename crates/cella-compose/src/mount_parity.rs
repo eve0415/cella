@@ -8,8 +8,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use cella_backend::{MountConfig, MountKind, MountSpec};
-use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
+
+use crate::config::ResolvedComposeConfig;
 use sha2::{Digest, Sha256};
 
 /// Return `true` if `candidate` is equal to `base` or is a descendant path of it.
@@ -364,7 +365,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 /// Extracted from [`validate_base_compose_against_reserved_agent`] to stay
 /// within clippy's `too_many_lines` limit.
 fn check_primary_non_volume_mount_targets(
-    svc: &cella_compose::config::ResolvedService,
+    svc: &crate::config::ResolvedService,
     primary_service: &str,
     agent_vol_target: &str,
 ) -> Result<(), String> {
@@ -480,7 +481,7 @@ fn is_compatible_base_volume_declaration(value: &serde_json::Value, expected_nam
 /// Read-only inheritance (`:ro` suffix / `read_only: true`) is always allowed.
 fn check_volumes_from(
     svc_name: &str,
-    svc: &cella_compose::config::ResolvedService,
+    svc: &crate::config::ResolvedService,
     primary_service: &str,
 ) -> Result<(), String> {
     for vf_entry in &svc.volumes_from {
@@ -1127,12 +1128,15 @@ pub fn mount_configs_to_specs(configs: &[MountConfig]) -> Vec<MountSpec> {
         .collect()
 }
 
+pub use cella_config::config_map::map_merged_mounts;
+pub use cella_config::config_map::mounts::{map_additional_mounts, parse_mount_string};
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use crate::config::{ResolvedComposeConfig, ResolvedService};
     use cella_backend::MountKind;
-    use cella_compose::config::{ResolvedComposeConfig, ResolvedService};
     use serde_json::json;
 
     use super::*;

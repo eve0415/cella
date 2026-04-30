@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve::ResolvedConfig;
+pub use cella_network::NetworkRulePolicy;
 
 /// Configuration for the full container-up pipeline.
 pub struct UpConfig<'a> {
@@ -56,15 +57,6 @@ pub enum ImageStrategy {
 pub enum HostRequirementPolicy {
     Warn,
     Error,
-}
-
-/// Whether network blocking rules are enforced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NetworkRulePolicy {
-    /// Enforce blocking rules from config.
-    Enforce,
-    /// Skip blocking rules (e.g. `--no-network-rules`).
-    Skip,
 }
 
 /// Configuration for creating a worktree-backed branch container.

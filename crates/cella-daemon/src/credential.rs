@@ -6,24 +6,9 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 
-use crate::CellaDaemonError;
+pub use cella_protocol::credential::format_credential_fields;
 
-/// Format credential fields as key=value lines (terminated by a blank line).
-///
-/// Used both for formatting responses and for piping into `git credential` stdin.
-pub fn format_credential_fields<S: std::hash::BuildHasher>(
-    fields: &HashMap<String, String, S>,
-) -> String {
-    let mut output = String::new();
-    for (key, value) in fields {
-        output.push_str(key);
-        output.push('=');
-        output.push_str(value);
-        output.push('\n');
-    }
-    output.push('\n');
-    output
-}
+use crate::CellaDaemonError;
 
 /// Parse credential response from `git credential` stdout.
 pub fn parse_credential_output(output: &str) -> HashMap<String, String> {
