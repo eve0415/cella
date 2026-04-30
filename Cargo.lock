@@ -615,6 +615,7 @@ dependencies = [
  "cella-git",
  "cella-network",
  "cella-protocol",
+ "cella-tool-install",
  "hex",
  "miette",
  "nix 0.31.2",
@@ -666,6 +667,17 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cella-tool-install"
+version = "0.0.39"
+dependencies = [
+ "cella-backend",
+ "cella-config",
+ "cella-env",
  "tokio",
  "tracing",
 ]

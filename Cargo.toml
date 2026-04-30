@@ -19,6 +19,7 @@ members = [
     "crates/cella-network",
     "crates/cella-oci",
     "crates/cella-orchestrator",
+    "crates/cella-tool-install",
     "crates/cella-protocol",
     "crates/cella-jsonc",
     "crates/cella-templates",
@@ -166,6 +167,7 @@ cella-git = { path = "crates/cella-git" }
 cella-network = { path = "crates/cella-network" }
 cella-oci = { path = "crates/cella-oci" }
 cella-orchestrator = { path = "crates/cella-orchestrator" }
+cella-tool-install = { path = "crates/cella-tool-install" }
 cella-port = { path = "crates/cella-port" }
 cella-protocol = { path = "crates/cella-protocol" }
 cella-templates = { path = "crates/cella-templates" }

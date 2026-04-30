@@ -426,8 +426,14 @@ impl UpContext {
         let any_tool = settings.tools.claude_code.enabled
             || settings.tools.codex.enabled
             || settings.tools.gemini.enabled;
-        self.install_tools(container_id, remote_user, settings, probed_env.as_ref())
-            .await;
+        self.install_tools(
+            container_id,
+            remote_user,
+            &shell,
+            settings,
+            probed_env.as_ref(),
+        )
+        .await;
 
         // Re-probe after tool installation to capture PATH changes
         // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
@@ -464,6 +470,7 @@ impl UpContext {
         &self,
         container_id: &str,
         remote_user: &str,
+        shell: &str,
         settings: &cella_config::CellaConfig,
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
@@ -472,6 +479,7 @@ impl UpContext {
             self.client.as_ref(),
             container_id,
             remote_user,
+            shell,
             settings,
             probed_env,
             &sender,
