@@ -7,6 +7,18 @@ use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve::ResolvedConfig;
 pub use cella_network::NetworkRulePolicy;
 
+/// Mount-related CLI flags for workspace configuration.
+pub struct MountFlags<'a> {
+    /// Additional mount points from CLI `--mount` flags.
+    pub additional_cli_mounts: &'a [cella_backend::MountConfig],
+    /// Workspace mount consistency mode (e.g. "cached", "delegated").
+    pub workspace_mount_consistency: Option<&'a str>,
+    /// Whether to mount the git root instead of the workspace folder.
+    pub mount_workspace_git_root: bool,
+    /// Whether to mount the git worktree common dir.
+    pub mount_git_worktree_common_dir: bool,
+}
+
 /// Configuration for the full container-up pipeline.
 pub struct UpConfig<'a> {
     /// Fully resolved devcontainer configuration.
@@ -38,6 +50,8 @@ pub struct UpConfig<'a> {
     /// Extra Docker networks to connect the container to after start,
     /// before lifecycle hooks run (e.g. parent compose network for worktrees).
     pub extra_networks: Vec<String>,
+    /// Mount-related CLI flags.
+    pub mount_flags: MountFlags<'a>,
 }
 
 /// How the up pipeline should handle the container image.

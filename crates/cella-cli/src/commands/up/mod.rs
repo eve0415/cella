@@ -6,9 +6,9 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat, StrictnessLevel};
+use super::{ComposePullPolicy, ImagePullPolicy, MountConsistency, OutputFormat, StrictnessLevel};
 
-use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, container_name};
+use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, MountConfig, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
 use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::shell_detect::detect_shell;
@@ -36,6 +36,28 @@ pub struct UpBuildArgs {
     /// Can be specified multiple times.
     #[arg(long = "secret")]
     pub(crate) secrets: Vec<String>,
+}
+
+/// Mount-related flags for an `up` invocation.
+#[derive(Args)]
+pub struct UpMountArgs {
+    /// Additional mount point(s).
+    /// Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]
+    #[arg(long = "mount")]
+    pub(crate) mount: Vec<String>,
+
+    /// Workspace mount consistency (ignored on Linux).
+    #[arg(long, value_enum, default_value = "cached")]
+    pub(crate) workspace_mount_consistency: MountConsistency,
+
+    /// Mount the workspace using its Git root (default: true).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    pub(crate) mount_workspace_git_root: bool,
+
+    /// Mount the Git worktree common dir for Git operations in the container.
+    /// Requires the worktree to be created with relative paths.
+    #[arg(long)]
+    pub(crate) mount_git_worktree_common_dir: bool,
 }
 
 /// Start a dev container for the current workspace.
@@ -89,6 +111,9 @@ pub struct UpArgs {
     /// Pull policy for Docker Compose services.
     #[arg(long = "pull-policy", value_enum)]
     pub(crate) pull_policy: Option<ComposePullPolicy>,
+
+    #[command(flatten)]
+    pub(crate) mounts: UpMountArgs,
 }
 
 impl UpArgs {
@@ -97,7 +122,109 @@ impl UpArgs {
     }
 }
 
+fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
+    let mut mount_type = None;
+    let mut source = None;
+    let mut target = None;
+    let mut external = false;
+
+    for part in s.split(',') {
+        if let Some((key, value)) = part.split_once('=') {
+            match key {
+                "type" => {
+                    if value != "bind" && value != "volume" {
+                        return Err(format!(
+                            "invalid mount type '{value}': expected 'bind' or 'volume'\n\
+                             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+                        ));
+                    }
+                    mount_type = Some(value.to_string());
+                }
+                "source" | "src" => source = Some(value.to_string()),
+                "target" | "dst" | "destination" => target = Some(value.to_string()),
+                "external" => match value {
+                    "true" => external = true,
+                    "false" => {}
+                    _ => {
+                        return Err(format!(
+                            "invalid external value '{value}': expected 'true' or 'false'"
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(format!(
+                        "unknown mount key '{key}'\n\
+                         Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+                    ));
+                }
+            }
+        } else {
+            return Err(format!(
+                "invalid mount format: {s}\n\
+                 Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+            ));
+        }
+    }
+
+    let Some(mount_type) = mount_type else {
+        return Err(format!(
+            "missing 'type' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+    let Some(source) = source else {
+        return Err(format!(
+            "missing 'source' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+    let Some(target) = target else {
+        return Err(format!(
+            "missing 'target' in mount: {s}\n\
+             Expected: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]"
+        ));
+    };
+
+    Ok(MountConfig {
+        mount_type,
+        source,
+        target,
+        consistency: None,
+        read_only: false,
+        external,
+    })
+}
+
+fn compute_default_workspace_folder(
+    workspace_root: &std::path::Path,
+    host_mount_folder: &std::path::Path,
+) -> String {
+    let mount_basename = host_mount_folder.file_name().map_or_else(
+        || "workspace".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
+    let container_mount_folder = format!("/workspaces/{mount_basename}");
+    if host_mount_folder == workspace_root {
+        return container_mount_folder;
+    }
+    if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
+        let rel_posix = rel.to_string_lossy().replace('\\', "/");
+        if !rel_posix.is_empty() {
+            return format!("{container_mount_folder}/{rel_posix}");
+        }
+    }
+    container_mount_folder
+}
+
 use cella_orchestrator::NetworkRulePolicy;
+
+/// Resolved mount configuration for an `up` invocation.
+struct ResolvedMountConfig {
+    additional_cli_mounts: Vec<MountConfig>,
+    workspace_mount_consistency: Option<String>,
+    mount_workspace_git_root: bool,
+    mount_git_worktree_common_dir: bool,
+}
 
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
@@ -130,6 +257,7 @@ pub struct UpContext {
     build_secrets: Vec<BuildSecret>,
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
+    mount_config: ResolvedMountConfig,
 }
 
 impl UpContext {
@@ -165,11 +293,12 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |n| n.to_string_lossy().to_string(),
+        let host_mount_folder = cella_git::find_git_root_folder(
+            &resolved.workspace_root,
+            args.mounts.mount_workspace_git_root,
         );
-        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+        let default_workspace_folder =
+            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
 
         let build_secrets = args
             .build
@@ -180,6 +309,14 @@ impl UpContext {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
         let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
+
+        let additional_cli_mounts = args
+            .mounts
+            .mount
+            .iter()
+            .map(|s| parse_cli_mount(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
         Ok(Self {
             resolved,
@@ -211,6 +348,14 @@ impl UpContext {
             compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
             extra_networks: Vec::new(),
+            mount_config: ResolvedMountConfig {
+                additional_cli_mounts,
+                workspace_mount_consistency: Some(
+                    args.mounts.workspace_mount_consistency.as_str().to_string(),
+                ),
+                mount_workspace_git_root: args.mounts.mount_workspace_git_root,
+                mount_git_worktree_common_dir: args.mounts.mount_git_worktree_common_dir,
+            },
         })
     }
 
@@ -252,11 +397,9 @@ impl UpContext {
             .get("workspaceFolder")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let workspace_basename = resolved.workspace_root.file_name().map_or_else(
-            || "workspace".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
-        let default_workspace_folder = format!("/workspaces/{workspace_basename}");
+        let host_mount_folder = cella_git::find_git_root_folder(&resolved.workspace_root, true);
+        let default_workspace_folder =
+            compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
 
         Ok(Self {
             resolved,
@@ -279,6 +422,12 @@ impl UpContext {
             compose_pull_policy: None,
             build_secrets: vec![],
             extra_networks: Vec::new(),
+            mount_config: ResolvedMountConfig {
+                additional_cli_mounts: Vec::new(),
+                workspace_mount_consistency: None,
+                mount_workspace_git_root: true,
+                mount_git_worktree_common_dir: false,
+            },
         })
     }
 
@@ -665,6 +814,15 @@ impl UpContext {
             pull_policy: self.pull_policy.as_deref(),
             build_secrets: self.build_secrets.clone(),
             extra_networks: self.extra_networks.clone(),
+            mount_flags: cella_orchestrator::MountFlags {
+                additional_cli_mounts: &self.mount_config.additional_cli_mounts,
+                workspace_mount_consistency: self
+                    .mount_config
+                    .workspace_mount_consistency
+                    .as_deref(),
+                mount_workspace_git_root: self.mount_config.mount_workspace_git_root,
+                mount_git_worktree_common_dir: self.mount_config.mount_git_worktree_common_dir,
+            },
         };
 
         let result =
@@ -1046,6 +1204,81 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_cli_mount ────────────────────────────────────────────
+
+    #[test]
+    fn parse_cli_mount_bind() {
+        let m = parse_cli_mount("type=bind,source=/host,target=/container").unwrap();
+        assert_eq!(m.mount_type, "bind");
+        assert_eq!(m.source, "/host");
+        assert_eq!(m.target, "/container");
+        assert!(!m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_volume() {
+        let m = parse_cli_mount("type=volume,source=mydata,target=/data").unwrap();
+        assert_eq!(m.mount_type, "volume");
+        assert_eq!(m.source, "mydata");
+        assert_eq!(m.target, "/data");
+    }
+
+    #[test]
+    fn parse_cli_mount_with_external_true() {
+        let m = parse_cli_mount("type=volume,source=ext-vol,target=/ext,external=true").unwrap();
+        assert!(m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_with_external_false() {
+        let m = parse_cli_mount("type=volume,source=vol,target=/vol,external=false").unwrap();
+        assert!(!m.external);
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_type() {
+        assert!(parse_cli_mount("source=/a,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_source() {
+        assert!(parse_cli_mount("type=bind,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_missing_target() {
+        assert!(parse_cli_mount("type=bind,source=/a").is_err());
+    }
+
+    #[test]
+    fn parse_cli_mount_invalid_type() {
+        let err = parse_cli_mount("type=tmpfs,source=/a,target=/b").unwrap_err();
+        assert!(err.contains("invalid mount type"));
+    }
+
+    #[test]
+    fn parse_cli_mount_invalid_format() {
+        let err = parse_cli_mount("garbage").unwrap_err();
+        assert!(err.contains("invalid mount format"));
+    }
+
+    #[test]
+    fn parse_cli_mount_clap_flag() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "up",
+            "--mount",
+            "type=bind,source=/a,target=/b",
+            "--mount",
+            "type=volume,source=vol,target=/c",
+        ])
+        .unwrap();
+        if let crate::commands::Command::Up(args) = &cli.command {
+            assert_eq!(args.mounts.mount.len(), 2);
+        }
+    }
 
     // ── map_env_object ─────────────────────────────────────────────
 

@@ -38,6 +38,18 @@ pub fn discover(path: &Path) -> Result<RepoInfo, CellaGitError> {
     Ok(RepoInfo { root, head_branch })
 }
 
+/// Find the git root directory containing `path`.
+///
+/// Returns the git root if `mount_git_root` is true and the path is inside
+/// a git repository. Falls back to `path` itself if not in a git repo or
+/// if `mount_git_root` is false.
+pub fn find_git_root_folder(path: &Path, mount_git_root: bool) -> PathBuf {
+    if !mount_git_root {
+        return path.to_path_buf();
+    }
+    discover(path).map_or_else(|_| path.to_path_buf(), |info| info.root)
+}
+
 /// Detect the default branch name (main, master, etc.).
 ///
 /// Resolution priority:
@@ -270,5 +282,41 @@ mod tests {
             cloned.root.canonicalize().unwrap()
         );
         assert_eq!(info.head_branch, cloned.head_branch);
+    }
+
+    // ── find_git_root_folder ──────────────────────────────────────
+
+    #[test]
+    fn find_git_root_folder_when_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let subdir = tmp.path().join("packages").join("app");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let root = find_git_root_folder(&subdir, true);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn find_git_root_folder_when_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let subdir = tmp.path().join("packages").join("app");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let root = find_git_root_folder(&subdir, false);
+        assert_eq!(root, subdir);
+    }
+
+    #[test]
+    fn find_git_root_folder_not_a_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = find_git_root_folder(tmp.path(), true);
+        assert_eq!(root, tmp.path());
     }
 }

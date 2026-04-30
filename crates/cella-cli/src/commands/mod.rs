@@ -73,6 +73,24 @@ pub enum StrictnessLevel {
     All,
 }
 
+/// Mount consistency mode for workspace mounts.
+#[derive(Clone, Debug, ValueEnum)]
+pub enum MountConsistency {
+    Consistent,
+    Cached,
+    Delegated,
+}
+
+impl MountConsistency {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Consistent => "consistent",
+            Self::Cached => "cached",
+            Self::Delegated => "delegated",
+        }
+    }
+}
+
 /// Pull policy for Docker Compose services.
 #[derive(Clone, ValueEnum)]
 pub enum ComposePullPolicy {

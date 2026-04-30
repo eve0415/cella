@@ -202,6 +202,8 @@ pub struct MountConfig {
     /// `Mount` struct — wiring read-only into the single-container path is
     /// deferred to a follow-up phase.
     pub read_only: bool,
+    /// Whether the volume already exists externally (don't auto-create).
+    pub external: bool,
 }
 
 /// Backend-agnostic port forward specification.

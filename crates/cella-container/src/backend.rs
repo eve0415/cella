@@ -1000,6 +1000,7 @@ mod tests {
             target: "/workspace".to_string(),
             consistency: None,
             read_only: false,
+            external: false,
         });
         let staging = PathBuf::from("/tmp/staging");
         let args = build_create_args(&opts, &staging);
@@ -1017,6 +1018,7 @@ mod tests {
             target: "/workspace".to_string(),
             consistency: None,
             read_only: true,
+            external: false,
         });
         let staging = PathBuf::from("/tmp/staging");
         let args = build_create_args(&opts, &staging);
@@ -1244,6 +1246,7 @@ mod tests {
                 target: "/data".to_string(),
                 consistency: None,
                 read_only: false,
+                external: false,
             },
             MountConfig {
                 mount_type: "volume".to_string(),
@@ -1251,6 +1254,7 @@ mod tests {
                 target: "/vol".to_string(),
                 consistency: None,
                 read_only: false,
+                external: false,
             },
         ];
         let staging = PathBuf::from("/tmp/staging");
@@ -1285,6 +1289,7 @@ mod tests {
             target: "/data".to_string(),
             consistency: None,
             read_only: true,
+            external: false,
         }];
         let staging = PathBuf::from("/tmp/staging");
         let args = build_create_args(&opts, &staging);

@@ -6,6 +6,7 @@ pub(super) fn map_workspace_mount(
     config: &serde_json::Value,
     workspace_root: &Path,
     workspace_folder: &str,
+    consistency: Option<&str>,
 ) -> Option<MountConfig> {
     if let Some(mount_str) = config.get("workspaceMount").and_then(|v| v.as_str()) {
         if mount_str.is_empty() {
@@ -14,7 +15,8 @@ pub(super) fn map_workspace_mount(
         return parse_mount_string(mount_str);
     }
 
-    // Default workspace mount
+    // Default workspace mount — consistency is skipped on Linux (Podman
+    // rejects it; native Docker ignores it).
     Some(MountConfig {
         mount_type: "bind".to_string(),
         source: workspace_root
@@ -23,8 +25,13 @@ pub(super) fn map_workspace_mount(
             .to_string_lossy()
             .to_string(),
         target: workspace_folder.to_string(),
-        consistency: Some("cached".to_string()),
+        consistency: if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(consistency.unwrap_or("cached").to_string())
+        },
         read_only: false,
+        external: false,
     })
 }
 
@@ -68,6 +75,7 @@ pub fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
                     target,
                     consistency: None,
                     read_only,
+                    external: false,
                 })
             }
             _ => None,
@@ -81,6 +89,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
     let mut target = String::new();
     let mut consistency = None;
     let mut read_only = false;
+    let mut external = false;
 
     for part in s.split(',') {
         let trimmed = part.trim();
@@ -91,6 +100,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
                 "source" | "src" => source = value.to_string(),
                 "target" | "dst" | "destination" => target = value.to_string(),
                 "consistency" => consistency = Some(value.to_string()),
+                "external" => external = value == "true",
                 _ => {}
             }
         } else {
@@ -112,6 +122,7 @@ pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
         target,
         consistency,
         read_only,
+        external,
     })
 }
 
@@ -147,14 +158,14 @@ mod tests {
     #[test]
     fn map_workspace_mount_explicitly_disabled() {
         let config = json!({"workspaceMount": ""});
-        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
         assert!(result.is_none());
     }
 
     #[test]
     fn map_workspace_mount_custom() {
         let config = json!({"workspaceMount": "type=bind,source=/host/code,target=/code"});
-        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj");
+        let result = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
         let mount = result.unwrap();
         assert_eq!(mount.mount_type, "bind");
         assert_eq!(mount.source, "/host/code");
@@ -232,6 +243,92 @@ mod tests {
         assert!(
             !mounts[0].read_only,
             "absent readOnly must default to false"
+        );
+    }
+
+    // ── external field ────────────────────────────────────────────
+
+    #[test]
+    fn parse_mount_string_external_true() {
+        let mount =
+            parse_mount_string("type=volume,source=vol,target=/data,external=true").unwrap();
+        assert!(mount.external);
+    }
+
+    #[test]
+    fn parse_mount_string_external_false() {
+        let mount =
+            parse_mount_string("type=volume,source=vol,target=/data,external=false").unwrap();
+        assert!(!mount.external);
+    }
+
+    #[test]
+    fn parse_mount_string_external_defaults_false() {
+        let mount = parse_mount_string("type=bind,source=/a,target=/b").unwrap();
+        assert!(!mount.external);
+    }
+
+    // ── workspace mount consistency ───────────────────────────────
+
+    #[test]
+    fn map_workspace_mount_default_consistency() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("cached"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_explicit_delegated() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("delegated"),
+        );
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("delegated"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_explicit_consistent() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("consistent"),
+        );
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("consistent"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_custom_ignores_consistency() {
+        let config = json!({"workspaceMount": "type=bind,source=/host,target=/code"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("delegated"),
+        );
+        let m = mount.unwrap();
+        assert!(
+            m.consistency.is_none(),
+            "custom workspaceMount should not get injected consistency"
         );
     }
 }

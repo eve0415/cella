@@ -25,9 +25,15 @@ pub struct MapConfigParams<'a, S: std::hash::BuildHasher> {
     pub image_name: &'a str,
     pub labels: HashMap<String, String, S>,
     pub workspace_root: &'a Path,
+    /// The host directory to mount (git root or workspace root).
+    pub host_mount_folder: &'a Path,
     pub feature_config: Option<&'a FeatureContainerConfig>,
     pub image_env: &'a [String],
     pub agent_arch: &'a str,
+    /// Workspace mount consistency mode (e.g. "cached", "delegated").
+    /// `None` means use the default ("cached"), except on Linux where
+    /// consistency is always omitted.
+    pub workspace_mount_consistency: Option<&'a str>,
 }
 
 /// Map a resolved devcontainer config to container creation options.
@@ -40,21 +46,46 @@ pub fn map_config<S: std::hash::BuildHasher>(
         image_name,
         labels,
         workspace_root,
+        host_mount_folder,
         feature_config,
         image_env,
         agent_arch,
+        workspace_mount_consistency,
     } = params;
-    let workspace_basename = workspace_root.file_name().map_or_else(
+
+    let mount_basename = host_mount_folder.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
     );
+    let container_mount_folder = format!("/workspaces/{mount_basename}");
 
     let workspace_folder = config
         .get("workspaceFolder")
         .and_then(|v| v.as_str())
-        .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
+        .map_or_else(
+            || {
+                if host_mount_folder == workspace_root {
+                    container_mount_folder.clone()
+                } else if let Ok(rel) = workspace_root.strip_prefix(host_mount_folder) {
+                    let rel_posix = rel.to_string_lossy().replace('\\', "/");
+                    if rel_posix.is_empty() {
+                        container_mount_folder.clone()
+                    } else {
+                        format!("{container_mount_folder}/{rel_posix}")
+                    }
+                } else {
+                    container_mount_folder.clone()
+                }
+            },
+            String::from,
+        );
 
-    let workspace_mount = map_workspace_mount(config, workspace_root, &workspace_folder);
+    let workspace_mount = map_workspace_mount(
+        config,
+        host_mount_folder,
+        &container_mount_folder,
+        workspace_mount_consistency,
+    );
     let mounts = map_merged_mounts(config, feature_config);
     let env = map_merged_env(config, image_env);
     let remote_env = map_remote_env(config);
@@ -306,9 +337,11 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/test"),
+            host_mount_folder: Path::new("/tmp/test"),
             feature_config,
             image_env,
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         })
     }
 
@@ -325,9 +358,11 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.image, "ubuntu");
@@ -347,9 +382,11 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.workspace_folder, "/home/user/project");
@@ -455,9 +492,11 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/tmp/my-project"),
+            host_mount_folder: Path::new("/tmp/my-project"),
             feature_config: None,
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
         assert!(opts.workspace_mount.is_some());
         let mount = opts.workspace_mount.unwrap();
@@ -744,9 +783,11 @@ mod tests {
             image_name: "ubuntu",
             labels: HashMap::new(),
             workspace_root: Path::new("/home/user/myproject"),
+            host_mount_folder: Path::new("/home/user/myproject"),
             feature_config: Some(&substituted),
             image_env: &[],
             agent_arch: "x86_64",
+            workspace_mount_consistency: None,
         });
 
         assert_eq!(opts.mounts.len(), 1);
@@ -755,5 +796,72 @@ mod tests {
             format!("dind-var-lib-docker-{devcontainer_id}")
         );
         assert_eq!(opts.mounts[0].target, "/var/lib/docker");
+    }
+
+    // ── host_mount_folder / git root ──────────────────────────────
+
+    #[test]
+    fn map_config_git_root_same_as_workspace() {
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/project"),
+            host_mount_folder: Path::new("/home/user/project"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(opts.workspace_folder, "/workspaces/project");
+    }
+
+    #[test]
+    fn map_config_git_root_is_parent_monorepo() {
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/monorepo/packages/app"),
+            host_mount_folder: Path::new("/home/user/monorepo"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(opts.workspace_folder, "/workspaces/monorepo/packages/app");
+        let ws_mount = opts.workspace_mount.unwrap();
+        assert!(
+            ws_mount.source.ends_with("monorepo"),
+            "mount source should be the git root"
+        );
+    }
+
+    #[test]
+    fn map_config_explicit_workspace_folder_overrides_git_root() {
+        let config = json!({
+            "image": "ubuntu",
+            "workspaceFolder": "/custom/path"
+        });
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/monorepo/packages/app"),
+            host_mount_folder: Path::new("/home/user/monorepo"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(
+            opts.workspace_folder, "/custom/path",
+            "explicit workspaceFolder must override git root computation"
+        );
     }
 }
