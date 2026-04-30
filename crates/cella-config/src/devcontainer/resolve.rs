@@ -29,6 +29,42 @@ pub struct ResolvedConfig {
     pub typed: Option<crate::schema::DevContainer>,
 }
 
+impl ResolvedConfig {
+    pub fn name(&self) -> Option<&str> {
+        self.typed.as_ref().and_then(|t| t.name())
+    }
+
+    pub fn remote_user(&self) -> Option<&str> {
+        self.typed.as_ref().and_then(|t| t.remote_user())
+    }
+
+    pub fn container_user(&self) -> Option<&str> {
+        self.typed.as_ref().and_then(|t| t.container_user())
+    }
+
+    pub fn features(&self) -> Option<&crate::schema::DevContainerCommonFeatures> {
+        self.typed.as_ref().and_then(|t| t.features())
+    }
+
+    pub fn remote_env(&self) -> Option<&std::collections::HashMap<String, Option<String>>> {
+        self.typed.as_ref().and_then(|t| t.remote_env())
+    }
+
+    pub fn mounts(&self) -> Option<&[crate::schema::DevContainerCommonMountsItem]> {
+        self.typed.as_ref().and_then(|t| t.mounts())
+    }
+
+    pub fn initialize_command(
+        &self,
+    ) -> Option<&crate::schema::DevContainerCommonInitializeCommand> {
+        self.typed.as_ref().and_then(|t| t.initialize_command())
+    }
+
+    pub fn host_requirements(&self) -> Option<&crate::schema::DevContainerCommonHostRequirements> {
+        self.typed.as_ref().and_then(|t| t.host_requirements())
+    }
+}
+
 /// Compute the spec-compliant `devcontainerId`.
 ///
 /// Per <https://containers.dev/implementors/spec/#devcontainerid>:
