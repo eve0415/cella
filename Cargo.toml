@@ -17,6 +17,7 @@ members = [
     "crates/cella-agent",
     "crates/cella-features",
     "crates/cella-network",
+    "crates/cella-oci",
     "crates/cella-orchestrator",
     "crates/cella-protocol",
     "crates/cella-jsonc",
@@ -163,6 +164,7 @@ cella-env = { path = "crates/cella-env" }
 cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
 cella-network = { path = "crates/cella-network" }
+cella-oci = { path = "crates/cella-oci" }
 cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-port = { path = "crates/cella-port" }
 cella-protocol = { path = "crates/cella-protocol" }

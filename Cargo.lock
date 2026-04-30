@@ -535,6 +535,7 @@ name = "cella-features"
 version = "0.0.39"
 dependencies = [
  "base64 0.22.1",
+ "cella-oci",
  "dirs",
  "flate2",
  "futures-util",
@@ -587,6 +588,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cella-oci"
+version = "0.0.39"
+dependencies = [
+ "base64 0.22.1",
+ "dirs",
+ "flate2",
+ "oci-distribution",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "cella-orchestrator"
 version = "0.0.39"
 dependencies = [
@@ -634,8 +650,8 @@ dependencies = [
 name = "cella-templates"
 version = "0.0.39"
 dependencies = [
- "cella-features",
  "cella-jsonc",
+ "cella-oci",
  "dirs",
  "filetime",
  "flate2",

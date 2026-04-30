@@ -6,7 +6,6 @@
 
 use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::secrets::RegistryAuth;
 use tracing::debug;
 
 use crate::cache::TemplateCache;
@@ -162,17 +161,7 @@ pub async fn fetch_image_tags(
     Ok(response.tags)
 }
 
-/// Build [`RegistryAuth`] from Docker credential store.
-fn build_registry_auth(registry: &str) -> RegistryAuth {
-    let creds = cella_features::auth::resolve_credentials(registry);
-    if let (Some(u), Some(p)) = (creds.username, creds.password) {
-        debug!("using basic auth for {registry}");
-        RegistryAuth::Basic(u, p)
-    } else {
-        debug!("no credentials for {registry}; using anonymous auth");
-        RegistryAuth::Anonymous
-    }
-}
+use cella_oci::build_registry_auth;
 
 // ===========================================================================
 // Tests

@@ -11,7 +11,6 @@ use oci_distribution::client::{ClientConfig, ClientProtocol};
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
-use oci_distribution::secrets::RegistryAuth;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -157,14 +156,7 @@ fn parse_template_ref(template_ref: &str) -> Result<(String, String, String), Te
     Ok((registry.to_owned(), repository.to_owned(), tag))
 }
 
-fn build_registry_auth(registry: &str) -> RegistryAuth {
-    let creds = cella_features::auth::resolve_credentials(registry);
-    if let (Some(u), Some(p)) = (creds.username, creds.password) {
-        RegistryAuth::Basic(u, p)
-    } else {
-        RegistryAuth::Anonymous
-    }
-}
+use cella_oci::build_registry_auth;
 
 fn find_extractable_layer<'a>(
     manifest: &'a oci_distribution::manifest::OciImageManifest,

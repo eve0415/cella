@@ -6,23 +6,15 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use flate2::read::GzDecoder;
 use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::manifest::{
-    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-};
 use oci_distribution::secrets::RegistryAuth;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::auth::resolve_credentials;
 use crate::cache::FeatureCache;
 use crate::reference::NormalizedRef;
 use crate::{FeatureError, Platform};
-
-/// Media type for devcontainer feature layers (plain tar).
-const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -288,57 +280,7 @@ pub fn detect_platform(os: &str, arch: &str) -> Platform {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build [`RegistryAuth`] from Docker credential store for the given registry.
-fn build_registry_auth(registry: &str) -> RegistryAuth {
-    let creds = resolve_credentials(registry);
-    if let (Some(u), Some(p)) = (creds.username, creds.password) {
-        debug!("using basic auth for {registry}");
-        RegistryAuth::Basic(u, p)
-    } else {
-        debug!("no credentials for {registry}; using anonymous auth");
-        RegistryAuth::Anonymous
-    }
-}
-
-/// Returns `true` when the media type indicates a layer we can extract.
-fn is_extractable_layer(media_type: &str) -> bool {
-    matches!(
-        media_type,
-        IMAGE_LAYER_GZIP_MEDIA_TYPE
-            | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
-            | IMAGE_LAYER_MEDIA_TYPE
-            | DEVCONTAINERS_LAYER_MEDIA_TYPE
-    ) || media_type.contains("tar+gzip")
-        || media_type.contains("tar.gzip")
-}
-
-/// Extract a layer blob (gzip tarball or plain tar) into `dest`.
-fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::io::Result<()> {
-    let is_gzip = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
-
-    if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
-        if is_gzip {
-            let gz = GzDecoder::new(blob);
-            let mut archive = tar::Archive::new(gz);
-            archive.unpack(dest)?;
-        } else {
-            warn!("layer declared as gzip but does not have gzip magic; trying raw tar");
-            let mut archive = tar::Archive::new(blob);
-            archive.unpack(dest)?;
-        }
-    } else if is_gzip {
-        // Plain tar media type but gzip magic — publisher compressed the blob
-        // without reflecting it in the media type (common with devcontainer features).
-        warn!("layer declared as plain tar but has gzip magic; decompressing");
-        let gz = GzDecoder::new(blob);
-        let mut archive = tar::Archive::new(gz);
-        archive.unpack(dest)?;
-    } else {
-        let mut archive = tar::Archive::new(blob);
-        archive.unpack(dest)?;
-    }
-    Ok(())
-}
+use cella_oci::{build_registry_auth, extract_layer, is_extractable_layer};
 
 // ===========================================================================
 // Tests
@@ -350,161 +292,6 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     use crate::test_utils::test_platform;
-
-    // -----------------------------------------------------------------------
-    // Unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn is_extractable_layer_recognises_oci_gzip() {
-        assert!(is_extractable_layer(IMAGE_LAYER_GZIP_MEDIA_TYPE));
-    }
-
-    #[test]
-    fn is_extractable_layer_recognises_docker_gzip() {
-        assert!(is_extractable_layer(IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE));
-    }
-
-    #[test]
-    fn is_extractable_layer_recognises_plain_tar() {
-        assert!(is_extractable_layer(IMAGE_LAYER_MEDIA_TYPE));
-    }
-
-    #[test]
-    fn is_extractable_layer_recognises_devcontainers_tar() {
-        assert!(is_extractable_layer(
-            "application/vnd.devcontainers.layer.v1+tar"
-        ));
-    }
-
-    #[test]
-    fn is_extractable_layer_rejects_manifest_type() {
-        assert!(!is_extractable_layer(
-            "application/vnd.oci.image.manifest.v1+json"
-        ));
-    }
-
-    #[test]
-    fn is_extractable_layer_rejects_config() {
-        assert!(!is_extractable_layer(
-            "application/vnd.oci.image.config.v1+json"
-        ));
-    }
-
-    #[test]
-    fn build_auth_anonymous_when_no_creds() {
-        // No Docker config on CI -- should fall back to anonymous.
-        let auth = build_registry_auth("does-not-exist.example.com");
-        assert_eq!(auth, RegistryAuth::Anonymous);
-    }
-
-    #[test]
-    fn extract_layer_gzip_tarball() {
-        // Build a minimal gzipped tarball in memory.
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = tempfile::tempdir().unwrap();
-
-        // Create a file to tar up.
-        let src_path = dir.path().join("hello.txt");
-        std::fs::write(&src_path, "world").unwrap();
-
-        // Create tar.gz in memory.
-        let buf = Vec::new();
-        let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::fast());
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder
-            .append_path_with_name(&src_path, "hello.txt")
-            .unwrap();
-        let encoder = tar_builder.into_inner().unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        extract_layer(&compressed, IMAGE_LAYER_GZIP_MEDIA_TYPE, staging_dir.path()).unwrap();
-
-        let extracted = staging_dir.path().join("hello.txt");
-        assert!(extracted.exists(), "extracted file should exist");
-        assert_eq!(std::fs::read_to_string(&extracted).unwrap(), "world");
-    }
-
-    #[test]
-    fn extract_layer_plain_tar() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = tempfile::tempdir().unwrap();
-
-        let src_path = dir.path().join("data.txt");
-        std::fs::write(&src_path, "content").unwrap();
-
-        let buf = Vec::new();
-        let mut tar_builder = tar::Builder::new(buf);
-        tar_builder
-            .append_path_with_name(&src_path, "data.txt")
-            .unwrap();
-        let raw_tar = tar_builder.into_inner().unwrap();
-
-        extract_layer(&raw_tar, IMAGE_LAYER_MEDIA_TYPE, staging_dir.path()).unwrap();
-
-        let extracted = staging_dir.path().join("data.txt");
-        assert!(extracted.exists());
-        assert_eq!(std::fs::read_to_string(&extracted).unwrap(), "content");
-    }
-
-    #[test]
-    fn extract_layer_devcontainers_tar() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = tempfile::tempdir().unwrap();
-
-        let src_path = dir.path().join("install.sh");
-        std::fs::write(&src_path, "#!/bin/sh\necho hello").unwrap();
-
-        let buf = Vec::new();
-        let mut tar_builder = tar::Builder::new(buf);
-        tar_builder
-            .append_path_with_name(&src_path, "install.sh")
-            .unwrap();
-        let raw_tar = tar_builder.into_inner().unwrap();
-
-        extract_layer(&raw_tar, DEVCONTAINERS_LAYER_MEDIA_TYPE, staging_dir.path()).unwrap();
-
-        let extracted = staging_dir.path().join("install.sh");
-        assert!(extracted.exists());
-        assert_eq!(
-            std::fs::read_to_string(&extracted).unwrap(),
-            "#!/bin/sh\necho hello"
-        );
-    }
-
-    #[test]
-    fn extract_layer_plain_tar_media_type_with_gzip_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = tempfile::tempdir().unwrap();
-
-        let src_path = dir.path().join("feature.txt");
-        std::fs::write(&src_path, "gzipped-content").unwrap();
-
-        // Create a gzipped tarball.
-        let buf = Vec::new();
-        let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::fast());
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder
-            .append_path_with_name(&src_path, "feature.txt")
-            .unwrap();
-        let encoder = tar_builder.into_inner().unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Pass with a plain tar media type (no "gzip" in the string).
-        extract_layer(
-            &compressed,
-            DEVCONTAINERS_LAYER_MEDIA_TYPE,
-            staging_dir.path(),
-        )
-        .unwrap();
-
-        let extracted = staging_dir.path().join("feature.txt");
-        assert!(extracted.exists());
-        assert_eq!(
-            std::fs::read_to_string(&extracted).unwrap(),
-            "gzipped-content"
-        );
-    }
 
     #[test]
     fn verify_blob_digest_match_passes() {
