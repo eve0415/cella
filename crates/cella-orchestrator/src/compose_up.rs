@@ -399,56 +399,24 @@ async fn prepare_and_start(
     .await?;
 
     // 10. Resolve remote user, env forwarding, and ssh-agent proxy.
-    let (remote_user, image_user, env_fwd, ssh_agent_proxy) =
+    let (remote_user, image_user, mut env_fwd, ssh_agent_proxy) =
         resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
-    // 11-12. Build extra env vars and labels for the primary service.
-    let managed = client.capabilities().managed_agent;
-    let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env, managed);
-    let mut labels = build_compose_labels(cfg, project, &remote_user);
-
-    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
-    insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
-
-    let mount_specs = build_compose_mount_specs(ComposeMountParams {
-        workspace_root: cfg.workspace_root,
-        settings: &settings,
-        remote_user: &remote_user,
-        env_fwd: &env_fwd,
-        project,
-        config,
-        resolved_features: features_build.as_ref().map(|fb| &fb.resolved_features),
-        agent_vol_target: &agent_vol_target,
-        agent_vol_name: &agent_vol_name,
-    })
-    .await?;
-
-    let ov_ctx = OverrideContext {
-        agent_vol_name,
-        agent_vol_target,
-        extra_env,
-        labels,
-        extra_volumes: mount_specs,
-    };
-
-    // 13. Build-time UID remap: build a thin image layer with correct UID/GID.
-    let uid_image = build_uid_remap_image_compose(
+    // 11-15. Build override context, UID remap, write override, and start.
+    build_override_and_start(
         ctx,
+        &compose_cmd,
         project,
         features_build.as_ref(),
+        config,
+        daemon_env,
+        &mut env_fwd,
         &remote_user,
         &image_user,
+        agent_vol_name,
+        agent_vol_target,
     )
-    .await?;
-
-    // 14. Write final override with labels, env, and UID remap image.
-    write_final_override(project, features_build.as_ref(), &ov_ctx, uid_image)?;
-
-    // 15. docker compose up -d (idempotent)
-    run_step_result(progress, "Starting compose services...", async {
-        compose_cmd.up(project.run_services.as_deref(), false).await
-    })
     .await?;
 
     let resolved_features = features_build.map(|b| b.resolved_features);
@@ -864,6 +832,148 @@ fn write_final_override(
         project.override_file.display()
     );
     Ok(())
+}
+
+/// Build the override context (env, labels, mounts), UID remap image,
+/// and start compose services with SSH fallback retry.
+#[expect(clippy::too_many_arguments)]
+async fn build_override_and_start(
+    ctx: &Ctx<'_>,
+    compose_cmd: &ComposeCommand,
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    config: &serde_json::Value,
+    daemon_env: Vec<String>,
+    env_fwd: &mut cella_env::EnvForwarding,
+    remote_user: &str,
+    image_user: &str,
+    agent_vol_name: String,
+    agent_vol_target: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = ctx.cfg;
+    let progress = ctx.progress;
+
+    let managed = ctx.client.capabilities().managed_agent;
+    let extra_env = build_extra_env(daemon_env, env_fwd, cfg.remote_env, managed);
+    let mut labels = build_compose_labels(cfg, project, remote_user);
+
+    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
+    insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
+
+    let mount_specs = build_compose_mount_specs(ComposeMountParams {
+        workspace_root: cfg.workspace_root,
+        settings: &settings,
+        remote_user,
+        env_fwd,
+        project,
+        config,
+        resolved_features: features_build.map(|fb| &fb.resolved_features),
+        agent_vol_target: &agent_vol_target,
+        agent_vol_name: &agent_vol_name,
+    })
+    .await?;
+
+    let mut ov_ctx = OverrideContext {
+        agent_vol_name,
+        agent_vol_target,
+        extra_env,
+        labels,
+        extra_volumes: mount_specs,
+    };
+
+    let uid_image =
+        build_uid_remap_image_compose(ctx, project, features_build, remote_user, image_user)
+            .await?;
+
+    compose_up_with_ssh_fallback(
+        compose_cmd,
+        project,
+        features_build,
+        &mut ov_ctx,
+        uid_image,
+        env_fwd,
+        progress,
+    )
+    .await
+}
+
+/// Write override and run `compose up`, retrying on SSH agent mount failures.
+///
+/// On failure, removes the SSH mount from `ov_ctx.extra_volumes` and
+/// `ov_ctx.extra_env`, tries the next fallback strategy, rewrites the
+/// override, and retries. If all strategies are exhausted, skips SSH
+/// forwarding with a warning.
+async fn compose_up_with_ssh_fallback(
+    compose_cmd: &ComposeCommand,
+    project: &ComposeProject,
+    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    ov_ctx: &mut OverrideContext,
+    uid_image: Option<String>,
+    env_fwd: &mut cella_env::EnvForwarding,
+    progress: &ProgressSender,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        write_final_override(project, features_build, ov_ctx, uid_image.clone())?;
+
+        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+            run_step_result(progress, "Starting compose services...", async {
+                compose_cmd.up(project.run_services.as_deref(), false).await
+            })
+            .await
+            .map_err(Into::into);
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let err_msg = e.to_string();
+                if !cella_env::ssh_agent::is_ssh_mount_error(
+                    &err_msg,
+                    env_fwd.ssh_agent_mount_source.as_deref(),
+                ) {
+                    return Err(e);
+                }
+
+                if let Some(ref source) = env_fwd.ssh_agent_mount_source {
+                    ov_ctx.extra_volumes.retain(|m| m.source != *source);
+                }
+                ov_ctx
+                    .extra_env
+                    .retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+                env_fwd.ssh_agent_mount_source = None;
+
+                if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
+                    env_fwd.ssh_agent_fallbacks.remove(0);
+                    if let cella_env::ssh_agent::SshAgentRequest::Direct(ssh) = next {
+                        info!(
+                            "Compose SSH mount failed, trying fallback: {}",
+                            ssh.mount_source
+                        );
+                        env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
+                        ov_ctx
+                            .extra_volumes
+                            .push(MountSpec::bind(ssh.mount_source, ssh.mount_target));
+                        ov_ctx
+                            .extra_env
+                            .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
+                        continue;
+                    }
+                }
+
+                let runtime = env_fwd
+                    .ssh_agent_runtime
+                    .as_ref()
+                    .unwrap_or(&cella_env::DockerRuntime::Unknown);
+                progress.warn(&cella_env::ssh_agent::ssh_skip_warning(runtime));
+
+                write_final_override(project, features_build, ov_ctx, uid_image)?;
+                return run_step_result(progress, "Starting compose services...", async {
+                    compose_cmd.up(project.run_services.as_deref(), false).await
+                })
+                .await
+                .map_err(Into::into);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
