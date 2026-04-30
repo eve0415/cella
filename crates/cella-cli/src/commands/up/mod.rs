@@ -153,7 +153,7 @@ impl UpContext {
         }
 
         let config = &resolved.config;
-        let config_name = config.get("name").and_then(|v| v.as_str());
+        let config_name = resolved.name();
 
         // 2. Connect to backend
         let client = args.backend.resolve_client().await?;
@@ -241,7 +241,7 @@ impl UpContext {
         }
 
         let config = &resolved.config;
-        let config_name = config.get("name").and_then(|v| v.as_str());
+        let config_name = resolved.name();
 
         let client = backend_args.resolve_client().await?;
         client.ping().await?;

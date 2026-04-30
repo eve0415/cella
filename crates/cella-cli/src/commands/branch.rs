@@ -208,11 +208,7 @@ pub(super) async fn run_compose_branch(
         }
     };
 
-    let parent_config_name = ctx
-        .config()
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let parent_config_name = ctx.resolved.name().map(str::to_string);
     let parent_project_name =
         cella_backend::compose_project_name(repo_root, parent_config_name.as_deref());
     let parent_network = format!("{parent_project_name}_default");
