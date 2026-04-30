@@ -14,6 +14,9 @@ use crate::progress::{ProgressSender, format_elapsed};
 use crate::traits::ContainerBackend;
 use crate::types::{ExecOptions, ExecResult};
 
+/// Callback applied to lifecycle entries after resolution, before execution.
+pub type PostResolveFn = dyn Fn(&mut Vec<cella_features::LifecycleEntry>) + Send + Sync;
+
 /// Parsed lifecycle command.
 pub enum ParsedLifecycle {
     /// Sequential commands.
@@ -522,7 +525,7 @@ pub async fn run_all_lifecycle_phases(
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     image_metadata: Option<&str>,
     progress: &ProgressSender,
-    post_resolve: Option<&dyn Fn(&mut Vec<cella_features::LifecycleEntry>)>,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases = [
         "onCreateCommand",
@@ -616,7 +619,7 @@ pub async fn run_lifecycle_phases_with_wait_for(
     image_metadata: Option<&str>,
     progress: &ProgressSender,
     wait_for: WaitForPhase,
-    post_resolve: Option<&dyn Fn(&mut Vec<cella_features::LifecycleEntry>)>,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phases: &[&str] = &[
         "onCreateCommand",
@@ -738,7 +741,7 @@ pub async fn check_and_run_content_update(
     metadata: Option<&str>,
     workspace_root: &std::path::Path,
     progress: &ProgressSender,
-    post_resolve: Option<&dyn Fn(&mut Vec<cella_features::LifecycleEntry>)>,
+    post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current_hash = cella_git::content_hash::compute(workspace_root);
 

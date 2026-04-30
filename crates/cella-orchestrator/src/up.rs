@@ -464,7 +464,7 @@ impl EnsureUpContext<'_> {
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
-            Some(&|entries| {
+            Some(&move |entries| {
                 crate::config_map::substitute_lifecycle_entries(entries, &subst);
             }),
         )
@@ -510,18 +510,19 @@ impl EnsureUpContext<'_> {
         }
 
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-        let subst = crate::subst_ctx(self.config.resolved);
+        let content_subst = crate::subst_ctx(self.config.resolved);
         check_and_run_content_update(
             &lc_ctx,
             self.config_json(),
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
-            Some(&|entries| {
-                crate::config_map::substitute_lifecycle_entries(entries, &subst);
+            Some(&move |entries| {
+                crate::config_map::substitute_lifecycle_entries(entries, &content_subst);
             }),
         )
         .await?;
+        let subst = crate::subst_ctx(self.config.resolved);
         for phase in ["postStartCommand", "postAttachCommand"] {
             let mut entries = lifecycle_entries_for_phase(
                 metadata.map(String::as_str),
@@ -1281,7 +1282,7 @@ impl EnsureUpContext<'_> {
             image_metadata,
             &self.progress,
             wait_for,
-            Some(&|entries| {
+            Some(&move |entries| {
                 crate::config_map::substitute_lifecycle_entries(entries, &subst);
             }),
         )
