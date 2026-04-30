@@ -16,6 +16,7 @@ use cella_backend::{
     run_lifecycle_phase,
 };
 use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
+use cella_config::devcontainer::resolve::ResolvedConfig;
 
 use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
 use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
@@ -28,6 +29,8 @@ use crate::up::restart_agent_in_container;
 
 /// Configuration for a compose up invocation.
 pub struct ComposeUpConfig<'a> {
+    /// Fully resolved devcontainer configuration.
+    pub resolved: &'a ResolvedConfig,
     /// Parsed devcontainer JSON.
     pub config: &'a serde_json::Value,
     /// Path to devcontainer.json.
@@ -1267,7 +1270,15 @@ mod tests {
         let config = serde_json::json!({});
         let config_path = PathBuf::from("/tmp/devcontainer.json");
         let workspace_root = PathBuf::from("/tmp/workspace");
+        let resolved = ResolvedConfig {
+            config: config.clone(),
+            config_path: config_path.clone(),
+            workspace_root: workspace_root.clone(),
+            config_hash: String::new(),
+            warnings: vec![],
+        };
         let cfg = ComposeUpConfig {
+            resolved: &resolved,
             config: &config,
             config_path: &config_path,
             workspace_root: &workspace_root,
@@ -1312,7 +1323,15 @@ mod tests {
         let workspace_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("devcontainer.json");
         std::fs::write(&config_path, "{}").unwrap();
+        let resolved = ResolvedConfig {
+            config: config.clone(),
+            config_path: config_path.clone(),
+            workspace_root: workspace_dir.path().to_path_buf(),
+            config_hash: String::new(),
+            warnings: vec![],
+        };
         let cfg = ComposeUpConfig {
+            resolved: &resolved,
             config: &config,
             config_path: &config_path,
             workspace_root: workspace_dir.path(),

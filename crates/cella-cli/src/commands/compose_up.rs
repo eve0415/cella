@@ -23,6 +23,7 @@ pub async fn compose_ensure_up(
 ) -> Result<super::up::UpResult, Box<dyn std::error::Error + Send + Sync>> {
     let hooks = CliComposeUpHooks { ctx };
     let cfg = ComposeUpConfig {
+        resolved: &ctx.resolved,
         config: ctx.config(),
         config_path: &ctx.resolved.config_path,
         workspace_root: &ctx.resolved.workspace_root,
