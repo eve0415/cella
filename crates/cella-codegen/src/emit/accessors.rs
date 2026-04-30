@@ -22,7 +22,7 @@ pub fn emit_accessors(types: &[IrType], config: &CodegenConfig) -> TokenStream {
     let field_accessors: Vec<_> = common_struct
         .fields
         .iter()
-        .filter_map(emit_field_accessor)
+        .map(emit_field_accessor)
         .collect();
 
     quote! {
@@ -91,10 +91,11 @@ fn emit_common_accessor(
     common_name: &proc_macro2::Ident,
     wrapper_struct: &IrStruct,
 ) -> TokenStream {
+    let common_name_str = common_name.to_string();
     let common_field = wrapper_struct
         .fields
         .iter()
-        .find(|f| matches!(&f.ty, IrTypeRef::Named(name) if *name == common_name.to_string()))
+        .find(|f| matches!(&f.ty, IrTypeRef::Named(name) if *name == common_name_str))
         .expect("wrapper struct must have common field");
     let common_field_name = format_ident!("{}", common_field.name);
 
@@ -121,19 +122,19 @@ fn emit_common_accessor(
     }
 }
 
-fn emit_field_accessor(field: &IrField) -> Option<TokenStream> {
+fn emit_field_accessor(field: &IrField) -> TokenStream {
     let accessor_name = format_ident!("{}", field.name);
 
     if !field.required {
-        return Some(emit_optional_accessor(&accessor_name, field));
+        return emit_optional_accessor(&accessor_name, field);
     }
 
     let ret_ty = emit_type_ref(&field.ty);
-    Some(quote! {
+    quote! {
         pub fn #accessor_name(&self) -> &#ret_ty {
             &self.common().#accessor_name
         }
-    })
+    }
 }
 
 fn emit_optional_accessor(accessor_name: &proc_macro2::Ident, field: &IrField) -> TokenStream {
