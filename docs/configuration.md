@@ -170,11 +170,12 @@ version = "latest"
 
 #### `[tools.nvim]`
 
-Neovim does not have an `enabled` toggle — it is installed on-demand when first used. This section controls config forwarding.
+Neovim does not have an `enabled` toggle — it is installed on-demand when first used. This section controls config forwarding and the install version.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `forward_config` | bool | `true` | Bind-mount host nvim config into the container |
+| `version` | string | `"stable"` | `"stable"`, `"nightly"`, or a pinned version like `"0.10.3"` |
 | `config_path` | string | *unset* | Override host config source directory (default: `~/.config/nvim`) |
 
 Host paths mounted when `forward_config = true`:
@@ -185,6 +186,7 @@ The `config_path` option changes where cella reads config on the host — the co
 ```toml
 [tools.nvim]
 forward_config = true
+version = "stable"
 config_path = "~/dotfiles/nvim"
 ```
 
