@@ -429,10 +429,13 @@ dependencies = [
 name = "cella-config"
 version = "0.0.39"
 dependencies = [
+ "cella-backend",
  "cella-codegen",
  "cella-env",
+ "cella-features",
  "cella-jsonc",
  "cella-network",
+ "cella-protocol",
  "hex",
  "miette",
  "serde",
