@@ -64,7 +64,7 @@ fn vm_host_services_ssh_forwarding(
     host_socket: Option<&String>,
 ) -> SshAgentForwarding {
     if host_socket.is_none() {
-        warn!(
+        tracing::debug!(
             "SSH_AUTH_SOCK not set on host, but {runtime} may still provide the SSH agent via /run/host-services/ssh-auth.sock"
         );
     }
