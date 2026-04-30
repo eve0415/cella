@@ -25,8 +25,8 @@ Settings in `devcontainer.json` go under `customizations.cella`:
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "customizations": {
     "cella": {
-      "security": { "mode": "enforced" },
-      "credentials": { "gh": true }
+      "credentials": { "gh": true },
+      "tools": { "claude-code": { "version": "stable" } }
     }
   }
 }
@@ -79,19 +79,6 @@ anthropic = false        # added by project
 ## Settings reference
 
 All enum values are lowercase strings in config files.
-
-### `[security]`
-
-Security mode for the container.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `mode` | string | `"disabled"` | `"disabled"`, `"logged"`, or `"enforced"` |
-
-```toml
-[security]
-mode = "enforced"
-```
 
 ### `[credentials]`
 
@@ -183,12 +170,11 @@ version = "latest"
 
 #### `[tools.nvim]`
 
-Neovim does not have an `enabled` toggle — it is installed on-demand when first used. This section controls config forwarding and the install version.
+Neovim does not have an `enabled` toggle — it is installed on-demand when first used. This section controls config forwarding.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `forward_config` | bool | `true` | Bind-mount host nvim config into the container |
-| `version` | string | `"stable"` | `"stable"`, `"nightly"`, or a pinned version like `"0.10.3"` |
 | `config_path` | string | *unset* | Override host config source directory (default: `~/.config/nvim`) |
 
 Host paths mounted when `forward_config = true`:
@@ -199,7 +185,6 @@ The `config_path` option changes where cella reads config on the host — the co
 ```toml
 [tools.nvim]
 forward_config = true
-version = "stable"
 config_path = "~/dotfiles/nvim"
 ```
 
