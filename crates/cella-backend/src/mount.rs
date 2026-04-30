@@ -87,11 +87,6 @@ impl MountSpec {
     }
 
     /// Adapter: Docker API `MountConfig`.
-    ///
-    /// `read_only` is preserved in `MountConfig` but note that `cella-docker`
-    /// does not yet forward it to bollard's `Mount` struct — wiring
-    /// read-only into the single-container path is deferred to a follow-up
-    /// phase.
     pub fn to_mount_config(&self) -> MountConfig {
         MountConfig {
             mount_type: self.kind.as_str().to_owned(),
