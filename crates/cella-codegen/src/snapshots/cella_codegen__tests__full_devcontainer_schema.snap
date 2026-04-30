@@ -1,5 +1,6 @@
 ---
 source: crates/cella-codegen/src/lib.rs
+assertion_line: 175
 expression: result
 ---
 use std::collections::HashMap;
@@ -4135,5 +4136,104 @@ impl DevContainer {
                 ValidationErrorKind::TypeError, }
             ],
         )
+    }
+}
+impl DevContainer {
+    pub fn common(&self) -> &DevContainerCommon {
+        match self {
+            Self::DevContainerVariant0(v) => &v.dev_container_common,
+            Self::DevContainerCommon(c) => c,
+        }
+    }
+    pub fn schema(&self) -> Option<&str> {
+        self.common().schema.as_deref()
+    }
+    pub fn additional_properties(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.common().additional_properties.as_ref()
+    }
+    pub fn cap_add(&self) -> Option<&[String]> {
+        self.common().cap_add.as_deref()
+    }
+    pub fn container_env(&self) -> Option<&HashMap<String, String>> {
+        self.common().container_env.as_ref()
+    }
+    pub fn container_user(&self) -> Option<&str> {
+        self.common().container_user.as_deref()
+    }
+    pub fn customizations(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.common().customizations.as_ref()
+    }
+    pub fn features(&self) -> Option<&DevContainerCommonFeatures> {
+        self.common().features.as_ref()
+    }
+    pub fn forward_ports(&self) -> Option<&[DevContainerCommonForwardPortsItem]> {
+        self.common().forward_ports.as_deref()
+    }
+    pub fn host_requirements(&self) -> Option<&DevContainerCommonHostRequirements> {
+        self.common().host_requirements.as_ref()
+    }
+    pub fn init(&self) -> Option<bool> {
+        self.common().init
+    }
+    pub fn initialize_command(&self) -> Option<&DevContainerCommonInitializeCommand> {
+        self.common().initialize_command.as_ref()
+    }
+    pub fn mounts(&self) -> Option<&[DevContainerCommonMountsItem]> {
+        self.common().mounts.as_deref()
+    }
+    pub fn name(&self) -> Option<&str> {
+        self.common().name.as_deref()
+    }
+    pub fn on_create_command(&self) -> Option<&DevContainerCommonOnCreateCommand> {
+        self.common().on_create_command.as_ref()
+    }
+    pub fn other_ports_attributes(
+        &self,
+    ) -> Option<&DevContainerCommonOtherPortsAttributes> {
+        self.common().other_ports_attributes.as_ref()
+    }
+    pub fn override_feature_install_order(&self) -> Option<&[String]> {
+        self.common().override_feature_install_order.as_deref()
+    }
+    pub fn ports_attributes(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.common().ports_attributes.as_ref()
+    }
+    pub fn post_attach_command(&self) -> Option<&DevContainerCommonPostAttachCommand> {
+        self.common().post_attach_command.as_ref()
+    }
+    pub fn post_create_command(&self) -> Option<&DevContainerCommonPostCreateCommand> {
+        self.common().post_create_command.as_ref()
+    }
+    pub fn post_start_command(&self) -> Option<&DevContainerCommonPostStartCommand> {
+        self.common().post_start_command.as_ref()
+    }
+    pub fn privileged(&self) -> Option<bool> {
+        self.common().privileged
+    }
+    pub fn remote_env(&self) -> Option<&HashMap<String, Option<String>>> {
+        self.common().remote_env.as_ref()
+    }
+    pub fn remote_user(&self) -> Option<&str> {
+        self.common().remote_user.as_deref()
+    }
+    pub fn secrets(&self) -> Option<&HashMap<String, serde_json::Value>> {
+        self.common().secrets.as_ref()
+    }
+    pub fn security_opt(&self) -> Option<&[String]> {
+        self.common().security_opt.as_deref()
+    }
+    pub fn update_content_command(
+        &self,
+    ) -> Option<&DevContainerCommonUpdateContentCommand> {
+        self.common().update_content_command.as_ref()
+    }
+    pub fn update_remote_user_uid(&self) -> Option<bool> {
+        self.common().update_remote_user_uid
+    }
+    pub fn user_env_probe(&self) -> Option<&DevContainerCommonUserEnvProbe> {
+        self.common().user_env_probe.as_ref()
+    }
+    pub fn wait_for(&self) -> Option<&DevContainerCommonWaitFor> {
+        self.common().wait_for.as_ref()
     }
 }
