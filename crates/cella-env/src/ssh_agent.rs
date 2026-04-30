@@ -7,6 +7,7 @@ use tracing::warn;
 use crate::platform::DockerRuntime;
 
 /// SSH agent forwarding configuration.
+#[derive(Debug, Clone)]
 pub struct SshAgentForwarding {
     /// Host-side socket path or Docker-internal path to mount from.
     pub mount_source: String,
@@ -19,10 +20,11 @@ pub struct SshAgentForwarding {
 /// What `cella-env` can determine about SSH agent forwarding without
 /// daemon access. The orchestrator (Tier 2) translates `ProxyOnColima`
 /// into a real mount by calling into the daemon.
+#[derive(Debug, Clone)]
 pub enum SshAgentRequest {
     /// Direct mount of an existing socket — used for Docker Desktop and
-    /// `OrbStack` (magic VM socket) and for Linux/Podman direct host
-    /// bind-mount. Ready to be mounted as-is.
+    /// `OrbStack` (magic VM socket), Linux native (host bind-mount), and
+    /// as a fallback for VM-based runtimes. Ready to be mounted as-is.
     Direct(SshAgentForwarding),
     /// **Known broken on colima — see `cella_daemon::ssh_proxy` module
     /// docs.** Lima's OpenSSH-protocol `forwardAgent` degenerates with
@@ -62,7 +64,7 @@ fn vm_host_services_ssh_forwarding(
     host_socket: Option<&String>,
 ) -> SshAgentForwarding {
     if host_socket.is_none() {
-        warn!(
+        tracing::debug!(
             "SSH_AUTH_SOCK not set on host, but {runtime} may still provide the SSH agent via /run/host-services/ssh-auth.sock"
         );
     }
@@ -75,14 +77,10 @@ fn vm_host_services_ssh_forwarding(
 
 /// SSH agent forwarding via direct bind-mount of the host socket.
 ///
-/// Used as the fallback in `ssh_agent_request` for runtimes that aren't
-/// `DockerDesktop` / `OrbStack` / `Colima` — typically `LinuxNative`
-/// Docker, Podman, or Rancher Desktop. macOS sandbox-dir concerns
-/// don't apply on these runtimes (no Lima virtiofs in the path), so
-/// the host socket is reachable from the docker daemon as-is. (For
-/// `Colima` direct mount fails — Docker's mkdir-source-if-missing
-/// returns EOPNOTSUPP under macOS sandbox dirs — which is why colima
-/// takes the daemon-managed proxy path instead.)
+/// Used for `LinuxNative` Docker where the docker daemon runs on the
+/// same host, so the host socket is reachable as-is. Also used as a
+/// fallback strategy for VM-based runtimes (Rancher Desktop, Podman,
+/// Unknown) when the magic VM socket is not available.
 fn direct_ssh_forwarding(
     _runtime: &DockerRuntime,
     host_socket: Option<String>,
@@ -103,38 +101,63 @@ fn direct_ssh_forwarding(
     })
 }
 
-/// Detect the host SSH agent socket and decide how to forward it.
+/// Build the ordered list of SSH agent strategies for a given runtime.
 ///
-/// Returns `None` if:
-/// - `SSH_AUTH_SOCK` is unset or empty
+/// Separated from env/config concerns for testability. Each runtime gets
+/// strategies in preference order — the orchestrator tries them in sequence,
+/// falling back on bind-mount failures.
+fn ssh_agent_strategies_for_runtime(
+    runtime: &DockerRuntime,
+    host_socket: Option<String>,
+) -> Vec<SshAgentRequest> {
+    match runtime {
+        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack => {
+            vec![SshAgentRequest::Direct(vm_host_services_ssh_forwarding(
+                runtime,
+                host_socket.as_ref(),
+            ))]
+        }
+        DockerRuntime::Colima => colima_proxy_request(host_socket.as_deref())
+            .into_iter()
+            .collect(),
+        DockerRuntime::LinuxNative => direct_ssh_forwarding(runtime, host_socket)
+            .map(SshAgentRequest::Direct)
+            .into_iter()
+            .collect(),
+        // VM-based or unknown: try magic socket first, then direct mount
+        DockerRuntime::RancherDesktop | DockerRuntime::Podman | DockerRuntime::Unknown => {
+            let mut strategies = vec![SshAgentRequest::Direct(vm_host_services_ssh_forwarding(
+                runtime,
+                host_socket.as_ref(),
+            ))];
+            if let Some(direct) = direct_ssh_forwarding(runtime, host_socket) {
+                strategies.push(SshAgentRequest::Direct(direct));
+            }
+            strategies
+        }
+    }
+}
+
+/// Detect the host SSH agent socket and return ordered strategies to try.
+///
+/// Returns an empty vec if:
 /// - The user has already configured `SSH_AUTH_SOCK` in `containerEnv`/`remoteEnv`
 /// - The user has a mount targeting the SSH socket path
-/// - The detected runtime is colima but `SSH_AUTH_SOCK` is unset on the host
-///   (proxy can't bridge to nothing — orchestrator skips forwarding)
-///
-/// Renamed from `ssh_agent_forwarding` to make the colima divergence
-/// explicit: the result on colima is a *request* the orchestrator must
-/// translate via the daemon, not a final mount.
+/// - No strategies are available for this runtime
 pub fn ssh_agent_request(
     runtime: &DockerRuntime,
     config: &serde_json::Value,
-) -> Option<SshAgentRequest> {
+) -> Vec<SshAgentRequest> {
     if has_user_ssh_override(config) {
         tracing::debug!("User has SSH_AUTH_SOCK override in config, skipping auto-forward");
-        return None;
+        return Vec::new();
     }
 
     let host_socket = std::env::var("SSH_AUTH_SOCK")
         .ok()
         .filter(|s| !s.is_empty());
 
-    match runtime {
-        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack => Some(SshAgentRequest::Direct(
-            vm_host_services_ssh_forwarding(runtime, host_socket.as_ref()),
-        )),
-        DockerRuntime::Colima => colima_proxy_request(host_socket.as_deref()),
-        _ => direct_ssh_forwarding(runtime, host_socket).map(SshAgentRequest::Direct),
-    }
+    ssh_agent_strategies_for_runtime(runtime, host_socket)
 }
 
 /// On colima, defer SSH-agent forwarding to a daemon-managed host-side
@@ -172,6 +195,36 @@ fn colima_proxy_request(host_socket: Option<&str>) -> Option<SshAgentRequest> {
         mount_target: VM_HOST_SERVICES_SSH_SOCK.to_string(),
         env_value: VM_HOST_SERVICES_SSH_SOCK.to_string(),
     })
+}
+
+/// Check if a Docker error is a bind-mount failure for the SSH agent socket.
+pub fn is_ssh_mount_error(error_msg: &str, ssh_mount_source: Option<&str>) -> bool {
+    let Some(source) = ssh_mount_source else {
+        return false;
+    };
+    error_msg.contains("bind source path does not exist") && error_msg.contains(source)
+}
+
+/// Actionable warning message when SSH agent forwarding is skipped after
+/// all strategies fail.
+pub fn ssh_skip_warning(runtime: &DockerRuntime) -> String {
+    let base = "SSH agent forwarding skipped — git operations requiring SSH keys may not work inside the container.";
+    let hint = match runtime {
+        DockerRuntime::RancherDesktop => {
+            " To enable, create ~/Library/Application Support/rancher-desktop/lima/_config/override.yaml with:\n  ssh:\n    forwardAgent: true\n  Then restart Rancher Desktop."
+        }
+        DockerRuntime::Colima => {
+            " Try `colima start --ssh-agent` or add `forwardAgent: true` to ~/.colima/default/colima.yaml."
+        }
+        DockerRuntime::Podman => {
+            " Podman Machine may not forward the SSH agent by default. Check podman-machine configuration."
+        }
+        DockerRuntime::Unknown => {
+            " If using a VM-based Docker runtime, ensure SSH agent forwarding is enabled in the VM configuration."
+        }
+        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack | DockerRuntime::LinuxNative => "",
+    };
+    format!("{base}{hint}")
 }
 
 /// Check if the user has already configured SSH agent forwarding in their config.
@@ -340,30 +393,33 @@ mod tests {
     #[test]
     fn ssh_agent_request_user_override_skips_forward() {
         let config = json!({"containerEnv": {"SSH_AUTH_SOCK": "/custom/socket"}});
-        // Even on colima, an explicit user override wins.
-        assert!(ssh_agent_request(&DockerRuntime::Colima, &config).is_none());
-        assert!(ssh_agent_request(&DockerRuntime::DockerDesktop, &config).is_none());
-        assert!(ssh_agent_request(&DockerRuntime::OrbStack, &config).is_none());
+        assert!(ssh_agent_request(&DockerRuntime::Colima, &config).is_empty());
+        assert!(ssh_agent_request(&DockerRuntime::DockerDesktop, &config).is_empty());
+        assert!(ssh_agent_request(&DockerRuntime::OrbStack, &config).is_empty());
     }
 
     #[test]
     fn ssh_agent_request_orbstack_returns_direct_magic_socket() {
         let config = json!({});
-        let req = ssh_agent_request(&DockerRuntime::OrbStack, &config);
-        match req {
-            Some(SshAgentRequest::Direct(fwd)) => {
+        let strategies = ssh_agent_request(&DockerRuntime::OrbStack, &config);
+        assert!(!strategies.is_empty());
+        match &strategies[0] {
+            SshAgentRequest::Direct(fwd) => {
                 assert_eq!(fwd.mount_source, "/run/host-services/ssh-auth.sock");
                 assert_eq!(fwd.env_value, "/run/host-services/ssh-auth.sock");
             }
-            _ => panic!("expected Direct on OrbStack"),
+            SshAgentRequest::ProxyOnColima { .. } => {
+                panic!("expected Direct on OrbStack, got ProxyOnColima")
+            }
         }
     }
 
     #[test]
     fn ssh_agent_request_docker_desktop_returns_direct_magic_socket() {
         let config = json!({});
-        let req = ssh_agent_request(&DockerRuntime::DockerDesktop, &config);
-        assert!(matches!(req, Some(SshAgentRequest::Direct(_))));
+        let strategies = ssh_agent_request(&DockerRuntime::DockerDesktop, &config);
+        assert!(!strategies.is_empty());
+        assert!(matches!(&strategies[0], SshAgentRequest::Direct(_)));
     }
 
     #[test]
@@ -417,5 +473,207 @@ mod tests {
         assert_eq!(fwd.mount_source, sock.to_string_lossy());
         assert_eq!(fwd.mount_target, CONTAINER_SSH_SOCK);
         assert_eq!(fwd.env_value, CONTAINER_SSH_SOCK);
+    }
+
+    // -----------------------------------------------------------------
+    // ssh_agent_strategies_for_runtime: ordered strategy tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn strategies_rancher_desktop_returns_vm_then_direct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        std::fs::File::create(&sock).unwrap();
+        let host_socket = Some(sock.to_string_lossy().into_owned());
+
+        let strategies =
+            ssh_agent_strategies_for_runtime(&DockerRuntime::RancherDesktop, host_socket);
+        assert_eq!(strategies.len(), 2);
+        match &strategies[0] {
+            SshAgentRequest::Direct(fwd) => {
+                assert_eq!(fwd.mount_source, VM_HOST_SERVICES_SSH_SOCK);
+            }
+            SshAgentRequest::ProxyOnColima { .. } => {
+                panic!("first strategy should be vm_host_services, got ProxyOnColima")
+            }
+        }
+        match &strategies[1] {
+            SshAgentRequest::Direct(fwd) => {
+                assert_eq!(fwd.mount_source, sock.to_string_lossy());
+            }
+            SshAgentRequest::ProxyOnColima { .. } => {
+                panic!("second strategy should be direct mount, got ProxyOnColima")
+            }
+        }
+    }
+
+    #[test]
+    fn strategies_podman_returns_vm_then_direct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        std::fs::File::create(&sock).unwrap();
+        let host_socket = Some(sock.to_string_lossy().into_owned());
+
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::Podman, host_socket);
+        assert_eq!(strategies.len(), 2);
+    }
+
+    #[test]
+    fn strategies_unknown_returns_vm_then_direct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        std::fs::File::create(&sock).unwrap();
+        let host_socket = Some(sock.to_string_lossy().into_owned());
+
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::Unknown, host_socket);
+        assert_eq!(strategies.len(), 2);
+    }
+
+    #[test]
+    fn strategies_linux_native_returns_direct_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        std::fs::File::create(&sock).unwrap();
+        let host_socket = Some(sock.to_string_lossy().into_owned());
+
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::LinuxNative, host_socket);
+        assert_eq!(strategies.len(), 1);
+        match &strategies[0] {
+            SshAgentRequest::Direct(fwd) => {
+                assert_eq!(fwd.mount_source, sock.to_string_lossy());
+            }
+            SshAgentRequest::ProxyOnColima { .. } => {
+                panic!("should be direct mount, got ProxyOnColima")
+            }
+        }
+    }
+
+    #[test]
+    fn strategies_docker_desktop_returns_vm_only() {
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::DockerDesktop, None);
+        assert_eq!(strategies.len(), 1);
+        match &strategies[0] {
+            SshAgentRequest::Direct(fwd) => {
+                assert_eq!(fwd.mount_source, VM_HOST_SERVICES_SSH_SOCK);
+            }
+            SshAgentRequest::ProxyOnColima { .. } => {
+                panic!("should be vm_host_services, got ProxyOnColima")
+            }
+        }
+    }
+
+    #[test]
+    fn strategies_orbstack_returns_vm_only() {
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::OrbStack, None);
+        assert_eq!(strategies.len(), 1);
+        assert!(matches!(&strategies[0], SshAgentRequest::Direct(_)));
+    }
+
+    #[test]
+    fn strategies_colima_returns_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("ssh.sock");
+        std::fs::File::create(&sock).unwrap();
+        let host_socket = Some(sock.to_string_lossy().into_owned());
+
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::Colima, host_socket);
+        assert_eq!(strategies.len(), 1);
+        assert!(
+            matches!(&strategies[0], SshAgentRequest::ProxyOnColima { .. }),
+            "expected ProxyOnColima, got {:?}",
+            strategies[0]
+        );
+    }
+
+    #[test]
+    fn strategies_no_host_socket_vm_runtimes_still_return_magic() {
+        for runtime in [
+            DockerRuntime::RancherDesktop,
+            DockerRuntime::Podman,
+            DockerRuntime::Unknown,
+        ] {
+            let strategies = ssh_agent_strategies_for_runtime(&runtime, None);
+            assert_eq!(
+                strategies.len(),
+                1,
+                "{runtime:?}: should have magic socket only (no direct without host socket)"
+            );
+        }
+    }
+
+    #[test]
+    fn strategies_no_host_socket_linux_native_returns_empty() {
+        let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::LinuxNative, None);
+        assert!(strategies.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Error detection and warning helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_ssh_mount_error_matches_bind_source() {
+        let msg = r#"Docker responded with status code 400: invalid mount config for type "bind": bind source path does not exist: /run/host-services/ssh-auth.sock"#;
+        assert!(is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_no_match_different_path() {
+        let msg = r"bind source path does not exist: /some/other/path";
+        assert!(!is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_no_match_different_error() {
+        let msg = "container name already in use";
+        assert!(!is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_none_source() {
+        let msg = "bind source path does not exist: /foo";
+        assert!(!is_ssh_mount_error(msg, None));
+    }
+
+    #[test]
+    fn ssh_skip_warning_rancher_desktop_has_lima_hint() {
+        let msg = ssh_skip_warning(&DockerRuntime::RancherDesktop);
+        assert!(msg.contains("forwardAgent: true"));
+        assert!(msg.contains("Rancher Desktop"));
+    }
+
+    #[test]
+    fn ssh_skip_warning_linux_native_no_hint() {
+        let msg = ssh_skip_warning(&DockerRuntime::LinuxNative);
+        assert!(msg.contains("SSH agent forwarding skipped"));
+        assert!(!msg.contains("forwardAgent"));
+    }
+
+    #[test]
+    fn ssh_skip_warning_all_runtimes_have_base_message() {
+        for runtime in [
+            DockerRuntime::DockerDesktop,
+            DockerRuntime::OrbStack,
+            DockerRuntime::LinuxNative,
+            DockerRuntime::Colima,
+            DockerRuntime::Podman,
+            DockerRuntime::RancherDesktop,
+            DockerRuntime::Unknown,
+        ] {
+            let warning = ssh_skip_warning(&runtime);
+            assert!(
+                warning.contains("SSH agent forwarding skipped"),
+                "{runtime:?} missing base warning"
+            );
+        }
     }
 }

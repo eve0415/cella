@@ -10,13 +10,14 @@ pub enum DockerRuntime {
     OrbStack,
     /// Native Docker on Linux — direct socket bind-mount works.
     LinuxNative,
-    /// Colima (macOS) — direct socket bind-mount works.
+    /// Colima (macOS) — uses daemon-managed SSH proxy.
     Colima,
     /// Podman — VM-based on macOS (Podman Machine), native on Linux.
     Podman,
-    /// Rancher Desktop — VM-based (Lima) on macOS/Linux.
+    /// Rancher Desktop — VM-based (Lima) on macOS/Linux. Uses
+    /// `/run/host-services/ssh-auth.sock` when Lima `ssh.forwardAgent` is enabled.
     RancherDesktop,
-    /// Unknown runtime — try direct bind-mount with warning.
+    /// Unknown runtime — tries VM magic socket, then direct bind-mount.
     Unknown,
 }
 

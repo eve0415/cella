@@ -96,6 +96,13 @@ pub struct EnvForwarding {
     /// where the SSH agent is forwarded directly via host bind-mount or
     /// the magic VM socket (already pushed into `mounts` and `env`).
     pub ssh_agent_proxy_request: Option<SshAgentProxyRequest>,
+    /// Source path of the currently-applied SSH agent mount, if any.
+    /// Used by retry logic to identify SSH-specific mount failures.
+    pub ssh_agent_mount_source: Option<String>,
+    /// Remaining SSH agent strategies to try if the primary fails.
+    pub ssh_agent_fallbacks: Vec<ssh_agent::SshAgentRequest>,
+    /// Detected runtime, passed through for warning messages on fallback.
+    pub ssh_agent_runtime: Option<DockerRuntime>,
 }
 
 /// Post-start injection commands and files.
@@ -116,21 +123,32 @@ pub struct PostStartInjection {
 
 /// Apply SSH agent forwarding to the environment.
 ///
-/// For most runtimes this synchronously appends the mount and env entries.
-/// For colima, the daemon must materialize a proxy socket first — we set
-/// `ssh_agent_proxy_request` and let the orchestrator resolve it.
+/// Takes the first strategy from the ordered list and applies it
+/// immediately. Remaining strategies are stored as fallbacks for the
+/// orchestrator's retry logic. For colima, the daemon must materialize
+/// a proxy socket first — we set `ssh_agent_proxy_request`.
 fn apply_ssh_agent_forwarding(
     fwd: &mut EnvForwarding,
     runtime: &DockerRuntime,
     config: &serde_json::Value,
 ) {
-    match ssh_agent::ssh_agent_request(runtime, config) {
-        Some(ssh_agent::SshAgentRequest::Direct(ssh)) => {
+    let mut strategies = ssh_agent::ssh_agent_request(runtime, config);
+    if strategies.is_empty() {
+        return;
+    }
+    fwd.ssh_agent_runtime = Some(runtime.clone());
+
+    let primary = strategies.remove(0);
+    fwd.ssh_agent_fallbacks = strategies;
+
+    match primary {
+        ssh_agent::SshAgentRequest::Direct(ssh) => {
             tracing::info!(
                 "SSH agent forwarding: {} -> {}",
                 ssh.mount_source,
                 ssh.mount_target
             );
+            fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
             fwd.mounts.push(ForwardMount {
                 source: ssh.mount_source,
                 target: ssh.mount_target,
@@ -140,11 +158,11 @@ fn apply_ssh_agent_forwarding(
                 value: ssh.env_value,
             });
         }
-        Some(ssh_agent::SshAgentRequest::ProxyOnColima {
+        ssh_agent::SshAgentRequest::ProxyOnColima {
             upstream_socket,
             mount_target,
             env_value,
-        }) => {
+        } => {
             tracing::info!(
                 "SSH agent forwarding (colima proxy): bridging {} via daemon",
                 upstream_socket.display()
@@ -155,7 +173,6 @@ fn apply_ssh_agent_forwarding(
                 env_value,
             });
         }
-        None => {}
     }
 }
 
