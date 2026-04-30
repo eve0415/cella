@@ -225,12 +225,10 @@ async fn query_live_agent_version(container_id: &str) -> Option<String> {
         return None;
     }
 
-    let resp = cella_daemon::management::send_management_request(
-        &mgmt_socket,
-        &ManagementRequest::QueryStatus,
-    )
-    .await
-    .ok()?;
+    let resp =
+        cella_daemon_client::send_management_request(&mgmt_socket, &ManagementRequest::QueryStatus)
+            .await
+            .ok()?;
 
     if let ManagementResponse::Status { containers, .. } = resp {
         containers
@@ -248,7 +246,7 @@ async fn check_agent_connectivity(checks: &mut Vec<CheckResult>, container_id: &
     };
     let mgmt_socket = data_dir.join("daemon.sock");
 
-    match cella_daemon::management::send_management_request(
+    match cella_daemon_client::send_management_request(
         &mgmt_socket,
         &ManagementRequest::QueryStatus,
     )
@@ -339,7 +337,7 @@ async fn check_ports(checks: &mut Vec<CheckResult>, container_id: &str) {
     };
     let mgmt_socket = data_dir.join("daemon.sock");
 
-    match cella_daemon::management::send_management_request(
+    match cella_daemon_client::send_management_request(
         &mgmt_socket,
         &ManagementRequest::QueryStatus,
     )

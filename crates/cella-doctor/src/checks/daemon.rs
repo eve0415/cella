@@ -41,7 +41,7 @@ pub async fn check_daemon() -> CategoryReport {
     }
 
     // Daemon version match
-    match cella_daemon::management::send_management_request(
+    match cella_daemon_client::send_management_request(
         &socket_path,
         &ManagementRequest::QueryStatus,
     )

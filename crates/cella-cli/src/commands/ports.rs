@@ -34,7 +34,7 @@ impl PortsArgs {
             && let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
             && mgmt_sock.exists()
         {
-            match cella_daemon::management::send_management_request(
+            match cella_daemon_client::send_management_request(
                 &mgmt_sock,
                 &cella_protocol::ManagementRequest::QueryPorts,
             )

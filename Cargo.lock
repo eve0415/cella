@@ -350,6 +350,7 @@ dependencies = [
  "cella-config",
  "cella-container",
  "cella-daemon",
+ "cella-daemon-client",
  "cella-docker",
  "cella-doctor",
  "cella-env",
@@ -446,6 +447,7 @@ name = "cella-daemon"
 version = "0.0.39"
 dependencies = [
  "base64 0.22.1",
+ "cella-daemon-client",
  "cella-port",
  "cella-protocol",
  "hex",
@@ -499,6 +501,7 @@ dependencies = [
  "cella-backend",
  "cella-config",
  "cella-daemon",
+ "cella-daemon-client",
  "cella-docker",
  "cella-env",
  "cella-protocol",
@@ -583,7 +586,7 @@ dependencies = [
  "cella-backend",
  "cella-compose",
  "cella-config",
- "cella-daemon",
+ "cella-daemon-client",
  "cella-env",
  "cella-features",
  "cella-git",

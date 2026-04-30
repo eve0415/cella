@@ -419,7 +419,7 @@ async fn check_daemon_needs_restart(control_socket_path: &std::path::Path) -> Op
         return None;
     }
 
-    let resp = cella_daemon::management::send_management_request(
+    let resp = cella_daemon_client::send_management_request(
         control_socket_path,
         &ManagementRequest::QueryStatus,
     )
@@ -512,11 +512,9 @@ async fn graceful_shutdown_daemon(pid_path: &std::path::Path, socket_path: &std:
     use cella_protocol::ManagementRequest;
 
     if socket_path.exists() {
-        let _ = cella_daemon::management::send_management_request(
-            socket_path,
-            &ManagementRequest::Shutdown,
-        )
-        .await;
+        let _ =
+            cella_daemon_client::send_management_request(socket_path, &ManagementRequest::Shutdown)
+                .await;
     }
 
     for _ in 0..50 {
@@ -590,7 +588,7 @@ async fn re_register_containers(
             },
         ));
 
-        match cella_daemon::management::send_management_request(socket_path, &req).await {
+        match cella_daemon_client::send_management_request(socket_path, &req).await {
             Ok(resp) => {
                 tracing::debug!("Re-registered container {}: {resp:?}", container.name);
             }

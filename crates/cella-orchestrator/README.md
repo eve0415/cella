@@ -62,7 +62,7 @@ cella-orchestrator extracts the shared container management logic so that both t
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-protocol](../cella-protocol)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-daemon-client](../cella-daemon-client), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-protocol](../cella-protocol)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor)
 

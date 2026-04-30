@@ -347,7 +347,7 @@ impl UpContext {
                 docker_host: self.docker_host.clone(),
             },
         ));
-        match cella_daemon::management::send_management_request(&mgmt_sock, &req).await {
+        match cella_daemon_client::send_management_request(&mgmt_sock, &req).await {
             Ok(resp) => {
                 debug!("Container registered with daemon: {resp:?}");
             }
@@ -597,7 +597,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
                     docker_host,
                 },
             ));
-            let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+            let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
         })
     }
 
@@ -627,7 +627,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
             };
             // Check if the daemon recognized the container.
             matches!(
-                cella_daemon::management::send_management_request(&mgmt_sock, &req).await,
+                cella_daemon_client::send_management_request(&mgmt_sock, &req).await,
                 Ok(cella_protocol::ManagementResponse::ContainerIpUpdated { .. })
             )
         })
@@ -647,7 +647,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
             }
 
             let req = cella_protocol::ManagementRequest::DeregisterContainer { container_name };
-            let _ = cella_daemon::management::send_management_request(&mgmt_sock, &req).await;
+            let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
         })
     }
 }
@@ -950,7 +950,7 @@ pub async fn query_daemon_env(container_nm: &str, host_gateway: &str) -> Vec<Str
     if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
         && mgmt_sock.exists()
     {
-        let status_resp = cella_daemon::management::send_management_request(
+        let status_resp = cella_daemon_client::send_management_request(
             &mgmt_sock,
             &cella_protocol::ManagementRequest::QueryStatus,
         )
@@ -1056,7 +1056,7 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
         control_port,
         control_token,
         ..
-    }) = cella_daemon::management::send_management_request(
+    }) = cella_daemon_client::send_management_request(
         &mgmt_sock,
         &cella_protocol::ManagementRequest::QueryStatus,
     )
