@@ -1879,4 +1879,82 @@ mod tests {
             ProgressEvent::StepFailed { message, .. } if message == "boom"
         ));
     }
+
+    // ── normalize_path_string ─────────────────────────────────────
+
+    #[test]
+    fn normalize_removes_dot_segments() {
+        assert_eq!(normalize_path_string("/a/b/../c"), "/a/c");
+    }
+
+    #[test]
+    fn normalize_preserves_absolute_prefix() {
+        assert_eq!(normalize_path_string("/a/b/c"), "/a/b/c");
+    }
+
+    #[test]
+    fn normalize_collapses_multiple_dot_dot() {
+        assert_eq!(normalize_path_string("/a/b/c/../../d"), "/a/d");
+    }
+
+    #[test]
+    fn normalize_handles_relative_path() {
+        assert_eq!(normalize_path_string("a/b/../c"), "a/c");
+    }
+
+    // ── resolve_worktree_common_dir ───────────────────────────────
+
+    #[test]
+    fn worktree_common_dir_not_a_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let result = resolve_worktree_common_dir(tmp.path(), true, true, None);
+        assert!(result.is_none(), ".git directory → not a worktree");
+    }
+
+    #[test]
+    fn worktree_common_dir_disabled() {
+        let result = resolve_worktree_common_dir(std::path::Path::new("/tmp"), true, false, None);
+        assert!(result.is_none(), "must return None when flag is disabled");
+    }
+
+    #[test]
+    fn worktree_common_dir_git_root_disabled() {
+        let result = resolve_worktree_common_dir(std::path::Path::new("/tmp"), false, true, None);
+        assert!(
+            result.is_none(),
+            "must return None when git root mount is disabled"
+        );
+    }
+
+    #[test]
+    fn worktree_common_dir_absolute_gitdir_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".git"),
+            "gitdir: /absolute/path/.git/worktrees/wt",
+        )
+        .unwrap();
+        let result = resolve_worktree_common_dir(tmp.path(), true, true, None);
+        assert!(result.is_none(), "absolute gitdir paths must be ignored");
+    }
+
+    #[test]
+    fn worktree_common_dir_relative_gitdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("worktrees/my-wt")).unwrap();
+        let worktree_dir = tmp.path().join("worktrees").join("my-wt");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(
+            worktree_dir.join(".git"),
+            "gitdir: ../../.git/worktrees/my-wt",
+        )
+        .unwrap();
+
+        let result = resolve_worktree_common_dir(&worktree_dir, true, true, None);
+        assert!(result.is_some(), "should resolve relative gitdir");
+        let wt = result.unwrap();
+        assert_eq!(wt.mount.mount_type, "bind");
+    }
 }

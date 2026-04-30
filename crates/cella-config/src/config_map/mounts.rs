@@ -245,4 +245,90 @@ mod tests {
             "absent readOnly must default to false"
         );
     }
+
+    // ── external field ────────────────────────────────────────────
+
+    #[test]
+    fn parse_mount_string_external_true() {
+        let mount =
+            parse_mount_string("type=volume,source=vol,target=/data,external=true").unwrap();
+        assert!(mount.external);
+    }
+
+    #[test]
+    fn parse_mount_string_external_false() {
+        let mount =
+            parse_mount_string("type=volume,source=vol,target=/data,external=false").unwrap();
+        assert!(!mount.external);
+    }
+
+    #[test]
+    fn parse_mount_string_external_defaults_false() {
+        let mount = parse_mount_string("type=bind,source=/a,target=/b").unwrap();
+        assert!(!mount.external);
+    }
+
+    // ── workspace mount consistency ───────────────────────────────
+
+    #[test]
+    fn map_workspace_mount_default_consistency() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(&config, Path::new("/src"), "/workspaces/proj", None);
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("cached"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_explicit_delegated() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("delegated"),
+        );
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("delegated"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_explicit_consistent() {
+        let config = json!({"image": "ubuntu"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("consistent"),
+        );
+        let m = mount.unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(m.consistency.is_none());
+        } else {
+            assert_eq!(m.consistency.as_deref(), Some("consistent"));
+        }
+    }
+
+    #[test]
+    fn map_workspace_mount_custom_ignores_consistency() {
+        let config = json!({"workspaceMount": "type=bind,source=/host,target=/code"});
+        let mount = map_workspace_mount(
+            &config,
+            Path::new("/src"),
+            "/workspaces/proj",
+            Some("delegated"),
+        );
+        let m = mount.unwrap();
+        assert!(
+            m.consistency.is_none(),
+            "custom workspaceMount should not get injected consistency"
+        );
+    }
 }

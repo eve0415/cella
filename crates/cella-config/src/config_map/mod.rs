@@ -797,4 +797,71 @@ mod tests {
         );
         assert_eq!(opts.mounts[0].target, "/var/lib/docker");
     }
+
+    // ── host_mount_folder / git root ──────────────────────────────
+
+    #[test]
+    fn map_config_git_root_same_as_workspace() {
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/project"),
+            host_mount_folder: Path::new("/home/user/project"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(opts.workspace_folder, "/workspaces/project");
+    }
+
+    #[test]
+    fn map_config_git_root_is_parent_monorepo() {
+        let config = json!({"image": "ubuntu"});
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/monorepo/packages/app"),
+            host_mount_folder: Path::new("/home/user/monorepo"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(opts.workspace_folder, "/workspaces/monorepo/packages/app");
+        let ws_mount = opts.workspace_mount.unwrap();
+        assert!(
+            ws_mount.source.ends_with("monorepo"),
+            "mount source should be the git root"
+        );
+    }
+
+    #[test]
+    fn map_config_explicit_workspace_folder_overrides_git_root() {
+        let config = json!({
+            "image": "ubuntu",
+            "workspaceFolder": "/custom/path"
+        });
+        let opts = map_config(MapConfigParams {
+            config: &config,
+            container_name: "test",
+            image_name: "ubuntu",
+            labels: HashMap::new(),
+            workspace_root: Path::new("/home/user/monorepo/packages/app"),
+            host_mount_folder: Path::new("/home/user/monorepo"),
+            feature_config: None,
+            image_env: &[],
+            agent_arch: "x86_64",
+            workspace_mount_consistency: None,
+        });
+        assert_eq!(
+            opts.workspace_folder, "/custom/path",
+            "explicit workspaceFolder must override git root computation"
+        );
+    }
 }

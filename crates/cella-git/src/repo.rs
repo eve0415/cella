@@ -283,4 +283,40 @@ mod tests {
         );
         assert_eq!(info.head_branch, cloned.head_branch);
     }
+
+    // ── find_git_root_folder ──────────────────────────────────────
+
+    #[test]
+    fn find_git_root_folder_when_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let subdir = tmp.path().join("packages").join("app");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let root = find_git_root_folder(&subdir, true);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn find_git_root_folder_when_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let subdir = tmp.path().join("packages").join("app");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let root = find_git_root_folder(&subdir, false);
+        assert_eq!(root, subdir);
+    }
+
+    #[test]
+    fn find_git_root_folder_not_a_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = find_git_root_folder(tmp.path(), true);
+        assert_eq!(root, tmp.path());
+    }
 }
