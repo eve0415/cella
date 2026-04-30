@@ -1319,23 +1319,28 @@ impl EnsureUpContext<'_> {
 
                     if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
                         env_fwd.ssh_agent_fallbacks.remove(0);
-                        if let cella_env::ssh_agent::SshAgentRequest::Direct(ssh) = next {
-                            info!(
-                                "SSH agent mount failed, trying fallback: {} -> {}",
-                                ssh.mount_source, ssh.mount_target
-                            );
-                            env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
-                            create_opts.mounts.push(MountConfig {
-                                mount_type: "bind".to_string(),
-                                source: ssh.mount_source,
-                                target: ssh.mount_target.clone(),
-                                consistency: None,
-                                read_only: false,
-                            });
-                            create_opts
-                                .env
-                                .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
-                            continue;
+                        match next {
+                            cella_env::ssh_agent::SshAgentRequest::Direct(ssh) => {
+                                info!(
+                                    "SSH agent mount failed, trying fallback: {} -> {}",
+                                    ssh.mount_source, ssh.mount_target
+                                );
+                                env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
+                                create_opts.mounts.push(MountConfig {
+                                    mount_type: "bind".to_string(),
+                                    source: ssh.mount_source,
+                                    target: ssh.mount_target.clone(),
+                                    consistency: None,
+                                    read_only: false,
+                                });
+                                create_opts
+                                    .env
+                                    .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
+                                continue;
+                            }
+                            cella_env::ssh_agent::SshAgentRequest::ProxyOnColima { .. } => {
+                                debug!("Skipping ProxyOnColima fallback in retry loop");
+                            }
                         }
                     }
 

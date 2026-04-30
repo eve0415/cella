@@ -943,19 +943,24 @@ async fn compose_up_with_ssh_fallback(
 
                 if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
                     env_fwd.ssh_agent_fallbacks.remove(0);
-                    if let cella_env::ssh_agent::SshAgentRequest::Direct(ssh) = next {
-                        info!(
-                            "Compose SSH mount failed, trying fallback: {}",
-                            ssh.mount_source
-                        );
-                        env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
-                        ov_ctx
-                            .extra_volumes
-                            .push(MountSpec::bind(ssh.mount_source, ssh.mount_target));
-                        ov_ctx
-                            .extra_env
-                            .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
-                        continue;
+                    match next {
+                        cella_env::ssh_agent::SshAgentRequest::Direct(ssh) => {
+                            info!(
+                                "Compose SSH mount failed, trying fallback: {}",
+                                ssh.mount_source
+                            );
+                            env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
+                            ov_ctx
+                                .extra_volumes
+                                .push(MountSpec::bind(ssh.mount_source, ssh.mount_target));
+                            ov_ctx
+                                .extra_env
+                                .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
+                            continue;
+                        }
+                        cella_env::ssh_agent::SshAgentRequest::ProxyOnColima { .. } => {
+                            debug!("Skipping ProxyOnColima fallback in retry loop");
+                        }
                     }
                 }
 
