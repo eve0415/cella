@@ -12,7 +12,9 @@ pub mod merge;
 pub mod proxy_env;
 pub mod rules;
 
-pub use config::{NetworkConfig, NetworkMode, NetworkRule, ProxyConfig, RuleAction};
+pub use config::{
+    NetworkConfig, NetworkMode, NetworkRule, NetworkRulePolicy, ProxyConfig, RuleAction,
+};
 pub use merge::merge_network_configs;
 pub use proxy_env::ProxyEnvVars;
 pub use rules::RuleMatcher;
