@@ -25,6 +25,8 @@ pub struct ResolvedConfig {
     pub config_hash: String,
     /// Diagnostics (warnings) from parsing.
     pub warnings: Vec<Diagnostic>,
+    /// Typed representation of the merged config, if validation succeeded.
+    pub typed: Option<crate::schema::DevContainer>,
 }
 
 /// Compute the spec-compliant `devcontainerId`.
@@ -174,12 +176,15 @@ pub fn config(
     let canonical = serde_json::to_string(&config)?;
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
 
+    let typed = crate::schema::DevContainer::validate(&config, "").ok();
+
     Ok(ResolvedConfig {
         config,
         config_path,
         workspace_root: workspace_root.to_path_buf(),
         config_hash: hash,
         warnings,
+        typed,
     })
 }
 
@@ -416,5 +421,22 @@ mod tests {
         let id = spec_devcontainer_id(&labels);
         assert_eq!(id.len(), 52);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn typed_populated_for_valid_config() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "name": "test"}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(resolved.typed.is_some());
+        assert_eq!(resolved.typed.as_ref().unwrap().name(), Some("test"));
+    }
+
+    #[test]
+    fn typed_populated_with_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "unknownField": true}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(resolved.typed.is_some());
     }
 }

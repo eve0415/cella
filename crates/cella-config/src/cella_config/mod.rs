@@ -99,12 +99,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_resolved(config: Value) -> crate::devcontainer::resolve::ResolvedConfig {
+        let typed = crate::schema::DevContainer::validate(&config, "").ok();
         crate::devcontainer::resolve::ResolvedConfig {
             config,
             config_path: std::path::PathBuf::new(),
             workspace_root: std::path::PathBuf::new(),
             config_hash: String::new(),
             warnings: vec![],
+            typed,
         }
     }
 

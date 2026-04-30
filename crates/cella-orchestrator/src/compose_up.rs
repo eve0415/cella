@@ -1259,6 +1259,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             config_hash: String::new(),
             warnings: vec![],
+            typed: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,
@@ -1312,6 +1313,7 @@ mod tests {
             workspace_root: workspace_dir.path().to_path_buf(),
             config_hash: String::new(),
             warnings: vec![],
+            typed: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,
