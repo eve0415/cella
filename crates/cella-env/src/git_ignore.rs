@@ -11,7 +11,7 @@ const HOST_UPLOAD_PATH: &str = "/tmp/.cella/host-gitignore";
 ///
 /// Checks `core.excludesFile` via git first, then falls back to the
 /// XDG default location.
-pub fn resolve_host_gitignore_path() -> Option<PathBuf> {
+fn resolve_host_gitignore_path() -> Option<PathBuf> {
     if let Some(path) = resolve_from_git_config() {
         return Some(path);
     }
@@ -55,15 +55,19 @@ fn read_gitignore_file(path: &Path) -> Option<String> {
     }
 }
 
+/// Read the host's global gitignore content, returning `None` if
+/// unset, missing, or empty.
 pub fn read_host_gitignore() -> Option<String> {
     let path = resolve_host_gitignore_path()?;
     read_gitignore_file(&path)
 }
 
+/// Container-side path for the cella-managed merged gitignore file.
 pub fn cella_ignore_path(remote_user: &str) -> String {
     format!("{}/.config/git/cella-ignore", container_home(remote_user))
 }
 
+/// Container-side staging path for the raw host gitignore upload.
 pub const fn host_upload_path() -> &'static str {
     HOST_UPLOAD_PATH
 }
@@ -87,6 +91,8 @@ cat {upload_path}
     )
 }
 
+/// Build `sh -c` commands to merge uploaded host gitignore with the
+/// container's existing `~/.config/git/ignore`.
 pub fn build_merge_commands(remote_user: &str, upload_path: &str) -> Vec<Vec<String>> {
     let home = container_home(remote_user);
     let git_config_dir = format!("{home}/.config/git");
@@ -260,6 +266,9 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     #[test]
     fn resolve_from_real_git_config() {
-        let _ = resolve_host_gitignore_path();
+        // If git reports an excludesFile, the resolved path must exist.
+        if let Some(path) = resolve_host_gitignore_path() {
+            assert!(path.is_file(), "resolved gitignore path must be a file");
+        }
     }
 }

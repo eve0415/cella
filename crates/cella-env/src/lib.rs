@@ -221,6 +221,7 @@ fn apply_credential_forwarding(fwd: &mut EnvForwarding) {
     ]);
 }
 
+/// Forward the host's global gitignore into the container.
 fn apply_global_gitignore(fwd: &mut EnvForwarding, remote_user: &str) {
     let Some(content) = git_ignore::read_host_gitignore() else {
         return;
