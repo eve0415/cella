@@ -12,6 +12,7 @@ mod error;
 pub mod gemini;
 pub mod gh_credential;
 pub mod git_config;
+pub mod git_ignore;
 pub mod nvim;
 pub mod paths;
 pub mod platform;
