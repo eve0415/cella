@@ -201,6 +201,36 @@ fn colima_proxy_request(host_socket: Option<&str>) -> Option<SshAgentRequest> {
     })
 }
 
+/// Check if a Docker error is a bind-mount failure for the SSH agent socket.
+pub fn is_ssh_mount_error(error_msg: &str, ssh_mount_source: Option<&str>) -> bool {
+    let Some(source) = ssh_mount_source else {
+        return false;
+    };
+    error_msg.contains("bind source path does not exist") && error_msg.contains(source)
+}
+
+/// Actionable warning message when SSH agent forwarding is skipped after
+/// all strategies fail.
+pub fn ssh_skip_warning(runtime: &DockerRuntime) -> String {
+    let base = "SSH agent forwarding skipped — git operations requiring SSH keys may not work inside the container.";
+    let hint = match runtime {
+        DockerRuntime::RancherDesktop => {
+            " To enable, create ~/Library/Application Support/rancher-desktop/lima/_config/override.yaml with:\n  ssh:\n    forwardAgent: true\n  Then restart Rancher Desktop."
+        }
+        DockerRuntime::Colima => {
+            " Try `colima start --ssh-agent` or add `forwardAgent: true` to ~/.colima/default/colima.yaml."
+        }
+        DockerRuntime::Podman => {
+            " Podman Machine may not forward the SSH agent by default. Check podman-machine configuration."
+        }
+        DockerRuntime::Unknown => {
+            " If using a VM-based Docker runtime, ensure SSH agent forwarding is enabled in the VM configuration."
+        }
+        DockerRuntime::DockerDesktop | DockerRuntime::OrbStack | DockerRuntime::LinuxNative => "",
+    };
+    format!("{base}{hint}")
+}
+
 /// Check if the user has already configured SSH agent forwarding in their config.
 fn has_user_ssh_override(config: &serde_json::Value) -> bool {
     // Check containerEnv for SSH_AUTH_SOCK
@@ -579,5 +609,75 @@ mod tests {
     fn strategies_no_host_socket_linux_native_returns_empty() {
         let strategies = ssh_agent_strategies_for_runtime(&DockerRuntime::LinuxNative, None);
         assert!(strategies.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Error detection and warning helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_ssh_mount_error_matches_bind_source() {
+        let msg = r#"Docker responded with status code 400: invalid mount config for type "bind": bind source path does not exist: /run/host-services/ssh-auth.sock"#;
+        assert!(is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_no_match_different_path() {
+        let msg = r#"bind source path does not exist: /some/other/path"#;
+        assert!(!is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_no_match_different_error() {
+        let msg = "container name already in use";
+        assert!(!is_ssh_mount_error(
+            msg,
+            Some("/run/host-services/ssh-auth.sock")
+        ));
+    }
+
+    #[test]
+    fn is_ssh_mount_error_none_source() {
+        let msg = "bind source path does not exist: /foo";
+        assert!(!is_ssh_mount_error(msg, None));
+    }
+
+    #[test]
+    fn ssh_skip_warning_rancher_desktop_has_lima_hint() {
+        let msg = ssh_skip_warning(&DockerRuntime::RancherDesktop);
+        assert!(msg.contains("forwardAgent: true"));
+        assert!(msg.contains("Rancher Desktop"));
+    }
+
+    #[test]
+    fn ssh_skip_warning_linux_native_no_hint() {
+        let msg = ssh_skip_warning(&DockerRuntime::LinuxNative);
+        assert!(msg.contains("SSH agent forwarding skipped"));
+        assert!(!msg.contains("forwardAgent"));
+    }
+
+    #[test]
+    fn ssh_skip_warning_all_runtimes_have_base_message() {
+        for runtime in [
+            DockerRuntime::DockerDesktop,
+            DockerRuntime::OrbStack,
+            DockerRuntime::LinuxNative,
+            DockerRuntime::Colima,
+            DockerRuntime::Podman,
+            DockerRuntime::RancherDesktop,
+            DockerRuntime::Unknown,
+        ] {
+            let warning = ssh_skip_warning(&runtime);
+            assert!(
+                warning.contains("SSH agent forwarding skipped"),
+                "{runtime:?} missing base warning"
+            );
+        }
     }
 }
