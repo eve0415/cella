@@ -212,7 +212,16 @@ pub fn config(
     let canonical = serde_json::to_string(&config)?;
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
 
-    let typed = crate::schema::DevContainer::validate(&config, "").ok();
+    let typed = match crate::schema::DevContainer::validate(&config, "") {
+        Ok(t) => Some(t),
+        Err(errs) => {
+            debug!(
+                "typed DevContainer validation failed ({} errors); typed accessors will return None",
+                errs.len()
+            );
+            None
+        }
+    };
 
     Ok(ResolvedConfig {
         config,
