@@ -30,16 +30,29 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
+    fn config_string(&self, key: &str) -> Option<&str> {
+        self.config.get(key).and_then(|v| v.as_str())
+    }
+
     pub fn name(&self) -> Option<&str> {
-        self.typed.as_ref().and_then(|t| t.name())
+        self.typed
+            .as_ref()
+            .and_then(|t| t.name())
+            .or_else(|| self.config_string("name"))
     }
 
     pub fn remote_user(&self) -> Option<&str> {
-        self.typed.as_ref().and_then(|t| t.remote_user())
+        self.typed
+            .as_ref()
+            .and_then(|t| t.remote_user())
+            .or_else(|| self.config_string("remoteUser"))
     }
 
     pub fn container_user(&self) -> Option<&str> {
-        self.typed.as_ref().and_then(|t| t.container_user())
+        self.typed
+            .as_ref()
+            .and_then(|t| t.container_user())
+            .or_else(|| self.config_string("containerUser"))
     }
 
     pub fn features(&self) -> Option<&crate::schema::DevContainerCommonFeatures> {
