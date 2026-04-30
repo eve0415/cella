@@ -11,17 +11,19 @@ use std::pin::Pin;
 
 use tracing::{debug, info, warn};
 
-use cella_backend::{
-    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec, agent_env_vars,
-    run_lifecycle_phase,
+use cella_backend::agent::restart_agent_in_container;
+use cella_backend::container_setup::{
+    resolve_remote_user, run_host_command, verify_container_running,
 };
-use cella_compose::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
+use cella_backend::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
+use cella_backend::progress::ProgressSender;
+use cella_backend::{
+    ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
+    SshAgentProxyStatus, agent_env_vars, run_lifecycle_phase,
+};
 use cella_config::devcontainer::resolve::ResolvedConfig;
 
-use crate::container_setup::{resolve_remote_user, run_host_command, verify_container_running};
-use crate::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entries};
-use crate::progress::ProgressSender;
-use cella_backend::agent::restart_agent_in_container;
+use crate::{ComposeCommand, ComposeProject, OverrideConfig, ServiceBuildInfo};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -54,7 +56,7 @@ pub struct ComposeUpConfig<'a> {
     /// Pull policy for docker compose up/build (`--pull` flag).
     pub pull_policy: Option<String>,
     /// Network rule enforcement policy.
-    pub network_rule_policy: crate::NetworkRulePolicy,
+    pub network_rule_policy: cella_network::NetworkRulePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ pub struct ComposeUpResult {
     /// SSH-agent proxy status, when an SSH-agent forwarding decision
     /// was actually surfaced for this container. `None` when the proxy
     /// code path was not exercised.
-    pub ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus>,
+    pub ssh_agent_proxy: Option<SshAgentProxyStatus>,
 }
 
 /// Whether the compose container was created fresh or was already running.
@@ -189,14 +191,11 @@ pub async fn compose_up(
 
     // 2. Validate primary service exists in compose files
     run_step_result(&progress, "Validating compose configuration...", async {
-        cella_compose::parse::validate_primary_service(
-            &project.compose_files,
-            &project.primary_service,
-        )?;
+        crate::parse::validate_primary_service(&project.compose_files, &project.primary_service)?;
         if let Some(ref run_services) = project.run_services {
-            cella_compose::parse::validate_run_services(&project.compose_files, run_services)?;
+            crate::parse::validate_run_services(&project.compose_files, run_services)?;
         }
-        Ok::<(), cella_compose::CellaComposeError>(())
+        Ok::<(), crate::CellaComposeError>(())
     })
     .await?;
 
@@ -257,14 +256,14 @@ async fn resolve_ssh_agent_proxy_for_compose(
     env_fwd: &mut cella_env::EnvForwarding,
     workspace_root: &Path,
     host_gateway: &str,
-) -> Option<crate::result::SshAgentProxyStatus> {
+) -> Option<SshAgentProxyStatus> {
     let request = env_fwd.ssh_agent_proxy_request.take()?;
     let Some(daemon_sock) = cella_env::paths::daemon_socket_path() else {
-        return Some(crate::result::SshAgentProxyStatus::Skipped {
+        return Some(SshAgentProxyStatus::Skipped {
             reason: "daemon socket path could not be determined".to_string(),
         });
     };
-    match crate::ssh_proxy_client::register_proxy(
+    match cella_daemon_client::ssh_proxy::register_proxy(
         &daemon_sock,
         workspace_root,
         host_gateway,
@@ -274,12 +273,12 @@ async fn resolve_ssh_agent_proxy_for_compose(
     {
         Some(resolved) => {
             env_fwd.env.extend(resolved.env);
-            Some(crate::result::SshAgentProxyStatus::Bridged {
+            Some(SshAgentProxyStatus::Bridged {
                 host_endpoint: format!("{host_gateway}:{}", resolved.bridge_port),
                 refcount: resolved.refcount,
             })
         }
-        None => Some(crate::result::SshAgentProxyStatus::Skipped {
+        None => Some(SshAgentProxyStatus::Skipped {
             reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
         }),
     }
@@ -292,12 +291,12 @@ async fn resolve_user_and_env(
     client: &dyn ContainerBackend,
     ctx: &Ctx<'_>,
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
 ) -> (
     String,
     String,
     cella_env::EnvForwarding,
-    Option<crate::result::SshAgentProxyStatus>,
+    Option<SshAgentProxyStatus>,
 ) {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
@@ -305,7 +304,7 @@ async fn resolve_user_and_env(
         resolve_compose_image_info(client, project, features_build, progress).await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
-    let skip_rules = cfg.network_rule_policy == crate::NetworkRulePolicy::Skip;
+    let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
     let proxy_fwd = build_proxy_forwarding_config(cfg.resolved, managed_agent, skip_rules);
     let mut env_fwd =
         cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
@@ -327,7 +326,7 @@ async fn prepare_and_start(
         String,
         Option<cella_features::ResolvedFeatures>,
         String,
-        Option<crate::result::SshAgentProxyStatus>,
+        Option<SshAgentProxyStatus>,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
@@ -343,10 +342,10 @@ async fn prepare_and_start(
     }
 
     // 5. Check Docker Compose version supports additional_contexts (>= 2.17.0)
-    cella_compose::check_compose_features_support().await?;
+    crate::check_compose_features_support().await?;
 
     // 6. Resolve features via combined-Dockerfile approach (if features configured)
-    let features_build = crate::compose_features::resolve_compose_features(
+    let features_build = crate::combined_dockerfile_build::resolve_compose_features(
         client,
         config,
         cfg.config_path,
@@ -568,7 +567,7 @@ async fn handle_compose_running(
     // mount-affecting changes that `config_hash` does not cover.
     let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
     let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
-    let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
+    let current_mount_fp = crate::mount_parity::compute_mount_input_fingerprint(
         &settings_now,
         &env_fwd_now,
         cfg.workspace_root,
@@ -651,7 +650,7 @@ struct OverrideContext {
 /// Write the initial compose override YAML for building with features.
 fn write_build_override(
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     ov: &OverrideContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let override_config = OverrideConfig {
@@ -671,8 +670,8 @@ fn write_build_override(
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
     };
-    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
-    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    let override_yaml = crate::override_file::generate_override_yaml(&override_config);
+    crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
     debug!(
         "Override file written to: {}",
         project.override_file.display()
@@ -694,7 +693,7 @@ fn write_build_override(
 async fn resolve_compose_image_info(
     client: &dyn ContainerBackend,
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     progress: &ProgressSender,
 ) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
     // If features resolved an image, its metadata was already extracted.
@@ -716,14 +715,14 @@ async fn resolve_compose_image_info(
         }
     };
 
-    let service_info =
-        match cella_compose::extract_service_build_info(&resolved, &project.primary_service) {
-            Ok(info) => info,
-            Err(e) => {
-                warn!("Failed to extract service build info: {e}");
-                return ("root".to_string(), None);
-            }
-        };
+    let service_info = match crate::extract_service_build_info(&resolved, &project.primary_service)
+    {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("Failed to extract service build info: {e}");
+            return ("root".to_string(), None);
+        }
+    };
 
     let image_name = match &service_info {
         ServiceBuildInfo::Image { image } => {
@@ -769,7 +768,7 @@ async fn resolve_compose_image_info(
 async fn build_uid_remap_image_compose(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     remote_user: &str,
     image_user: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -788,7 +787,7 @@ async fn build_uid_remap_image_compose(
         .and_then(|b| b.image_name_override.clone())
         .unwrap_or_else(|| format!("{}-{}", project.project_name, project.primary_service));
 
-    crate::uid_image::build_uid_remap_image(
+    cella_backend::uid_image::build_uid_remap_image(
         ctx.client,
         &compose_image,
         image_user,
@@ -801,7 +800,7 @@ async fn build_uid_remap_image_compose(
 /// Write the final compose override with labels, env, and optional UID remap image.
 fn write_final_override(
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     ov: &OverrideContext,
     uid_image: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -825,8 +824,8 @@ fn write_final_override(
         build_secrets: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
     };
-    let override_yaml = cella_compose::override_file::generate_override_yaml(&override_config);
-    cella_compose::override_file::write_override_file(&project.override_file, &override_yaml)?;
+    let override_yaml = crate::override_file::generate_override_yaml(&override_config);
+    crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
     debug!(
         "Final override written to: {}",
         project.override_file.display()
@@ -841,7 +840,7 @@ async fn build_override_and_start(
     ctx: &Ctx<'_>,
     compose_cmd: &ComposeCommand,
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     config: &serde_json::Value,
     daemon_env: Vec<String>,
     env_fwd: &mut cella_env::EnvForwarding,
@@ -906,7 +905,7 @@ async fn build_override_and_start(
 async fn compose_up_with_ssh_fallback(
     compose_cmd: &ComposeCommand,
     project: &ComposeProject,
-    features_build: Option<&crate::compose_features::ComposeFeaturesBuild>,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     ov_ctx: &mut OverrideContext,
     uid_image: Option<String>,
     env_fwd: &mut cella_env::EnvForwarding,
@@ -1090,7 +1089,7 @@ fn insert_mount_input_fingerprint_label(
     workspace_root: &Path,
 ) {
     let fp =
-        crate::compose_mounts::compute_mount_input_fingerprint(settings, env_fwd, workspace_root);
+        crate::mount_parity::compute_mount_input_fingerprint(settings, env_fwd, workspace_root);
     labels.insert("dev.cella.mount_input_fingerprint".to_string(), fp);
 }
 
@@ -1133,7 +1132,7 @@ struct ComposeMountParams<'a> {
 /// be a security hole.
 async fn build_compose_mount_specs(
     p: ComposeMountParams<'_>,
-) -> Result<Vec<MountSpec>, crate::error::OrchestratorError> {
+) -> Result<Vec<MountSpec>, crate::CellaComposeError> {
     // Assembly order mirrors single-container `config_map::map_config`:
     //   1. User devcontainer.json `mounts:` and feature `mounts:` FIRST.
     //   2. Auto-forwarded mounts (tool-config, env-fwd, parent-git) LAST.
@@ -1152,23 +1151,22 @@ async fn build_compose_mount_specs(
     // user mounts after `merge_with_devcontainer`); otherwise it falls back to
     // `map_additional_mounts` on the raw config.
     let feature_config = p.resolved_features.map(|rf| &rf.container_config);
-    let user_feature_mounts = crate::config_map::map_merged_mounts(p.config, feature_config);
-    let mut user_feature_specs =
-        crate::compose_mounts::mount_configs_to_specs(&user_feature_mounts);
+    let user_feature_mounts = crate::mount_parity::map_merged_mounts(p.config, feature_config);
+    let mut user_feature_specs = crate::mount_parity::mount_configs_to_specs(&user_feature_mounts);
     // Absolutize relative bind sources before emission. Docker Compose resolves
     // relative paths relative to the compose file's parent directory, but cella
     // writes its override to ~/.cella/…, so relative sources must be resolved
     // against the user's workspace root to point at the intended host path.
-    crate::compose_mounts::resolve_bind_sources(&mut user_feature_specs, p.workspace_root);
+    crate::mount_parity::resolve_bind_sources(&mut user_feature_specs, p.workspace_root);
     let mut specs = user_feature_specs;
 
     // 2. Auto-forwarded mounts — appended last so last-wins dedup gives them
     //    precedence over a user/feature mount at the same target.
-    specs.extend(crate::tool_install::build_tool_config_mount_specs(
+    specs.extend(cella_tool_install::build_tool_config_mount_specs(
         p.settings,
         p.remote_user,
     ));
-    specs.extend(crate::compose_mounts::env_fwd_to_mount_specs(p.env_fwd));
+    specs.extend(crate::mount_parity::env_fwd_to_mount_specs(p.env_fwd));
 
     // Parent git dir — canonicalize mirrors single-container up.rs:826-830 to
     // handle linked git worktrees whose .gitdir pointer is non-canonical.
@@ -1186,11 +1184,8 @@ async fn build_compose_mount_specs(
     // Tool-config / env-fwd / parent-git mounts should never trigger these, but
     // user and feature mounts are untrusted input — apply the filter to all.
     if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
-        specs = crate::compose_mounts::filter_reserved_agent(
-            specs,
-            p.agent_vol_target,
-            p.agent_vol_name,
-        );
+        specs =
+            crate::mount_parity::filter_reserved_agent(specs, p.agent_vol_target, p.agent_vol_name);
     }
 
     // Validate the base compose config and dedup candidates against it.
@@ -1210,39 +1205,39 @@ async fn build_compose_mount_specs(
             // or mounts the managed agent volume. Docker Compose multi-file merge
             // appends entries — cella cannot remove base service volumes, only add.
             if !p.agent_vol_target.is_empty() && !p.agent_vol_name.is_empty() {
-                crate::compose_mounts::validate_base_compose_against_reserved_agent(
+                crate::mount_parity::validate_base_compose_against_reserved_agent(
                     &resolved,
                     p.agent_vol_name,
                     p.agent_vol_target,
                     &p.project.primary_service,
                     p.project.run_services.as_deref(),
                 )
-                .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+                .map_err(|message| crate::CellaComposeError::Config { message })?;
             }
             // Dedup first: remove mounts whose target is already covered by the
             // base service.  Only the surviving (emittable) specs are then
             // validated for named-volume identity collisions.  Running the
             // collision check on the pre-dedup list would produce false positives
             // for mounts that dedup will silently drop anyway.
-            let deduped = crate::compose_mounts::dedup_against_base(
+            let deduped = crate::mount_parity::dedup_against_base(
                 &resolved,
                 &p.project.primary_service,
                 specs,
             )
-            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            .map_err(|message| crate::CellaComposeError::Config { message })?;
             // Reject any extra named-volume source that collides with a base
             // top-level volume key bound to a different backing volume.  Compose
             // deep-merges top-level volume declarations, so our `name:` pin could
             // silently repoint an existing volume and break other services.
-            crate::compose_mounts::validate_extra_named_volumes_against_base(
+            crate::mount_parity::validate_extra_named_volumes_against_base(
                 &resolved,
                 &deduped,
                 p.project.run_services.as_deref(),
             )
-            .map_err(|message| crate::error::OrchestratorError::Config { message })?;
+            .map_err(|message| crate::CellaComposeError::Config { message })?;
             Ok(deduped)
         }
-        Err(e) => Err(crate::error::OrchestratorError::Config {
+        Err(e) => Err(crate::CellaComposeError::Config {
             message: format!(
                 "cannot resolve compose config for mount validation: {e}. \
                  Cella cannot safely emit compose mounts without validating the \
@@ -1391,7 +1386,7 @@ mod tests {
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
-            network_rule_policy: crate::NetworkRulePolicy::Enforce,
+            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1399,7 +1394,7 @@ mod tests {
             override_file: PathBuf::from("/tmp/override.yaml"),
             primary_service: "app".to_string(),
             run_services: None,
-            shutdown_action: cella_compose::ShutdownAction::StopCompose,
+            shutdown_action: crate::ShutdownAction::StopCompose,
             override_command: false,
             workspace_folder: "/workspace".to_string(),
             config_dir: PathBuf::from("/tmp"),
@@ -1445,7 +1440,7 @@ mod tests {
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
-            network_rule_policy: crate::NetworkRulePolicy::Enforce,
+            network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),
@@ -1453,7 +1448,7 @@ mod tests {
             override_file: config_dir.path().join("docker-compose.cella.yml"),
             primary_service: "web".to_string(),
             run_services: Some(vec!["web".to_string(), "worker".to_string()]),
-            shutdown_action: cella_compose::ShutdownAction::StopCompose,
+            shutdown_action: crate::ShutdownAction::StopCompose,
             override_command: false,
             workspace_folder: "/workspace/project".to_string(),
             config_dir: config_dir.path().to_path_buf(),

@@ -10,15 +10,14 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use cella_backend::{ContainerBackend, image_name_with_features};
-use cella_compose::{
+use cella_backend::progress::ProgressSender;
+use cella_backend::{ContainerBackend, compute_features_digest, image_name_with_features};
+use cella_features::ResolvedFeatures;
+
+use crate::{
     ComposeCommand, ComposeProject, FEATURES_TARGET_STAGE, ServiceBuildInfo,
     extract_service_build_info,
 };
-use cella_features::ResolvedFeatures;
-
-use crate::image::compute_features_digest;
-use crate::progress::ProgressSender;
 
 /// Result of resolving features for a compose service.
 pub struct ComposeFeaturesBuild {
@@ -100,8 +99,7 @@ pub async fn resolve_compose_features(
                 )
             })?;
 
-            let (named_content, name) =
-                cella_compose::ensure_stage_named(&content, target.as_deref())?;
+            let (named_content, name) = crate::ensure_stage_named(&content, target.as_deref())?;
 
             debug!(
                 "Original Dockerfile from compose service (stage: {name}): {}",
@@ -129,7 +127,7 @@ pub async fn resolve_compose_features(
             }
 
             let details = client.inspect_image_details(image).await?;
-            let (content, name) = cella_compose::synthetic_dockerfile(image);
+            let (content, name) = crate::synthetic_dockerfile(image);
 
             debug!("Synthetic Dockerfile for image-only compose service: {image}");
 
@@ -205,10 +203,9 @@ async fn resolve_build_image_user(
     target_stage: Option<&str>,
     progress: &ProgressSender,
 ) -> (String, Option<String>) {
-    let parsed_user = cella_compose::find_user_statement(dockerfile_content, target_stage);
+    let parsed_user = crate::find_user_statement(dockerfile_content, target_stage);
 
-    let Some(base_image) = cella_compose::find_stage_base_image(dockerfile_content, target_stage)
-    else {
+    let Some(base_image) = crate::find_stage_base_image(dockerfile_content, target_stage) else {
         debug!("Could not resolve a base image to inspect for metadata");
         return (parsed_user.unwrap_or_else(|| "root".to_string()), None);
     };
@@ -274,7 +271,7 @@ fn write_combined_dockerfile(
     stage_name: &str,
     image_user: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let combined = cella_compose::generate_combined_dockerfile(
+    let combined = crate::generate_combined_dockerfile(
         original_dockerfile,
         features_dockerfile,
         stage_name,
@@ -391,7 +388,7 @@ mod tests {
     //! `inspect_image_details` are covered by integration tests gated on the
     //! `integration-tests` feature of `cella-compose`.
 
-    use cella_compose::{FEATURES_TARGET_STAGE, find_stage_base_image, find_user_statement};
+    use crate::{FEATURES_TARGET_STAGE, find_stage_base_image, find_user_statement};
     use cella_features::dockerfile::generate_dockerfile;
 
     /// End-to-end reproduction of the original bug: a Dockerfile ending with
@@ -437,7 +434,7 @@ RUN echo install-as-node
             "features closing ARG must not shadow the global with =root"
         );
 
-        let combined = cella_compose::generate_combined_dockerfile(
+        let combined = crate::generate_combined_dockerfile(
             original,
             &feature_dockerfile,
             "base",

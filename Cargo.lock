@@ -403,9 +403,18 @@ name = "cella-compose"
 version = "0.0.39"
 dependencies = [
  "cella-backend",
+ "cella-config",
+ "cella-daemon-client",
+ "cella-env",
+ "cella-features",
+ "cella-git",
+ "cella-network",
+ "cella-protocol",
+ "cella-tool-install",
  "hex",
  "insta",
  "miette",
+ "nix 0.31.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",

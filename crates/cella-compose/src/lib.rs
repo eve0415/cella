@@ -7,12 +7,16 @@
 //! - Discovering compose-managed containers via Docker labels
 //! - Computing multi-file change detection hashes
 
+pub mod build_features;
 pub mod cli;
+pub mod combined_dockerfile_build;
 pub mod config;
 pub mod discovery;
 pub mod dockerfile;
 pub mod error;
 pub mod hash;
+pub mod mount_parity;
+pub mod orchestrate;
 pub mod override_file;
 pub mod parse;
 pub mod project;

@@ -6,22 +6,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use cella_backend::{
-    BuildOptions, BuildSecret, ContainerBackend, ImageDetails, image_name, image_name_with_features,
+    BuildOptions, BuildSecret, ContainerBackend, ImageDetails, compute_features_digest, image_name,
+    image_name_with_features,
 };
 use cella_features::ResolvedFeatures;
 
 use crate::progress::{ProgressSender, format_elapsed};
-
-/// Compute a SHA-256 digest of the features config for image tagging.
-pub fn compute_features_digest(config: &serde_json::Value) -> String {
-    let features = config.get("features").unwrap_or(&serde_json::Value::Null);
-    let canonical = serde_json::to_string(features).unwrap_or_default();
-    hex::encode(Sha256::digest(canonical.as_bytes()))
-}
 
 /// Context for building a features layer image.
 pub struct FeaturesLayerContext<'a> {

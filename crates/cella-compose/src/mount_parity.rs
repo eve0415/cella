@@ -8,8 +8,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use cella_backend::{MountConfig, MountKind, MountSpec};
-use cella_compose::config::ResolvedComposeConfig;
 use cella_env::EnvForwarding;
+
+use crate::config::ResolvedComposeConfig;
 use sha2::{Digest, Sha256};
 
 /// Return `true` if `candidate` is equal to `base` or is a descendant path of it.
@@ -364,7 +365,7 @@ pub(crate) fn validate_base_compose_against_reserved_agent(
 /// Extracted from [`validate_base_compose_against_reserved_agent`] to stay
 /// within clippy's `too_many_lines` limit.
 fn check_primary_non_volume_mount_targets(
-    svc: &cella_compose::config::ResolvedService,
+    svc: &crate::config::ResolvedService,
     primary_service: &str,
     agent_vol_target: &str,
 ) -> Result<(), String> {
@@ -480,7 +481,7 @@ fn is_compatible_base_volume_declaration(value: &serde_json::Value, expected_nam
 /// Read-only inheritance (`:ro` suffix / `read_only: true`) is always allowed.
 fn check_volumes_from(
     svc_name: &str,
-    svc: &cella_compose::config::ResolvedService,
+    svc: &crate::config::ResolvedService,
     primary_service: &str,
 ) -> Result<(), String> {
     for vf_entry in &svc.volumes_from {
@@ -1127,12 +1128,118 @@ pub fn mount_configs_to_specs(configs: &[MountConfig]) -> Vec<MountSpec> {
         .collect()
 }
 
+/// Parse a Docker mount string (`type=bind,source=…,target=…`) into a [`MountConfig`].
+pub fn parse_mount_string(s: &str) -> Option<MountConfig> {
+    let mut mount_type = "bind".to_string();
+    let mut source = String::new();
+    let mut target = String::new();
+    let mut consistency = None;
+    let mut read_only = false;
+
+    for part in s.split(',') {
+        let trimmed = part.trim();
+        if let Some((key, value)) = trimmed.split_once('=') {
+            let value = value.trim();
+            match key.trim() {
+                "type" => mount_type = value.to_string(),
+                "source" | "src" => source = value.to_string(),
+                "target" | "dst" | "destination" => target = value.to_string(),
+                "consistency" => consistency = Some(value.to_string()),
+                _ => {}
+            }
+        } else {
+            match trimmed {
+                "ro" | "readonly" => read_only = true,
+                _ => {}
+            }
+        }
+    }
+
+    if target.is_empty() {
+        return None;
+    }
+
+    Some(MountConfig {
+        mount_type,
+        source,
+        target,
+        consistency,
+        read_only,
+    })
+}
+
+/// Parse the devcontainer.json `mounts` array into [`MountConfig`] values.
+pub fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
+    let Some(mounts) = config.get("mounts").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    mounts
+        .iter()
+        .filter_map(|m| match m {
+            serde_json::Value::String(s) => parse_mount_string(s),
+            serde_json::Value::Object(obj) => {
+                let mount_type = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("bind")
+                    .to_string();
+                let source = obj
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let target = obj
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let read_only = obj
+                    .get("readOnly")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+
+                if target.is_empty() {
+                    return None;
+                }
+
+                Some(MountConfig {
+                    mount_type,
+                    source,
+                    target,
+                    consistency: None,
+                    read_only,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Merge feature mounts with devcontainer.json mounts.
+pub fn map_merged_mounts(
+    config: &serde_json::Value,
+    feature_config: Option<&cella_features::FeatureContainerConfig>,
+) -> Vec<MountConfig> {
+    let mut mounts = Vec::new();
+    if let Some(fc) = feature_config {
+        for mount_str in &fc.mounts {
+            if let Some(mc) = parse_mount_string(mount_str) {
+                mounts.push(mc);
+            }
+        }
+    } else {
+        mounts.extend(map_additional_mounts(config));
+    }
+    mounts
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use crate::config::{ResolvedComposeConfig, ResolvedService};
     use cella_backend::MountKind;
-    use cella_compose::config::{ResolvedComposeConfig, ResolvedService};
     use serde_json::json;
 
     use super::*;

@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
+use cella_backend::progress::ProgressSender;
 use cella_backend::{BuildSecret, ContainerBackend};
-use cella_compose::ComposeProject;
 
-use crate::progress::ProgressSender;
+use crate::ComposeProject;
 
 /// Result of a compose build operation.
 pub struct ComposeBuildResult {
@@ -67,7 +67,7 @@ pub async fn compose_build(
     );
 
     // Resolve features via combined-Dockerfile approach
-    let features_build = crate::compose_features::resolve_compose_features(
+    let features_build = crate::combined_dockerfile_build::resolve_compose_features(
         client,
         config,
         config_path,
@@ -83,16 +83,16 @@ pub async fn compose_build(
         } else {
             (String::new(), String::new(), true)
         };
-        let compose_secrets: Vec<cella_compose::ComposeSecret> = cfg
+        let compose_secrets: Vec<crate::ComposeSecret> = cfg
             .secrets
             .iter()
-            .map(|s| cella_compose::ComposeSecret {
+            .map(|s| crate::ComposeSecret {
                 id: s.id.clone(),
                 file: s.src.clone(),
                 environment: s.env.clone(),
             })
             .collect();
-        let override_config = cella_compose::OverrideConfig {
+        let override_config = crate::OverrideConfig {
             primary_service: project.primary_service.clone(),
             image_override: fb.image_name_override.clone(),
             override_command: project.override_command,
@@ -107,12 +107,12 @@ pub async fn compose_build(
             build_secrets: compose_secrets,
             extra_volumes: Vec::new(),
         };
-        let yaml = cella_compose::override_file::generate_override_yaml(&override_config);
-        cella_compose::override_file::write_override_file(&project.override_file, &yaml)?;
+        let yaml = crate::override_file::generate_override_yaml(&override_config);
+        crate::override_file::write_override_file(&project.override_file, &yaml)?;
     }
 
     // Run docker compose build
-    let compose_cmd = cella_compose::ComposeCommand::new(&project);
+    let compose_cmd = crate::ComposeCommand::new(&project);
     compose_cmd.build(None, false).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("docker compose build failed: {e}").into()
