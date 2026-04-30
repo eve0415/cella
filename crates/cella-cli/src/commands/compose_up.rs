@@ -142,6 +142,7 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
             let proxy_fwd = cella_orchestrator::compose_up::build_proxy_forwarding_config(
                 config,
                 workspace_root,
+                &self.ctx.resolved,
                 managed_agent,
                 skip_rules,
             );

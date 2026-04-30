@@ -306,8 +306,13 @@ async fn resolve_user_and_env(
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == crate::NetworkRulePolicy::Skip;
-    let proxy_fwd =
-        build_proxy_forwarding_config(cfg.config, cfg.workspace_root, managed_agent, skip_rules);
+    let proxy_fwd = build_proxy_forwarding_config(
+        cfg.config,
+        cfg.workspace_root,
+        cfg.resolved,
+        managed_agent,
+        skip_rules,
+    );
     let mut env_fwd =
         cella_env::prepare_env_forwarding(cfg.config, &remote_user, proxy_fwd.as_ref());
     let ssh_agent_proxy = resolve_ssh_agent_proxy_for_compose(
@@ -409,7 +414,7 @@ async fn prepare_and_start(
     let extra_env = build_extra_env(daemon_env, &env_fwd, cfg.remote_env, managed);
     let mut labels = build_compose_labels(cfg, project, &remote_user);
 
-    let settings = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
+    let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     insert_mount_input_fingerprint_label(&mut labels, &settings, &env_fwd, cfg.workspace_root);
 
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
@@ -600,7 +605,7 @@ async fn handle_compose_running(
     // Mount-input drift (settings, env forwarding, parent-git) — catches
     // mount-affecting changes that `config_hash` does not cover.
     let env_fwd_now = cella_env::prepare_env_forwarding(config, &remote_user, None);
-    let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, None)?;
+    let settings_now = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     let current_mount_fp = crate::compose_mounts::compute_mount_input_fingerprint(
         &settings_now,
         &env_fwd_now,
@@ -1197,10 +1202,12 @@ where
 pub fn build_proxy_forwarding_config(
     config: &serde_json::Value,
     workspace_root: &Path,
+    resolved: &ResolvedConfig,
     managed_agent: bool,
     skip_rules: bool,
 ) -> Option<cella_env::ProxyForwardingConfig> {
-    let settings = cella_config::CellaConfig::load(workspace_root, None).unwrap_or_default();
+    let settings =
+        cella_config::CellaConfig::load(workspace_root, Some(resolved)).unwrap_or_default();
     let toml_net = settings.network.to_network_config();
     let toml_mode_override = settings.network.mode_override();
     let dc_net = config
