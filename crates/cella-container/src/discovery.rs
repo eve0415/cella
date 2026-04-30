@@ -184,8 +184,8 @@ fn is_apple_container_entry(entry: &VersionInfo) -> bool {
 mod tests {
     use super::*;
 
-    /// Pre-built mock scripts for discovery tests (created once, reused).
     struct DiscMocks {
+        _dir: tempfile::TempDir,
         valid_version: PathBuf,
         fail: PathBuf,
         invalid_json: PathBuf,
@@ -199,21 +199,16 @@ mod tests {
 
         static MOCKS: OnceLock<DiscMocks> = OnceLock::new();
         MOCKS.get_or_init(|| {
-            let dir = PathBuf::from("/tmp/cella_disc_mock_scripts");
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = tempfile::TempDir::new().unwrap();
 
             let write_script = |name: &str, body: &str| -> PathBuf {
-                let path = dir.join(name);
-                let content = format!("#!/bin/sh\n{body}\n");
-                let needs_write =
-                    std::fs::read_to_string(&path).map_or(true, |existing| existing != content);
-                if needs_write {
-                    std::fs::write(&path, &content).unwrap();
-                }
+                let path = dir.path().join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
                 }
                 path
             };
@@ -231,6 +226,7 @@ mod tests {
                     r#"echo '[{"version":"3.0.0","appName":"some-other-tool"}]'"#,
                 ),
                 no_version: write_script("no_version.sh", "echo '[{}]'"),
+                _dir: dir,
             }
         })
     }
