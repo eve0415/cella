@@ -264,9 +264,9 @@ pub async fn config_exists_in_container(
 
 /// Inject post-start environment forwarding into a running container.
 ///
-/// Uploads SSH config files, sets git config, and runs privileged root
-/// commands. Never fails -- individual steps log warnings and are skipped
-/// on error.
+/// Uploads files, runs user commands (e.g., gitignore merge), sets git
+/// config, and runs privileged root commands. Never fails -- individual
+/// steps log warnings and are skipped on error.
 pub async fn inject_post_start(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -274,6 +274,34 @@ pub async fn inject_post_start(
     remote_user: &str,
 ) {
     upload_ssh_files(client, container_id, &post_start.file_uploads, remote_user).await;
+
+    for cmd in &post_start.user_commands {
+        let result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: cmd.clone(),
+                    user: Some(remote_user.to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(r) if r.exit_code != 0 => {
+                warn!(
+                    "Post-start command failed (exit {}): {}",
+                    r.exit_code,
+                    r.stderr.trim()
+                );
+            }
+            Err(e) => {
+                warn!("Failed to exec post-start command: {e}");
+            }
+            _ => {}
+        }
+    }
+
     apply_git_config(
         client,
         container_id,
