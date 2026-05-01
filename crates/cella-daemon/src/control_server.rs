@@ -2260,13 +2260,22 @@ mod tests {
     use cella_protocol::PortProtocol;
 
     use super::*;
+    use crate::port_manager::ContainerRegistrationInfo;
 
     /// Helper to set up a port manager with a forwarded port for testing.
     async fn pm_with_forwarded_port(container_port: u16) -> Arc<Mutex<PortManager>> {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", container_port, PortProtocol::Tcp, None);
         }
         pm
@@ -2285,8 +2294,24 @@ mod tests {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test-a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "test-b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "test-b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             // c1 gets port 3000
             guard.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
             // c2 also wants 3000 — gets remapped to 3001
@@ -2301,8 +2326,24 @@ mod tests {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", 8080, PortProtocol::Tcp, None);
             guard.handle_port_open("c2", 8080, PortProtocol::Tcp, None);
         }
@@ -3194,7 +3235,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3312,8 +3361,24 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", 4000, PortProtocol::Tcp, None);
             guard.handle_port_open("c2", 4000, PortProtocol::Tcp, None);
         }
@@ -3337,7 +3402,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3379,17 +3452,19 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container(
-                "c1",
-                "test",
-                Some("172.20.0.5".to_string()),
-                vec![cella_protocol::PortAttributes {
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![cella_protocol::PortAttributes {
                     port: cella_protocol::PortPattern::Single(9229),
                     on_auto_forward: cella_protocol::OnAutoForward::Ignore,
                     ..cella_protocol::PortAttributes::default()
                 }],
-                None,
-            );
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3425,7 +3500,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", None, vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: None,
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3462,7 +3545,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         pm.lock()
             .await
-            .register_container("c1", "test", None, vec![], None);
+            .register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: None,
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         assert!(
             pm.lock()
                 .await

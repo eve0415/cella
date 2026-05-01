@@ -32,6 +32,8 @@ struct ContainerPorts {
     detected_ports: Vec<DetectedPort>,
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
+    project_name: Option<String>,
+    branch: Option<String>,
 }
 
 /// A port detected by the in-container agent.
@@ -41,6 +43,17 @@ struct DetectedPort {
     protocol: PortProtocol,
     process: Option<String>,
     host_port: Option<u16>,
+}
+
+/// Data needed to register a container for port management.
+pub struct ContainerRegistrationInfo {
+    pub container_id: String,
+    pub container_name: String,
+    pub container_ip: Option<String>,
+    pub ports_attributes: Vec<PortAttributes>,
+    pub other_ports_attributes: Option<PortAttributes>,
+    pub project_name: Option<String>,
+    pub branch: Option<String>,
 }
 
 impl PortManager {
@@ -76,35 +89,30 @@ impl PortManager {
     /// Returns the list of host ports that were released. The caller must
     /// send `ProxyCommand::Stop` for each to stop the coordinator-owned
     /// TCP proxies.
-    pub fn register_container(
-        &mut self,
-        container_id: &str,
-        container_name: &str,
-        container_ip: Option<String>,
-        ports_attributes: Vec<PortAttributes>,
-        other_ports_attributes: Option<PortAttributes>,
-    ) -> Vec<u16> {
+    pub fn register_container(&mut self, info: ContainerRegistrationInfo) -> Vec<u16> {
         let mut released_ports = Vec::new();
 
         // Release stale allocations from a previous registration.
-        if self.containers.contains_key(container_id) {
+        if self.containers.contains_key(&info.container_id) {
             released_ports = self
                 .allocation
-                .container_ports(container_id)
+                .container_ports(&info.container_id)
                 .iter()
                 .map(|p| p.host_port)
                 .collect();
-            self.allocation.release_container(container_id);
+            self.allocation.release_container(&info.container_id);
         }
 
         self.containers.insert(
-            container_id.to_string(),
+            info.container_id,
             ContainerPorts {
-                container_name: container_name.to_string(),
-                container_ip,
+                container_name: info.container_name,
+                container_ip: info.container_ip,
                 detected_ports: Vec::new(),
-                ports_attributes,
-                other_ports_attributes,
+                ports_attributes: info.ports_attributes,
+                other_ports_attributes: info.other_ports_attributes,
+                project_name: info.project_name,
+                branch: info.branch,
             },
         );
 
@@ -278,6 +286,8 @@ impl PortManager {
                         protocol: detected.protocol,
                         process: detected.process.clone(),
                         is_orbstack: self.is_orbstack,
+                        project_name: container.project_name.clone(),
+                        branch: container.branch.clone(),
                     });
                 }
             }
@@ -311,6 +321,8 @@ pub struct ForwardedPortInfo {
     pub protocol: PortProtocol,
     pub process: Option<String>,
     pub is_orbstack: bool,
+    pub project_name: Option<String>,
+    pub branch: Option<String>,
 }
 
 impl ForwardedPortInfo {
@@ -330,6 +342,18 @@ impl ForwardedPortInfo {
             None
         }
     }
+
+    /// Get the hostname-based URL, if project and branch metadata are available.
+    pub fn hostname_url(&self) -> Option<String> {
+        let project = self.project_name.as_ref()?;
+        let branch = self.branch.as_deref().unwrap_or("main");
+        Some(cella_proxy::hostname::build_hostname_url(
+            self.container_port,
+            branch,
+            project,
+            self.is_orbstack,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -341,7 +365,15 @@ mod tests {
     #[test]
     fn register_and_detect_port() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test-container", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test-container".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, Some("node".to_string()));
 
         let ports = pm.all_forwarded_ports();
@@ -353,8 +385,24 @@ mod tests {
     #[test]
     fn port_remapping_on_conflict() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "container-a", None, vec![], None);
-        pm.register_container("c2", "container-b", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "container-a".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c2".to_string(),
+            container_name: "container-b".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
 
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         pm.handle_port_open("c2", 3000, PortProtocol::Tcp, None);
@@ -375,7 +423,15 @@ mod tests {
             on_auto_forward: OnAutoForward::Ignore,
             ..PortAttributes::default()
         }];
-        pm.register_container("c1", "test", None, attrs, None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: attrs,
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         pm.handle_port_open("c1", 9229, PortProtocol::Tcp, Some("node".to_string()));
 
         let ports = pm.all_forwarded_ports();
@@ -385,7 +441,15 @@ mod tests {
     #[test]
     fn unregister_releases_ports() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
 
         pm.unregister_container("c1");
@@ -397,7 +461,15 @@ mod tests {
     #[test]
     fn register_stores_container_ip() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: Some("172.20.0.5".to_string()),
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         assert_eq!(pm.container_ip("c1"), Some("172.20.0.5"));
         assert_eq!(pm.container_ip("c2"), None);
     }
@@ -405,7 +477,15 @@ mod tests {
     #[test]
     fn register_without_container_ip() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         assert_eq!(pm.container_ip("c1"), None);
     }
 
@@ -419,6 +499,8 @@ mod tests {
             protocol: PortProtocol::Tcp,
             process: Some("node".to_string()),
             is_orbstack: true,
+            project_name: None,
+            branch: None,
         };
         // url() always returns localhost
         assert_eq!(info.url(), "localhost:3000");
@@ -439,6 +521,8 @@ mod tests {
             protocol: PortProtocol::Tcp,
             process: None,
             is_orbstack: false,
+            project_name: None,
+            branch: None,
         };
         assert_eq!(info.orb_url(), None);
     }
@@ -453,6 +537,8 @@ mod tests {
             protocol: PortProtocol::Tcp,
             process: None,
             is_orbstack: false,
+            project_name: None,
+            branch: None,
         };
         assert_eq!(info.url(), "localhost:3001");
     }
@@ -460,7 +546,15 @@ mod tests {
     #[test]
     fn duplicate_port_open_returns_existing() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         let hp1 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, Some("node".to_string()));
         let hp2 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, Some("node".to_string()));
         assert_eq!(hp1, Some(3000));
@@ -472,7 +566,15 @@ mod tests {
     #[test]
     fn port_close_releases_allocation() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         pm.handle_port_closed("c1", 3000);
         // Re-opening should get the same port back, not 3001
@@ -483,13 +585,29 @@ mod tests {
     #[test]
     fn re_register_releases_old_allocations() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         let hp1 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         assert_eq!(hp1, Some(3000));
 
         // Re-register simulates a container restart: old allocations must be
         // released so the agent can reclaim the native port.
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         let hp2 = pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
         assert_eq!(
             hp2,
@@ -501,7 +619,15 @@ mod tests {
     #[test]
     fn update_container_ip_preserves_ports() {
         let mut pm = PortManager::new(false);
-        pm.register_container("c1", "test", None, vec![], None);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
         pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
 
         assert!(pm.update_container_ip("c1", Some("172.20.0.5".to_string())));

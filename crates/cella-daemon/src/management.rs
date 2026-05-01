@@ -212,6 +212,8 @@ async fn handle_management_request(
                 forward_ports: data.forward_ports,
                 backend_kind: data.backend_kind,
                 docker_host: data.docker_host,
+                project_name: data.project_name,
+                branch: data.branch,
             };
             handle_register(reg, &ctx.port_manager, container_handles, &ctx.proxy_cmd_tx).await
         }
@@ -325,6 +327,8 @@ struct ContainerRegistration {
     forward_ports: Vec<u16>,
     backend_kind: Option<String>,
     docker_host: Option<String>,
+    project_name: Option<String>,
+    branch: Option<String>,
 }
 
 /// Handle container registration.
@@ -335,15 +339,20 @@ async fn handle_register(
     proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
 ) -> ManagementResponse {
     // Register with port manager
+    let container_id = reg.container_id.clone();
+    let container_name = reg.container_name.clone();
     {
+        use crate::port_manager::ContainerRegistrationInfo;
         let mut pm = port_manager.lock().await;
-        let released = pm.register_container(
-            &reg.container_id,
-            &reg.container_name,
-            reg.container_ip,
-            reg.ports_attributes,
-            reg.other_ports_attributes,
-        );
+        let released = pm.register_container(ContainerRegistrationInfo {
+            container_id: reg.container_id,
+            container_name: reg.container_name,
+            container_ip: reg.container_ip,
+            ports_attributes: reg.ports_attributes,
+            other_ports_attributes: reg.other_ports_attributes,
+            project_name: reg.project_name,
+            branch: reg.branch,
+        });
 
         // Stop coordinator-owned proxies for ports released by re-registration.
         for hp in released {
@@ -355,7 +364,7 @@ async fn handle_register(
         // Pre-allocate host ports for forwardPorts
         for &fwd_port in &reg.forward_ports {
             pm.handle_port_open(
-                &reg.container_id,
+                &container_id,
                 fwd_port,
                 cella_protocol::PortProtocol::Tcp,
                 None,
@@ -367,9 +376,9 @@ async fn handle_register(
     {
         let mut handles = container_handles.lock().await;
         handles.insert(
-            reg.container_name.clone(),
+            container_name.clone(),
             ContainerHandle {
-                container_id: reg.container_id,
+                container_id,
                 agent_state: Arc::new(AgentConnectionState::new()),
                 backend_kind: reg.backend_kind,
                 docker_host: reg.docker_host,
@@ -378,11 +387,9 @@ async fn handle_register(
         );
     }
 
-    info!("Registered container {}", reg.container_name);
+    info!("Registered container {container_name}");
 
-    ManagementResponse::ContainerRegistered {
-        container_name: reg.container_name,
-    }
+    ManagementResponse::ContainerRegistered { container_name }
 }
 
 /// Handle container deregistration.
@@ -423,14 +430,17 @@ async fn handle_query_ports(port_manager: &Arc<Mutex<PortManager>>) -> Managemen
         let pm = port_manager.lock().await;
         pm.all_forwarded_ports()
             .into_iter()
-            .map(|p| ForwardedPortDetail {
-                container_name: p.container_name.clone(),
-                container_port: p.container_port,
-                host_port: p.host_port,
-                protocol: p.protocol,
-                process: p.process.clone(),
-                url: p.url(),
-                hostname: None,
+            .map(|p| {
+                let hostname = p.hostname_url();
+                ForwardedPortDetail {
+                    container_name: p.container_name.clone(),
+                    container_port: p.container_port,
+                    host_port: p.host_port,
+                    protocol: p.protocol,
+                    process: p.process.clone(),
+                    url: p.url(),
+                    hostname,
+                }
             })
             .collect()
     };
