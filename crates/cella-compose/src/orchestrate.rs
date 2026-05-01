@@ -859,6 +859,7 @@ async fn build_override_and_start(
     let mut labels = build_compose_labels(cfg, project, remote_user);
 
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
+    cella_tool_install::ensure_tool_config_paths(&settings);
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
