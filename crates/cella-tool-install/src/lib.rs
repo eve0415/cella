@@ -190,6 +190,11 @@ pub fn normalize_nvim_version_tag(version: &str) -> String {
 }
 
 /// Install nvim from GitHub releases into the container.
+///
+/// # Errors
+///
+/// Returns an error string if the architecture is unsupported, the download
+/// fails, or post-install verification fails.
 pub async fn install_nvim(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -293,6 +298,11 @@ pub async fn install_nvim(
 /// Install tmux via the container's package manager.
 ///
 /// Tries apt-get, apk, dnf, pacman, zypper in order.
+///
+/// # Errors
+///
+/// Returns an error string if no supported package manager is found or
+/// the install command fails.
 pub async fn install_tmux(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -1439,28 +1449,27 @@ fn render_failure_reason(install_result: Option<&ExecResult>, reason: &str) -> S
     }
 }
 
-/// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
+/// What to install and where.
+pub struct InstallSpec<'a> {
+    pub settings: &'a cella_config::CellaConfig,
+    pub tools: &'a [ToolName],
+    pub probed_env: Option<&'a HashMap<String, String>>,
+}
+
+/// Install the specified tools inside a container.
 ///
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
 /// Nvim and tmux run in parallel with the other branches.
-///
-/// After each install attempt, `verified_install_step` confirms the binary is
-/// callable via the same login-shell wrap `cella exec` uses. When the tool is
-/// installed elsewhere (e.g. `~/.local/bin`, an nvm-managed npm global), a
-/// `/usr/local/bin/<tool>` symlink is created so repeated `cella up` runs
-/// self-heal. A `✗` is rendered with the installer's exit code + stderr when
-/// verification still fails.
 pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     shell: &str,
-    settings: &cella_config::CellaConfig,
-    tools: &[ToolName],
-    probed_env: Option<&ProbedEnv>,
+    spec: &InstallSpec<'_>,
     progress: &ProgressSender,
 ) {
+    let (settings, tools, probed_env) = (spec.settings, spec.tools, spec.probed_env);
     if tools.is_empty() {
         return;
     }

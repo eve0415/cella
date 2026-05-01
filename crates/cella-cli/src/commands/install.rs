@@ -93,24 +93,8 @@ impl InstallArgs {
             .or_else(|| container.container_user.clone())
             .unwrap_or_else(|| "root".to_string());
 
-        // Check install status for all tools
-        let mut installed = Vec::new();
-        let mut not_installed = Vec::new();
-        for tool in ToolName::ALL {
-            let is_installed = cella_orchestrator::tool_install::is_tool_installed(
-                client.as_ref(),
-                &container.id,
-                &remote_user,
-                *tool,
-                None,
-            )
-            .await;
-            if is_installed {
-                installed.push(*tool);
-            } else {
-                not_installed.push(*tool);
-            }
-        }
+        let (installed, not_installed) =
+            probe_install_status(client.as_ref(), &container.id, &remote_user).await;
 
         // Determine which tools to install
         let to_install = if self.all {
@@ -129,38 +113,8 @@ impl InstallArgs {
             return Ok(());
         }
 
-        // Apply version override if specified
-        let workspace_path = container
-            .labels
-            .get("dev.cella.workspace_path")
-            .map(|p| PathBuf::from(p));
-        let resolved = workspace_path
-            .as_deref()
-            .and_then(|p| cella_config::devcontainer::resolve::config(p, None).ok());
-        let mut settings = cella_config::CellaConfig::load(
-            workspace_path
-                .as_deref()
-                .unwrap_or_else(|| std::path::Path::new(".")),
-            resolved.as_ref(),
-        )
-        .unwrap_or_default();
-
-        if let Some(ref ver) = self.version {
-            for tool in &to_install {
-                match tool {
-                    ToolName::ClaudeCode => settings.tools.claude_code.version = ver.clone(),
-                    ToolName::Codex => settings.tools.codex.version = ver.clone(),
-                    ToolName::Gemini => settings.tools.gemini.version = ver.clone(),
-                    ToolName::Nvim => settings.tools.nvim.version = ver.clone(),
-                    ToolName::Tmux => {
-                        return Err(
-                            "tmux does not support --version (installed via system package manager)"
-                                .into(),
-                        );
-                    }
-                }
-            }
-        }
+        let settings =
+            load_settings_with_version(&container, self.version.as_deref(), &to_install)?;
 
         // Detect shell for verification
         let shell = cella_orchestrator::shell_detect::detect_shell(
@@ -173,14 +127,17 @@ impl InstallArgs {
         // Install using the shared install_tools machinery
         let progress = crate::progress::Progress::new(true, crate::progress::Verbosity::Normal);
         let (sender, renderer) = crate::progress::bridge(&progress);
+        let spec = cella_orchestrator::tool_install::InstallSpec {
+            settings: &settings,
+            tools: &to_install,
+            probed_env: None,
+        };
         cella_orchestrator::tool_install::install_tools(
             client.as_ref(),
             &container.id,
             &remote_user,
             &shell,
-            &settings,
-            &to_install,
-            None,
+            &spec,
             &sender,
         )
         .await;
@@ -260,4 +217,68 @@ fn resolve_tool_args(
         tools.push(tool);
     }
     Ok(tools)
+}
+
+async fn probe_install_status(
+    client: &dyn cella_backend::ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) -> (Vec<ToolName>, Vec<ToolName>) {
+    let mut installed = Vec::new();
+    let mut not_installed = Vec::new();
+    for tool in ToolName::ALL {
+        if cella_orchestrator::tool_install::is_tool_installed(
+            client,
+            container_id,
+            remote_user,
+            *tool,
+            None,
+        )
+        .await
+        {
+            installed.push(*tool);
+        } else {
+            not_installed.push(*tool);
+        }
+    }
+    (installed, not_installed)
+}
+
+fn load_settings_with_version(
+    container: &cella_backend::ContainerInfo,
+    version: Option<&str>,
+    tools: &[ToolName],
+) -> Result<cella_config::CellaConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let workspace_path = container
+        .labels
+        .get("dev.cella.workspace_path")
+        .map(PathBuf::from);
+    let resolved = workspace_path
+        .as_deref()
+        .and_then(|p| cella_config::devcontainer::resolve::config(p, None).ok());
+    let mut settings = cella_config::CellaConfig::load(
+        workspace_path
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        resolved.as_ref(),
+    )
+    .unwrap_or_default();
+
+    if let Some(ver) = version {
+        for tool in tools {
+            match tool {
+                ToolName::ClaudeCode => settings.tools.claude_code.version = ver.to_string(),
+                ToolName::Codex => settings.tools.codex.version = ver.to_string(),
+                ToolName::Gemini => settings.tools.gemini.version = ver.to_string(),
+                ToolName::Nvim => settings.tools.nvim.version = ver.to_string(),
+                ToolName::Tmux => {
+                    return Err(
+                        "tmux does not support --version (installed via system package manager)"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(settings)
 }

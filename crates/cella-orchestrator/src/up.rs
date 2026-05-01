@@ -316,19 +316,24 @@ impl EnsureUpContext<'_> {
             .iter()
             .filter_map(|name| crate::tool_install::ToolName::from_config_name(name))
             .collect();
+        let spec = crate::tool_install::InstallSpec {
+            settings: &settings,
+            tools: &tools_to_install,
+            probed_env: probed_env.as_ref(),
+        };
         crate::tool_install::install_tools(
             self.client,
             container_id,
             remote_user,
             &shell,
-            &settings,
-            &tools_to_install,
-            probed_env.as_ref(),
+            &spec,
             &self.progress,
         )
         .await;
 
-        let final_probed = if !tools_to_install.is_empty() {
+        let final_probed = if tools_to_install.is_empty() {
+            probed_env
+        } else {
             run_step_result(&self.progress, "Updating environment cache...", async {
                 Ok::<_, std::convert::Infallible>(
                     crate::env_cache::probe_and_cache_user_env(
@@ -345,8 +350,6 @@ impl EnsureUpContext<'_> {
             .await
             .ok()
             .flatten()
-        } else {
-            probed_env
         };
 
         let lifecycle_env = final_probed.as_ref().map_or_else(
@@ -1138,19 +1141,24 @@ impl EnsureUpContext<'_> {
             .iter()
             .filter_map(|name| crate::tool_install::ToolName::from_config_name(name))
             .collect();
+        let spec = crate::tool_install::InstallSpec {
+            settings,
+            tools: &tools_to_install,
+            probed_env: probed_env.as_ref(),
+        };
         crate::tool_install::install_tools(
             self.client,
             container_id,
             remote_user,
             shell,
-            settings,
-            &tools_to_install,
-            probed_env.as_ref(),
+            &spec,
             &self.progress,
         )
         .await;
 
-        let final_probed = if !tools_to_install.is_empty() {
+        let final_probed = if tools_to_install.is_empty() {
+            probed_env
+        } else {
             run_step_result(&self.progress, "Updating environment cache...", async {
                 Ok::<_, std::convert::Infallible>(
                     crate::env_cache::probe_and_cache_user_env(
@@ -1167,8 +1175,6 @@ impl EnsureUpContext<'_> {
             .await
             .ok()
             .flatten()
-        } else {
-            probed_env
         };
 
         let lifecycle_env = final_probed.as_ref().map_or_else(

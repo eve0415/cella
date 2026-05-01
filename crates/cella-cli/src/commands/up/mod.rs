@@ -578,18 +578,18 @@ impl UpContext {
             .iter()
             .filter_map(|name| cella_orchestrator::tool_install::ToolName::from_config_name(name))
             .collect();
-        self.install_tools(
-            container_id,
-            remote_user,
-            &shell,
+        let spec = cella_orchestrator::tool_install::InstallSpec {
             settings,
-            &tools_to_install,
-            probed_env.as_ref(),
-        )
-        .await;
+            tools: &tools_to_install,
+            probed_env: probed_env.as_ref(),
+        };
+        self.install_tools(container_id, remote_user, &shell, &spec)
+            .await;
 
         // Re-probe after tool installation to capture PATH changes
-        let final_probed = if !tools_to_install.is_empty() {
+        let final_probed = if tools_to_install.is_empty() {
+            probed_env
+        } else {
             self.progress
                 .run_step(
                     "Updating environment cache...",
@@ -603,8 +603,6 @@ impl UpContext {
                 )
                 .await
                 .or(probed_env)
-        } else {
-            probed_env
         };
 
         let lifecycle_env = final_probed.as_ref().map_or_else(
@@ -621,9 +619,7 @@ impl UpContext {
         container_id: &str,
         remote_user: &str,
         shell: &str,
-        settings: &cella_config::CellaConfig,
-        tools: &[cella_orchestrator::tool_install::ToolName],
-        probed_env: Option<&std::collections::HashMap<String, String>>,
+        spec: &cella_orchestrator::tool_install::InstallSpec<'_>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         cella_orchestrator::tool_install::install_tools(
@@ -631,9 +627,7 @@ impl UpContext {
             container_id,
             remote_user,
             shell,
-            settings,
-            tools,
-            probed_env,
+            spec,
             &sender,
         )
         .await;

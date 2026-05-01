@@ -474,31 +474,31 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── tmux command ────────────────────────────────────────────────
+    // ── install command ──────────────────────────────────────────────
 
     #[test]
-    fn parse_tmux_minimal() {
-        let cli = parse(&["cella", "tmux"]).unwrap();
-        assert!(matches!(cli.command, super::commands::Command::Tmux(_)));
+    fn parse_install_minimal() {
+        let cli = parse(&["cella", "install"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Install(_)));
     }
 
     #[test]
-    fn parse_tmux_force() {
-        let cli = parse(&["cella", "tmux", "--force"]).unwrap();
-        if let super::commands::Command::Tmux(args) = cli.command {
-            assert!(args.force);
+    fn parse_install_with_tools() {
+        let cli = parse(&["cella", "install", "claude-code", "nvim"]).unwrap();
+        if let super::commands::Command::Install(args) = cli.command {
+            assert_eq!(args.tools, vec!["claude-code", "nvim"]);
         } else {
-            panic!("expected Tmux command");
+            panic!("expected Install command");
         }
     }
 
     #[test]
-    fn parse_tmux_with_extra_args() {
-        let cli = parse(&["cella", "tmux", "--", "list-sessions"]).unwrap();
-        if let super::commands::Command::Tmux(args) = cli.command {
-            assert_eq!(args.extra_args, vec!["list-sessions"]);
+    fn parse_install_all() {
+        let cli = parse(&["cella", "install", "--all"]).unwrap();
+        if let super::commands::Command::Install(args) = cli.command {
+            assert!(args.all);
         } else {
-            panic!("expected Tmux command");
+            panic!("expected Install command");
         }
     }
 

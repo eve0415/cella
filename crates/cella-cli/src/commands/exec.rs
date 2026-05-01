@@ -118,29 +118,8 @@ impl ExecArgs {
         // Determine workdir: --workdir > label
         let working_dir = self.workdir.or(label_workdir);
 
-        // Build environment: probed env (merged with label env) + --remote-env + terminal env
-        let base_env = if let Some(probed) =
-            read_probed_env_cache(client.as_ref(), &container.id, &user).await
-        {
-            cella_env::user_env_probe::merge_env(&probed, &label_env)
-        } else {
-            label_env
-        };
-        let mut env = base_env;
+        let mut env = build_exec_env(client.as_ref(), &container, &user, label_env).await;
         env.extend(self.remote_env);
-
-        // SSH_AUTH_SOCK fallback for containers created before forwarding env was stored
-        ensure_ssh_auth_sock(client.as_ref(), &container.id, &user, &mut env).await;
-
-        // Forward AI provider API keys from host environment
-        super::append_ai_keys(&mut env, &container.labels);
-
-        // Forward terminal environment variables
-        for var in super::TERMINAL_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                env.push(format!("{var}={val}"));
-            }
-        }
 
         // Wrap command in a login shell so that shell profiles are sourced
         // and the full PATH (including ~/.local/bin etc.) is available.
@@ -177,19 +156,40 @@ impl ExecArgs {
                 )
                 .await?;
             drop(title_guard);
-            if exit_code == 127 {
-                if let Some(binary) = self.command.first() {
-                    if let Some(tool) = ToolName::from_binary_name(binary) {
-                        eprintln!(
-                            "{binary} is not installed. Run `cella install {}` to install it.",
-                            tool.config_name(),
-                        );
-                    }
-                }
+            if exit_code == 127
+                && let Some(binary) = self.command.first()
+                && let Some(tool) = ToolName::from_binary_name(binary)
+            {
+                eprintln!(
+                    "{binary} is not installed. Run `cella install {}` to install it.",
+                    tool.config_name(),
+                );
             }
             std::process::exit(i32::try_from(exit_code).unwrap_or(125));
         }
 
         Ok(())
     }
+}
+
+async fn build_exec_env(
+    client: &dyn cella_backend::ContainerBackend,
+    container: &cella_backend::ContainerInfo,
+    user: &str,
+    label_env: Vec<String>,
+) -> Vec<String> {
+    let base_env = if let Some(probed) = read_probed_env_cache(client, &container.id, user).await {
+        cella_env::user_env_probe::merge_env(&probed, &label_env)
+    } else {
+        label_env
+    };
+    let mut env = base_env;
+    ensure_ssh_auth_sock(client, &container.id, user, &mut env).await;
+    super::append_ai_keys(&mut env, &container.labels);
+    for var in super::TERMINAL_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            env.push(format!("{var}={val}"));
+        }
+    }
+    env
 }
