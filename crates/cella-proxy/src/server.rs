@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::service::service_fn;
@@ -20,6 +20,7 @@ use crate::router::{BackendTarget, ProxyMode, RouteKey, RouteTable};
 
 /// Shared state for the proxy server.
 pub type SharedRouteTable = Arc<RwLock<RouteTable>>;
+type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Start the HTTP reverse proxy server.
 ///
@@ -67,7 +68,7 @@ async fn handle_connection(
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
         .http1()
         .keep_alive(true)
-        .serve_connection(
+        .serve_connection_with_upgrades(
             io,
             service_fn(move |req| {
                 let rt = route_table.clone();
@@ -83,7 +84,7 @@ async fn handle_request(
     req: Request<Incoming>,
     peer: SocketAddr,
     route_table: &SharedRouteTable,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let host = req
         .headers()
         .get(header::HOST)
@@ -122,12 +123,13 @@ async fn handle_request(
 }
 
 async fn proxy_request(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     peer: SocketAddr,
     original_host: &str,
     target: &BackendTarget,
     is_websocket: bool,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
+    let client_upgrade = is_websocket.then(|| hyper::upgrade::on(&mut req));
     let backend_addr = match &target.mode {
         ProxyMode::Localhost => format!("127.0.0.1:{}", target.target_port),
         ProxyMode::DirectIp(ip) => format!("{ip}:{}", target.target_port),
@@ -169,14 +171,31 @@ async fn proxy_request(
 
     let proxied_req = build_proxied_request(req, original_host, peer, is_websocket);
     match sender.send_request(proxied_req).await {
-        Ok(resp) => {
-            let (parts, body) = resp.into_parts();
-            let bytes = body
-                .collect()
-                .await
-                .map(http_body_util::Collected::to_bytes)
-                .unwrap_or_default();
-            Response::from_parts(parts, Full::new(bytes))
+        Ok(mut resp) => {
+            if is_websocket && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                if let Some(client_upgrade) = client_upgrade {
+                    let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                    let host = original_host.to_string();
+                    tokio::spawn(async move {
+                        let (client_io, upstream_io) =
+                            match tokio::join!(client_upgrade, upstream_upgrade) {
+                                (Ok(client), Ok(upstream)) => (client, upstream),
+                                (Err(e), _) | (_, Err(e)) => {
+                                    debug!("WebSocket upgrade for {host} failed: {e}");
+                                    return;
+                                }
+                            };
+                        let mut client_io = TokioIo::new(client_io);
+                        let mut upstream_io = TokioIo::new(upstream_io);
+                        if let Err(e) =
+                            tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                        {
+                            debug!("WebSocket stream for {host} ended: {e}");
+                        }
+                    });
+                }
+            }
+            resp.map(|body| body.map_err(Into::into).boxed())
         }
         Err(e) => {
             debug!("Backend request failed: {e}");
@@ -235,7 +254,7 @@ fn is_websocket_upgrade_headers(headers: &hyper::HeaderMap) -> bool {
     has_upgrade && is_websocket
 }
 
-fn unavailable_response(target: &BackendTarget) -> Response<Full<Bytes>> {
+fn unavailable_response(target: &BackendTarget) -> Response<ProxyBody> {
     html_response(
         StatusCode::BAD_GATEWAY,
         error_page::backend_unreachable(
@@ -249,30 +268,36 @@ fn unavailable_response(target: &BackendTarget) -> Response<Full<Bytes>> {
     )
 }
 
-fn html_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+fn html_response(status: StatusCode, body: String) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(full(body))
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Internal error")))
+                .body(full("Internal error".to_string()))
                 .expect("static response")
         })
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain")
-        .body(Full::new(Bytes::from(message.to_string())))
+        .body(full(message.to_string()))
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Internal error")))
+                .body(full("Internal error".to_string()))
                 .expect("static response")
         })
+}
+
+fn full(data: String) -> ProxyBody {
+    Full::new(Bytes::from(data))
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 #[cfg(test)]
@@ -548,6 +573,191 @@ mod tests {
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"via host port");
+
+        server.abort();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_response_body_without_buffering() {
+        use futures_util::StreamExt;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        use tokio::sync::oneshot;
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let release_rx = std::sync::Mutex::new(Some(release_rx));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(move |_req| {
+                        let rx = release_rx.lock().unwrap().take().unwrap();
+                        async move {
+                            let first = futures_util::stream::once(async {
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"first")))
+                            });
+                            let second = futures_util::stream::once(async move {
+                                let _ = rx.await;
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"second")))
+                            });
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .body(StreamBody::new(first.chain(second)))
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut table = RouteTable::new();
+        table.insert(
+            RouteKey {
+                project: "myapp".to_string(),
+                branch: "main".to_string(),
+                port: 3000,
+            },
+            BackendTarget {
+                container_id: "c1".to_string(),
+                container_name: "cella-myapp".to_string(),
+                target_port: backend_addr.port(),
+                mode: ProxyMode::Localhost,
+            },
+        );
+        let rt: SharedRouteTable = Arc::new(RwLock::new(table));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = proxy_listener.accept().await.unwrap();
+            let _ = handle_connection(stream, peer, rt).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .header("Host", "3000.main.myapp.localhost")
+            .body(Full::<Bytes>::default())
+            .unwrap();
+        let mut resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            resp.body_mut().frame(),
+        )
+        .await
+        .expect("first body chunk should arrive before backend finishes")
+        .expect("body should have a frame")
+        .unwrap()
+        .into_data()
+        .unwrap();
+        assert_eq!(&first[..], b"first");
+
+        release_tx.send(()).unwrap();
+        server.abort();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_websocket_upgrade_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut buf).await.unwrap();
+                request.push(buf[0]);
+            }
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .to_ascii_lowercase()
+                    .contains("upgrade: websocket")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Connection: Upgrade\r\n\
+                      Upgrade: websocket\r\n\
+                      \r\n",
+                )
+                .await
+                .unwrap();
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let mut table = RouteTable::new();
+        table.insert(
+            RouteKey {
+                project: "myapp".to_string(),
+                branch: "main".to_string(),
+                port: 3000,
+            },
+            BackendTarget {
+                container_id: "c1".to_string(),
+                container_name: "cella-myapp".to_string(),
+                target_port: backend_addr.port(),
+                mode: ProxyMode::Localhost,
+            },
+        );
+        let rt: SharedRouteTable = Arc::new(RwLock::new(table));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = proxy_listener.accept().await.unwrap();
+            let _ = handle_connection(stream, peer, rt).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /socket HTTP/1.1\r\n\
+                  Host: 3000.main.myapp.localhost\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        let mut b = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut b).await.unwrap();
+            response.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_exact(&mut echoed),
+        )
+        .await
+        .expect("upgraded bytes should be forwarded")
+        .unwrap();
+        assert_eq!(&echoed, b"ping");
 
         server.abort();
         backend.abort();

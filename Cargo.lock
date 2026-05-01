@@ -658,6 +658,7 @@ dependencies = [
 name = "cella-proxy"
 version = "0.0.40"
 dependencies = [
+ "futures-util",
  "hex",
  "http-body-util",
  "hyper",
