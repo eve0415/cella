@@ -635,6 +635,83 @@ pub async fn setup_plugin_manifests(
     chown_in_container(client, container_id, remote_user, &plugins_dir).await;
 }
 
+// ── Tool config path pre-creation ────────────────────────────────────────────
+
+/// Pre-create missing tool config files and directories on the host.
+///
+/// Must be called before [`build_tool_config_mount_specs`] so the `host_*`
+/// detection functions find the paths and emit bind-mount specs.
+pub fn ensure_tool_config_paths(settings: &cella_config::CellaConfig) {
+    let Some(home) = cella_env::paths::home_dir() else {
+        warn!("cannot determine HOME; skipping tool config path creation");
+        return;
+    };
+    ensure_tool_config_paths_in(&home, settings);
+}
+
+fn ensure_tool_config_paths_in(home: &std::path::Path, settings: &cella_config::CellaConfig) {
+    if settings.tools.claude_code.forward_config {
+        ensure_file(&home.join(".claude.json"), "{}");
+        ensure_dir(&home.join(".claude"));
+    }
+
+    if settings.tools.codex.forward_config {
+        ensure_dir(&home.join(".codex"));
+    }
+
+    if settings.tools.gemini.forward_config {
+        ensure_dir(&home.join(".gemini"));
+    }
+
+    if settings.tools.nvim.forward_config {
+        ensure_dir(&home.join(".config").join("nvim"));
+    }
+
+    if settings.tools.tmux.forward_config {
+        ensure_file(&home.join(".tmux.conf"), "");
+    }
+}
+
+fn ensure_file(path: &std::path::Path, content: &str) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("cannot create parent directory {}: {e}", parent.display());
+            return;
+        }
+    }
+    match std::fs::write(path, content) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            debug!("created {}", path.display());
+        }
+        Err(e) => warn!("cannot create {}: {e}", path.display()),
+    }
+}
+
+fn ensure_dir(path: &std::path::Path) {
+    if path.is_dir() {
+        return;
+    }
+    match std::fs::create_dir_all(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            }
+            debug!("created {}", path.display());
+        }
+        Err(e) => warn!("cannot create {}: {e}", path.display()),
+    }
+}
+
 // ── Tool config mounts ───────────────────────────────────────────────────────
 
 /// Build bind/tmpfs mount specs for tool config directories (Claude Code, Codex, Gemini, nvim, tmux).
@@ -2088,5 +2165,117 @@ mod tests {
             !saw_completed,
             "must not render ✓ when installer exited non-zero",
         );
+    }
+
+    // ── ensure_tool_config_paths tests ─────────────────────────────────────
+
+    #[test]
+    fn ensure_creates_claude_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        let claude_json = tmp.path().join(".claude.json");
+        assert!(claude_json.is_file(), "~/.claude.json should be created");
+        let content = std::fs::read_to_string(&claude_json).unwrap();
+        assert_eq!(content, "{}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&claude_json)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn ensure_creates_tool_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        assert!(tmp.path().join(".claude").is_dir());
+        assert!(
+            !tmp.path().join(".claude/plugins").exists(),
+            "plugins/ must not be auto-created"
+        );
+        assert!(tmp.path().join(".codex").is_dir());
+        assert!(tmp.path().join(".gemini").is_dir());
+        assert!(tmp.path().join(".config/nvim").is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join(".claude"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn ensure_creates_tmux_conf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        let tmux_conf = tmp.path().join(".tmux.conf");
+        assert!(tmux_conf.is_file());
+        assert!(std::fs::read_to_string(&tmux_conf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ensure_does_not_overwrite_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        let claude_json = tmp.path().join(".claude.json");
+        std::fs::write(&claude_json, r#"{"existing": true}"#).unwrap();
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        let content = std::fs::read_to_string(&claude_json).unwrap();
+        assert_eq!(content, r#"{"existing": true}"#);
+    }
+
+    #[test]
+    fn ensure_skips_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.claude_code.forward_config = false;
+        settings.tools.codex.forward_config = false;
+        settings.tools.gemini.forward_config = false;
+        settings.tools.nvim.forward_config = false;
+        settings.tools.tmux.forward_config = false;
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        assert!(!tmp.path().join(".claude.json").exists());
+        assert!(!tmp.path().join(".claude").exists());
+        assert!(!tmp.path().join(".codex").exists());
+        assert!(!tmp.path().join(".gemini").exists());
+        assert!(!tmp.path().join(".config/nvim").exists());
+        assert!(!tmp.path().join(".tmux.conf").exists());
+    }
+
+    #[test]
+    fn ensure_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        let content = std::fs::read_to_string(tmp.path().join(".claude.json")).unwrap();
+        assert_eq!(content, "{}");
     }
 }
