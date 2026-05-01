@@ -282,3 +282,38 @@ fn load_settings_with_version(
     }
     Ok(settings)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_tool_args_valid_names() {
+        let args = vec!["claude-code".to_string(), "nvim".to_string()];
+        let result = resolve_tool_args(&args, &[]).unwrap();
+        assert_eq!(result, vec![ToolName::ClaudeCode, ToolName::Nvim]);
+    }
+
+    #[test]
+    fn resolve_tool_args_unknown_name() {
+        let args = vec!["vim".to_string()];
+        let err = resolve_tool_args(&args, &[]).unwrap_err();
+        assert!(err.to_string().contains("Unknown tool: vim"));
+    }
+
+    #[test]
+    fn resolve_tool_args_skips_installed() {
+        let args = vec!["claude-code".to_string(), "nvim".to_string()];
+        let installed = vec![ToolName::ClaudeCode];
+        let result = resolve_tool_args(&args, &installed).unwrap();
+        assert_eq!(result, vec![ToolName::Nvim]);
+    }
+
+    #[test]
+    fn resolve_tool_args_all_installed() {
+        let args = vec!["codex".to_string()];
+        let installed = vec![ToolName::Codex];
+        let result = resolve_tool_args(&args, &installed).unwrap();
+        assert!(result.is_empty());
+    }
+}

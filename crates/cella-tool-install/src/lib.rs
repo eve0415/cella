@@ -96,6 +96,19 @@ impl std::fmt::Display for ToolName {
     }
 }
 
+/// Parse config names into `ToolName`s, warning on unrecognized entries.
+pub fn resolve_tool_names(names: &[String]) -> Vec<ToolName> {
+    names
+        .iter()
+        .filter_map(|name| {
+            ToolName::from_config_name(name).or_else(|| {
+                warn!("Unknown tool name in install list: {name:?} (valid: claude-code, codex, gemini, nvim, tmux)");
+                None
+            })
+        })
+        .collect()
+}
+
 /// Check if a named tool is installed in a container.
 pub async fn is_tool_installed(
     client: &dyn ContainerBackend,
@@ -1610,6 +1623,26 @@ mod tests {
     #[test]
     fn tool_name_binary_name_claude_maps_to_claude() {
         assert_eq!(ToolName::ClaudeCode.binary_name(), "claude");
+    }
+
+    #[test]
+    fn resolve_tool_names_valid() {
+        let names = vec!["claude-code".to_string(), "nvim".to_string()];
+        let result = resolve_tool_names(&names);
+        assert_eq!(result, vec![ToolName::ClaudeCode, ToolName::Nvim]);
+    }
+
+    #[test]
+    fn resolve_tool_names_skips_unknown() {
+        let names = vec!["claude-code".to_string(), "vim".to_string()];
+        let result = resolve_tool_names(&names);
+        assert_eq!(result, vec![ToolName::ClaudeCode]);
+    }
+
+    #[test]
+    fn resolve_tool_names_empty() {
+        let result = resolve_tool_names(&[]);
+        assert!(result.is_empty());
     }
 
     // ── normalize_nvim_version_tag ─────────────────────────────────────────

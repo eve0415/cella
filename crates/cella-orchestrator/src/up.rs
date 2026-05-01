@@ -310,12 +310,7 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        let tools_to_install: Vec<crate::tool_install::ToolName> = settings
-            .tools
-            .install
-            .iter()
-            .filter_map(|name| crate::tool_install::ToolName::from_config_name(name))
-            .collect();
+        let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
         let spec = crate::tool_install::InstallSpec {
             settings: &settings,
             tools: &tools_to_install,
@@ -1135,12 +1130,7 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        let tools_to_install: Vec<crate::tool_install::ToolName> = settings
-            .tools
-            .install
-            .iter()
-            .filter_map(|name| crate::tool_install::ToolName::from_config_name(name))
-            .collect();
+        let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
         let spec = crate::tool_install::InstallSpec {
             settings,
             tools: &tools_to_install,

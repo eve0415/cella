@@ -572,12 +572,8 @@ impl UpContext {
         }
 
         // Install tools listed in [tools] install = [...]
-        let tools_to_install: Vec<cella_orchestrator::tool_install::ToolName> = settings
-            .tools
-            .install
-            .iter()
-            .filter_map(|name| cella_orchestrator::tool_install::ToolName::from_config_name(name))
-            .collect();
+        let tools_to_install =
+            cella_orchestrator::tool_install::resolve_tool_names(&settings.tools.install);
         let spec = cella_orchestrator::tool_install::InstallSpec {
             settings,
             tools: &tools_to_install,
