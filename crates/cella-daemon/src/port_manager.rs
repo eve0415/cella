@@ -34,6 +34,8 @@ struct ContainerPorts {
     other_ports_attributes: Option<PortAttributes>,
     project_name: Option<String>,
     branch: Option<String>,
+    project_slug: Option<String>,
+    branch_slug: Option<String>,
 }
 
 /// A port detected by the in-container agent.
@@ -103,6 +105,16 @@ impl PortManager {
             self.allocation.release_container(&info.container_id);
         }
 
+        let project_slug = info
+            .project_name
+            .as_deref()
+            .map(cella_proxy::hostname::sanitize_branch)
+            .filter(|slug| !slug.is_empty());
+        let branch = info.branch.clone().unwrap_or_else(|| "main".to_string());
+        let branch_slug = project_slug
+            .as_ref()
+            .map(|project| self.collision_safe_branch_slug(project, &branch));
+
         self.containers.insert(
             info.container_id,
             ContainerPorts {
@@ -113,10 +125,33 @@ impl PortManager {
                 other_ports_attributes: info.other_ports_attributes,
                 project_name: info.project_name,
                 branch: info.branch,
+                project_slug,
+                branch_slug,
             },
         );
 
         released_ports
+    }
+
+    fn collision_safe_branch_slug(&self, project_slug: &str, branch: &str) -> String {
+        let sanitized = cella_proxy::hostname::sanitize_branch(branch);
+        let fallback = if sanitized.is_empty() {
+            "main".to_string()
+        } else {
+            sanitized
+        };
+
+        let collides = self.containers.values().any(|container| {
+            container.project_slug.as_deref() == Some(project_slug)
+                && container.branch_slug.as_deref() == Some(fallback.as_str())
+                && container.branch.as_deref().unwrap_or("main") != branch
+        });
+
+        if collides {
+            cella_proxy::hostname::sanitize_branch_with_suffix(branch)
+        } else {
+            fallback
+        }
     }
 
     /// Update a container's IP address without touching ports or allocations.
@@ -137,6 +172,28 @@ impl PortManager {
         self.containers
             .get(container_id)
             .and_then(|c| c.container_ip.as_deref())
+    }
+
+    /// Return the allocated host port for an already-detected container port.
+    pub fn host_port_for(&self, container_id: &str, port: u16) -> Option<u16> {
+        self.containers
+            .get(container_id)?
+            .detected_ports
+            .iter()
+            .find(|p| p.port == port)
+            .and_then(|p| p.host_port)
+    }
+
+    /// Return hostname route metadata for an allocated forwarded port.
+    pub fn hostname_route_for(&self, container_id: &str, port: u16) -> Option<HostnameRouteInfo> {
+        let container = self.containers.get(container_id)?;
+        let host_port = self.host_port_for(container_id, port)?;
+        Some(HostnameRouteInfo {
+            project: container.project_slug.clone()?,
+            branch: container.branch_slug.clone()?,
+            container_port: port,
+            host_port,
+        })
     }
 
     /// Allocate a host port using the port checker if configured.
@@ -288,6 +345,8 @@ impl PortManager {
                         is_orbstack: self.is_orbstack,
                         project_name: container.project_name.clone(),
                         branch: container.branch.clone(),
+                        project_slug: container.project_slug.clone(),
+                        branch_slug: container.branch_slug.clone(),
                     });
                 }
             }
@@ -323,6 +382,17 @@ pub struct ForwardedPortInfo {
     pub is_orbstack: bool,
     pub project_name: Option<String>,
     pub branch: Option<String>,
+    pub project_slug: Option<String>,
+    pub branch_slug: Option<String>,
+}
+
+/// Metadata needed to add/remove a hostname route.
+#[derive(Debug, Clone)]
+pub struct HostnameRouteInfo {
+    pub project: String,
+    pub branch: String,
+    pub container_port: u16,
+    pub host_port: u16,
 }
 
 impl ForwardedPortInfo {
@@ -345,8 +415,8 @@ impl ForwardedPortInfo {
 
     /// Get the hostname-based URL, if project and branch metadata are available.
     pub fn hostname_url(&self) -> Option<String> {
-        let project = self.project_name.as_ref()?;
-        let branch = self.branch.as_deref().unwrap_or("main");
+        let project = self.project_slug.as_ref()?;
+        let branch = self.branch_slug.as_deref().unwrap_or("main");
         Some(cella_proxy::hostname::build_hostname_url(
             self.container_port,
             branch,
@@ -501,6 +571,8 @@ mod tests {
             is_orbstack: true,
             project_name: None,
             branch: None,
+            project_slug: None,
+            branch_slug: None,
         };
         // url() always returns localhost
         assert_eq!(info.url(), "localhost:3000");
@@ -523,6 +595,8 @@ mod tests {
             is_orbstack: false,
             project_name: None,
             branch: None,
+            project_slug: None,
+            branch_slug: None,
         };
         assert_eq!(info.orb_url(), None);
     }
@@ -539,6 +613,8 @@ mod tests {
             is_orbstack: false,
             project_name: None,
             branch: None,
+            project_slug: None,
+            branch_slug: None,
         };
         assert_eq!(info.url(), "localhost:3001");
     }
@@ -561,6 +637,58 @@ mod tests {
         assert_eq!(hp2, Some(3000));
         let ports = pm.all_forwarded_ports();
         assert_eq!(ports.len(), 1);
+    }
+
+    #[test]
+    fn hostname_route_uses_sanitized_project_branch_and_host_port() {
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: Some("My App".to_string()),
+            branch: Some("feature/auth".to_string()),
+        });
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+
+        let route = pm.hostname_route_for("c1", 3000).unwrap();
+        assert_eq!(route.project, "my-app");
+        assert_eq!(route.branch, "feature-auth");
+        assert_eq!(route.container_port, 3000);
+        assert_eq!(route.host_port, 3000);
+    }
+
+    #[test]
+    fn branch_slug_collision_gets_suffix_for_second_branch() {
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "one".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: Some("myapp".to_string()),
+            branch: Some("a/b".to_string()),
+        });
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c2".to_string(),
+            container_name: "two".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: Some("myapp".to_string()),
+            branch: Some("a-b".to_string()),
+        });
+        pm.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
+        pm.handle_port_open("c2", 3000, PortProtocol::Tcp, None);
+
+        let first = pm.hostname_route_for("c1", 3000).unwrap();
+        let second = pm.hostname_route_for("c2", 3000).unwrap();
+        assert_eq!(first.branch, "a-b");
+        assert!(second.branch.starts_with("a-b-"));
+        assert_ne!(first.branch, second.branch);
     }
 
     #[test]

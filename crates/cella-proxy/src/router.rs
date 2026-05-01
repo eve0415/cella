@@ -56,6 +56,13 @@ impl RouteTable {
             .insert((project.to_string(), branch.to_string()), port);
     }
 
+    /// Set the default port only when this project/branch has no default yet.
+    pub fn set_default_port_if_absent(&mut self, project: &str, branch: &str, port: u16) {
+        self.defaults
+            .entry((project.to_string(), branch.to_string()))
+            .or_insert(port);
+    }
+
     /// Look up a route by exact key.
     pub fn lookup(&self, project: &str, branch: &str, port: u16) -> Option<&BackendTarget> {
         let key = RouteKey {
@@ -77,6 +84,10 @@ impl RouteTable {
     /// Remove a single route.
     pub fn remove(&mut self, key: &RouteKey) -> Option<BackendTarget> {
         let target = self.routes.remove(key)?;
+        let default_key = (key.project.clone(), key.branch.clone());
+        if self.defaults.get(&default_key) == Some(&key.port) {
+            self.defaults.remove(&default_key);
+        }
         if let Some(keys) = self.by_container.get_mut(&target.container_id) {
             keys.remove(key);
             if keys.is_empty() {
@@ -191,6 +202,20 @@ mod tests {
     }
 
     #[test]
+    fn default_port_if_absent_preserves_first_default() {
+        let mut rt = RouteTable::new();
+        rt.insert(test_key("myapp", "main", 3000), test_target("c1", 3000));
+        rt.insert(test_key("myapp", "main", 8080), test_target("c1", 8080));
+        rt.set_default_port_if_absent("myapp", "main", 3000);
+        rt.set_default_port_if_absent("myapp", "main", 8080);
+
+        assert_eq!(
+            rt.lookup_default("myapp", "main").unwrap().target_port,
+            3000
+        );
+    }
+
+    #[test]
     fn remove_single_route() {
         let mut rt = RouteTable::new();
         let key = test_key("myapp", "main", 3000);
@@ -199,6 +224,7 @@ mod tests {
         let removed = rt.remove(&key);
         assert!(removed.is_some());
         assert!(rt.lookup("myapp", "main", 3000).is_none());
+        assert!(rt.lookup_default("myapp", "main").is_none());
         assert!(rt.is_empty());
     }
 

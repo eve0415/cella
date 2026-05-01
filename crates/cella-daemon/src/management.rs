@@ -97,6 +97,7 @@ pub(crate) async fn run_management_server(
             cella_bin: crate::control_server::resolve_cella_binary(),
             tunnel_broker: ctx.tunnel_broker.clone(),
             is_orbstack: ctx.is_orbstack,
+            hostname_route_table: ctx.hostname_route_table.clone(),
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(
@@ -222,6 +223,7 @@ async fn handle_management_request(
                 container_handles,
                 &ctx.proxy_cmd_tx,
                 &ctx.hostname_route_table,
+                ctx.is_orbstack,
             )
             .await
         }
@@ -352,12 +354,11 @@ async fn handle_register(
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
     proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
     route_table: &cella_proxy::server::SharedRouteTable,
+    is_orbstack: bool,
 ) -> ManagementResponse {
     // Register with port manager
     let container_id = reg.container_id.clone();
     let container_name = reg.container_name.clone();
-    let project_name = reg.project_name.clone();
-    let branch = reg.branch.clone();
     let container_ip_clone = reg.container_ip.clone();
     {
         use crate::port_manager::ContainerRegistrationInfo;
@@ -378,37 +379,16 @@ async fn handle_register(
                 .send(ProxyCommand::Stop { host_port: hp })
                 .await;
         }
-
-        // Pre-allocate host ports for forwardPorts
-        for &fwd_port in &reg.forward_ports {
-            pm.handle_port_open(
-                &container_id,
-                fwd_port,
-                cella_protocol::PortProtocol::Tcp,
-                None,
-            );
-        }
     }
 
-    // Populate hostname route table
-    populate_routes(
-        route_table,
-        &container_id,
-        &container_name,
-        project_name.as_deref(),
-        branch.as_deref(),
-        container_ip_clone.as_deref(),
-        &reg.forward_ports,
-    )
-    .await;
-
-    // Store handle for agent connection tracking
+    // Store handle before starting tunnel-mode forwardPorts so those proxies
+    // can resolve the agent channel once it connects.
     {
         let mut handles = container_handles.lock().await;
         handles.insert(
             container_name.clone(),
             ContainerHandle {
-                container_id,
+                container_id: container_id.clone(),
                 agent_state: Arc::new(AgentConnectionState::new()),
                 backend_kind: reg.backend_kind,
                 docker_host: reg.docker_host,
@@ -417,45 +397,92 @@ async fn handle_register(
         );
     }
 
+    preload_forward_ports(
+        port_manager,
+        proxy_cmd_tx,
+        route_table,
+        &container_id,
+        &container_name,
+        container_ip_clone.as_deref(),
+        &reg.forward_ports,
+        is_orbstack,
+    )
+    .await;
+
     info!("Registered container {container_name}");
 
     ManagementResponse::ContainerRegistered { container_name }
 }
 
-async fn populate_routes(
+async fn preload_forward_ports(
+    port_manager: &Arc<Mutex<PortManager>>,
+    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
     route_table: &cella_proxy::server::SharedRouteTable,
     container_id: &str,
     container_name: &str,
-    project: Option<&str>,
-    branch: Option<&str>,
     container_ip: Option<&str>,
     forward_ports: &[u16],
+    is_orbstack: bool,
 ) {
-    let Some(project) = project else { return };
-    let sanitized = cella_proxy::hostname::sanitize_branch(branch.unwrap_or("main"));
-    let mode = container_ip.and_then(|ip| ip.parse().ok()).map_or_else(
-        || cella_proxy::router::ProxyMode::AgentTunnel(container_name.to_string()),
-        cella_proxy::router::ProxyMode::DirectIp,
-    );
+    route_table.write().await.remove_container(container_id);
 
-    let mut rt = route_table.write().await;
-    rt.remove_container(container_id);
-    for (i, &port) in forward_ports.iter().enumerate() {
-        rt.insert(
-            cella_proxy::router::RouteKey {
-                project: project.to_string(),
-                branch: sanitized.clone(),
-                port,
-            },
-            cella_proxy::router::BackendTarget {
-                container_id: container_id.to_string(),
+    for &port in forward_ports {
+        let host_port = {
+            let mut pm = port_manager.lock().await;
+            pm.handle_port_open(container_id, port, cella_protocol::PortProtocol::Tcp, None)
+        };
+        let Some(host_port) = host_port else { continue };
+
+        let use_direct_ip = cfg!(target_os = "linux") || is_orbstack;
+        let target = if use_direct_ip {
+            if let Some(ip) = container_ip {
+                crate::proxy::ProxyStartTarget::DirectIp {
+                    ip: ip.to_string(),
+                    port,
+                }
+            } else {
+                warn!("No container IP for direct proxy, skipping forwardPort {port}");
+                port_manager
+                    .lock()
+                    .await
+                    .handle_port_closed(container_id, port);
+                continue;
+            }
+        } else {
+            crate::proxy::ProxyStartTarget::AgentTunnel {
                 container_name: container_name.to_string(),
-                target_port: port,
-                mode: mode.clone(),
-            },
-        );
-        if i == 0 {
-            rt.set_default_port(project, &sanitized, port);
+                port,
+            }
+        };
+
+        if !crate::control_server::start_port_proxy(host_port, target, proxy_cmd_tx).await {
+            port_manager
+                .lock()
+                .await
+                .handle_port_closed(container_id, port);
+            continue;
+        }
+
+        let route = {
+            let pm = port_manager.lock().await;
+            pm.hostname_route_for(container_id, port)
+        };
+        if let Some(route) = route {
+            let mut rt = route_table.write().await;
+            rt.insert(
+                cella_proxy::router::RouteKey {
+                    project: route.project.clone(),
+                    branch: route.branch.clone(),
+                    port: route.container_port,
+                },
+                cella_proxy::router::BackendTarget {
+                    container_id: container_id.to_string(),
+                    container_name: container_name.to_string(),
+                    target_port: route.host_port,
+                    mode: cella_proxy::router::ProxyMode::Localhost,
+                },
+            );
+            rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
         }
     }
 }
