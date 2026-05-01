@@ -54,6 +54,97 @@ pub fn sanitize_branch_with_suffix(branch: &str) -> String {
     format!("{trimmed}-{suffix}")
 }
 
+/// Parsed components from a `*.localhost` or `*.local` hostname.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedHostname {
+    /// Container port (`None` for bare hostnames → use default port).
+    pub port: Option<u16>,
+    /// Sanitized branch slug.
+    pub branch: String,
+    /// Project slug.
+    pub project: String,
+}
+
+/// Which TLD family the hostname belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostnameTld {
+    Localhost,
+    Local,
+}
+
+/// Parse a `Host` header value into routing components.
+///
+/// Expected formats:
+/// - `{port}.{branch}.{project}.localhost` → port + branch + project
+/// - `{branch}.{project}.localhost`        → bare (default port)
+/// - Same patterns with `.local` (`OrbStack`)
+///
+/// Strips any `:port` suffix from the Host header before parsing.
+pub fn parse_hostname(host: &str) -> Option<ParsedHostname> {
+    // Strip port suffix (e.g., "foo.localhost:80" → "foo.localhost")
+    let hostname = host.split(':').next().unwrap_or(host);
+    let (labels, _tld) = split_tld(hostname)?;
+
+    match labels.len() {
+        // {branch}.{project}.{tld}
+        2 => Some(ParsedHostname {
+            port: None,
+            branch: labels[0].to_string(),
+            project: labels[1].to_string(),
+        }),
+        // {port}.{branch}.{project}.{tld}
+        3 => {
+            let port: u16 = labels[0].parse().ok()?;
+            Some(ParsedHostname {
+                port: Some(port),
+                branch: labels[1].to_string(),
+                project: labels[2].to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Split a hostname into (labels-before-tld, tld).
+/// Returns `None` if the TLD is not `.localhost` or `.local`.
+fn split_tld(hostname: &str) -> Option<(Vec<&str>, HostnameTld)> {
+    let parts: Vec<&str> = hostname.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let last = *parts.last()?;
+    if last.eq_ignore_ascii_case("localhost") {
+        Some((parts[..parts.len() - 1].to_vec(), HostnameTld::Localhost))
+    } else if parts.len() >= 3 && parts[parts.len() - 1].eq_ignore_ascii_case("local") {
+        // For .local we don't want to confuse "something.local" (2 parts)
+        // with our routing hostnames which always have 3+ parts before .local
+        Some((parts[..parts.len() - 1].to_vec(), HostnameTld::Local))
+    } else {
+        None
+    }
+}
+
+/// Build a hostname URL for a forwarded port.
+pub fn build_hostname_url(port: u16, branch: &str, project: &str, is_orbstack: bool) -> String {
+    let sanitized = sanitize_branch(branch);
+    if is_orbstack {
+        format!("https://{port}.{sanitized}.{project}.local")
+    } else {
+        format!("http://{port}.{sanitized}.{project}.localhost")
+    }
+}
+
+/// Build the bare hostname (without port) for default-port access.
+pub fn build_bare_hostname(branch: &str, project: &str, is_orbstack: bool) -> String {
+    let sanitized = sanitize_branch(branch);
+    if is_orbstack {
+        format!("{sanitized}.{project}.local")
+    } else {
+        format!("{sanitized}.{project}.localhost")
+    }
+}
+
 fn collapse_hyphens(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut prev_hyphen = false;
@@ -177,5 +268,112 @@ mod tests {
         let a = sanitize_branch_with_suffix("feature/auth");
         let b = sanitize_branch_with_suffix("feature/auth");
         assert_eq!(a, b);
+    }
+
+    // -- parse_hostname tests --
+
+    #[test]
+    fn parse_port_branch_project_localhost() {
+        let parsed = parse_hostname("3000.feature-auth.myapp.localhost").unwrap();
+        assert_eq!(parsed.port, Some(3000));
+        assert_eq!(parsed.branch, "feature-auth");
+        assert_eq!(parsed.project, "myapp");
+    }
+
+    #[test]
+    fn parse_bare_hostname_localhost() {
+        let parsed = parse_hostname("feature-auth.myapp.localhost").unwrap();
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.branch, "feature-auth");
+        assert_eq!(parsed.project, "myapp");
+    }
+
+    #[test]
+    fn parse_port_branch_project_local() {
+        let parsed = parse_hostname("3000.feature-auth.myapp.local").unwrap();
+        assert_eq!(parsed.port, Some(3000));
+        assert_eq!(parsed.branch, "feature-auth");
+        assert_eq!(parsed.project, "myapp");
+    }
+
+    #[test]
+    fn parse_bare_hostname_local() {
+        let parsed = parse_hostname("feature-auth.myapp.local").unwrap();
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.branch, "feature-auth");
+        assert_eq!(parsed.project, "myapp");
+    }
+
+    #[test]
+    fn parse_strips_host_port_suffix() {
+        let parsed = parse_hostname("3000.main.myapp.localhost:80").unwrap();
+        assert_eq!(parsed.port, Some(3000));
+        assert_eq!(parsed.branch, "main");
+    }
+
+    #[test]
+    fn parse_rejects_plain_localhost() {
+        assert!(parse_hostname("localhost").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_single_label_before_tld() {
+        assert!(parse_hostname("myapp.localhost").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_tld() {
+        assert!(parse_hostname("3000.main.myapp.example.com").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_too_many_labels() {
+        assert!(parse_hostname("extra.3000.main.myapp.localhost").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_non_numeric_port_label() {
+        // "abc" is not a valid port, so 3-label form fails
+        assert!(parse_hostname("abc.main.myapp.localhost").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_something_dot_local() {
+        // "something.local" is only 2 parts total — not enough labels
+        assert!(parse_hostname("something.local").is_none());
+    }
+
+    // -- build_hostname_url tests --
+
+    #[test]
+    fn build_url_non_orbstack() {
+        assert_eq!(
+            build_hostname_url(3000, "feature/auth", "myapp", false),
+            "http://3000.feature-auth.myapp.localhost"
+        );
+    }
+
+    #[test]
+    fn build_url_orbstack() {
+        assert_eq!(
+            build_hostname_url(3000, "feature/auth", "myapp", true),
+            "https://3000.feature-auth.myapp.local"
+        );
+    }
+
+    #[test]
+    fn build_bare_non_orbstack() {
+        assert_eq!(
+            build_bare_hostname("main", "myapp", false),
+            "main.myapp.localhost"
+        );
+    }
+
+    #[test]
+    fn build_bare_orbstack() {
+        assert_eq!(
+            build_bare_hostname("main", "myapp", true),
+            "main.myapp.local"
+        );
     }
 }
