@@ -11,6 +11,7 @@ mod down;
 mod exec;
 pub mod features;
 mod init;
+mod install;
 mod list;
 mod logs;
 mod network;
@@ -122,6 +123,8 @@ pub enum Command {
     Shell(shell::ShellArgs),
     /// Execute a command inside the running dev container.
     Exec(exec::ExecArgs),
+    /// Install tools into the running dev container.
+    Install(install::InstallArgs),
     /// Build the dev container image without starting it.
     Build(build::BuildArgs),
     /// List all dev containers managed by cella.
@@ -216,6 +219,7 @@ impl Command {
             Self::Down(args) => args.execute().await,
             Self::Shell(args) => args.execute().await,
             Self::Exec(args) => args.execute().await,
+            Self::Install(args) => args.execute().await,
             Self::Build(args) => args.execute(progress).await,
             Self::List(args) => args.execute().await,
             Self::Logs(args) => args.execute().await,
