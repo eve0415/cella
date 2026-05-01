@@ -32,10 +32,11 @@ type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 pub async fn start_proxy_server(
     addr: SocketAddr,
     route_table: SharedRouteTable,
-) -> std::io::Result<tokio::task::JoinHandle<()>> {
+) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
-    let proxy_port = addr.port();
-    info!("Hostname proxy listening on {addr}");
+    let bound_addr = listener.local_addr()?;
+    let proxy_port = bound_addr.port();
+    info!("Hostname proxy listening on {bound_addr}");
 
     let handle = tokio::spawn(async move {
         loop {
@@ -56,7 +57,7 @@ pub async fn start_proxy_server(
         }
     });
 
-    Ok(handle)
+    Ok((bound_addr, handle))
 }
 
 async fn handle_connection(
@@ -379,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_server_binds_and_responds() {
         let rt = Arc::new(RwLock::new(RouteTable::new()));
-        let handle = start_proxy_server("127.0.0.1:0".parse().unwrap(), rt)
+        let (_, handle) = start_proxy_server("127.0.0.1:0".parse().unwrap(), rt)
             .await
             .unwrap();
         handle.abort();

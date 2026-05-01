@@ -61,15 +61,19 @@ async fn start_hostname_proxy(is_orbstack: bool, socket_path: &Path) -> Hostname
     if !is_orbstack {
         for (addr, using_fallback_port) in hostname_proxy_bind_candidates(socket_path) {
             match cella_proxy::server::start_proxy_server(addr, route_table.clone()).await {
-                Ok(_handle) => {
-                    info!("Hostname proxy started on {addr}");
-                    persist_hostname_proxy_port(socket_path, addr.port(), using_fallback_port);
+                Ok((bound_addr, _handle)) => {
+                    info!("Hostname proxy started on {bound_addr}");
+                    persist_hostname_proxy_port(
+                        socket_path,
+                        bound_addr.port(),
+                        using_fallback_port,
+                    );
                     return HostnameProxyRuntime {
                         route_table,
                         status: Some(cella_protocol::HostnameProxyStatus {
                             enabled: true,
-                            address: Some(addr.to_string()),
-                            port: Some(addr.port()),
+                            address: Some(bound_addr.to_string()),
+                            port: Some(bound_addr.port()),
                             using_fallback_port,
                         }),
                     };
