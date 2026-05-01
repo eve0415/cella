@@ -49,6 +49,23 @@ fn write_control_file(
     Ok(control_file_path)
 }
 
+async fn start_hostname_proxy(is_orbstack: bool) -> cella_proxy::server::SharedRouteTable {
+    let rt = Arc::new(tokio::sync::RwLock::new(
+        cella_proxy::router::RouteTable::new(),
+    ));
+    if !is_orbstack {
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 80).into();
+        match cella_proxy::server::start_proxy_server(addr, rt.clone()).await {
+            Ok(_handle) => info!("Hostname proxy started on {addr}"),
+            Err(e) => {
+                warn!("Could not start hostname proxy on port 80: {e}");
+                info!("Hostname-based routing unavailable; using port-based forwarding only");
+            }
+        }
+    }
+    rt
+}
+
 /// Run the unified cella daemon.
 ///
 /// Starts the control server and health monitor.
@@ -142,6 +159,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         .unwrap_or_default()
         .as_secs();
 
+    let hostname_route_table = start_hostname_proxy(is_orbstack).await;
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let ctx = ManagementContext {
@@ -159,6 +178,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         ssh_proxy_manager,
         container_handles,
         tunnel_broker,
+        hostname_route_table,
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown

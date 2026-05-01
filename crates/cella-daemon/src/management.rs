@@ -38,6 +38,7 @@ pub(crate) struct ManagementContext {
     pub ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub tunnel_broker: Arc<crate::tunnel::TunnelBroker>,
+    pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -215,10 +216,23 @@ async fn handle_management_request(
                 project_name: data.project_name,
                 branch: data.branch,
             };
-            handle_register(reg, &ctx.port_manager, container_handles, &ctx.proxy_cmd_tx).await
+            handle_register(
+                reg,
+                &ctx.port_manager,
+                container_handles,
+                &ctx.proxy_cmd_tx,
+                &ctx.hostname_route_table,
+            )
+            .await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
-            handle_deregister(&container_name, &ctx.port_manager, container_handles).await
+            handle_deregister(
+                &container_name,
+                &ctx.port_manager,
+                container_handles,
+                &ctx.hostname_route_table,
+            )
+            .await
         }
         ManagementRequest::QueryPorts => handle_query_ports(&ctx.port_manager).await,
         ManagementRequest::QueryStatus => {
@@ -337,10 +351,14 @@ async fn handle_register(
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
     proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
+    route_table: &cella_proxy::server::SharedRouteTable,
 ) -> ManagementResponse {
     // Register with port manager
     let container_id = reg.container_id.clone();
     let container_name = reg.container_name.clone();
+    let project_name = reg.project_name.clone();
+    let branch = reg.branch.clone();
+    let container_ip_clone = reg.container_ip.clone();
     {
         use crate::port_manager::ContainerRegistrationInfo;
         let mut pm = port_manager.lock().await;
@@ -372,6 +390,18 @@ async fn handle_register(
         }
     }
 
+    // Populate hostname route table
+    populate_routes(
+        route_table,
+        &container_id,
+        &container_name,
+        project_name.as_deref(),
+        branch.as_deref(),
+        container_ip_clone.as_deref(),
+        &reg.forward_ports,
+    )
+    .await;
+
     // Store handle for agent connection tracking
     {
         let mut handles = container_handles.lock().await;
@@ -392,11 +422,50 @@ async fn handle_register(
     ManagementResponse::ContainerRegistered { container_name }
 }
 
+async fn populate_routes(
+    route_table: &cella_proxy::server::SharedRouteTable,
+    container_id: &str,
+    container_name: &str,
+    project: Option<&str>,
+    branch: Option<&str>,
+    container_ip: Option<&str>,
+    forward_ports: &[u16],
+) {
+    let Some(project) = project else { return };
+    let sanitized = cella_proxy::hostname::sanitize_branch(branch.unwrap_or("main"));
+    let mode = container_ip.and_then(|ip| ip.parse().ok()).map_or_else(
+        || cella_proxy::router::ProxyMode::AgentTunnel(container_name.to_string()),
+        cella_proxy::router::ProxyMode::DirectIp,
+    );
+
+    let mut rt = route_table.write().await;
+    rt.remove_container(container_id);
+    for (i, &port) in forward_ports.iter().enumerate() {
+        rt.insert(
+            cella_proxy::router::RouteKey {
+                project: project.to_string(),
+                branch: sanitized.clone(),
+                port,
+            },
+            cella_proxy::router::BackendTarget {
+                container_id: container_id.to_string(),
+                container_name: container_name.to_string(),
+                target_port: port,
+                mode: mode.clone(),
+            },
+        );
+        if i == 0 {
+            rt.set_default_port(project, &sanitized, port);
+        }
+    }
+}
+
 /// Handle container deregistration.
 async fn handle_deregister(
     container_name: &str,
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    route_table: &cella_proxy::server::SharedRouteTable,
 ) -> ManagementResponse {
     let mut ports_released = 0;
 
@@ -414,6 +483,12 @@ async fn handle_deregister(
         let ports_after = pm.all_forwarded_ports().len();
         drop(pm);
         ports_released = ports_before.saturating_sub(ports_after);
+
+        // Remove hostname routes
+        route_table
+            .write()
+            .await
+            .remove_container(&handle.container_id);
     }
 
     info!("Deregistered container {container_name} ({ports_released} ports released)");
@@ -526,6 +601,9 @@ mod tests {
             ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep(), "test-token".to_string()),
             container_handles: Arc::new(Mutex::new(HashMap::new())),
             tunnel_broker: Arc::new(crate::tunnel::TunnelBroker::new()),
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
         (ctx, srx)
     }
