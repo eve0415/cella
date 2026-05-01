@@ -676,11 +676,11 @@ fn ensure_file(path: &std::path::Path, content: &str) {
     if path.exists() {
         return;
     }
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!("cannot create parent directory {}: {e}", parent.display());
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!("cannot create parent directory {}: {e}", parent.display());
+        return;
     }
     match std::fs::write(path, content) {
         Ok(()) => {
@@ -2277,5 +2277,37 @@ mod tests {
 
         let content = std::fs::read_to_string(tmp.path().join(".claude.json")).unwrap();
         assert_eq!(content, "{}");
+    }
+
+    #[test]
+    fn ensure_then_mount_produces_expected_specs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = cella_config::CellaConfig::default();
+
+        let original_home = std::env::var("HOME").ok();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+        let specs = build_tool_config_mount_specs(&settings, "vscode");
+
+        #[allow(unsafe_code)]
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(
+            specs.iter().any(|s| s.target.ends_with("/.claude.json")),
+            "should have .claude.json mount; got: {specs:?}"
+        );
+        assert!(
+            specs.iter().any(|s| s.target.ends_with("/.claude")),
+            "should have .claude/ mount; got: {specs:?}"
+        );
     }
 }
