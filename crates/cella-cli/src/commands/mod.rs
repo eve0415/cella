@@ -1,7 +1,7 @@
 mod branch;
 mod build;
 mod code;
-mod completions;
+mod completion;
 mod compose_up;
 mod config;
 mod credential;
@@ -160,7 +160,7 @@ pub enum Command {
     #[command(name = "read-configuration")]
     ReadConfiguration(read_configuration::ReadConfigurationArgs),
     /// Generate shell completion scripts.
-    Completions(completions::CompletionsArgs),
+    Completion(completion::CompletionArgs),
     /// Manage the cella daemon.
     #[command(name = "daemon", hide = true)]
     Daemon(daemon::DaemonArgs),
@@ -230,7 +230,7 @@ impl Command {
             Self::Init(args) => args.execute(progress).await,
             Self::Nvim(args) => args.execute(progress).await,
             Self::Tmux(args) => args.execute(progress).await,
-            Self::Completions(args) => {
+            Self::Completion(args) => {
                 args.execute();
                 Ok(())
             }
