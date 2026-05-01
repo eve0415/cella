@@ -1,5 +1,8 @@
 //! Helpers for building daemon container registration payloads.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use cella_backend::{BACKEND_LABEL, ContainerInfo};
 use cella_protocol::ContainerRegistrationData;
 
@@ -55,9 +58,16 @@ pub fn from_container_labels(
         shutdown_action: container.labels.get("dev.cella.shutdown_action").cloned(),
         backend_kind: container.labels.get(BACKEND_LABEL).cloned(),
         docker_host,
-        project_name: None,
+        project_name: project_name_from_labels(&container.labels),
         branch: container.labels.get("dev.cella.branch").cloned(),
     }
+}
+
+fn project_name_from_labels(labels: &HashMap<String, String>) -> Option<String> {
+    labels
+        .get("dev.cella.workspace_path")
+        .and_then(|p| Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().to_string())
 }
 
 fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
@@ -155,5 +165,48 @@ mod tests {
             data.docker_host.as_deref(),
             Some("unix:///var/run/docker.sock")
         );
+    }
+
+    #[test]
+    fn container_labels_derives_project_name_from_workspace_path() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            "/home/user/myapp".to_string(),
+        );
+        labels.insert("dev.cella.branch".to_string(), "feature/auth".to_string());
+
+        let container = ContainerInfo {
+            id: "c1".to_string(),
+            name: "cella-myapp-abc123".to_string(),
+            state: ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: BackendKind::Docker,
+        };
+
+        let data = from_container_labels(&container, None, None);
+        assert_eq!(data.project_name.as_deref(), Some("myapp"));
+        assert_eq!(data.branch.as_deref(), Some("feature/auth"));
+    }
+
+    #[test]
+    fn devcontainer_config_extracts_project_name_from_name_field() {
+        let config = json!({ "name": "my-project" });
+        let data = from_devcontainer_config(&config, "id", "name", None, None, None);
+        assert_eq!(data.project_name.as_deref(), Some("my-project"));
+    }
+
+    #[test]
+    fn devcontainer_config_without_name_has_no_project_name() {
+        let config = json!({});
+        let data = from_devcontainer_config(&config, "id", "name", None, None, None);
+        assert_eq!(data.project_name, None);
     }
 }
