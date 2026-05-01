@@ -414,14 +414,15 @@ impl ForwardedPortInfo {
     }
 
     /// Get the hostname-based URL, if project and branch metadata are available.
-    pub fn hostname_url(&self) -> Option<String> {
+    pub fn hostname_url(&self, proxy_port: Option<u16>) -> Option<String> {
         let project = self.project_slug.as_ref()?;
         let branch = self.branch_slug.as_deref().unwrap_or("main");
-        Some(cella_proxy::hostname::build_hostname_url(
+        Some(cella_proxy::hostname::build_hostname_url_with_proxy_port(
             self.container_port,
             branch,
             project,
             self.is_orbstack,
+            proxy_port,
         ))
     }
 }

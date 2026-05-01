@@ -49,21 +49,84 @@ fn write_control_file(
     Ok(control_file_path)
 }
 
-async fn start_hostname_proxy(is_orbstack: bool) -> cella_proxy::server::SharedRouteTable {
-    let rt = Arc::new(tokio::sync::RwLock::new(
+struct HostnameProxyRuntime {
+    route_table: cella_proxy::server::SharedRouteTable,
+    status: Option<cella_protocol::HostnameProxyStatus>,
+}
+
+async fn start_hostname_proxy(is_orbstack: bool, socket_path: &Path) -> HostnameProxyRuntime {
+    let route_table = Arc::new(tokio::sync::RwLock::new(
         cella_proxy::router::RouteTable::new(),
     ));
     if !is_orbstack {
-        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 80).into();
-        match cella_proxy::server::start_proxy_server(addr, rt.clone()).await {
-            Ok(_handle) => info!("Hostname proxy started on {addr}"),
-            Err(e) => {
-                warn!("Could not start hostname proxy on port 80: {e}");
-                info!("Hostname-based routing unavailable; using port-based forwarding only");
+        for (addr, using_fallback_port) in hostname_proxy_bind_candidates(socket_path) {
+            match cella_proxy::server::start_proxy_server(addr, route_table.clone()).await {
+                Ok(_handle) => {
+                    info!("Hostname proxy started on {addr}");
+                    persist_hostname_proxy_port(socket_path, addr.port(), using_fallback_port);
+                    return HostnameProxyRuntime {
+                        route_table,
+                        status: Some(cella_protocol::HostnameProxyStatus {
+                            enabled: true,
+                            address: Some(addr.to_string()),
+                            port: Some(addr.port()),
+                            using_fallback_port,
+                        }),
+                    };
+                }
+                Err(e) => {
+                    warn!("Could not start hostname proxy on {addr}: {e}");
+                }
             }
         }
+        info!("Hostname-based routing unavailable; using port-based forwarding only");
     }
-    rt
+    HostnameProxyRuntime {
+        route_table,
+        status: Some(cella_protocol::HostnameProxyStatus {
+            enabled: false,
+            address: None,
+            port: None,
+            using_fallback_port: false,
+        }),
+    }
+}
+
+fn hostname_proxy_bind_candidates(socket_path: &Path) -> Vec<(std::net::SocketAddr, bool)> {
+    let persisted_port = read_persisted_hostname_proxy_port(socket_path);
+    let mut candidates = vec![(([127, 0, 0, 1], 80).into(), false)];
+    if let Some(port) = persisted_port
+        && port != 80
+    {
+        candidates.push((([127, 0, 0, 1], port).into(), true));
+    }
+    candidates.push((([127, 0, 0, 1], 0).into(), true));
+    candidates
+}
+
+fn hostname_proxy_port_file(socket_path: &Path) -> PathBuf {
+    socket_path.with_file_name("hostname-proxy.port")
+}
+
+fn read_persisted_hostname_proxy_port(socket_path: &Path) -> Option<u16> {
+    std::fs::read_to_string(hostname_proxy_port_file(socket_path))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
+fn persist_hostname_proxy_port(socket_path: &Path, port: u16, using_fallback_port: bool) {
+    let path = hostname_proxy_port_file(socket_path);
+    if using_fallback_port {
+        if let Err(e) = std::fs::write(&path, port.to_string()) {
+            warn!(
+                "failed to persist hostname proxy port {}: {e}",
+                path.display()
+            );
+        }
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Run the unified cella daemon.
@@ -159,7 +222,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         .unwrap_or_default()
         .as_secs();
 
-    let hostname_route_table = start_hostname_proxy(is_orbstack).await;
+    let hostname_proxy = start_hostname_proxy(is_orbstack, socket_path).await;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -178,7 +241,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         ssh_proxy_manager,
         container_handles,
         tunnel_broker,
-        hostname_route_table,
+        hostname_route_table: hostname_proxy.route_table,
+        hostname_proxy: hostname_proxy.status,
     };
 
     // Run the management server (CLI protocol) — blocks until shutdown
@@ -439,6 +503,19 @@ mod tests {
         let control = dir.path().join("daemon.sock");
         let token = load_or_create_auth_token(&control).unwrap();
         assert!(is_valid_token(&token));
+    }
+
+    #[test]
+    fn hostname_proxy_bind_candidates_include_persisted_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(hostname_proxy_port_file(&socket), "49180").unwrap();
+
+        let candidates = hostname_proxy_bind_candidates(&socket);
+
+        assert_eq!(candidates[0], (([127, 0, 0, 1], 80).into(), false));
+        assert_eq!(candidates[1], (([127, 0, 0, 1], 49180).into(), true));
+        assert_eq!(candidates[2], (([127, 0, 0, 1], 0).into(), true));
     }
 
     #[cfg(unix)]

@@ -65,6 +65,7 @@ impl DaemonClient {
                 daemon_started_at,
                 control_port,
                 control_token,
+                hostname_proxy,
             } => Ok(DaemonStatus {
                 pid,
                 uptime_secs,
@@ -75,6 +76,7 @@ impl DaemonClient {
                 daemon_started_at,
                 control_port,
                 control_token,
+                hostname_proxy,
             }),
             response => Err(DaemonClientError::unexpected("status", &response)),
         }
@@ -246,6 +248,7 @@ pub struct DaemonStatus {
     pub daemon_started_at: u64,
     pub control_port: u16,
     pub control_token: String,
+    pub hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
 }
 
 /// Successful SSH-agent proxy registration details.

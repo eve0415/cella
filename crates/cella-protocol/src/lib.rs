@@ -275,6 +275,9 @@ pub enum ManagementResponse {
         /// Auth token for agent connections.
         #[serde(default)]
         control_token: String,
+        /// Hostname proxy bind state for diagnostics and URL rendering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname_proxy: Option<HostnameProxyStatus>,
     },
     /// Daemon is shutting down.
     ShuttingDown { pid: u32 },
@@ -310,6 +313,18 @@ pub struct ForwardedPortDetail {
     /// Hostname-based URL (e.g., `http://3000.main.myapp.localhost`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+}
+
+/// Runtime state for the hostname HTTP proxy listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostnameProxyStatus {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub using_fallback_port: bool,
 }
 
 /// Summary of a registered container.
@@ -964,6 +979,12 @@ mod tests {
             daemon_started_at: 1_700_000_000,
             control_port: 54321,
             control_token: "abc123".to_string(),
+            hostname_proxy: Some(HostnameProxyStatus {
+                enabled: true,
+                address: Some("127.0.0.1:49180".to_string()),
+                port: Some(49180),
+                using_fallback_port: true,
+            }),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
@@ -981,11 +1002,13 @@ mod tests {
         if let ManagementResponse::Status {
             daemon_version,
             daemon_started_at,
+            hostname_proxy,
             ..
         } = decoded
         {
             assert!(daemon_version.is_empty());
             assert_eq!(daemon_started_at, 0);
+            assert!(hostname_proxy.is_none());
         } else {
             panic!("Expected Status");
         }

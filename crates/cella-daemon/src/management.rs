@@ -39,6 +39,7 @@ pub(crate) struct ManagementContext {
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub tunnel_broker: Arc<crate::tunnel::TunnelBroker>,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
+    pub hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -236,7 +237,9 @@ async fn handle_management_request(
             )
             .await
         }
-        ManagementRequest::QueryPorts => handle_query_ports(&ctx.port_manager).await,
+        ManagementRequest::QueryPorts => {
+            handle_query_ports(&ctx.port_manager, ctx.hostname_proxy.as_ref()).await
+        }
         ManagementRequest::QueryStatus => {
             handle_query_status(
                 &ctx.port_manager,
@@ -246,6 +249,7 @@ async fn handle_management_request(
                 ctx.daemon_started_at,
                 &ctx.auth_token,
                 ctx.control_port,
+                ctx.hostname_proxy.clone(),
             )
             .await
         }
@@ -527,13 +531,18 @@ async fn handle_deregister(
 }
 
 /// Handle port query.
-async fn handle_query_ports(port_manager: &Arc<Mutex<PortManager>>) -> ManagementResponse {
+async fn handle_query_ports(
+    port_manager: &Arc<Mutex<PortManager>>,
+    hostname_proxy: Option<&cella_protocol::HostnameProxyStatus>,
+) -> ManagementResponse {
+    let hostname_proxy_port =
+        hostname_proxy.and_then(|status| if status.enabled { status.port } else { None });
     let ports = {
         let pm = port_manager.lock().await;
         pm.all_forwarded_ports()
             .into_iter()
             .map(|p| {
-                let hostname = p.hostname_url();
+                let hostname = p.hostname_url(hostname_proxy_port);
                 ForwardedPortDetail {
                     container_name: p.container_name.clone(),
                     container_port: p.container_port,
@@ -559,6 +568,7 @@ async fn handle_query_status(
     daemon_started_at: u64,
     auth_token: &str,
     control_port: u16,
+    hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
 ) -> ManagementResponse {
     let handles = container_handles.lock().await;
     let pm = port_manager.lock().await;
@@ -600,6 +610,7 @@ async fn handle_query_status(
         daemon_started_at,
         control_port,
         control_token: auth_token.to_string(),
+        hostname_proxy,
     }
 }
 
@@ -631,6 +642,12 @@ mod tests {
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
+            hostname_proxy: Some(cella_protocol::HostnameProxyStatus {
+                enabled: true,
+                address: Some("127.0.0.1:80".to_string()),
+                port: Some(80),
+                using_fallback_port: false,
+            }),
         };
         (ctx, srx)
     }
@@ -757,6 +774,40 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn query_ports_includes_hostname_proxy_fallback_port() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container(crate::port_manager::ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: Some("myapp".to_string()),
+                branch: Some("feature/auth".to_string()),
+            });
+            guard.handle_port_open("c1", 3000, cella_protocol::PortProtocol::Tcp, None);
+        }
+        let status = cella_protocol::HostnameProxyStatus {
+            enabled: true,
+            address: Some("127.0.0.1:49180".to_string()),
+            port: Some(49180),
+            using_fallback_port: true,
+        };
+
+        let resp = handle_query_ports(&pm, Some(&status)).await;
+
+        let ManagementResponse::Ports { ports } = resp else {
+            panic!("expected ports response");
+        };
+        assert_eq!(
+            ports[0].hostname.as_deref(),
+            Some("http://3000.feature-auth.myapp.localhost:49180")
+        );
     }
 
     /// Stand up an echo server on `path` to mimic an upstream ssh-agent.
