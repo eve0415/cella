@@ -181,16 +181,16 @@ pub fn worktree_labels(branch_name: &str, parent_repo: &Path) -> HashMap<String,
 
 /// Generate `dev.orbstack.domains` label value for hostname-based routing.
 ///
-/// Produces domains like `3000.feature-auth.myapp.local` for each forwarded port,
-/// plus a bare `feature-auth.myapp.local` for the default port.
-pub fn orbstack_domains_label(project: &str, branch: &str, forward_ports: &[u16]) -> String {
+/// V1 uses a single native domain for the default web port. Additional ports
+/// stay on Cella's explicit hostname proxy URLs.
+pub fn orbstack_domains_label(project: &str, branch: &str) -> String {
     let sanitized = cella_proxy::hostname::sanitize_branch(branch);
-    let mut domains: Vec<String> = forward_ports
-        .iter()
-        .map(|port| format!("{port}.{sanitized}.{project}.local"))
-        .collect();
-    domains.push(format!("{sanitized}.{project}.local"));
-    domains.join(",")
+    format!("{sanitized}.{project}.local")
+}
+
+/// Generate `dev.orbstack.http-port` for the configured default web port.
+pub fn orbstack_http_port_label(forward_ports: &[u16]) -> Option<String> {
+    forward_ports.first().map(u16::to_string)
 }
 
 /// Compute a SHA-256 digest of the features config for image tagging.
@@ -399,16 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn orbstack_domains_with_ports() {
-        let label = orbstack_domains_label("myapp", "feature/auth", &[3000, 8080]);
-        assert!(label.contains("3000.feature-auth.myapp.local"));
-        assert!(label.contains("8080.feature-auth.myapp.local"));
-        assert!(label.contains("feature-auth.myapp.local"));
+    fn orbstack_domains_uses_single_default_domain() {
+        let label = orbstack_domains_label("myapp", "feature/auth");
+        assert_eq!(label, "feature-auth.myapp.local");
+        assert!(!label.contains("3000."));
     }
 
     #[test]
-    fn orbstack_domains_no_ports() {
-        let label = orbstack_domains_label("myapp", "main", &[]);
-        assert_eq!(label, "main.myapp.local");
+    fn orbstack_http_port_uses_first_forward_port() {
+        assert_eq!(
+            orbstack_http_port_label(&[3000, 8080]).as_deref(),
+            Some("3000")
+        );
+        assert_eq!(orbstack_http_port_label(&[]), None);
     }
 }
