@@ -378,6 +378,7 @@ mod tests {
                 protocol: cella_protocol::PortProtocol::Tcp,
                 process: Some("node".to_string()),
                 url: "localhost:49152".to_string(),
+                hostname: None,
             },
             cella_protocol::ForwardedPortDetail {
                 container_name: "api".to_string(),
@@ -386,6 +387,7 @@ mod tests {
                 protocol: cella_protocol::PortProtocol::Tcp,
                 process: None,
                 url: "localhost:49153".to_string(),
+                hostname: None,
             },
         ];
 

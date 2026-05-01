@@ -25,6 +25,11 @@ pub fn from_devcontainer_config(
             .map(String::from),
         backend_kind,
         docker_host,
+        project_name: config
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        branch: None,
     }
 }
 
@@ -50,6 +55,8 @@ pub fn from_container_labels(
         shutdown_action: container.labels.get("dev.cella.shutdown_action").cloned(),
         backend_kind: container.labels.get(BACKEND_LABEL).cloned(),
         docker_host,
+        project_name: None,
+        branch: container.labels.get("dev.cella.branch").cloned(),
     }
 }
 

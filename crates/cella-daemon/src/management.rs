@@ -430,6 +430,7 @@ async fn handle_query_ports(port_manager: &Arc<Mutex<PortManager>>) -> Managemen
                 protocol: p.protocol,
                 process: p.process.clone(),
                 url: p.url(),
+                hostname: None,
             })
             .collect()
     };
@@ -590,6 +591,8 @@ mod tests {
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    project_name: None,
+                    branch: None,
                 },
             )),
         )
@@ -903,6 +906,8 @@ mod tests {
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    project_name: None,
+                    branch: None,
                 },
             )),
         )

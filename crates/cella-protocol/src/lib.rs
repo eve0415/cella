@@ -197,6 +197,12 @@ pub struct ContainerRegistrationData {
     /// Docker host override used when the container was created.
     #[serde(default)]
     pub docker_host: Option<String>,
+    /// Project name from devcontainer.json `name` field or repo directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// Git branch name (for worktree containers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Requests from CLI tools to the daemon management socket.
@@ -301,6 +307,9 @@ pub struct ForwardedPortDetail {
     pub protocol: PortProtocol,
     pub process: Option<String>,
     pub url: String,
+    /// Hostname-based URL (e.g., `http://3000.main.myapp.localhost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Summary of a registered container.
@@ -866,6 +875,8 @@ mod tests {
             shutdown_action: None,
             backend_kind: Some("docker".to_string()),
             docker_host: None,
+            project_name: None,
+            branch: None,
         }));
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"register_container\""));
@@ -926,6 +937,7 @@ mod tests {
                 protocol: PortProtocol::Tcp,
                 process: Some("node".to_string()),
                 url: "localhost:3000".to_string(),
+                hostname: None,
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();
