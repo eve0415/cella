@@ -8,6 +8,7 @@ license.workspace = true
 cella-env.workspace = true
 cella-features.workspace = true
 cella-git.workspace = true
+cella-proxy.workspace = true
 chrono.workspace = true
 nix.workspace = true
 tokio.workspace = true

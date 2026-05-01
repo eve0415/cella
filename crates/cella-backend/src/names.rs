@@ -179,6 +179,20 @@ pub fn worktree_labels(branch_name: &str, parent_repo: &Path) -> HashMap<String,
     labels
 }
 
+/// Generate `dev.orbstack.domains` label value for hostname-based routing.
+///
+/// Produces domains like `3000.feature-auth.myapp.local` for each forwarded port,
+/// plus a bare `feature-auth.myapp.local` for the default port.
+pub fn orbstack_domains_label(project: &str, branch: &str, forward_ports: &[u16]) -> String {
+    let sanitized = cella_proxy::hostname::sanitize_branch(branch);
+    let mut domains: Vec<String> = forward_ports
+        .iter()
+        .map(|port| format!("{port}.{sanitized}.{project}.local"))
+        .collect();
+    domains.push(format!("{sanitized}.{project}.local"));
+    domains.join(",")
+}
+
 /// Compute a SHA-256 digest of the features config for image tagging.
 pub fn compute_features_digest(config: &serde_json::Value) -> String {
     let features = config.get("features").unwrap_or(&serde_json::Value::Null);
@@ -382,5 +396,19 @@ mod tests {
         let path = PathBuf::from("/");
         let name = container_name(&path, None);
         assert!(name.starts_with("cella-unnamed-"));
+    }
+
+    #[test]
+    fn orbstack_domains_with_ports() {
+        let label = orbstack_domains_label("myapp", "feature/auth", &[3000, 8080]);
+        assert!(label.contains("3000.feature-auth.myapp.local"));
+        assert!(label.contains("8080.feature-auth.myapp.local"));
+        assert!(label.contains("feature-auth.myapp.local"));
+    }
+
+    #[test]
+    fn orbstack_domains_no_ports() {
+        let label = orbstack_domains_label("myapp", "main", &[]);
+        assert_eq!(label, "main.myapp.local");
     }
 }
