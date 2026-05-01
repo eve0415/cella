@@ -5,6 +5,12 @@ use super::{ClaudeCode, Codex, Gemini, Nvim, Tmux};
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Tools {
+    /// Tools to eagerly install during `cella up`.
+    ///
+    /// Valid values: `"claude-code"`, `"codex"`, `"gemini"`, `"nvim"`, `"tmux"`.
+    #[serde(default)]
+    pub install: Vec<String>,
+
     #[serde(default, rename = "claude-code")]
     pub claude_code: ClaudeCode,
 
@@ -57,5 +63,30 @@ version = "0.1.2"
     fn unknown_tool_rejected() {
         let result = toml::from_str::<Tools>("[unknown_tool]\nenabled = true\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn install_list_defaults_empty() {
+        let tools: Tools = toml::from_str("").unwrap();
+        assert!(tools.install.is_empty());
+    }
+
+    #[test]
+    fn install_list_parses() {
+        let tools: Tools = toml::from_str(r#"install = ["claude-code", "nvim", "tmux"]"#).unwrap();
+        assert_eq!(tools.install, vec!["claude-code", "nvim", "tmux"]);
+    }
+
+    #[test]
+    fn install_list_with_tool_config() {
+        let toml_str = r#"
+install = ["claude-code"]
+
+[claude-code]
+version = "1.0.58"
+"#;
+        let tools: Tools = toml::from_str(toml_str).unwrap();
+        assert_eq!(tools.install, vec!["claude-code"]);
+        assert_eq!(tools.claude_code.version, "1.0.58");
     }
 }
