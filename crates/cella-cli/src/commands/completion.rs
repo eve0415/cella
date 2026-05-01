@@ -6,12 +6,12 @@ use clap_complete::{Shell, generate};
 /// Output the completion script to stdout. Pipe it to the appropriate
 /// location for your shell:
 ///
-///   cella completions bash > ~/.local/share/bash-completion/completions/cella
-///   cella completions zsh > ~/.zfunc/_cella
-///   cella completions fish > ~/.config/fish/completions/cella.fish
+///   cella completion bash > ~/.local/share/bash-completion/completions/cella
+///   cella completion zsh > ~/.zfunc/_cella
+///   cella completion fish > ~/.config/fish/completions/cella.fish
 #[derive(Args)]
-pub struct CompletionsArgs {
-    /// Shell to generate completions for.
+pub struct CompletionArgs {
+    /// Shell to generate completion for.
     #[arg(value_enum)]
     shell: CompletionShell,
 }
@@ -23,7 +23,7 @@ enum CompletionShell {
     Fish,
 }
 
-impl CompletionsArgs {
+impl CompletionArgs {
     pub fn execute(&self) {
         let shell = match self.shell {
             CompletionShell::Bash => Shell::Bash,
@@ -41,7 +41,7 @@ mod tests {
     use clap_complete::{Shell, generate};
 
     #[test]
-    fn bash_completions_output() {
+    fn bash_completion_output() {
         let mut buf = Vec::new();
         let mut cmd = crate::Cli::command();
         generate(Shell::Bash, &mut cmd, "cella", &mut buf);
@@ -51,7 +51,7 @@ mod tests {
     }
 
     #[test]
-    fn zsh_completions_output() {
+    fn zsh_completion_output() {
         let mut buf = Vec::new();
         let mut cmd = crate::Cli::command();
         generate(Shell::Zsh, &mut cmd, "cella", &mut buf);
@@ -60,7 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn fish_completions_output() {
+    fn fish_completion_output() {
         let mut buf = Vec::new();
         let mut cmd = crate::Cli::command();
         generate(Shell::Fish, &mut cmd, "cella", &mut buf);

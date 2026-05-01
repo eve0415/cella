@@ -37,7 +37,7 @@ Date: 2026-04-29
 | `templates generate-docs` | Generate docs | Not implemented | MISSING |
 
 ### Cella-Specific Commands (beyond spec, keep as-is)
-`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config validate`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completions`
+`shell`, `list`, `logs`, `doctor`, `branch`, `switch`, `prune`, `nvim`, `code`, `tmux`, `ports`, `credential`, `network`, `init`, `config validate`, `down`, `daemon`, `features edit`, `features list`, `features update`, `completion`
 
 ### CLI surface reserved for future work (stubs present, not yet implemented)
 
