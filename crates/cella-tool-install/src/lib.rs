@@ -663,11 +663,11 @@ fn ensure_tool_config_paths_in(home: &std::path::Path, settings: &cella_config::
         ensure_dir(&home.join(".gemini"));
     }
 
-    if settings.tools.nvim.forward_config {
+    if settings.tools.nvim.forward_config && settings.tools.nvim.config_path.is_none() {
         ensure_dir(&home.join(".config").join("nvim"));
     }
 
-    if settings.tools.tmux.forward_config {
+    if settings.tools.tmux.forward_config && settings.tools.tmux.config_path.is_none() {
         ensure_file(&home.join(".tmux.conf"), "");
     }
 }
@@ -687,7 +687,11 @@ fn ensure_file(path: &std::path::Path, content: &str) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    warn!("cannot set permissions on {}: {e}", path.display());
+                }
             }
             debug!("created {}", path.display());
         }
@@ -704,7 +708,11 @@ fn ensure_dir(path: &std::path::Path) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!("cannot set permissions on {}: {e}", path.display());
+                }
             }
             debug!("created {}", path.display());
         }
@@ -2265,6 +2273,25 @@ mod tests {
         assert!(!tmp.path().join(".gemini").exists());
         assert!(!tmp.path().join(".config/nvim").exists());
         assert!(!tmp.path().join(".tmux.conf").exists());
+    }
+
+    #[test]
+    fn ensure_skips_default_when_custom_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.nvim.config_path = Some("~/dotfiles/nvim".to_string());
+        settings.tools.tmux.config_path = Some("~/dotfiles/.tmux.conf".to_string());
+
+        ensure_tool_config_paths_in(tmp.path(), &settings);
+
+        assert!(
+            !tmp.path().join(".config/nvim").exists(),
+            "default nvim path must not be created when config_path is set"
+        );
+        assert!(
+            !tmp.path().join(".tmux.conf").exists(),
+            "default tmux path must not be created when config_path is set"
+        );
     }
 
     #[test]

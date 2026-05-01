@@ -862,6 +862,7 @@ async fn build_override_and_start(
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
+    cella_tool_install::ensure_tool_config_paths(&settings);
     let mount_specs = build_compose_mount_specs(ComposeMountParams {
         workspace_root: cfg.workspace_root,
         settings: &settings,
@@ -1173,7 +1174,6 @@ async fn build_compose_mount_specs(
 
     // 2. Auto-forwarded mounts — appended last so last-wins dedup gives them
     //    precedence over a user/feature mount at the same target.
-    cella_tool_install::ensure_tool_config_paths(p.settings);
     specs.extend(cella_tool_install::build_tool_config_mount_specs(
         p.settings,
         p.remote_user,
