@@ -113,13 +113,39 @@ When `enabled = false`, all per-provider toggles are ignored and no keys are for
 
 ### `[tools]`
 
-Controls automatic installation and host config forwarding for dev tools. Each tool section can enable/disable the tool and control whether host configuration is bind-mounted into the container.
+Controls tool installation and host config forwarding for dev tools. Tools are **not installed by default** — use `cella install` to install tools on-demand, or list them in `install` for eager installation during `cella up`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `install` | list | `[]` | Tools to install during `cella up`. Valid values: `"claude-code"`, `"codex"`, `"gemini"`, `"nvim"`, `"tmux"` |
+
+```toml
+[tools]
+install = ["claude-code", "nvim"]
+```
+
+#### `cella install`
+
+Install tools into a running container:
+
+```sh
+cella install                    # interactive selector
+cella install claude-code nvim   # install specific tools
+cella install --all              # install everything
+cella install codex --version 0.1.2  # pin a version
+```
+
+After installing, run tools with `cella exec`:
+
+```sh
+cella exec nvim
+cella exec tmux new-session -As main
+```
 
 #### `[tools.claude-code]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Install Claude Code in the container |
 | `forward_config` | bool | `true` | Bind-mount host config into the container |
 | `version` | string | `"latest"` | `"latest"`, `"stable"`, or a pinned version like `"1.0.58"` |
 
@@ -129,7 +155,6 @@ Host paths mounted when `forward_config = true`:
 
 ```toml
 [tools.claude-code]
-enabled = true
 forward_config = true
 version = "latest"
 ```
@@ -138,7 +163,6 @@ version = "latest"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Install Codex CLI in the container |
 | `forward_config` | bool | `true` | Bind-mount host config into the container |
 | `version` | string | `"latest"` | `"latest"` or a pinned version like `"0.1.2"` |
 
@@ -147,7 +171,6 @@ Host paths mounted when `forward_config = true`:
 
 ```toml
 [tools.codex]
-enabled = true
 version = "latest"
 ```
 
@@ -155,7 +178,6 @@ version = "latest"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Install Gemini CLI in the container |
 | `forward_config` | bool | `true` | Bind-mount host config into the container |
 | `version` | string | `"latest"` | `"latest"` or a pinned version like `"0.1.2"` |
 
@@ -164,13 +186,10 @@ Host paths mounted when `forward_config = true`:
 
 ```toml
 [tools.gemini]
-enabled = true
 version = "latest"
 ```
 
 #### `[tools.nvim]`
-
-Neovim does not have an `enabled` toggle — it is installed on-demand when first used. This section controls config forwarding and the install version.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -192,7 +211,7 @@ config_path = "~/dotfiles/nvim"
 
 #### `[tools.tmux]`
 
-Tmux does not have an `enabled` toggle or a `version` field. This section controls config forwarding only.
+Tmux has no `version` field — it is installed via the container's system package manager.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
