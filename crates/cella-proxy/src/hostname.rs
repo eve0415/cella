@@ -125,30 +125,27 @@ fn split_tld(hostname: &str) -> Option<(Vec<&str>, HostnameTld)> {
     }
 }
 
-/// Build a hostname URL for a forwarded port.
-pub fn build_hostname_url(port: u16, branch: &str, project: &str, is_orbstack: bool) -> String {
-    build_hostname_url_with_proxy_port(port, branch, project, is_orbstack, None)
-}
-
 /// Build a hostname URL for a forwarded port, including the hostname proxy
 /// listener port when it is not the default HTTP port.
-pub fn build_hostname_url_with_proxy_port(
+///
+/// Returns `None` when `proxy_port` is `None`, since hostname URLs require the
+/// proxy to be running. `OrbStack`'s `.local` default-port domain is exposed via
+/// Docker labels, not through this function.
+pub fn build_hostname_url(
     port: u16,
     branch: &str,
     project: &str,
-    is_orbstack: bool,
     proxy_port: Option<u16>,
-) -> String {
+) -> Option<String> {
+    proxy_port?;
     let sanitized = sanitize_branch(branch);
-    if is_orbstack {
-        format!("http://{port}.{sanitized}.{project}.local")
-    } else if matches!(proxy_port, Some(p) if p != 80) {
-        format!(
+    if matches!(proxy_port, Some(p) if p != 80) {
+        Some(format!(
             "http://{port}.{sanitized}.{project}.localhost:{}",
             proxy_port.unwrap_or(80)
-        )
+        ))
     } else {
-        format!("http://{port}.{sanitized}.{project}.localhost")
+        Some(format!("http://{port}.{sanitized}.{project}.localhost"))
     }
 }
 
@@ -363,34 +360,26 @@ mod tests {
     // -- build_hostname_url tests --
 
     #[test]
-    fn build_url_non_orbstack() {
+    fn build_url_with_default_proxy_port() {
         assert_eq!(
-            build_hostname_url(3000, "feature/auth", "myapp", false),
-            "http://3000.feature-auth.myapp.localhost"
+            build_hostname_url(3000, "feature/auth", "myapp", Some(80)),
+            Some("http://3000.feature-auth.myapp.localhost".to_string())
         );
     }
 
     #[test]
-    fn build_url_orbstack() {
+    fn build_url_returns_none_without_proxy() {
         assert_eq!(
-            build_hostname_url(3000, "feature/auth", "myapp", true),
-            "http://3000.feature-auth.myapp.local"
+            build_hostname_url(3000, "feature/auth", "myapp", None),
+            None
         );
     }
 
     #[test]
-    fn build_url_non_orbstack_includes_fallback_proxy_port() {
+    fn build_url_includes_fallback_proxy_port() {
         assert_eq!(
-            build_hostname_url_with_proxy_port(3000, "feature/auth", "myapp", false, Some(49180)),
-            "http://3000.feature-auth.myapp.localhost:49180"
-        );
-    }
-
-    #[test]
-    fn build_url_non_orbstack_omits_default_proxy_port() {
-        assert_eq!(
-            build_hostname_url_with_proxy_port(3000, "feature/auth", "myapp", false, Some(80)),
-            "http://3000.feature-auth.myapp.localhost"
+            build_hostname_url(3000, "feature/auth", "myapp", Some(49180)),
+            Some("http://3000.feature-auth.myapp.localhost:49180".to_string())
         );
     }
 

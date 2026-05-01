@@ -110,7 +110,7 @@ fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
         if has_hostnames {
             row.push(port.hostname.as_deref().unwrap_or("-").to_string());
         }
-        row.push(port.hostname.as_deref().unwrap_or(&port.url).to_string());
+        row.push(port.url.clone());
         table.add_row(row);
     }
 

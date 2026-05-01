@@ -34,6 +34,7 @@ pub async fn start_proxy_server(
     route_table: SharedRouteTable,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(addr).await?;
+    let proxy_port = addr.port();
     info!("Hostname proxy listening on {addr}");
 
     let handle = tokio::spawn(async move {
@@ -48,7 +49,7 @@ pub async fn start_proxy_server(
 
             let rt = route_table.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, peer, rt).await {
+                if let Err(e) = handle_connection(stream, peer, rt, proxy_port).await {
                     debug!("Connection error from {peer}: {e}");
                 }
             });
@@ -62,6 +63,7 @@ async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     route_table: SharedRouteTable,
+    proxy_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
 
@@ -72,7 +74,7 @@ async fn handle_connection(
             io,
             service_fn(move |req| {
                 let rt = route_table.clone();
-                async move { Ok::<_, Infallible>(handle_request(req, peer, &rt).await) }
+                async move { Ok::<_, Infallible>(handle_request(req, peer, &rt, proxy_port).await) }
             }),
         )
         .await?;
@@ -84,6 +86,7 @@ async fn handle_request(
     req: Request<Incoming>,
     peer: SocketAddr,
     route_table: &SharedRouteTable,
+    proxy_port: u16,
 ) -> Response<ProxyBody> {
     let host = req
         .headers()
@@ -96,7 +99,7 @@ async fn handle_request(
         let rt = route_table.read().await;
         return html_response(
             StatusCode::NOT_FOUND,
-            error_page::no_route_found(&host, &rt),
+            error_page::no_route_found(&host, &rt, Some(proxy_port)),
         );
     };
 
@@ -112,14 +115,19 @@ async fn handle_request(
         None => {
             return html_response(
                 StatusCode::NOT_FOUND,
-                error_page::no_route_found(&host, &rt),
+                error_page::no_route_found(&host, &rt, Some(proxy_port)),
             );
         }
     };
     drop(rt);
 
+    let route_key = RouteKey {
+        project: parsed.project,
+        branch: parsed.branch,
+        port: parsed.port.unwrap_or(0),
+    };
     let is_ws = is_websocket_upgrade_headers(req.headers());
-    proxy_request(req, peer, &host, &target, is_ws).await
+    proxy_request(req, peer, &host, &target, &route_key, is_ws).await
 }
 
 async fn proxy_request(
@@ -127,6 +135,7 @@ async fn proxy_request(
     peer: SocketAddr,
     original_host: &str,
     target: &BackendTarget,
+    route_key: &RouteKey,
     is_websocket: bool,
 ) -> Response<ProxyBody> {
     let client_upgrade = is_websocket.then(|| hyper::upgrade::on(&mut req));
@@ -134,7 +143,7 @@ async fn proxy_request(
         ProxyMode::Localhost => format!("127.0.0.1:{}", target.target_port),
         ProxyMode::DirectIp(ip) => format!("{ip}:{}", target.target_port),
         ProxyMode::AgentTunnel(_) => {
-            return unavailable_response(target);
+            return unavailable_response(route_key, target);
         }
     };
 
@@ -142,7 +151,7 @@ async fn proxy_request(
         Ok(s) => s,
         Err(e) => {
             debug!("Backend connect to {backend_addr} failed: {e}");
-            return unavailable_response(target);
+            return unavailable_response(route_key, target);
         }
     };
 
@@ -214,6 +223,7 @@ const HOP_BY_HOP: &[&str] = &[
     "te",
     "trailer",
     "transfer-encoding",
+    "upgrade",
 ];
 
 fn build_proxied_request(
@@ -255,17 +265,10 @@ fn is_websocket_upgrade_headers(headers: &hyper::HeaderMap) -> bool {
     has_upgrade && is_websocket
 }
 
-fn unavailable_response(target: &BackendTarget) -> Response<ProxyBody> {
+fn unavailable_response(route_key: &RouteKey, target: &BackendTarget) -> Response<ProxyBody> {
     html_response(
         StatusCode::BAD_GATEWAY,
-        error_page::backend_unreachable(
-            &RouteKey {
-                project: String::new(),
-                branch: String::new(),
-                port: target.target_port,
-            },
-            target,
-        ),
+        error_page::backend_unreachable(route_key, target),
     )
 }
 
@@ -358,13 +361,18 @@ mod tests {
 
     #[test]
     fn unavailable_response_is_502() {
+        let key = RouteKey {
+            project: "myapp".to_string(),
+            branch: "main".to_string(),
+            port: 3000,
+        };
         let target = BackendTarget {
             container_id: "c1".to_string(),
             container_name: "cella-test".to_string(),
             target_port: 3000,
             mode: ProxyMode::DirectIp(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         };
-        let resp = unavailable_response(&target);
+        let resp = unavailable_response(&key, &target);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -387,7 +395,7 @@ mod tests {
         let rt_clone = rt.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt_clone).await;
+            let _ = handle_connection(stream, peer, rt_clone, 80).await;
         });
 
         let stream = TcpStream::connect(bound_addr).await.unwrap();
@@ -429,7 +437,7 @@ mod tests {
         let rt_clone = rt.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt_clone).await;
+            let _ = handle_connection(stream, peer, rt_clone, 80).await;
         });
 
         let stream = TcpStream::connect(bound_addr).await.unwrap();
@@ -492,7 +500,7 @@ mod tests {
         let rt_clone = rt.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = proxy_listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt_clone).await;
+            let _ = handle_connection(stream, peer, rt_clone, 80).await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -557,7 +565,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = proxy_listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt).await;
+            let _ = handle_connection(stream, peer, rt, 80).await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -639,7 +647,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = proxy_listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt).await;
+            let _ = handle_connection(stream, peer, rt, 80).await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -724,7 +732,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = proxy_listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt).await;
+            let _ = handle_connection(stream, peer, rt, 80).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -816,7 +824,7 @@ mod tests {
         let rt_clone = rt.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = proxy_listener.accept().await.unwrap();
-            let _ = handle_connection(stream, peer, rt_clone).await;
+            let _ = handle_connection(stream, peer, rt_clone, 80).await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
