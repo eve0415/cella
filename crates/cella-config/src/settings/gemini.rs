@@ -10,15 +10,11 @@ fn default_latest() -> String {
 
 /// Google Gemini CLI tool settings.
 ///
-/// Controls automatic installation and config forwarding of the Gemini CLI
-/// into dev containers.
+/// Controls config forwarding and version for the Gemini CLI inside dev containers.
+/// Installation is triggered via `cella install` or `[tools] install = ["gemini"]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gemini {
-    /// Install Gemini CLI in the container (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
     /// Bind-mount `~/.gemini` from host into the container (default: true).
     #[serde(default = "default_true")]
     pub forward_config: bool,
@@ -31,7 +27,6 @@ pub struct Gemini {
 impl Default for Gemini {
     fn default() -> Self {
         Self {
-            enabled: true,
             forward_config: true,
             version: "latest".to_string(),
         }
@@ -43,9 +38,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_enables_all() {
+    fn default_values() {
         let settings = Gemini::default();
-        assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
     }
@@ -53,15 +47,13 @@ mod tests {
     #[test]
     fn deserialize_empty_uses_defaults() {
         let settings: Gemini = toml::from_str("").unwrap();
-        assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
     }
 
     #[test]
-    fn deserialize_disabled() {
-        let settings: Gemini = toml::from_str("enabled = false\nforward_config = false").unwrap();
-        assert!(!settings.enabled);
+    fn deserialize_forward_config_disabled() {
+        let settings: Gemini = toml::from_str("forward_config = false").unwrap();
         assert!(!settings.forward_config);
     }
 
@@ -72,10 +64,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_only_enabled() {
-        let settings: Gemini = toml::from_str("enabled = true").unwrap();
-        assert!(settings.enabled);
-        assert!(settings.forward_config);
-        assert_eq!(settings.version, "latest");
+    fn rejects_unknown_fields() {
+        assert!(toml::from_str::<Gemini>("enabled = true").is_err());
     }
 }

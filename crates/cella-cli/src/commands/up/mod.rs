@@ -571,22 +571,25 @@ impl UpContext {
             setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
         }
 
-        // Install AI coding tools
-        let any_tool = settings.tools.claude_code.enabled
-            || settings.tools.codex.enabled
-            || settings.tools.gemini.enabled;
+        // Install tools listed in [tools] install = [...]
+        let tools_to_install: Vec<cella_orchestrator::tool_install::ToolName> = settings
+            .tools
+            .install
+            .iter()
+            .filter_map(|name| cella_orchestrator::tool_install::ToolName::from_config_name(name))
+            .collect();
         self.install_tools(
             container_id,
             remote_user,
             &shell,
             settings,
+            &tools_to_install,
             probed_env.as_ref(),
         )
         .await;
 
         // Re-probe after tool installation to capture PATH changes
-        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
-        let final_probed = if any_tool {
+        let final_probed = if !tools_to_install.is_empty() {
             self.progress
                 .run_step(
                     "Updating environment cache...",
@@ -612,8 +615,6 @@ impl UpContext {
         (final_probed, lifecycle_env)
     }
 
-    /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
-    ///
     /// Delegates to [`cella_orchestrator::tool_install::install_tools`].
     async fn install_tools(
         &self,
@@ -621,6 +622,7 @@ impl UpContext {
         remote_user: &str,
         shell: &str,
         settings: &cella_config::CellaConfig,
+        tools: &[cella_orchestrator::tool_install::ToolName],
         probed_env: Option<&std::collections::HashMap<String, String>>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
@@ -630,6 +632,7 @@ impl UpContext {
             remote_user,
             shell,
             settings,
+            tools,
             probed_env,
             &sender,
         )

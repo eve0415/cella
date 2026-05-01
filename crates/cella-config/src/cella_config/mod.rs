@@ -117,7 +117,7 @@ mod tests {
         let cfg = CellaConfig::load_with_global(tmp.path(), None, Some(tmp.path())).unwrap();
         assert_eq!(cfg.security.mode, SecurityMode::Disabled);
         assert!(cfg.credentials.gh);
-        assert!(cfg.tools.claude_code.enabled);
+        assert!(cfg.tools.claude_code.forward_config);
     }
 
     #[test]

@@ -1443,6 +1443,7 @@ fn render_failure_reason(install_result: Option<&ExecResult>, reason: &str) -> S
 ///
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
+/// Nvim and tmux run in parallel with the other branches.
 ///
 /// After each install attempt, `verified_install_step` confirms the binary is
 /// callable via the same login-shell wrap `cella exec` uses. When the tool is
@@ -1456,23 +1457,22 @@ pub async fn install_tools(
     remote_user: &str,
     shell: &str,
     settings: &cella_config::CellaConfig,
+    tools: &[ToolName],
     probed_env: Option<&ProbedEnv>,
     progress: &ProgressSender,
 ) {
-    let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+    if tools.is_empty() {
+        return;
+    }
+
+    let has = |t: ToolName| tools.contains(&t);
+
+    let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
     let node_available = if needs_npm {
         ensure_node_available(client, container_id, probed_env).await
     } else {
         false
     };
-
-    let any_tool = settings.tools.claude_code.enabled
-        || settings.tools.codex.enabled
-        || settings.tools.gemini.enabled;
-
-    if !any_tool {
-        return;
-    }
 
     let ctx = InstallCtx {
         client,
@@ -1482,11 +1482,10 @@ pub async fn install_tools(
         probed_env,
     };
 
-    // Grouped phase: parallel Claude Code (curl) || npm tools (Codex -> Gemini)
     let phase = progress.phase("Installing tools...");
 
     let claude_branch = async {
-        if settings.tools.claude_code.enabled {
+        if has(ToolName::ClaudeCode) {
             let step = phase.step("Claude Code");
             let install_result = install_claude_code(
                 client,
@@ -1505,7 +1504,7 @@ pub async fn install_tools(
             warn!("Skipping npm tool installs: Node.js/npm not available");
             return;
         }
-        if settings.tools.codex.enabled {
+        if has(ToolName::Codex) {
             let step = phase.step("Codex");
             let install_result = install_codex(
                 client,
@@ -1517,7 +1516,7 @@ pub async fn install_tools(
             .await;
             verified_install_step(&ctx, "codex", install_result, step).await;
         }
-        if settings.tools.gemini.enabled {
+        if has(ToolName::Gemini) {
             let step = phase.step("Gemini CLI");
             let install_result = install_gemini(
                 client,
@@ -1531,7 +1530,35 @@ pub async fn install_tools(
         }
     };
 
-    tokio::join!(claude_branch, npm_branch);
+    let nvim_branch = async {
+        if has(ToolName::Nvim) {
+            let step = phase.step("nvim");
+            let result = install_nvim(
+                client,
+                container_id,
+                remote_user,
+                &settings.tools.nvim.version,
+            )
+            .await;
+            match result {
+                Ok(r) => verified_install_step(&ctx, "nvim", Some(r), step).await,
+                Err(e) => step.fail(&e),
+            }
+        }
+    };
+
+    let tmux_branch = async {
+        if has(ToolName::Tmux) {
+            let step = phase.step("tmux");
+            let result = install_tmux(client, container_id).await;
+            match result {
+                Ok(r) => verified_install_step(&ctx, "tmux", Some(r), step).await,
+                Err(e) => step.fail(&e),
+            }
+        }
+    };
+
+    tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
     phase.finish();
 }
 
@@ -2206,7 +2233,6 @@ mod tests {
     async fn install_claude_code_short_circuits_when_requested_version_exists() {
         let backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 1.2.3\n"))]);
         let settings = cella_config::settings::ClaudeCode {
-            enabled: true,
             version: "1.2.3".to_string(),
             forward_config: false,
         };
@@ -2227,7 +2253,6 @@ mod tests {
             Ok(ok_exit(0)), // native installer
         ]);
         let settings = cella_config::settings::ClaudeCode {
-            enabled: true,
             version: "stable".to_string(),
             forward_config: false,
         };
@@ -2387,7 +2412,6 @@ mod tests {
             Ok(ok_exit(0)), // npm install succeeds
         ]);
         let settings = cella_config::settings::Codex {
-            enabled: true,
             version: "0.42.0".to_string(),
             forward_config: false,
         };
@@ -2419,7 +2443,6 @@ mod tests {
             Ok(ok_stdout(0, "codex 0.42.0\n")),
         ]);
         let settings = cella_config::settings::Codex {
-            enabled: true,
             version: "0.42.0".to_string(),
             forward_config: false,
         };
@@ -2437,7 +2460,6 @@ mod tests {
             Ok(ok_exit(0)), // npm install succeeds
         ]);
         let settings = cella_config::settings::Gemini {
-            enabled: true,
             version: "latest".to_string(),
             forward_config: false,
         };
@@ -2462,7 +2484,6 @@ mod tests {
             }),
         ]);
         let settings = cella_config::settings::Gemini {
-            enabled: true,
             version: "latest".to_string(),
             forward_config: false,
         };

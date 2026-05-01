@@ -10,15 +10,11 @@ fn default_latest() -> String {
 
 /// Claude Code tool settings.
 ///
-/// Controls automatic installation and config forwarding of Claude Code
-/// into dev containers.
+/// Controls config forwarding and version for Claude Code inside dev containers.
+/// Installation is triggered via `cella install` or `[tools] install = ["claude-code"]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeCode {
-    /// Install Claude Code in the container (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
     /// Forward `~/.claude` and `~/.claude.json` from host (default: true).
     #[serde(default = "default_true")]
     pub forward_config: bool,
@@ -31,7 +27,6 @@ pub struct ClaudeCode {
 impl Default for ClaudeCode {
     fn default() -> Self {
         Self {
-            enabled: true,
             forward_config: true,
             version: "latest".to_string(),
         }
@@ -43,9 +38,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_enables_all() {
+    fn default_values() {
         let settings = ClaudeCode::default();
-        assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
     }
@@ -53,16 +47,13 @@ mod tests {
     #[test]
     fn deserialize_empty_uses_defaults() {
         let settings: ClaudeCode = toml::from_str("").unwrap();
-        assert!(settings.enabled);
         assert!(settings.forward_config);
         assert_eq!(settings.version, "latest");
     }
 
     #[test]
-    fn deserialize_disabled() {
-        let settings: ClaudeCode =
-            toml::from_str("enabled = false\nforward_config = false").unwrap();
-        assert!(!settings.enabled);
+    fn deserialize_forward_config_disabled() {
+        let settings: ClaudeCode = toml::from_str("forward_config = false").unwrap();
         assert!(!settings.forward_config);
     }
 
@@ -79,10 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_only_enabled() {
-        let settings: ClaudeCode = toml::from_str("enabled = true").unwrap();
-        assert!(settings.enabled);
-        assert!(settings.forward_config);
-        assert_eq!(settings.version, "latest");
+    fn rejects_unknown_fields() {
+        assert!(toml::from_str::<ClaudeCode>("enabled = true").is_err());
     }
 }
