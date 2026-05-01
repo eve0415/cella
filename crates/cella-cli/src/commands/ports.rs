@@ -85,22 +85,33 @@ fn is_remote_docker_host(host: &str) -> bool {
 fn print_daemon_ports(ports: &[cella_protocol::ForwardedPortDetail]) {
     use crate::table::{Column, Table};
 
-    let mut table = Table::new(vec![
+    let has_hostnames = ports.iter().any(|p| p.hostname.is_some());
+
+    let mut columns = vec![
         Column::shrinkable("CONTAINER"),
         Column::fixed("PORT"),
         Column::fixed("PROCESS"),
         Column::fixed("HOST PORT"),
-        Column::fixed("URL"),
-    ]);
+    ];
+    if has_hostnames {
+        columns.push(Column::shrinkable("HOSTNAME"));
+    }
+    columns.push(Column::fixed("URL"));
+
+    let mut table = Table::new(columns);
 
     for port in ports {
-        table.add_row(vec![
+        let mut row = vec![
             port.container_name.clone(),
             port.container_port.to_string(),
             port.process.as_deref().unwrap_or("-").to_string(),
             port.host_port.to_string(),
-            port.url.clone(),
-        ]);
+        ];
+        if has_hostnames {
+            row.push(port.hostname.as_deref().unwrap_or("-").to_string());
+        }
+        row.push(port.url.clone());
+        table.add_row(row);
     }
 
     table.eprint();
@@ -378,6 +389,7 @@ mod tests {
                 protocol: cella_protocol::PortProtocol::Tcp,
                 process: Some("node".to_string()),
                 url: "localhost:49152".to_string(),
+                hostname: None,
             },
             cella_protocol::ForwardedPortDetail {
                 container_name: "api".to_string(),
@@ -386,6 +398,7 @@ mod tests {
                 protocol: cella_protocol::PortProtocol::Tcp,
                 process: None,
                 url: "localhost:49153".to_string(),
+                hostname: None,
             },
         ];
 

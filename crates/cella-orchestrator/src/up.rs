@@ -800,6 +800,14 @@ impl EnsureUpContext<'_> {
         }
 
         labels.extend(self.config.extra_labels.clone());
+        if runtime == cella_env::DockerRuntime::OrbStack {
+            add_orbstack_hostname_labels(
+                &mut labels,
+                config,
+                &self.config.resolved.workspace_root,
+                self.config.extra_labels,
+            );
+        }
         labels
     }
 
@@ -1630,6 +1638,58 @@ impl EnsureUpContext<'_> {
     }
 }
 
+fn add_orbstack_hostname_labels(
+    labels: &mut std::collections::HashMap<String, String>,
+    config: &serde_json::Value,
+    workspace_root: &std::path::Path,
+    extra_labels: &std::collections::HashMap<String, String>,
+) {
+    let forward_ports = parse_forward_ports(config);
+    let Some(default_port) = cella_backend::orbstack_http_port_label(&forward_ports) else {
+        return;
+    };
+    let project = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .map_or_else(
+            || {
+                workspace_root.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                )
+            },
+            String::from,
+        );
+    let branch = extra_labels
+        .get("dev.cella.branch")
+        .cloned()
+        .or_else(|| {
+            cella_git::discover(workspace_root)
+                .ok()
+                .and_then(|r| r.head_branch)
+        })
+        .unwrap_or_else(|| "main".to_string());
+
+    labels.insert(
+        "dev.orbstack.domains".to_string(),
+        cella_backend::orbstack_domains_label(&project, &branch),
+    );
+    labels.insert("dev.orbstack.http-port".to_string(), default_port);
+}
+
+fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
+    config
+        .get("forwardPorts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Run the full non-compose container-up pipeline.
 ///
 /// # Errors
@@ -1843,6 +1903,39 @@ mod tests {
         hooks.on_container_stopping("test-container").await;
         assert!(hooks.daemon_env("test", "host").await.is_empty());
         assert!(hooks.update_container_ip("container-123", None).await);
+    }
+
+    #[test]
+    fn orbstack_hostname_labels_use_default_port_only() {
+        let mut labels = std::collections::HashMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("dev.cella.branch".to_string(), "feature/auth".to_string());
+        let config = serde_json::json!({
+            "name": "myapp",
+            "forwardPorts": [3000, 8080]
+        });
+
+        add_orbstack_hostname_labels(
+            &mut labels,
+            &config,
+            std::path::Path::new("/tmp/app"),
+            &extra,
+        );
+
+        assert_eq!(
+            labels.get("dev.orbstack.domains").map(String::as_str),
+            Some("feature-auth.myapp.local")
+        );
+        assert_eq!(
+            labels.get("dev.orbstack.http-port").map(String::as_str),
+            Some("3000")
+        );
+        assert!(
+            !labels
+                .get("dev.orbstack.domains")
+                .unwrap()
+                .contains("8080.")
+        );
     }
 
     #[tokio::test]

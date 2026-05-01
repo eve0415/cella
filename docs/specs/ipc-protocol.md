@@ -822,7 +822,7 @@ All variants are tagged with `"type"` in snake_case.
 | `ports` | `ForwardedPortDetail[]` | All forwarded ports across all containers |
 
 ```json
-{"type":"ports","ports":[{"container_name":"cella-myapp-main","container_port":3000,"host_port":3000,"protocol":"tcp","process":"node","url":"localhost:3000"}]}
+{"type":"ports","ports":[{"container_name":"cella-myapp-main","container_port":3000,"host_port":3000,"protocol":"tcp","process":"node","url":"localhost:3000","hostname":"http://3000.main.myapp.localhost"}]}
 ```
 
 **`status`** -- Daemon status.
@@ -838,9 +838,10 @@ All variants are tagged with `"type"` in snake_case.
 | `daemon_started_at` | `u64` | Unix timestamp when daemon started (default: `0`) |
 | `control_port` | `u16` | TCP control port for agent connections (default: `0`) |
 | `control_token` | `string` | Auth token for agent connections (default: `""`) |
+| `hostname_proxy` | `HostnameProxyStatus?` | Hostname HTTP proxy listener state for diagnostics and URL rendering |
 
 ```json
-{"type":"status","pid":12345,"uptime_secs":3600,"container_count":2,"containers":[],"is_orbstack":true,"daemon_version":"0.1.0","daemon_started_at":1711929600,"control_port":9876,"control_token":"secret"}
+{"type":"status","pid":12345,"uptime_secs":3600,"container_count":2,"containers":[],"is_orbstack":false,"daemon_version":"0.1.0","daemon_started_at":1711929600,"control_port":9876,"control_token":"secret","hostname_proxy":{"enabled":true,"address":"127.0.0.1:49180","port":49180,"using_fallback_port":true}}
 ```
 
 **`shutting_down`** -- Daemon is shutting down.
@@ -911,7 +912,17 @@ All variants are tagged with `"type"` in snake_case.
 | `host_port` | `u16` | Port on the host |
 | `protocol` | `PortProtocol` | `"tcp"` or `"udp"` |
 | `process` | `string?` | Process name, if known |
-| `url` | `string` | URL for accessing this port |
+| `url` | `string` | Compatibility URL for accessing this port via `localhost:<host_port>` |
+| `hostname` | `string?` | Full hostname URL when hostname routing is available; includes the fallback proxy port when needed |
+
+**`HostnameProxyStatus`** -- Runtime state for the hostname HTTP proxy listener.
+
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | `bool` | Whether the hostname proxy listener is available |
+| `address` | `string?` | Bound loopback address, for example `127.0.0.1:80` or `127.0.0.1:49180` |
+| `port` | `u16?` | Bound listener port |
+| `using_fallback_port` | `bool` | `true` when port 80 was unavailable and a high loopback port is used |
 
 **`ContainerSummary`** -- Summary of a registered container.
 

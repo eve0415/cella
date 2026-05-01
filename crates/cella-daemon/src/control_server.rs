@@ -38,6 +38,7 @@ pub(crate) struct ControlContext {
     pub cella_bin: std::path::PathBuf,
     pub tunnel_broker: Arc<TunnelBroker>,
     pub is_orbstack: bool,
+    pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -395,6 +396,7 @@ async fn handle_agent_connection_after_hello(
                     container_ip: hs.container_ip.as_deref(),
                     container_name: Some(&hs.container_name),
                     is_orbstack: ctx.is_orbstack,
+                    hostname_route_table: ctx.hostname_route_table.clone(),
                 };
                 let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
 
@@ -435,6 +437,7 @@ pub(crate) struct AgentHandlerContext<'a> {
     pub container_ip: Option<&'a str>,
     pub container_name: Option<&'a str>,
     pub is_orbstack: bool,
+    pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
 
 use crate::proxy::ProxyStartTarget;
@@ -442,7 +445,7 @@ use crate::proxy::ProxyStartTarget;
 /// Start a TCP proxy for a forwarded port and verify it bound successfully.
 ///
 /// Returns `false` if the proxy bind failed and the allocation should be rolled back.
-async fn start_port_proxy(
+pub(crate) async fn start_port_proxy(
     host_port: u16,
     target: ProxyStartTarget,
     proxy_cmd_tx: &tokio::sync::mpsc::Sender<ProxyCommand>,
@@ -483,9 +486,11 @@ async fn handle_port_open(
     );
     let host_port = {
         let mut pm = ctx.port_manager.lock().await;
+        let existing = pm.host_port_for(&cid, port);
         pm.handle_port_open(&cid, port, protocol, process)
+            .map(|hp| (hp, existing == Some(hp)))
     };
-    let Some(hp) = host_port else {
+    let Some((hp, already_forwarded)) = host_port else {
         return Some(DaemonMessage::Ack { id: None });
     };
 
@@ -495,7 +500,9 @@ async fn handle_port_open(
         pm.container_ip(&cid).map(str::to_string)
     };
 
-    if let Some(tx) = ctx.proxy_cmd_tx {
+    if let Some(tx) = ctx.proxy_cmd_tx
+        && !already_forwarded
+    {
         let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
         let target = if use_direct_ip {
             if let Some(ip) = current_container_ip.as_deref().or(ctx.container_ip) {
@@ -525,6 +532,8 @@ async fn handle_port_open(
         }
     }
 
+    sync_hostname_route(&cid, port, ctx).await;
+
     Some(DaemonMessage::PortMapping {
         container_port: port,
         host_port: hp,
@@ -535,14 +544,57 @@ async fn handle_port_open(
 async fn handle_port_closed(port: u16, protocol: PortProtocol, ctx: &AgentHandlerContext<'_>) {
     let cid = ctx.container_id.unwrap_or("unknown").to_string();
     debug!("Port closed: {port}/{protocol} from {cid}");
-    let host_port = {
+    let (host_port, route) = {
         let mut pm = ctx.port_manager.lock().await;
-        pm.handle_port_closed(&cid, port)
+        let route = pm.hostname_route_for(&cid, port);
+        let host_port = pm.handle_port_closed(&cid, port);
+        drop(pm);
+        (host_port, route)
     };
 
     if let (Some(hp), Some(tx)) = (host_port, ctx.proxy_cmd_tx) {
         let _ = tx.send(ProxyCommand::Stop { host_port: hp }).await;
     }
+    remove_hostname_route(route, ctx).await;
+}
+
+async fn sync_hostname_route(container_id: &str, port: u16, ctx: &AgentHandlerContext<'_>) {
+    let route = {
+        let pm = ctx.port_manager.lock().await;
+        pm.hostname_route_for(container_id, port)
+    };
+    let Some(route) = route else { return };
+    let container_name = ctx.container_name.unwrap_or("unknown").to_string();
+
+    let mut rt = ctx.hostname_route_table.write().await;
+    rt.insert(
+        cella_proxy::router::RouteKey {
+            project: route.project.clone(),
+            branch: route.branch.clone(),
+            port: route.container_port,
+        },
+        cella_proxy::router::BackendTarget {
+            container_id: container_id.to_string(),
+            container_name,
+            target_port: route.host_port,
+            mode: cella_proxy::router::ProxyMode::Localhost,
+        },
+    );
+    rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
+}
+
+async fn remove_hostname_route(
+    route: Option<crate::port_manager::HostnameRouteInfo>,
+    ctx: &AgentHandlerContext<'_>,
+) {
+    let Some(route) = route else { return };
+
+    let mut rt = ctx.hostname_route_table.write().await;
+    rt.remove(&cella_proxy::router::RouteKey {
+        project: route.project,
+        branch: route.branch,
+        port: route.container_port,
+    });
 }
 
 /// Handle a browser open request from an agent.
@@ -2260,13 +2312,22 @@ mod tests {
     use cella_protocol::PortProtocol;
 
     use super::*;
+    use crate::port_manager::ContainerRegistrationInfo;
 
     /// Helper to set up a port manager with a forwarded port for testing.
     async fn pm_with_forwarded_port(container_port: u16) -> Arc<Mutex<PortManager>> {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", container_port, PortProtocol::Tcp, None);
         }
         pm
@@ -2285,8 +2346,24 @@ mod tests {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test-a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "test-b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "test-b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             // c1 gets port 3000
             guard.handle_port_open("c1", 3000, PortProtocol::Tcp, None);
             // c2 also wants 3000 — gets remapped to 3001
@@ -2301,8 +2378,24 @@ mod tests {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", 8080, PortProtocol::Tcp, None);
             guard.handle_port_open("c2", 8080, PortProtocol::Tcp, None);
         }
@@ -2389,6 +2482,9 @@ mod tests {
             cella_bin: std::path::PathBuf::from("/nonexistent"),
             tunnel_broker: Arc::new(TunnelBroker::new()),
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         }
     }
 
@@ -3062,6 +3158,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::Health {
@@ -3094,6 +3193,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::ClipboardCopy {
@@ -3120,6 +3222,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::ClipboardCopy {
@@ -3146,6 +3251,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::ClipboardPaste {
@@ -3174,6 +3282,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::ClipboardPaste { mime_type: None };
@@ -3194,7 +3305,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3208,6 +3327,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::PortClosed {
@@ -3237,6 +3359,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         // Use an unknown operation so it fails fast without needing real git
@@ -3280,6 +3405,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::Health {
@@ -3312,8 +3440,24 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "a", Some("172.20.0.5".to_string()), vec![], None);
-            guard.register_container("c2", "b", Some("172.20.0.6".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "a".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c2".to_string(),
+                container_name: "b".to_string(),
+                container_ip: Some("172.20.0.6".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
             guard.handle_port_open("c1", 4000, PortProtocol::Tcp, None);
             guard.handle_port_open("c2", 4000, PortProtocol::Tcp, None);
         }
@@ -3337,7 +3481,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", Some("172.20.0.5".to_string()), vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3351,6 +3503,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: None,
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::PortOpen {
@@ -3375,21 +3530,105 @@ branch refs/heads/feat-b
     }
 
     #[tokio::test]
+    async fn port_open_duplicate_and_close_update_hostname_routes() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: Some("My App".to_string()),
+                branch: Some("feature/auth".to_string()),
+            });
+        }
+        let browser = Arc::new(BrowserHandler::new());
+        let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
+        let state = Arc::new(AgentConnectionState::new());
+        let routes = Arc::new(tokio::sync::RwLock::new(
+            cella_proxy::router::RouteTable::new(),
+        ));
+        let ctx = AgentHandlerContext {
+            port_manager: &pm,
+            browser_handler: &browser,
+            clipboard_handler: &clipboard,
+            container_id: Some("c1"),
+            proxy_cmd_tx: None,
+            container_ip: None,
+            container_name: Some("test"),
+            is_orbstack: false,
+            hostname_route_table: routes.clone(),
+        };
+
+        let msg = AgentMessage::PortOpen {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+            process: None,
+            bind: cella_protocol::BindAddress::All,
+            proxy_port: None,
+        };
+        let first = handle_agent_message(msg.clone(), &ctx, &state).await;
+        let second = handle_agent_message(msg, &ctx, &state).await;
+        assert!(matches!(
+            first,
+            Some(DaemonMessage::PortMapping {
+                container_port: 3000,
+                host_port: 3000
+            })
+        ));
+        assert!(matches!(
+            second,
+            Some(DaemonMessage::PortMapping {
+                container_port: 3000,
+                host_port: 3000
+            })
+        ));
+
+        {
+            let table = routes.read().await;
+            let target = table.lookup("my-app", "feature-auth", 3000).unwrap();
+            assert_eq!(target.target_port, 3000);
+            assert!(matches!(
+                target.mode,
+                cella_proxy::router::ProxyMode::Localhost
+            ));
+            drop(table);
+        }
+
+        let closed = AgentMessage::PortClosed {
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+        };
+        assert!(handle_agent_message(closed, &ctx, &state).await.is_none());
+        assert!(
+            routes
+                .read()
+                .await
+                .lookup("my-app", "feature-auth", 3000)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_port_open_acknowledges_ignored_port() {
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container(
-                "c1",
-                "test",
-                Some("172.20.0.5".to_string()),
-                vec![cella_protocol::PortAttributes {
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![cella_protocol::PortAttributes {
                     port: cella_protocol::PortPattern::Single(9229),
                     on_auto_forward: cella_protocol::OnAutoForward::Ignore,
                     ..cella_protocol::PortAttributes::default()
                 }],
-                None,
-            );
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3403,6 +3642,9 @@ branch refs/heads/feat-b
             container_ip: Some("172.20.0.5"),
             container_name: Some("test"),
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::PortOpen {
@@ -3425,7 +3667,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         {
             let mut guard = pm.lock().await;
-            guard.register_container("c1", "test", None, vec![], None);
+            guard.register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: None,
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         }
         let browser = Arc::new(BrowserHandler::new());
         let clipboard = Arc::new(crate::clipboard::ClipboardHandler::null());
@@ -3440,6 +3690,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: Some("test"),
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::PortOpen {
@@ -3462,7 +3715,15 @@ branch refs/heads/feat-b
         let pm = Arc::new(Mutex::new(PortManager::new(false)));
         pm.lock()
             .await
-            .register_container("c1", "test", None, vec![], None);
+            .register_container(ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test".to_string(),
+                container_ip: None,
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: None,
+                branch: None,
+            });
         assert!(
             pm.lock()
                 .await
@@ -3507,6 +3768,9 @@ branch refs/heads/feat-b
             container_ip: None,
             container_name: Some("test"),
             is_orbstack: false,
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
         };
 
         let msg = AgentMessage::PortOpen {

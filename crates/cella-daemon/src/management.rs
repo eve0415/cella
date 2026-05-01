@@ -38,6 +38,8 @@ pub(crate) struct ManagementContext {
     pub ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
     pub container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
     pub tunnel_broker: Arc<crate::tunnel::TunnelBroker>,
+    pub hostname_route_table: cella_proxy::server::SharedRouteTable,
+    pub hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -96,6 +98,7 @@ pub(crate) async fn run_management_server(
             cella_bin: crate::control_server::resolve_cella_binary(),
             tunnel_broker: ctx.tunnel_broker.clone(),
             is_orbstack: ctx.is_orbstack,
+            hostname_route_table: ctx.hostname_route_table.clone(),
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(
@@ -212,25 +215,24 @@ async fn handle_management_request(
                 forward_ports: data.forward_ports,
                 backend_kind: data.backend_kind,
                 docker_host: data.docker_host,
+                project_name: data.project_name,
+                branch: data.branch,
             };
-            handle_register(reg, &ctx.port_manager, container_handles, &ctx.proxy_cmd_tx).await
+            handle_register(reg, ctx, container_handles).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
-            handle_deregister(&container_name, &ctx.port_manager, container_handles).await
-        }
-        ManagementRequest::QueryPorts => handle_query_ports(&ctx.port_manager).await,
-        ManagementRequest::QueryStatus => {
-            handle_query_status(
+            handle_deregister(
+                &container_name,
                 &ctx.port_manager,
                 container_handles,
-                ctx.start_time,
-                ctx.is_orbstack,
-                ctx.daemon_started_at,
-                &ctx.auth_token,
-                ctx.control_port,
+                &ctx.hostname_route_table,
             )
             .await
         }
+        ManagementRequest::QueryPorts => {
+            handle_query_ports(&ctx.port_manager, ctx.hostname_proxy.as_ref()).await
+        }
+        ManagementRequest::QueryStatus => handle_query_status(ctx, container_handles).await,
         ManagementRequest::UpdateContainerIp {
             container_id,
             container_ip,
@@ -325,63 +327,142 @@ struct ContainerRegistration {
     forward_ports: Vec<u16>,
     backend_kind: Option<String>,
     docker_host: Option<String>,
+    project_name: Option<String>,
+    branch: Option<String>,
 }
 
 /// Handle container registration.
 async fn handle_register(
     reg: ContainerRegistration,
-    port_manager: &Arc<Mutex<PortManager>>,
+    ctx: &ManagementContext,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
 ) -> ManagementResponse {
     // Register with port manager
-    {
-        let mut pm = port_manager.lock().await;
-        let released = pm.register_container(
-            &reg.container_id,
-            &reg.container_name,
-            reg.container_ip,
-            reg.ports_attributes,
-            reg.other_ports_attributes,
-        );
-
-        // Stop coordinator-owned proxies for ports released by re-registration.
-        for hp in released {
-            let _ = proxy_cmd_tx
-                .send(ProxyCommand::Stop { host_port: hp })
-                .await;
-        }
-
-        // Pre-allocate host ports for forwardPorts
-        for &fwd_port in &reg.forward_ports {
-            pm.handle_port_open(
-                &reg.container_id,
-                fwd_port,
-                cella_protocol::PortProtocol::Tcp,
-                None,
-            );
-        }
-    }
-
-    // Store handle for agent connection tracking
-    {
-        let mut handles = container_handles.lock().await;
-        handles.insert(
-            reg.container_name.clone(),
-            ContainerHandle {
+    let container_id = reg.container_id.clone();
+    let container_name = reg.container_name.clone();
+    let container_ip_clone = reg.container_ip.clone();
+    let released = {
+        use crate::port_manager::ContainerRegistrationInfo;
+        ctx.port_manager
+            .lock()
+            .await
+            .register_container(ContainerRegistrationInfo {
                 container_id: reg.container_id,
-                agent_state: Arc::new(AgentConnectionState::new()),
-                backend_kind: reg.backend_kind,
-                docker_host: reg.docker_host,
-                agent_tx: None,
-            },
-        );
+                container_name: reg.container_name,
+                container_ip: reg.container_ip,
+                ports_attributes: reg.ports_attributes,
+                other_ports_attributes: reg.other_ports_attributes,
+                project_name: reg.project_name,
+                branch: reg.branch,
+            })
+    };
+
+    // Stop coordinator-owned proxies for ports released by re-registration.
+    for hp in released {
+        let _ = ctx
+            .proxy_cmd_tx
+            .send(ProxyCommand::Stop { host_port: hp })
+            .await;
     }
 
-    info!("Registered container {}", reg.container_name);
+    // Store handle before starting tunnel-mode forwardPorts so those proxies
+    // can resolve the agent channel once it connects.
+    container_handles.lock().await.insert(
+        container_name.clone(),
+        ContainerHandle {
+            container_id: container_id.clone(),
+            agent_state: Arc::new(AgentConnectionState::new()),
+            backend_kind: reg.backend_kind,
+            docker_host: reg.docker_host,
+            agent_tx: None,
+        },
+    );
 
-    ManagementResponse::ContainerRegistered {
-        container_name: reg.container_name,
+    preload_forward_ports(
+        ctx,
+        &container_id,
+        &container_name,
+        container_ip_clone.as_deref(),
+        &reg.forward_ports,
+    )
+    .await;
+
+    info!("Registered container {container_name}");
+
+    ManagementResponse::ContainerRegistered { container_name }
+}
+
+async fn preload_forward_ports(
+    ctx: &ManagementContext,
+    container_id: &str,
+    container_name: &str,
+    container_ip: Option<&str>,
+    forward_ports: &[u16],
+) {
+    ctx.hostname_route_table
+        .write()
+        .await
+        .remove_container(container_id);
+
+    for &port in forward_ports {
+        let host_port = {
+            let mut pm = ctx.port_manager.lock().await;
+            pm.handle_port_open(container_id, port, cella_protocol::PortProtocol::Tcp, None)
+        };
+        let Some(host_port) = host_port else { continue };
+
+        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+        let target = if use_direct_ip {
+            if let Some(ip) = container_ip {
+                crate::proxy::ProxyStartTarget::DirectIp {
+                    ip: ip.to_string(),
+                    port,
+                }
+            } else {
+                warn!("No container IP for direct proxy, skipping forwardPort {port}");
+                ctx.port_manager
+                    .lock()
+                    .await
+                    .handle_port_closed(container_id, port);
+                continue;
+            }
+        } else {
+            crate::proxy::ProxyStartTarget::AgentTunnel {
+                container_name: container_name.to_string(),
+                port,
+            }
+        };
+
+        if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+            ctx.port_manager
+                .lock()
+                .await
+                .handle_port_closed(container_id, port);
+            continue;
+        }
+
+        let route = ctx
+            .port_manager
+            .lock()
+            .await
+            .hostname_route_for(container_id, port);
+        if let Some(route) = route {
+            let mut rt = ctx.hostname_route_table.write().await;
+            rt.insert(
+                cella_proxy::router::RouteKey {
+                    project: route.project.clone(),
+                    branch: route.branch.clone(),
+                    port: route.container_port,
+                },
+                cella_proxy::router::BackendTarget {
+                    container_id: container_id.to_string(),
+                    container_name: container_name.to_string(),
+                    target_port: route.host_port,
+                    mode: cella_proxy::router::ProxyMode::Localhost,
+                },
+            );
+            rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
+        }
     }
 }
 
@@ -390,6 +471,7 @@ async fn handle_deregister(
     container_name: &str,
     port_manager: &Arc<Mutex<PortManager>>,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
+    route_table: &cella_proxy::server::SharedRouteTable,
 ) -> ManagementResponse {
     let mut ports_released = 0;
 
@@ -407,6 +489,12 @@ async fn handle_deregister(
         let ports_after = pm.all_forwarded_ports().len();
         drop(pm);
         ports_released = ports_before.saturating_sub(ports_after);
+
+        // Remove hostname routes
+        route_table
+            .write()
+            .await
+            .remove_container(&handle.container_id);
     }
 
     info!("Deregistered container {container_name} ({ports_released} ports released)");
@@ -418,18 +506,27 @@ async fn handle_deregister(
 }
 
 /// Handle port query.
-async fn handle_query_ports(port_manager: &Arc<Mutex<PortManager>>) -> ManagementResponse {
+async fn handle_query_ports(
+    port_manager: &Arc<Mutex<PortManager>>,
+    hostname_proxy: Option<&cella_protocol::HostnameProxyStatus>,
+) -> ManagementResponse {
+    let hostname_proxy_port =
+        hostname_proxy.and_then(|status| if status.enabled { status.port } else { None });
     let ports = {
         let pm = port_manager.lock().await;
         pm.all_forwarded_ports()
             .into_iter()
-            .map(|p| ForwardedPortDetail {
-                container_name: p.container_name.clone(),
-                container_port: p.container_port,
-                host_port: p.host_port,
-                protocol: p.protocol,
-                process: p.process.clone(),
-                url: p.url(),
+            .map(|p| {
+                let hostname = p.hostname_url(hostname_proxy_port);
+                ForwardedPortDetail {
+                    container_name: p.container_name.clone(),
+                    container_port: p.container_port,
+                    host_port: p.host_port,
+                    protocol: p.protocol,
+                    process: p.process.clone(),
+                    url: p.url(),
+                    hostname,
+                }
             })
             .collect()
     };
@@ -439,16 +536,11 @@ async fn handle_query_ports(port_manager: &Arc<Mutex<PortManager>>) -> Managemen
 
 /// Handle status query.
 async fn handle_query_status(
-    port_manager: &Arc<Mutex<PortManager>>,
+    ctx: &ManagementContext,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    start_time: std::time::Instant,
-    is_orbstack: bool,
-    daemon_started_at: u64,
-    auth_token: &str,
-    control_port: u16,
 ) -> ManagementResponse {
     let handles = container_handles.lock().await;
-    let pm = port_manager.lock().await;
+    let pm = ctx.port_manager.lock().await;
 
     let containers: Vec<ContainerSummary> = handles
         .iter()
@@ -479,14 +571,15 @@ async fn handle_query_status(
 
     ManagementResponse::Status {
         pid: std::process::id(),
-        uptime_secs: start_time.elapsed().as_secs(),
+        uptime_secs: ctx.start_time.elapsed().as_secs(),
         container_count,
         containers,
-        is_orbstack,
+        is_orbstack: ctx.is_orbstack,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        daemon_started_at,
-        control_port,
-        control_token: auth_token.to_string(),
+        daemon_started_at: ctx.daemon_started_at,
+        control_port: ctx.control_port,
+        control_token: ctx.auth_token.clone(),
+        hostname_proxy: ctx.hostname_proxy.clone(),
     }
 }
 
@@ -515,6 +608,15 @@ mod tests {
             ssh_proxy_manager: crate::ssh_proxy::new_shared(tmp.keep(), "test-token".to_string()),
             container_handles: Arc::new(Mutex::new(HashMap::new())),
             tunnel_broker: Arc::new(crate::tunnel::TunnelBroker::new()),
+            hostname_route_table: Arc::new(tokio::sync::RwLock::new(
+                cella_proxy::router::RouteTable::new(),
+            )),
+            hostname_proxy: Some(cella_protocol::HostnameProxyStatus {
+                enabled: true,
+                address: Some("127.0.0.1:80".to_string()),
+                port: Some(80),
+                using_fallback_port: false,
+            }),
         };
         (ctx, srx)
     }
@@ -590,6 +692,8 @@ mod tests {
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    project_name: None,
+                    branch: None,
                 },
             )),
         )
@@ -639,6 +743,40 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn query_ports_includes_hostname_proxy_fallback_port() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        {
+            let mut guard = pm.lock().await;
+            guard.register_container(crate::port_manager::ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: Some("myapp".to_string()),
+                branch: Some("feature/auth".to_string()),
+            });
+            guard.handle_port_open("c1", 3000, cella_protocol::PortProtocol::Tcp, None);
+        }
+        let status = cella_protocol::HostnameProxyStatus {
+            enabled: true,
+            address: Some("127.0.0.1:49180".to_string()),
+            port: Some(49180),
+            using_fallback_port: true,
+        };
+
+        let resp = handle_query_ports(&pm, Some(&status)).await;
+
+        let ManagementResponse::Ports { ports } = resp else {
+            panic!("expected ports response");
+        };
+        assert_eq!(
+            ports[0].hostname.as_deref(),
+            Some("http://3000.feature-auth.myapp.localhost:49180")
+        );
     }
 
     /// Stand up an echo server on `path` to mimic an upstream ssh-agent.
@@ -903,6 +1041,8 @@ mod tests {
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
+                    project_name: None,
+                    branch: None,
                 },
             )),
         )
