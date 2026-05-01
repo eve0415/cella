@@ -6,6 +6,7 @@ use tracing::warn;
 use cella_backend::{ContainerTarget, ExecOptions, InteractiveExecOptions};
 use cella_orchestrator::env_cache::{ensure_ssh_auth_sock, read_probed_env_cache};
 use cella_orchestrator::shell_detect::{detect_shell, wrap_in_login_shell};
+use cella_orchestrator::tool_install::ToolName;
 
 use crate::picker;
 use crate::title::push_for_container;
@@ -176,6 +177,16 @@ impl ExecArgs {
                 )
                 .await?;
             drop(title_guard);
+            if exit_code == 127 {
+                if let Some(binary) = self.command.first() {
+                    if let Some(tool) = ToolName::from_binary_name(binary) {
+                        eprintln!(
+                            "{binary} is not installed. Run `cella install {}` to install it.",
+                            tool.config_name(),
+                        );
+                    }
+                }
+            }
             std::process::exit(i32::try_from(exit_code).unwrap_or(125));
         }
 
