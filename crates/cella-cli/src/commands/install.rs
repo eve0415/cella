@@ -11,7 +11,7 @@ use crate::picker;
 /// Install tools into the running dev container.
 ///
 /// With no arguments, shows an interactive selector. Already-installed tools
-/// are shown but disabled. Specify tool names or `--all` for non-interactive use.
+/// are hidden. Specify tool names or `--all` for non-interactive use.
 #[derive(Args)]
 pub struct InstallArgs {
     /// Tools to install (e.g. `claude-code`, `codex`, `gemini`, `nvim`, `tmux`).
@@ -51,6 +51,11 @@ pub struct InstallArgs {
 
 impl InstallArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Validate flag combinations before any I/O
+        if let Some(ref ver) = self.version {
+            validate_version_flag(ver, &self.tools, self.all)?;
+        }
+
         let client = self.backend.resolve_client().await?;
 
         let target = ContainerTarget {
@@ -93,28 +98,32 @@ impl InstallArgs {
             .or_else(|| container.container_user.clone())
             .unwrap_or_else(|| "root".to_string());
 
-        let (installed, not_installed) =
-            probe_install_status(client.as_ref(), &container.id, &remote_user).await;
-
-        // Determine which tools to install
-        let to_install = if self.all {
-            if not_installed.is_empty() {
-                eprintln!("All tools are already installed.");
-                return Ok(());
-            }
-            not_installed
-        } else if self.tools.is_empty() {
-            select_tools_interactive(&installed, &not_installed)?
+        // When --version is specified, skip install-status checks — the user
+        // wants to install/upgrade a specific version regardless.
+        let to_install = if self.version.is_some() {
+            // --version requires exactly one tool name (validated above)
+            vec![ToolName::from_config_name(&self.tools[0]).unwrap()]
         } else {
-            resolve_tool_args(&self.tools, &installed)?
+            let (installed, not_installed) =
+                probe_install_status(client.as_ref(), &container.id, &remote_user).await;
+            if self.all {
+                if not_installed.is_empty() {
+                    eprintln!("All tools are already installed.");
+                    return Ok(());
+                }
+                not_installed
+            } else if self.tools.is_empty() {
+                select_tools_interactive(&installed, &not_installed)?
+            } else {
+                resolve_tool_args(&self.tools, &installed)?
+            }
         };
 
         if to_install.is_empty() {
             return Ok(());
         }
 
-        let settings =
-            load_settings_with_version(&container, self.version.as_deref(), &to_install)?;
+        let settings = load_settings_with_version(&container, self.version.as_deref(), &to_install);
 
         // Detect shell for verification
         let shell = cella_orchestrator::shell_detect::detect_shell(
@@ -248,7 +257,7 @@ fn load_settings_with_version(
     container: &cella_backend::ContainerInfo,
     version: Option<&str>,
     tools: &[ToolName],
-) -> Result<cella_config::CellaConfig, Box<dyn std::error::Error + Send + Sync>> {
+) -> cella_config::CellaConfig {
     let workspace_path = container
         .labels
         .get("dev.cella.workspace_path")
@@ -271,16 +280,37 @@ fn load_settings_with_version(
                 ToolName::Codex => settings.tools.codex.version = ver.to_string(),
                 ToolName::Gemini => settings.tools.gemini.version = ver.to_string(),
                 ToolName::Nvim => settings.tools.nvim.version = ver.to_string(),
-                ToolName::Tmux => {
-                    return Err(
-                        "tmux does not support --version (installed via system package manager)"
-                            .into(),
-                    );
-                }
+                ToolName::Tmux => unreachable!("validated in validate_version_flag"),
             }
         }
     }
-    Ok(settings)
+    settings
+}
+
+fn validate_version_flag(
+    _version: &str,
+    tools: &[String],
+    all: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if all {
+        return Err("--version cannot be combined with --all".into());
+    }
+    if tools.is_empty() {
+        return Err("--version requires specifying a tool name".into());
+    }
+    if tools.len() > 1 {
+        return Err("--version can only be used with a single tool".into());
+    }
+    let name = &tools[0];
+    let Some(tool) = ToolName::from_config_name(name) else {
+        return Err(format!("Unknown tool: {name}").into());
+    };
+    if tool == ToolName::Tmux {
+        return Err(
+            "tmux does not support --version (installed via system package manager)".into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,5 +345,38 @@ mod tests {
         let installed = vec![ToolName::Codex];
         let result = resolve_tool_args(&args, &installed).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn validate_version_single_tool_ok() {
+        let tools = vec!["claude-code".to_string()];
+        assert!(validate_version_flag("1.0.0", &tools, false).is_ok());
+    }
+
+    #[test]
+    fn validate_version_rejects_all() {
+        let tools = vec!["claude-code".to_string()];
+        let err = validate_version_flag("1.0.0", &tools, true).unwrap_err();
+        assert!(err.to_string().contains("--all"));
+    }
+
+    #[test]
+    fn validate_version_rejects_multiple_tools() {
+        let tools = vec!["claude-code".to_string(), "codex".to_string()];
+        let err = validate_version_flag("1.0.0", &tools, false).unwrap_err();
+        assert!(err.to_string().contains("single tool"));
+    }
+
+    #[test]
+    fn validate_version_rejects_tmux() {
+        let tools = vec!["tmux".to_string()];
+        let err = validate_version_flag("1.0.0", &tools, false).unwrap_err();
+        assert!(err.to_string().contains("tmux"));
+    }
+
+    #[test]
+    fn validate_version_rejects_no_tools() {
+        let err = validate_version_flag("1.0.0", &[], false).unwrap_err();
+        assert!(err.to_string().contains("requires"));
     }
 }
