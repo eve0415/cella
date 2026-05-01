@@ -129,6 +129,7 @@ async fn proxy_request(
     is_websocket: bool,
 ) -> Response<Full<Bytes>> {
     let backend_addr = match &target.mode {
+        ProxyMode::Localhost => format!("127.0.0.1:{}", target.target_port),
         ProxyMode::DirectIp(ip) => format!("{ip}:{}", target.target_port),
         ProxyMode::AgentTunnel(_) => {
             return unavailable_response(target);
@@ -482,6 +483,71 @@ mod tests {
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"hello from backend");
+
+        server.abort();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_to_existing_localhost_host_port() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = backend_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(|_req| async {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::from("via host port")))
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut table = RouteTable::new();
+        table.insert(
+            RouteKey {
+                project: "myapp".to_string(),
+                branch: "main".to_string(),
+                port: 3000,
+            },
+            BackendTarget {
+                container_id: "c1".to_string(),
+                container_name: "cella-myapp".to_string(),
+                target_port: backend_addr.port(),
+                mode: ProxyMode::Localhost,
+            },
+        );
+        let rt: SharedRouteTable = Arc::new(RwLock::new(table));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = proxy_listener.accept().await.unwrap();
+            let _ = handle_connection(stream, peer, rt).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .header("Host", "3000.main.myapp.localhost")
+            .body(Full::<Bytes>::default())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"via host port");
 
         server.abort();
         backend.abort();

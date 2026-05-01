@@ -1,7 +1,6 @@
 //! Route table for hostname-based request routing.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 
 /// Lookup key for a hostname route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -14,7 +13,9 @@ pub struct RouteKey {
 /// How to reach the backend container.
 #[derive(Debug, Clone)]
 pub enum ProxyMode {
-    DirectIp(IpAddr),
+    /// Connect to Cella's existing host-port proxy on `127.0.0.1:target_port`.
+    Localhost,
+    DirectIp(std::net::IpAddr),
     AgentTunnel(String),
 }
 
@@ -130,7 +131,7 @@ impl RouteTable {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
 
@@ -254,6 +255,24 @@ mod tests {
         assert!(matches!(target.mode, ProxyMode::AgentTunnel(ref n) if n == "cella-c1"));
         let target = rt.lookup("myapp", "main", 8080).unwrap();
         assert!(matches!(target.mode, ProxyMode::AgentTunnel(ref n) if n == "cella-c1"));
+    }
+
+    #[test]
+    fn route_target_can_use_existing_localhost_proxy() {
+        let mut rt = RouteTable::new();
+        rt.insert(
+            test_key("myapp", "main", 3000),
+            BackendTarget {
+                container_id: "c1".to_string(),
+                container_name: "cella-c1".to_string(),
+                target_port: 49152,
+                mode: ProxyMode::Localhost,
+            },
+        );
+
+        let target = rt.lookup("myapp", "main", 3000).unwrap();
+        assert_eq!(target.target_port, 49152);
+        assert!(matches!(target.mode, ProxyMode::Localhost));
     }
 
     #[test]
