@@ -218,15 +218,7 @@ async fn handle_management_request(
                 project_name: data.project_name,
                 branch: data.branch,
             };
-            handle_register(
-                reg,
-                &ctx.port_manager,
-                container_handles,
-                &ctx.proxy_cmd_tx,
-                &ctx.hostname_route_table,
-                ctx.is_orbstack,
-            )
-            .await
+            handle_register(reg, ctx, container_handles).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
             handle_deregister(
@@ -240,19 +232,7 @@ async fn handle_management_request(
         ManagementRequest::QueryPorts => {
             handle_query_ports(&ctx.port_manager, ctx.hostname_proxy.as_ref()).await
         }
-        ManagementRequest::QueryStatus => {
-            handle_query_status(
-                &ctx.port_manager,
-                container_handles,
-                ctx.start_time,
-                ctx.is_orbstack,
-                ctx.daemon_started_at,
-                &ctx.auth_token,
-                ctx.control_port,
-                ctx.hostname_proxy.clone(),
-            )
-            .await
-        }
+        ManagementRequest::QueryStatus => handle_query_status(ctx, container_handles).await,
         ManagementRequest::UpdateContainerIp {
             container_id,
             container_ip,
@@ -354,62 +334,56 @@ struct ContainerRegistration {
 /// Handle container registration.
 async fn handle_register(
     reg: ContainerRegistration,
-    port_manager: &Arc<Mutex<PortManager>>,
+    ctx: &ManagementContext,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
-    route_table: &cella_proxy::server::SharedRouteTable,
-    is_orbstack: bool,
 ) -> ManagementResponse {
     // Register with port manager
     let container_id = reg.container_id.clone();
     let container_name = reg.container_name.clone();
     let container_ip_clone = reg.container_ip.clone();
-    {
+    let released = {
         use crate::port_manager::ContainerRegistrationInfo;
-        let mut pm = port_manager.lock().await;
-        let released = pm.register_container(ContainerRegistrationInfo {
-            container_id: reg.container_id,
-            container_name: reg.container_name,
-            container_ip: reg.container_ip,
-            ports_attributes: reg.ports_attributes,
-            other_ports_attributes: reg.other_ports_attributes,
-            project_name: reg.project_name,
-            branch: reg.branch,
-        });
+        ctx.port_manager
+            .lock()
+            .await
+            .register_container(ContainerRegistrationInfo {
+                container_id: reg.container_id,
+                container_name: reg.container_name,
+                container_ip: reg.container_ip,
+                ports_attributes: reg.ports_attributes,
+                other_ports_attributes: reg.other_ports_attributes,
+                project_name: reg.project_name,
+                branch: reg.branch,
+            })
+    };
 
-        // Stop coordinator-owned proxies for ports released by re-registration.
-        for hp in released {
-            let _ = proxy_cmd_tx
-                .send(ProxyCommand::Stop { host_port: hp })
-                .await;
-        }
+    // Stop coordinator-owned proxies for ports released by re-registration.
+    for hp in released {
+        let _ = ctx
+            .proxy_cmd_tx
+            .send(ProxyCommand::Stop { host_port: hp })
+            .await;
     }
 
     // Store handle before starting tunnel-mode forwardPorts so those proxies
     // can resolve the agent channel once it connects.
-    {
-        let mut handles = container_handles.lock().await;
-        handles.insert(
-            container_name.clone(),
-            ContainerHandle {
-                container_id: container_id.clone(),
-                agent_state: Arc::new(AgentConnectionState::new()),
-                backend_kind: reg.backend_kind,
-                docker_host: reg.docker_host,
-                agent_tx: None,
-            },
-        );
-    }
+    container_handles.lock().await.insert(
+        container_name.clone(),
+        ContainerHandle {
+            container_id: container_id.clone(),
+            agent_state: Arc::new(AgentConnectionState::new()),
+            backend_kind: reg.backend_kind,
+            docker_host: reg.docker_host,
+            agent_tx: None,
+        },
+    );
 
     preload_forward_ports(
-        port_manager,
-        proxy_cmd_tx,
-        route_table,
+        ctx,
         &container_id,
         &container_name,
         container_ip_clone.as_deref(),
         &reg.forward_ports,
-        is_orbstack,
     )
     .await;
 
@@ -419,25 +393,25 @@ async fn handle_register(
 }
 
 async fn preload_forward_ports(
-    port_manager: &Arc<Mutex<PortManager>>,
-    proxy_cmd_tx: &mpsc::Sender<ProxyCommand>,
-    route_table: &cella_proxy::server::SharedRouteTable,
+    ctx: &ManagementContext,
     container_id: &str,
     container_name: &str,
     container_ip: Option<&str>,
     forward_ports: &[u16],
-    is_orbstack: bool,
 ) {
-    route_table.write().await.remove_container(container_id);
+    ctx.hostname_route_table
+        .write()
+        .await
+        .remove_container(container_id);
 
     for &port in forward_ports {
         let host_port = {
-            let mut pm = port_manager.lock().await;
+            let mut pm = ctx.port_manager.lock().await;
             pm.handle_port_open(container_id, port, cella_protocol::PortProtocol::Tcp, None)
         };
         let Some(host_port) = host_port else { continue };
 
-        let use_direct_ip = cfg!(target_os = "linux") || is_orbstack;
+        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
         let target = if use_direct_ip {
             if let Some(ip) = container_ip {
                 crate::proxy::ProxyStartTarget::DirectIp {
@@ -446,7 +420,7 @@ async fn preload_forward_ports(
                 }
             } else {
                 warn!("No container IP for direct proxy, skipping forwardPort {port}");
-                port_manager
+                ctx.port_manager
                     .lock()
                     .await
                     .handle_port_closed(container_id, port);
@@ -459,20 +433,21 @@ async fn preload_forward_ports(
             }
         };
 
-        if !crate::control_server::start_port_proxy(host_port, target, proxy_cmd_tx).await {
-            port_manager
+        if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+            ctx.port_manager
                 .lock()
                 .await
                 .handle_port_closed(container_id, port);
             continue;
         }
 
-        let route = {
-            let pm = port_manager.lock().await;
-            pm.hostname_route_for(container_id, port)
-        };
+        let route = ctx
+            .port_manager
+            .lock()
+            .await
+            .hostname_route_for(container_id, port);
         if let Some(route) = route {
-            let mut rt = route_table.write().await;
+            let mut rt = ctx.hostname_route_table.write().await;
             rt.insert(
                 cella_proxy::router::RouteKey {
                     project: route.project.clone(),
@@ -561,17 +536,11 @@ async fn handle_query_ports(
 
 /// Handle status query.
 async fn handle_query_status(
-    port_manager: &Arc<Mutex<PortManager>>,
+    ctx: &ManagementContext,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
-    start_time: std::time::Instant,
-    is_orbstack: bool,
-    daemon_started_at: u64,
-    auth_token: &str,
-    control_port: u16,
-    hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
 ) -> ManagementResponse {
     let handles = container_handles.lock().await;
-    let pm = port_manager.lock().await;
+    let pm = ctx.port_manager.lock().await;
 
     let containers: Vec<ContainerSummary> = handles
         .iter()
@@ -602,15 +571,15 @@ async fn handle_query_status(
 
     ManagementResponse::Status {
         pid: std::process::id(),
-        uptime_secs: start_time.elapsed().as_secs(),
+        uptime_secs: ctx.start_time.elapsed().as_secs(),
         container_count,
         containers,
-        is_orbstack,
+        is_orbstack: ctx.is_orbstack,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        daemon_started_at,
-        control_port,
-        control_token: auth_token.to_string(),
-        hostname_proxy,
+        daemon_started_at: ctx.daemon_started_at,
+        control_port: ctx.control_port,
+        control_token: ctx.auth_token.clone(),
+        hostname_proxy: ctx.hostname_proxy.clone(),
     }
 }
 

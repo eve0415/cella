@@ -75,10 +75,10 @@ fn project_name_from_config(config: &serde_json::Value, workspace_root: &Path) -
         .filter(|name| !name.trim().is_empty())
         .map_or_else(
             || {
-                workspace_root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".to_string())
+                workspace_root.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                )
             },
             String::from,
         )

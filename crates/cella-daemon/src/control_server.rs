@@ -548,6 +548,7 @@ async fn handle_port_closed(port: u16, protocol: PortProtocol, ctx: &AgentHandle
         let mut pm = ctx.port_manager.lock().await;
         let route = pm.hostname_route_for(&cid, port);
         let host_port = pm.handle_port_closed(&cid, port);
+        drop(pm);
         (host_port, route)
     };
 
@@ -3593,6 +3594,7 @@ branch refs/heads/feat-b
                 target.mode,
                 cella_proxy::router::ProxyMode::Localhost
             ));
+            drop(table);
         }
 
         let closed = AgentMessage::PortClosed {

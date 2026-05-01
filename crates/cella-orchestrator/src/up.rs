@@ -805,7 +805,7 @@ impl EnsureUpContext<'_> {
                 &mut labels,
                 config,
                 &self.config.resolved.workspace_root,
-                &self.config.extra_labels,
+                self.config.extra_labels,
             );
         }
         labels
@@ -1654,10 +1654,10 @@ fn add_orbstack_hostname_labels(
         .filter(|name| !name.trim().is_empty())
         .map_or_else(
             || {
-                workspace_root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".to_string())
+                workspace_root.file_name().map_or_else(
+                    || "workspace".to_string(),
+                    |n| n.to_string_lossy().to_string(),
+                )
             },
             String::from,
         );

@@ -172,28 +172,29 @@ async fn proxy_request(
     let proxied_req = build_proxied_request(req, original_host, peer, is_websocket);
     match sender.send_request(proxied_req).await {
         Ok(mut resp) => {
-            if is_websocket && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-                if let Some(client_upgrade) = client_upgrade {
-                    let upstream_upgrade = hyper::upgrade::on(&mut resp);
-                    let host = original_host.to_string();
-                    tokio::spawn(async move {
-                        let (client_io, upstream_io) =
-                            match tokio::join!(client_upgrade, upstream_upgrade) {
-                                (Ok(client), Ok(upstream)) => (client, upstream),
-                                (Err(e), _) | (_, Err(e)) => {
-                                    debug!("WebSocket upgrade for {host} failed: {e}");
-                                    return;
-                                }
-                            };
-                        let mut client_io = TokioIo::new(client_io);
-                        let mut upstream_io = TokioIo::new(upstream_io);
-                        if let Err(e) =
-                            tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
-                        {
-                            debug!("WebSocket stream for {host} ended: {e}");
-                        }
-                    });
-                }
+            if is_websocket
+                && resp.status() == StatusCode::SWITCHING_PROTOCOLS
+                && let Some(client_upgrade) = client_upgrade
+            {
+                let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                let host = original_host.to_string();
+                tokio::spawn(async move {
+                    let (client_io, upstream_io) =
+                        match tokio::join!(client_upgrade, upstream_upgrade) {
+                            (Ok(client), Ok(upstream)) => (client, upstream),
+                            (Err(e), _) | (_, Err(e)) => {
+                                debug!("WebSocket upgrade for {host} failed: {e}");
+                                return;
+                            }
+                        };
+                    let mut client_io = TokioIo::new(client_io);
+                    let mut upstream_io = TokioIo::new(upstream_io);
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                    {
+                        debug!("WebSocket stream for {host} ended: {e}");
+                    }
+                });
             }
             resp.map(|body| body.map_err(Into::into).boxed())
         }
