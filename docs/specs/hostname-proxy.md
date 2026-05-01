@@ -7,8 +7,9 @@ cella routes HTTP traffic to dev containers via stable, human-readable hostnames
 ## Hostname Scheme
 
 ```
-{port}.{branch}.{project}.localhost     (non-OrbStack)
-{port}.{branch}.{project}.local         (OrbStack via dev.orbstack.domains)
+{port}.{branch}.{project}.localhost          (generic Cella HTTP proxy)
+{port}.{branch}.{project}.localhost:{proxy}  (when port 80 is unavailable)
+{branch}.{project}.local                     (OrbStack default web port)
 ```
 
 | Component | Source | Example |
@@ -17,7 +18,7 @@ cella routes HTTP traffic to dev containers via stable, human-readable hostnames
 | `{branch}` | Sanitized git branch name | `feature-auth` |
 | `{project}` | devcontainer.json `name` field, fallback to repo dir | `myapp` |
 
-When port is omitted (`{branch}.{project}.localhost`), the proxy routes to the first `forwardPorts` entry or first auto-detected port.
+When port is omitted (`{branch}.{project}.localhost`), the generic proxy routes to the first `forwardPorts` entry or first auto-detected port.
 
 ### Branch Name Sanitization
 
@@ -32,12 +33,12 @@ Collision handling: append 4-char SHA-256 suffix when two branches sanitize iden
 ## Architecture
 
 ```
-Browser → Port 80 (hostname proxy) → Route Table → Backend Container
+Browser → Hostname proxy → 127.0.0.1:<host_port> → Existing Cella port proxy → Container
 ```
 
-The proxy is a hyper-based HTTP reverse proxy in the `cella-proxy` crate. It parses the `Host` header, looks up the route table, and forwards to the backend container via direct IP or agent tunnel.
+The proxy is a hyper-based HTTP reverse proxy in the `cella-proxy` crate. It parses the `Host` header, looks up the route table, and forwards to Cella's already allocated loopback host port. This keeps Docker Desktop, Colima, Linux, and OrbStack behavior on the same routing path.
 
-On OrbStack, the proxy is bypassed. Instead, `dev.orbstack.domains` container labels delegate routing to OrbStack's built-in reverse proxy with automatic TLS.
+On OrbStack, `dev.orbstack.domains` and `dev.orbstack.http-port` are used only for the default web port. Additional ports use explicit fallback URLs from `cella ports`; V1 does not promise native per-port OrbStack custom domains.
 
 ## Proxy Behavior
 
@@ -53,8 +54,8 @@ Routes are managed via `PortManager` events:
 
 | Event | Action |
 |-------|--------|
-| Container registration | Insert routes for `forwardPorts` |
-| Port detected | Insert route for new port |
+| Container registration | Preload `forwardPorts`, start host-port proxies, insert routes |
+| Port detected | Insert or update route using the allocated host port |
 | Port closed | Remove route |
 | Container deregistered | Remove all routes |
 
@@ -67,8 +68,10 @@ Routes are managed via `PortManager` events:
 
 ## Known Limitations
 
-1. Cookie leakage across branches with `Domain=myapp.localhost`
-2. Dev servers may reject unfamiliar `Host` headers (Vite, Next.js, Django, Rails)
-3. Safari `.localhost` resolution may be inconsistent
-4. Port 80 conflicts fall back to port-based forwarding
-5. Non-HTTP traffic (databases, gRPC) uses port-based allocation only
+1. HTTP only for the generic Cella hostname proxy; no CA install or HTTPS termination.
+2. Loopback only; no LAN exposure or arbitrary TLD support.
+3. Cookie leakage can happen across branches with `Domain=myapp.localhost`.
+4. Dev servers may reject unfamiliar `Host` headers (Vite, Next.js, Django, Rails).
+5. Safari `.localhost` resolution may be inconsistent.
+6. Non-HTTP traffic (databases, raw TCP, UDP) uses port-based allocation only.
+7. OrbStack native custom domains are limited to the default web port in V1.

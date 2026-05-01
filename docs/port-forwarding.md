@@ -9,7 +9,7 @@ When a service starts listening on a port inside your container, cella detects i
 1. **Hostname URLs** (recommended): `http://3000.main.myapp.localhost`
 2. **Port numbers** (traditional): `http://localhost:3000`
 
-Hostname URLs are stable across restarts and each worktree gets its own unique hostname.
+Hostname URLs are stable per project/branch identity and each worktree gets its own unique hostname. `localhost:<host_port>` remains the compatibility fallback for every forwarded port.
 
 ## Hostname Format
 
@@ -30,16 +30,22 @@ http://8080.feature-auth.myapp.localhost   # feature/auth branch, port 8080
 http://feature-auth.myapp.localhost        # feature/auth branch, default port
 ```
 
+If the hostname proxy cannot bind `127.0.0.1:80`, cella binds a high loopback port and shows full URLs:
+
+```
+http://3000.feature-auth.myapp.localhost:49180
+```
+
 ## OrbStack Users
 
-On OrbStack, cella uses OrbStack's native proxy with automatic HTTPS:
+On OrbStack, V1 uses OrbStack's native `.local` domain for the configured default web port only:
 
 ```
-https://3000.main.myapp.local
-https://3000.feature-auth.myapp.local
+http://main.myapp.local
+http://feature-auth.myapp.local
 ```
 
-Note the `.local` TLD (instead of `.localhost`) and `https://` (OrbStack provides automatic TLS).
+Additional forwarded ports are shown as explicit fallback URLs by `cella ports`. Cella does not claim arbitrary TLDs, LAN exposure, HTTPS/CA trust, command running, or native per-port OrbStack custom domains in V1.
 
 ## Viewing Forwarded Ports
 
@@ -118,7 +124,7 @@ The hostname doesn't match any running container. Run `cella ports --all` to see
 Your dev server is likely rejecting the `Host` header. See the dev server configuration section above.
 
 **Port 80 not available:**
-Another service is using port 80. The proxy will fall back to port-based forwarding. Stop the conflicting service or use `cella ports` to see the port-based URLs.
+Another service is using port 80. The proxy binds a high loopback port instead, and `cella ports` prints hostname URLs with that port suffix. `localhost:<host_port>` URLs still work.
 
 **Safari doesn't resolve `*.localhost`:**
 Safari may not resolve deep `*.localhost` subdomains. Use Chrome or Firefox, or add specific entries to `/etc/hosts`:
