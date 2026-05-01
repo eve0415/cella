@@ -11,16 +11,14 @@ mod down;
 mod exec;
 pub mod features;
 mod init;
+mod install;
 mod list;
 mod logs;
 mod network;
-mod nvim;
 mod ports;
 mod prune;
 mod read_configuration;
 mod shell;
-mod tmux;
-
 mod switch;
 mod template;
 pub mod up;
@@ -122,6 +120,8 @@ pub enum Command {
     Shell(shell::ShellArgs),
     /// Execute a command inside the running dev container.
     Exec(exec::ExecArgs),
+    /// Install tools into the running dev container.
+    Install(install::InstallArgs),
     /// Build the dev container image without starting it.
     Build(build::BuildArgs),
     /// List all dev containers managed by cella.
@@ -146,10 +146,6 @@ pub enum Command {
     Init(init::InitArgs),
     /// Open VS Code connected to the dev container.
     Code(code::CodeArgs),
-    /// Open neovim inside the dev container.
-    Nvim(nvim::NvimArgs),
-    /// Open a persistent tmux session inside the dev container.
-    Tmux(tmux::TmuxArgs),
     /// Inspect network proxy and blocking configuration.
     Network(network::NetworkArgs),
     /// View port forwarding status for dev containers.
@@ -172,8 +168,6 @@ impl Command {
         match self {
             Self::Up(args) => args.is_text_output(),
             Self::Code(args) => args.is_text_output(),
-            Self::Nvim(args) => args.is_text_output(),
-            Self::Tmux(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
             Self::ReadConfiguration(_) => false,
@@ -186,8 +180,6 @@ impl Command {
         let verbose = match self {
             Self::Up(args) => args.verbose.verbose,
             Self::Code(args) => args.up.verbose.verbose,
-            Self::Nvim(args) => args.up.verbose.verbose,
-            Self::Tmux(args) => args.up.verbose.verbose,
             Self::Build(args) => args.verbose.verbose,
             Self::Branch(args) => args.verbose.verbose,
             Self::Down(args) => args.verbose.verbose,
@@ -216,6 +208,7 @@ impl Command {
             Self::Down(args) => args.execute().await,
             Self::Shell(args) => args.execute().await,
             Self::Exec(args) => args.execute().await,
+            Self::Install(args) => args.execute().await,
             Self::Build(args) => args.execute(progress).await,
             Self::List(args) => args.execute().await,
             Self::Logs(args) => args.execute().await,
@@ -228,8 +221,6 @@ impl Command {
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
             Self::Init(args) => args.execute(progress).await,
-            Self::Nvim(args) => args.execute(progress).await,
-            Self::Tmux(args) => args.execute(progress).await,
             Self::Completion(args) => {
                 args.execute();
                 Ok(())
@@ -353,45 +344,6 @@ pub const TERMINAL_ENV_VARS: &[&str] = &[
     "COLUMNS",
     "LINES",
 ];
-
-/// Build the container environment for interactive sessions (nvim, tmux, etc.).
-///
-/// Merges label env, probed env cache, SSH auth sock, and host terminal vars.
-pub async fn build_container_env(
-    client: &dyn cella_backend::ContainerBackend,
-    container: &cella_backend::ContainerInfo,
-    container_id: &str,
-    remote_user: &str,
-) -> Vec<String> {
-    let label_env: Vec<String> = container
-        .labels
-        .get("dev.cella.remote_env")
-        .and_then(|v| serde_json::from_str(v).ok())
-        .unwrap_or_default();
-
-    let base_env = if let Some(probed) =
-        cella_orchestrator::env_cache::read_probed_env_cache(client, container_id, remote_user)
-            .await
-    {
-        cella_env::user_env_probe::merge_env(&probed, &label_env)
-    } else {
-        label_env
-    };
-    let mut env = base_env;
-    cella_orchestrator::env_cache::ensure_ssh_auth_sock(
-        client,
-        container_id,
-        remote_user,
-        &mut env,
-    )
-    .await;
-    for var in TERMINAL_ENV_VARS {
-        if let Ok(val) = std::env::var(var) {
-            env.push(format!("{var}={val}"));
-        }
-    }
-    env
-}
 
 /// Ensure the cella daemon is running and version-compatible.
 ///

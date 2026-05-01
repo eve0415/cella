@@ -571,22 +571,21 @@ impl UpContext {
             setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
         }
 
-        // Install AI coding tools
-        let any_tool = settings.tools.claude_code.enabled
-            || settings.tools.codex.enabled
-            || settings.tools.gemini.enabled;
-        self.install_tools(
-            container_id,
-            remote_user,
-            &shell,
+        // Install tools listed in [tools] install = [...]
+        let tools_to_install =
+            cella_orchestrator::tool_install::resolve_tool_names(&settings.tools.install);
+        let spec = cella_orchestrator::tool_install::InstallSpec {
             settings,
-            probed_env.as_ref(),
-        )
-        .await;
+            tools: &tools_to_install,
+            probed_env: probed_env.as_ref(),
+        };
+        self.install_tools(container_id, remote_user, &shell, &spec)
+            .await;
 
         // Re-probe after tool installation to capture PATH changes
-        // (e.g., Claude Code installer adds ~/.local/bin to shell profiles)
-        let final_probed = if any_tool {
+        let final_probed = if tools_to_install.is_empty() {
+            probed_env
+        } else {
             self.progress
                 .run_step(
                     "Updating environment cache...",
@@ -600,8 +599,6 @@ impl UpContext {
                 )
                 .await
                 .or(probed_env)
-        } else {
-            probed_env
         };
 
         let lifecycle_env = final_probed.as_ref().map_or_else(
@@ -612,16 +609,13 @@ impl UpContext {
         (final_probed, lifecycle_env)
     }
 
-    /// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
-    ///
     /// Delegates to [`cella_orchestrator::tool_install::install_tools`].
     async fn install_tools(
         &self,
         container_id: &str,
         remote_user: &str,
         shell: &str,
-        settings: &cella_config::CellaConfig,
-        probed_env: Option<&std::collections::HashMap<String, String>>,
+        spec: &cella_orchestrator::tool_install::InstallSpec<'_>,
     ) {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         cella_orchestrator::tool_install::install_tools(
@@ -629,8 +623,7 @@ impl UpContext {
             container_id,
             remote_user,
             shell,
-            settings,
-            probed_env,
+            spec,
             &sender,
         )
         .await;

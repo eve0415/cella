@@ -1,10 +1,10 @@
-//! Tool installation helpers for AI coding tools (Claude Code, Codex, Gemini).
+//! Tool installation helpers for dev container tools.
 //!
-//! These functions install and configure AI coding tools inside dev containers.
-//! They were extracted from the CLI `up` command to be reusable by both the CLI
-//! and daemon.
+//! Centralizes install logic for all tools (Claude Code, Codex, Gemini, nvim,
+//! tmux) so both `cella up` and `cella install` share the same code paths.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use cella_backend::container_setup::chown_in_container;
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
@@ -15,6 +15,375 @@ use tracing::{debug, warn};
 ///
 /// Concrete type alias avoids generic hasher parameters on every helper function.
 type ProbedEnv = HashMap<String, String>;
+
+// ── ToolName ────────────────────────────────────────────────────────────────
+
+/// Identifies an installable tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolName {
+    ClaudeCode,
+    Codex,
+    Gemini,
+    Nvim,
+    Tmux,
+}
+
+impl ToolName {
+    pub const ALL: &[Self] = &[
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Gemini,
+        Self::Nvim,
+        Self::Tmux,
+    ];
+
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        match name {
+            "claude-code" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "nvim" => Some(Self::Nvim),
+            "tmux" => Some(Self::Tmux),
+            _ => None,
+        }
+    }
+
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    pub const fn binary_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Gemini => "Gemini CLI",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    /// Map a binary name (as typed by the user) to a `ToolName`.
+    pub fn from_binary_name(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "nvim" => Some(Self::Nvim),
+            "tmux" => Some(Self::Tmux),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+/// Parse config names into `ToolName`s, warning on unrecognized entries.
+pub fn resolve_tool_names(names: &[String]) -> Vec<ToolName> {
+    names
+        .iter()
+        .filter_map(|name| {
+            ToolName::from_config_name(name).or_else(|| {
+                warn!("Unknown tool name in install list: {name:?} (valid: claude-code, codex, gemini, nvim, tmux)");
+                None
+            })
+        })
+        .collect()
+}
+
+/// Check if a named tool is installed in a container.
+pub async fn is_tool_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    tool: ToolName,
+    probed_env: Option<&ProbedEnv>,
+) -> bool {
+    match tool {
+        ToolName::ClaudeCode => {
+            is_claude_code_installed(client, container_id, remote_user, "latest", probed_env).await
+        }
+        ToolName::Codex => {
+            is_npm_tool_installed(
+                client,
+                container_id,
+                remote_user,
+                "codex",
+                "latest",
+                probed_env,
+            )
+            .await
+        }
+        ToolName::Gemini => {
+            is_npm_tool_installed(
+                client,
+                container_id,
+                remote_user,
+                "gemini",
+                "latest",
+                probed_env,
+            )
+            .await
+        }
+        ToolName::Nvim => is_nvim_installed(client, container_id, remote_user).await,
+        ToolName::Tmux => is_tmux_installed(client, container_id, remote_user).await,
+    }
+}
+
+/// Check if nvim is installed in the container.
+pub async fn is_nvim_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) -> bool {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["which".to_string(), "nvim".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
+/// Check if tmux is installed in the container.
+pub async fn is_tmux_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) -> bool {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["which".to_string(), "tmux".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
+// ── Nvim ────────────────────────────────────────────────────────────────────
+
+/// Normalize a version string into a GitHub release tag.
+///
+/// Bare semver versions (e.g. `"0.10.3"`) get a `v` prefix (`"v0.10.3"`).
+/// Special tags like `"stable"` and `"nightly"` are returned as-is.
+pub fn normalize_nvim_version_tag(version: &str) -> String {
+    if version.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    }
+}
+
+/// Install nvim from GitHub releases into the container.
+///
+/// # Errors
+///
+/// Returns an error string if the architecture is unsupported, the download
+/// fails, or post-install verification fails.
+pub async fn install_nvim(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    version: &str,
+) -> Result<ExecResult, String> {
+    let arch_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["uname".to_string(), "-m".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to detect architecture: {e}"))?;
+
+    let arch = arch_result.stdout.trim().to_string();
+    debug!("Container architecture: {arch}");
+
+    let version_tag = normalize_nvim_version_tag(version);
+
+    let (url, extract_cmd) = match arch.as_str() {
+        "x86_64" | "amd64" => {
+            let url = format!(
+                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-x86_64.tar.gz"
+            );
+            (
+                url,
+                "tar xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1",
+            )
+        }
+        "aarch64" | "arm64" => {
+            let url = format!(
+                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-arm64.tar.gz"
+            );
+            (
+                url,
+                "tar xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1",
+            )
+        }
+        other => {
+            return Err(format!(
+                "Unsupported architecture for nvim installation: {other}. \
+                 Install nvim manually in your container image."
+            ));
+        }
+    };
+
+    debug!("Downloading nvim from: {url}");
+
+    let install_script = format!(
+        "curl -fsSL -o /tmp/nvim.tar.gz '{url}' && {extract_cmd} && rm -f /tmp/nvim.tar.gz"
+    );
+
+    let install_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_script],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to run nvim installer: {e}"))?;
+
+    if install_result.exit_code != 0 {
+        return Err(format!(
+            "Failed to install nvim (exit {}): tried {url} (arch: {arch}). {}",
+            install_result.exit_code,
+            install_result.stderr.trim()
+        ));
+    }
+
+    let verify = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["nvim".to_string(), "--version".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("nvim verification failed: {e}"))?;
+
+    if verify.exit_code != 0 {
+        return Err("nvim installed but verification failed".to_string());
+    }
+
+    Ok(install_result)
+}
+
+// ── Tmux install ────────────────────────────────────────────────────────────
+
+/// Install tmux via the container's package manager.
+///
+/// Tries apt-get, apk, dnf, pacman, zypper in order.
+///
+/// # Errors
+///
+/// Returns an error string if no supported package manager is found or
+/// the install command fails.
+pub async fn install_tmux(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+) -> Result<ExecResult, String> {
+    let install_commands: &[(&str, &str)] = &[
+        (
+            "apt-get",
+            "apt-get update -qq && apt-get install -y -qq tmux",
+        ),
+        ("apk", "apk add --no-cache tmux"),
+        ("dnf", "dnf install -y tmux"),
+        ("pacman", "pacman -S --noconfirm tmux"),
+        ("zypper", "zypper install -y tmux"),
+    ];
+
+    for (pkg_mgr, install_cmd) in install_commands {
+        let check = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["which".to_string(), (*pkg_mgr).to_string()],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+
+        if !check.is_ok_and(|r| r.exit_code == 0) {
+            continue;
+        }
+
+        debug!("Installing tmux via {pkg_mgr}");
+        let result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        (*install_cmd).to_string(),
+                    ],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("failed to run {pkg_mgr}: {e}"))?;
+
+        if result.exit_code != 0 {
+            return Err(format!(
+                "Failed to install tmux via {pkg_mgr} (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            ));
+        }
+
+        return Ok(result);
+    }
+
+    Err(
+        "No supported package manager found (apt-get, apk, dnf, pacman, zypper). \
+         Install tmux manually in your container image."
+            .to_string(),
+    )
+}
 
 // ── Tool exec helpers ────────────────────────────────────────────────────────
 
@@ -1008,16 +1377,13 @@ async fn verified_install_step(
     binary: &str,
     install_result: Option<ExecResult>,
     step: PhaseChildHandle,
-) {
-    // Short-circuit: if the installer ran and reported a non-zero exit, the
-    // requested install/upgrade did not take effect. Do not let a stale
-    // binary still on PATH render as ✓.
+) -> bool {
     if matches!(install_result.as_ref(), Some(r) if r.exit_code != 0) {
         step.fail(&render_failure_reason(
             install_result.as_ref(),
             "installer exited non-zero",
         ));
-        return;
+        return false;
     }
 
     let verify = verify_tool_callable(
@@ -1031,7 +1397,10 @@ async fn verified_install_step(
     .await;
 
     match verify {
-        VerifyOutcome::Reachable => step.finish(),
+        VerifyOutcome::Reachable => {
+            step.finish();
+            true
+        }
         VerifyOutcome::InstalledElsewhere(path) => {
             match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
                 Ok(()) => {
@@ -1045,27 +1414,42 @@ async fn verified_install_step(
                     )
                     .await;
                     match second {
-                        VerifyOutcome::Reachable => step.finish(),
-                        other => step.fail(&render_failure_reason(
-                            install_result.as_ref(),
-                            &format!("symlink created but still not reachable: {other:?}"),
-                        )),
+                        VerifyOutcome::Reachable => {
+                            step.finish();
+                            true
+                        }
+                        other => {
+                            step.fail(&render_failure_reason(
+                                install_result.as_ref(),
+                                &format!("symlink created but still not reachable: {other:?}"),
+                            ));
+                            false
+                        }
                     }
                 }
-                Err(e) => step.fail(&render_failure_reason(
-                    install_result.as_ref(),
-                    &format!("symlink failed: {e}"),
-                )),
+                Err(e) => {
+                    step.fail(&render_failure_reason(
+                        install_result.as_ref(),
+                        &format!("symlink failed: {e}"),
+                    ));
+                    false
+                }
             }
         }
-        VerifyOutcome::NotInstalled => step.fail(&render_failure_reason(
-            install_result.as_ref(),
-            "install did not produce a reachable binary",
-        )),
-        VerifyOutcome::ProbeError(e) => step.fail(&render_failure_reason(
-            install_result.as_ref(),
-            &format!("verification failed: {e}"),
-        )),
+        VerifyOutcome::NotInstalled => {
+            step.fail(&render_failure_reason(
+                install_result.as_ref(),
+                "install did not produce a reachable binary",
+            ));
+            false
+        }
+        VerifyOutcome::ProbeError(e) => {
+            step.fail(&render_failure_reason(
+                install_result.as_ref(),
+                &format!("verification failed: {e}"),
+            ));
+            false
+        }
     }
 }
 
@@ -1094,40 +1478,41 @@ fn render_failure_reason(install_result: Option<&ExecResult>, reason: &str) -> S
     }
 }
 
-/// Forward config and install AI coding tools (Claude Code, Codex, Gemini).
+/// What to install and where.
+pub struct InstallSpec<'a> {
+    pub settings: &'a cella_config::CellaConfig,
+    pub tools: &'a [ToolName],
+    pub probed_env: Option<&'a HashMap<String, String>>,
+}
+
+/// Install the specified tools inside a container.
 ///
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
+/// Nvim and tmux run in parallel with the other branches.
 ///
-/// After each install attempt, `verified_install_step` confirms the binary is
-/// callable via the same login-shell wrap `cella exec` uses. When the tool is
-/// installed elsewhere (e.g. `~/.local/bin`, an nvm-managed npm global), a
-/// `/usr/local/bin/<tool>` symlink is created so repeated `cella up` runs
-/// self-heal. A `✗` is rendered with the installer's exit code + stderr when
-/// verification still fails.
+/// Returns the number of tools that failed to install.
 pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
     shell: &str,
-    settings: &cella_config::CellaConfig,
-    probed_env: Option<&ProbedEnv>,
+    spec: &InstallSpec<'_>,
     progress: &ProgressSender,
-) {
-    let needs_npm = settings.tools.codex.enabled || settings.tools.gemini.enabled;
+) -> usize {
+    let (settings, tools, probed_env) = (spec.settings, spec.tools, spec.probed_env);
+    if tools.is_empty() {
+        return 0;
+    }
+
+    let has = |t: ToolName| tools.contains(&t);
+
+    let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
     let node_available = if needs_npm {
         ensure_node_available(client, container_id, probed_env).await
     } else {
         false
     };
-
-    let any_tool = settings.tools.claude_code.enabled
-        || settings.tools.codex.enabled
-        || settings.tools.gemini.enabled;
-
-    if !any_tool {
-        return;
-    }
 
     let ctx = InstallCtx {
         client,
@@ -1137,62 +1522,307 @@ pub async fn install_tools(
         probed_env,
     };
 
-    // Grouped phase: parallel Claude Code (curl) || npm tools (Codex -> Gemini)
     let phase = progress.phase("Installing tools...");
 
-    let claude_branch = async {
-        if settings.tools.claude_code.enabled {
-            let step = phase.step("Claude Code");
-            let install_result = install_claude_code(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.claude_code,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "claude", install_result, step).await;
-        }
-    };
+    let claude_branch = install_claude_branch(&ctx, &phase, settings, has(ToolName::ClaudeCode));
+    let npm_branch = install_npm_branch(
+        &ctx,
+        &phase,
+        settings,
+        has(ToolName::Codex),
+        has(ToolName::Gemini),
+        needs_npm && !node_available,
+    );
+    let nvim_branch = install_fallible_branch(
+        &ctx,
+        &phase,
+        "nvim",
+        has(ToolName::Nvim),
+        install_nvim(
+            client,
+            container_id,
+            remote_user,
+            &settings.tools.nvim.version,
+        ),
+    );
+    let tmux_branch = install_fallible_branch(
+        &ctx,
+        &phase,
+        "tmux",
+        has(ToolName::Tmux),
+        install_tmux(client, container_id),
+    );
 
-    let npm_branch = async {
-        if needs_npm && !node_available {
-            warn!("Skipping npm tool installs: Node.js/npm not available");
-            return;
-        }
-        if settings.tools.codex.enabled {
-            let step = phase.step("Codex");
-            let install_result = install_codex(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.codex,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "codex", install_result, step).await;
-        }
-        if settings.tools.gemini.enabled {
-            let step = phase.step("Gemini CLI");
-            let install_result = install_gemini(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.gemini,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "gemini", install_result, step).await;
-        }
-    };
-
-    tokio::join!(claude_branch, npm_branch);
+    let (c, n, nv, t) = tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
     phase.finish();
+    c + n + nv + t
+}
+
+async fn install_claude_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    settings: &cella_config::CellaConfig,
+    requested: bool,
+) -> usize {
+    if !requested {
+        return 0;
+    }
+    let step = phase.step("Claude Code");
+    let result = install_claude_code(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        &settings.tools.claude_code,
+        ctx.probed_env,
+    )
+    .await;
+    usize::from(!verified_install_step(ctx, "claude", result, step).await)
+}
+
+async fn install_npm_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    settings: &cella_config::CellaConfig,
+    codex: bool,
+    gemini: bool,
+    node_unavailable: bool,
+) -> usize {
+    if node_unavailable {
+        let mut f = 0;
+        if codex {
+            phase.step("Codex").fail("Node.js/npm not available");
+            f += 1;
+        }
+        if gemini {
+            phase.step("Gemini CLI").fail("Node.js/npm not available");
+            f += 1;
+        }
+        return f;
+    }
+    let mut failures = 0;
+    if codex {
+        let step = phase.step("Codex");
+        let r = install_codex(
+            ctx.client,
+            ctx.container_id,
+            ctx.remote_user,
+            &settings.tools.codex,
+            ctx.probed_env,
+        )
+        .await;
+        if !verified_install_step(ctx, "codex", r, step).await {
+            failures += 1;
+        }
+    }
+    if gemini {
+        let step = phase.step("Gemini CLI");
+        let r = install_gemini(
+            ctx.client,
+            ctx.container_id,
+            ctx.remote_user,
+            &settings.tools.gemini,
+            ctx.probed_env,
+        )
+        .await;
+        if !verified_install_step(ctx, "gemini", r, step).await {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+async fn install_fallible_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    binary: &str,
+    requested: bool,
+    install_future: impl Future<Output = Result<ExecResult, String>>,
+) -> usize {
+    if !requested {
+        return 0;
+    }
+    let step = phase.step(binary);
+    let ok = match install_future.await {
+        Ok(r) => verified_install_step(ctx, binary, Some(r), step).await,
+        Err(e) => {
+            step.fail(&e);
+            false
+        }
+    };
+    usize::from(!ok)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ToolName ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_name_from_config_name_roundtrip() {
+        for tool in ToolName::ALL {
+            assert_eq!(ToolName::from_config_name(tool.config_name()), Some(*tool));
+        }
+    }
+
+    #[test]
+    fn tool_name_from_binary_name_roundtrip() {
+        for tool in ToolName::ALL {
+            assert_eq!(ToolName::from_binary_name(tool.binary_name()), Some(*tool));
+        }
+    }
+
+    #[test]
+    fn tool_name_from_config_name_unknown() {
+        assert_eq!(ToolName::from_config_name("vim"), None);
+    }
+
+    #[test]
+    fn tool_name_all_has_five_entries() {
+        assert_eq!(ToolName::ALL.len(), 5);
+    }
+
+    #[test]
+    fn tool_name_display() {
+        assert_eq!(ToolName::ClaudeCode.to_string(), "Claude Code");
+        assert_eq!(ToolName::Nvim.to_string(), "nvim");
+    }
+
+    #[test]
+    fn tool_name_binary_name_claude_maps_to_claude() {
+        assert_eq!(ToolName::ClaudeCode.binary_name(), "claude");
+    }
+
+    #[test]
+    fn resolve_tool_names_valid() {
+        let names = vec!["claude-code".to_string(), "nvim".to_string()];
+        let result = resolve_tool_names(&names);
+        assert_eq!(result, vec![ToolName::ClaudeCode, ToolName::Nvim]);
+    }
+
+    #[test]
+    fn resolve_tool_names_skips_unknown() {
+        let names = vec!["claude-code".to_string(), "vim".to_string()];
+        let result = resolve_tool_names(&names);
+        assert_eq!(result, vec![ToolName::ClaudeCode]);
+    }
+
+    #[test]
+    fn resolve_tool_names_empty() {
+        let result = resolve_tool_names(&[]);
+        assert!(result.is_empty());
+    }
+
+    // ── normalize_nvim_version_tag ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_nvim_bare_semver_gets_v_prefix() {
+        assert_eq!(normalize_nvim_version_tag("0.10.3"), "v0.10.3");
+        assert_eq!(normalize_nvim_version_tag("1.0.0"), "v1.0.0");
+    }
+
+    #[test]
+    fn normalize_nvim_already_prefixed_unchanged() {
+        assert_eq!(normalize_nvim_version_tag("v0.10.3"), "v0.10.3");
+    }
+
+    #[test]
+    fn normalize_nvim_special_tags_unchanged() {
+        assert_eq!(normalize_nvim_version_tag("stable"), "stable");
+        assert_eq!(normalize_nvim_version_tag("nightly"), "nightly");
+    }
+
+    // ── is_nvim_installed / is_tmux_installed ──────────────────────────────
+
+    #[tokio::test]
+    async fn is_nvim_installed_returns_true_when_present() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        assert!(is_nvim_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_nvim_installed_returns_false_when_absent() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!is_nvim_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_tmux_installed_returns_true_when_present() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        assert!(is_tmux_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_tmux_installed_returns_false_when_absent() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!is_tmux_installed(&backend, "test-container", "vscode").await);
+    }
+
+    // ── install_nvim ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn install_nvim_unsupported_arch() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "riscv64\n"))]);
+        let Err(err) = install_nvim(&backend, "test-container", "vscode", "stable").await else {
+            panic!("expected Err for unsupported arch");
+        };
+        assert!(err.contains("riscv64"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn install_nvim_success_x86() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, "x86_64\n")), // uname -m
+            Ok(ok_exit(0)),               // curl + extract
+            Ok(ok_exit(0)),               // nvim --version verify
+        ]);
+        let result = install_nvim(&backend, "test-container", "vscode", "stable")
+            .await
+            .expect("should succeed");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    // ── install_tmux ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn install_tmux_apt_success() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // which apt-get
+            Ok(ok_exit(0)), // apt-get install
+        ]);
+        let result = install_tmux(&backend, "test-container")
+            .await
+            .expect("should succeed");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn install_tmux_fallback_to_apk() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // which apt-get — not found
+            Ok(ok_exit(0)), // which apk
+            Ok(ok_exit(0)), // apk add
+        ]);
+        let result = install_tmux(&backend, "test-container")
+            .await
+            .expect("should succeed via apk");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn install_tmux_no_package_manager() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // no apt-get
+            Ok(ok_exit(1)), // no apk
+            Ok(ok_exit(1)), // no dnf
+            Ok(ok_exit(1)), // no pacman
+            Ok(ok_exit(1)), // no zypper
+        ]);
+        let Err(err) = install_tmux(&backend, "test-container").await else {
+            panic!("expected Err with no package manager");
+        };
+        assert!(err.contains("No supported package manager"), "got: {err}");
+    }
 
     #[test]
     fn tool_exec_env_with_path() {
@@ -1713,7 +2343,6 @@ mod tests {
     async fn install_claude_code_short_circuits_when_requested_version_exists() {
         let backend = MockBackend::new(vec![Ok(ok_stdout(0, "Claude Code 1.2.3\n"))]);
         let settings = cella_config::settings::ClaudeCode {
-            enabled: true,
             version: "1.2.3".to_string(),
             forward_config: false,
         };
@@ -1734,7 +2363,6 @@ mod tests {
             Ok(ok_exit(0)), // native installer
         ]);
         let settings = cella_config::settings::ClaudeCode {
-            enabled: true,
             version: "stable".to_string(),
             forward_config: false,
         };
@@ -1894,7 +2522,6 @@ mod tests {
             Ok(ok_exit(0)), // npm install succeeds
         ]);
         let settings = cella_config::settings::Codex {
-            enabled: true,
             version: "0.42.0".to_string(),
             forward_config: false,
         };
@@ -1926,7 +2553,6 @@ mod tests {
             Ok(ok_stdout(0, "codex 0.42.0\n")),
         ]);
         let settings = cella_config::settings::Codex {
-            enabled: true,
             version: "0.42.0".to_string(),
             forward_config: false,
         };
@@ -1944,7 +2570,6 @@ mod tests {
             Ok(ok_exit(0)), // npm install succeeds
         ]);
         let settings = cella_config::settings::Gemini {
-            enabled: true,
             version: "latest".to_string(),
             forward_config: false,
         };
@@ -1969,7 +2594,6 @@ mod tests {
             }),
         ]);
         let settings = cella_config::settings::Gemini {
-            enabled: true,
             version: "latest".to_string(),
             forward_config: false,
         };
