@@ -1509,6 +1509,7 @@ impl EnsureUpContext<'_> {
             &self.config.resolved.workspace_root,
             Some(self.config.resolved),
         )?;
+        crate::tool_install::ensure_tool_config_paths(&settings);
         self.apply_env_and_mounts(
             &mut create_opts,
             &env_fwd,
