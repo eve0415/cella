@@ -1,8 +1,7 @@
-//! Tool installation helpers for AI coding tools (Claude Code, Codex, Gemini).
+//! Tool installation helpers for dev container tools.
 //!
-//! These functions install and configure AI coding tools inside dev containers.
-//! They were extracted from the CLI `up` command to be reusable by both the CLI
-//! and daemon.
+//! Centralizes install logic for all tools (Claude Code, Codex, Gemini, nvim,
+//! tmux) so both `cella up` and `cella install` share the same code paths.
 
 use std::collections::HashMap;
 
@@ -15,6 +14,166 @@ use tracing::{debug, warn};
 ///
 /// Concrete type alias avoids generic hasher parameters on every helper function.
 type ProbedEnv = HashMap<String, String>;
+
+// ── ToolName ────────────────────────────────────────────────────────────────
+
+/// Identifies an installable tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolName {
+    ClaudeCode,
+    Codex,
+    Gemini,
+    Nvim,
+    Tmux,
+}
+
+impl ToolName {
+    pub const ALL: &[Self] = &[
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Gemini,
+        Self::Nvim,
+        Self::Tmux,
+    ];
+
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        match name {
+            "claude-code" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "nvim" => Some(Self::Nvim),
+            "tmux" => Some(Self::Tmux),
+            _ => None,
+        }
+    }
+
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    pub const fn binary_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Gemini => "Gemini CLI",
+            Self::Nvim => "nvim",
+            Self::Tmux => "tmux",
+        }
+    }
+
+    /// Map a binary name (as typed by the user) to a `ToolName`.
+    pub fn from_binary_name(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
+            "nvim" => Some(Self::Nvim),
+            "tmux" => Some(Self::Tmux),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+/// Check if a named tool is installed in a container.
+pub async fn is_tool_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    tool: ToolName,
+    probed_env: Option<&ProbedEnv>,
+) -> bool {
+    match tool {
+        ToolName::ClaudeCode => {
+            is_claude_code_installed(client, container_id, remote_user, "latest", probed_env).await
+        }
+        ToolName::Codex => {
+            is_npm_tool_installed(
+                client,
+                container_id,
+                remote_user,
+                "codex",
+                "latest",
+                probed_env,
+            )
+            .await
+        }
+        ToolName::Gemini => {
+            is_npm_tool_installed(
+                client,
+                container_id,
+                remote_user,
+                "gemini",
+                "latest",
+                probed_env,
+            )
+            .await
+        }
+        ToolName::Nvim => is_nvim_installed(client, container_id, remote_user).await,
+        ToolName::Tmux => is_tmux_installed(client, container_id, remote_user).await,
+    }
+}
+
+/// Check if nvim is installed in the container.
+pub async fn is_nvim_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) -> bool {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["which".to_string(), "nvim".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+}
+
+/// Check if tmux is installed in the container.
+pub async fn is_tmux_installed(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) -> bool {
+    client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["which".to_string(), "tmux".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
+}
 
 // ── Tool exec helpers ────────────────────────────────────────────────────────
 
@@ -1193,6 +1352,43 @@ pub async fn install_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ToolName ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_name_from_config_name_roundtrip() {
+        for tool in ToolName::ALL {
+            assert_eq!(ToolName::from_config_name(tool.config_name()), Some(*tool));
+        }
+    }
+
+    #[test]
+    fn tool_name_from_binary_name_roundtrip() {
+        for tool in ToolName::ALL {
+            assert_eq!(ToolName::from_binary_name(tool.binary_name()), Some(*tool));
+        }
+    }
+
+    #[test]
+    fn tool_name_from_config_name_unknown() {
+        assert_eq!(ToolName::from_config_name("vim"), None);
+    }
+
+    #[test]
+    fn tool_name_all_has_five_entries() {
+        assert_eq!(ToolName::ALL.len(), 5);
+    }
+
+    #[test]
+    fn tool_name_display() {
+        assert_eq!(ToolName::ClaudeCode.to_string(), "Claude Code");
+        assert_eq!(ToolName::Nvim.to_string(), "nvim");
+    }
+
+    #[test]
+    fn tool_name_binary_name_claude_maps_to_claude() {
+        assert_eq!(ToolName::ClaudeCode.binary_name(), "claude");
+    }
 
     #[test]
     fn tool_exec_env_with_path() {
