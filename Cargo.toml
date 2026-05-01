@@ -21,6 +21,7 @@ members = [
     "crates/cella-orchestrator",
     "crates/cella-tool-install",
     "crates/cella-protocol",
+    "crates/cella-proxy",
     "crates/cella-jsonc",
     "crates/cella-templates",
 ]
@@ -170,6 +171,7 @@ cella-orchestrator = { path = "crates/cella-orchestrator" }
 cella-tool-install = { path = "crates/cella-tool-install" }
 cella-port = { path = "crates/cella-port" }
 cella-protocol = { path = "crates/cella-protocol" }
+cella-proxy = { path = "crates/cella-proxy" }
 cella-templates = { path = "crates/cella-templates" }
 
 [profile.release]
