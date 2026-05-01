@@ -64,7 +64,7 @@ Routes are managed via `PortManager` events:
 - `cella-proxy` - hostname parsing, route table, HTTP server, error pages
 - `cella-daemon` - lifecycle management, port manager integration
 - `cella-backend` - OrbStack label generation
-- `cella-protocol` - `project_name`, `branch`, `hostname` fields
+- `cella-protocol` - `project_name`, `branch`, `ForwardedPortDetail.hostname`, `HostnameProxyStatus`
 
 ## Known Limitations
 

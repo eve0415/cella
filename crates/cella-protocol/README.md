@@ -33,7 +33,8 @@ See [docs/specs/ipc-protocol.md](../../docs/specs/ipc-protocol.md) for the full 
 - `WorktreeOperationResult` / `DownOperationResult` / `TaskRunOperationResult` — operation result enums (Success or Error)
 - `TaskEntry` — background task state (id, branch, container, status, command, elapsed)
 - `WorktreeEntry` — worktree listing entry (branch, path, container association)
-- `ForwardedPortDetail` — forwarded port info (container, ports, protocol, process, URL)
+- `ForwardedPortDetail` — forwarded port info (container, ports, protocol, process, `localhost:<host_port>` URL, optional full hostname URL)
+- `HostnameProxyStatus` — hostname HTTP proxy listener diagnostics, including high-port fallback state
 - `ContainerSummary` — registered container summary (name, id, port count, agent connection)
 
 ### Modules
