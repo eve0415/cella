@@ -175,6 +175,192 @@ pub async fn is_tmux_installed(
         .is_ok_and(|r| r.exit_code == 0)
 }
 
+// ── Nvim ────────────────────────────────────────────────────────────────────
+
+/// Normalize a version string into a GitHub release tag.
+///
+/// Bare semver versions (e.g. `"0.10.3"`) get a `v` prefix (`"v0.10.3"`).
+/// Special tags like `"stable"` and `"nightly"` are returned as-is.
+pub fn normalize_nvim_version_tag(version: &str) -> String {
+    if version.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    }
+}
+
+/// Install nvim from GitHub releases into the container.
+pub async fn install_nvim(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    version: &str,
+) -> Result<ExecResult, String> {
+    let arch_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["uname".to_string(), "-m".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to detect architecture: {e}"))?;
+
+    let arch = arch_result.stdout.trim().to_string();
+    debug!("Container architecture: {arch}");
+
+    let version_tag = normalize_nvim_version_tag(version);
+
+    let (url, extract_cmd) = match arch.as_str() {
+        "x86_64" | "amd64" => {
+            let url = format!(
+                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-x86_64.tar.gz"
+            );
+            (
+                url,
+                "tar xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1",
+            )
+        }
+        "aarch64" | "arm64" => {
+            let url = format!(
+                "https://github.com/neovim/neovim/releases/download/{version_tag}/nvim-linux-arm64.tar.gz"
+            );
+            (
+                url,
+                "tar xzf /tmp/nvim.tar.gz -C /usr/local --strip-components=1",
+            )
+        }
+        other => {
+            return Err(format!(
+                "Unsupported architecture for nvim installation: {other}. \
+                 Install nvim manually in your container image."
+            ));
+        }
+    };
+
+    debug!("Downloading nvim from: {url}");
+
+    let install_script = format!(
+        "curl -fsSL -o /tmp/nvim.tar.gz '{url}' && {extract_cmd} && rm -f /tmp/nvim.tar.gz"
+    );
+
+    let install_result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["sh".to_string(), "-c".to_string(), install_script],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to run nvim installer: {e}"))?;
+
+    if install_result.exit_code != 0 {
+        return Err(format!(
+            "Failed to install nvim (exit {}): tried {url} (arch: {arch}). {}",
+            install_result.exit_code,
+            install_result.stderr.trim()
+        ));
+    }
+
+    let verify = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["nvim".to_string(), "--version".to_string()],
+                user: Some(remote_user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("nvim verification failed: {e}"))?;
+
+    if verify.exit_code != 0 {
+        return Err("nvim installed but verification failed".to_string());
+    }
+
+    Ok(install_result)
+}
+
+// ── Tmux install ────────────────────────────────────────────────────────────
+
+/// Install tmux via the container's package manager.
+///
+/// Tries apt-get, apk, dnf, pacman, zypper in order.
+pub async fn install_tmux(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+) -> Result<ExecResult, String> {
+    let install_commands: &[(&str, &str)] = &[
+        (
+            "apt-get",
+            "apt-get update -qq && apt-get install -y -qq tmux",
+        ),
+        ("apk", "apk add --no-cache tmux"),
+        ("dnf", "dnf install -y tmux"),
+        ("pacman", "pacman -S --noconfirm tmux"),
+        ("zypper", "zypper install -y tmux"),
+    ];
+
+    for (pkg_mgr, install_cmd) in install_commands {
+        let check = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["which".to_string(), (*pkg_mgr).to_string()],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+
+        if !check.is_ok_and(|r| r.exit_code == 0) {
+            continue;
+        }
+
+        debug!("Installing tmux via {pkg_mgr}");
+        let result = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        (*install_cmd).to_string(),
+                    ],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("failed to run {pkg_mgr}: {e}"))?;
+
+        if result.exit_code != 0 {
+            return Err(format!(
+                "Failed to install tmux via {pkg_mgr} (exit {}): {}",
+                result.exit_code,
+                result.stderr.trim()
+            ));
+        }
+
+        return Ok(result);
+    }
+
+    Err(
+        "No supported package manager found (apt-get, apk, dnf, pacman, zypper). \
+         Install tmux manually in your container image."
+            .to_string(),
+    )
+}
+
 // ── Tool exec helpers ────────────────────────────────────────────────────────
 
 /// Extract PATH from the probed user environment for tool exec calls.
@@ -1388,6 +1574,117 @@ mod tests {
     #[test]
     fn tool_name_binary_name_claude_maps_to_claude() {
         assert_eq!(ToolName::ClaudeCode.binary_name(), "claude");
+    }
+
+    // ── normalize_nvim_version_tag ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_nvim_bare_semver_gets_v_prefix() {
+        assert_eq!(normalize_nvim_version_tag("0.10.3"), "v0.10.3");
+        assert_eq!(normalize_nvim_version_tag("1.0.0"), "v1.0.0");
+    }
+
+    #[test]
+    fn normalize_nvim_already_prefixed_unchanged() {
+        assert_eq!(normalize_nvim_version_tag("v0.10.3"), "v0.10.3");
+    }
+
+    #[test]
+    fn normalize_nvim_special_tags_unchanged() {
+        assert_eq!(normalize_nvim_version_tag("stable"), "stable");
+        assert_eq!(normalize_nvim_version_tag("nightly"), "nightly");
+    }
+
+    // ── is_nvim_installed / is_tmux_installed ──────────────────────────────
+
+    #[tokio::test]
+    async fn is_nvim_installed_returns_true_when_present() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        assert!(is_nvim_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_nvim_installed_returns_false_when_absent() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!is_nvim_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_tmux_installed_returns_true_when_present() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        assert!(is_tmux_installed(&backend, "test-container", "vscode").await);
+    }
+
+    #[tokio::test]
+    async fn is_tmux_installed_returns_false_when_absent() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!is_tmux_installed(&backend, "test-container", "vscode").await);
+    }
+
+    // ── install_nvim ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn install_nvim_unsupported_arch() {
+        let backend = MockBackend::new(vec![Ok(ok_stdout(0, "riscv64\n"))]);
+        let Err(err) = install_nvim(&backend, "test-container", "vscode", "stable").await else {
+            panic!("expected Err for unsupported arch");
+        };
+        assert!(err.contains("riscv64"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn install_nvim_success_x86() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_stdout(0, "x86_64\n")), // uname -m
+            Ok(ok_exit(0)),               // curl + extract
+            Ok(ok_exit(0)),               // nvim --version verify
+        ]);
+        let result = install_nvim(&backend, "test-container", "vscode", "stable")
+            .await
+            .expect("should succeed");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    // ── install_tmux ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn install_tmux_apt_success() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // which apt-get
+            Ok(ok_exit(0)), // apt-get install
+        ]);
+        let result = install_tmux(&backend, "test-container")
+            .await
+            .expect("should succeed");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn install_tmux_fallback_to_apk() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // which apt-get — not found
+            Ok(ok_exit(0)), // which apk
+            Ok(ok_exit(0)), // apk add
+        ]);
+        let result = install_tmux(&backend, "test-container")
+            .await
+            .expect("should succeed via apk");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn install_tmux_no_package_manager() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // no apt-get
+            Ok(ok_exit(1)), // no apk
+            Ok(ok_exit(1)), // no dnf
+            Ok(ok_exit(1)), // no pacman
+            Ok(ok_exit(1)), // no zypper
+        ]);
+        let Err(err) = install_tmux(&backend, "test-container").await else {
+            panic!("expected Err with no package manager");
+        };
+        assert!(err.contains("No supported package manager"), "got: {err}");
     }
 
     #[test]
