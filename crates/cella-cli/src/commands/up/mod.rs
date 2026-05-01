@@ -468,6 +468,7 @@ impl UpContext {
 
         let registration = cella_orchestrator::daemon_registration::from_devcontainer_config(
             config,
+            &self.resolved.workspace_root,
             container_id,
             self.container_nm.clone(),
             container_ip,
@@ -643,6 +644,7 @@ pub struct UpResult {
 
 struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
+    workspace_root: &'a std::path::Path,
     managed_agent: bool,
     backend_kind: String,
     docker_host: Option<String>,
@@ -677,6 +679,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
         container_ip: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let config = self.config;
+        let workspace_root = self.workspace_root;
         let container_id = container_id.to_string();
         let container_name = container_name.to_string();
         let container_ip = container_ip.map(str::to_string);
@@ -699,6 +702,7 @@ impl cella_orchestrator::up::UpHooks for CliUpHooks<'_> {
 
             let registration = cella_orchestrator::daemon_registration::from_devcontainer_config(
                 config,
+                workspace_root,
                 container_id,
                 container_name,
                 container_ip,
@@ -775,6 +779,7 @@ impl UpContext {
         let (sender, renderer) = crate::progress::bridge(&self.progress);
         let hooks = CliUpHooks {
             config: self.config(),
+            workspace_root: &self.resolved.workspace_root,
             managed_agent: self.client.capabilities().managed_agent,
             backend_kind: self.client.kind().to_string(),
             docker_host: self.docker_host.clone(),
