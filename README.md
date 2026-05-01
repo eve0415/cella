@@ -112,7 +112,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] Lifecycle commands (initializeCommand, postCreate, postStart, postAttach, updateContentCommand)
 - [x] Image and Dockerfile builds
 - [x] Config validation with source-positioned diagnostics (`cella config validate`)
-- [x] Shell completions (`cella completions`)
+- [x] Shell completions (`cella completion`)
 
 ### Environment & Credentials
 
@@ -219,7 +219,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 | `cella read-configuration` | Output resolved devcontainer config as JSON |
 | `cella doctor` | Check system dependencies and configuration |
 | `cella network` | Inspect network proxy and blocking configuration |
-| `cella completions` | Generate shell completions (bash, zsh, fish, etc.) |
+| `cella completion` | Generate shell completions (bash, zsh, fish, etc.) |
 
 ### Port & Credential Management
 

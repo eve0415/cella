@@ -35,7 +35,7 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `credential` | Manage credential forwarding for dev containers |
 | `network` | Manage network proxy settings for dev containers |
 | `features` | Manage devcontainer features (edit, list, update) |
-| `completions` | Generate shell completions |
+| `completion` | Generate shell completions |
 | `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
 
 Hidden internal commands: `daemon`.
@@ -81,7 +81,7 @@ Hidden internal commands: `daemon`.
 | `commands/credential.rs` | Credential forwarding management |
 | `commands/daemon.rs` | Daemon lifecycle management (hidden) |
 | `commands/network.rs` | Network proxy management |
-| `commands/completions.rs` | Shell completion generation |
+| `commands/completion.rs` | Shell completion generation |
 | `commands/features/` | Feature management (mod.rs, edit.rs, jsonc_edit.rs, list.rs, prompts.rs, resolve.rs, update.rs) |
 | `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
 | `picker.rs` | Interactive selection picker |
