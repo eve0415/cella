@@ -4,6 +4,7 @@
 //! tmux) so both `cella up` and `cella install` share the same code paths.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use cella_backend::container_setup::chown_in_container;
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
@@ -1376,16 +1377,13 @@ async fn verified_install_step(
     binary: &str,
     install_result: Option<ExecResult>,
     step: PhaseChildHandle,
-) {
-    // Short-circuit: if the installer ran and reported a non-zero exit, the
-    // requested install/upgrade did not take effect. Do not let a stale
-    // binary still on PATH render as ✓.
+) -> bool {
     if matches!(install_result.as_ref(), Some(r) if r.exit_code != 0) {
         step.fail(&render_failure_reason(
             install_result.as_ref(),
             "installer exited non-zero",
         ));
-        return;
+        return false;
     }
 
     let verify = verify_tool_callable(
@@ -1399,7 +1397,10 @@ async fn verified_install_step(
     .await;
 
     match verify {
-        VerifyOutcome::Reachable => step.finish(),
+        VerifyOutcome::Reachable => {
+            step.finish();
+            true
+        }
         VerifyOutcome::InstalledElsewhere(path) => {
             match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
                 Ok(()) => {
@@ -1413,27 +1414,42 @@ async fn verified_install_step(
                     )
                     .await;
                     match second {
-                        VerifyOutcome::Reachable => step.finish(),
-                        other => step.fail(&render_failure_reason(
-                            install_result.as_ref(),
-                            &format!("symlink created but still not reachable: {other:?}"),
-                        )),
+                        VerifyOutcome::Reachable => {
+                            step.finish();
+                            true
+                        }
+                        other => {
+                            step.fail(&render_failure_reason(
+                                install_result.as_ref(),
+                                &format!("symlink created but still not reachable: {other:?}"),
+                            ));
+                            false
+                        }
                     }
                 }
-                Err(e) => step.fail(&render_failure_reason(
-                    install_result.as_ref(),
-                    &format!("symlink failed: {e}"),
-                )),
+                Err(e) => {
+                    step.fail(&render_failure_reason(
+                        install_result.as_ref(),
+                        &format!("symlink failed: {e}"),
+                    ));
+                    false
+                }
             }
         }
-        VerifyOutcome::NotInstalled => step.fail(&render_failure_reason(
-            install_result.as_ref(),
-            "install did not produce a reachable binary",
-        )),
-        VerifyOutcome::ProbeError(e) => step.fail(&render_failure_reason(
-            install_result.as_ref(),
-            &format!("verification failed: {e}"),
-        )),
+        VerifyOutcome::NotInstalled => {
+            step.fail(&render_failure_reason(
+                install_result.as_ref(),
+                "install did not produce a reachable binary",
+            ));
+            false
+        }
+        VerifyOutcome::ProbeError(e) => {
+            step.fail(&render_failure_reason(
+                install_result.as_ref(),
+                &format!("verification failed: {e}"),
+            ));
+            false
+        }
     }
 }
 
@@ -1474,6 +1490,8 @@ pub struct InstallSpec<'a> {
 /// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
 /// Codex and Gemini run sequentially to avoid npm global lock contention.
 /// Nvim and tmux run in parallel with the other branches.
+///
+/// Returns the number of tools that failed to install.
 pub async fn install_tools(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -1481,10 +1499,10 @@ pub async fn install_tools(
     shell: &str,
     spec: &InstallSpec<'_>,
     progress: &ProgressSender,
-) {
+) -> usize {
     let (settings, tools, probed_env) = (spec.settings, spec.tools, spec.probed_env);
     if tools.is_empty() {
-        return;
+        return 0;
     }
 
     let has = |t: ToolName| tools.contains(&t);
@@ -1506,82 +1524,132 @@ pub async fn install_tools(
 
     let phase = progress.phase("Installing tools...");
 
-    let claude_branch = async {
-        if has(ToolName::ClaudeCode) {
-            let step = phase.step("Claude Code");
-            let install_result = install_claude_code(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.claude_code,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "claude", install_result, step).await;
-        }
-    };
+    let claude_branch = install_claude_branch(&ctx, &phase, settings, has(ToolName::ClaudeCode));
+    let npm_branch = install_npm_branch(
+        &ctx,
+        &phase,
+        settings,
+        has(ToolName::Codex),
+        has(ToolName::Gemini),
+        needs_npm && !node_available,
+    );
+    let nvim_branch = install_fallible_branch(
+        &ctx,
+        &phase,
+        "nvim",
+        has(ToolName::Nvim),
+        install_nvim(
+            client,
+            container_id,
+            remote_user,
+            &settings.tools.nvim.version,
+        ),
+    );
+    let tmux_branch = install_fallible_branch(
+        &ctx,
+        &phase,
+        "tmux",
+        has(ToolName::Tmux),
+        install_tmux(client, container_id),
+    );
 
-    let npm_branch = async {
-        if needs_npm && !node_available {
-            warn!("Skipping npm tool installs: Node.js/npm not available");
-            return;
-        }
-        if has(ToolName::Codex) {
-            let step = phase.step("Codex");
-            let install_result = install_codex(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.codex,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "codex", install_result, step).await;
-        }
-        if has(ToolName::Gemini) {
-            let step = phase.step("Gemini CLI");
-            let install_result = install_gemini(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.gemini,
-                probed_env,
-            )
-            .await;
-            verified_install_step(&ctx, "gemini", install_result, step).await;
-        }
-    };
-
-    let nvim_branch = async {
-        if has(ToolName::Nvim) {
-            let step = phase.step("nvim");
-            let result = install_nvim(
-                client,
-                container_id,
-                remote_user,
-                &settings.tools.nvim.version,
-            )
-            .await;
-            match result {
-                Ok(r) => verified_install_step(&ctx, "nvim", Some(r), step).await,
-                Err(e) => step.fail(&e),
-            }
-        }
-    };
-
-    let tmux_branch = async {
-        if has(ToolName::Tmux) {
-            let step = phase.step("tmux");
-            let result = install_tmux(client, container_id).await;
-            match result {
-                Ok(r) => verified_install_step(&ctx, "tmux", Some(r), step).await,
-                Err(e) => step.fail(&e),
-            }
-        }
-    };
-
-    tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
+    let (c, n, nv, t) = tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
     phase.finish();
+    c + n + nv + t
+}
+
+async fn install_claude_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    settings: &cella_config::CellaConfig,
+    requested: bool,
+) -> usize {
+    if !requested {
+        return 0;
+    }
+    let step = phase.step("Claude Code");
+    let result = install_claude_code(
+        ctx.client,
+        ctx.container_id,
+        ctx.remote_user,
+        &settings.tools.claude_code,
+        ctx.probed_env,
+    )
+    .await;
+    usize::from(!verified_install_step(ctx, "claude", result, step).await)
+}
+
+async fn install_npm_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    settings: &cella_config::CellaConfig,
+    codex: bool,
+    gemini: bool,
+    node_unavailable: bool,
+) -> usize {
+    if node_unavailable {
+        let mut f = 0;
+        if codex {
+            phase.step("Codex").fail("Node.js/npm not available");
+            f += 1;
+        }
+        if gemini {
+            phase.step("Gemini CLI").fail("Node.js/npm not available");
+            f += 1;
+        }
+        return f;
+    }
+    let mut failures = 0;
+    if codex {
+        let step = phase.step("Codex");
+        let r = install_codex(
+            ctx.client,
+            ctx.container_id,
+            ctx.remote_user,
+            &settings.tools.codex,
+            ctx.probed_env,
+        )
+        .await;
+        if !verified_install_step(ctx, "codex", r, step).await {
+            failures += 1;
+        }
+    }
+    if gemini {
+        let step = phase.step("Gemini CLI");
+        let r = install_gemini(
+            ctx.client,
+            ctx.container_id,
+            ctx.remote_user,
+            &settings.tools.gemini,
+            ctx.probed_env,
+        )
+        .await;
+        if !verified_install_step(ctx, "gemini", r, step).await {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+async fn install_fallible_branch(
+    ctx: &InstallCtx<'_>,
+    phase: &cella_backend::progress::PhaseHandle,
+    binary: &str,
+    requested: bool,
+    install_future: impl Future<Output = Result<ExecResult, String>>,
+) -> usize {
+    if !requested {
+        return 0;
+    }
+    let step = phase.step(binary);
+    let ok = match install_future.await {
+        Ok(r) => verified_install_step(ctx, binary, Some(r), step).await,
+        Err(e) => {
+            step.fail(&e);
+            false
+        }
+    };
+    usize::from(!ok)
 }
 
 #[cfg(test)]

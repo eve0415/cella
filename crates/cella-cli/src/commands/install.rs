@@ -141,7 +141,7 @@ impl InstallArgs {
             tools: &to_install,
             probed_env: None,
         };
-        cella_orchestrator::tool_install::install_tools(
+        let failures = cella_orchestrator::tool_install::install_tools(
             client.as_ref(),
             &container.id,
             &remote_user,
@@ -153,6 +153,9 @@ impl InstallArgs {
         drop(sender);
         let _ = renderer.await;
 
+        if failures > 0 {
+            return Err(format!("{failures} tool(s) failed to install").into());
+        }
         Ok(())
     }
 }
