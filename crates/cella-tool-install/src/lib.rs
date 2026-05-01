@@ -673,7 +673,10 @@ fn ensure_tool_config_paths_in(home: &std::path::Path, settings: &cella_config::
 }
 
 fn ensure_file(path: &std::path::Path, content: &str) {
-    if path.exists() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    if path.is_file() {
         return;
     }
     if let Some(parent) = path.parent()
@@ -682,8 +685,12 @@ fn ensure_file(path: &std::path::Path, content: &str) {
         warn!("cannot create parent directory {}: {e}", parent.display());
         return;
     }
-    match std::fs::write(path, content) {
-        Ok(()) => {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(content.as_bytes()) {
+                warn!("cannot write to {}: {e}", path.display());
+                return;
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -695,6 +702,7 @@ fn ensure_file(path: &std::path::Path, content: &str) {
             }
             debug!("created {}", path.display());
         }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => warn!("cannot create {}: {e}", path.display()),
     }
 }
@@ -2307,34 +2315,27 @@ mod tests {
     }
 
     #[test]
-    fn ensure_then_mount_produces_expected_specs() {
+    fn ensure_creates_paths_matching_host_detection_predicates() {
         let tmp = tempfile::tempdir().unwrap();
         let settings = cella_config::CellaConfig::default();
 
-        let original_home = std::env::var("HOME").ok();
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
-
         ensure_tool_config_paths_in(tmp.path(), &settings);
-        let specs = build_tool_config_mount_specs(&settings, "vscode");
-
-        #[allow(unsafe_code)]
-        unsafe {
-            match original_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
 
         assert!(
-            specs.iter().any(|s| s.target.ends_with("/.claude.json")),
-            "should have .claude.json mount; got: {specs:?}"
+            tmp.path().join(".claude.json").is_file(),
+            ".claude.json must satisfy is_file() for host detection"
         );
         assert!(
-            specs.iter().any(|s| s.target.ends_with("/.claude")),
-            "should have .claude/ mount; got: {specs:?}"
+            tmp.path().join(".claude").is_dir(),
+            ".claude must satisfy is_dir() for host detection"
+        );
+        assert!(
+            tmp.path().join(".codex").is_dir(),
+            ".codex must satisfy is_dir() for host detection"
+        );
+        assert!(
+            tmp.path().join(".gemini").is_dir(),
+            ".gemini must satisfy is_dir() for host detection"
         );
     }
 }
