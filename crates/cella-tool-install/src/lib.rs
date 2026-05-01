@@ -679,6 +679,13 @@ fn ensure_file(path: &std::path::Path, content: &str) {
     if path.is_file() {
         return;
     }
+    if path.exists() {
+        warn!(
+            "{} exists but is not a regular file; tool config mount may not work",
+            path.display()
+        );
+        return;
+    }
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -709,6 +716,13 @@ fn ensure_file(path: &std::path::Path, content: &str) {
 
 fn ensure_dir(path: &std::path::Path) {
     if path.is_dir() {
+        return;
+    }
+    if path.exists() {
+        warn!(
+            "{} exists but is not a directory; tool config mount may not work",
+            path.display()
+        );
         return;
     }
     match std::fs::create_dir_all(path) {
