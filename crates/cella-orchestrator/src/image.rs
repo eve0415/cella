@@ -10,7 +10,7 @@ use tracing::info;
 
 use cella_backend::{
     BuildOptions, BuildSecret, ContainerBackend, ImageDetails, compute_features_digest, image_name,
-    image_name_with_features,
+    image_name_for_worktree, image_name_with_features,
 };
 use cella_features::ResolvedFeatures;
 
@@ -151,6 +151,22 @@ pub async fn ensure_image(
     Ok((features_image, Some(resolved), base_image_details))
 }
 
+/// Compute image name, using parent repo for worktrees to share the cache.
+fn resolve_image_name(
+    workspace_root: &Path,
+    config_name: Option<&str>,
+    config: &serde_json::Value,
+) -> String {
+    cella_git::parent_git_dir(workspace_root).map_or_else(
+        || image_name(workspace_root, config_name),
+        |parent_git| {
+            let parent_repo = parent_git.parent().unwrap_or(&parent_git).to_path_buf();
+            let config_hash = compute_features_digest(config);
+            image_name_for_worktree(&parent_repo, config_name, &config_hash)
+        },
+    )
+}
+
 /// Pull or build the base image and return its tag.
 ///
 /// When `will_build_features` is false and the config has a Dockerfile build,
@@ -180,7 +196,7 @@ async fn resolve_base_image(
         }
         Ok(image.to_string())
     } else if let Some(build) = input.config.get("build").and_then(|v| v.as_object()) {
-        let img_name = image_name(input.workspace_root, input.config_name);
+        let img_name = resolve_image_name(input.workspace_root, input.config_name, input.config);
         let mut build_opts = parse_build_options(
             build,
             &img_name,

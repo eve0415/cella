@@ -19,8 +19,8 @@ pub use lifecycle::{
 pub use mount::{MountKind, MountSpec};
 pub use names::{
     BACKEND_LABEL, compose_labels, compose_project_name, compute_features_digest, container_labels,
-    container_name, image_name, image_name_with_features, orbstack_domains_label,
-    orbstack_http_port_label, worktree_labels,
+    container_name, image_name, image_name_for_worktree, image_name_with_features,
+    orbstack_domains_label, orbstack_http_port_label, worktree_labels,
 };
 pub use network::{ManagedNetwork, RemovalOutcome};
 pub use resolve::ContainerTarget;

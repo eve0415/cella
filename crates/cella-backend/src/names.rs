@@ -76,6 +76,22 @@ fn sanitize_name(s: &str) -> String {
     result.trim_matches('-').to_string()
 }
 
+/// Generate image name keyed on a parent repo path instead of the workspace.
+///
+/// For worktree-backed containers, using the parent repo path ensures all
+/// worktrees with the same config produce the same image name, avoiding
+/// redundant Docker builds.
+pub fn image_name_for_worktree(
+    parent_repo: &Path,
+    config_name: Option<&str>,
+    config_hash: &str,
+) -> String {
+    let identifier = identifier_from(parent_repo, config_name);
+    let hash = workspace_hash(parent_repo);
+    let cfg_hash = &config_hash[..8.min(config_hash.len())];
+    format!("cella-img-{identifier}-{hash}-{cfg_hash}")
+}
+
 /// Generate image name for a features-layered build.
 /// `features_digest` is the hex-encoded lowercase SHA256 (64-character string).
 pub fn image_name_with_features(
@@ -292,6 +308,30 @@ mod tests {
         let name = image_name_with_features(&path, Some("my-app"), digest);
         assert!(name.starts_with("cella-img-my-app-"));
         assert!(name.ends_with(&digest[..8]));
+    }
+
+    #[test]
+    fn image_name_for_worktree_format() {
+        let parent = PathBuf::from("/tmp/my-project");
+        let name = image_name_for_worktree(&parent, Some("test"), "abcdef0123456789");
+        assert!(name.starts_with("cella-img-test-"));
+        assert!(name.ends_with("abcdef01"));
+    }
+
+    #[test]
+    fn image_name_for_worktree_same_parent_same_name() {
+        let parent = PathBuf::from("/tmp/my-project");
+        let name_a = image_name_for_worktree(&parent, Some("test"), "abcdef0123456789");
+        let name_b = image_name_for_worktree(&parent, Some("test"), "abcdef0123456789");
+        assert_eq!(name_a, name_b);
+    }
+
+    #[test]
+    fn image_name_for_worktree_different_config_different_name() {
+        let parent = PathBuf::from("/tmp/my-project");
+        let name_a = image_name_for_worktree(&parent, Some("test"), "aaaa0000");
+        let name_b = image_name_for_worktree(&parent, Some("test"), "bbbb1111");
+        assert_ne!(name_a, name_b);
     }
 
     #[test]
