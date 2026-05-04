@@ -9,12 +9,19 @@ pub struct PortsArgs {
     /// Show ports across all worktrees/containers.
     #[arg(long)]
     all: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    output: super::OutputFormat,
+
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
 }
 
 impl PortsArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let is_json = matches!(self.output, super::OutputFormat::Json);
+
         // Try querying the daemon first for dynamic port info — only when
         // the selected backend uses daemon-managed port forwarding and no
         // custom Docker host is specified (daemon tracks local containers only).
@@ -42,7 +49,11 @@ impl PortsArgs {
             {
                 Ok(cella_protocol::ManagementResponse::Ports { ports }) => {
                     if !ports.is_empty() {
-                        print_daemon_ports(&ports);
+                        if is_json {
+                            print_daemon_ports_json(&ports);
+                        } else {
+                            print_daemon_ports(&ports);
+                        }
                         return Ok(());
                     }
                     // Fall through to Docker static ports
@@ -57,7 +68,11 @@ impl PortsArgs {
         }
 
         // Fall back to the selected backend for static port bindings
-        print_backend_ports(self.all, &self.backend).await
+        if is_json {
+            print_backend_ports_json(self.all, &self.backend).await
+        } else {
+            print_backend_ports(self.all, &self.backend).await
+        }
     }
 }
 
@@ -322,6 +337,61 @@ fn print_container_ports(containers: &[ContainerInfo], is_orbstack: bool) {
     }
 
     table.eprint();
+}
+
+fn print_daemon_ports_json(ports: &[cella_protocol::ForwardedPortDetail]) {
+    let items: Vec<_> = ports
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "container_name": p.container_name,
+                "container_port": p.container_port,
+                "host_port": p.host_port,
+                "protocol": format!("{:?}", p.protocol).to_lowercase(),
+                "process": p.process,
+                "url": p.url,
+                "hostname": p.hostname,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&items).unwrap_or_default()
+    );
+}
+
+async fn print_backend_ports_json(
+    all: bool,
+    backend_args: &crate::backend::BackendArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = backend_args.resolve_client().await?;
+    let containers = client.list_cella_containers(true).await?;
+
+    let filter_containers: Vec<_> = if all {
+        containers.iter().collect()
+    } else {
+        containers.iter().filter(|c| !c.ports.is_empty()).collect()
+    };
+
+    let items: Vec<_> = filter_containers
+        .iter()
+        .flat_map(|c| {
+            c.ports.iter().map(|p| {
+                serde_json::json!({
+                    "container_name": c.name,
+                    "container_port": p.container_port,
+                    "host_port": p.host_port,
+                    "protocol": p.protocol,
+                })
+            })
+        })
+        .collect();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&items).unwrap_or_default()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -197,14 +197,38 @@ fn print_json(containers: &[ContainerInfo]) {
     let items: Vec<_> = containers
         .iter()
         .map(|c| {
+            let ports_json: Vec<_> = c
+                .ports
+                .iter()
+                .map(|p| {
+                    json!({
+                        "container_port": p.container_port,
+                        "host_port": p.host_port,
+                        "protocol": p.protocol,
+                    })
+                })
+                .collect();
+
+            let is_worktree = c
+                .labels
+                .get("dev.cella.worktree")
+                .is_some_and(|v| v == "true");
+
             json!({
+                "id": c.id,
                 "name": c.name,
-                "id": short_id(&c.id),
                 "state": state_str(&c.state),
                 "branch": c.labels.get("dev.cella.branch").unwrap_or(&String::new()),
-                "workspace": c.labels.get("dev.cella.workspace_path").unwrap_or(&String::new()),
-                "ports": format_ports(c),
-                "age": format_age(c.created_at.as_deref()),
+                "workspace_path": c.labels.get("dev.cella.workspace_path").unwrap_or(&String::new()),
+                "config_path": c.labels.get("dev.cella.config_path").unwrap_or(&String::new()),
+                "config_hash": c.config_hash.as_deref().unwrap_or_default(),
+                "image": c.image.as_deref().unwrap_or_default(),
+                "parent_repo": c.labels.get("dev.cella.parent_repo").unwrap_or(&String::new()),
+                "is_worktree": is_worktree,
+                "created_at": c.created_at.as_deref().unwrap_or_default(),
+                "ports": ports_json,
+                "labels": c.labels,
+                "backend": format!("{:?}", c.backend).to_lowercase(),
             })
         })
         .collect();
