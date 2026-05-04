@@ -98,7 +98,15 @@ impl PruneArgs {
         )
         .await?;
 
-        // 3. Apply filters
+        // 3. Validate filter args
+        for spec in &self.scope.labels {
+            if !spec.contains('=') {
+                return Err(
+                    format!("invalid label filter '{spec}': expected KEY=VALUE format").into(),
+                );
+            }
+        }
+
         let older_than = self
             .scope
             .older_than

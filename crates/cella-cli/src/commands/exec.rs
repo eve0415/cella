@@ -217,7 +217,7 @@ async fn run_exec(
         });
         println!(
             "{}",
-            serde_json::to_string(&json_output).unwrap_or_default()
+            serde_json::to_string_pretty(&json_output).unwrap_or_default()
         );
         if result.exit_code != 0 {
             std::process::exit(i32::try_from(result.exit_code).unwrap_or(125));

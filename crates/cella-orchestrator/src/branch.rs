@@ -77,12 +77,3 @@ pub fn create_worktree(
         created: !already_existed,
     })
 }
-
-/// Remove a git worktree (rollback helper).
-///
-/// Used when container creation fails after worktree creation.
-pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) {
-    if let Err(e) = cella_git::remove(repo_root, worktree_path) {
-        tracing::warn!("failed to clean up worktree: {e}");
-    }
-}

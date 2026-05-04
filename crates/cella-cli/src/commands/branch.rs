@@ -114,6 +114,11 @@ impl BranchArgs {
         let mut extra_labels = worktree_labels(&self.name, repo_root);
         for label in &self.labels {
             if let Some((key, value)) = label.split_once('=') {
+                if key.starts_with("dev.cella.") || key.starts_with("devcontainer.") {
+                    return Err(format!(
+                        "reserved label prefix: '{key}' — dev.cella.* and devcontainer.* labels are managed by cella"
+                    ).into());
+                }
                 extra_labels.insert(key.to_string(), value.to_string());
             }
         }
@@ -203,7 +208,10 @@ impl BranchArgs {
                     "worktreePath": wt_path.display().to_string(),
                     "branch": self.name,
                 });
-                println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).unwrap_or_default()
+                );
             }
         }
 

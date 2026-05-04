@@ -20,7 +20,7 @@ impl StatusArgs {
         let (containers, daemon, docker) = tokio::join!(
             gather_containers(client.as_ref()),
             gather_daemon(),
-            gather_docker(client.as_ref()),
+            gather_docker_version(),
         );
 
         match self.output {
@@ -117,7 +117,7 @@ async fn gather_daemon() -> serde_json::Value {
     }
 }
 
-async fn gather_docker(_client: &dyn cella_backend::ContainerBackend) -> serde_json::Value {
+async fn gather_docker_version() -> serde_json::Value {
     match tokio::process::Command::new("docker")
         .arg("--version")
         .output()

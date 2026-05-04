@@ -1801,8 +1801,7 @@ fn append_extra_mounts(
     client: &dyn ContainerBackend,
     managed_agent: bool,
 ) {
-    let is_worktree = cella_git::parent_git_dir(workspace_root);
-    if let Some(ref parent_git) = is_worktree {
+    if let Some(parent_git) = cella_git::parent_git_dir(workspace_root) {
         let canonical = parent_git
             .canonicalize()
             .unwrap_or_else(|_| parent_git.clone());
