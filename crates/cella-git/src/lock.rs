@@ -3,7 +3,6 @@
 use std::fs::File;
 use std::path::Path;
 
-use fs4::fs_std::FileExt;
 use tracing::debug;
 
 use crate::CellaGitError;
@@ -43,7 +42,7 @@ impl BranchLock {
         let lock_path = lock_dir.join(format!("cella-{sanitized}.lock"));
 
         let file = File::create(&lock_path).map_err(CellaGitError::Io)?;
-        file.lock_exclusive().map_err(|e| {
+        file.lock().map_err(|e| {
             debug!("failed to acquire lock at {}: {e}", lock_path.display());
             CellaGitError::Io(e)
         })?;

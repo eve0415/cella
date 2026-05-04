@@ -376,7 +376,7 @@ async fn check_volume_version(docker: &Docker, expected: &str) -> Result<bool, C
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/cella".to_string()),
                 source: Some(AGENT_VOLUME_NAME.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 read_only: Some(true),
                 ..Default::default()
             }]),
@@ -742,7 +742,7 @@ async fn build_agent_in_container(docker: &Docker) -> Result<Vec<u8>, CellaDocke
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/src".to_string()),
                 source: Some(workspace_root.to_string_lossy().to_string()),
-                typ: Some(bollard::models::MountTypeEnum::BIND),
+                typ: Some(bollard::models::MountType::BIND),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -869,7 +869,7 @@ async fn upload_to_volume(
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/cella".to_string()),
                 source: Some(AGENT_VOLUME_NAME.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -1074,7 +1074,7 @@ pub async fn write_daemon_addr_file(
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/cella".to_string()),
                 source: Some(AGENT_VOLUME_NAME.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -1228,7 +1228,7 @@ async fn list_volume_versions(docker: &Docker) -> Result<Vec<String>, CellaDocke
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/cella".to_string()),
                 source: Some(AGENT_VOLUME_NAME.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -1314,7 +1314,7 @@ async fn delete_version_dirs(
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/cella".to_string()),
                 source: Some(AGENT_VOLUME_NAME.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             ..Default::default()
