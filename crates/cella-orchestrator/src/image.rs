@@ -152,6 +152,10 @@ pub async fn ensure_image(
 }
 
 /// Compute image name, using parent repo for worktrees to share the cache.
+///
+/// Hashes the full build-relevant config (build, image, features, Dockerfile)
+/// so that worktrees with different configs get distinct image tags even when
+/// sharing the same parent repo.
 fn resolve_image_name(
     workspace_root: &Path,
     config_name: Option<&str>,
@@ -161,10 +165,33 @@ fn resolve_image_name(
         || image_name(workspace_root, config_name),
         |parent_git| {
             let parent_repo = parent_git.parent().unwrap_or(&parent_git).to_path_buf();
-            let config_hash = compute_features_digest(config);
+            let config_hash = build_config_digest(config);
             image_name_for_worktree(&parent_repo, config_name, &config_hash)
         },
     )
+}
+
+/// Hash the build-relevant parts of a devcontainer config.
+///
+/// Includes `build`, `image`, `dockerFile`, `dockerComposeFile`, and `features`
+/// so that any change to the image definition produces a different digest.
+fn build_config_digest(config: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for key in [
+        "build",
+        "image",
+        "dockerFile",
+        "dockerComposeFile",
+        "features",
+    ] {
+        if let Some(v) = config.get(key) {
+            let canonical = serde_json::to_string(v).unwrap_or_default();
+            hasher.update(key.as_bytes());
+            hasher.update(canonical.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Pull or build the base image and return its tag.
@@ -603,5 +630,31 @@ mod tests {
         inject_proxy_build_args(&mut opts, &proxy);
         // Existing value must not be overwritten
         assert_eq!(opts.args.get("HTTP_PROXY").unwrap(), "http://custom:1234");
+    }
+
+    #[test]
+    fn build_config_digest_differs_for_different_images() {
+        let config_a = serde_json::json!({ "image": "node:20" });
+        let config_b = serde_json::json!({ "image": "python:3.12" });
+        assert_ne!(
+            build_config_digest(&config_a),
+            build_config_digest(&config_b)
+        );
+    }
+
+    #[test]
+    fn build_config_digest_same_config_is_deterministic() {
+        let config = serde_json::json!({ "build": { "dockerfile": "Dockerfile" } });
+        assert_eq!(build_config_digest(&config), build_config_digest(&config));
+    }
+
+    #[test]
+    fn build_config_digest_includes_features() {
+        let config_a = serde_json::json!({ "image": "node:20", "features": {} });
+        let config_b = serde_json::json!({ "image": "node:20", "features": { "ghcr.io/devcontainers/features/node:1": {} } });
+        assert_ne!(
+            build_config_digest(&config_a),
+            build_config_digest(&config_b)
+        );
     }
 }
