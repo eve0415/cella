@@ -5,7 +5,7 @@ pub mod env;
 use std::collections::{HashMap, HashSet};
 
 use bollard::models::{
-    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, Mount, MountTypeEnum, PortMap,
+    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, Mount, MountType, PortMap,
     ResourcesUlimits, RestartPolicy, RestartPolicyNameEnum,
 };
 use cella_backend::{CreateContainerOptions, GpuRequest, MountConfig, RunArgsOverrides};
@@ -375,10 +375,10 @@ fn gpu_request_to_device_request(gpu: &GpuRequest) -> DeviceRequest {
 
 fn to_bollard_mount(m: &MountConfig) -> Option<Mount> {
     let typ = match m.mount_type.as_str() {
-        "bind" => MountTypeEnum::BIND,
-        "volume" => MountTypeEnum::VOLUME,
-        "tmpfs" => MountTypeEnum::TMPFS,
-        "npipe" => MountTypeEnum::NPIPE,
+        "bind" => MountType::BIND,
+        "volume" => MountType::VOLUME,
+        "tmpfs" => MountType::TMPFS,
+        "npipe" => MountType::NPIPE,
         other => {
             tracing::warn!(
                 mount_type = other,
@@ -652,7 +652,7 @@ mod tests {
             external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
-        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::VOLUME));
+        assert_eq!(bollard_mount.typ, Some(MountType::VOLUME));
     }
 
     #[test]
@@ -666,7 +666,7 @@ mod tests {
             external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
-        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::TMPFS));
+        assert_eq!(bollard_mount.typ, Some(MountType::TMPFS));
     }
 
     #[test]
@@ -680,7 +680,7 @@ mod tests {
             external: false,
         };
         let bollard_mount = to_bollard_mount(&m).unwrap();
-        assert_eq!(bollard_mount.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(bollard_mount.typ, Some(MountType::BIND));
         assert_eq!(bollard_mount.consistency, Some("cached".to_string()));
     }
 
@@ -697,8 +697,8 @@ mod tests {
         let bollard_mount = to_bollard_mount(&m).unwrap();
         assert_eq!(
             bollard_mount.typ,
-            Some(MountTypeEnum::NPIPE),
-            "npipe mount type must map to MountTypeEnum::NPIPE"
+            Some(MountType::NPIPE),
+            "npipe mount type must map to MountType::NPIPE"
         );
     }
 

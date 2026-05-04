@@ -71,13 +71,15 @@ pub fn worktree_path(repo_root: &Path, branch: &str, worktree_root: Option<&Path
 /// - If `Remote`, creates a local branch tracking the remote.
 /// - If `Local`, checks it out in the new worktree.
 ///
-/// Returns information about the created worktree.
+/// By default, if the worktree already exists and the branch matches, returns
+/// the existing worktree info (idempotent). Set `fail_if_exists` to `true` to
+/// get the old error behavior.
 ///
 /// # Errors
 ///
-/// Returns `CellaGitError::WorktreeAlreadyExists` if the path exists,
-/// `CellaGitError::BranchCheckedOut` if the branch is checked out elsewhere,
-/// or other git errors.
+/// Returns `CellaGitError::WorktreeAlreadyExists` if `fail_if_exists` is true
+/// and the path exists, `CellaGitError::BranchCheckedOut` if the branch is
+/// checked out elsewhere, or other git errors.
 pub fn create(
     repo_root: &Path,
     branch: &str,
@@ -85,9 +87,48 @@ pub fn create(
     worktree_root: Option<&Path>,
     base: Option<&str>,
 ) -> Result<WorktreeInfo, CellaGitError> {
+    create_inner(repo_root, branch, branch_state, worktree_root, base, false)
+}
+
+/// Like [`create`] but errors if the worktree already exists.
+///
+/// # Errors
+///
+/// Returns `WorktreeAlreadyExists` if the path exists, or other git errors.
+pub fn create_strict(
+    repo_root: &Path,
+    branch: &str,
+    branch_state: &BranchState,
+    worktree_root: Option<&Path>,
+    base: Option<&str>,
+) -> Result<WorktreeInfo, CellaGitError> {
+    create_inner(repo_root, branch, branch_state, worktree_root, base, true)
+}
+
+fn create_inner(
+    repo_root: &Path,
+    branch: &str,
+    branch_state: &BranchState,
+    worktree_root: Option<&Path>,
+    base: Option<&str>,
+    fail_if_exists: bool,
+) -> Result<WorktreeInfo, CellaGitError> {
     let wt_path = worktree_path(repo_root, branch, worktree_root);
 
     if wt_path.exists() {
+        if fail_if_exists {
+            return Err(CellaGitError::WorktreeAlreadyExists { path: wt_path });
+        }
+        // Idempotent: verify the existing worktree has the correct branch
+        let worktrees = list(repo_root)?;
+        if let Some(existing) = worktrees.into_iter().find(|wt| {
+            wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone())
+                == wt_path.canonicalize().unwrap_or_else(|_| wt_path.clone())
+        }) && existing.branch.as_deref() == Some(branch)
+        {
+            debug!("worktree already exists for branch '{branch}', returning existing");
+            return Ok(existing);
+        }
         return Err(CellaGitError::WorktreeAlreadyExists { path: wt_path });
     }
 
@@ -359,14 +400,14 @@ mod tests {
     }
 
     #[test]
-    fn create_duplicate_errors() {
+    fn create_duplicate_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         init_repo(tmp.path());
 
         let wt_root = tmp.path().join("worktrees");
         std::fs::create_dir_all(&wt_root).unwrap();
 
-        create(
+        let first = create(
             tmp.path(),
             "dup-branch",
             &BranchState::New,
@@ -375,7 +416,37 @@ mod tests {
         )
         .unwrap();
 
-        let result = create(
+        let second = create(
+            tmp.path(),
+            "dup-branch",
+            &BranchState::New,
+            Some(&wt_root),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.branch, second.branch);
+    }
+
+    #[test]
+    fn create_strict_duplicate_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).unwrap();
+
+        create_strict(
+            tmp.path(),
+            "dup-branch",
+            &BranchState::New,
+            Some(&wt_root),
+            None,
+        )
+        .unwrap();
+
+        let result = create_strict(
             tmp.path(),
             "dup-branch",
             &BranchState::New,

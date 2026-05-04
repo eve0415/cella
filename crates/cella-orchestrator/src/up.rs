@@ -934,36 +934,14 @@ impl EnsureUpContext<'_> {
             );
         }
 
-        if let Some(parent_git) = cella_git::parent_git_dir(&self.config.resolved.workspace_root) {
-            let canonical = parent_git
-                .canonicalize()
-                .unwrap_or_else(|_| parent_git.clone());
-            let path_str = canonical.to_string_lossy().to_string();
-            create_opts.mounts.push(MountConfig {
-                mount_type: "bind".to_string(),
-                source: path_str.clone(),
-                target: path_str,
-                consistency: None,
-                read_only: false,
-                external: false,
-            });
-        }
-
-        for m in self.config.mount_flags.additional_cli_mounts {
-            create_opts.mounts.push(m.clone());
-        }
-
-        let (vol_name, vol_target, _ro) = self.client.agent_volume_mount();
-        if capabilities.managed_agent && !vol_name.is_empty() {
-            create_opts.mounts.push(MountConfig {
-                mount_type: "volume".to_string(),
-                source: vol_name,
-                target: vol_target,
-                consistency: None,
-                read_only: false,
-                external: false,
-            });
-        }
+        append_extra_mounts(
+            &mut create_opts.mounts,
+            &self.config.resolved.workspace_root,
+            remote_user,
+            self.config.mount_flags.additional_cli_mounts,
+            self.client,
+            capabilities.managed_agent,
+        );
 
         Ok(())
     }
@@ -1812,6 +1790,80 @@ fn resolve_worktree_common_dir(
             external: false,
         },
     })
+}
+
+/// Append worktree parent git dir, agent IPC dirs, CLI mounts, and agent volume.
+fn append_extra_mounts(
+    mounts: &mut Vec<MountConfig>,
+    workspace_root: &std::path::Path,
+    remote_user: &str,
+    additional_cli_mounts: &[MountConfig],
+    client: &dyn ContainerBackend,
+    managed_agent: bool,
+) {
+    if let Some(parent_git) = cella_git::parent_git_dir(workspace_root) {
+        let canonical = parent_git
+            .canonicalize()
+            .unwrap_or_else(|_| parent_git.clone());
+        let path_str = canonical.to_string_lossy().to_string();
+        mounts.push(MountConfig {
+            mount_type: "bind".to_string(),
+            source: path_str.clone(),
+            target: path_str,
+            consistency: None,
+            read_only: false,
+            external: false,
+        });
+        append_agent_ipc_mounts(mounts, remote_user);
+    }
+
+    for m in additional_cli_mounts {
+        mounts.push(m.clone());
+    }
+
+    let (vol_name, vol_target, _ro) = client.agent_volume_mount();
+    if managed_agent && !vol_name.is_empty() {
+        mounts.push(MountConfig {
+            mount_type: "volume".to_string(),
+            source: vol_name,
+            target: vol_target,
+            consistency: None,
+            read_only: false,
+            external: false,
+        });
+    }
+}
+
+/// Bind-mount agent IPC directories (Claude Code teams/tasks, Codex queues)
+/// from the host into the container for cross-container communication.
+fn append_agent_ipc_mounts(mounts: &mut Vec<MountConfig>, remote_user: &str) {
+    let Ok(home_str) = std::env::var("HOME") else {
+        return;
+    };
+    let home = std::path::PathBuf::from(&home_str);
+    let container_home = if remote_user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{remote_user}")
+    };
+    let ipc_dirs = [
+        (".claude/teams", ".claude/teams"),
+        (".claude/tasks", ".claude/tasks"),
+        (".acpx", ".acpx"),
+    ];
+    for (host_rel, target_rel) in ipc_dirs {
+        let host_path = home.join(host_rel);
+        if host_path.is_dir() {
+            mounts.push(MountConfig {
+                mount_type: "bind".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target: format!("{container_home}/{target_rel}"),
+                consistency: None,
+                read_only: false,
+                external: false,
+            });
+        }
+    }
 }
 
 fn normalize_path_string(path: &str) -> String {

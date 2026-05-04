@@ -19,6 +19,7 @@ mod ports;
 mod prune;
 mod read_configuration;
 mod shell;
+mod status;
 mod switch;
 mod template;
 pub mod up;
@@ -150,6 +151,8 @@ pub enum Command {
     Network(network::NetworkArgs),
     /// View port forwarding status for dev containers.
     Ports(ports::PortsArgs),
+    /// Show system-level status overview.
+    Status(status::StatusArgs),
     /// Manage credential forwarding for dev containers.
     Credential(credential::CredentialArgs),
     /// Read and output the resolved devcontainer configuration.
@@ -228,6 +231,7 @@ impl Command {
             Self::Credential(args) => args.execute().await,
             Self::Network(args) => args.execute(),
             Self::Ports(args) => args.execute().await,
+            Self::Status(args) => args.execute().await,
             Self::Daemon(args) => args.execute().await,
         }
     }

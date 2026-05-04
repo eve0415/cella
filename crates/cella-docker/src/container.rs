@@ -264,6 +264,7 @@ impl DockerClient {
             .map(|mp| MountInfo {
                 mount_type: mp
                     .typ
+                    .as_ref()
                     .map_or_else(|| "bind".to_string(), |t| format!("{t:?}").to_lowercase()),
                 source: mp.source.clone().unwrap_or_default(),
                 destination: mp.destination.clone().unwrap_or_default(),

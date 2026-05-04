@@ -55,6 +55,18 @@ struct PruneScope {
     /// disconnects endpoints.
     #[arg(long, conflicts_with = "all")]
     networks: bool,
+
+    /// Only prune worktrees/containers older than this duration (e.g. 2h, 7d).
+    #[arg(long)]
+    older_than: Option<String>,
+
+    /// Prune containers whose workspace path no longer exists on disk.
+    #[arg(long)]
+    missing_worktree: bool,
+
+    /// Only prune containers matching this label (KEY=VALUE, repeatable).
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
 }
 
 impl PruneArgs {
@@ -77,12 +89,65 @@ impl PruneArgs {
         if !self.is_json() {
             eprintln!("Fetching remote refs...");
         }
-        let candidates = cella_orchestrator::prune::build_prune_candidates(
+
+        let include_all = self.scope.all || self.scope.missing_worktree;
+        let mut candidates = cella_orchestrator::prune::build_prune_candidates(
             repo_root,
             client.as_ref(),
-            self.scope.all,
+            include_all,
         )
         .await?;
+
+        // 3. Validate filter args
+        for spec in &self.scope.labels {
+            if !spec.contains('=') {
+                return Err(
+                    format!("invalid label filter '{spec}': expected KEY=VALUE format").into(),
+                );
+            }
+        }
+
+        let older_than = self
+            .scope
+            .older_than
+            .as_deref()
+            .map(parse_duration)
+            .transpose()?;
+
+        candidates.retain(|c| {
+            if let Some(max_age) = older_than {
+                let created = c
+                    .container
+                    .as_ref()
+                    .and_then(|ci| ci.created_at.as_deref())
+                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+                if let Some(dt) = created {
+                    let age = chrono::Utc::now().signed_duration_since(dt);
+                    if age < max_age {
+                        return false;
+                    }
+                }
+            }
+
+            if self.scope.missing_worktree && c.worktree_path.exists() {
+                return false;
+            }
+
+            if !self.scope.labels.is_empty() {
+                let Some(ci) = &c.container else {
+                    return false;
+                };
+                let all_match = self.scope.labels.iter().all(|spec| {
+                    spec.split_once('=')
+                        .is_some_and(|(k, v)| ci.labels.get(k).is_some_and(|lv| lv == v))
+                });
+                if !all_match {
+                    return false;
+                }
+            }
+
+            true
+        });
 
         if candidates.is_empty() {
             if self.is_json() {
@@ -90,7 +155,7 @@ impl PruneArgs {
             } else if self.scope.all {
                 eprintln!("Nothing to prune. No linked worktrees found.");
             } else {
-                eprintln!("Nothing to prune. No merged or gone worktrees found.");
+                eprintln!("Nothing to prune. No matching worktrees found.");
             }
             return Ok(());
         }
@@ -362,6 +427,20 @@ fn format_orphan_networks(networks: &[ManagedNetwork]) -> String {
     table.render()
 }
 
+/// Parse a human-readable duration like "2h", "7d", "30m" into a `chrono::Duration`.
+fn parse_duration(s: &str) -> Result<chrono::Duration, Box<dyn std::error::Error + Send + Sync>> {
+    let s = s.trim();
+    let (num, suffix) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let value: i64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
+    match suffix {
+        "s" => Ok(chrono::Duration::seconds(value)),
+        "m" => Ok(chrono::Duration::minutes(value)),
+        "h" => Ok(chrono::Duration::hours(value)),
+        "d" => Ok(chrono::Duration::days(value)),
+        _ => Err(format!("unknown duration suffix '{suffix}', expected s/m/h/d").into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +674,81 @@ mod tests {
             &["cella"],
             &["cella-net-bbb: permission denied".to_string()],
         );
+    }
+
+    // ── parse_duration ────────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_seconds() {
+        let d = parse_duration("30s").unwrap();
+        assert_eq!(d.num_seconds(), 30);
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        let d = parse_duration("5m").unwrap();
+        assert_eq!(d.num_minutes(), 5);
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        let d = parse_duration("2h").unwrap();
+        assert_eq!(d.num_hours(), 2);
+    }
+
+    #[test]
+    fn parse_duration_days() {
+        let d = parse_duration("7d").unwrap();
+        assert_eq!(d.num_days(), 7);
+    }
+
+    #[test]
+    fn parse_duration_invalid_number() {
+        assert!(parse_duration("xh").is_err());
+    }
+
+    #[test]
+    fn parse_duration_unknown_suffix() {
+        assert!(parse_duration("5w").is_err());
+    }
+
+    // ── filter flag parsing ───────────────────────────────────────
+
+    #[test]
+    fn prune_args_older_than_parses() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["cella", "prune", "--older-than", "2h", "--all"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert_eq!(args.scope.older_than.as_deref(), Some("2h"));
+        }
+    }
+
+    #[test]
+    fn prune_args_missing_worktree_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(["cella", "prune", "--missing-worktree"]).unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert!(args.scope.missing_worktree);
+        }
+    }
+
+    #[test]
+    fn prune_args_label_parses() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "prune",
+            "--label",
+            "session=abc",
+            "--label",
+            "agent=claude",
+            "--all",
+        ])
+        .unwrap();
+        if let crate::commands::Command::Prune(args) = &cli.command {
+            assert_eq!(args.scope.labels.len(), 2);
+            assert_eq!(args.scope.labels[0], "session=abc");
+        }
     }
 }
