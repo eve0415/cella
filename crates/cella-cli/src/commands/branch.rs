@@ -28,6 +28,10 @@ pub struct BranchArgs {
     #[arg(long)]
     pub fail_if_exists: bool,
 
+    /// Custom labels to add to the container (repeatable, KEY=VALUE format).
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
+
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
 
@@ -106,8 +110,13 @@ impl BranchArgs {
         freshly_created: bool,
         progress: &crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Prepare worktree-specific labels
-        let extra_labels = worktree_labels(&self.name, repo_root);
+        // Prepare worktree-specific labels + user-supplied labels
+        let mut extra_labels = worktree_labels(&self.name, repo_root);
+        for label in &self.labels {
+            if let Some((key, value)) = label.split_once('=') {
+                extra_labels.insert(key.to_string(), value.to_string());
+            }
+        }
 
         // Create the container using the up pipeline
         let mut ctx = UpContext::for_workspace(
