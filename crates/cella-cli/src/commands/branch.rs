@@ -5,6 +5,9 @@ use super::up::UpContext;
 use cella_backend::{ExecOptions, worktree_labels};
 
 /// Create a new worktree-backed branch with its own dev container.
+///
+/// Idempotent: if the worktree already exists for the named branch, ensures
+/// the container is running rather than erroring.
 #[derive(Args)]
 pub struct BranchArgs {
     #[command(flatten)]
@@ -20,6 +23,10 @@ pub struct BranchArgs {
     /// Command to execute in the new container after creation.
     #[arg(long = "exec")]
     pub exec_cmd: Option<String>,
+
+    /// Error if the worktree already exists (disable idempotent behavior).
+    #[arg(long)]
+    pub fail_if_exists: bool,
 
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
@@ -42,9 +49,16 @@ impl BranchArgs {
             })?;
         let repo_root = &repo_info.root;
 
-        // 2. Create git worktree via orchestrator
+        // 2. Acquire per-branch advisory lock for concurrent safety
+        let _lock = cella_git::BranchLock::acquire(repo_root, &self.name).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Failed to acquire branch lock: {e}").into()
+            },
+        )?;
+
+        // 3. Create git worktree via orchestrator (idempotent)
         let (sender, renderer) = crate::progress::bridge(&progress);
-        let wt_path = cella_orchestrator::branch::create_worktree(
+        let wt_result = cella_orchestrator::branch::create_worktree(
             repo_root,
             &self.name,
             self.base.as_deref(),
@@ -55,16 +69,26 @@ impl BranchArgs {
         drop(sender);
         let _ = renderer.await;
 
-        // 3. Run container pipeline (with rollback on failure)
+        if !wt_result.created && self.fail_if_exists {
+            return Err(format!(
+                "Worktree already exists for branch '{}' at {}",
+                self.name,
+                wt_result.path.display()
+            )
+            .into());
+        }
+
+        // 4. Run container pipeline (with rollback only for freshly-created worktrees)
         let result = self
-            .run_container_pipeline(&wt_path, repo_root, &progress)
+            .run_container_pipeline(&wt_result.path, repo_root, wt_result.created, &progress)
             .await;
 
-        if let Err(e) = &result {
-            // Rollback: remove the worktree on container failure
+        if let Err(e) = &result
+            && wt_result.created
+        {
             progress.warn(&format!("Container creation failed: {e}"));
             let rollback_step = progress.step("Rolling back worktree...");
-            if let Err(re) = cella_git::remove(repo_root, &wt_path) {
+            if let Err(re) = cella_git::remove(repo_root, &wt_result.path) {
                 rollback_step.fail("rollback failed");
                 progress.warn(&format!("Failed to remove worktree: {re}"));
             } else {
@@ -79,6 +103,7 @@ impl BranchArgs {
         &self,
         wt_path: &std::path::Path,
         repo_root: &std::path::Path,
+        freshly_created: bool,
         progress: &crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Prepare worktree-specific labels
@@ -103,11 +128,12 @@ impl BranchArgs {
         )
         .await;
 
-        // Remove any leftover container from a previous failed attempt so
-        // ensure_up always runs the full first-create path (lifecycle hooks,
-        // tool setup, etc.) rather than reusing a half-initialized container.
-        if let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
-            // Deregister from daemon to clean up forwarded ports
+        // For freshly-created worktrees, remove any leftover container from a
+        // previous failed attempt so ensure_up always runs the full first-create
+        // path (lifecycle hooks, tool setup, etc.).
+        // For existing worktrees (idempotent path), let ensure_up decide whether
+        // to reuse or rebuild the container based on config hash.
+        if freshly_created && let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
             if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
                 && mgmt_sock.exists()
             {
@@ -127,7 +153,7 @@ impl BranchArgs {
         };
 
         // If --exec provided, run the command in the new container
-        if let Some(ref exec_cmd) = self.exec_cmd {
+        let exec_exit_code = if let Some(ref exec_cmd) = self.exec_cmd {
             let step = progress.step(&format!("Executing: {exec_cmd}"));
             let exec_result = ctx
                 .client
@@ -147,7 +173,10 @@ impl BranchArgs {
             } else {
                 step.finish();
             }
-        }
+            Some(exec_result.exit_code)
+        } else {
+            None
+        };
 
         // Summary
         match self.output {
@@ -167,6 +196,13 @@ impl BranchArgs {
                 });
                 println!("{}", serde_json::to_string(&output).unwrap_or_default());
             }
+        }
+
+        // Propagate --exec exit code to the caller
+        if let Some(code) = exec_exit_code
+            && code != 0
+        {
+            std::process::exit(i32::try_from(code).unwrap_or(125));
         }
 
         Ok(())

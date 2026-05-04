@@ -12,10 +12,23 @@ use tracing::info;
 use crate::error::OrchestratorError;
 use crate::progress::ProgressSender;
 
-/// Create a git worktree for a branch.
+/// Result of worktree creation, indicating whether a new worktree was created
+/// or an existing one was reused.
+#[derive(Debug, Clone)]
+pub struct WorktreeResult {
+    /// Path to the worktree directory.
+    pub path: PathBuf,
+    /// Whether the worktree was freshly created (`true`) or already existed (`false`).
+    pub created: bool,
+}
+
+/// Create a git worktree for a branch (idempotent).
 ///
-/// Returns the worktree path. Does NOT create a container — the caller
-/// is responsible for running the container-up pipeline on the returned path.
+/// If the worktree already exists for the given branch, returns its path with
+/// `created: false`. Otherwise creates a new worktree and returns `created: true`.
+///
+/// Does NOT create a container — the caller is responsible for running the
+/// container-up pipeline on the returned path.
 ///
 /// # Errors
 ///
@@ -26,8 +39,15 @@ pub fn create_worktree(
     base: Option<&str>,
     worktree_root: Option<&Path>,
     progress: &ProgressSender,
-) -> Result<PathBuf, OrchestratorError> {
-    let step = progress.step(&format!("Creating worktree for branch '{branch}'..."));
+) -> Result<WorktreeResult, OrchestratorError> {
+    let wt_path = cella_git::worktree_path(repo_root, branch, worktree_root);
+    let already_existed = wt_path.exists();
+
+    let step = if already_existed {
+        progress.step(&format!("Reusing worktree for branch '{branch}'..."))
+    } else {
+        progress.step(&format!("Creating worktree for branch '{branch}'..."))
+    };
 
     let branch_state =
         cella_git::resolve_branch(repo_root, branch).map_err(|e| OrchestratorError::Git {
@@ -37,6 +57,7 @@ pub fn create_worktree(
     info!(
         branch = branch,
         state = ?branch_state,
+        already_existed = already_existed,
         "resolved branch state"
     );
 
@@ -45,9 +66,16 @@ pub fn create_worktree(
             message: format!("failed to create worktree for '{branch}': {e}"),
         })?;
 
-    step.finish_with(&format!("Worktree created at {}", wt_info.path.display()));
+    if already_existed {
+        step.finish_with(&format!("Worktree reused at {}", wt_info.path.display()));
+    } else {
+        step.finish_with(&format!("Worktree created at {}", wt_info.path.display()));
+    }
 
-    Ok(wt_info.path)
+    Ok(WorktreeResult {
+        path: wt_info.path,
+        created: !already_existed,
+    })
 }
 
 /// Remove a git worktree (rollback helper).
