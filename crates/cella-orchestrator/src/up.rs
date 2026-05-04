@@ -1801,7 +1801,8 @@ fn append_extra_mounts(
     client: &dyn ContainerBackend,
     managed_agent: bool,
 ) {
-    if let Some(parent_git) = cella_git::parent_git_dir(workspace_root) {
+    let is_worktree = cella_git::parent_git_dir(workspace_root);
+    if let Some(ref parent_git) = is_worktree {
         let canonical = parent_git
             .canonicalize()
             .unwrap_or_else(|_| parent_git.clone());
@@ -1814,9 +1815,8 @@ fn append_extra_mounts(
             read_only: false,
             external: false,
         });
+        append_agent_ipc_mounts(mounts, remote_user);
     }
-
-    append_agent_ipc_mounts(mounts, remote_user);
 
     for m in additional_cli_mounts {
         mounts.push(m.clone());
