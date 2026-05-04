@@ -110,6 +110,7 @@ reqwest = { version = "=0.13.3", default-features = false, features = [
 
 # Filesystem
 dirs = "=6.0.0"
+fs4 = "=0.12.0"
 
 # Compression
 flate2 = "=1.1.9"
