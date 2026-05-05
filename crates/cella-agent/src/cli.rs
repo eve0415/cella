@@ -94,6 +94,13 @@ pub enum CliCommand {
 pub fn parse_cli_args(args: &[String]) -> CliCommand {
     let subcmd = args.get(1).map(String::as_str);
 
+    if let Some(cmd) = subcmd.filter(|c| {
+        *c != "--help" && *c != "-h" && args[2..].iter().any(|a| a == "--help" || a == "-h")
+    }) {
+        print_command_help(cmd);
+        return CliCommand::Help;
+    }
+
     match subcmd {
         Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => {
@@ -194,6 +201,14 @@ fn parse_branch_subcommand(args: &[String]) -> CliCommand {
         Some(n) if !n.starts_with('-') => n.clone(),
         _ => return CliCommand::Help,
     };
+    if name.is_empty() {
+        eprintln!("Error: branch name cannot be empty");
+        return CliCommand::Help;
+    }
+    if name.contains(|c: char| c.is_whitespace()) {
+        eprintln!("Error: branch name cannot contain whitespace");
+        return CliCommand::Help;
+    }
     let mut base = None;
     let mut labels = Vec::new();
     let mut i = 3;
@@ -455,6 +470,100 @@ Options:
 
 Run `cella --help` on the host for all commands."
     );
+}
+
+fn print_command_help(command: &str) {
+    let text = match command {
+        "branch" => {
+            "\
+Usage: cella branch <name> [options]
+
+Create a worktree-backed branch with its own container.
+
+Options:
+  --base <ref>       Base branch or commit (default: current HEAD)
+  --label KEY=VALUE  Add a label to the container (repeatable)"
+        }
+        "list" | "ls" => {
+            "\
+Usage: cella list [options]
+
+List worktree branches and their container status.
+
+Options:
+  --json    Output as JSON array"
+        }
+        "exec" => {
+            "\
+Usage: cella exec <branch> [options] -- <command...>
+
+Run a command in another branch's container.
+
+Options:
+  --json    Capture stdout/stderr and output as JSON envelope"
+        }
+        "down" => {
+            "\
+Usage: cella down <branch> [options]
+
+Stop a worktree branch's container.
+
+Options:
+  --rm        Remove the container and worktree after stopping
+  --volumes   Also remove volumes (requires --rm)
+  --force     Force stop even when shutdownAction is \"none\""
+        }
+        "up" => {
+            "\
+Usage: cella up <branch> [options]
+
+Start or restart a worktree branch's container.
+
+Options:
+  --rebuild   Rebuild the container from scratch"
+        }
+        "prune" => {
+            "\
+Usage: cella prune [options]
+
+Remove worktrees and their containers.
+
+Options:
+  --all               Include unmerged worktrees
+  --dry-run           Show what would be pruned without doing it
+  --older-than <dur>  Only prune older than duration (e.g., 7d, 24h)
+  --missing-worktree  Only prune branches whose worktree is gone
+  --label KEY=VALUE   Only prune matching labels (repeatable)"
+        }
+        "task" => {
+            "\
+Usage: cella task <subcommand>
+
+Subcommands:
+  run <branch> [--base ref] -- <cmd...>   Run a background task
+  list                                    List active tasks
+  logs [-f|--follow] <branch>             Show task output
+  wait <branch>                           Wait for task completion
+  stop <branch>                           Stop a running task"
+        }
+        "doctor" => {
+            "\
+Usage: cella doctor [options]
+
+Check daemon connectivity and version status.
+
+Options:
+  --json    Output structured health data as JSON"
+        }
+        "switch" => {
+            "\
+Usage: cella switch <branch>
+
+Open an interactive shell in another branch's container."
+        }
+        _ => "No help available for this command.",
+    };
+    eprintln!("{text}");
 }
 
 fn print_unsupported(command: &str) {
