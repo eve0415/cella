@@ -205,28 +205,6 @@ impl TaskManager {
         Some(state.output.lock().await.contents())
     }
 
-    /// Wait for a task to complete, returning its exit code.
-    ///
-    /// Uses a watch channel so it doesn't hold any lock while waiting.
-    pub async fn wait_for(&self, branch: &str) -> Option<i32> {
-        let mut rx = self.tasks.get(branch)?.exit_watch.subscribe();
-        // Check if already done
-        let current = *rx.borrow_and_update();
-        if current.is_some() {
-            return current;
-        }
-        // Wait for the value to change
-        loop {
-            if rx.changed().await.is_err() {
-                return None;
-            }
-            let value = *rx.borrow_and_update();
-            if value.is_some() {
-                return value;
-            }
-        }
-    }
-
     /// Stop a running task. Only sets exit code 130 if still running.
     pub async fn stop_task(&mut self, branch: &str) -> bool {
         let Some(state) = self.tasks.get(branch) else {
@@ -543,15 +521,6 @@ mod tests {
             .start_task("br", "c".into(), vec!["echo".into()])
             .unwrap_err();
         assert!(err.contains("already running"));
-    }
-
-    // -- wait_for --
-
-    #[tokio::test]
-    async fn wait_for_returns_none_for_unknown() {
-        let mgr = manager();
-        // Unknown branch returns None immediately (no state to poll).
-        assert!(mgr.wait_for("ghost").await.is_none());
     }
 
     // -- TaskOutput ring buffer --

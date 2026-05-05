@@ -2196,4 +2196,79 @@ mod tests {
         // Should not panic on empty slice.
         print_worktree_table(&[]);
     }
+
+    // --- JSON flag parsing ---
+
+    #[test]
+    fn parse_list_json() {
+        let args: Vec<String> = ["cella", "list", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::List { json: true }));
+    }
+
+    #[test]
+    fn parse_exec_json() {
+        let args: Vec<String> = ["cella", "exec", "feat/x", "--json", "--", "echo", "hi"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Exec { branch, json: true, .. } if branch == "feat/x"));
+    }
+
+    #[test]
+    fn parse_doctor_json() {
+        let args: Vec<String> = ["cella", "doctor", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Doctor { json: true }));
+    }
+
+    // --- per-command help ---
+
+    #[test]
+    fn parse_branch_help() {
+        let args: Vec<String> = ["cella", "branch", "--help"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn parse_task_help() {
+        let args: Vec<String> = ["cella", "task", "--help"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    // --- branch name validation ---
+
+    #[test]
+    fn parse_branch_whitespace_rejected() {
+        let args: Vec<String> = ["cella", "branch", "bad name"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
+    fn print_command_help_does_not_panic() {
+        for cmd in &[
+            "branch", "list", "exec", "down", "up", "prune", "task", "doctor", "switch", "bogus",
+        ] {
+            print_command_help(cmd);
+        }
+    }
 }
