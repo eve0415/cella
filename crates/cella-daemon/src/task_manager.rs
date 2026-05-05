@@ -267,11 +267,16 @@ struct TaskHandles {
 /// When `cella_bin` is provided, uses `cella exec --container-name <name> -- <cmd>`
 /// which resolves the proper user, working directory, and environment variables
 /// (AI keys, SSH agent, terminal vars). Falls back to raw `docker exec` otherwise.
+///
+/// When `pid_file` is set, wraps the command to record its in-container PID
+/// before exec-replacing into the real command. This enables targeted cleanup
+/// on timeout without killing unrelated container processes.
 fn build_task_command(
     container_name: &str,
     command: &[String],
     cella_bin: Option<&std::path::Path>,
     backend_args: &[String],
+    pid_file: Option<&str>,
 ) -> tokio::process::Command {
     cella_bin.map_or_else(
         || {
@@ -289,6 +294,15 @@ fn build_task_command(
                 c.arg(arg);
             }
             c.arg("--container-name").arg(container_name).arg("--");
+            if let Some(pf) = pid_file {
+                // Wrapper: write PID, then exec-replace with the real command.
+                // `exec "$@"` keeps the same PID, so the file points at the
+                // actual command, not the wrapper shell.
+                c.arg("sh")
+                    .arg("-c")
+                    .arg(format!("echo $$ > {pf} && exec \"$@\""))
+                    .arg("_");
+            }
             for arg in command {
                 c.arg(arg);
             }
@@ -308,7 +322,15 @@ async fn run_task_process(
 ) {
     use tokio::io::AsyncBufReadExt;
 
-    let mut cmd = build_task_command(container_name, command, cella_bin, backend_args);
+    // When timeout is set, record the in-container PID for targeted cleanup.
+    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{}.pid", std::process::id()));
+    let mut cmd = build_task_command(
+        container_name,
+        command,
+        cella_bin,
+        backend_args,
+        pid_file.as_deref(),
+    );
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -361,7 +383,14 @@ async fn run_task_process(
     // Wait for process exit with optional timeout. The timeout wraps child.wait()
     // concurrently — stdout/stderr pipes close when the process exits (or is killed),
     // so reader tasks will finish after the process terminates.
-    let code = wait_or_timeout(&mut child, timeout_secs, container_name, handles).await;
+    let code = wait_or_timeout(
+        &mut child,
+        timeout_secs,
+        container_name,
+        pid_file.as_deref(),
+        handles,
+    )
+    .await;
 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
@@ -379,6 +408,7 @@ async fn wait_or_timeout(
     child: &mut tokio::process::Child,
     timeout_secs: Option<u64>,
     container_name: &str,
+    pid_file: Option<&str>,
     handles: &TaskHandles,
 ) -> i32 {
     let Some(secs) = timeout_secs else {
@@ -398,9 +428,12 @@ async fn wait_or_timeout(
             nix::sys::signal::Signal::SIGTERM,
         );
     }
-    // Kill in-container processes: the host-side kill only terminates the
-    // docker exec client — the in-container process tree survives without a tty.
-    kill_in_container(container_name).await;
+    // Kill the in-container process by PID file. The host-side kill only
+    // terminates the docker exec client — the in-container process survives
+    // without a tty, so we must target it explicitly.
+    if let Some(pf) = pid_file {
+        kill_task_by_pid_file(container_name, pf).await;
+    }
     // Grace period: reap the local child process.
     if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
         .await
@@ -415,25 +448,24 @@ async fn wait_or_timeout(
     124
 }
 
-/// Send SIGTERM to all user processes in the container (excluding PID 1/init).
+/// Kill the specific task process inside the container using its PID file.
 ///
-/// Docker execs without a tty survive client disconnect, so we explicitly
-/// kill the orphaned process tree inside the container after timeout.
-async fn kill_in_container(container_name: &str) {
+/// The wrapper in `build_task_command` writes the in-container PID to a
+/// known file before exec-replacing into the real command. On timeout we
+/// read that file, SIGTERM the exact PID, and clean up — no pattern
+/// matching or broad kills that could hit unrelated processes.
+async fn kill_task_by_pid_file(container_name: &str, pid_file: &str) {
+    let kill_script = format!(
+        "pid=$(cat {pid_file} 2>/dev/null) && kill -TERM \"$pid\" 2>/dev/null; rm -f {pid_file}"
+    );
     let result = tokio::process::Command::new("docker")
-        .args([
-            "exec",
-            container_name,
-            "sh",
-            "-c",
-            "pkill -TERM -P 1 2>/dev/null; true",
-        ])
+        .args(["exec", container_name, "sh", "-c", &kill_script])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .await;
     if let Err(e) = result {
-        warn!("Failed to kill in-container processes for '{container_name}': {e}");
+        warn!("Failed to kill task process in '{container_name}': {e}");
     }
 }
 
