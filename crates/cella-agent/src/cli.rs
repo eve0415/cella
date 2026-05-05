@@ -67,7 +67,9 @@ pub enum CliCommand {
         command: Vec<String>,
         base: Option<String>,
     },
-    TaskList,
+    TaskList {
+        json: bool,
+    },
     TaskLogs {
         branch: String,
         follow: bool,
@@ -85,6 +87,7 @@ pub enum CliCommand {
         json: bool,
     },
     Help,
+    CommandHelp,
     Unsupported {
         command: String,
     },
@@ -98,7 +101,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         *c != "--help" && *c != "-h" && args[2..].iter().any(|a| a == "--help" || a == "-h")
     }) {
         print_command_help(cmd);
-        return CliCommand::Help;
+        return CliCommand::CommandHelp;
     }
 
     match subcmd {
@@ -352,7 +355,10 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 base,
             }
         }
-        Some("list" | "ls") => CliCommand::TaskList,
+        Some("list" | "ls") => {
+            let json = args[3..].iter().any(|a| a == "--json");
+            CliCommand::TaskList { json }
+        }
         Some("logs") => {
             // Parse: cella task logs [-f|--follow] <branch>
             let follow = args[3..].iter().any(|a| a == "-f" || a == "--follow");
@@ -387,6 +393,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             print_help();
             Ok(())
         }
+        CliCommand::CommandHelp => Ok(()),
         CliCommand::Doctor { json } => {
             if json {
                 run_doctor_json().await
@@ -435,7 +442,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             command,
             base,
         } => run_task_run(&branch, &command, base.as_deref()).await,
-        CliCommand::TaskList => run_task_list().await,
+        CliCommand::TaskList { json } => run_task_list(json).await,
         CliCommand::TaskLogs { branch, follow } => run_task_logs(&branch, follow).await,
         CliCommand::TaskWait { branch } => run_task_wait(&branch).await,
         CliCommand::TaskStop { branch } => run_task_stop(&branch).await,
@@ -541,7 +548,7 @@ Usage: cella task <subcommand>
 
 Subcommands:
   run <branch> [--base ref] -- <cmd...>   Run a background task
-  list                                    List active tasks
+  list [--json]                           List active tasks
   logs [-f|--follow] <branch>             Show task output
   wait <branch>                           Wait for task completion
   stop <branch>                           Stop a running task"
@@ -1195,7 +1202,7 @@ async fn run_task_run(
     }
 }
 
-async fn run_task_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_task_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -1207,7 +1214,9 @@ async fn run_task_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     loop {
         let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::TaskListResult { tasks, .. } = resp {
-            if tasks.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
                 eprintln!("No active tasks.");
             } else {
                 const HEADER: &str = "BRANCH               STATUS     TIME     COMMAND";
@@ -1716,7 +1725,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::TaskList));
+        assert!(matches!(cmd, CliCommand::TaskList { json: false }));
     }
 
     #[test]
@@ -1726,7 +1735,17 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::TaskList));
+        assert!(matches!(cmd, CliCommand::TaskList { json: false }));
+    }
+
+    #[test]
+    fn parse_task_list_json() {
+        let args: Vec<String> = ["cella", "task", "list", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::TaskList { json: true }));
     }
 
     #[test]
@@ -1939,6 +1958,8 @@ mod tests {
                 is_main: true,
                 container_name: Some("project-main".to_string()),
                 container_state: Some("running".to_string()),
+                container_id: None,
+                labels: None,
             },
             cella_protocol::WorktreeEntry {
                 branch: Some("feat/auth".to_string()),
@@ -1946,6 +1967,8 @@ mod tests {
                 is_main: false,
                 container_name: None,
                 container_state: None,
+                container_id: None,
+                labels: None,
             },
             cella_protocol::WorktreeEntry {
                 branch: None,
@@ -1953,6 +1976,8 @@ mod tests {
                 is_main: false,
                 container_name: Some("detached-ctr".to_string()),
                 container_state: Some("exited".to_string()),
+                container_id: None,
+                labels: None,
             },
         ];
         print_worktree_table(&worktrees);
@@ -2238,7 +2263,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::CommandHelp));
     }
 
     #[test]
@@ -2248,7 +2273,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Help));
+        assert!(matches!(cmd, CliCommand::CommandHelp));
     }
 
     // --- branch name validation ---
