@@ -1932,32 +1932,62 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     if follow {
-        // Send existing output snapshot first.
-        let snapshot = task_mgr
+        stream_task_logs_follow(request_id, branch, task_mgr, writer).await?;
+    } else {
+        let output = task_mgr
             .lock()
             .await
             .get_output(branch)
             .await
             .unwrap_or_default();
-        if !snapshot.is_empty() {
-            send_message(
-                writer,
-                &DaemonMessage::TaskLogsData {
-                    request_id: request_id.to_string(),
-                    data: snapshot,
-                    done: false,
-                },
-            )
-            .await?;
-        }
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: output,
+                done: true,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-        // Subscribe and stream live output until task completes.
-        let mgr = task_mgr.lock().await;
-        let rx = mgr.subscribe(branch);
-        let exit_rx = mgr.subscribe_exit(branch);
-        drop(mgr);
+/// Stream task output in follow mode, handling snapshot + live output + completion.
+async fn stream_task_logs_follow<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // Subscribe before snapshot to avoid losing output between the two.
+    let mgr = task_mgr.lock().await;
+    let rx = mgr.subscribe(branch);
+    let exit_rx = mgr.subscribe_exit(branch);
+    drop(mgr);
 
-        if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
+    let snapshot = task_mgr
+        .lock()
+        .await
+        .get_output(branch)
+        .await
+        .unwrap_or_default();
+    if !snapshot.is_empty() {
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: snapshot,
+                done: false,
+            },
+        )
+        .await?;
+    }
+
+    if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
+        if exit_rx.borrow().is_some() {
+            drain_broadcast(request_id, &mut rx, writer).await?;
+        } else {
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -1980,53 +2010,42 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
                         }
                     }
                     _ = exit_rx.changed() => {
-                        // Drain remaining broadcast messages
-                        while let Ok(chunk) = rx.try_recv() {
-                            send_message(
-                                writer,
-                                &DaemonMessage::TaskLogsData {
-                                    request_id: request_id.to_string(),
-                                    data: chunk,
-                                    done: false,
-                                },
-                            )
-                            .await?;
-                        }
+                        drain_broadcast(request_id, &mut rx, writer).await?;
                         break;
                     }
                 }
             }
         }
+    }
 
+    send_message(
+        writer,
+        &DaemonMessage::TaskLogsData {
+            request_id: request_id.to_string(),
+            data: String::new(),
+            done: true,
+        },
+    )
+    .await
+}
+
+/// Drain remaining buffered broadcast messages.
+async fn drain_broadcast<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<String>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    while let Ok(chunk) = rx.try_recv() {
         send_message(
             writer,
             &DaemonMessage::TaskLogsData {
                 request_id: request_id.to_string(),
-                data: String::new(),
-                done: true,
-            },
-        )
-        .await?;
-    } else {
-        // Snapshot mode: dump available output and signal stream complete.
-        let output = task_mgr
-            .lock()
-            .await
-            .get_output(branch)
-            .await
-            .unwrap_or_default();
-
-        send_message(
-            writer,
-            &DaemonMessage::TaskLogsData {
-                request_id: request_id.to_string(),
-                data: output,
-                done: true,
+                data: chunk,
+                done: false,
             },
         )
         .await?;
     }
-
     Ok(())
 }
 
