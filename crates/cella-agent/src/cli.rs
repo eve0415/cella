@@ -806,7 +806,11 @@ async fn run_prune(
             },
             DaemonMessage::PruneResult { pruned, errors, .. } => {
                 if !pruned.is_empty() {
-                    eprintln!("Pruned {} worktree(s).", pruned.len());
+                    if dry_run {
+                        eprintln!("Would prune {} worktree(s).", pruned.len());
+                    } else {
+                        eprintln!("Pruned {} worktree(s).", pruned.len());
+                    }
                 }
                 if !errors.is_empty() {
                     for e in &errors {
