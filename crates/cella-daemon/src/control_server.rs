@@ -967,7 +967,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
         &DaemonMessage::OperationProgress {
             request_id: request_id.to_string(),
             step: "starting".to_string(),
-            message: format!("Creating worktree branch '{branch}'..."),
+            message: format!("Ensuring worktree branch '{branch}'..."),
         },
     )
     .await?;
