@@ -70,8 +70,11 @@ impl TaskManager {
         container_name: String,
         command: Vec<String>,
     ) -> Result<String, String> {
-        if self.tasks.contains_key(branch) {
-            return Err(format!("task already running for branch '{branch}'"));
+        if let Some(existing) = self.tasks.get(branch) {
+            if existing.exit_code.try_lock().map_or(true, |g| g.is_none()) {
+                return Err(format!("task already running for branch '{branch}'"));
+            }
+            self.tasks.remove(branch);
         }
 
         let task_id = branch.to_string();
@@ -437,6 +440,32 @@ mod tests {
         let mut mgr = manager();
         mgr.cleanup_done().await;
         assert!(mgr.list_tasks().await.is_empty());
+    }
+
+    // -- start_task after completion --
+
+    #[tokio::test]
+    async fn start_task_after_stop_succeeds() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        mgr.stop_task("br").await;
+        // Task is done (exit_code=130), re-run should succeed
+        let id = mgr
+            .start_task("br", "c".into(), vec!["echo".into()])
+            .unwrap();
+        assert_eq!(id, "br");
+    }
+
+    #[tokio::test]
+    async fn start_task_while_running_still_errors() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["sleep".into(), "9999".into()])
+            .unwrap();
+        // Task is still running (exit_code=None)
+        let err = mgr
+            .start_task("br", "c".into(), vec!["echo".into()])
+            .unwrap_err();
+        assert!(err.contains("already running"));
     }
 
     // -- wait_for --
