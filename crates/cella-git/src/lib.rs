@@ -15,7 +15,7 @@ pub use branch::{
 pub use error::CellaGitError;
 pub use lock::BranchLock;
 pub use repo::{RepoInfo, default_branch, discover, find_git_root_folder, is_inside_container};
-pub use sanitize::branch_to_dir_name;
+pub use sanitize::{branch_to_dir_name, branch_to_dir_name_legacy};
 pub use worktree::{
     WorktreeInfo, create, create_strict, list, parent_git_dir, remove, worktree_path,
 };

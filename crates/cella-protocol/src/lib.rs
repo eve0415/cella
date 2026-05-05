@@ -104,6 +104,8 @@ pub enum AgentMessage {
         branch: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
     },
     /// Request to list worktree branches and their container status.
     ListRequest { request_id: String },
@@ -123,6 +125,15 @@ pub enum AgentMessage {
         /// When true, include unmerged worktrees (not just merged ones).
         #[serde(default)]
         all: bool,
+        /// Only prune worktrees older than this duration (e.g. "7d", "24h").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        older_than: Option<String>,
+        /// Only prune worktrees whose git branch no longer exists.
+        #[serde(default)]
+        missing_worktree: bool,
+        /// Only prune worktrees matching these labels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
     },
     /// Stop (and optionally remove) a worktree branch's container.
     DownRequest {
@@ -598,7 +609,20 @@ pub enum TaskRunOperationResult {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<TaskErrorCode>,
     },
+}
+
+/// Structured error codes for task operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskErrorCode {
+    AlreadyRunning,
+    NotFound,
+    BranchNotFound,
+    ContainerNotRunning,
+    ExecFailed,
 }
 
 /// A background task entry.
@@ -1219,12 +1243,13 @@ mod tests {
             request_id: "br-1".to_string(),
             branch: "feat/auth".to_string(),
             base: Some("main".to_string()),
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"branch_request\""));
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
         assert!(
-            matches!(decoded, AgentMessage::BranchRequest { request_id, branch, base }
+            matches!(decoded, AgentMessage::BranchRequest { request_id, branch, base, .. }
                 if request_id == "br-1" && branch == "feat/auth" && base.as_deref() == Some("main"))
         );
     }
@@ -1235,6 +1260,7 @@ mod tests {
             request_id: "br-2".to_string(),
             branch: "fix/bug".to_string(),
             base: None,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // base=None should be omitted
@@ -1400,6 +1426,9 @@ mod tests {
             request_id: "pr-1".to_string(),
             dry_run: true,
             all: false,
+            older_than: None,
+            missing_worktree: false,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
@@ -1415,6 +1444,9 @@ mod tests {
             request_id: "pr-2".to_string(),
             dry_run: false,
             all: true,
+            older_than: None,
+            missing_worktree: false,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();

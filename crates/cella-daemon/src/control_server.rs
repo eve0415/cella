@@ -845,8 +845,17 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             branch,
             base,
+            labels,
         } => {
-            handle_branch_request(&request_id, &branch, base.as_deref(), &wt, writer).await?;
+            handle_branch_request(
+                &request_id,
+                &branch,
+                base.as_deref(),
+                labels.as_deref(),
+                &wt,
+                writer,
+            )
+            .await?;
         }
         AgentMessage::ListRequest { request_id } => {
             handle_list_request(&request_id, wt.workspace_path, writer).await?;
@@ -860,8 +869,18 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             dry_run,
             all,
+            older_than,
+            missing_worktree,
+            labels,
         } => {
-            handle_prune_request(&request_id, dry_run, all, &wt, writer).await?;
+            let opts = PruneOpts {
+                dry_run,
+                all,
+                older_than: older_than.as_deref(),
+                missing_worktree,
+                labels: labels.as_deref(),
+            };
+            handle_prune_request(&request_id, &opts, &wt, writer).await?;
         }
         AgentMessage::DownRequest {
             request_id,
@@ -918,6 +937,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     base: Option<&str>,
+    labels: Option<&[String]>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -948,6 +968,11 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
     }
+    if let Some(lbls) = labels {
+        for label in lbls {
+            cmd.arg("--label").arg(label);
+        }
+    }
     if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
     }
@@ -972,15 +997,15 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    let (status, last_stdout_line, stderr_collected) =
+    let (status, stdout_collected, stderr_collected) =
         stream_child_output(&mut child, request_id, writer).await?;
 
     // Send final result.
     let result = if status.success() {
-        parse_branch_json_output(&last_stdout_line).unwrap_or_else(|| {
+        parse_branch_json_output(&stdout_collected).unwrap_or_else(|| {
             WorktreeOperationResult::Error {
                 message: format!(
-                    "operation may have succeeded but output was unparseable: {last_stdout_line}"
+                    "operation may have succeeded but output was unparseable: {stdout_collected}"
                 ),
             }
         })
@@ -1011,7 +1036,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
 
 /// Stream a child process's stdout and stderr line-by-line as `OperationOutput` messages.
 ///
-/// Returns the exit status, last stdout line (for JSON parsing), and collected stderr.
+/// Returns the exit status, accumulated stdout, and collected stderr.
 async fn stream_child_output<W: AsyncWriteExt + Unpin>(
     child: &mut tokio::process::Child,
     request_id: &str,
@@ -1021,7 +1046,7 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
 
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
-    let mut last_stdout_line = String::new();
+    let mut stdout_collected = String::new();
 
     let mut stdout_reader = child_stdout.map(|s| BufReader::new(s).lines());
     let mut stderr_reader = child_stderr.map(|s| BufReader::new(s).lines());
@@ -1036,7 +1061,8 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
             }, if !stdout_done => {
                 match line {
                     Ok(Some(text)) => {
-                        last_stdout_line.clone_from(&text);
+                        stdout_collected.push_str(&text);
+                        stdout_collected.push('\n');
                         send_message(writer, &DaemonMessage::OperationOutput {
                             request_id: request_id.to_string(),
                             stream: OutputStream::Stdout,
@@ -1069,34 +1095,44 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
         message: format!("failed to wait for child process: {e}"),
     })?;
 
-    Ok((status, last_stdout_line, stderr_collected))
+    Ok((status, stdout_collected, stderr_collected))
 }
 
 /// Try to parse the JSON output from `cella branch --output json`.
 fn parse_branch_json_output(stdout: &str) -> Option<cella_protocol::WorktreeOperationResult> {
-    // The JSON output may contain multiple lines; find the last JSON object
-    // which should be the final result.
+    // Try parsing the full output as a single JSON object first (handles pretty-printed JSON).
+    if let Some(result) = try_parse_branch_json(stdout) {
+        return Some(result);
+    }
+    // Fall back to scanning individual lines in reverse.
     for line in stdout.lines().rev() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            let container_name = v
-                .get("containerId")
-                .or_else(|| v.get("containerName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let worktree_path = v
-                .get("workspaceFolder")
-                .or_else(|| v.get("remoteWorkspaceFolder"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if v.get("outcome").is_some() || v.get("containerId").is_some() {
-                return Some(cella_protocol::WorktreeOperationResult::Success {
-                    container_name,
-                    worktree_path,
-                });
-            }
+        if let Some(result) = try_parse_branch_json(line.trim()) {
+            return Some(result);
         }
+    }
+    None
+}
+
+fn try_parse_branch_json(text: &str) -> Option<cella_protocol::WorktreeOperationResult> {
+    let v = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let container_name = v
+        .get("containerId")
+        .or_else(|| v.get("containerName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let worktree_path = v
+        .get("worktreePath")
+        .or_else(|| v.get("workspaceFolder"))
+        .or_else(|| v.get("remoteWorkspaceFolder"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if v.get("outcome").is_some() || v.get("containerId").is_some() {
+        return Some(cella_protocol::WorktreeOperationResult::Success {
+            container_name,
+            worktree_path,
+        });
     }
     None
 }
@@ -1146,6 +1182,9 @@ async fn handle_list_request<W: AsyncWriteExt + Unpin>(
         {
             wt.container_name = Some(c.name.clone());
             wt.container_state = Some(c.state.clone());
+            if let Some(ref label) = c.branch_label {
+                wt.branch = Some(label.clone());
+            }
         }
     }
 
@@ -1234,6 +1273,7 @@ struct CellaContainer {
     name: String,
     state: String,
     workspace_path: Option<String>,
+    branch_label: Option<String>,
 }
 
 /// List all cella-managed containers with their workspace paths.
@@ -1246,7 +1286,7 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
             "--filter",
             "label=dev.cella.tool=cella",
             "--format",
-            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}",
+            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}\t{{.Label \"dev.cella.branch\"}}",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1265,10 +1305,14 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
         .lines()
         .filter(|line| !line.is_empty())
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let name = parts.next()?.to_string();
             let state = parts.next()?.to_string();
             let ws = parts
+                .next()
+                .map(ToString::to_string)
+                .filter(|s| !s.is_empty());
+            let branch = parts
                 .next()
                 .map(ToString::to_string)
                 .filter(|s| !s.is_empty());
@@ -1276,6 +1320,7 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
                 name,
                 state,
                 workspace_path: ws,
+                branch_label: branch,
             })
         })
         .collect()
@@ -1366,11 +1411,18 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+struct PruneOpts<'a> {
+    dry_run: bool,
+    all: bool,
+    older_than: Option<&'a str>,
+    missing_worktree: bool,
+    labels: Option<&'a [String]>,
+}
+
 /// Handle a `PruneRequest` by spawning `cella prune` as a subprocess.
 async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
-    dry_run: bool,
-    all: bool,
+    opts: &PruneOpts<'_>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -1378,11 +1430,22 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     cmd.arg("prune");
     forward_backend_flags(&mut cmd, wt).await;
     cmd.arg("--force").arg("--output").arg("json");
-    if dry_run {
+    if opts.dry_run {
         cmd.arg("--dry-run");
     }
-    if all {
+    if opts.all {
         cmd.arg("--all");
+    }
+    if let Some(duration) = opts.older_than {
+        cmd.arg("--older-than").arg(duration);
+    }
+    if opts.missing_worktree {
+        cmd.arg("--missing-worktree");
+    }
+    if let Some(lbls) = opts.labels {
+        for label in lbls {
+            cmd.arg("--label").arg(label);
+        }
     }
     if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
@@ -1758,7 +1821,10 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::TaskRunResult {
                     request_id: request_id.to_string(),
-                    result: cella_protocol::TaskRunOperationResult::Error { message: error_msg },
+                    result: cella_protocol::TaskRunOperationResult::Error {
+                        message: error_msg,
+                        code: Some(cella_protocol::TaskErrorCode::ContainerNotRunning),
+                    },
                 },
             )
             .await?;
@@ -1785,7 +1851,14 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                     writer,
                     &DaemonMessage::TaskRunResult {
                         request_id: request_id.to_string(),
-                        result: cella_protocol::TaskRunOperationResult::Error { message: e },
+                        result: cella_protocol::TaskRunOperationResult::Error {
+                            message: e.clone(),
+                            code: if e.contains("already running") {
+                                Some(cella_protocol::TaskErrorCode::AlreadyRunning)
+                            } else {
+                                Some(cella_protocol::TaskErrorCode::ExecFailed)
+                            },
+                        },
                     },
                 )
                 .await?;
@@ -1878,25 +1951,48 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
             .await?;
         }
 
-        // Subscribe and stream live output.
-        let rx = task_mgr.lock().await.subscribe(branch);
-        if let Some(mut rx) = rx {
+        // Subscribe and stream live output until task completes.
+        let mgr = task_mgr.lock().await;
+        let rx = mgr.subscribe(branch);
+        let exit_rx = mgr.subscribe_exit(branch);
+        drop(mgr);
+
+        if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
             loop {
-                match rx.recv().await {
-                    Ok(chunk) => {
-                        send_message(
-                            writer,
-                            &DaemonMessage::TaskLogsData {
-                                request_id: request_id.to_string(),
-                                data: chunk,
-                                done: false,
-                            },
-                        )
-                        .await?;
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok(chunk) => {
+                                send_message(
+                                    writer,
+                                    &DaemonMessage::TaskLogsData {
+                                        request_id: request_id.to_string(),
+                                        data: chunk,
+                                        done: false,
+                                    },
+                                )
+                                .await?;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("task logs subscriber lagged by {n} messages");
+                            }
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("task logs subscriber lagged by {n} messages");
+                    _ = exit_rx.changed() => {
+                        // Drain remaining broadcast messages
+                        while let Ok(chunk) = rx.try_recv() {
+                            send_message(
+                                writer,
+                                &DaemonMessage::TaskLogsData {
+                                    request_id: request_id.to_string(),
+                                    data: chunk,
+                                    done: false,
+                                },
+                            )
+                            .await?;
+                        }
+                        break;
                     }
                 }
             }

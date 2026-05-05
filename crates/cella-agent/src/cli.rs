@@ -35,6 +35,7 @@ pub enum CliCommand {
     Branch {
         name: String,
         base: Option<String>,
+        labels: Vec<String>,
     },
     List,
     Down {
@@ -54,6 +55,9 @@ pub enum CliCommand {
     Prune {
         dry_run: bool,
         all: bool,
+        older_than: Option<String>,
+        missing_worktree: bool,
+        labels: Vec<String>,
     },
     TaskRun {
         branch: String,
@@ -86,33 +90,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
     let subcmd = args.get(1).map(String::as_str);
 
     match subcmd {
-        Some("branch") => {
-            let name = match args.get(2) {
-                Some(n) if !n.starts_with('-') => n.clone(),
-                _ => {
-                    return CliCommand::Help;
-                }
-            };
-            let mut base = None;
-            let mut i = 3;
-            while i < args.len() {
-                if args[i] == "--base" {
-                    match args.get(i + 1) {
-                        Some(val) if !val.starts_with('-') => {
-                            base = Some(val.clone());
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!("Error: --base requires a value (e.g., --base main)");
-                            return CliCommand::Help;
-                        }
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            CliCommand::Branch { name, base }
-        }
+        Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => CliCommand::List,
         Some("exec") => {
             // Parse: cella exec <branch> -- <cmd...>
@@ -133,9 +111,25 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
-            let rm = args.iter().any(|a| a == "--rm");
-            let volumes = args.iter().any(|a| a == "--volumes");
-            let force = args.iter().any(|a| a == "--force");
+            let mut rm = false;
+            let mut volumes = false;
+            let mut force = false;
+            for arg in &args[3..] {
+                match arg.as_str() {
+                    "--rm" => rm = true,
+                    "--volumes" => volumes = true,
+                    "--force" => force = true,
+                    f if f.starts_with('-') => {
+                        eprintln!("Error: unknown flag '{f}' for down command");
+                        return CliCommand::Help;
+                    }
+                    _ => {}
+                }
+            }
+            if volumes && !rm {
+                eprintln!("Error: --volumes requires --rm");
+                return CliCommand::Help;
+            }
             CliCommand::Down {
                 branch,
                 rm,
@@ -148,14 +142,20 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
-            let rebuild = args.iter().any(|a| a == "--rebuild");
+            let mut rebuild = false;
+            for arg in &args[3..] {
+                match arg.as_str() {
+                    "--rebuild" => rebuild = true,
+                    f if f.starts_with('-') => {
+                        eprintln!("Error: unknown flag '{f}' for up command");
+                        return CliCommand::Help;
+                    }
+                    _ => {}
+                }
+            }
             CliCommand::Up { branch, rebuild }
         }
-        Some("prune") => {
-            let dry_run = args.iter().any(|a| a == "--dry-run");
-            let all = args.iter().any(|a| a == "--all");
-            CliCommand::Prune { dry_run, all }
-        }
+        Some("prune") => parse_prune_subcommand(args),
         Some("task") => parse_task_subcommand(args),
         Some("switch") => {
             let branch = match args.get(2) {
@@ -169,6 +169,112 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
         },
+    }
+}
+
+fn parse_branch_subcommand(args: &[String]) -> CliCommand {
+    let name = match args.get(2) {
+        Some(n) if !n.starts_with('-') => n.clone(),
+        _ => return CliCommand::Help,
+    };
+    let mut base = None;
+    let mut labels = Vec::new();
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "--base" {
+            match args.get(i + 1) {
+                Some(val) if !val.starts_with('-') => {
+                    base = Some(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --base requires a value (e.g., --base main)");
+                    return CliCommand::Help;
+                }
+            }
+        } else if args[i] == "--label" {
+            match args.get(i + 1) {
+                Some(val) if val.contains('=') => {
+                    if val.starts_with("dev.cella.") || val.starts_with("devcontainer.") {
+                        eprintln!(
+                            "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
+                        );
+                        return CliCommand::Help;
+                    }
+                    labels.push(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --label requires KEY=VALUE format");
+                    return CliCommand::Help;
+                }
+            }
+        } else if args[i].starts_with('-') {
+            eprintln!("Error: unknown flag '{}' for branch command", args[i]);
+            return CliCommand::Help;
+        } else {
+            i += 1;
+        }
+    }
+    CliCommand::Branch { name, base, labels }
+}
+
+fn parse_prune_subcommand(args: &[String]) -> CliCommand {
+    let mut dry_run = false;
+    let mut all = false;
+    let mut older_than = None;
+    let mut missing_worktree = false;
+    let mut labels = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--missing-worktree" => {
+                missing_worktree = true;
+                i += 1;
+            }
+            "--older-than" => match args.get(i + 1) {
+                Some(val) if !val.starts_with('-') => {
+                    older_than = Some(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --older-than requires a value (e.g., --older-than 7d)");
+                    return CliCommand::Help;
+                }
+            },
+            "--label" => match args.get(i + 1) {
+                Some(val) if val.contains('=') => {
+                    labels.push(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --label requires KEY=VALUE format");
+                    return CliCommand::Help;
+                }
+            },
+            f if f.starts_with('-') => {
+                eprintln!("Error: unknown flag '{f}' for prune command");
+                return CliCommand::Help;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    CliCommand::Prune {
+        dry_run,
+        all,
+        older_than,
+        missing_worktree,
+        labels,
     }
 }
 
@@ -201,6 +307,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                             return CliCommand::Help;
                         }
                     }
+                } else if args[i].starts_with('-') {
+                    eprintln!("Error: unknown flag '{}' for task run command", args[i]);
+                    return CliCommand::Help;
                 } else {
                     i += 1;
                 }
@@ -251,7 +360,9 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             print_unsupported(&command);
             std::process::exit(1);
         }
-        CliCommand::Branch { name, base } => run_branch(&name, base.as_deref()).await,
+        CliCommand::Branch { name, base, labels } => {
+            run_branch(&name, base.as_deref(), &labels).await
+        }
         CliCommand::List => run_list().await,
         CliCommand::Down {
             branch,
@@ -261,7 +372,22 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
         } => run_down(&branch, rm, volumes, force).await,
         CliCommand::Up { branch, rebuild } => run_up(&branch, rebuild).await,
         CliCommand::Exec { branch, command } => run_exec(&branch, &command).await,
-        CliCommand::Prune { dry_run, all } => run_prune(dry_run, all).await,
+        CliCommand::Prune {
+            dry_run,
+            all,
+            older_than,
+            missing_worktree,
+            labels,
+        } => {
+            run_prune(
+                dry_run,
+                all,
+                older_than.as_deref(),
+                missing_worktree,
+                &labels,
+            )
+            .await
+        }
         CliCommand::TaskRun {
             branch,
             command,
@@ -562,6 +688,7 @@ mod doctor_tests {
 async fn run_branch(
     name: &str,
     base: Option<&str>,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
@@ -570,6 +697,11 @@ async fn run_branch(
         request_id: id.clone(),
         branch: name.to_string(),
         base: base.map(String::from),
+        labels: if labels.is_empty() {
+            None
+        } else {
+            Some(labels.to_vec())
+        },
     };
     client.send(&msg).await?;
 
@@ -786,6 +918,9 @@ async fn run_up(
 async fn run_prune(
     dry_run: bool,
     all: bool,
+    older_than: Option<&str>,
+    missing_worktree: bool,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
@@ -794,6 +929,13 @@ async fn run_prune(
         request_id: id.clone(),
         dry_run,
         all,
+        older_than: older_than.map(String::from),
+        missing_worktree,
+        labels: if labels.is_empty() {
+            None
+        } else {
+            Some(labels.to_vec())
+        },
     };
     client.send(&msg).await?;
 
@@ -806,7 +948,11 @@ async fn run_prune(
             },
             DaemonMessage::PruneResult { pruned, errors, .. } => {
                 if !pruned.is_empty() {
-                    eprintln!("Pruned {} worktree(s).", pruned.len());
+                    if dry_run {
+                        eprintln!("Would prune {} worktree(s).", pruned.len());
+                    } else {
+                        eprintln!("Pruned {} worktree(s).", pruned.len());
+                    }
                 }
                 if !errors.is_empty() {
                     for e in &errors {
@@ -855,7 +1001,7 @@ async fn run_task_run(
                     eprintln!("Task '{task_id}' started in container {container_name}");
                     return Ok(());
                 }
-                cella_protocol::TaskRunOperationResult::Error { message } => {
+                cella_protocol::TaskRunOperationResult::Error { message, .. } => {
                     return Err(format!("Failed to start task: {message}").into());
                 }
             },
@@ -1107,7 +1253,7 @@ mod tests {
         ];
         let cmd = parse_cli_args(&args);
         assert!(
-            matches!(cmd, CliCommand::Branch { name, base } if name == "feat/auth" && base.is_none())
+            matches!(cmd, CliCommand::Branch { name, base, .. } if name == "feat/auth" && base.is_none())
         );
     }
 
@@ -1121,7 +1267,7 @@ mod tests {
             "main".to_string(),
         ];
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Branch { name, base }
+        assert!(matches!(cmd, CliCommand::Branch { name, base, .. }
             if name == "feat/auth" && base.as_deref() == Some("main")));
     }
 
@@ -1201,7 +1347,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: false,
-                all: false
+                all: false,
+                ..
             }
         ));
     }
@@ -1218,7 +1365,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: true,
-                all: false
+                all: false,
+                ..
             }
         ));
     }
@@ -1235,7 +1383,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: false,
-                all: true
+                all: true,
+                ..
             }
         ));
     }
@@ -1532,21 +1681,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_down_volumes_only() {
+    fn parse_down_volumes_without_rm_rejected() {
         let args: Vec<String> = ["cella", "down", "feat/auth", "--volumes"]
             .iter()
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(
-            cmd,
-            CliCommand::Down {
-                volumes: true,
-                rm: false,
-                force: false,
-                ..
-            }
-        ));
+        assert!(matches!(cmd, CliCommand::Help));
     }
 
     #[test]
@@ -1667,6 +1808,7 @@ mod tests {
             CliCommand::Prune {
                 dry_run: true,
                 all: true,
+                ..
             }
         ));
     }
@@ -1712,15 +1854,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_branch_ignores_unknown_flags() {
+    fn parse_branch_rejects_unknown_flags() {
         let args: Vec<String> = ["cella", "branch", "my-branch", "--unknown"]
             .iter()
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(
-            matches!(cmd, CliCommand::Branch { name, base } if name == "my-branch" && base.is_none())
-        );
+        assert!(matches!(cmd, CliCommand::Help));
     }
 
     #[test]

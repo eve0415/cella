@@ -42,10 +42,15 @@ impl BranchLock {
         let lock_path = lock_dir.join(format!("cella-{sanitized}.lock"));
 
         let file = File::create(&lock_path).map_err(CellaGitError::Io)?;
-        file.lock().map_err(|e| {
-            debug!("failed to acquire lock at {}: {e}", lock_path.display());
-            CellaGitError::Io(e)
-        })?;
+        if file.try_lock().is_err() {
+            tracing::info!(
+                "Waiting for lock on branch '{branch}' (another operation in progress)..."
+            );
+            file.lock().map_err(|e| {
+                debug!("failed to acquire lock at {}: {e}", lock_path.display());
+                CellaGitError::Io(e)
+            })?;
+        }
 
         debug!("acquired branch lock: {}", lock_path.display());
         Ok(Self { _file: file })
