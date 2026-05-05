@@ -17,8 +17,10 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
 static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn next_pid_file_id() -> u64 {
-    TASK_SEQ.fetch_add(1, Ordering::Relaxed)
+fn next_pid_file_path() -> String {
+    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let daemon_pid = std::process::id();
+    format!("/tmp/.cella-task-{daemon_pid}-{seq}.pid")
 }
 
 /// Ring buffer for captured task output.
@@ -331,7 +333,7 @@ async fn run_task_process(
     // When timeout is set, record the in-container PID for targeted cleanup.
     // Use a unique ID per task invocation to avoid collisions between concurrent
     // tasks and stale files from prior runs.
-    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{}.pid", next_pid_file_id()));
+    let pid_file = timeout_secs.map(|_| next_pid_file_path());
     let mut cmd = build_task_command(
         container_name,
         command,
