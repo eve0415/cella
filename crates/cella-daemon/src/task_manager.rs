@@ -37,6 +37,8 @@ struct TaskState {
     abort_handle: tokio::task::AbortHandle,
     /// Broadcast channel for live output streaming.
     output_tx: tokio::sync::broadcast::Sender<String>,
+    /// Watch channel for non-blocking wait on task completion.
+    exit_watch: tokio::sync::watch::Sender<Option<i32>>,
 }
 
 /// Public task info for list responses.
@@ -81,10 +83,12 @@ impl TaskManager {
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let (output_tx, _) = tokio::sync::broadcast::channel(1024);
+        let (exit_watch, _) = tokio::sync::watch::channel(None);
 
         let output_clone = output.clone();
         let exit_code_clone = exit_code.clone();
         let output_tx_clone = output_tx.clone();
+        let exit_watch_clone = exit_watch.clone();
         let container = container_name.clone();
         let cmd = command.clone();
 
@@ -95,6 +99,7 @@ impl TaskManager {
                 &output_clone,
                 &exit_code_clone,
                 &output_tx_clone,
+                &exit_watch_clone,
             )
             .await;
         });
@@ -108,6 +113,7 @@ impl TaskManager {
             exit_code,
             abort_handle: handle.abort_handle(),
             output_tx,
+            exit_watch,
         };
 
         self.tasks.insert(task_id.clone(), state);
@@ -154,16 +160,22 @@ impl TaskManager {
     }
 
     /// Wait for a task to complete, returning its exit code.
+    ///
+    /// Uses a watch channel so it doesn't hold any lock while waiting.
     pub async fn wait_for(&self, branch: &str) -> Option<i32> {
-        let state = self.tasks.get(branch)?;
-        let exit_code = state.exit_code.clone();
-        // Poll until done
+        let mut rx = self.tasks.get(branch)?.exit_watch.subscribe();
+        // Check if already done
+        if let Some(code) = *rx.borrow() {
+            return Some(code);
+        }
+        // Wait for the value to change
         loop {
-            let code = *exit_code.lock().await;
-            if let Some(c) = code {
-                return Some(c);
+            if rx.changed().await.is_err() {
+                return None;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some(code) = *rx.borrow() {
+                return Some(code);
+            }
         }
     }
 
@@ -171,8 +183,8 @@ impl TaskManager {
     pub async fn stop_task(&mut self, branch: &str) -> bool {
         if let Some(state) = self.tasks.get(branch) {
             state.abort_handle.abort();
-            // Set exit code to signal interrupted
-            *state.exit_code.lock().await = Some(130); // SIGINT convention
+            *state.exit_code.lock().await = Some(130);
+            let _ = state.exit_watch.send(Some(130));
             info!("Stopped task '{branch}'");
             true
         } else {
@@ -201,6 +213,7 @@ async fn run_task_process(
     output: &Arc<Mutex<String>>,
     exit_code: &Arc<Mutex<Option<i32>>>,
     output_tx: &tokio::sync::broadcast::Sender<String>,
+    exit_watch: &tokio::sync::watch::Sender<Option<i32>>,
 ) {
     use tokio::io::AsyncBufReadExt;
 
@@ -217,6 +230,7 @@ async fn run_task_process(
         Err(e) => {
             warn!("Failed to spawn task process: {e}");
             *exit_code.lock().await = Some(1);
+            let _ = exit_watch.send(Some(1));
             let error_line = format!("Error: failed to spawn: {e}");
             let _ = writeln!(output.lock().await, "{error_line}");
             let _ = output_tx.send(format!("{error_line}\n"));
@@ -260,6 +274,7 @@ async fn run_task_process(
     let status = child.wait().await;
     let code = status.map_or(1, |s| s.code().unwrap_or(1));
     *exit_code.lock().await = Some(code);
+    let _ = exit_watch.send(Some(code));
     info!("Task in '{container_name}' exited with code {code}");
 }
 
