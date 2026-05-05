@@ -66,6 +66,7 @@ pub enum CliCommand {
         branch: String,
         command: Vec<String>,
         base: Option<String>,
+        timeout_secs: Option<u64>,
     },
     TaskList {
         json: bool,
@@ -326,8 +327,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
             if command.is_empty() {
                 return CliCommand::Help;
             }
-            // Check for --base before the separator
+            // Check for --base / --timeout before the separator
             let mut base = None;
+            let mut timeout_secs = None;
             let end = sep.unwrap_or(args.len());
             let mut i = 4;
             while i < end {
@@ -342,6 +344,16 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                             return CliCommand::Help;
                         }
                     }
+                } else if args[i] == "--timeout" {
+                    if let Some(secs) = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                        timeout_secs = Some(secs);
+                        i += 2;
+                    } else {
+                        eprintln!(
+                            "Error: --timeout requires a value in seconds (e.g., --timeout 300)"
+                        );
+                        return CliCommand::Help;
+                    }
                 } else if args[i].starts_with('-') {
                     eprintln!("Error: unknown flag '{}' for task run command", args[i]);
                     return CliCommand::Help;
@@ -353,6 +365,7 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                 branch,
                 command,
                 base,
+                timeout_secs,
             }
         }
         Some("list" | "ls") => {
@@ -441,7 +454,8 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             branch,
             command,
             base,
-        } => run_task_run(&branch, &command, base.as_deref()).await,
+            timeout_secs,
+        } => run_task_run(&branch, &command, base.as_deref(), timeout_secs).await,
         CliCommand::TaskList { json } => run_task_list(json).await,
         CliCommand::TaskLogs { branch, follow } => run_task_logs(&branch, follow).await,
         CliCommand::TaskWait { branch } => run_task_wait(&branch).await,
@@ -465,7 +479,7 @@ Commands:
   exec <branch> -- <cmd...>      Run a command in another branch's container
   switch <branch>                Open a shell in another branch's container
   prune [--all] [--dry-run]      Remove worktrees and their containers
-  task run <branch> -- <cmd...>  Run a background task in a branch's container
+  task run <branch> [--timeout N] -- <cmd...>  Run a background task
   task list                      List active background tasks
   task logs [-f] <branch>        Show output from a background task (-f to follow)
   task wait <branch>             Wait for a background task to complete
@@ -547,7 +561,7 @@ Options:
 Usage: cella task <subcommand>
 
 Subcommands:
-  run <branch> [--base ref] -- <cmd...>   Run a background task
+  run <branch> [--base ref] [--timeout secs] -- <cmd...>   Run a background task
   list [--json]                           List active tasks
   logs [-f|--follow] <branch>             Show task output
   wait <branch>                           Wait for task completion
@@ -1163,6 +1177,7 @@ async fn run_task_run(
     branch: &str,
     command: &[String],
     base: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
@@ -1172,6 +1187,7 @@ async fn run_task_run(
         branch: branch.to_string(),
         command: command.to_vec(),
         base: base.map(String::from),
+        timeout_secs,
     };
     client.send(&msg).await?;
 
@@ -1677,10 +1693,13 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::TaskRun { branch, command, base }
+        assert!(
+            matches!(cmd, CliCommand::TaskRun { branch, command, base, timeout_secs }
                 if branch == "feat/ci"
                     && command == ["cargo", "test"]
-                    && base.is_none()));
+                    && base.is_none()
+                    && timeout_secs.is_none())
+        );
     }
 
     #[test]
@@ -1692,10 +1711,57 @@ mod tests {
         .map(ToString::to_string)
         .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::TaskRun { branch, command, base }
+        assert!(
+            matches!(cmd, CliCommand::TaskRun { branch, command, base, .. }
                 if branch == "feat/ci"
                     && command == ["make", "build"]
-                    && base.as_deref() == Some("develop")));
+                    && base.as_deref() == Some("develop"))
+        );
+    }
+
+    #[test]
+    fn parse_task_run_with_timeout() {
+        let args: Vec<String> = [
+            "cella",
+            "task",
+            "run",
+            "feat/ci",
+            "--timeout",
+            "300",
+            "--",
+            "cargo",
+            "test",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(
+            matches!(cmd, CliCommand::TaskRun { branch, command, timeout_secs, .. }
+                if branch == "feat/ci"
+                    && command == ["cargo", "test"]
+                    && timeout_secs == Some(300))
+        );
+    }
+
+    #[test]
+    fn parse_task_run_invalid_timeout_shows_help() {
+        let args: Vec<String> = [
+            "cella",
+            "task",
+            "run",
+            "feat/ci",
+            "--timeout",
+            "abc",
+            "--",
+            "echo",
+            "hi",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
     }
 
     #[test]
