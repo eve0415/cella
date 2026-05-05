@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::CellaGitError;
 use crate::branch::BranchState;
 use crate::cmd;
-use crate::sanitize::branch_to_dir_name;
+use crate::sanitize::{branch_to_dir_name, branch_to_dir_name_legacy};
 
 /// Information about a single git worktree.
 #[derive(Debug, Clone)]
@@ -49,19 +49,35 @@ pub fn parent_git_dir(workspace_root: &Path) -> Option<PathBuf> {
 /// If `worktree_root` is provided (from `cella.toml` config), the worktree
 /// is placed under that root. Otherwise, the default sibling pattern is used:
 /// `{repo_parent}/{repo_dir_name}-worktrees/{sanitized_branch}`.
+///
+/// For backward compatibility, if a legacy-named directory (without hash suffix)
+/// already exists, that path is returned instead of the new-style name.
 pub fn worktree_path(repo_root: &Path, branch: &str, worktree_root: Option<&Path>) -> PathBuf {
     let dir_name = branch_to_dir_name(branch);
+    let legacy_dir_name = branch_to_dir_name_legacy(branch);
+
+    let compute_path = |root: &Path| -> PathBuf {
+        let new_path = root.join(&dir_name);
+        if new_path.exists() {
+            return new_path;
+        }
+        let legacy_path = root.join(&legacy_dir_name);
+        if legacy_path.exists() {
+            return legacy_path;
+        }
+        new_path
+    };
+
     worktree_root.map_or_else(
         || {
             let repo_name = repo_root
                 .file_name()
                 .map_or("repo", |n| n.to_str().unwrap_or("repo"));
             let parent = repo_root.parent().unwrap_or(repo_root);
-            parent
-                .join(format!("{repo_name}-worktrees"))
-                .join(&dir_name)
+            let root = parent.join(format!("{repo_name}-worktrees"));
+            compute_path(&root)
         },
-        |root| root.join(&dir_name),
+        compute_path,
     )
 }
 
@@ -296,9 +312,10 @@ mod tests {
     fn worktree_path_default_sibling() {
         let repo = Path::new("/home/user/my-project");
         let path = worktree_path(repo, "feature/auth", None);
+        let dir_name = branch_to_dir_name("feature/auth");
         assert_eq!(
             path,
-            PathBuf::from("/home/user/my-project-worktrees/feature-auth")
+            PathBuf::from(format!("/home/user/my-project-worktrees/{dir_name}"))
         );
     }
 
@@ -307,7 +324,8 @@ mod tests {
         let repo = Path::new("/home/user/my-project");
         let custom = Path::new("/tmp/worktrees");
         let path = worktree_path(repo, "feature/auth", Some(custom));
-        assert_eq!(path, PathBuf::from("/tmp/worktrees/feature-auth"));
+        let dir_name = branch_to_dir_name("feature/auth");
+        assert_eq!(path, PathBuf::from(format!("/tmp/worktrees/{dir_name}")));
     }
 
     #[test]
@@ -641,7 +659,11 @@ detached
         // Repo at filesystem root edge case
         let repo = Path::new("/my-project");
         let path = worktree_path(repo, "fix/bug", None);
-        assert_eq!(path, PathBuf::from("/my-project-worktrees/fix-bug"));
+        let dir_name = branch_to_dir_name("fix/bug");
+        assert_eq!(
+            path,
+            PathBuf::from(format!("/my-project-worktrees/{dir_name}"))
+        );
     }
 
     #[test]
