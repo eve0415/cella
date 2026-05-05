@@ -448,15 +448,22 @@ async fn wait_or_timeout(
     124
 }
 
-/// Kill the specific task process inside the container using its PID file.
+/// Kill the task's entire process tree inside the container using its PID file.
 ///
 /// The wrapper in `build_task_command` writes the in-container PID to a
 /// known file before exec-replacing into the real command. On timeout we
-/// read that file, SIGTERM the exact PID, and clean up — no pattern
-/// matching or broad kills that could hit unrelated processes.
+/// look up that process's group ID and kill the entire group — this
+/// catches child processes (e.g. `cargo test` spawning test runners)
+/// without affecting unrelated container processes.
 async fn kill_task_by_pid_file(container_name: &str, pid_file: &str) {
     let kill_script = format!(
-        "pid=$(cat {pid_file} 2>/dev/null) && kill -TERM \"$pid\" 2>/dev/null; rm -f {pid_file}"
+        concat!(
+            "pid=$(cat {0} 2>/dev/null) || exit 0; ",
+            "pgid=$(ps -o pgid= -p \"$pid\" 2>/dev/null | tr -d ' ') && ",
+            "kill -TERM -- -\"$pgid\" 2>/dev/null; ",
+            "rm -f {0}"
+        ),
+        pid_file
     );
     let result = tokio::process::Command::new("docker")
         .args(["exec", container_name, "sh", "-c", &kill_script])
