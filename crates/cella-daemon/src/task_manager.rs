@@ -3,12 +3,41 @@
 //! Tracks `cella task run` background processes: their Docker exec handles,
 //! output capture, and lifecycle state. Tasks are identified by branch name.
 
-use std::collections::HashMap;
-use std::fmt::Write;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
+
+/// Ring buffer for captured task output.
+struct TaskOutput {
+    buffer: VecDeque<u8>,
+    max_bytes: usize,
+}
+
+impl TaskOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, data: &str) {
+        let bytes = data.as_bytes();
+        self.buffer.extend(bytes);
+        while self.buffer.len() > self.max_bytes {
+            self.buffer.pop_front();
+        }
+    }
+
+    fn contents(&self) -> String {
+        let bytes: Vec<u8> = self.buffer.iter().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
 
 /// Shared task manager state.
 pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
@@ -29,8 +58,8 @@ struct TaskState {
     container_name: String,
     command: Vec<String>,
     started_at: std::time::Instant,
-    /// Captured output (stdout + stderr interleaved).
-    output: Arc<Mutex<String>>,
+    /// Captured output (stdout + stderr interleaved, ring buffer).
+    output: Arc<Mutex<TaskOutput>>,
     /// Set when the task completes.
     exit_code: Arc<Mutex<Option<i32>>>,
     /// Handle to abort the task.
@@ -80,7 +109,7 @@ impl TaskManager {
         }
 
         let task_id = branch.to_string();
-        let output = Arc::new(Mutex::new(String::new()));
+        let output = Arc::new(Mutex::new(TaskOutput::new(MAX_OUTPUT_BYTES)));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let (output_tx, _) = tokio::sync::broadcast::channel(1024);
         let (exit_watch, _) = tokio::sync::watch::channel(None);
@@ -156,7 +185,7 @@ impl TaskManager {
     /// Get captured output for a task.
     pub async fn get_output(&self, branch: &str) -> Option<String> {
         let state = self.tasks.get(branch)?;
-        Some(state.output.lock().await.clone())
+        Some(state.output.lock().await.contents())
     }
 
     /// Wait for a task to complete, returning its exit code.
@@ -210,7 +239,7 @@ impl TaskManager {
 async fn run_task_process(
     container_name: &str,
     command: &[String],
-    output: &Arc<Mutex<String>>,
+    output: &Arc<Mutex<TaskOutput>>,
     exit_code: &Arc<Mutex<Option<i32>>>,
     output_tx: &tokio::sync::broadcast::Sender<String>,
     exit_watch: &tokio::sync::watch::Sender<Option<i32>>,
@@ -231,9 +260,9 @@ async fn run_task_process(
             warn!("Failed to spawn task process: {e}");
             *exit_code.lock().await = Some(1);
             let _ = exit_watch.send(Some(1));
-            let error_line = format!("Error: failed to spawn: {e}");
-            let _ = writeln!(output.lock().await, "{error_line}");
-            let _ = output_tx.send(format!("{error_line}\n"));
+            let error_line = format!("Error: failed to spawn: {e}\n");
+            output.lock().await.push(&error_line);
+            let _ = output_tx.send(error_line);
             return;
         }
     };
@@ -249,7 +278,7 @@ async fn run_task_process(
             let mut reader = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let formatted = format!("{line}\n");
-                output_stdout.lock().await.push_str(&formatted);
+                output_stdout.lock().await.push(&formatted);
                 let _ = tx_stdout.send(formatted);
             }
         }
@@ -262,7 +291,7 @@ async fn run_task_process(
             let mut reader = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let formatted = format!("{line}\n");
-                output_stderr.lock().await.push_str(&formatted);
+                output_stderr.lock().await.push(&formatted);
                 let _ = tx_stderr.send(formatted);
             }
         }
@@ -490,5 +519,24 @@ mod tests {
         let mgr = manager();
         // Unknown branch returns None immediately (no state to poll).
         assert!(mgr.wait_for("ghost").await.is_none());
+    }
+
+    // -- TaskOutput ring buffer --
+
+    #[test]
+    fn task_output_caps_at_max_bytes() {
+        let mut out = TaskOutput::new(10);
+        out.push("hello"); // 5 bytes
+        out.push("world!"); // 6 bytes, total 11 > 10
+        let contents = out.contents();
+        assert_eq!(contents.len(), 10);
+        assert_eq!(contents, "elloworld!");
+    }
+
+    #[test]
+    fn task_output_under_limit_preserved() {
+        let mut out = TaskOutput::new(100);
+        out.push("small");
+        assert_eq!(out.contents(), "small");
     }
 }
