@@ -17,10 +17,17 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
 static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
+static DAEMON_INSTANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}-{start}", std::process::id())
+});
+
 fn next_pid_file_path() -> String {
     let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let daemon_pid = std::process::id();
-    format!("/tmp/.cella-task-{daemon_pid}-{seq}.pid")
+    format!("/tmp/.cella-task-{}-{seq}.pid", *DAEMON_INSTANCE)
 }
 
 /// Ring buffer for captured task output.
