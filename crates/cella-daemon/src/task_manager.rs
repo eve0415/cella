@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -14,6 +14,12 @@ use tracing::{info, warn};
 const EXIT_RUNNING: i32 = -1;
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
+
+static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_pid_file_id() -> u64 {
+    TASK_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Ring buffer for captured task output.
 struct TaskOutput {
@@ -325,11 +331,7 @@ async fn run_task_process(
     // When timeout is set, record the in-container PID for targeted cleanup.
     // Use a unique ID per task invocation to avoid collisions between concurrent
     // tasks and stale files from prior runs.
-    let task_unique_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{task_unique_id}.pid"));
+    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{}.pid", next_pid_file_id()));
     let mut cmd = build_task_command(
         container_name,
         command,
