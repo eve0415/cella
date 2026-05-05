@@ -18,11 +18,10 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static DAEMON_INSTANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let start = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{start}")
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    format!("{:x}", hasher.finish())
 });
 
 fn next_pid_file_path() -> String {
