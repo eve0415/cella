@@ -570,8 +570,10 @@ name = "cella-git"
 version = "0.0.43"
 dependencies = [
  "fs4",
+ "hex",
  "insta",
  "miette",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
