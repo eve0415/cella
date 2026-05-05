@@ -910,13 +910,44 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         } => {
             handle_up_request(&request_id, &branch, rebuild, &wt, writer).await?;
         }
+        msg @ (AgentMessage::TaskRunRequest { .. }
+        | AgentMessage::TaskListRequest { .. }
+        | AgentMessage::TaskLogsRequest { .. }
+        | AgentMessage::TaskWaitRequest { .. }
+        | AgentMessage::TaskStopRequest { .. }) => {
+            handle_task_message(msg, &wt, writer).await?;
+        }
+        AgentMessage::SwitchRequest { request_id, branch } => {
+            handle_switch_request(&request_id, &branch, &wt, writer).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_task_message<W: AsyncWriteExt + Unpin>(
+    msg: AgentMessage,
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    match msg {
         AgentMessage::TaskRunRequest {
             request_id,
             branch,
             command,
             base,
+            timeout_secs,
         } => {
-            handle_task_run(&request_id, &branch, &command, base.as_deref(), &wt, writer).await?;
+            handle_task_run(
+                &request_id,
+                &branch,
+                &command,
+                base.as_deref(),
+                timeout_secs,
+                wt,
+                writer,
+            )
+            .await?;
         }
         AgentMessage::TaskListRequest { request_id } => {
             handle_task_list(&request_id, wt.task_mgr, writer).await?;
@@ -933,9 +964,6 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
         }
         AgentMessage::TaskStopRequest { request_id, branch } => {
             handle_task_stop(&request_id, &branch, wt.task_mgr, writer).await?;
-        }
-        AgentMessage::SwitchRequest { request_id, branch } => {
-            handle_switch_request(&request_id, &branch, &wt, writer).await?;
         }
         _ => {}
     }
@@ -1959,6 +1987,7 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
     branch: &str,
     command: &[String],
     base: Option<&str>,
+    timeout_secs: Option<u64>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -1991,10 +2020,17 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    // Start the background task.
+    // Start the background task using `cella exec` for proper user/env resolution.
     let task_id = {
         let mut mgr = wt.task_mgr.lock().await;
-        match mgr.start_task(branch, container_name.clone(), command.to_vec()) {
+        let cella_bin = Some(wt.cella_bin.to_path_buf());
+        match mgr.start_task(
+            branch,
+            container_name.clone(),
+            command.to_vec(),
+            cella_bin,
+            timeout_secs,
+        ) {
             Ok(id) => id,
             Err(e) => {
                 send_message(

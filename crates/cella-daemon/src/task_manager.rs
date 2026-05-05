@@ -96,6 +96,10 @@ impl TaskManager {
 
     /// Start a background task: create branch (if needed) and run command.
     ///
+    /// Uses `cella exec` for proper user/env/workdir resolution (same context
+    /// as interactive `cella exec`). Falls back to raw `docker exec` when
+    /// `cella_bin` is `None`.
+    ///
     /// Returns the task ID (branch name) on success.
     ///
     /// # Errors
@@ -106,6 +110,8 @@ impl TaskManager {
         branch: &str,
         container_name: String,
         command: Vec<String>,
+        cella_bin: Option<std::path::PathBuf>,
+        timeout_secs: Option<u64>,
     ) -> Result<String, String> {
         if let Some(existing) = self.tasks.get(branch) {
             if existing.exit_code.load(Ordering::Acquire) == EXIT_RUNNING {
@@ -121,11 +127,13 @@ impl TaskManager {
         let (output_tx, _) = tokio::sync::broadcast::channel(1024);
         let (exit_watch, _) = tokio::sync::watch::channel(None);
 
-        let output_clone = output.clone();
-        let exit_code_clone = exit_code.clone();
-        let child_pid_clone = child_pid.clone();
-        let output_tx_clone = output_tx.clone();
-        let exit_watch_clone = exit_watch.clone();
+        let handles = TaskHandles {
+            output: output.clone(),
+            exit_code: exit_code.clone(),
+            child_pid: child_pid.clone(),
+            output_tx: output_tx.clone(),
+            exit_watch: exit_watch.clone(),
+        };
         let container = container_name.clone();
         let cmd = command.clone();
 
@@ -133,11 +141,9 @@ impl TaskManager {
             run_task_process(
                 &container,
                 &cmd,
-                &output_clone,
-                &exit_code_clone,
-                &child_pid_clone,
-                &output_tx_clone,
-                &exit_watch_clone,
+                cella_bin.as_deref(),
+                timeout_secs,
+                &handles,
             )
             .await;
         });
@@ -245,23 +251,59 @@ impl TaskManager {
     }
 }
 
-/// Run a docker exec command and capture output.
+/// Shared handles for a running task's output and lifecycle tracking.
+struct TaskHandles {
+    output: Arc<Mutex<TaskOutput>>,
+    exit_code: Arc<AtomicI32>,
+    child_pid: Arc<AtomicU32>,
+    output_tx: tokio::sync::broadcast::Sender<String>,
+    exit_watch: tokio::sync::watch::Sender<Option<i32>>,
+}
+
+/// Build the command to execute inside a container.
+///
+/// When `cella_bin` is provided, uses `cella exec --container-name <name> -- <cmd>`
+/// which resolves the proper user, working directory, and environment variables
+/// (AI keys, SSH agent, terminal vars). Falls back to raw `docker exec` otherwise.
+fn build_task_command(
+    container_name: &str,
+    command: &[String],
+    cella_bin: Option<&std::path::Path>,
+) -> tokio::process::Command {
+    cella_bin.map_or_else(
+        || {
+            let mut c = tokio::process::Command::new("docker");
+            c.arg("exec").arg(container_name);
+            for arg in command {
+                c.arg(arg);
+            }
+            c
+        },
+        |bin| {
+            let mut c = tokio::process::Command::new(bin);
+            c.arg("exec")
+                .arg("--container-name")
+                .arg(container_name)
+                .arg("--");
+            for arg in command {
+                c.arg(arg);
+            }
+            c
+        },
+    )
+}
+
+/// Run a command in a container and capture output.
 async fn run_task_process(
     container_name: &str,
     command: &[String],
-    output: &Arc<Mutex<TaskOutput>>,
-    exit_code: &Arc<AtomicI32>,
-    child_pid: &Arc<AtomicU32>,
-    output_tx: &tokio::sync::broadcast::Sender<String>,
-    exit_watch: &tokio::sync::watch::Sender<Option<i32>>,
+    cella_bin: Option<&std::path::Path>,
+    timeout_secs: Option<u64>,
+    handles: &TaskHandles,
 ) {
     use tokio::io::AsyncBufReadExt;
 
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.arg("exec").arg(container_name);
-    for arg in command {
-        cmd.arg(arg);
-    }
+    let mut cmd = build_task_command(container_name, command, cella_bin);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -269,23 +311,24 @@ async fn run_task_process(
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to spawn task process: {e}");
-            exit_code.store(1, Ordering::Release);
-            let _ = exit_watch.send(Some(1));
+            handles.exit_code.store(1, Ordering::Release);
+            let _ = handles.exit_watch.send(Some(1));
             let error_line = format!("Error: failed to spawn: {e}\n");
-            output.lock().await.push(&error_line);
-            let _ = output_tx.send(error_line);
+            handles.output.lock().await.push(&error_line);
+            let _ = handles.output_tx.send(error_line);
             return;
         }
     };
 
-    child_pid.store(child.id().unwrap_or(0), Ordering::Release);
+    handles
+        .child_pid
+        .store(child.id().unwrap_or(0), Ordering::Release);
 
-    // Read stdout and stderr concurrently
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let output_stdout = output.clone();
-    let tx_stdout = output_tx.clone();
+    let output_stdout = handles.output.clone();
+    let tx_stdout = handles.output_tx.clone();
     let stdout_task = tokio::spawn(async move {
         if let Some(stdout) = child_stdout {
             let mut reader = tokio::io::BufReader::new(stdout).lines();
@@ -297,8 +340,8 @@ async fn run_task_process(
         }
     });
 
-    let output_stderr = output.clone();
-    let tx_stderr = output_tx.clone();
+    let output_stderr = handles.output.clone();
+    let tx_stderr = handles.output_tx.clone();
     let stderr_task = tokio::spawn(async move {
         if let Some(stderr) = child_stderr {
             let mut reader = tokio::io::BufReader::new(stderr).lines();
@@ -313,12 +356,42 @@ async fn run_task_process(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let status = child.wait().await;
-    let code = status.map_or(1, |s| s.code().unwrap_or(1));
+    let code = wait_or_timeout(&mut child, timeout_secs, container_name, handles).await;
     // Only set if still running — stop_task may have already set 130.
-    let _ = exit_code.compare_exchange(EXIT_RUNNING, code, Ordering::AcqRel, Ordering::Acquire);
-    let _ = exit_watch.send(Some(code));
+    let _ =
+        handles
+            .exit_code
+            .compare_exchange(EXIT_RUNNING, code, Ordering::AcqRel, Ordering::Acquire);
+    let _ = handles.exit_watch.send(Some(code));
     info!("Task in '{container_name}' exited with code {code}");
+}
+
+async fn wait_or_timeout(
+    child: &mut tokio::process::Child,
+    timeout_secs: Option<u64>,
+    container_name: &str,
+    handles: &TaskHandles,
+) -> i32 {
+    let Some(secs) = timeout_secs else {
+        return child.wait().await.map_or(1, |s| s.code().unwrap_or(1));
+    };
+    if let Ok(status) =
+        tokio::time::timeout(std::time::Duration::from_secs(secs), child.wait()).await
+    {
+        return status.map_or(1, |s| s.code().unwrap_or(1));
+    }
+    warn!("Task in '{container_name}' timed out after {secs}s");
+    let pid = handles.child_pid.load(Ordering::Acquire);
+    if pid != 0 {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid.cast_signed()),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    let timeout_msg = format!("Task timed out after {secs}s\n");
+    handles.output.lock().await.push(&timeout_msg);
+    let _ = handles.output_tx.send(timeout_msg);
+    124
 }
 
 #[cfg(test)]
@@ -344,7 +417,7 @@ mod tests {
     async fn start_task_returns_branch_as_task_id() {
         let mut mgr = manager();
         let id = mgr
-            .start_task("feature/abc", "ctr1".into(), vec!["ls".into()])
+            .start_task("feature/abc", "ctr1".into(), vec!["ls".into()], None, None)
             .unwrap();
         assert_eq!(id, "feature/abc");
     }
@@ -352,10 +425,10 @@ mod tests {
     #[tokio::test]
     async fn start_task_duplicate_branch_is_error() {
         let mut mgr = manager();
-        mgr.start_task("dup", "ctr".into(), vec!["echo".into()])
+        mgr.start_task("dup", "ctr".into(), vec!["echo".into()], None, None)
             .unwrap();
         let err = mgr
-            .start_task("dup", "ctr".into(), vec!["echo".into()])
+            .start_task("dup", "ctr".into(), vec!["echo".into()], None, None)
             .unwrap_err();
         assert!(err.contains("already running"));
     }
@@ -363,9 +436,9 @@ mod tests {
     #[tokio::test]
     async fn start_task_different_branches_both_succeed() {
         let mut mgr = manager();
-        mgr.start_task("b1", "ctr".into(), vec!["a".into()])
+        mgr.start_task("b1", "ctr".into(), vec!["a".into()], None, None)
             .unwrap();
-        mgr.start_task("b2", "ctr".into(), vec!["b".into()])
+        mgr.start_task("b2", "ctr".into(), vec!["b".into()], None, None)
             .unwrap();
         let list = mgr.list_tasks();
         assert_eq!(list.len(), 2);
@@ -386,6 +459,8 @@ mod tests {
             "main",
             "my-container".into(),
             vec!["cargo".into(), "test".into()],
+            None,
+            None,
         )
         .unwrap();
         let tasks = mgr.list_tasks();
@@ -411,7 +486,8 @@ mod tests {
     #[tokio::test]
     async fn subscribe_returns_receiver_for_existing_task() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("br", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
         assert!(mgr.subscribe("br").is_some());
     }
 
@@ -427,8 +503,14 @@ mod tests {
     #[tokio::test]
     async fn is_done_returns_false_when_task_just_started() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["sleep".into(), "9999".into()])
-            .unwrap();
+        mgr.start_task(
+            "br",
+            "c".into(),
+            vec!["sleep".into(), "9999".into()],
+            None,
+            None,
+        )
+        .unwrap();
         // The spawned task will fail quickly (docker not available in test), but
         // right after insertion the exit_code starts as None.
         // We check immediately, so it should still be false.
@@ -448,7 +530,8 @@ mod tests {
     #[tokio::test]
     async fn get_output_returns_some_for_existing_task() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("br", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
         // Output starts empty.
         let out = mgr.get_output("br").await.unwrap();
         assert!(out.is_empty() || out.contains("Error")); // may have spawned & failed fast
@@ -465,7 +548,8 @@ mod tests {
     #[tokio::test]
     async fn stop_task_on_already_completed_returns_false() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("br", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
         // In CI docker is unavailable, so the task exits almost immediately.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         // Task already completed — stop must not overwrite exit code.
@@ -481,8 +565,10 @@ mod tests {
     #[tokio::test]
     async fn cleanup_done_removes_completed_tasks() {
         let mut mgr = manager();
-        mgr.start_task("a", "c".into(), vec!["x".into()]).unwrap();
-        mgr.start_task("b", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("a", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
+        mgr.start_task("b", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
         // Let both tasks finish (docker unavailable → exit 1).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         mgr.cleanup_done();
@@ -501,12 +587,13 @@ mod tests {
     #[tokio::test]
     async fn start_task_after_completion_succeeds() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
+        mgr.start_task("br", "c".into(), vec!["x".into()], None, None)
+            .unwrap();
         // Let task finish (docker unavailable → exit 1).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(mgr.is_done("br"));
         let id = mgr
-            .start_task("br", "c".into(), vec!["echo".into()])
+            .start_task("br", "c".into(), vec!["echo".into()], None, None)
             .unwrap();
         assert_eq!(id, "br");
     }
@@ -514,11 +601,17 @@ mod tests {
     #[tokio::test]
     async fn start_task_while_running_still_errors() {
         let mut mgr = manager();
-        mgr.start_task("br", "c".into(), vec!["sleep".into(), "9999".into()])
-            .unwrap();
+        mgr.start_task(
+            "br",
+            "c".into(),
+            vec!["sleep".into(), "9999".into()],
+            None,
+            None,
+        )
+        .unwrap();
         // Task is still running (exit_code=None)
         let err = mgr
-            .start_task("br", "c".into(), vec!["echo".into()])
+            .start_task("br", "c".into(), vec!["echo".into()], None, None)
             .unwrap_err();
         assert!(err.contains("already running"));
     }
