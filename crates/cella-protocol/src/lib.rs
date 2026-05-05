@@ -609,7 +609,20 @@ pub enum TaskRunOperationResult {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<TaskErrorCode>,
     },
+}
+
+/// Structured error codes for task operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskErrorCode {
+    AlreadyRunning,
+    NotFound,
+    BranchNotFound,
+    ContainerNotRunning,
+    ExecFailed,
 }
 
 /// A background task entry.

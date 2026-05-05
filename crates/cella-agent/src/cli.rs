@@ -1001,7 +1001,7 @@ async fn run_task_run(
                     eprintln!("Task '{task_id}' started in container {container_name}");
                     return Ok(());
                 }
-                cella_protocol::TaskRunOperationResult::Error { message } => {
+                cella_protocol::TaskRunOperationResult::Error { message, .. } => {
                     return Err(format!("Failed to start task: {message}").into());
                 }
             },

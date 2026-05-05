@@ -1820,7 +1820,10 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                 writer,
                 &DaemonMessage::TaskRunResult {
                     request_id: request_id.to_string(),
-                    result: cella_protocol::TaskRunOperationResult::Error { message: error_msg },
+                    result: cella_protocol::TaskRunOperationResult::Error {
+                        message: error_msg,
+                        code: Some(cella_protocol::TaskErrorCode::ContainerNotRunning),
+                    },
                 },
             )
             .await?;
@@ -1847,7 +1850,14 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
                     writer,
                     &DaemonMessage::TaskRunResult {
                         request_id: request_id.to_string(),
-                        result: cella_protocol::TaskRunOperationResult::Error { message: e },
+                        result: cella_protocol::TaskRunOperationResult::Error {
+                            message: e.clone(),
+                            code: if e.contains("already running") {
+                                Some(cella_protocol::TaskErrorCode::AlreadyRunning)
+                            } else {
+                                Some(cella_protocol::TaskErrorCode::ExecFailed)
+                            },
+                        },
                     },
                 )
                 .await?;
