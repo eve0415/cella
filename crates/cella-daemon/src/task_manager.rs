@@ -21,8 +21,8 @@ static DAEMON_INSTANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
     let start = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    format!("{}-{start}", std::process::id())
+        .as_nanos();
+    format!("{start}")
 });
 
 fn next_pid_file_path() -> String {
