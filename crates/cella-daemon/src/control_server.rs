@@ -1940,25 +1940,48 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
             .await?;
         }
 
-        // Subscribe and stream live output.
-        let rx = task_mgr.lock().await.subscribe(branch);
-        if let Some(mut rx) = rx {
+        // Subscribe and stream live output until task completes.
+        let mgr = task_mgr.lock().await;
+        let rx = mgr.subscribe(branch);
+        let exit_rx = mgr.subscribe_exit(branch);
+        drop(mgr);
+
+        if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
             loop {
-                match rx.recv().await {
-                    Ok(chunk) => {
-                        send_message(
-                            writer,
-                            &DaemonMessage::TaskLogsData {
-                                request_id: request_id.to_string(),
-                                data: chunk,
-                                done: false,
-                            },
-                        )
-                        .await?;
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok(chunk) => {
+                                send_message(
+                                    writer,
+                                    &DaemonMessage::TaskLogsData {
+                                        request_id: request_id.to_string(),
+                                        data: chunk,
+                                        done: false,
+                                    },
+                                )
+                                .await?;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("task logs subscriber lagged by {n} messages");
+                            }
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("task logs subscriber lagged by {n} messages");
+                    _ = exit_rx.changed() => {
+                        // Drain remaining broadcast messages
+                        while let Ok(chunk) = rx.try_recv() {
+                            send_message(
+                                writer,
+                                &DaemonMessage::TaskLogsData {
+                                    request_id: request_id.to_string(),
+                                    data: chunk,
+                                    done: false,
+                                },
+                            )
+                            .await?;
+                        }
+                        break;
                     }
                 }
             }

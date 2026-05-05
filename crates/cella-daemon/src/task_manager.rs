@@ -173,6 +173,14 @@ impl TaskManager {
         self.tasks.get(branch).map(|s| s.output_tx.subscribe())
     }
 
+    /// Subscribe to exit notification for a task.
+    pub fn subscribe_exit(
+        &self,
+        branch: &str,
+    ) -> Option<tokio::sync::watch::Receiver<Option<i32>>> {
+        self.tasks.get(branch).map(|s| s.exit_watch.subscribe())
+    }
+
     /// Check if a task is done.
     pub async fn is_done(&self, branch: &str) -> bool {
         if let Some(state) = self.tasks.get(branch) {
