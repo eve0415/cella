@@ -1194,8 +1194,26 @@ async fn handle_list_request<W: AsyncWriteExt + Unpin>(
         {
             wt.container_name = Some(c.name.clone());
             wt.container_state = Some(c.state.clone());
+            wt.container_id = Some(c.container_id.clone());
             if let Some(ref label) = c.branch_label {
                 wt.branch = Some(label.clone());
+            }
+        }
+    }
+
+    // Batch-inspect matched containers for labels (uses `docker inspect`
+    // with proper JSON output instead of the ambiguous comma-separated format).
+    let matched_ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|wt| wt.container_id.as_deref())
+        .collect();
+    if !matched_ids.is_empty() {
+        let label_map = batch_inspect_labels(&matched_ids).await;
+        for wt in &mut worktrees {
+            if let Some(ref id) = wt.container_id
+                && let Some(labels) = label_map.get(id.as_str())
+            {
+                wt.labels = Some(labels.clone());
             }
         }
     }
@@ -1251,6 +1269,8 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_protocol::WorktreeEntry> 
                     is_main: is_first && !is_bare,
                     container_name: None,
                     container_state: None,
+                    container_id: None,
+                    labels: None,
                 });
                 is_first = false;
                 is_bare = false;
@@ -1274,6 +1294,8 @@ fn parse_worktree_porcelain(output: &str) -> Vec<cella_protocol::WorktreeEntry> 
             is_main: is_first && !is_bare,
             container_name: None,
             container_state: None,
+            container_id: None,
+            labels: None,
         });
     }
 
@@ -1286,6 +1308,7 @@ struct CellaContainer {
     state: String,
     workspace_path: Option<String>,
     branch_label: Option<String>,
+    container_id: String,
 }
 
 /// List all cella-managed containers with their workspace paths.
@@ -1295,10 +1318,11 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
         .args([
             "ps",
             "-a",
+            "--no-trunc",
             "--filter",
             "label=dev.cella.tool=cella",
             "--format",
-            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}\t{{.Label \"dev.cella.branch\"}}",
+            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}\t{{.Label \"dev.cella.branch\"}}\t{{.ID}}",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1317,7 +1341,7 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
         .lines()
         .filter(|line| !line.is_empty())
         .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
+            let mut parts = line.splitn(5, '\t');
             let name = parts.next()?.to_string();
             let state = parts.next()?.to_string();
             let ws = parts
@@ -1328,12 +1352,47 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
                 .next()
                 .map(ToString::to_string)
                 .filter(|s| !s.is_empty());
+            let container_id = parts.next().unwrap_or_default().to_string();
             Some(CellaContainer {
                 name,
                 state,
                 workspace_path: ws,
                 branch_label: branch,
+                container_id,
             })
+        })
+        .collect()
+}
+
+/// Batch-inspect containers by ID to get their labels as proper JSON maps.
+async fn batch_inspect_labels(ids: &[&str]) -> HashMap<String, HashMap<String, String>> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(["inspect", "--format", "{{.Id}}\t{{json .Config.Labels}}"]);
+    for id in ids {
+        cmd.arg(id);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let Ok(output) = cmd.output().await else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (id, json) = line.split_once('\t')?;
+            let labels: HashMap<String, String> = serde_json::from_str(json).ok()?;
+            Some((id.to_string(), labels))
         })
         .collect()
 }

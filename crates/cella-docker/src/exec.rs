@@ -334,17 +334,20 @@ fn spawn_io_tasks(
 
     let output_handle = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
         while let Some(chunk) = output.next().await {
             match chunk {
-                Ok(
-                    LogOutput::StdOut { message }
-                    | LogOutput::StdErr { message }
-                    | LogOutput::Console { message },
-                ) => {
+                Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
                     if stdout.write_all(&message).await.is_err() {
                         break;
                     }
                     let _ = stdout.flush().await;
+                }
+                Ok(LogOutput::StdErr { message }) => {
+                    if stderr.write_all(&message).await.is_err() {
+                        break;
+                    }
+                    let _ = stderr.flush().await;
                 }
                 Err(_) | Ok(_) => break,
             }

@@ -686,6 +686,12 @@ pub struct WorktreeEntry {
     pub container_name: Option<String>,
     /// Container state (running, exited, etc.), if a container exists.
     pub container_state: Option<String>,
+    /// Docker container ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    /// Container labels (all labels, including cella-managed ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -1393,6 +1399,8 @@ mod tests {
                     is_main: true,
                     container_name: Some("cella-proj-main".to_string()),
                     container_state: Some("running".to_string()),
+                    container_id: None,
+                    labels: None,
                 },
                 WorktreeEntry {
                     branch: Some("feat/auth".to_string()),
@@ -1400,6 +1408,8 @@ mod tests {
                     is_main: false,
                     container_name: None,
                     container_state: None,
+                    container_id: None,
+                    labels: None,
                 },
             ],
         };
@@ -1408,6 +1418,55 @@ mod tests {
         assert!(
             matches!(decoded, DaemonMessage::ListResult { worktrees, .. } if worktrees.len() == 2)
         );
+    }
+
+    #[test]
+    fn worktree_entry_backward_compat_missing_new_fields() {
+        let json = r#"{"branch":"main","worktree_path":"/repo","is_main":true,"container_name":"ctr","container_state":"running"}"#;
+        let entry: WorktreeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.branch.as_deref(), Some("main"));
+        assert!(entry.container_id.is_none());
+        assert!(entry.labels.is_none());
+    }
+
+    #[test]
+    fn worktree_entry_new_fields_roundtrip() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("team".to_string(), "backend".to_string());
+        let entry = WorktreeEntry {
+            branch: Some("feat/x".to_string()),
+            worktree_path: "/repo".to_string(),
+            is_main: false,
+            container_name: Some("ctr".to_string()),
+            container_state: Some("running".to_string()),
+            container_id: Some("abc123def456".to_string()),
+            labels: Some(labels),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"container_id\":\"abc123def456\""));
+        assert!(json.contains("\"team\":\"backend\""));
+        let decoded: WorktreeEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.container_id.as_deref(), Some("abc123def456"));
+        assert_eq!(
+            decoded.labels.as_ref().unwrap().get("team").unwrap(),
+            "backend"
+        );
+    }
+
+    #[test]
+    fn worktree_entry_none_fields_omitted_in_json() {
+        let entry = WorktreeEntry {
+            branch: None,
+            worktree_path: "/repo".to_string(),
+            is_main: false,
+            container_name: None,
+            container_state: None,
+            container_id: None,
+            labels: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("container_id"));
+        assert!(!json.contains("labels"));
     }
 
     // -- Phase 2 protocol tests --------------------------------------------
