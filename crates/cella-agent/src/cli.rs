@@ -107,6 +107,9 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                             return CliCommand::Help;
                         }
                     }
+                } else if args[i].starts_with('-') {
+                    eprintln!("Error: unknown flag '{}' for branch command", args[i]);
+                    return CliCommand::Help;
                 } else {
                     i += 1;
                 }
@@ -133,9 +136,25 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
-            let rm = args.iter().any(|a| a == "--rm");
-            let volumes = args.iter().any(|a| a == "--volumes");
-            let force = args.iter().any(|a| a == "--force");
+            let mut rm = false;
+            let mut volumes = false;
+            let mut force = false;
+            for arg in &args[3..] {
+                match arg.as_str() {
+                    "--rm" => rm = true,
+                    "--volumes" => volumes = true,
+                    "--force" => force = true,
+                    f if f.starts_with('-') => {
+                        eprintln!("Error: unknown flag '{f}' for down command");
+                        return CliCommand::Help;
+                    }
+                    _ => {}
+                }
+            }
+            if volumes && !rm {
+                eprintln!("Error: --volumes requires --rm");
+                return CliCommand::Help;
+            }
             CliCommand::Down {
                 branch,
                 rm,
@@ -148,12 +167,33 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 Some(b) if !b.starts_with('-') => b.clone(),
                 _ => return CliCommand::Help,
             };
-            let rebuild = args.iter().any(|a| a == "--rebuild");
+            let mut rebuild = false;
+            for arg in &args[3..] {
+                match arg.as_str() {
+                    "--rebuild" => rebuild = true,
+                    f if f.starts_with('-') => {
+                        eprintln!("Error: unknown flag '{f}' for up command");
+                        return CliCommand::Help;
+                    }
+                    _ => {}
+                }
+            }
             CliCommand::Up { branch, rebuild }
         }
         Some("prune") => {
-            let dry_run = args.iter().any(|a| a == "--dry-run");
-            let all = args.iter().any(|a| a == "--all");
+            let mut dry_run = false;
+            let mut all = false;
+            for arg in &args[2..] {
+                match arg.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--all" => all = true,
+                    f if f.starts_with('-') => {
+                        eprintln!("Error: unknown flag '{f}' for prune command");
+                        return CliCommand::Help;
+                    }
+                    _ => {}
+                }
+            }
             CliCommand::Prune { dry_run, all }
         }
         Some("task") => parse_task_subcommand(args),
@@ -201,6 +241,9 @@ fn parse_task_subcommand(args: &[String]) -> CliCommand {
                             return CliCommand::Help;
                         }
                     }
+                } else if args[i].starts_with('-') {
+                    eprintln!("Error: unknown flag '{}' for task run command", args[i]);
+                    return CliCommand::Help;
                 } else {
                     i += 1;
                 }
@@ -1536,21 +1579,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_down_volumes_only() {
+    fn parse_down_volumes_without_rm_rejected() {
         let args: Vec<String> = ["cella", "down", "feat/auth", "--volumes"]
             .iter()
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(
-            cmd,
-            CliCommand::Down {
-                volumes: true,
-                rm: false,
-                force: false,
-                ..
-            }
-        ));
+        assert!(matches!(cmd, CliCommand::Help));
     }
 
     #[test]
@@ -1716,15 +1751,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_branch_ignores_unknown_flags() {
+    fn parse_branch_rejects_unknown_flags() {
         let args: Vec<String> = ["cella", "branch", "my-branch", "--unknown"]
             .iter()
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(
-            matches!(cmd, CliCommand::Branch { name, base } if name == "my-branch" && base.is_none())
-        );
+        assert!(matches!(cmd, CliCommand::Help));
     }
 
     #[test]
