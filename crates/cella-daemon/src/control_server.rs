@@ -362,6 +362,8 @@ async fn handle_agent_connection_after_hello(
                     AgentMessage::BranchRequest { .. }
                         | AgentMessage::ListRequest { .. }
                         | AgentMessage::ExecRequest { .. }
+                        | AgentMessage::ExecCaptureRequest { .. }
+                        | AgentMessage::DoctorRequest { .. }
                         | AgentMessage::PruneRequest { .. }
                         | AgentMessage::DownRequest { .. }
                         | AgentMessage::UpRequest { .. }
@@ -731,6 +733,8 @@ pub(crate) async fn handle_agent_message(
         AgentMessage::BranchRequest { .. }
         | AgentMessage::ListRequest { .. }
         | AgentMessage::ExecRequest { .. }
+        | AgentMessage::ExecCaptureRequest { .. }
+        | AgentMessage::DoctorRequest { .. }
         | AgentMessage::PruneRequest { .. }
         | AgentMessage::DownRequest { .. }
         | AgentMessage::UpRequest { .. }
@@ -865,6 +869,14 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             branch,
             command,
         } => handle_exec_request(&request_id, &branch, &command, &wt, writer).await?,
+        AgentMessage::ExecCaptureRequest {
+            request_id,
+            branch,
+            command,
+        } => handle_exec_capture(&request_id, &branch, &command, &wt, writer).await?,
+        AgentMessage::DoctorRequest { request_id } => {
+            handle_doctor_request(&request_id, &wt, writer).await?;
+        }
         AgentMessage::PruneRequest {
             request_id,
             dry_run,
@@ -1404,6 +1416,94 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
         &DaemonMessage::ExecResult {
             request_id: request_id.to_string(),
             exit_code: status.code().unwrap_or(1),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `ExecCaptureRequest`: run command, capture stdout/stderr separately.
+async fn handle_exec_capture<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    command: &[String],
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let container_name = find_container_for_branch(branch, wt).await;
+    let Some(container_name) = container_name else {
+        send_message(
+            writer,
+            &DaemonMessage::ExecCaptureResult {
+                request_id: request_id.to_string(),
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("No running container found for branch '{branch}'\n"),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("exec");
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg("--container-name").arg(&container_name).arg("--");
+    for arg in command {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
+        message: format!("failed to spawn cella exec: {e}"),
+    })?;
+
+    send_message(
+        writer,
+        &DaemonMessage::ExecCaptureResult {
+            request_id: request_id.to_string(),
+            exit_code: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `DoctorRequest`: return structured daemon health data.
+async fn handle_doctor_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let handles = wt.container_handles.lock().await;
+    let container_count = handles.len();
+    let containers: Vec<serde_json::Value> = handles
+        .iter()
+        .map(|(name, h)| {
+            serde_json::json!({
+                "container_name": name,
+                "agent_connected": h.agent_tx.is_some(),
+            })
+        })
+        .collect();
+    drop(handles);
+
+    let task_count = wt.task_mgr.lock().await.list_tasks().len();
+
+    let data = serde_json::json!({
+        "daemon_version": env!("CARGO_PKG_VERSION"),
+        "container_count": container_count,
+        "containers": containers,
+        "task_count": task_count,
+    });
+
+    send_message(
+        writer,
+        &DaemonMessage::DoctorResult {
+            request_id: request_id.to_string(),
+            data,
         },
     )
     .await?;

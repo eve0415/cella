@@ -180,6 +180,14 @@ pub enum AgentMessage {
     TaskWaitRequest { request_id: String, branch: String },
     /// Stop a running background task.
     TaskStopRequest { request_id: String, branch: String },
+    /// Execute a command and capture stdout/stderr separately (JSON mode).
+    ExecCaptureRequest {
+        request_id: String,
+        branch: String,
+        command: Vec<String>,
+    },
+    /// Request structured health/status data.
+    DoctorRequest { request_id: String },
     /// Switch to another branch's container (run default shell).
     SwitchRequest { request_id: String, branch: String },
 }
@@ -448,10 +456,22 @@ pub enum DaemonMessage {
     TaskWaitResult { request_id: String, exit_code: i32 },
     /// Keep-alive during `task wait` so the agent knows the connection is alive.
     TaskWaitHeartbeat { request_id: String },
+    /// Result of a captured exec request (stdout/stderr separated).
+    ExecCaptureResult {
+        request_id: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     /// Background task stopped.
     TaskStopResult { request_id: String },
     /// Stream channel is ready for TTY forwarding.
     StreamReady { request_id: String, port: u16 },
+    /// Structured health/status data.
+    DoctorResult {
+        request_id: String,
+        data: serde_json::Value,
+    },
     /// Result of a switch (shell exec in target container).
     SwitchResult { request_id: String, exit_code: i32 },
 }

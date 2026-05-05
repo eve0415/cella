@@ -37,7 +37,9 @@ pub enum CliCommand {
         base: Option<String>,
         labels: Vec<String>,
     },
-    List,
+    List {
+        json: bool,
+    },
     Down {
         branch: String,
         rm: bool,
@@ -51,6 +53,7 @@ pub enum CliCommand {
     Exec {
         branch: String,
         command: Vec<String>,
+        json: bool,
     },
     Prune {
         dry_run: bool,
@@ -78,7 +81,9 @@ pub enum CliCommand {
     Switch {
         branch: String,
     },
-    Doctor,
+    Doctor {
+        json: bool,
+    },
     Help,
     Unsupported {
         command: String,
@@ -91,20 +96,29 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
 
     match subcmd {
         Some("branch") => parse_branch_subcommand(args),
-        Some("list" | "ls") => CliCommand::List,
+        Some("list" | "ls") => {
+            let json = args[2..].iter().any(|a| a == "--json");
+            CliCommand::List { json }
+        }
         Some("exec") => {
-            // Parse: cella exec <branch> -- <cmd...>
+            // Parse: cella exec <branch> [--json] -- <cmd...>
             let branch = match args.get(2) {
                 Some(b) if !b.starts_with('-') && b != "--" => b.clone(),
                 _ => return CliCommand::Help,
             };
-            // Find "--" separator
             let sep = args.iter().position(|a| a == "--");
             let command = sep.map_or_else(Vec::new, |i| args[i + 1..].to_vec());
             if command.is_empty() {
                 return CliCommand::Help;
             }
-            CliCommand::Exec { branch, command }
+            let json = args[3..sep.unwrap_or(args.len())]
+                .iter()
+                .any(|a| a == "--json");
+            CliCommand::Exec {
+                branch,
+                command,
+                json,
+            }
         }
         Some("down") => {
             let branch = match args.get(2) {
@@ -164,7 +178,10 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             };
             CliCommand::Switch { branch }
         }
-        Some("doctor") => CliCommand::Doctor,
+        Some("doctor") => {
+            let json = args[2..].iter().any(|a| a == "--json");
+            CliCommand::Doctor { json }
+        }
         Some("--help" | "-h") | None => CliCommand::Help,
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
@@ -355,7 +372,13 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             print_help();
             Ok(())
         }
-        CliCommand::Doctor => run_doctor().await,
+        CliCommand::Doctor { json } => {
+            if json {
+                run_doctor_json().await
+            } else {
+                run_doctor().await
+            }
+        }
         CliCommand::Unsupported { command } => {
             print_unsupported(&command);
             std::process::exit(1);
@@ -363,7 +386,7 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
         CliCommand::Branch { name, base, labels } => {
             run_branch(&name, base.as_deref(), &labels).await
         }
-        CliCommand::List => run_list().await,
+        CliCommand::List { json } => run_list(json).await,
         CliCommand::Down {
             branch,
             rm,
@@ -371,7 +394,11 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             force,
         } => run_down(&branch, rm, volumes, force).await,
         CliCommand::Up { branch, rebuild } => run_up(&branch, rebuild).await,
-        CliCommand::Exec { branch, command } => run_exec(&branch, &command).await,
+        CliCommand::Exec {
+            branch,
+            command,
+            json,
+        } => run_exec(&branch, &command, json).await,
         CliCommand::Prune {
             dry_run,
             all,
@@ -544,6 +571,24 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     eprintln!();
     Ok(())
+}
+
+async fn run_doctor_json() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut client = connect_daemon().await?;
+    let id = request_id();
+    client
+        .send(&AgentMessage::DoctorRequest {
+            request_id: id.clone(),
+        })
+        .await?;
+
+    loop {
+        let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
+        if let DaemonMessage::DoctorResult { data, .. } = resp {
+            println!("{}", serde_json::to_string_pretty(&data)?);
+            return Ok(());
+        }
+    }
 }
 
 fn report_main_agent_status() {
@@ -735,7 +780,7 @@ async fn run_branch(
     }
 }
 
-async fn run_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
     let id = request_id();
@@ -747,45 +792,76 @@ async fn run_list() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::ListResult { worktrees, .. } = resp {
-            if worktrees.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&worktrees)?);
+            } else if worktrees.is_empty() {
                 eprintln!("No worktree branches found.");
             } else {
                 print_worktree_table(&worktrees);
             }
             return Ok(());
         }
-        // Ignore unrelated messages (Ack, PortMapping, etc.)
     }
 }
 
 async fn run_exec(
     branch: &str,
     command: &[String],
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
-
     let id = request_id();
-    let msg = AgentMessage::ExecRequest {
-        request_id: id.clone(),
-        branch: branch.to_string(),
-        command: command.to_vec(),
-    };
-    client.send(&msg).await?;
 
-    loop {
-        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
-        match resp {
-            DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
-                OutputStream::Stderr => eprint!("{data}"),
-            },
-            DaemonMessage::ExecResult { exit_code, .. } => {
+    if json {
+        let msg = AgentMessage::ExecCaptureRequest {
+            request_id: id.clone(),
+            branch: branch.to_string(),
+            command: command.to_vec(),
+        };
+        client.send(&msg).await?;
+        loop {
+            let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
+            if let DaemonMessage::ExecCaptureResult {
+                exit_code,
+                stdout,
+                stderr,
+                ..
+            } = resp
+            {
+                let envelope = serde_json::json!({
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                });
+                println!("{}", serde_json::to_string_pretty(&envelope)?);
                 if exit_code != 0 {
                     std::process::exit(exit_code);
                 }
                 return Ok(());
             }
-            _ => {}
+        }
+    } else {
+        let msg = AgentMessage::ExecRequest {
+            request_id: id.clone(),
+            branch: branch.to_string(),
+            command: command.to_vec(),
+        };
+        client.send(&msg).await?;
+        loop {
+            let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
+            match resp {
+                DaemonMessage::OperationOutput { stream, data, .. } => match stream {
+                    OutputStream::Stdout => print!("{data}"),
+                    OutputStream::Stderr => eprint!("{data}"),
+                },
+                DaemonMessage::ExecResult { exit_code, .. } => {
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -1277,14 +1353,14 @@ mod tests {
     fn parse_list_command() {
         let args = vec!["cella".to_string(), "list".to_string()];
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::List));
+        assert!(matches!(cmd, CliCommand::List { json: false }));
     }
 
     #[test]
     fn parse_ls_alias() {
         let args = vec!["cella".to_string(), "ls".to_string()];
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::List));
+        assert!(matches!(cmd, CliCommand::List { json: false }));
     }
 
     #[test]
@@ -1326,8 +1402,10 @@ mod tests {
             "test".to_string(),
         ];
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Exec { branch, command }
-                if branch == "feat/auth" && command == ["cargo", "test"]));
+        assert!(
+            matches!(cmd, CliCommand::Exec { branch, command, json: false }
+                if branch == "feat/auth" && command == ["cargo", "test"])
+        );
     }
 
     #[test]
@@ -1832,7 +1910,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Doctor));
+        assert!(matches!(cmd, CliCommand::Doctor { json: false }));
     }
 
     #[test]
