@@ -90,54 +90,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
     let subcmd = args.get(1).map(String::as_str);
 
     match subcmd {
-        Some("branch") => {
-            let name = match args.get(2) {
-                Some(n) if !n.starts_with('-') => n.clone(),
-                _ => {
-                    return CliCommand::Help;
-                }
-            };
-            let mut base = None;
-            let mut labels = Vec::new();
-            let mut i = 3;
-            while i < args.len() {
-                if args[i] == "--base" {
-                    match args.get(i + 1) {
-                        Some(val) if !val.starts_with('-') => {
-                            base = Some(val.clone());
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!("Error: --base requires a value (e.g., --base main)");
-                            return CliCommand::Help;
-                        }
-                    }
-                } else if args[i] == "--label" {
-                    match args.get(i + 1) {
-                        Some(val) if val.contains('=') => {
-                            if val.starts_with("dev.cella.") || val.starts_with("devcontainer.") {
-                                eprintln!(
-                                    "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
-                                );
-                                return CliCommand::Help;
-                            }
-                            labels.push(val.clone());
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!("Error: --label requires KEY=VALUE format");
-                            return CliCommand::Help;
-                        }
-                    }
-                } else if args[i].starts_with('-') {
-                    eprintln!("Error: unknown flag '{}' for branch command", args[i]);
-                    return CliCommand::Help;
-                } else {
-                    i += 1;
-                }
-            }
-            CliCommand::Branch { name, base, labels }
-        }
+        Some("branch") => parse_branch_subcommand(args),
         Some("list" | "ls") => CliCommand::List,
         Some("exec") => {
             // Parse: cella exec <branch> -- <cmd...>
@@ -202,66 +155,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
             }
             CliCommand::Up { branch, rebuild }
         }
-        Some("prune") => {
-            let mut dry_run = false;
-            let mut all = false;
-            let mut older_than = None;
-            let mut missing_worktree = false;
-            let mut labels = Vec::new();
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--dry-run" => {
-                        dry_run = true;
-                        i += 1;
-                    }
-                    "--all" => {
-                        all = true;
-                        i += 1;
-                    }
-                    "--missing-worktree" => {
-                        missing_worktree = true;
-                        i += 1;
-                    }
-                    "--older-than" => match args.get(i + 1) {
-                        Some(val) if !val.starts_with('-') => {
-                            older_than = Some(val.clone());
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!(
-                                "Error: --older-than requires a value (e.g., --older-than 7d)"
-                            );
-                            return CliCommand::Help;
-                        }
-                    },
-                    "--label" => match args.get(i + 1) {
-                        Some(val) if val.contains('=') => {
-                            labels.push(val.clone());
-                            i += 2;
-                        }
-                        _ => {
-                            eprintln!("Error: --label requires KEY=VALUE format");
-                            return CliCommand::Help;
-                        }
-                    },
-                    f if f.starts_with('-') => {
-                        eprintln!("Error: unknown flag '{f}' for prune command");
-                        return CliCommand::Help;
-                    }
-                    _ => {
-                        i += 1;
-                    }
-                }
-            }
-            CliCommand::Prune {
-                dry_run,
-                all,
-                older_than,
-                missing_worktree,
-                labels,
-            }
-        }
+        Some("prune") => parse_prune_subcommand(args),
         Some("task") => parse_task_subcommand(args),
         Some("switch") => {
             let branch = match args.get(2) {
@@ -275,6 +169,112 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         Some(cmd) => CliCommand::Unsupported {
             command: cmd.to_string(),
         },
+    }
+}
+
+fn parse_branch_subcommand(args: &[String]) -> CliCommand {
+    let name = match args.get(2) {
+        Some(n) if !n.starts_with('-') => n.clone(),
+        _ => return CliCommand::Help,
+    };
+    let mut base = None;
+    let mut labels = Vec::new();
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "--base" {
+            match args.get(i + 1) {
+                Some(val) if !val.starts_with('-') => {
+                    base = Some(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --base requires a value (e.g., --base main)");
+                    return CliCommand::Help;
+                }
+            }
+        } else if args[i] == "--label" {
+            match args.get(i + 1) {
+                Some(val) if val.contains('=') => {
+                    if val.starts_with("dev.cella.") || val.starts_with("devcontainer.") {
+                        eprintln!(
+                            "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
+                        );
+                        return CliCommand::Help;
+                    }
+                    labels.push(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --label requires KEY=VALUE format");
+                    return CliCommand::Help;
+                }
+            }
+        } else if args[i].starts_with('-') {
+            eprintln!("Error: unknown flag '{}' for branch command", args[i]);
+            return CliCommand::Help;
+        } else {
+            i += 1;
+        }
+    }
+    CliCommand::Branch { name, base, labels }
+}
+
+fn parse_prune_subcommand(args: &[String]) -> CliCommand {
+    let mut dry_run = false;
+    let mut all = false;
+    let mut older_than = None;
+    let mut missing_worktree = false;
+    let mut labels = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--missing-worktree" => {
+                missing_worktree = true;
+                i += 1;
+            }
+            "--older-than" => match args.get(i + 1) {
+                Some(val) if !val.starts_with('-') => {
+                    older_than = Some(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --older-than requires a value (e.g., --older-than 7d)");
+                    return CliCommand::Help;
+                }
+            },
+            "--label" => match args.get(i + 1) {
+                Some(val) if val.contains('=') => {
+                    labels.push(val.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("Error: --label requires KEY=VALUE format");
+                    return CliCommand::Help;
+                }
+            },
+            f if f.starts_with('-') => {
+                eprintln!("Error: unknown flag '{f}' for prune command");
+                return CliCommand::Help;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    CliCommand::Prune {
+        dry_run,
+        all,
+        older_than,
+        missing_worktree,
+        labels,
     }
 }
 
@@ -1347,7 +1347,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: false,
-                all: false
+                all: false,
+                ..
             }
         ));
     }
@@ -1364,7 +1365,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: true,
-                all: false
+                all: false,
+                ..
             }
         ));
     }
@@ -1381,7 +1383,8 @@ mod tests {
             cmd,
             CliCommand::Prune {
                 dry_run: false,
-                all: true
+                all: true,
+                ..
             }
         ));
     }
@@ -1805,6 +1808,7 @@ mod tests {
             CliCommand::Prune {
                 dry_run: true,
                 all: true,
+                ..
             }
         ));
     }

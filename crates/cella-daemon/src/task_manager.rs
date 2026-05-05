@@ -18,7 +18,7 @@ struct TaskOutput {
 }
 
 impl TaskOutput {
-    fn new(max_bytes: usize) -> Self {
+    const fn new(max_bytes: usize) -> Self {
         Self {
             buffer: VecDeque::new(),
             max_bytes,
@@ -202,16 +202,18 @@ impl TaskManager {
     pub async fn wait_for(&self, branch: &str) -> Option<i32> {
         let mut rx = self.tasks.get(branch)?.exit_watch.subscribe();
         // Check if already done
-        if let Some(code) = *rx.borrow() {
-            return Some(code);
+        let current = *rx.borrow_and_update();
+        if current.is_some() {
+            return current;
         }
         // Wait for the value to change
         loop {
             if rx.changed().await.is_err() {
                 return None;
             }
-            if let Some(code) = *rx.borrow() {
-                return Some(code);
+            let value = *rx.borrow_and_update();
+            if value.is_some() {
+                return value;
             }
         }
     }

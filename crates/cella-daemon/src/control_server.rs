@@ -873,17 +873,14 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             missing_worktree,
             labels,
         } => {
-            handle_prune_request(
-                &request_id,
+            let opts = PruneOpts {
                 dry_run,
                 all,
-                older_than.as_deref(),
+                older_than: older_than.as_deref(),
                 missing_worktree,
-                labels.as_deref(),
-                &wt,
-                writer,
-            )
-            .await?;
+                labels: labels.as_deref(),
+            };
+            handle_prune_request(&request_id, &opts, &wt, writer).await?;
         }
         AgentMessage::DownRequest {
             request_id,
@@ -1414,14 +1411,18 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+struct PruneOpts<'a> {
+    dry_run: bool,
+    all: bool,
+    older_than: Option<&'a str>,
+    missing_worktree: bool,
+    labels: Option<&'a [String]>,
+}
+
 /// Handle a `PruneRequest` by spawning `cella prune` as a subprocess.
 async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
-    dry_run: bool,
-    all: bool,
-    older_than: Option<&str>,
-    missing_worktree: bool,
-    labels: Option<&[String]>,
+    opts: &PruneOpts<'_>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -1429,19 +1430,19 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     cmd.arg("prune");
     forward_backend_flags(&mut cmd, wt).await;
     cmd.arg("--force").arg("--output").arg("json");
-    if dry_run {
+    if opts.dry_run {
         cmd.arg("--dry-run");
     }
-    if all {
+    if opts.all {
         cmd.arg("--all");
     }
-    if let Some(duration) = older_than {
+    if let Some(duration) = opts.older_than {
         cmd.arg("--older-than").arg(duration);
     }
-    if missing_worktree {
+    if opts.missing_worktree {
         cmd.arg("--missing-worktree");
     }
-    if let Some(lbls) = labels {
+    if let Some(lbls) = opts.labels {
         for label in lbls {
             cmd.arg("--label").arg(label);
         }

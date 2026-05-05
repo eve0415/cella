@@ -1426,6 +1426,9 @@ mod tests {
             request_id: "pr-1".to_string(),
             dry_run: true,
             all: false,
+            older_than: None,
+            missing_worktree: false,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
@@ -1441,6 +1444,9 @@ mod tests {
             request_id: "pr-2".to_string(),
             dry_run: false,
             all: true,
+            older_than: None,
+            missing_worktree: false,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
