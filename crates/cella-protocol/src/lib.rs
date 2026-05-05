@@ -125,6 +125,15 @@ pub enum AgentMessage {
         /// When true, include unmerged worktrees (not just merged ones).
         #[serde(default)]
         all: bool,
+        /// Only prune worktrees older than this duration (e.g. "7d", "24h").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        older_than: Option<String>,
+        /// Only prune worktrees whose git branch no longer exists.
+        #[serde(default)]
+        missing_worktree: bool,
+        /// Only prune worktrees matching these labels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
     },
     /// Stop (and optionally remove) a worktree branch's container.
     DownRequest {

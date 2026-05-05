@@ -55,6 +55,9 @@ pub enum CliCommand {
     Prune {
         dry_run: bool,
         all: bool,
+        older_than: Option<String>,
+        missing_worktree: bool,
+        labels: Vec<String>,
     },
     TaskRun {
         branch: String,
@@ -202,18 +205,62 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
         Some("prune") => {
             let mut dry_run = false;
             let mut all = false;
-            for arg in &args[2..] {
-                match arg.as_str() {
-                    "--dry-run" => dry_run = true,
-                    "--all" => all = true,
+            let mut older_than = None;
+            let mut missing_worktree = false;
+            let mut labels = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dry-run" => {
+                        dry_run = true;
+                        i += 1;
+                    }
+                    "--all" => {
+                        all = true;
+                        i += 1;
+                    }
+                    "--missing-worktree" => {
+                        missing_worktree = true;
+                        i += 1;
+                    }
+                    "--older-than" => match args.get(i + 1) {
+                        Some(val) if !val.starts_with('-') => {
+                            older_than = Some(val.clone());
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!(
+                                "Error: --older-than requires a value (e.g., --older-than 7d)"
+                            );
+                            return CliCommand::Help;
+                        }
+                    },
+                    "--label" => match args.get(i + 1) {
+                        Some(val) if val.contains('=') => {
+                            labels.push(val.clone());
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!("Error: --label requires KEY=VALUE format");
+                            return CliCommand::Help;
+                        }
+                    },
                     f if f.starts_with('-') => {
                         eprintln!("Error: unknown flag '{f}' for prune command");
                         return CliCommand::Help;
                     }
-                    _ => {}
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
-            CliCommand::Prune { dry_run, all }
+            CliCommand::Prune {
+                dry_run,
+                all,
+                older_than,
+                missing_worktree,
+                labels,
+            }
         }
         Some("task") => parse_task_subcommand(args),
         Some("switch") => {
@@ -325,7 +372,22 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
         } => run_down(&branch, rm, volumes, force).await,
         CliCommand::Up { branch, rebuild } => run_up(&branch, rebuild).await,
         CliCommand::Exec { branch, command } => run_exec(&branch, &command).await,
-        CliCommand::Prune { dry_run, all } => run_prune(dry_run, all).await,
+        CliCommand::Prune {
+            dry_run,
+            all,
+            older_than,
+            missing_worktree,
+            labels,
+        } => {
+            run_prune(
+                dry_run,
+                all,
+                older_than.as_deref(),
+                missing_worktree,
+                &labels,
+            )
+            .await
+        }
         CliCommand::TaskRun {
             branch,
             command,
@@ -856,6 +918,9 @@ async fn run_up(
 async fn run_prune(
     dry_run: bool,
     all: bool,
+    older_than: Option<&str>,
+    missing_worktree: bool,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
@@ -864,6 +929,13 @@ async fn run_prune(
         request_id: id.clone(),
         dry_run,
         all,
+        older_than: older_than.map(String::from),
+        missing_worktree,
+        labels: if labels.is_empty() {
+            None
+        } else {
+            Some(labels.to_vec())
+        },
     };
     client.send(&msg).await?;
 

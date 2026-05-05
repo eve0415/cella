@@ -869,8 +869,21 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             dry_run,
             all,
+            older_than,
+            missing_worktree,
+            labels,
         } => {
-            handle_prune_request(&request_id, dry_run, all, &wt, writer).await?;
+            handle_prune_request(
+                &request_id,
+                dry_run,
+                all,
+                older_than.as_deref(),
+                missing_worktree,
+                labels.as_deref(),
+                &wt,
+                writer,
+            )
+            .await?;
         }
         AgentMessage::DownRequest {
             request_id,
@@ -1406,6 +1419,9 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     dry_run: bool,
     all: bool,
+    older_than: Option<&str>,
+    missing_worktree: bool,
+    labels: Option<&[String]>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -1418,6 +1434,17 @@ async fn handle_prune_request<W: AsyncWriteExt + Unpin>(
     }
     if all {
         cmd.arg("--all");
+    }
+    if let Some(duration) = older_than {
+        cmd.arg("--older-than").arg(duration);
+    }
+    if missing_worktree {
+        cmd.arg("--missing-worktree");
+    }
+    if let Some(lbls) = labels {
+        for label in lbls {
+            cmd.arg("--label").arg(label);
+        }
     }
     if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);
