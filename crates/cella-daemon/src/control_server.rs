@@ -2037,10 +2037,43 @@ async fn handle_task_wait<W: AsyncWriteExt + Unpin>(
     task_mgr: &crate::task_manager::SharedTaskManager,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // We need to drop the lock while waiting, so clone what we need.
-    let exit_code = {
+    // Subscribe under the lock, then drop the lock before awaiting.
+    let rx = {
         let mgr = task_mgr.lock().await;
-        mgr.wait_for(branch).await
+        mgr.subscribe_exit(branch)
+    };
+
+    let exit_code = match rx {
+        Some(mut rx) => {
+            let current = *rx.borrow_and_update();
+            if current.is_some() {
+                current
+            } else {
+                loop {
+                    tokio::select! {
+                        result = rx.changed() => {
+                            if result.is_err() {
+                                break None;
+                            }
+                            let v = *rx.borrow_and_update();
+                            if v.is_some() {
+                                break v;
+                            }
+                        }
+                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                            send_message(
+                                writer,
+                                &DaemonMessage::TaskWaitHeartbeat {
+                                    request_id: request_id.to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+        None => None,
     };
 
     send_message(

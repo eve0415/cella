@@ -446,6 +446,8 @@ pub enum DaemonMessage {
     },
     /// Background task completed.
     TaskWaitResult { request_id: String, exit_code: i32 },
+    /// Keep-alive during `task wait` so the agent knows the connection is alive.
+    TaskWaitHeartbeat { request_id: String },
     /// Background task stopped.
     TaskStopResult { request_id: String },
     /// Stream channel is ready for TTY forwarding.

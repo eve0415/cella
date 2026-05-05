@@ -1080,8 +1080,9 @@ async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error + S
     };
     client.send(&msg).await?;
 
+    // 60s timeout resets on each heartbeat (daemon sends every 30s).
     loop {
-        let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
+        let resp = recv_timeout(&mut client, Duration::from_mins(1)).await?;
         if let DaemonMessage::TaskWaitResult { exit_code, .. } = resp {
             if exit_code != 0 {
                 eprintln!("Task '{branch}' exited with code {exit_code}");
@@ -1090,6 +1091,7 @@ async fn run_task_wait(branch: &str) -> Result<(), Box<dyn std::error::Error + S
             eprintln!("Task '{branch}' completed successfully.");
             return Ok(());
         }
+        // TaskWaitHeartbeat and other messages just reset the timeout.
     }
 }
 
