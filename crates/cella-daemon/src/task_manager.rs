@@ -323,7 +323,13 @@ async fn run_task_process(
     use tokio::io::AsyncBufReadExt;
 
     // When timeout is set, record the in-container PID for targeted cleanup.
-    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{}.pid", std::process::id()));
+    // Use a unique ID per task invocation to avoid collisions between concurrent
+    // tasks and stale files from prior runs.
+    let task_unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid_file = timeout_secs.map(|_| format!("/tmp/.cella-task-{task_unique_id}.pid"));
     let mut cmd = build_task_command(
         container_name,
         command,
@@ -394,6 +400,11 @@ async fn run_task_process(
 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
+
+    // Clean up PID file on normal exit so stale files don't accumulate.
+    if let Some(ref pf) = pid_file {
+        cleanup_pid_file(container_name, pf).await;
+    }
 
     // Only set if still running — stop_task may have already set 130.
     let _ =
@@ -474,6 +485,15 @@ async fn kill_task_by_pid_file(container_name: &str, pid_file: &str) {
     if let Err(e) = result {
         warn!("Failed to kill task process in '{container_name}': {e}");
     }
+}
+
+async fn cleanup_pid_file(container_name: &str, pid_file: &str) {
+    let _ = tokio::process::Command::new("docker")
+        .args(["exec", container_name, "rm", "-f", pid_file])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
 }
 
 #[cfg(test)]
