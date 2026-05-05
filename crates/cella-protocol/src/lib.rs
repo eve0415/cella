@@ -166,6 +166,8 @@ pub enum AgentMessage {
         command: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
     },
     /// List active background tasks.
     TaskListRequest { request_id: String },
@@ -1646,6 +1648,7 @@ mod tests {
             branch: "feat/auth".to_string(),
             command: vec!["claude".to_string(), "-p".to_string(), "test".to_string()],
             base: None,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"task_run_request\""));
