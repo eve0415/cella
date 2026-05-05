@@ -2024,11 +2024,13 @@ async fn handle_task_run<W: AsyncWriteExt + Unpin>(
     let task_id = {
         let mut mgr = wt.task_mgr.lock().await;
         let cella_bin = Some(wt.cella_bin.to_path_buf());
+        let backend_args = collect_backend_args(wt).await;
         match mgr.start_task(
             branch,
             container_name.clone(),
             command.to_vec(),
             cella_bin,
+            backend_args,
             timeout_secs,
         ) {
             Ok(id) => id,
@@ -2554,6 +2556,23 @@ async fn forward_backend_flags(cmd: &mut tokio::process::Command, wt: &WorktreeH
             cmd.arg("--docker-host").arg(dh);
         }
     }
+}
+
+async fn collect_backend_args(wt: &WorktreeHandlerCtx<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    let handles = wt.container_handles.lock().await;
+    if let Some(handle) = handles.get(wt.container_name) {
+        if let Some(ref kind) = handle.backend_kind {
+            args.push("--backend".to_string());
+            args.push(kind.clone());
+        }
+        if let Some(ref dh) = handle.docker_host {
+            args.push("--docker-host".to_string());
+            args.push(dh.clone());
+        }
+    }
+    drop(handles);
+    args
 }
 
 /// Resolve the backend CLI binary name and Docker host from the calling container's handle.

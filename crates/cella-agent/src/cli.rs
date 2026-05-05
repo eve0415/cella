@@ -1720,6 +1720,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_task_run_with_timeout() {
+        let args: Vec<String> = [
+            "cella",
+            "task",
+            "run",
+            "feat/ci",
+            "--timeout",
+            "300",
+            "--",
+            "cargo",
+            "test",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(
+            matches!(cmd, CliCommand::TaskRun { branch, command, timeout_secs, .. }
+                if branch == "feat/ci"
+                    && command == ["cargo", "test"]
+                    && timeout_secs == Some(300))
+        );
+    }
+
+    #[test]
+    fn parse_task_run_invalid_timeout_shows_help() {
+        let args: Vec<String> = [
+            "cella",
+            "task",
+            "run",
+            "feat/ci",
+            "--timeout",
+            "abc",
+            "--",
+            "echo",
+            "hi",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cmd = parse_cli_args(&args);
+        assert!(matches!(cmd, CliCommand::Help));
+    }
+
+    #[test]
     fn parse_task_run_missing_command_shows_help() {
         let args: Vec<String> = ["cella", "task", "run", "feat/ci"]
             .iter()
