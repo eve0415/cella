@@ -1157,6 +1157,9 @@ async fn handle_list_request<W: AsyncWriteExt + Unpin>(
         {
             wt.container_name = Some(c.name.clone());
             wt.container_state = Some(c.state.clone());
+            if let Some(ref label) = c.branch_label {
+                wt.branch = Some(label.clone());
+            }
         }
     }
 
@@ -1245,6 +1248,7 @@ struct CellaContainer {
     name: String,
     state: String,
     workspace_path: Option<String>,
+    branch_label: Option<String>,
 }
 
 /// List all cella-managed containers with their workspace paths.
@@ -1257,7 +1261,7 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
             "--filter",
             "label=dev.cella.tool=cella",
             "--format",
-            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}",
+            "{{.Names}}\t{{.State}}\t{{.Label \"dev.cella.workspace_path\"}}\t{{.Label \"dev.cella.branch\"}}",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1276,10 +1280,14 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
         .lines()
         .filter(|line| !line.is_empty())
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let name = parts.next()?.to_string();
             let state = parts.next()?.to_string();
             let ws = parts
+                .next()
+                .map(ToString::to_string)
+                .filter(|s| !s.is_empty());
+            let branch = parts
                 .next()
                 .map(ToString::to_string)
                 .filter(|s| !s.is_empty());
@@ -1287,6 +1295,7 @@ async fn list_cella_containers() -> Vec<CellaContainer> {
                 name,
                 state,
                 workspace_path: ws,
+                branch_label: branch,
             })
         })
         .collect()
