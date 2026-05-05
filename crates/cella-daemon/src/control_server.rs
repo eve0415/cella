@@ -1889,7 +1889,7 @@ async fn handle_task_list<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     let tasks = {
-        let infos = task_mgr.lock().await.list_tasks().await;
+        let infos = task_mgr.lock().await.list_tasks();
         infos
             .into_iter()
             .map(|t| cella_protocol::TaskEntry {
@@ -2008,27 +2008,20 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
         )
         .await?;
     } else {
-        // Snapshot mode: dump available output and return.
+        // Snapshot mode: dump available output and signal stream complete.
         let output = task_mgr
             .lock()
             .await
             .get_output(branch)
             .await
             .unwrap_or_default();
-        let is_done = task_mgr
-            .lock()
-            .await
-            .list_tasks()
-            .await
-            .iter()
-            .any(|t| t.branch == branch && t.is_done);
 
         send_message(
             writer,
             &DaemonMessage::TaskLogsData {
                 request_id: request_id.to_string(),
                 data: output,
-                done: is_done,
+                done: true,
             },
         )
         .await?;
