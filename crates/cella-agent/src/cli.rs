@@ -35,6 +35,7 @@ pub enum CliCommand {
     Branch {
         name: String,
         base: Option<String>,
+        labels: Vec<String>,
     },
     List,
     Down {
@@ -94,6 +95,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                 }
             };
             let mut base = None;
+            let mut labels = Vec::new();
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "--base" {
@@ -107,6 +109,23 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                             return CliCommand::Help;
                         }
                     }
+                } else if args[i] == "--label" {
+                    match args.get(i + 1) {
+                        Some(val) if val.contains('=') => {
+                            if val.starts_with("dev.cella.") || val.starts_with("devcontainer.") {
+                                eprintln!(
+                                    "Error: reserved label prefix in '{val}' (dev.cella.* and devcontainer.* are reserved)"
+                                );
+                                return CliCommand::Help;
+                            }
+                            labels.push(val.clone());
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!("Error: --label requires KEY=VALUE format");
+                            return CliCommand::Help;
+                        }
+                    }
                 } else if args[i].starts_with('-') {
                     eprintln!("Error: unknown flag '{}' for branch command", args[i]);
                     return CliCommand::Help;
@@ -114,7 +133,7 @@ pub fn parse_cli_args(args: &[String]) -> CliCommand {
                     i += 1;
                 }
             }
-            CliCommand::Branch { name, base }
+            CliCommand::Branch { name, base, labels }
         }
         Some("list" | "ls") => CliCommand::List,
         Some("exec") => {
@@ -294,7 +313,9 @@ pub async fn run(command: CliCommand) -> Result<(), Box<dyn std::error::Error + 
             print_unsupported(&command);
             std::process::exit(1);
         }
-        CliCommand::Branch { name, base } => run_branch(&name, base.as_deref()).await,
+        CliCommand::Branch { name, base, labels } => {
+            run_branch(&name, base.as_deref(), &labels).await
+        }
         CliCommand::List => run_list().await,
         CliCommand::Down {
             branch,
@@ -605,6 +626,7 @@ mod doctor_tests {
 async fn run_branch(
     name: &str,
     base: Option<&str>,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = connect_daemon().await?;
 
@@ -613,6 +635,11 @@ async fn run_branch(
         request_id: id.clone(),
         branch: name.to_string(),
         base: base.map(String::from),
+        labels: if labels.is_empty() {
+            None
+        } else {
+            Some(labels.to_vec())
+        },
     };
     client.send(&msg).await?;
 
@@ -1154,7 +1181,7 @@ mod tests {
         ];
         let cmd = parse_cli_args(&args);
         assert!(
-            matches!(cmd, CliCommand::Branch { name, base } if name == "feat/auth" && base.is_none())
+            matches!(cmd, CliCommand::Branch { name, base, .. } if name == "feat/auth" && base.is_none())
         );
     }
 
@@ -1168,7 +1195,7 @@ mod tests {
             "main".to_string(),
         ];
         let cmd = parse_cli_args(&args);
-        assert!(matches!(cmd, CliCommand::Branch { name, base }
+        assert!(matches!(cmd, CliCommand::Branch { name, base, .. }
             if name == "feat/auth" && base.as_deref() == Some("main")));
     }
 

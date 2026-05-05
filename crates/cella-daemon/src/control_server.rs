@@ -845,8 +845,17 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             request_id,
             branch,
             base,
+            labels,
         } => {
-            handle_branch_request(&request_id, &branch, base.as_deref(), &wt, writer).await?;
+            handle_branch_request(
+                &request_id,
+                &branch,
+                base.as_deref(),
+                labels.as_deref(),
+                &wt,
+                writer,
+            )
+            .await?;
         }
         AgentMessage::ListRequest { request_id } => {
             handle_list_request(&request_id, wt.workspace_path, writer).await?;
@@ -918,6 +927,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     branch: &str,
     base: Option<&str>,
+    labels: Option<&[String]>,
     wt: &WorktreeHandlerCtx<'_>,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
@@ -947,6 +957,11 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     cmd.arg(branch).arg("--output").arg("json");
     if let Some(b) = base {
         cmd.arg("--base").arg(b);
+    }
+    if let Some(lbls) = labels {
+        for label in lbls {
+            cmd.arg("--label").arg(label);
+        }
     }
     if let Some(ws) = wt.workspace_path {
         cmd.current_dir(ws);

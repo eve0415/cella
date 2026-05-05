@@ -104,6 +104,8 @@ pub enum AgentMessage {
         branch: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
     },
     /// Request to list worktree branches and their container status.
     ListRequest { request_id: String },
@@ -1219,12 +1221,13 @@ mod tests {
             request_id: "br-1".to_string(),
             branch: "feat/auth".to_string(),
             base: Some("main".to_string()),
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"branch_request\""));
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
         assert!(
-            matches!(decoded, AgentMessage::BranchRequest { request_id, branch, base }
+            matches!(decoded, AgentMessage::BranchRequest { request_id, branch, base, .. }
                 if request_id == "br-1" && branch == "feat/auth" && base.as_deref() == Some("main"))
         );
     }
@@ -1235,6 +1238,7 @@ mod tests {
             request_id: "br-2".to_string(),
             branch: "fix/bug".to_string(),
             base: None,
+            labels: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // base=None should be omitted
