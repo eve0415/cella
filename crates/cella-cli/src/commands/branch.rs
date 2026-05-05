@@ -110,6 +110,12 @@ impl BranchArgs {
         freshly_created: bool,
         progress: &crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !freshly_created && !self.labels.is_empty() {
+            progress.warn(
+                "Branch already exists, --label flags ignored (container labels are immutable)",
+            );
+        }
+
         // Prepare worktree-specific labels + user-supplied labels
         let mut extra_labels = worktree_labels(&self.name, repo_root);
         for label in &self.labels {
@@ -142,22 +148,8 @@ impl BranchArgs {
         )
         .await;
 
-        // For freshly-created worktrees, remove any leftover container from a
-        // previous failed attempt so ensure_up always runs the full first-create
-        // path (lifecycle hooks, tool setup, etc.).
-        // For existing worktrees (idempotent path), let ensure_up decide whether
-        // to reuse or rebuild the container based on config hash.
-        if freshly_created && let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
-            if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
-                && mgmt_sock.exists()
-            {
-                let req = cella_protocol::ManagementRequest::DeregisterContainer {
-                    container_name: existing.name.clone(),
-                };
-                let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
-            }
-            let _ = ctx.client.stop_container(&existing.id).await;
-            let _ = ctx.client.remove_container(&existing.id, false).await;
+        if freshly_created {
+            remove_leftover_container(&ctx, wt_path).await;
         }
 
         let create_result = if ctx.is_compose() {
@@ -223,6 +215,23 @@ impl BranchArgs {
         }
 
         Ok(())
+    }
+}
+
+/// Remove leftover container from a previous failed attempt so `ensure_up`
+/// runs the full first-create path (lifecycle hooks, tool setup, etc.).
+async fn remove_leftover_container(ctx: &UpContext, wt_path: &std::path::Path) {
+    if let Ok(Some(existing)) = ctx.client.find_container(wt_path).await {
+        if let Some(mgmt_sock) = cella_env::paths::daemon_socket_path()
+            && mgmt_sock.exists()
+        {
+            let req = cella_protocol::ManagementRequest::DeregisterContainer {
+                container_name: existing.name.clone(),
+            };
+            let _ = cella_daemon_client::send_management_request(&mgmt_sock, &req).await;
+        }
+        let _ = ctx.client.stop_container(&existing.id).await;
+        let _ = ctx.client.remove_container(&existing.id, false).await;
     }
 }
 

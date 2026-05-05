@@ -362,6 +362,8 @@ async fn handle_agent_connection_after_hello(
                     AgentMessage::BranchRequest { .. }
                         | AgentMessage::ListRequest { .. }
                         | AgentMessage::ExecRequest { .. }
+                        | AgentMessage::ExecCaptureRequest { .. }
+                        | AgentMessage::DoctorRequest { .. }
                         | AgentMessage::PruneRequest { .. }
                         | AgentMessage::DownRequest { .. }
                         | AgentMessage::UpRequest { .. }
@@ -731,6 +733,8 @@ pub(crate) async fn handle_agent_message(
         AgentMessage::BranchRequest { .. }
         | AgentMessage::ListRequest { .. }
         | AgentMessage::ExecRequest { .. }
+        | AgentMessage::ExecCaptureRequest { .. }
+        | AgentMessage::DoctorRequest { .. }
         | AgentMessage::PruneRequest { .. }
         | AgentMessage::DownRequest { .. }
         | AgentMessage::UpRequest { .. }
@@ -865,6 +869,14 @@ async fn handle_worktree_message<W: AsyncWriteExt + Unpin>(
             branch,
             command,
         } => handle_exec_request(&request_id, &branch, &command, &wt, writer).await?,
+        AgentMessage::ExecCaptureRequest {
+            request_id,
+            branch,
+            command,
+        } => handle_exec_capture(&request_id, &branch, &command, &wt, writer).await?,
+        AgentMessage::DoctorRequest { request_id } => {
+            handle_doctor_request(&request_id, &wt, writer).await?;
+        }
         AgentMessage::PruneRequest {
             request_id,
             dry_run,
@@ -955,7 +967,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
         &DaemonMessage::OperationProgress {
             request_id: request_id.to_string(),
             step: "starting".to_string(),
-            message: format!("Creating worktree branch '{branch}'..."),
+            message: format!("Ensuring worktree branch '{branch}'..."),
         },
     )
     .await?;
@@ -1404,6 +1416,94 @@ async fn handle_exec_request<W: AsyncWriteExt + Unpin>(
         &DaemonMessage::ExecResult {
             request_id: request_id.to_string(),
             exit_code: status.code().unwrap_or(1),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `ExecCaptureRequest`: run command, capture stdout/stderr separately.
+async fn handle_exec_capture<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    command: &[String],
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let container_name = find_container_for_branch(branch, wt).await;
+    let Some(container_name) = container_name else {
+        send_message(
+            writer,
+            &DaemonMessage::ExecCaptureResult {
+                request_id: request_id.to_string(),
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("No running container found for branch '{branch}'\n"),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let mut cmd = tokio::process::Command::new(wt.cella_bin);
+    cmd.arg("exec");
+    forward_backend_flags(&mut cmd, wt).await;
+    cmd.arg("--container-name").arg(&container_name).arg("--");
+    for arg in command {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().await.map_err(|e| CellaDaemonError::Protocol {
+        message: format!("failed to spawn cella exec: {e}"),
+    })?;
+
+    send_message(
+        writer,
+        &DaemonMessage::ExecCaptureResult {
+            request_id: request_id.to_string(),
+            exit_code: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle `DoctorRequest`: return structured daemon health data.
+async fn handle_doctor_request<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    wt: &WorktreeHandlerCtx<'_>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    let handles = wt.container_handles.lock().await;
+    let container_count = handles.len();
+    let containers: Vec<serde_json::Value> = handles
+        .iter()
+        .map(|(name, h)| {
+            serde_json::json!({
+                "container_name": name,
+                "agent_connected": h.agent_tx.is_some(),
+            })
+        })
+        .collect();
+    drop(handles);
+
+    let task_count = wt.task_mgr.lock().await.list_tasks().len();
+
+    let data = serde_json::json!({
+        "daemon_version": env!("CARGO_PKG_VERSION"),
+        "container_count": container_count,
+        "containers": containers,
+        "task_count": task_count,
+    });
+
+    send_message(
+        writer,
+        &DaemonMessage::DoctorResult {
+            request_id: request_id.to_string(),
+            data,
         },
     )
     .await?;
@@ -1889,7 +1989,7 @@ async fn handle_task_list<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     let tasks = {
-        let infos = task_mgr.lock().await.list_tasks().await;
+        let infos = task_mgr.lock().await.list_tasks();
         infos
             .into_iter()
             .map(|t| cella_protocol::TaskEntry {
@@ -1932,32 +2032,62 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
     if follow {
-        // Send existing output snapshot first.
-        let snapshot = task_mgr
+        stream_task_logs_follow(request_id, branch, task_mgr, writer).await?;
+    } else {
+        let output = task_mgr
             .lock()
             .await
             .get_output(branch)
             .await
             .unwrap_or_default();
-        if !snapshot.is_empty() {
-            send_message(
-                writer,
-                &DaemonMessage::TaskLogsData {
-                    request_id: request_id.to_string(),
-                    data: snapshot,
-                    done: false,
-                },
-            )
-            .await?;
-        }
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: output,
+                done: true,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-        // Subscribe and stream live output until task completes.
-        let mgr = task_mgr.lock().await;
-        let rx = mgr.subscribe(branch);
-        let exit_rx = mgr.subscribe_exit(branch);
-        drop(mgr);
+/// Stream task output in follow mode, handling snapshot + live output + completion.
+async fn stream_task_logs_follow<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    branch: &str,
+    task_mgr: &crate::task_manager::SharedTaskManager,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // Subscribe before snapshot to avoid losing output between the two.
+    let mgr = task_mgr.lock().await;
+    let rx = mgr.subscribe(branch);
+    let exit_rx = mgr.subscribe_exit(branch);
+    drop(mgr);
 
-        if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
+    let snapshot = task_mgr
+        .lock()
+        .await
+        .get_output(branch)
+        .await
+        .unwrap_or_default();
+    if !snapshot.is_empty() {
+        send_message(
+            writer,
+            &DaemonMessage::TaskLogsData {
+                request_id: request_id.to_string(),
+                data: snapshot,
+                done: false,
+            },
+        )
+        .await?;
+    }
+
+    if let (Some(mut rx), Some(mut exit_rx)) = (rx, exit_rx) {
+        if exit_rx.borrow().is_some() {
+            drain_broadcast(request_id, &mut rx, writer).await?;
+        } else {
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -1980,60 +2110,42 @@ async fn handle_task_logs<W: AsyncWriteExt + Unpin>(
                         }
                     }
                     _ = exit_rx.changed() => {
-                        // Drain remaining broadcast messages
-                        while let Ok(chunk) = rx.try_recv() {
-                            send_message(
-                                writer,
-                                &DaemonMessage::TaskLogsData {
-                                    request_id: request_id.to_string(),
-                                    data: chunk,
-                                    done: false,
-                                },
-                            )
-                            .await?;
-                        }
+                        drain_broadcast(request_id, &mut rx, writer).await?;
                         break;
                     }
                 }
             }
         }
+    }
 
+    send_message(
+        writer,
+        &DaemonMessage::TaskLogsData {
+            request_id: request_id.to_string(),
+            data: String::new(),
+            done: true,
+        },
+    )
+    .await
+}
+
+/// Drain remaining buffered broadcast messages.
+async fn drain_broadcast<W: AsyncWriteExt + Unpin>(
+    request_id: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<String>,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    while let Ok(chunk) = rx.try_recv() {
         send_message(
             writer,
             &DaemonMessage::TaskLogsData {
                 request_id: request_id.to_string(),
-                data: String::new(),
-                done: true,
-            },
-        )
-        .await?;
-    } else {
-        // Snapshot mode: dump available output and return.
-        let output = task_mgr
-            .lock()
-            .await
-            .get_output(branch)
-            .await
-            .unwrap_or_default();
-        let is_done = task_mgr
-            .lock()
-            .await
-            .list_tasks()
-            .await
-            .iter()
-            .any(|t| t.branch == branch && t.is_done);
-
-        send_message(
-            writer,
-            &DaemonMessage::TaskLogsData {
-                request_id: request_id.to_string(),
-                data: output,
-                done: is_done,
+                data: chunk,
+                done: false,
             },
         )
         .await?;
     }
-
     Ok(())
 }
 
@@ -2044,10 +2156,43 @@ async fn handle_task_wait<W: AsyncWriteExt + Unpin>(
     task_mgr: &crate::task_manager::SharedTaskManager,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // We need to drop the lock while waiting, so clone what we need.
-    let exit_code = {
+    // Subscribe under the lock, then drop the lock before awaiting.
+    let rx = {
         let mgr = task_mgr.lock().await;
-        mgr.wait_for(branch).await
+        mgr.subscribe_exit(branch)
+    };
+
+    let exit_code = match rx {
+        Some(mut rx) => {
+            let current = *rx.borrow_and_update();
+            if current.is_some() {
+                current
+            } else {
+                loop {
+                    tokio::select! {
+                        result = rx.changed() => {
+                            if result.is_err() {
+                                break None;
+                            }
+                            let v = *rx.borrow_and_update();
+                            if v.is_some() {
+                                break v;
+                            }
+                        }
+                        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                            send_message(
+                                writer,
+                                &DaemonMessage::TaskWaitHeartbeat {
+                                    request_id: request_id.to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+        None => None,
     };
 
     send_message(

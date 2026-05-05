@@ -5,9 +5,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+/// Sentinel value: task is still running (no valid exit code uses -1 on Unix).
+const EXIT_RUNNING: i32 = -1;
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB
 
@@ -60,8 +64,10 @@ struct TaskState {
     started_at: std::time::Instant,
     /// Captured output (stdout + stderr interleaved, ring buffer).
     output: Arc<Mutex<TaskOutput>>,
-    /// Set when the task completes.
-    exit_code: Arc<Mutex<Option<i32>>>,
+    /// `EXIT_RUNNING` (-1) while task is active; real exit code once done.
+    exit_code: Arc<AtomicI32>,
+    /// PID of the child `docker exec` process (0 = not yet known).
+    child_pid: Arc<AtomicU32>,
     /// Handle to abort the task.
     abort_handle: tokio::task::AbortHandle,
     /// Broadcast channel for live output streaming.
@@ -102,7 +108,7 @@ impl TaskManager {
         command: Vec<String>,
     ) -> Result<String, String> {
         if let Some(existing) = self.tasks.get(branch) {
-            if existing.exit_code.try_lock().map_or(true, |g| g.is_none()) {
+            if existing.exit_code.load(Ordering::Acquire) == EXIT_RUNNING {
                 return Err(format!("task already running for branch '{branch}'"));
             }
             self.tasks.remove(branch);
@@ -110,12 +116,14 @@ impl TaskManager {
 
         let task_id = branch.to_string();
         let output = Arc::new(Mutex::new(TaskOutput::new(MAX_OUTPUT_BYTES)));
-        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let exit_code = Arc::new(AtomicI32::new(EXIT_RUNNING));
+        let child_pid = Arc::new(AtomicU32::new(0));
         let (output_tx, _) = tokio::sync::broadcast::channel(1024);
         let (exit_watch, _) = tokio::sync::watch::channel(None);
 
         let output_clone = output.clone();
         let exit_code_clone = exit_code.clone();
+        let child_pid_clone = child_pid.clone();
         let output_tx_clone = output_tx.clone();
         let exit_watch_clone = exit_watch.clone();
         let container = container_name.clone();
@@ -127,6 +135,7 @@ impl TaskManager {
                 &cmd,
                 &output_clone,
                 &exit_code_clone,
+                &child_pid_clone,
                 &output_tx_clone,
                 &exit_watch_clone,
             )
@@ -140,6 +149,7 @@ impl TaskManager {
             started_at: std::time::Instant::now(),
             output,
             exit_code,
+            child_pid,
             abort_handle: handle.abort_handle(),
             output_tx,
             exit_watch,
@@ -151,18 +161,19 @@ impl TaskManager {
     }
 
     /// List all tasks with their current info.
-    pub async fn list_tasks(&self) -> Vec<TaskInfo> {
+    pub fn list_tasks(&self) -> Vec<TaskInfo> {
         let mut infos = Vec::with_capacity(self.tasks.len());
         for (id, state) in &self.tasks {
-            let exit = *state.exit_code.lock().await;
+            let code = state.exit_code.load(Ordering::Acquire);
+            let done = code != EXIT_RUNNING;
             infos.push(TaskInfo {
                 task_id: id.clone(),
                 branch: state.branch.clone(),
                 container_name: state.container_name.clone(),
                 command: state.command.clone(),
                 elapsed_secs: state.started_at.elapsed().as_secs(),
-                is_done: exit.is_some(),
-                exit_code: exit,
+                is_done: done,
+                exit_code: if done { Some(code) } else { None },
             });
         }
         infos
@@ -182,12 +193,10 @@ impl TaskManager {
     }
 
     /// Check if a task is done.
-    pub async fn is_done(&self, branch: &str) -> bool {
-        if let Some(state) = self.tasks.get(branch) {
-            state.exit_code.lock().await.is_some()
-        } else {
-            true // no task = done
-        }
+    pub fn is_done(&self, branch: &str) -> bool {
+        self.tasks
+            .get(branch)
+            .is_none_or(|state| state.exit_code.load(Ordering::Acquire) != EXIT_RUNNING)
     }
 
     /// Get captured output for a task.
@@ -196,52 +205,43 @@ impl TaskManager {
         Some(state.output.lock().await.contents())
     }
 
-    /// Wait for a task to complete, returning its exit code.
-    ///
-    /// Uses a watch channel so it doesn't hold any lock while waiting.
-    pub async fn wait_for(&self, branch: &str) -> Option<i32> {
-        let mut rx = self.tasks.get(branch)?.exit_watch.subscribe();
-        // Check if already done
-        let current = *rx.borrow_and_update();
-        if current.is_some() {
-            return current;
-        }
-        // Wait for the value to change
-        loop {
-            if rx.changed().await.is_err() {
-                return None;
-            }
-            let value = *rx.borrow_and_update();
-            if value.is_some() {
-                return value;
-            }
-        }
-    }
-
-    /// Stop a running task.
+    /// Stop a running task. Only sets exit code 130 if still running.
     pub async fn stop_task(&mut self, branch: &str) -> bool {
-        if let Some(state) = self.tasks.get(branch) {
-            state.abort_handle.abort();
-            *state.exit_code.lock().await = Some(130);
-            let _ = state.exit_watch.send(Some(130));
-            info!("Stopped task '{branch}'");
-            true
-        } else {
-            false
+        let Some(state) = self.tasks.get(branch) else {
+            return false;
+        };
+
+        // Only stop if still running — never overwrite a completed exit code.
+        if state
+            .exit_code
+            .compare_exchange(EXIT_RUNNING, 130, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
         }
+
+        // Kill the child process with SIGTERM.
+        let pid = state.child_pid.load(Ordering::Acquire);
+        if pid != 0 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid.cast_signed()),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+
+        // Give the process 2s to exit gracefully, then abort the Tokio task.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        state.abort_handle.abort();
+
+        let _ = state.exit_watch.send(Some(130));
+        info!("Stopped task '{branch}'");
+        true
     }
 
     /// Remove completed tasks.
-    pub async fn cleanup_done(&mut self) {
-        let mut to_remove = Vec::new();
-        for (id, state) in &self.tasks {
-            if state.exit_code.lock().await.is_some() {
-                to_remove.push(id.clone());
-            }
-        }
-        for id in to_remove {
-            self.tasks.remove(&id);
-        }
+    pub fn cleanup_done(&mut self) {
+        self.tasks
+            .retain(|_, state| state.exit_code.load(Ordering::Acquire) == EXIT_RUNNING);
     }
 }
 
@@ -250,7 +250,8 @@ async fn run_task_process(
     container_name: &str,
     command: &[String],
     output: &Arc<Mutex<TaskOutput>>,
-    exit_code: &Arc<Mutex<Option<i32>>>,
+    exit_code: &Arc<AtomicI32>,
+    child_pid: &Arc<AtomicU32>,
     output_tx: &tokio::sync::broadcast::Sender<String>,
     exit_watch: &tokio::sync::watch::Sender<Option<i32>>,
 ) {
@@ -268,7 +269,7 @@ async fn run_task_process(
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to spawn task process: {e}");
-            *exit_code.lock().await = Some(1);
+            exit_code.store(1, Ordering::Release);
             let _ = exit_watch.send(Some(1));
             let error_line = format!("Error: failed to spawn: {e}\n");
             output.lock().await.push(&error_line);
@@ -276,6 +277,8 @@ async fn run_task_process(
             return;
         }
     };
+
+    child_pid.store(child.id().unwrap_or(0), Ordering::Release);
 
     // Read stdout and stderr concurrently
     let child_stdout = child.stdout.take();
@@ -312,7 +315,8 @@ async fn run_task_process(
 
     let status = child.wait().await;
     let code = status.map_or(1, |s| s.code().unwrap_or(1));
-    *exit_code.lock().await = Some(code);
+    // Only set if still running — stop_task may have already set 130.
+    let _ = exit_code.compare_exchange(EXIT_RUNNING, code, Ordering::AcqRel, Ordering::Acquire);
     let _ = exit_watch.send(Some(code));
     info!("Task in '{container_name}' exited with code {code}");
 }
@@ -363,7 +367,7 @@ mod tests {
             .unwrap();
         mgr.start_task("b2", "ctr".into(), vec!["b".into()])
             .unwrap();
-        let list = mgr.list_tasks().await;
+        let list = mgr.list_tasks();
         assert_eq!(list.len(), 2);
     }
 
@@ -372,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn list_tasks_empty() {
         let mgr = manager();
-        assert!(mgr.list_tasks().await.is_empty());
+        assert!(mgr.list_tasks().is_empty());
     }
 
     #[tokio::test]
@@ -384,7 +388,7 @@ mod tests {
             vec!["cargo".into(), "test".into()],
         )
         .unwrap();
-        let tasks = mgr.list_tasks().await;
+        let tasks = mgr.list_tasks();
         assert_eq!(tasks.len(), 1);
 
         let t = &tasks[0];
@@ -417,7 +421,7 @@ mod tests {
     async fn is_done_returns_true_for_unknown_branch() {
         let mgr = manager();
         // "no task = done" per the implementation.
-        assert!(mgr.is_done("nonexistent").await);
+        assert!(mgr.is_done("nonexistent"));
     }
 
     #[tokio::test]
@@ -430,7 +434,7 @@ mod tests {
         // We check immediately, so it should still be false.
         // NOTE: there is a race, but it is extremely unlikely the spawned task
         // resolves before this line executes.
-        assert!(!mgr.is_done("br").await);
+        assert!(!mgr.is_done("br"));
     }
 
     // -- get_output --
@@ -459,51 +463,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_task_returns_true_and_sets_exit_130() {
+    async fn stop_task_on_already_completed_returns_false() {
         let mut mgr = manager();
         mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
-        assert!(mgr.stop_task("br").await);
-
-        // After stop, the task should be marked as done with exit code 130.
-        assert!(mgr.is_done("br").await);
-        let tasks = mgr.list_tasks().await;
+        // In CI docker is unavailable, so the task exits almost immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Task already completed — stop must not overwrite exit code.
+        assert!(!mgr.stop_task("br").await);
+        assert!(mgr.is_done("br"));
+        let tasks = mgr.list_tasks();
         let t = tasks.iter().find(|t| t.task_id == "br").unwrap();
-        assert_eq!(t.exit_code, Some(130));
+        assert_eq!(t.exit_code, Some(1));
     }
 
     // -- cleanup_done --
 
     #[tokio::test]
-    async fn cleanup_done_removes_stopped_tasks() {
+    async fn cleanup_done_removes_completed_tasks() {
         let mut mgr = manager();
         mgr.start_task("a", "c".into(), vec!["x".into()]).unwrap();
         mgr.start_task("b", "c".into(), vec!["x".into()]).unwrap();
-
-        // Stop only "a"
-        mgr.stop_task("a").await;
-        mgr.cleanup_done().await;
-
-        let tasks = mgr.list_tasks().await;
-        // "a" removed, "b" still present.
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task_id, "b");
+        // Let both tasks finish (docker unavailable → exit 1).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        mgr.cleanup_done();
+        assert!(mgr.list_tasks().is_empty());
     }
 
     #[tokio::test]
     async fn cleanup_done_on_empty_manager_is_noop() {
         let mut mgr = manager();
-        mgr.cleanup_done().await;
-        assert!(mgr.list_tasks().await.is_empty());
+        mgr.cleanup_done();
+        assert!(mgr.list_tasks().is_empty());
     }
 
     // -- start_task after completion --
 
     #[tokio::test]
-    async fn start_task_after_stop_succeeds() {
+    async fn start_task_after_completion_succeeds() {
         let mut mgr = manager();
         mgr.start_task("br", "c".into(), vec!["x".into()]).unwrap();
-        mgr.stop_task("br").await;
-        // Task is done (exit_code=130), re-run should succeed
+        // Let task finish (docker unavailable → exit 1).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(mgr.is_done("br"));
         let id = mgr
             .start_task("br", "c".into(), vec!["echo".into()])
             .unwrap();
@@ -520,15 +521,6 @@ mod tests {
             .start_task("br", "c".into(), vec!["echo".into()])
             .unwrap_err();
         assert!(err.contains("already running"));
-    }
-
-    // -- wait_for --
-
-    #[tokio::test]
-    async fn wait_for_returns_none_for_unknown() {
-        let mgr = manager();
-        // Unknown branch returns None immediately (no state to poll).
-        assert!(mgr.wait_for("ghost").await.is_none());
     }
 
     // -- TaskOutput ring buffer --
