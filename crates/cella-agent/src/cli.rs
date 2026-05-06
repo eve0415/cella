@@ -639,6 +639,8 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let agent_version = env!("CARGO_PKG_VERSION");
     eprintln!("cella doctor (in-container, agent v{agent_version})\n");
 
+    let mut has_failures = false;
+
     // 1. .daemon_addr file
     let daemon_addr_exists = std::path::Path::new("/cella/.daemon_addr").exists();
     if daemon_addr_exists {
@@ -646,6 +648,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         eprintln!("  \u{2717} daemon address file not found (/cella/.daemon_addr)");
         eprintln!("    Run `cella up` on the host to fix");
+        has_failures = true;
     }
 
     // 2. Resolve connection info (file is authoritative, env vars are fallback)
@@ -659,7 +662,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         eprintln!("  \u{2717} no connection info available");
         eprintln!("    Set CELLA_DAEMON_ADDR or ensure .daemon_addr exists");
-        return Ok(());
+        std::process::exit(1);
     };
 
     // 3. Daemon connectivity
@@ -685,6 +688,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Err(e) => {
             eprintln!("  \u{2717} daemon unreachable at {addr}: {e}");
+            has_failures = true;
         }
     }
 
@@ -700,11 +704,25 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     eprintln!();
+    if has_failures {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
 async fn run_doctor_json() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut client = connect_daemon().await?;
+    let mut client = match connect_daemon().await {
+        Ok(c) => c,
+        Err(e) => {
+            let error = serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+                "agent_version": env!("CARGO_PKG_VERSION"),
+            });
+            println!("{}", serde_json::to_string_pretty(&error)?);
+            std::process::exit(1);
+        }
+    };
     let id = request_id();
     client
         .send(&AgentMessage::DoctorRequest {
