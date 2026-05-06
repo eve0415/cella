@@ -23,40 +23,55 @@ Break the task into independent units of work. Each unit should:
 ### 2. Dispatch with `cella task run`
 
 ```sh
-cella task run <branch> [--base <ref>] -- <command...>
+cella task run <branch> [--base <ref>] [--timeout <secs>] -- <command...>
 ```
 
-Creates the branch + container (if needed) and runs the command in the background. The command typically invokes an AI agent (Claude Code, Codex, etc.).
+Creates the branch + container (if needed) and runs the command in the background. The `--timeout` flag kills the task after the specified duration (status becomes `timed_out` instead of `failed`).
 
 Examples:
 ```sh
-# Dispatch three parallel tasks
-cella task run feat/auth -- claude -p "Implement OAuth2 authentication in src/auth/"
-cella task run feat/api -- claude -p "Build the REST API endpoints in src/api/"
+# Dispatch Claude Code
+cella task run feat/auth --timeout 300 -- claude -p "Implement OAuth2 authentication in src/auth/"
+
+# Dispatch Codex
+cella task run feat/api --timeout 300 -- codex exec "Build the REST API endpoints in src/api/"
+
+# Dispatch any CLI agent
 cella task run feat/tests -- claude -p "Write integration tests for the auth module"
 ```
+
+Task environment parity: tasks get the same user, PATH, working directory, and environment variables (AI keys, SSH agent, terminal vars) as interactive `cella exec`.
 
 ### 3. Monitor with `cella task list`
 
 ```sh
-cella task list
+cella task list [--json]
 ```
 
 Shows all active tasks with status, elapsed time, and command:
 ```
 BRANCH               STATUS     TIME     COMMAND
 feat/auth            running    2m       claude -p "Implement OAuth2..."
-feat/api             running    2m       claude -p "Build REST API..."
+feat/api             timed_out  5m       codex exec "Build REST API..."
 feat/tests           done       5m       claude -p "Write integration..."
 ```
+
+Statuses: `running`, `done`, `failed`, `timed_out`
+
+With `--json`, outputs structured data for programmatic monitoring:
+```sh
+cella task list --json | jq '.[] | select(.status == "running")'
+```
+
+Elapsed time freezes at completion — a task that ran for 45s will always show 45s, not the time since it started.
 
 ### 4. Check output with `cella task logs`
 
 ```sh
-cella task logs <branch>
+cella task logs <branch> [--follow]
 ```
 
-Shows captured stdout/stderr from the task.
+Shows captured stdout/stderr from the task. With `--follow`, streams live output.
 
 ### 5. Wait for completion
 
@@ -72,32 +87,48 @@ Blocks until the task finishes. Returns the exit code.
 cella task stop <branch>
 ```
 
-Aborts a running task.
+Aborts a running task (sends SIGTERM to the process tree).
 
-## Additional commands for manual work
+## Agent dispatch patterns
 
-After tasks complete, you may want to inspect results:
+### Claude Code
 
 ```sh
-# Run a specific command in a task's container
-cella exec feat/auth -- cargo test
-
-# Check test results
-cella exec feat/api -- cat test-results.xml
-
-# View the diff
-cella exec feat/auth -- git diff
+cella task run <branch> --timeout 300 -- claude -p "your prompt here"
 ```
+
+### Codex
+
+```sh
+cella task run <branch> --timeout 300 -- codex exec "your prompt here"
+```
+
+Note: `--skip-git-repo-check` may be needed if the worktree directory isn't recognized as a git repo by Codex.
+
+### Polling for completion
+
+```sh
+# Poll until all tasks complete
+while cella task list --json | jq -e '.[] | select(.status == "running")' > /dev/null 2>&1; do
+  sleep 10
+done
+echo "All tasks complete"
+```
+
+## Failure handling
+
+- One task's failure does NOT affect other running tasks
+- Timed-out tasks exit with code 124 and status `timed_out`
+- Stopped tasks exit with code 130
+- After failure: inspect logs, fix the issue, re-run the task (previous entry is replaced)
 
 ## Example: Full parallel workflow
 
 ```sh
-# User: "Add authentication, rate limiting, and logging to the API"
-
-# 1. Dispatch
-cella task run feat/auth -- claude -p "Add JWT authentication middleware to src/middleware/auth.rs"
-cella task run feat/rate-limit -- claude -p "Add rate limiting middleware to src/middleware/rate_limit.rs"
-cella task run feat/logging -- claude -p "Add structured logging with tracing to all API handlers"
+# 1. Dispatch with timeouts
+cella task run feat/auth --timeout 300 -- claude -p "Add JWT auth middleware"
+cella task run feat/rate-limit --timeout 300 -- claude -p "Add rate limiting"
+cella task run feat/logging --timeout 300 -- claude -p "Add structured logging"
 
 # 2. Monitor
 cella task list
@@ -117,30 +148,28 @@ cella exec feat/logging -- cargo test
 
 ## Lifecycle management
 
-After tasks complete, you can manage the branch containers:
-
 ```sh
 # Stop a branch's container to free resources
 cella down feat/auth
 
-# Restart a stopped branch's container
+# Restart a stopped container
 cella up feat/auth
 
 # Stop and remove container + worktree
 cella down feat/auth --rm
 
-# Clean up all worktrees (including unmerged)
-cella prune --all
+# Clean up all worktrees older than a week
+cella prune --older-than 7d
 
-# Clean up only merged worktrees
-cella prune
+# Clean up all worktrees
+cella prune --all
 ```
 
-## Important notes
+## Best practices
 
-- Each branch gets its own container with the full dev environment
-- Tasks run independently — one failure doesn't affect others
-- The host filesystem is shared, so git operations are coordinated
-- Use `cella down <branch>` to stop individual branches and free resources
-- Use `cella up <branch>` to restart stopped branches (e.g., after reboot)
-- Use `cella prune` to clean up merged branches, `cella prune --all` for all branches
+- 3-4 parallel agents is the sweet spot for most repos
+- Use `--timeout` on all agent dispatches to prevent runaway tasks
+- Use `cella task list --json` for programmatic monitoring
+- Use `cella exec` for quick verification commands after tasks complete
+- Containers persist until explicitly removed with `cella down --rm` or `cella prune`
+- The host filesystem is shared — git operations are coordinated through the worktree mechanism

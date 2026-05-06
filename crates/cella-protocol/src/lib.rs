@@ -673,6 +673,7 @@ pub enum TaskStatus {
     Running,
     Done,
     Failed,
+    TimedOut,
 }
 
 /// A worktree entry for list responses.

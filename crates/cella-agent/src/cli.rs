@@ -622,7 +622,15 @@ async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error + S
 
     let (client, _hello) = ControlClient::connect(&addr, &container_name, &token)
         .await
-        .map_err(|e| format!("Failed to connect to host daemon: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to connect to host daemon: {e}\n\n\
+                 Possible fixes:\n  \
+                 - Run `cella up` on the host to restart the daemon\n  \
+                 - Check if the host daemon is running with `cella doctor`\n  \
+                 - Verify network connectivity to {addr}"
+            )
+        })?;
 
     Ok(client)
 }
@@ -639,6 +647,8 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let agent_version = env!("CARGO_PKG_VERSION");
     eprintln!("cella doctor (in-container, agent v{agent_version})\n");
 
+    let mut has_failures = false;
+
     // 1. .daemon_addr file
     let daemon_addr_exists = std::path::Path::new("/cella/.daemon_addr").exists();
     if daemon_addr_exists {
@@ -646,6 +656,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         eprintln!("  \u{2717} daemon address file not found (/cella/.daemon_addr)");
         eprintln!("    Run `cella up` on the host to fix");
+        has_failures = true;
     }
 
     // 2. Resolve connection info (file is authoritative, env vars are fallback)
@@ -659,7 +670,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         eprintln!("  \u{2717} no connection info available");
         eprintln!("    Set CELLA_DAEMON_ADDR or ensure .daemon_addr exists");
-        return Ok(());
+        std::process::exit(1);
     };
 
     // 3. Daemon connectivity
@@ -685,6 +696,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Err(e) => {
             eprintln!("  \u{2717} daemon unreachable at {addr}: {e}");
+            has_failures = true;
         }
     }
 
@@ -700,11 +712,25 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     eprintln!();
+    if has_failures {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
 async fn run_doctor_json() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut client = connect_daemon().await?;
+    let mut client = match connect_daemon().await {
+        Ok(c) => c,
+        Err(e) => {
+            let error = serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+                "agent_version": env!("CARGO_PKG_VERSION"),
+            });
+            println!("{}", serde_json::to_string_pretty(&error)?);
+            std::process::exit(1);
+        }
+    };
     let id = request_id();
     client
         .send(&AgentMessage::DoctorRequest {
@@ -919,6 +945,8 @@ async fn run_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + S
     };
     client.send(&msg).await?;
 
+    let current_container = std::env::var("CELLA_CONTAINER_NAME").ok();
+
     loop {
         let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::ListResult { worktrees, .. } = resp {
@@ -927,7 +955,7 @@ async fn run_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + S
             } else if worktrees.is_empty() {
                 eprintln!("No worktree branches found.");
             } else {
-                print_worktree_table(&worktrees);
+                print_worktree_table(&worktrees, current_container.as_deref());
             }
             return Ok(());
         }
@@ -1052,7 +1080,11 @@ async fn run_down(
                 eprintln!("\u{25cf} {step}: {message}");
             }
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::DownResult { result, .. } => match result {
@@ -1101,7 +1133,11 @@ async fn run_up(
                 eprintln!("\u{25cf} {step}: {message}");
             }
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::UpResult { result, .. } => match result {
@@ -1149,7 +1185,11 @@ async fn run_prune(
         let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::PruneResult { pruned, errors, .. } => {
@@ -1242,6 +1282,7 @@ async fn run_task_list(json: bool) -> Result<(), Box<dyn std::error::Error + Sen
                         cella_protocol::TaskStatus::Running => "running",
                         cella_protocol::TaskStatus::Done => "done",
                         cella_protocol::TaskStatus::Failed => "failed",
+                        cella_protocol::TaskStatus::TimedOut => "timed_out",
                     };
                     let time = format!("{}s", t.elapsed_secs);
                     let cmd = t.command.join(" ");
@@ -1434,14 +1475,19 @@ fn restore_terminal(termios: &nix::sys::termios::Termios) {
     let _ = t::tcsetattr(&stdin, t::SetArg::TCSANOW, termios);
 }
 
-fn print_worktree_table(worktrees: &[cella_protocol::WorktreeEntry]) {
+fn print_worktree_table(
+    worktrees: &[cella_protocol::WorktreeEntry],
+    current_container: Option<&str>,
+) {
     const HEADER: &str = "BRANCH               STATE      CONTAINER                      PATH";
     println!("{HEADER}");
     for wt in worktrees {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
         let state = wt.container_state.as_deref().unwrap_or("-");
         let container = wt.container_name.as_deref().unwrap_or("-");
-        let marker = if wt.is_main { " *" } else { "" };
+        let is_current = current_container.is_some_and(|c| wt.container_name.as_deref() == Some(c))
+            || (current_container.is_none() && wt.is_main);
+        let marker = if is_current { " *" } else { "" };
         println!(
             "{:<20} {:<10} {:<30} {}",
             format!("{branch}{marker}"),
@@ -1450,6 +1496,11 @@ fn print_worktree_table(worktrees: &[cella_protocol::WorktreeEntry]) {
             wt.worktree_path,
         );
     }
+}
+
+fn is_json_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
 }
 
 #[cfg(test)]
@@ -2046,7 +2097,7 @@ mod tests {
                 labels: None,
             },
         ];
-        print_worktree_table(&worktrees);
+        print_worktree_table(&worktrees, Some("project-main"));
     }
 
     #[test]
@@ -2285,7 +2336,7 @@ mod tests {
     #[test]
     fn print_worktree_table_empty() {
         // Should not panic on empty slice.
-        print_worktree_table(&[]);
+        print_worktree_table(&[], None);
     }
 
     // --- JSON flag parsing ---

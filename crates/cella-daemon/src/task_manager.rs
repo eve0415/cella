@@ -80,6 +80,8 @@ struct TaskState {
     output: Arc<Mutex<TaskOutput>>,
     /// `EXIT_RUNNING` (-1) while task is active; real exit code once done.
     exit_code: Arc<AtomicI32>,
+    /// Frozen elapsed seconds at completion (`u64::MAX` = still running).
+    completed_elapsed_secs: Arc<AtomicU64>,
     /// PID of the child `docker exec` process (0 = not yet known).
     child_pid: Arc<AtomicU32>,
     /// Handle to abort the task.
@@ -138,13 +140,17 @@ impl TaskManager {
         let task_id = branch.to_string();
         let output = Arc::new(Mutex::new(TaskOutput::new(MAX_OUTPUT_BYTES)));
         let exit_code = Arc::new(AtomicI32::new(EXIT_RUNNING));
+        let completed_elapsed_secs = Arc::new(AtomicU64::new(u64::MAX));
         let child_pid = Arc::new(AtomicU32::new(0));
+        let started_at = std::time::Instant::now();
         let (output_tx, _) = tokio::sync::broadcast::channel(1024);
         let (exit_watch, _) = tokio::sync::watch::channel(None);
 
         let handles = TaskHandles {
             output: output.clone(),
             exit_code: exit_code.clone(),
+            completed_elapsed_secs: completed_elapsed_secs.clone(),
+            started_at,
             child_pid: child_pid.clone(),
             output_tx: output_tx.clone(),
             exit_watch: exit_watch.clone(),
@@ -168,9 +174,10 @@ impl TaskManager {
             branch: branch.to_string(),
             container_name,
             command,
-            started_at: std::time::Instant::now(),
+            started_at,
             output,
             exit_code,
+            completed_elapsed_secs,
             child_pid,
             abort_handle: handle.abort_handle(),
             output_tx,
@@ -188,12 +195,18 @@ impl TaskManager {
         for (id, state) in &self.tasks {
             let code = state.exit_code.load(Ordering::Acquire);
             let done = code != EXIT_RUNNING;
+            let stored = state.completed_elapsed_secs.load(Ordering::Acquire);
+            let elapsed = if stored == u64::MAX {
+                state.started_at.elapsed().as_secs()
+            } else {
+                stored
+            };
             infos.push(TaskInfo {
                 task_id: id.clone(),
                 branch: state.branch.clone(),
                 container_name: state.container_name.clone(),
                 command: state.command.clone(),
-                elapsed_secs: state.started_at.elapsed().as_secs(),
+                elapsed_secs: elapsed,
                 is_done: done,
                 exit_code: if done { Some(code) } else { None },
             });
@@ -271,6 +284,8 @@ impl TaskManager {
 struct TaskHandles {
     output: Arc<Mutex<TaskOutput>>,
     exit_code: Arc<AtomicI32>,
+    completed_elapsed_secs: Arc<AtomicU64>,
+    started_at: std::time::Instant,
     child_pid: Arc<AtomicU32>,
     output_tx: tokio::sync::broadcast::Sender<String>,
     exit_watch: tokio::sync::watch::Sender<Option<i32>>,
@@ -415,6 +430,11 @@ async fn run_task_process(
     if let Some(ref pf) = pid_file {
         cleanup_pid_file(container_name, pf).await;
     }
+
+    // Freeze elapsed time at completion.
+    handles
+        .completed_elapsed_secs
+        .store(handles.started_at.elapsed().as_secs(), Ordering::Release);
 
     // Only set if still running — stop_task may have already set 130.
     let _ =
