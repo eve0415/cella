@@ -542,6 +542,7 @@ pub async fn is_claude_code_installed(
             return true;
         }
     }
+    debug!("Claude Code not found or version mismatch, will install");
     false
 }
 
@@ -597,6 +598,7 @@ pub async fn install_claude_code(
     )
     .await
     {
+        debug!("Claude Code install skipped (already at requested version)");
         return None;
     }
 
@@ -1386,6 +1388,10 @@ async fn verified_install_step(
         return false;
     }
 
+    if install_result.is_none() {
+        debug!("{binary}: install was idempotent, verifying reachability");
+    }
+
     let verify = verify_tool_callable(
         ctx.client,
         ctx.container_id,
@@ -1402,6 +1408,7 @@ async fn verified_install_step(
             true
         }
         VerifyOutcome::InstalledElsewhere(path) => {
+            debug!("{binary}: found at {path} but not on login-shell PATH, symlinking");
             match symlink_to_usr_local_bin(ctx.client, ctx.container_id, binary, &path).await {
                 Ok(()) => {
                     let second = verify_tool_callable(

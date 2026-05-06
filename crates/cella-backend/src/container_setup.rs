@@ -401,48 +401,79 @@ async fn apply_git_config(
     }
 }
 
-/// Add `/cella/bin` to PATH in the container's shell profile.
+/// Add `/cella/bin` and `~/.local/bin` to PATH in the container's shell
+/// profile.
 ///
-/// This makes the `cella` CLI (symlinked to the agent binary) discoverable
-/// by users and AI agents running inside the container.
+/// `/cella/bin` makes the cella CLI (symlinked to the agent binary)
+/// discoverable. `~/.local/bin` is the XDG-standard user-local binary
+/// directory used by `curl | bash` installers (Claude Code, uv, rustup,
+/// etc.) — without it, tools installed by `install_tools_and_probe_env`
+/// may not appear on PATH in worktree containers.
+///
+/// Each block has its own idempotency guard so the function is safe to
+/// re-run and also patches containers that were created before the
+/// `~/.local/bin` block existed.
 pub async fn inject_cella_path(
     client: &dyn ContainerBackend,
     container_id: &str,
     remote_user: &str,
 ) {
-    let snippet = r#"
-# cella CLI (in-container worktree commands)
-if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then
-    export PATH="/cella/bin:$PATH"
-fi
-"#;
-    // Determine home directory
     let home = if remote_user == "root" {
         "/root".to_string()
     } else {
         format!("/home/{remote_user}")
     };
 
-    for profile in &[".bashrc", ".zshrc", ".profile"] {
-        let path = format!("{home}/{profile}");
-        let cmd = format!(
-            "if [ -f '{path}' ] && ! grep -q '/cella/bin' '{path}'; then printf '%s\\n' '{snippet_escaped}' >> '{path}'; fi",
-            path = path,
-            snippet_escaped = snippet.replace('\'', "'\\''"),
-        );
-        let _ = client
-            .exec_command(
-                container_id,
-                &ExecOptions {
-                    cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
-                    user: Some("root".to_string()),
-                    working_dir: None,
-                    env: None,
-                },
-            )
-            .await;
+    for (guard, snippet) in PATH_SNIPPETS {
+        for profile in &[".bashrc", ".zshrc", ".profile"] {
+            let path = format!("{home}/{profile}");
+            let cmd = format!(
+                "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then printf '%s\\n' '{escaped}' >> '{path}'; fi",
+                path = path,
+                guard = guard,
+                escaped = snippet.replace('\'', "'\\''"),
+            );
+            let _ = client
+                .exec_command(
+                    container_id,
+                    &ExecOptions {
+                        cmd: vec!["sh".to_string(), "-c".to_string(), cmd],
+                        user: Some("root".to_string()),
+                        working_dir: None,
+                        env: None,
+                    },
+                )
+                .await;
+        }
     }
 }
+
+const PATH_SNIPPETS: &[(&str, &str)] = &[
+    (
+        "# cella CLI",
+        r#"
+# cella CLI (in-container worktree commands)
+if [ -d /cella/bin ]; then
+    case ":$PATH:" in
+        *":/cella/bin:"*) ;;
+        *) export PATH="/cella/bin:$PATH" ;;
+    esac
+fi
+"#,
+    ),
+    (
+        "# cella user-local bin",
+        r#"
+# cella user-local bin (curl|bash installers: claude, uv, rustup, etc.)
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+fi
+"#,
+    ),
+];
 
 /// Seed gh CLI credentials into a container.
 ///
@@ -566,6 +597,29 @@ mod tests {
         let config = json!({"remoteUser": 42, "containerUser": true});
         let result = resolve_remote_user(&config, None, "fallback");
         assert_eq!(result, "fallback");
+    }
+
+    // ── PATH_SNIPPETS ────────────────────────────────────────────────────
+
+    #[test]
+    fn path_snippets_include_cella_bin() {
+        let (guard, snippet) = PATH_SNIPPETS[0];
+        assert_eq!(guard, "# cella CLI");
+        assert!(snippet.contains("/cella/bin"));
+    }
+
+    #[test]
+    fn path_snippets_include_user_local_bin() {
+        let (guard, snippet) = PATH_SNIPPETS[1];
+        assert_eq!(guard, "# cella user-local bin");
+        assert!(snippet.contains("$HOME/.local/bin"));
+    }
+
+    #[test]
+    fn path_snippets_have_unique_guards() {
+        let guards: Vec<&str> = PATH_SNIPPETS.iter().map(|(g, _)| *g).collect();
+        let unique: std::collections::HashSet<&str> = guards.iter().copied().collect();
+        assert_eq!(guards.len(), unique.len());
     }
 
     // ── map_env_object ───────────────────────────────────────────────────

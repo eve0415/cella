@@ -393,6 +393,7 @@ cella exec feat/auth -- cargo test -p middleware
 | Agent can't reach API endpoints | Cella containers share the host network by default; check DNS/firewall |
 | Agent teams can't communicate | All teammates must run in the same container, not across containers |
 | Task shows "timed_out" | Increase `--timeout` or break the task into smaller pieces |
+| Plan/task files not visible in worktree | Place shared files in `~/.claude/plans/` — this volume is mounted in ALL containers. Don't rely on git-tracked files for cross-worktree sharing |
 
 ## Best Practices
 
