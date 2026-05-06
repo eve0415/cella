@@ -1485,13 +1485,9 @@ fn print_worktree_table(
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
         let state = wt.container_state.as_deref().unwrap_or("-");
         let container = wt.container_name.as_deref().unwrap_or("-");
-        let marker = if current_container.is_some_and(|c| wt.container_name.as_deref() == Some(c)) {
-            " *"
-        } else if current_container.is_none() && wt.is_main {
-            " *"
-        } else {
-            ""
-        };
+        let is_current = current_container.is_some_and(|c| wt.container_name.as_deref() == Some(c))
+            || (current_container.is_none() && wt.is_main);
+        let marker = if is_current { " *" } else { "" };
         println!(
             "{:<20} {:<10} {:<30} {}",
             format!("{branch}{marker}"),

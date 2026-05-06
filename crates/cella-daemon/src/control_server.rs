@@ -2576,14 +2576,14 @@ async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) ->
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
 
-        if let Ok(output) = cmd.output().await {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let (name, worktree_label) = line.split_once('\t').unwrap_or((line, ""));
-                    if worktree_label != "true" {
-                        return Some(name.to_string());
-                    }
+        if let Ok(output) = cmd.output().await
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let (name, worktree_label) = line.split_once('\t').unwrap_or((line, ""));
+                if worktree_label != "true" {
+                    return Some(name.to_string());
                 }
             }
         }
