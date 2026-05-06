@@ -165,8 +165,13 @@ impl DownArgs {
         }
 
         if container.state == ContainerState::Running {
-            client.as_ref().stop_container(&container.id).await?;
-            info!("Container stopped");
+            match client.as_ref().stop_container(&container.id).await {
+                Ok(()) => info!("Container stopped"),
+                Err(cella_backend::BackendError::ContainerNotFound { .. }) => {
+                    debug!("Container already removed, treating as stopped");
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else {
             info!("Container already stopped");
         }
