@@ -915,8 +915,8 @@ async fn compose_up_with_ssh_fallback(
     env_fwd: &mut cella_env::EnvForwarding,
     progress: &ProgressSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut bind_mount_attempts: u32 = 0;
     const MAX_BIND_MOUNT_RETRIES: u32 = 3;
+    let mut bind_mount_attempts: u32 = 0;
 
     loop {
         write_final_override(project, features_build, ov_ctx, uid_image.clone())?;

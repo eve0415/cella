@@ -1359,8 +1359,8 @@ impl EnsureUpContext<'_> {
         create_opts: &mut cella_backend::CreateContainerOptions,
         env_fwd: &mut cella_env::EnvForwarding,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let mut bind_mount_attempts: u32 = 0;
         const MAX_BIND_MOUNT_RETRIES: u32 = 3;
+        let mut bind_mount_attempts: u32 = 0;
 
         loop {
             match self.create_container(create_opts).await {

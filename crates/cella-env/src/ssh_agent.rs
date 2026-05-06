@@ -205,7 +205,7 @@ pub fn is_bind_mount_error(error_msg: &str, specific_source: Option<&str>) -> bo
     if !error_msg.contains("bind source path does not exist") {
         return false;
     }
-    specific_source.map_or(true, |source| error_msg.contains(source))
+    specific_source.is_none_or(|source| error_msg.contains(source))
 }
 
 /// Check if a Docker error is a bind-mount failure for the SSH agent socket.
