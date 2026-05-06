@@ -217,6 +217,7 @@ impl PruneArgs {
             &candidates,
             &progress,
             &hooks,
+            false,
         )
         .await;
 
