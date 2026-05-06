@@ -102,7 +102,9 @@ Checks connectivity to the host daemon, protocol version match, agent version, a
 | "Failed to connect to host daemon" | Check `cella doctor` output; restart with `cella up` on host |
 | Exec to main fails | Fixed in v0.0.48+ — main container lookup uses workspace_path fallback |
 | `*` marker shows wrong branch | Fixed in v0.0.48+ — uses CELLA_CONTAINER_NAME matching |
-| JSON in human output | Fixed in v0.0.48+ — daemon JSON responses are filtered |
+| JSON in human output | Fixed in v0.0.48+ — daemon JSON responses are filtered; `cella branch` stdout suppressed at daemon level |
+| Task ran in wrong container | Fixed — `task run` on non-existent branch now auto-creates instead of falling back to main |
+| Stale task records after `down --rm` | Fixed — `down --rm` cleans up task records for the removed branch |
 
 ## When to use
 

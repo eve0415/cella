@@ -41,8 +41,10 @@ To run teams across multiple containers, dispatch each agent via `cella task run
 ### `codex exec` for non-interactive dispatch
 
 ```sh
-cella task run <branch> --timeout 300 -- codex exec "your prompt here"
+cella task run <branch> --timeout 300 -- bash -c 'codex exec "your prompt here"'
 ```
+
+Multi-word prompts must be wrapped in `bash -c` because `cella task run` shell-splits args after `--`. Without the wrapper, each word becomes a separate arg and Codex interprets them as a command name instead of a single prompt.
 
 Notes:
 - Use `--skip-git-repo-check` if Codex doesn't recognize the worktree directory as a git repo
@@ -89,6 +91,9 @@ When using Codex orchestrated via Agents SDK, the two MCP tools (`codex()` and `
 
 | Issue | Solution |
 |-------|----------|
+| Claude Code waits for plan approval | Add `--dangerously-skip-permissions` for headless execution |
+| Claude Code "no stdin data received in 3s" | Cosmetic warning; task proceeds after the 3s delay |
+| Codex treats prompt as command name | Wrap in `bash -c 'codex exec "prompt"'` — `cella task run` shell-splits args |
 | Codex doesn't recognize git repo in worktree | Add `--skip-git-repo-check` flag |
 | Claude Code can't find tools/packages | Packages are per-container; install in each branch's container or use a shared base image |
 | Agent can't reach API endpoints | Check container network config; cella containers share the host network by default |

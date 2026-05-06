@@ -30,14 +30,14 @@ Creates the branch + container (if needed) and runs the command in the backgroun
 
 Examples:
 ```sh
-# Dispatch Claude Code
-cella task run feat/auth --timeout 300 -- claude -p "Implement OAuth2 authentication in src/auth/"
+# Dispatch Claude Code (--dangerously-skip-permissions required for headless)
+cella task run feat/auth --timeout 300 -- claude --dangerously-skip-permissions -p "Implement OAuth2 authentication in src/auth/"
 
-# Dispatch Codex
-cella task run feat/api --timeout 300 -- codex exec "Build the REST API endpoints in src/api/"
+# Dispatch Codex (bash -c wrapper needed to preserve prompt quoting)
+cella task run feat/api --timeout 300 -- bash -c 'codex exec "Build the REST API endpoints in src/api/"'
 
 # Dispatch any CLI agent
-cella task run feat/tests -- claude -p "Write integration tests for the auth module"
+cella task run feat/tests --timeout 300 -- claude --dangerously-skip-permissions -p "Write integration tests for the auth module"
 ```
 
 Task environment parity: tasks get the same user, PATH, working directory, and environment variables (AI keys, SSH agent, terminal vars) as interactive `cella exec`.
@@ -51,9 +51,9 @@ cella task list [--json]
 Shows all active tasks with status, elapsed time, and command:
 ```
 BRANCH               STATUS     TIME     COMMAND
-feat/auth            running    2m       claude -p "Implement OAuth2..."
-feat/api             timed_out  5m       codex exec "Build REST API..."
-feat/tests           done       5m       claude -p "Write integration..."
+feat/auth            running    2m       claude --dangerously-skip-permissions -p "Implement OAuth2..."
+feat/api             timed_out  5m       bash -c codex exec "Build REST API..."
+feat/tests           done       5m       claude --dangerously-skip-permissions -p "Write integration..."
 ```
 
 Statuses: `running`, `done`, `failed`, `timed_out`
@@ -94,16 +94,18 @@ Aborts a running task (sends SIGTERM to the process tree).
 ### Claude Code
 
 ```sh
-cella task run <branch> --timeout 300 -- claude -p "your prompt here"
+cella task run <branch> --timeout 300 -- claude --dangerously-skip-permissions -p "your prompt here"
 ```
+
+The `--dangerously-skip-permissions` flag is required for headless operation — without it Claude Code waits for interactive plan approval and the task stalls.
 
 ### Codex
 
 ```sh
-cella task run <branch> --timeout 300 -- codex exec "your prompt here"
+cella task run <branch> --timeout 300 -- bash -c 'codex exec "your prompt here"'
 ```
 
-Note: `--skip-git-repo-check` may be needed if the worktree directory isn't recognized as a git repo by Codex.
+Multi-word prompts must be wrapped in `bash -c` because `cella task run` shell-splits args after `--`. Without the wrapper, each word becomes a separate arg and Codex interprets them as a command name + arguments instead of a single prompt.
 
 ### Polling for completion
 
@@ -126,9 +128,9 @@ echo "All tasks complete"
 
 ```sh
 # 1. Dispatch with timeouts
-cella task run feat/auth --timeout 300 -- claude -p "Add JWT auth middleware"
-cella task run feat/rate-limit --timeout 300 -- claude -p "Add rate limiting"
-cella task run feat/logging --timeout 300 -- claude -p "Add structured logging"
+cella task run feat/auth --timeout 300 -- claude --dangerously-skip-permissions -p "Add JWT auth middleware"
+cella task run feat/rate-limit --timeout 300 -- claude --dangerously-skip-permissions -p "Add rate limiting"
+cella task run feat/logging --timeout 300 -- claude --dangerously-skip-permissions -p "Add structured logging"
 
 # 2. Monitor
 cella task list
@@ -165,6 +167,14 @@ cella prune --older-than 7d
 cella prune --all
 ```
 
+## Performance expectations
+
+- Branch creation: ~80s (full container build including image pull and postStartCommand)
+- Exec latency: sub-second for simple commands
+- Claude Code task: 20-30s for simple file operations
+- Codex task: 10-15s for simple file operations
+- Cross-container exec roundtrip: sub-second
+
 ## Best practices
 
 - 3-4 parallel agents is the sweet spot for most repos
@@ -172,4 +182,5 @@ cella prune --all
 - Use `cella task list --json` for programmatic monitoring
 - Use `cella exec` for quick verification commands after tasks complete
 - Containers persist until explicitly removed with `cella down --rm` or `cella prune`
+- `cella down --rm` automatically cleans up stale task records for the removed branch
 - The host filesystem is shared — git operations are coordinated through the worktree mechanism
