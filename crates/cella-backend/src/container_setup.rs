@@ -453,8 +453,11 @@ const PATH_SNIPPETS: &[(&str, &str)] = &[
         "# cella CLI",
         r#"
 # cella CLI (in-container worktree commands)
-if [ -d /cella/bin ] && ! echo "$PATH" | grep -q /cella/bin; then
-    export PATH="/cella/bin:$PATH"
+if [ -d /cella/bin ]; then
+    case ":$PATH:" in
+        *":/cella/bin:"*) ;;
+        *) export PATH="/cella/bin:$PATH" ;;
+    esac
 fi
 "#,
     ),
@@ -462,8 +465,11 @@ fi
         "# cella user-local bin",
         r#"
 # cella user-local bin (curl|bash installers: claude, uv, rustup, etc.)
-if [ -d "$HOME/.local/bin" ] && ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-    export PATH="$HOME/.local/bin:$PATH"
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
 fi
 "#,
     ),
