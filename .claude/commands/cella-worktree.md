@@ -14,23 +14,40 @@ You are inside a cella container if:
 ### Create a new branch
 
 ```sh
-cella branch <name> [--base <ref>]
+cella branch <name> [--base <ref>] [--label key=value]...
 ```
 
-Creates a git worktree for `<name>` on the host, builds and starts a new container for it. The `--base` flag specifies which commit/branch to branch from (defaults to HEAD).
+Creates a git worktree for `<name>` on the host, builds and starts a new container for it. The `--base` flag specifies which commit/branch to branch from (defaults to HEAD). `--label` adds custom metadata labels to the container.
 
 Example:
 ```sh
 cella branch feat/auth --base main
+cella branch feat/api --label team=backend --label priority=high
 ```
 
 ### List branches
 
 ```sh
-cella list
+cella list [--json]
 ```
 
-Shows all worktree branches with their container name and state (running/exited).
+Shows all worktree branches with their container name and state (running/exited). The current container is marked with `*`. Use `--json` for programmatic output.
+
+### Run a command in another branch's container
+
+```sh
+cella exec <branch> -- <command...>
+cella exec <branch> --json -- <command...>
+```
+
+Runs a command in the specified branch's container and streams output. The exit code is propagated. Works bidirectionally — worktree containers can exec to main and vice versa. With `--json`, outputs structured `{"exit_code": N, "stdout": "...", "stderr": "..."}`.
+
+Examples:
+```sh
+cella exec feat/auth -- cargo test
+cella exec main -- echo "hello from main"
+cella exec feat/auth --json -- cat src/auth.rs
+```
 
 ### Switch to another branch's container
 
@@ -38,21 +55,7 @@ Shows all worktree branches with their container name and state (running/exited)
 cella switch <branch>
 ```
 
-Opens a shell session in the target branch's container. Use this for quick checks; for running specific commands, prefer `cella exec`.
-
-### Run a command in another branch's container
-
-```sh
-cella exec <branch> -- <command...>
-```
-
-Runs a command in the specified branch's container and streams output. The exit code is propagated.
-
-Examples:
-```sh
-cella exec feat/auth -- cargo test
-cella exec feat/auth -- cat src/auth.rs
-```
+Opens an interactive shell session in the target branch's container. Use this for exploratory work; for running specific commands, prefer `cella exec`.
 
 ### Stop a branch's container
 
@@ -62,40 +65,44 @@ cella down <branch> [--rm] [--volumes] [--force]
 
 Stops the container for the specified branch. With `--rm`, also removes the container and worktree directory. With `--volumes`, removes associated volumes (requires `--rm`). With `--force`, overrides shutdownAction="none".
 
-Example:
-```sh
-cella down feat/auth          # Stop the container
-cella down feat/auth --rm     # Stop, remove container + worktree
-```
-
 ### Start/restart a branch's container
 
 ```sh
 cella up <branch> [--rebuild]
 ```
 
-Starts or restarts the container for the specified branch. If the container exists but is stopped, it restarts it. If the worktree exists but the container was removed, it creates a new container. With `--rebuild`, rebuilds from scratch.
-
-Example:
-```sh
-cella up feat/auth            # Restart stopped container
-cella up feat/auth --rebuild  # Rebuild from scratch
-```
+Starts or restarts the container for the specified branch. If the container exists but is stopped, it restarts it. With `--rebuild`, rebuilds from scratch.
 
 ### Clean up worktrees
 
 ```sh
-cella prune [--all] [--dry-run]
+cella prune [--all] [--dry-run] [--older-than <duration>] [--missing-worktree] [--label key=value]...
 ```
 
-Removes worktrees and their containers. By default, only removes worktrees whose branches have been merged. With `--all`, removes all linked worktrees including unmerged ones. Use `--dry-run` to preview what would be removed.
+Removes worktrees and their containers. Options:
+- `--all` — removes all linked worktrees including unmerged
+- `--dry-run` — preview what would be removed
+- `--older-than 7d` — only prune worktrees older than duration
+- `--missing-worktree` — prune entries whose worktree directory no longer exists
+- `--label key=value` — only prune worktrees matching these labels
 
-Examples:
+### Diagnostics
+
 ```sh
-cella prune                   # Remove merged worktrees
-cella prune --all             # Remove ALL worktrees
-cella prune --all --dry-run   # Preview what would be removed
+cella doctor [--json]
 ```
+
+Checks connectivity to the host daemon, protocol version match, agent version, and credential helper status. Exits 1 if any check fails. With `--json`, outputs structured diagnostics.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| "No daemon connection info" | Run `cella up` on the host to start the daemon |
+| "Failed to connect to host daemon" | Check `cella doctor` output; restart with `cella up` on host |
+| Exec to main fails | Fixed in v0.0.48+ — main container lookup uses workspace_path fallback |
+| `*` marker shows wrong branch | Fixed in v0.0.48+ — uses CELLA_CONTAINER_NAME matching |
+| JSON in human output | Fixed in v0.0.48+ — daemon JSON responses are filtered |
 
 ## When to use
 
