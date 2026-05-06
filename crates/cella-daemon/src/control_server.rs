@@ -213,6 +213,8 @@ struct HandshakeResult {
     agent_state: Arc<AgentConnectionState>,
     /// Host-side workspace path from container labels.
     workspace_path: Option<String>,
+    /// Host-side parent repo root (set for worktree containers).
+    parent_repo: Option<String>,
 }
 
 /// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
@@ -300,6 +302,7 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         .store(current_time_secs(), Ordering::Relaxed);
 
     let workspace_path = hello.workspace_path.clone();
+    let parent_repo = hello.parent_repo.clone();
 
     Ok(Some(HandshakeResult {
         container_name,
@@ -307,6 +310,7 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         container_ip,
         agent_state,
         workspace_path,
+        parent_repo,
     }))
 }
 
@@ -378,6 +382,7 @@ async fn handle_agent_connection_after_hello(
                         msg,
                         WorktreeHandlerCtx {
                             workspace_path: hs.workspace_path.as_deref(),
+                            parent_repo: hs.parent_repo.as_deref(),
                             cella_bin: &ctx.cella_bin,
                             task_mgr: &ctx.task_manager,
                             container_handles: &ctx.container_handles,
@@ -831,6 +836,8 @@ async fn lookup_container_labels(
 /// Shared context for worktree operation handlers.
 struct WorktreeHandlerCtx<'a> {
     workspace_path: Option<&'a str>,
+    /// Parent repo root (set for worktree containers, `None` for main).
+    parent_repo: Option<&'a str>,
     cella_bin: &'a std::path::Path,
     task_mgr: &'a crate::task_manager::SharedTaskManager,
     container_handles: &'a Arc<Mutex<HashMap<String, ContainerHandle>>>,
@@ -2518,6 +2525,10 @@ fn snapshot_binary(source: &std::path::Path) -> Option<std::path::PathBuf> {
 ///
 /// Uses the calling container's backend metadata to determine which CLI binary
 /// to invoke (`docker` or `container`), avoiding hardcoded Docker assumptions.
+///
+/// When targeting "main" from a worktree container, the main container won't have
+/// a `dev.cella.branch` label. Falls back to finding the parent repo's container
+/// by `dev.cella.workspace_path` without the worktree filter.
 async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) -> Option<String> {
     let (cmd_name, docker_host) = resolve_backend_cli_and_host(wt).await;
 
@@ -2539,12 +2550,49 @@ async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) ->
 
     let output = cmd.output().await.ok()?;
 
-    if !output.status.success() {
-        return None;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(name) = stdout.lines().next().map(ToString::to_string) {
+            return Some(name);
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().next().map(ToString::to_string)
+    // Fallback: when requesting "main" from a worktree, the main container lacks
+    // the branch/worktree labels. Look it up by workspace_path instead.
+    if let Some(parent) = wt.parent_repo {
+        let mut cmd = tokio::process::Command::new(&cmd_name);
+        if let Some(ref host) = docker_host {
+            cmd.arg("-H").arg(host);
+        }
+        cmd.args([
+            "ps",
+            "--filter",
+            &format!("label=dev.cella.workspace_path={parent}"),
+            "--filter",
+            "label=dev.cella.tool=cella",
+            "--format",
+            "{{.Names}}\t{{.Label \"dev.cella.worktree\"}}",
+        ]);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+
+        if let Ok(output) = cmd.output().await {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let (name, worktree_label) = line.split_once('\t').unwrap_or((line, ""));
+                    if worktree_label != "true" {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        // Caller IS the main container — resolve to self.
+        return Some(wt.container_name.to_string());
+    }
+
+    None
 }
 
 /// Append `--backend` and `--docker-host` flags from the calling container's handle.
