@@ -622,7 +622,15 @@ async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error + S
 
     let (client, _hello) = ControlClient::connect(&addr, &container_name, &token)
         .await
-        .map_err(|e| format!("Failed to connect to host daemon: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to connect to host daemon: {e}\n\n\
+                 Possible fixes:\n  \
+                 - Run `cella up` on the host to restart the daemon\n  \
+                 - Check if the host daemon is running with `cella doctor`\n  \
+                 - Verify network connectivity to {addr}"
+            )
+        })?;
 
     Ok(client)
 }
