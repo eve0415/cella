@@ -1052,7 +1052,11 @@ async fn run_down(
                 eprintln!("\u{25cf} {step}: {message}");
             }
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::DownResult { result, .. } => match result {
@@ -1101,7 +1105,11 @@ async fn run_up(
                 eprintln!("\u{25cf} {step}: {message}");
             }
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::UpResult { result, .. } => match result {
@@ -1149,7 +1157,11 @@ async fn run_prune(
         let resp = recv_timeout(&mut client, TIMEOUT_MEDIUM).await?;
         match resp {
             DaemonMessage::OperationOutput { stream, data, .. } => match stream {
-                OutputStream::Stdout => print!("{data}"),
+                OutputStream::Stdout => {
+                    if !is_json_line(&data) {
+                        print!("{data}");
+                    }
+                }
                 OutputStream::Stderr => eprint!("{data}"),
             },
             DaemonMessage::PruneResult { pruned, errors, .. } => {
@@ -1451,6 +1463,11 @@ fn print_worktree_table(worktrees: &[cella_protocol::WorktreeEntry]) {
             wt.worktree_path,
         );
     }
+}
+
+fn is_json_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
 }
 
 #[cfg(test)]
