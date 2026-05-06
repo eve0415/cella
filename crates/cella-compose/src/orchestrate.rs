@@ -901,12 +901,11 @@ async fn build_override_and_start(
     .await
 }
 
-/// Write override and run `compose up`, retrying on SSH agent mount failures.
+/// Write override and run `compose up`, retrying on mount failures.
 ///
-/// On failure, removes the SSH mount from `ov_ctx.extra_volumes` and
-/// `ov_ctx.extra_env`, tries the next fallback strategy, rewrites the
-/// override, and retries. If all strategies are exhausted, skips SSH
-/// forwarding with a warning.
+/// SSH agent mount failures cycle through fallback strategies then skip
+/// SSH forwarding. Non-SSH bind mount failures (transient TOCTOU races)
+/// are retried up to 3 times with a 500ms delay.
 async fn compose_up_with_ssh_fallback(
     compose_cmd: &ComposeCommand,
     project: &ComposeProject,
@@ -916,6 +915,9 @@ async fn compose_up_with_ssh_fallback(
     env_fwd: &mut cella_env::EnvForwarding,
     progress: &ProgressSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const MAX_BIND_MOUNT_RETRIES: u32 = 3;
+    let mut bind_mount_attempts: u32 = 0;
+
     loop {
         write_final_override(project, features_build, ov_ctx, uid_image.clone())?;
 
@@ -930,58 +932,72 @@ async fn compose_up_with_ssh_fallback(
             Ok(()) => return Ok(()),
             Err(e) => {
                 let err_msg = e.to_string();
-                if !cella_env::ssh_agent::is_ssh_mount_error(
+
+                if cella_env::ssh_agent::is_ssh_mount_error(
                     &err_msg,
                     env_fwd.ssh_agent_mount_source.as_deref(),
                 ) {
-                    return Err(e);
-                }
+                    if let Some(ref source) = env_fwd.ssh_agent_mount_source {
+                        ov_ctx.extra_volumes.retain(|m| m.source != *source);
+                        env_fwd.mounts.retain(|m| m.source != *source);
+                    }
+                    ov_ctx
+                        .extra_env
+                        .retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
+                    env_fwd.env.retain(|e| e.key != "SSH_AUTH_SOCK");
+                    env_fwd.ssh_agent_mount_source = None;
 
-                if let Some(ref source) = env_fwd.ssh_agent_mount_source {
-                    ov_ctx.extra_volumes.retain(|m| m.source != *source);
-                    env_fwd.mounts.retain(|m| m.source != *source);
-                }
-                ov_ctx
-                    .extra_env
-                    .retain(|e| !e.starts_with("SSH_AUTH_SOCK="));
-                env_fwd.env.retain(|e| e.key != "SSH_AUTH_SOCK");
-                env_fwd.ssh_agent_mount_source = None;
-
-                if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
-                    env_fwd.ssh_agent_fallbacks.remove(0);
-                    match next {
-                        cella_env::ssh_agent::SshAgentRequest::Direct(ssh) => {
-                            info!(
-                                "Compose SSH mount failed, trying fallback: {}",
-                                ssh.mount_source
-                            );
-                            env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
-                            ov_ctx
-                                .extra_volumes
-                                .push(MountSpec::bind(ssh.mount_source, ssh.mount_target));
-                            ov_ctx
-                                .extra_env
-                                .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
-                            continue;
-                        }
-                        cella_env::ssh_agent::SshAgentRequest::ProxyOnColima { .. } => {
-                            debug!("Skipping ProxyOnColima fallback in retry loop");
+                    if let Some(next) = env_fwd.ssh_agent_fallbacks.first().cloned() {
+                        env_fwd.ssh_agent_fallbacks.remove(0);
+                        match next {
+                            cella_env::ssh_agent::SshAgentRequest::Direct(ssh) => {
+                                info!(
+                                    "Compose SSH mount failed, trying fallback: {}",
+                                    ssh.mount_source
+                                );
+                                env_fwd.ssh_agent_mount_source = Some(ssh.mount_source.clone());
+                                ov_ctx
+                                    .extra_volumes
+                                    .push(MountSpec::bind(ssh.mount_source, ssh.mount_target));
+                                ov_ctx
+                                    .extra_env
+                                    .push(format!("SSH_AUTH_SOCK={}", ssh.env_value));
+                                continue;
+                            }
+                            cella_env::ssh_agent::SshAgentRequest::ProxyOnColima { .. } => {
+                                debug!("Skipping ProxyOnColima fallback in retry loop");
+                            }
                         }
                     }
+
+                    let runtime = env_fwd
+                        .ssh_agent_runtime
+                        .as_ref()
+                        .unwrap_or(&cella_env::DockerRuntime::Unknown);
+                    progress.warn(&cella_env::ssh_agent::ssh_skip_warning(runtime));
+
+                    write_final_override(project, features_build, ov_ctx, uid_image)?;
+                    return run_step_result(progress, "Starting compose services...", async {
+                        compose_cmd.up(project.run_services.as_deref(), false).await
+                    })
+                    .await
+                    .map_err(Into::into);
                 }
 
-                let runtime = env_fwd
-                    .ssh_agent_runtime
-                    .as_ref()
-                    .unwrap_or(&cella_env::DockerRuntime::Unknown);
-                progress.warn(&cella_env::ssh_agent::ssh_skip_warning(runtime));
+                if cella_env::ssh_agent::is_bind_mount_error(&err_msg, None)
+                    && bind_mount_attempts < MAX_BIND_MOUNT_RETRIES
+                {
+                    bind_mount_attempts += 1;
+                    warn!(
+                        attempt = bind_mount_attempts,
+                        max = MAX_BIND_MOUNT_RETRIES,
+                        "Bind mount source path not found, retrying in 500ms"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
 
-                write_final_override(project, features_build, ov_ctx, uid_image)?;
-                return run_step_result(progress, "Starting compose services...", async {
-                    compose_cmd.up(project.run_services.as_deref(), false).await
-                })
-                .await
-                .map_err(Into::into);
+                return Err(e);
             }
         }
     }

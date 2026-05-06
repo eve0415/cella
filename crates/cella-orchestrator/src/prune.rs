@@ -178,17 +178,29 @@ fn classify_branch(
 /// Compose containers are torn down via `hooks.compose_down()`.
 /// Non-compose containers are stopped and removed via the backend.
 /// After all candidates are processed, `hooks.cleanup_daemon()` is called.
+///
+/// When `dry_run` is true, no destructive operations are performed — the
+/// returned `PruneResult` describes what *would* be pruned.
 pub async fn execute_prune(
     repo_root: &Path,
     client: &dyn ContainerBackend,
     candidates: &[PruneCandidate],
     progress: &ProgressSender,
     hooks: &dyn PruneHooks,
+    dry_run: bool,
 ) -> PruneResult {
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
 
     for candidate in candidates {
+        if dry_run {
+            pruned.push(PrunedEntry {
+                branch: candidate.branch.clone(),
+                had_container: candidate.container.is_some(),
+            });
+            continue;
+        }
+
         // 1. Tear down container
         if let Some(ref container) = candidate.container {
             hooks.deregister_container(container).await;
@@ -222,9 +234,6 @@ pub async fn execute_prune(
                         container = %container.name,
                         "removed container"
                     );
-                    // Best-effort per-workspace network cleanup. Non-compose
-                    // containers get a deterministic `cella-net-{hash}` on
-                    // `cella up`; without this the network would linger.
                     match client
                         .remove_workspace_network(&candidate.worktree_path)
                         .await
@@ -278,14 +287,293 @@ pub async fn execute_prune(
         }
     }
 
-    // 4. Clean up stale git worktree records
-    let _ = std::process::Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(repo_root)
-        .output();
+    if !dry_run {
+        // 4. Clean up stale git worktree records
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo_root)
+            .output();
 
-    // 5. Stop daemon if no containers remain
-    hooks.cleanup_daemon();
+        // 5. Stop daemon if no containers remain
+        hooks.cleanup_daemon();
+    }
 
     PruneResult { pruned, errors }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use cella_backend::{BackendError, BackendKind, BoxFuture};
+
+    struct SpyHooks {
+        deregister_called: AtomicBool,
+        cleanup_called: AtomicBool,
+    }
+
+    impl SpyHooks {
+        fn new() -> Self {
+            Self {
+                deregister_called: AtomicBool::new(false),
+                cleanup_called: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl PruneHooks for SpyHooks {
+        fn deregister_container(
+            &self,
+            _container: &ContainerInfo,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.deregister_called.store(true, Ordering::Relaxed);
+            Box::pin(async {})
+        }
+
+        fn compose_down(
+            &self,
+            _project_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cleanup_daemon(&self) {
+            self.cleanup_called.store(true, Ordering::Relaxed);
+        }
+    }
+
+    struct PanicBackend;
+
+    macro_rules! panic_method {
+        ($name:ident, $($arg:ident: $ty:ty),* => $ret:ty) => {
+            fn $name<'a>(&'a self, $(_: $ty),*) -> BoxFuture<'a, $ret> {
+                panic!(concat!(stringify!($name), " must not be called in dry-run"));
+            }
+        };
+    }
+
+    impl ContainerBackend for PanicBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Docker
+        }
+
+        fn capabilities(&self) -> cella_backend::BackendCapabilities {
+            cella_backend::BackendCapabilities {
+                compose: false,
+                managed_agent: false,
+            }
+        }
+
+        panic_method!(find_container, w: &'a Path => Result<Option<ContainerInfo>, BackendError>);
+        panic_method!(create_container, o: &'a cella_backend::CreateContainerOptions => Result<String, BackendError>);
+        panic_method!(start_container, id: &'a str => Result<(), BackendError>);
+        panic_method!(stop_container, id: &'a str => Result<(), BackendError>);
+        fn remove_container<'a>(
+            &'a self,
+            _id: &'a str,
+            _remove_volumes: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("remove_container must not be called in dry-run");
+        }
+        panic_method!(inspect_container, id: &'a str => Result<ContainerInfo, BackendError>);
+        fn list_cella_containers(
+            &self,
+            _running_only: bool,
+        ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
+            panic!("list_cella_containers must not be called in dry-run");
+        }
+        fn find_compose_service<'a>(
+            &'a self,
+            _project: &'a str,
+            _service: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            panic!("find_compose_service must not be called in dry-run");
+        }
+        fn find_container_by_label<'a>(
+            &'a self,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            panic!("find_container_by_label must not be called in dry-run");
+        }
+        fn container_logs<'a>(
+            &'a self,
+            _id: &'a str,
+            _tail: u32,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("container_logs must not be called in dry-run");
+        }
+        fn exec_command<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a cella_backend::ExecOptions,
+        ) -> BoxFuture<'a, Result<cella_backend::ExecResult, BackendError>> {
+            panic!("exec_command must not be called in dry-run");
+        }
+        fn exec_stream<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a cella_backend::ExecOptions,
+            _stdout: Box<dyn std::io::Write + Send + 'a>,
+            _stderr: Box<dyn std::io::Write + Send + 'a>,
+        ) -> BoxFuture<'a, Result<cella_backend::ExecResult, BackendError>> {
+            panic!("exec_stream must not be called in dry-run");
+        }
+        fn exec_interactive<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a cella_backend::InteractiveExecOptions,
+        ) -> BoxFuture<'a, Result<i64, BackendError>> {
+            panic!("exec_interactive must not be called in dry-run");
+        }
+        fn exec_detached<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a cella_backend::ExecOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("exec_detached must not be called in dry-run");
+        }
+        panic_method!(pull_image, image: &'a str => Result<(), BackendError>);
+        panic_method!(build_image, opts: &'a cella_backend::BuildOptions => Result<String, BackendError>);
+        panic_method!(image_exists, image: &'a str => Result<bool, BackendError>);
+        panic_method!(inspect_image_details, image: &'a str => Result<cella_backend::ImageDetails, BackendError>);
+        fn upload_files<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _files: &'a [cella_backend::FileToUpload],
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("upload_files must not be called in dry-run");
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            panic!("ping must not be called in dry-run");
+        }
+        fn host_gateway(&self) -> &'static str {
+            "host.docker.internal"
+        }
+        fn detect_platform(&self) -> BoxFuture<'_, Result<cella_backend::Platform, BackendError>> {
+            panic!("detect_platform must not be called in dry-run");
+        }
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            panic!("detect_container_arch must not be called in dry-run");
+        }
+        fn inspect_image_env<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            panic!("inspect_image_env must not be called in dry-run");
+        }
+        fn inspect_image_user<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("inspect_image_user must not be called in dry-run");
+        }
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            panic!("ensure_network must not be called in dry-run");
+        }
+        fn ensure_container_network<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _repo_path: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("ensure_container_network must not be called in dry-run");
+        }
+        fn get_container_ip<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            panic!("get_container_ip must not be called in dry-run");
+        }
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _version: &'a str,
+            _arch: &'a str,
+            _skip_checksum: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("ensure_agent_provisioned must not be called in dry-run");
+        }
+        fn write_agent_addr<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _addr: &'a str,
+            _token: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("write_agent_addr must not be called in dry-run");
+        }
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            panic!("agent_volume_mount must not be called in dry-run");
+        }
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _current_version: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("prune_old_agent_versions must not be called in dry-run");
+        }
+    }
+
+    fn dummy_container(name: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: format!("{name}-id"),
+            name: name.to_string(),
+            image: Some("test:latest".to_string()),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels: HashMap::new(),
+            config_hash: None,
+            ports: vec![],
+            created_at: None,
+            container_user: None,
+            mounts: vec![],
+            backend: BackendKind::Docker,
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_candidates_without_side_effects() {
+        let hooks = SpyHooks::new();
+        let backend = PanicBackend;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let progress = ProgressSender::new(tx, false);
+
+        let candidates = vec![
+            PruneCandidate {
+                branch: "feat-a".to_string(),
+                worktree_path: PathBuf::from("/tmp/wt-a"),
+                container: Some(dummy_container("cella-feat-a")),
+                reason: PruneReason::Merged,
+            },
+            PruneCandidate {
+                branch: "feat-b".to_string(),
+                worktree_path: PathBuf::from("/tmp/wt-b"),
+                container: None,
+                reason: PruneReason::Gone,
+            },
+        ];
+
+        let result = execute_prune(
+            Path::new("/tmp"),
+            &backend,
+            &candidates,
+            &progress,
+            &hooks,
+            true,
+        )
+        .await;
+
+        assert_eq!(result.pruned.len(), 2);
+        assert_eq!(result.pruned[0].branch, "feat-a");
+        assert!(result.pruned[0].had_container);
+        assert_eq!(result.pruned[1].branch, "feat-b");
+        assert!(!result.pruned[1].had_container);
+        assert!(result.errors.is_empty());
+        assert!(
+            !hooks.deregister_called.load(Ordering::Relaxed),
+            "dry-run must not deregister containers"
+        );
+        assert!(
+            !hooks.cleanup_called.load(Ordering::Relaxed),
+            "dry-run must not call cleanup_daemon"
+        );
+    }
 }

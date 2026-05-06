@@ -157,45 +157,37 @@ impl DownArgs {
 
         deregister_container(&container).await;
 
-        // Docker Compose branch: use `docker compose down` for compose containers
-        if discovery::is_compose_container(&container.labels)
-            && let Some(project_name) = discovery::compose_project_from_labels(&container.labels)
-        {
-            info!("Stopping compose project: {project_name}");
-            let compose_cmd = cella_compose::ComposeCommand::from_project_name(project_name);
-            compose_cmd
-                .down()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("docker compose down failed: {e}").into()
-                })?;
-
-            // Clean up override file
-            if let Some(data_dir) = cella_data_dir() {
-                let override_path = data_dir
-                    .join("compose")
-                    .join(project_name)
-                    .join("docker-compose.cella.yml");
-                cella_compose::override_file::cleanup_override_file(&override_path);
-            }
-
+        if let Some(project_name) = compose_project_if_applicable(&container) {
+            stop_compose_project(project_name).await?;
             print_outcome(&self.output, "stopped", &container.id);
             cleanup_daemon();
             return Ok(());
         }
 
         if container.state == ContainerState::Running {
-            client.as_ref().stop_container(&container.id).await?;
-            info!("Container stopped");
+            match client.as_ref().stop_container(&container.id).await {
+                Ok(()) => info!("Container stopped"),
+                Err(cella_backend::BackendError::ContainerNotFound { .. }) => {
+                    debug!("Container already removed, treating as stopped");
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else {
             info!("Container already stopped");
         }
 
         let outcome = if self.rm {
-            client
+            match client
                 .as_ref()
                 .remove_container(&container.id, self.volumes)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(cella_backend::BackendError::ContainerNotFound { .. }) => {
+                    debug!("Container already removed, treating as success");
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             cleanup_workspace_network(client.as_ref(), &container).await;
 
@@ -213,6 +205,36 @@ impl DownArgs {
 
         Ok(())
     }
+}
+
+fn compose_project_if_applicable(container: &ContainerInfo) -> Option<&str> {
+    if discovery::is_compose_container(&container.labels) {
+        discovery::compose_project_from_labels(&container.labels)
+    } else {
+        None
+    }
+}
+
+async fn stop_compose_project(
+    project_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("Stopping compose project: {project_name}");
+    let compose_cmd = cella_compose::ComposeCommand::from_project_name(project_name);
+    compose_cmd
+        .down()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("docker compose down failed: {e}").into()
+        })?;
+
+    if let Some(data_dir) = cella_data_dir() {
+        let override_path = data_dir
+            .join("compose")
+            .join(project_name)
+            .join("docker-compose.cella.yml");
+        cella_compose::override_file::cleanup_override_file(&override_path);
+    }
+    Ok(())
 }
 
 /// Remove the per-workspace `cella-net-*` network if no containers are
@@ -340,5 +362,27 @@ mod tests {
         if let crate::commands::Command::Down(args) = &cli.command {
             assert!(!args.is_text_output());
         }
+    }
+
+    #[test]
+    fn container_not_found_is_tolerated_during_rm() {
+        let err = cella_backend::BackendError::ContainerNotFound {
+            identifier: "abc123".to_string(),
+        };
+        assert!(
+            matches!(err, cella_backend::BackendError::ContainerNotFound { .. }),
+            "ContainerNotFound should match and be treated as success"
+        );
+    }
+
+    #[test]
+    fn other_backend_errors_are_not_tolerated() {
+        let err = cella_backend::BackendError::ConnectionFailed {
+            message: "timeout".to_string(),
+        };
+        assert!(
+            !matches!(err, cella_backend::BackendError::ContainerNotFound { .. }),
+            "Non-ContainerNotFound errors should propagate"
+        );
     }
 }

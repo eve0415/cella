@@ -197,12 +197,23 @@ fn colima_proxy_request(host_socket: Option<&str>) -> Option<SshAgentRequest> {
     })
 }
 
+/// Check if a Docker error is a bind-mount source-path failure.
+///
+/// When `specific_source` is provided, additionally requires the error
+/// to mention that path.
+pub fn is_bind_mount_error(error_msg: &str, specific_source: Option<&str>) -> bool {
+    if !error_msg.contains("bind source path does not exist") {
+        return false;
+    }
+    specific_source.is_none_or(|source| error_msg.contains(source))
+}
+
 /// Check if a Docker error is a bind-mount failure for the SSH agent socket.
 pub fn is_ssh_mount_error(error_msg: &str, ssh_mount_source: Option<&str>) -> bool {
     let Some(source) = ssh_mount_source else {
         return false;
     };
-    error_msg.contains("bind source path does not exist") && error_msg.contains(source)
+    is_bind_mount_error(error_msg, Some(source))
 }
 
 /// Actionable warning message when SSH agent forwarding is skipped after
@@ -675,5 +686,40 @@ mod tests {
                 "{runtime:?} missing base warning"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // is_bind_mount_error / is_ssh_mount_error
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bind_mount_error_matches_generic_message() {
+        let msg = "error: bind source path does not exist: /tmp/foo";
+        assert!(is_bind_mount_error(msg, None));
+    }
+
+    #[test]
+    fn bind_mount_error_matches_with_specific_source() {
+        let msg = "error: bind source path does not exist: /tmp/foo";
+        assert!(is_bind_mount_error(msg, Some("/tmp/foo")));
+    }
+
+    #[test]
+    fn bind_mount_error_rejects_wrong_source() {
+        let msg = "error: bind source path does not exist: /tmp/foo";
+        assert!(!is_bind_mount_error(msg, Some("/tmp/bar")));
+    }
+
+    #[test]
+    fn bind_mount_error_rejects_unrelated_message() {
+        assert!(!is_bind_mount_error("connection refused", None));
+    }
+
+    #[test]
+    fn ssh_mount_error_requires_source() {
+        let msg = "error: bind source path does not exist: /tmp/ssh.sock";
+        assert!(!is_ssh_mount_error(msg, None));
+        assert!(is_ssh_mount_error(msg, Some("/tmp/ssh.sock")));
+        assert!(!is_ssh_mount_error(msg, Some("/other/path")));
     }
 }

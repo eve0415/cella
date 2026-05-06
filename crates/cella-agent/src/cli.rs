@@ -1195,6 +1195,9 @@ async fn run_prune(
             DaemonMessage::PruneResult { pruned, errors, .. } => {
                 if !pruned.is_empty() {
                     if dry_run {
+                        for branch in &pruned {
+                            eprintln!("  {branch}");
+                        }
                         eprintln!("Would prune {} worktree(s).", pruned.len());
                     } else {
                         eprintln!("Pruned {} worktree(s).", pruned.len());

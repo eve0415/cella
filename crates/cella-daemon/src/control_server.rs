@@ -1045,7 +1045,7 @@ async fn handle_branch_request<W: AsyncWriteExt + Unpin>(
     };
 
     let (status, stdout_collected, stderr_collected) =
-        stream_child_output(&mut child, request_id, writer).await?;
+        stream_child_output_opts(&mut child, request_id, writer, false).await?;
 
     // Send final result.
     let result = if status.success() {
@@ -1089,6 +1089,15 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
     request_id: &str,
     writer: &mut W,
 ) -> Result<(std::process::ExitStatus, String, String), CellaDaemonError> {
+    stream_child_output_opts(child, request_id, writer, true).await
+}
+
+async fn stream_child_output_opts<W: AsyncWriteExt + Unpin>(
+    child: &mut tokio::process::Child,
+    request_id: &str,
+    writer: &mut W,
+    forward_stdout: bool,
+) -> Result<(std::process::ExitStatus, String, String), CellaDaemonError> {
     use cella_protocol::OutputStream;
 
     let child_stdout = child.stdout.take();
@@ -1110,11 +1119,13 @@ async fn stream_child_output<W: AsyncWriteExt + Unpin>(
                     Ok(Some(text)) => {
                         stdout_collected.push_str(&text);
                         stdout_collected.push('\n');
-                        send_message(writer, &DaemonMessage::OperationOutput {
-                            request_id: request_id.to_string(),
-                            stream: OutputStream::Stdout,
-                            data: format!("{text}\n"),
-                        }).await?;
+                        if forward_stdout {
+                            send_message(writer, &DaemonMessage::OperationOutput {
+                                request_id: request_id.to_string(),
+                                stream: OutputStream::Stdout,
+                                data: format!("{text}\n"),
+                            }).await?;
+                        }
                     }
                     _ => stdout_done = true,
                 }
@@ -1777,6 +1788,11 @@ async fn handle_down_request<W: AsyncWriteExt + Unpin>(
         };
         cella_protocol::DownOperationResult::Error { message: error_msg }
     };
+
+    if rm && status.success() {
+        let mut mgr = wt.task_mgr.lock().await;
+        mgr.remove_branch(branch);
+    }
 
     send_message(
         writer,
@@ -2559,7 +2575,9 @@ async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) ->
 
     // Fallback: when requesting "main" from a worktree, the main container lacks
     // the branch/worktree labels. Look it up by workspace_path instead.
-    if let Some(parent) = wt.parent_repo {
+    if let Some(parent) = wt.parent_repo
+        && branch == "main"
+    {
         let mut cmd = tokio::process::Command::new(&cmd_name);
         if let Some(ref host) = docker_host {
             cmd.arg("-H").arg(host);
@@ -2587,8 +2605,8 @@ async fn find_container_for_branch(branch: &str, wt: &WorktreeHandlerCtx<'_>) ->
                 }
             }
         }
-    } else {
-        // Caller IS the main container — resolve to self.
+    } else if branch == "main" {
+        // Caller IS the main container and requesting "main" — resolve to self.
         return Some(wt.container_name.to_string());
     }
 

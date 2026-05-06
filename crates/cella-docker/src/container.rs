@@ -161,6 +161,8 @@ impl DockerClient {
 
     /// Stop a running container.
     ///
+    /// Returns `Ok(())` if the container was already removed (Docker 404).
+    ///
     /// # Errors
     ///
     /// Returns `CellaDockerError::DockerApi` on API errors.
@@ -170,11 +172,21 @@ impl DockerClient {
             t: Some(10),
             ..Default::default()
         };
-        self.inner().stop_container(id, Some(options)).await?;
-        Ok(())
+        match self.inner().stop_container(id, Some(options)).await {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(CellaDockerError::ContainerNotFound {
+                workspace: id.to_string(),
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Remove a container, optionally removing its volumes.
+    ///
+    /// Returns `ContainerNotFound` if the container was already removed
+    /// (Docker 404), allowing callers to treat it as a no-op.
     ///
     /// # Errors
     ///
@@ -190,8 +202,15 @@ impl DockerClient {
             force: false,
             ..Default::default()
         };
-        self.inner().remove_container(id, Some(options)).await?;
-        Ok(())
+        match self.inner().remove_container(id, Some(options)).await {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(CellaDockerError::ContainerNotFound {
+                workspace: id.to_string(),
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get detailed container info.

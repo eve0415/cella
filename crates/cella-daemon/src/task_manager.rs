@@ -273,10 +273,15 @@ impl TaskManager {
         true
     }
 
-    /// Remove completed tasks.
+    /// Remove all completed (non-running) tasks.
     pub fn cleanup_done(&mut self) {
         self.tasks
             .retain(|_, state| state.exit_code.load(Ordering::Acquire) == EXIT_RUNNING);
+    }
+
+    /// Remove the task record for a branch (completed or not).
+    pub fn remove_branch(&mut self, branch: &str) -> bool {
+        self.tasks.remove(branch).is_some()
     }
 }
 
@@ -784,6 +789,40 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("already running"));
+    }
+
+    // -- remove_branch --
+
+    #[tokio::test]
+    async fn remove_branch_returns_false_for_unknown() {
+        let mut mgr = manager();
+        assert!(!mgr.remove_branch("ghost"));
+    }
+
+    #[tokio::test]
+    async fn remove_branch_removes_completed_task() {
+        let mut mgr = manager();
+        mgr.start_task("br", "c".into(), vec!["x".into()], None, Vec::new(), None)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(mgr.remove_branch("br"));
+        assert!(mgr.list_tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_branch_removes_running_task() {
+        let mut mgr = manager();
+        mgr.start_task(
+            "br",
+            "c".into(),
+            vec!["sleep".into(), "9999".into()],
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        assert!(mgr.remove_branch("br"));
+        assert!(mgr.list_tasks().is_empty());
     }
 
     // -- TaskOutput ring buffer --
