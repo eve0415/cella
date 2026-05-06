@@ -919,6 +919,8 @@ async fn run_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + S
     };
     client.send(&msg).await?;
 
+    let current_container = std::env::var("CELLA_CONTAINER_NAME").ok();
+
     loop {
         let resp = recv_timeout(&mut client, TIMEOUT_FAST).await?;
         if let DaemonMessage::ListResult { worktrees, .. } = resp {
@@ -927,7 +929,7 @@ async fn run_list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + S
             } else if worktrees.is_empty() {
                 eprintln!("No worktree branches found.");
             } else {
-                print_worktree_table(&worktrees);
+                print_worktree_table(&worktrees, current_container.as_deref());
             }
             return Ok(());
         }
@@ -1447,14 +1449,23 @@ fn restore_terminal(termios: &nix::sys::termios::Termios) {
     let _ = t::tcsetattr(&stdin, t::SetArg::TCSANOW, termios);
 }
 
-fn print_worktree_table(worktrees: &[cella_protocol::WorktreeEntry]) {
+fn print_worktree_table(
+    worktrees: &[cella_protocol::WorktreeEntry],
+    current_container: Option<&str>,
+) {
     const HEADER: &str = "BRANCH               STATE      CONTAINER                      PATH";
     println!("{HEADER}");
     for wt in worktrees {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
         let state = wt.container_state.as_deref().unwrap_or("-");
         let container = wt.container_name.as_deref().unwrap_or("-");
-        let marker = if wt.is_main { " *" } else { "" };
+        let marker = if current_container.is_some_and(|c| wt.container_name.as_deref() == Some(c)) {
+            " *"
+        } else if current_container.is_none() && wt.is_main {
+            " *"
+        } else {
+            ""
+        };
         println!(
             "{:<20} {:<10} {:<30} {}",
             format!("{branch}{marker}"),
@@ -2064,7 +2075,7 @@ mod tests {
                 labels: None,
             },
         ];
-        print_worktree_table(&worktrees);
+        print_worktree_table(&worktrees, Some("project-main"));
     }
 
     #[test]
@@ -2303,7 +2314,7 @@ mod tests {
     #[test]
     fn print_worktree_table_empty() {
         // Should not panic on empty slice.
-        print_worktree_table(&[]);
+        print_worktree_table(&[], None);
     }
 
     // --- JSON flag parsing ---
