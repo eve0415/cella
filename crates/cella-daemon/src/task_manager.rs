@@ -729,8 +729,13 @@ mod tests {
             .unwrap();
         mgr.start_task("b", "c".into(), vec!["x".into()], None, Vec::new(), None)
             .unwrap();
-        // Let both tasks finish (docker unavailable → exit 1).
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Poll until both tasks finish (docker unavailable → exit 1).
+        for _ in 0..50 {
+            if mgr.is_done("a") && mgr.is_done("b") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         mgr.cleanup_done();
         assert!(mgr.list_tasks().is_empty());
     }
