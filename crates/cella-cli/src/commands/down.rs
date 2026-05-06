@@ -192,10 +192,17 @@ impl DownArgs {
         }
 
         let outcome = if self.rm {
-            client
+            match client
                 .as_ref()
                 .remove_container(&container.id, self.volumes)
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(cella_backend::BackendError::ContainerNotFound { .. }) => {
+                    debug!("Container already removed, treating as success");
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             cleanup_workspace_network(client.as_ref(), &container).await;
 
@@ -340,5 +347,27 @@ mod tests {
         if let crate::commands::Command::Down(args) = &cli.command {
             assert!(!args.is_text_output());
         }
+    }
+
+    #[test]
+    fn container_not_found_is_tolerated_during_rm() {
+        let err = cella_backend::BackendError::ContainerNotFound {
+            identifier: "abc123".to_string(),
+        };
+        assert!(
+            matches!(err, cella_backend::BackendError::ContainerNotFound { .. }),
+            "ContainerNotFound should match and be treated as success"
+        );
+    }
+
+    #[test]
+    fn other_backend_errors_are_not_tolerated() {
+        let err = cella_backend::BackendError::ConnectionFailed {
+            message: "timeout".to_string(),
+        };
+        assert!(
+            !matches!(err, cella_backend::BackendError::ContainerNotFound { .. }),
+            "Non-ContainerNotFound errors should propagate"
+        );
     }
 }
