@@ -2096,6 +2096,8 @@ async fn handle_task_list<W: AsyncWriteExt + Unpin>(
                 status: if t.is_done {
                     if t.exit_code == Some(0) {
                         cella_protocol::TaskStatus::Done
+                    } else if t.exit_code == Some(124) {
+                        cella_protocol::TaskStatus::TimedOut
                     } else {
                         cella_protocol::TaskStatus::Failed
                     }

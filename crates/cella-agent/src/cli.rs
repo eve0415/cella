@@ -1242,6 +1242,7 @@ async fn run_task_list(json: bool) -> Result<(), Box<dyn std::error::Error + Sen
                         cella_protocol::TaskStatus::Running => "running",
                         cella_protocol::TaskStatus::Done => "done",
                         cella_protocol::TaskStatus::Failed => "failed",
+                        cella_protocol::TaskStatus::TimedOut => "timed_out",
                     };
                     let time = format!("{}s", t.elapsed_secs);
                     let cmd = t.command.join(" ");
