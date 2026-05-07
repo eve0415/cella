@@ -204,7 +204,7 @@ Shows captured stdout/stderr from the task. With `--follow`, streams live output
 cella task wait <branch>
 ```
 
-Blocks until the task finishes. The process exit code (`$?`) matches the task's exit code (see table below). Prints a summary line to stdout (`Task <branch> exited with code N`) when it observes the exit — if the task already completed before `wait` is called, it may return silently with just the exit code.
+Blocks until the task finishes. The process exit code (`$?`) matches the task's exit code (see table below). Always prints a status message to **stderr**: `Task '<branch>' exited with code N` (non-zero) or `Task '<branch>' completed successfully.` (zero). Stdout is never written to, so scripts can safely capture it.
 
 ### Stop a Task
 
