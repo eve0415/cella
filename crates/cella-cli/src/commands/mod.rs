@@ -219,7 +219,7 @@ impl Command {
             Self::Branch(args) => args.execute(progress).await,
             Self::Switch(args) => args.execute().await,
             Self::Prune(args) => args.execute().await,
-            Self::ReadConfiguration(args) => args.execute(),
+            Self::ReadConfiguration(args) => args.execute().await,
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,

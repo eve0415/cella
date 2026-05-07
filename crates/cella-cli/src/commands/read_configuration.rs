@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use serde_json::json;
 
+use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve;
 
 use crate::backend::BackendArgs;
@@ -47,12 +48,32 @@ pub struct ReadConfigurationArgs {
 }
 
 impl ReadConfigurationArgs {
-    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let has_container_target = self.id_label.is_some() || self.container_id.is_some();
 
-        let resolved = resolve::config(&cwd, self.config.as_deref())?;
+        let (resolved, cwd) = if has_container_target {
+            let client = self.backend.resolve_client().await?;
+            let target = ContainerTarget {
+                container_id: self.container_id.clone(),
+                container_name: None,
+                id_label: self.id_label.clone(),
+                workspace_folder: self.workspace_folder.clone(),
+            };
+            let container = target.resolve(&*client, false).await?;
 
-        // Determine deviceContainerType
+            let workspace_path = container
+                .labels
+                .get("dev.cella.workspace_path")
+                .ok_or("container has no dev.cella.workspace_path label")?;
+            let ws = PathBuf::from(workspace_path);
+            let res = resolve::config(&ws, self.config.as_deref())?;
+            (res, ws)
+        } else {
+            let ws = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
+            let res = resolve::config(&ws, self.config.as_deref())?;
+            (res, ws)
+        };
+
         let device_type = if resolved.config.get("dockerComposeFile").is_some() {
             "dockerCompose"
         } else if resolved.config.get("build").is_some()
@@ -63,7 +84,6 @@ impl ReadConfigurationArgs {
             "image"
         };
 
-        // Compute workspace folder
         let workspace_basename = cwd.file_name().map_or_else(
             || "workspace".to_string(),
             |n| n.to_string_lossy().to_string(),
@@ -94,11 +114,8 @@ impl ReadConfigurationArgs {
             }
         });
 
-        // Include merged configuration if requested.
-        // Full feature resolution requires Docker and network access;
-        // for now output the resolved configuration itself.
         if self.include_merged_configuration {
-            output["mergeConfiguration"] = output["configuration"].clone();
+            output["mergedConfiguration"] = output["configuration"].clone();
         }
 
         println!("{}", serde_json::to_string_pretty(&output)?);
