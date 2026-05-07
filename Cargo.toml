@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.51"
+version = "0.0.52"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -106,9 +106,7 @@ chrono = { version = "=0.4.44", default-features = false, features = ["clock"] }
 tar = "=0.4.45"
 
 # HTTP client
-reqwest = { version = "=0.13.3", default-features = false, features = [
-    "rustls",
-] }
+reqwest = { version = "=0.13.3", default-features = false, features = ["rustls"] }
 
 # Filesystem
 dirs = "=6.0.0"
