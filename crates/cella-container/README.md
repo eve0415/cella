@@ -55,7 +55,7 @@ The backend discovers the `container` binary via `CELLA_CONTAINER_PATH` or `PATH
 cargo test -p cella-container
 ```
 
-Unit tests cover CLI argument assembly, JSON output parsing, and container state mapping. Integration tests require macOS 26 with the Apple Container CLI installed and are gated behind the `integration-tests` feature.
+Unit tests cover CLI argument assembly, JSON output parsing, and container state mapping. Integration tests require macOS 26 with the Apple Container CLI installed and use `#[runtime_test(apple_container)]` for runtime detection — they skip gracefully on other platforms.
 
 ## Development
 

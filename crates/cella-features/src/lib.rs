@@ -636,7 +636,6 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "integration-tests")]
     use crate::test_utils::test_platform;
 
     // -----------------------------------------------------------------------
@@ -1120,8 +1119,7 @@ mod tests {
     // End-to-end: OCI feature resolution (requires Docker + network)
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn e2e_resolve_node_feature() {
         let config = json!({
             "image": "mcr.microsoft.com/devcontainers/base:ubuntu",

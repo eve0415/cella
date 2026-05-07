@@ -245,8 +245,7 @@ mod tests {
         assert_eq!(cached.features[2].id, "rust");
     }
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn fetch_official_template_collection() {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(cache_dir.path());
@@ -266,8 +265,7 @@ mod tests {
         assert!(ids.contains(&"debian"), "should contain debian template");
     }
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn fetch_official_feature_collection() {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(cache_dir.path());

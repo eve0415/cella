@@ -20,8 +20,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-[features]
-integration-tests = []
+[dev-dependencies]
+cella-testing.workspace = true
 
 [lints]
 workspace = true

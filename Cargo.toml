@@ -19,6 +19,8 @@ members = [
     "crates/cella-network",
     "crates/cella-oci",
     "crates/cella-orchestrator",
+    "crates/cella-test-macros",
+    "crates/cella-testing",
     "crates/cella-tool-install",
     "crates/cella-protocol",
     "crates/cella-proxy",
@@ -146,10 +148,16 @@ nix = { version = "=0.31.2", default-features = false, features = ["signal", "te
 # PTY
 portable-pty = "=0.9.0"
 
+# Proc macros
+syn = { version = "=2.0.117", features = ["full"] }
+quote = "=1.0.45"
+proc-macro2 = "=1.0.106"
+
 # Testing
 tempfile = "=3.27.0"
 filetime = "=0.2.27"
 insta = { version = "=1.47.2", features = ["json", "yaml", "redactions"] }
+trybuild = "=1.0.116"
 
 # Internal crates
 cella-backend = { path = "crates/cella-backend" }
@@ -174,6 +182,8 @@ cella-port = { path = "crates/cella-port" }
 cella-protocol = { path = "crates/cella-protocol" }
 cella-proxy = { path = "crates/cella-proxy" }
 cella-templates = { path = "crates/cella-templates" }
+cella-test-macros = { path = "crates/cella-test-macros" }
+cella-testing = { path = "crates/cella-testing" }
 
 [profile.release]
 strip = true

@@ -1,7 +1,4 @@
 //! Smoke tests: full compose lifecycle with Docker.
-//!
-//! These tests are `#[ignore = "requires Docker daemon"]`-d by default because they require a running
-//! Docker daemon. Run them with `cargo test --features integration-tests -- --ignored`.
 
 use std::collections::BTreeMap;
 
@@ -30,8 +27,7 @@ fn plain_override(service: &str) -> OverrideConfig {
 }
 
 /// Plain compose: write override -> build -> up -> ps -> down.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker, compose)]
 async fn plain_compose_lifecycle() {
     let ctx = ComposeTestContext::new("plain-compose");
     let config = load_fixture_config(&ctx.fixture_dir);
@@ -87,8 +83,7 @@ async fn plain_compose_lifecycle() {
 /// for an image-only service that would normally get features injected.
 /// It does not perform actual feature resolution (that requires cella-features),
 /// but confirms the override structure is accepted by Docker Compose.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker, compose)]
 async fn image_only_features_lifecycle() {
     let ctx = ComposeTestContext::new("image-only-features");
     let config = load_fixture_config(&ctx.fixture_dir);
@@ -131,8 +126,7 @@ async fn image_only_features_lifecycle() {
 }
 
 /// Multi-service compose: verify that runServices are started and others are not.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker, compose)]
 async fn multi_service_lifecycle() {
     let ctx = ComposeTestContext::new("multi-service");
     let config = load_fixture_config(&ctx.fixture_dir);

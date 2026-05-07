@@ -2967,7 +2967,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn control_server_marks_connected_via_real_tcp_handshake() {
         use tokio::io::AsyncWriteExt;

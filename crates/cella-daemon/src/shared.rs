@@ -204,8 +204,7 @@ mod tests {
         cleanup_files(&[&dir.path().join("nonexistent")]);
     }
 
-    #[test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(docker)]
     fn container_count_with_no_containers() {
         assert_eq!(running_cella_container_count(), 0);
     }

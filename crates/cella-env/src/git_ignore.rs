@@ -263,7 +263,6 @@ mod tests {
         assert_eq!(content, "# --- forwarded from host ---\n*.log\n");
     }
 
-    #[cfg(feature = "integration-tests")]
     #[test]
     fn resolve_from_real_git_config() {
         // If git reports an excludesFile, the resolved path must exist.

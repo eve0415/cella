@@ -7,15 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 cargo fmt --all -- --check                                            # format check
 cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::all  # lint (all warnings are errors)
-cargo test --workspace                                                # unit tests
+cargo test --workspace                                                # all tests (integration tests skip if runtime unavailable)
 cargo insta test --workspace --check --unreferenced=reject            # snapshot tests
 ```
 
-Integration tests require Docker and are feature-gated:
-
-```sh
-cargo test -p cella-features -p cella-daemon -p cella-compose --features integration-tests
-```
+Integration tests use `#[runtime_test]` from `cella-testing` for runtime detection. They always compile and skip gracefully when the required runtime (Docker, compose, network, etc.) is unavailable. No special flags needed — `cargo test --workspace` runs everything.
 
 Update snapshots with `cargo insta review`.
 
@@ -55,11 +51,12 @@ Always research before suggesting changes or asking the user questions. Use `/sp
 
 ## Architecture
 
-Rust workspace (edition 2024, MSRV 1.95.0) with 19 crates in `crates/`. Three-tier structure:
+Rust workspace (edition 2024, MSRV 1.95.0) with crates in `crates/`. Three-tier structure:
 
 - **Tier 1 (CLI):** cella-cli — binary entry point, delegates to library crates
 - **Tier 2 (Domain):** cella-docker, cella-compose, cella-orchestrator, cella-config, cella-features, cella-git, cella-daemon, cella-agent, cella-env, cella-doctor, cella-container, cella-templates
 - **Tier 3 (Foundation):** cella-backend, cella-port, cella-codegen, cella-network, cella-protocol, cella-jsonc
+- **Testing:** cella-testing (runtime detection + `#[runtime_test]` macro), cella-test-macros (proc macro)
 
 Backend-agnostic design: cella-backend defines traits, cella-docker and cella-container implement them. Hooks pattern (PruneHooks, ComposeUpHooks, UpHooks) bridges CLI-owned operations into the orchestrator without circular dependencies.
 

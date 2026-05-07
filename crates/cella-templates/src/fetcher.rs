@@ -303,8 +303,7 @@ mod tests {
         assert!(read_template_metadata(dir.path()).is_err());
     }
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn fetch_rust_template() {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = TemplateCache::with_root(cache_dir.path());
