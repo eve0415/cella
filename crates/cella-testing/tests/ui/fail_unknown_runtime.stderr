@@ -1,0 +1,5 @@
+error: unknown runtime `foobar`. Expected one of: docker, compose, buildx, podman, apple_container, orbstack, colima, lima, network, container_runtime
+ --> tests/ui/fail_unknown_runtime.rs:3:16
+  |
+3 | #[runtime_test(foobar)]
+  |                ^^^^^^

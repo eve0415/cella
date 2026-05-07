@@ -9,5 +9,9 @@ cella-test-macros.workspace = true
 tokio.workspace = true
 bollard.workspace = true
 
+[dev-dependencies]
+bollard.workspace = true
+trybuild.workspace = true
+
 [lints]
 workspace = true

@@ -157,6 +157,7 @@ proc-macro2 = "=1.0.106"
 tempfile = "=3.27.0"
 filetime = "=0.2.27"
 insta = { version = "=1.47.2", features = ["json", "yaml", "redactions"] }
+trybuild = "=1.0.116"
 
 # Internal crates
 cella-backend = { path = "crates/cella-backend" }
