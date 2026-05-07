@@ -25,6 +25,8 @@ Cella gives each git branch its own isolated dev container. This test sweep exer
    ```
    The JSON output contains a `daemon_version` field. The text output of `cella doctor` (without `--json`) also prints the agent version in its banner. Verify these match.
 
+**Pre-existing branches**: If `test/a`, `test/b`, or `test/deep/nested/name` already exist as git branches (e.g., from a previous failed run), `cella branch` handles them idempotently — it creates the worktree and container without error.
+
 ## Test Phases
 
 ### Phase 1: Baseline Diagnostics
@@ -97,12 +99,13 @@ cella exec test/b -- cat /tmp/test.txt
 ### Phase 5: Output Quality
 
 ```sh
-cella up test/a 2>&1 | grep -c '{'    # expect 0
-cella down test/a 2>&1 | grep -c '{'  # expect 0
+cella up test/a 2>&1 | grep -c '{' || true    # expect count 0
+cella down test/a 2>&1 | grep -c '{' || true  # expect count 0
 ```
 
 **Expected results:**
 - No JSON fragments leak into human-readable output (count should be 0)
+- Note: `grep -c` exits with code 1 when the count is 0 (no matches). The `|| true` prevents this from being misread as a test failure. Check the printed count, not the exit code.
 
 Note: Phase 5's `cella down test/a` leaves it stopped. Phase 6 starts with `cella down test/a` which is intentionally idempotent — it confirms the stopped state rather than changing it.
 
