@@ -69,6 +69,8 @@ impl ShellArgs {
             super::resolve_service_container(client.as_ref(), container, self.service.as_deref())
                 .await?;
 
+        let cella_title =
+            crate::title::title_for_container(&container, self.service.as_deref(), "shell");
         let title_guard =
             crate::title::push_for_container(&container, self.service.as_deref(), "shell");
 
@@ -131,6 +133,8 @@ impl ShellArgs {
                 env.push(format!("{var}={val}"));
             }
         }
+
+        env.push(format!("CELLA_TITLE={cella_title}"));
 
         let exit_code = client
             .as_ref()

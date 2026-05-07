@@ -50,6 +50,7 @@ impl SwitchArgs {
         };
 
         let container = target.resolve(client.as_ref(), true).await?;
+        let cella_title = crate::title::title_for_container(&container, None, "switch");
         let title_guard = crate::title::push_for_container(&container, None, "switch");
 
         super::ensure_cella_daemon().await;
@@ -108,6 +109,8 @@ impl SwitchArgs {
                 env.push(format!("{var}={val}"));
             }
         }
+
+        env.push(format!("CELLA_TITLE={cella_title}"));
 
         let exit_code = client
             .as_ref()
