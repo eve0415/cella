@@ -111,9 +111,12 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Run tests with coverage
-        run: cargo llvm-cov --no-report --workspace
+        run: >
+          cargo llvm-cov --no-report --workspace
+          --exclude cella-docker
+          --exclude cella-compose
 
-      - name: Run Docker integration tests serialized
+      - name: Run Docker and Compose tests serialized
         run: >
           cargo llvm-cov --no-report
           -p cella-docker
