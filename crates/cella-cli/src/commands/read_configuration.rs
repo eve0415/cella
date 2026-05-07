@@ -5,6 +5,7 @@ use serde_json::json;
 
 use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve;
+use cella_features::types::FeatureContainerConfig;
 
 use crate::backend::BackendArgs;
 
@@ -137,10 +138,85 @@ impl ReadConfigurationArgs {
         });
 
         if self.include_merged_configuration {
-            output["mergedConfiguration"] = output["configuration"].clone();
+            output["mergedConfiguration"] =
+                resolve_merged_config(&resolved.config, &resolved.config_path).await?;
         }
 
         println!("{}", serde_json::to_string_pretty(&output)?);
         Ok(())
+    }
+}
+
+async fn resolve_merged_config(
+    config: &serde_json::Value,
+    config_path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let features = super::features::resolve::extract_features(config);
+    if features.is_empty() {
+        return Ok(config.clone());
+    }
+
+    let platform =
+        cella_features::oci::detect_platform(std::env::consts::OS, std::env::consts::ARCH);
+    let cache = cella_features::cache::FeatureCache::new();
+    let base_image = config.get("image").and_then(|v| v.as_str()).unwrap_or("");
+    let base_ctx = cella_features::BaseImageContext {
+        base_image,
+        image_user: "root",
+        metadata: None,
+    };
+    let rf =
+        cella_features::resolve_features(config, config_path, &platform, &cache, &base_ctx, false)
+            .await?;
+
+    let mut merged = config.clone();
+    apply_feature_config(&mut merged, &rf.container_config);
+    Ok(merged)
+}
+
+fn apply_feature_config(config: &mut serde_json::Value, fc: &FeatureContainerConfig) {
+    if !fc.mounts.is_empty() {
+        config["mounts"] = json!(fc.mounts);
+    }
+    if !fc.cap_add.is_empty() {
+        config["capAdd"] = json!(fc.cap_add);
+    }
+    if !fc.security_opt.is_empty() {
+        config["securityOpt"] = json!(fc.security_opt);
+    }
+    if fc.privileged {
+        config["privileged"] = json!(true);
+    }
+    if fc.init {
+        config["init"] = json!(true);
+    }
+    if !fc.container_env.is_empty() {
+        config["containerEnv"] = json!(fc.container_env);
+    }
+    if !fc.customizations.is_null() {
+        config["customizations"] = fc.customizations.clone();
+    }
+    apply_lifecycle_field(config, "onCreateCommand", &fc.lifecycle.on_create);
+    apply_lifecycle_field(config, "updateContentCommand", &fc.lifecycle.update_content);
+    apply_lifecycle_field(config, "postCreateCommand", &fc.lifecycle.post_create);
+    apply_lifecycle_field(config, "postStartCommand", &fc.lifecycle.post_start);
+    apply_lifecycle_field(config, "postAttachCommand", &fc.lifecycle.post_attach);
+}
+
+fn apply_lifecycle_field(
+    config: &mut serde_json::Value,
+    key: &str,
+    entries: &[cella_features::types::LifecycleEntry],
+) {
+    match entries.len() {
+        0 => {}
+        1 => config[key] = entries[0].command.clone(),
+        _ => {
+            let obj: serde_json::Map<String, serde_json::Value> = entries
+                .iter()
+                .map(|e| (e.origin.clone(), e.command.clone()))
+                .collect();
+            config[key] = serde_json::Value::Object(obj);
+        }
     }
 }
