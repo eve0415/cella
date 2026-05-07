@@ -5,9 +5,14 @@ use serde_json::json;
 
 use cella_config::devcontainer::resolve;
 
+use crate::backend::BackendArgs;
+
 /// Read and output the resolved devcontainer configuration.
 #[derive(Args)]
 pub struct ReadConfigurationArgs {
+    #[command(flatten)]
+    backend: BackendArgs,
+
     /// Workspace folder path (defaults to current directory).
     #[arg(long)]
     workspace_folder: Option<PathBuf>,
@@ -23,6 +28,22 @@ pub struct ReadConfigurationArgs {
     /// Include features configuration details.
     #[arg(long)]
     include_features_configuration: bool,
+
+    /// Path to a devcontainer.json that replaces the discovered config entirely.
+    #[arg(long = "override-config")]
+    override_config: Option<PathBuf>,
+
+    /// Target container by label.
+    #[arg(long = "id-label")]
+    id_label: Option<String>,
+
+    /// Target container by ID.
+    #[arg(long = "container-id")]
+    container_id: Option<String>,
+
+    /// Additional features as JSON string.
+    #[arg(long = "additional-features")]
+    additional_features: Option<String>,
 }
 
 impl ReadConfigurationArgs {
