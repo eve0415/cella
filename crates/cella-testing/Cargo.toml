@@ -1,0 +1,13 @@
+[package]
+name = "cella-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cella-test-macros.workspace = true
+tokio.workspace = true
+bollard.workspace = true
+
+[lints]
+workspace = true
