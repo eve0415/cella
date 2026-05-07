@@ -424,7 +424,7 @@ pub async fn inject_cella_path(
         format!("/home/{remote_user}")
     };
 
-    for (guard, snippet) in PATH_SNIPPETS {
+    for (guard, snippet) in PATH_SNIPPETS.iter().chain(TITLE_SNIPPETS) {
         for profile in &[".bashrc", ".zshrc", ".profile"] {
             let path = format!("{home}/{profile}");
             let cmd = format!(
@@ -474,6 +474,22 @@ fi
 "#,
     ),
 ];
+
+const TITLE_SNIPPETS: &[(&str, &str)] = &[(
+    "# cella terminal title",
+    r#"
+# cella terminal title (re-set title after each command for WezTerm compat)
+if [ -n "$CELLA_TITLE" ]; then
+    if [ -n "$BASH" ]; then
+        __cella_title() { printf '\033]0;%s\007' "$CELLA_TITLE"; }
+        PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__cella_title"
+    elif [ -n "$ZSH_VERSION" ]; then
+        __cella_title() { printf '\033]0;%s\007' "$CELLA_TITLE" }
+        precmd_functions+=(__cella_title)
+    fi
+fi
+"#,
+)];
 
 /// Seed gh CLI credentials into a container.
 ///
@@ -808,5 +824,33 @@ mod tests {
         let cmd = json!({"step": 42});
         let result = run_host_command("test", &cmd);
         assert!(result.is_ok());
+    }
+
+    // ── TITLE_SNIPPETS ──────────────────────────────────────────────
+
+    #[test]
+    fn title_snippet_contains_prompt_command_for_bash() {
+        let (_, snippet) = TITLE_SNIPPETS[0];
+        assert!(snippet.contains("PROMPT_COMMAND"));
+        assert!(snippet.contains("CELLA_TITLE"));
+    }
+
+    #[test]
+    fn title_snippet_contains_precmd_for_zsh() {
+        let (_, snippet) = TITLE_SNIPPETS[0];
+        assert!(snippet.contains("precmd_functions"));
+        assert!(snippet.contains("ZSH_VERSION"));
+    }
+
+    #[test]
+    fn title_snippet_guard_is_idempotent_marker() {
+        let (guard, _) = TITLE_SNIPPETS[0];
+        assert!(guard.starts_with("# cella"));
+    }
+
+    #[test]
+    fn title_snippet_only_activates_when_cella_title_set() {
+        let (_, snippet) = TITLE_SNIPPETS[0];
+        assert!(snippet.contains(r#"if [ -n "$CELLA_TITLE" ]"#));
     }
 }
