@@ -19,11 +19,7 @@ Unit tests (no external dependencies):
 cargo test --workspace
 ```
 
-Integration tests (requires Docker, feature-gated):
-
-```sh
-cargo test -p cella-features -p cella-daemon -p cella-compose --features integration-tests
-```
+Integration tests skip gracefully when the runtime (Docker, network) is unavailable — no special flags needed.
 
 Snapshot tests (insta):
 

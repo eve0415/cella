@@ -6,7 +6,7 @@ cella uses a layered testing approach:
 
 - **Unit tests** — fast, inline with the code, no external dependencies
 - **Snapshot tests** — schema codegen and feature resolution, via [insta](https://insta.rs/)
-- **Integration tests** — feature-gated, require Docker and network access
+- **Integration tests** — use `#[runtime_test]` for runtime detection, skip gracefully when unavailable
 
 ## Unit Tests
 
@@ -24,7 +24,7 @@ mod tests {
 }
 ```
 
-Run all unit tests:
+Run all tests (unit + integration):
 
 ```sh
 cargo test --workspace
@@ -50,20 +50,32 @@ If `cargo-insta` is not installed in a dev container, run `cargo test` to verify
 
 ## Integration Tests
 
-Tests that require Docker or network access (OCI registry fetches, container lifecycle) are gated behind a Cargo feature flag:
+Tests that require Docker, compose, or network access use the `#[runtime_test]` proc macro from `cella-testing`. Tests always compile and skip gracefully at runtime when the required runtime is unavailable:
 
 ```rust
-#[cfg(feature = "integration-tests")]
-#[tokio::test]
+#[cella_testing::runtime_test(docker)]
+async fn network_lifecycle() {
+    let docker = Docker::connect_with_local_defaults().unwrap();
+    // ...
+}
+
+#[cella_testing::runtime_test(network)]
 async fn fetch_from_ghcr() {
+    // ...
+}
+
+#[cella_testing::runtime_test(docker, compose)]
+async fn compose_lifecycle() {
     // ...
 }
 ```
 
-Run integration tests locally (requires Docker):
+Available runtime requirements: `docker`, `compose`, `buildx`, `podman`, `apple_container`, `orbstack`, `colima`, `lima`, `network`, `container_runtime`.
+
+Run all tests — integration tests skip if the runtime is unavailable:
 
 ```sh
-cargo test -p cella-features -p cella-daemon -p cella-compose --features integration-tests
+cargo test --workspace
 ```
 
 These tests run automatically in CI via the **Integration Test** job, which authenticates to `ghcr.io` and produces a combined coverage report via `cargo llvm-cov`.
@@ -104,8 +116,8 @@ impl ContainerRuntime for MockRuntime {
 ## Adding New Tests
 
 1. **Unit test**: add a `#[cfg(test)]` module in the same file as the code under test.
-2. **Integration test**: wrap the test in `#[cfg(feature = "integration-tests")]`. Add the feature flag to the crate's `Cargo.toml` if not already present.
-3. **Async tests**: use `#[tokio::test]` for async test functions.
+2. **Integration test**: add `cella-testing` to `[dev-dependencies]` and use `#[cella_testing::runtime_test(docker)]` (or other runtime).
+3. **Async tests**: `#[runtime_test]` handles async/sync detection automatically. For tests without runtime deps, use `#[tokio::test]`.
 4. **Snapshots**: use `insta::assert_snapshot!` / `insta::assert_json_snapshot!`; run `cargo insta review` to accept.
 5. **Architecture**: use `test_platform()` instead of hardcoding `"amd64"` in OCI or image-architecture tests.
 6. **Regression tests**: every bugfix should land with a failing test from the bug and the fix in the same commit (or split as the fix + the test, but the test should precede or accompany the code).
