@@ -88,7 +88,10 @@ jobs:
           tool: cargo-insta
 
       - name: Validate snapshots
-        run: cargo insta test --workspace --check --unreferenced=reject
+        run: cargo insta test --workspace --exclude cella-docker --exclude cella-compose --check --unreferenced=reject
+
+      - name: Validate Docker and Compose snapshots serialized
+        run: cargo insta test -p cella-docker -p cella-compose --check --unreferenced=reject -- --test-threads=1
 
   integration-test:
     name: Integration Test
