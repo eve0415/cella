@@ -51,6 +51,8 @@ impl ReadConfigurationArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let has_container_target = self.id_label.is_some() || self.container_id.is_some();
 
+        let config_path = self.override_config.as_deref().or(self.config.as_deref());
+
         let (resolved, cwd) = if has_container_target {
             let client = self.backend.resolve_client().await?;
             let target = ContainerTarget {
@@ -66,11 +68,11 @@ impl ReadConfigurationArgs {
                 .get("dev.cella.workspace_path")
                 .ok_or("container has no dev.cella.workspace_path label")?;
             let ws = PathBuf::from(workspace_path);
-            let res = resolve::config(&ws, self.config.as_deref())?;
+            let res = resolve::config(&ws, config_path)?;
             (res, ws)
         } else {
             let ws = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let res = resolve::config(&ws, self.config.as_deref())?;
+            let res = resolve::config(&ws, config_path)?;
             (res, ws)
         };
 
