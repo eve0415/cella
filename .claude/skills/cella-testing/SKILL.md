@@ -76,7 +76,7 @@ cella task logs test/b
 - Quick task (`echo "done"`) completes almost instantly; `cella task list` shows status `done` with ~0s elapsed
 - Timeout task (`sleep 30` with `--timeout 5`) shows status `timed_out` after ~7s, with elapsed frozen at ~5s
 - `cella task logs test/b` may show "Task timed out after 5s" or be empty — the `timed_out` status in `cella task list` is what matters
-- The timeout kill signal may leave test/b's container in `exited` state. If subsequent phases need test/b running, restart it with `cella up test/b` before continuing.
+- The timeout kills the task process inside the container but does NOT stop the container itself. However, if subsequent phases find test/b in `exited` state (for unrelated reasons), restart it with `cella up test/b` before continuing.
 
 ### Phase 4: Agent Dispatch
 
