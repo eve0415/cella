@@ -15,6 +15,7 @@ mod install;
 mod list;
 mod logs;
 mod network;
+mod outdated;
 mod ports;
 mod prune;
 mod read_configuration;
@@ -143,6 +144,8 @@ pub enum Command {
     Template(template::TemplateArgs),
     /// Manage devcontainer features.
     Features(features::FeaturesArgs),
+    /// Show current and available versions.
+    Outdated(outdated::OutdatedArgs),
     /// Initialize cella in the current repository.
     Init(init::InitArgs),
     /// Open VS Code connected to the dev container.
@@ -223,6 +226,7 @@ impl Command {
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
+            Self::Outdated(args) => args.execute().await,
             Self::Init(args) => args.execute(progress).await,
             Self::Completion(args) => {
                 args.execute();
