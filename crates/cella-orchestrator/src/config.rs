@@ -52,6 +52,9 @@ pub struct UpConfig<'a> {
     pub extra_networks: Vec<String>,
     /// Mount-related CLI flags.
     pub mount_flags: MountFlags<'a>,
+    /// Secrets injected into lifecycle commands as environment variables.
+    /// Runtime-only — must NOT be stored in labels or image layers.
+    pub lifecycle_secrets: &'a [String],
 }
 
 /// How the up pipeline should handle the container image.

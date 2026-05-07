@@ -347,10 +347,15 @@ impl EnsureUpContext<'_> {
             .flatten()
         };
 
-        let lifecycle_env = final_probed.as_ref().map_or_else(
+        let mut lifecycle_env = final_probed.as_ref().map_or_else(
             || self.config.remote_env.to_vec(),
             |probed| cella_env::user_env_probe::merge_env(probed, self.config.remote_env),
         );
+        if !self.config.lifecycle_secrets.is_empty() {
+            let mut env_with_secrets = self.config.lifecycle_secrets.to_vec();
+            env_with_secrets.append(&mut lifecycle_env);
+            lifecycle_env = env_with_secrets;
+        }
 
         Ok((final_probed, lifecycle_env))
     }
@@ -1153,10 +1158,15 @@ impl EnsureUpContext<'_> {
             .flatten()
         };
 
-        let lifecycle_env = final_probed.as_ref().map_or_else(
+        let mut lifecycle_env = final_probed.as_ref().map_or_else(
             || remote_env.to_vec(),
             |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
         );
+        if !self.config.lifecycle_secrets.is_empty() {
+            let mut env_with_secrets = self.config.lifecycle_secrets.to_vec();
+            env_with_secrets.append(&mut lifecycle_env);
+            lifecycle_env = env_with_secrets;
+        }
 
         (final_probed, lifecycle_env)
     }

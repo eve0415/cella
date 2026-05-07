@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use clap::Args;
@@ -36,6 +36,11 @@ pub struct UpBuildArgs {
     /// Can be specified multiple times.
     #[arg(long = "secret")]
     pub(crate) secrets: Vec<String>,
+
+    /// JSON file mapping secret names to values, injected as env vars into
+    /// lifecycle commands only (never stored in labels or image layers).
+    #[arg(long = "secrets-file")]
+    pub(crate) secrets_file: Option<PathBuf>,
 }
 
 /// Mount-related flags for an `up` invocation.
@@ -195,10 +200,30 @@ fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
     })
 }
 
-fn compute_default_workspace_folder(
-    workspace_root: &std::path::Path,
-    host_mount_folder: &std::path::Path,
-) -> String {
+fn parse_secrets_file(
+    path: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read secrets file '{}': {e}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid JSON in secrets file '{}': {e}", path.display()))?;
+    let obj = parsed.as_object().ok_or_else(|| {
+        format!(
+            "Secrets file '{}' must contain a JSON object",
+            path.display()
+        )
+    })?;
+    let mut secrets = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        let val = value
+            .as_str()
+            .ok_or_else(|| format!("Secret '{key}' must be a string value"))?;
+        secrets.push(format!("{key}={val}"));
+    }
+    Ok(secrets)
+}
+
+fn compute_default_workspace_folder(workspace_root: &Path, host_mount_folder: &Path) -> String {
     let mount_basename = host_mount_folder.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
@@ -255,6 +280,8 @@ pub struct UpContext {
     pub(crate) compose_pull_policy: Option<String>,
     /// `BuildKit` secrets for image builds.
     build_secrets: Vec<BuildSecret>,
+    /// Secrets injected into lifecycle commands as env vars (runtime-only).
+    lifecycle_secrets: Vec<String>,
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
     mount_config: ResolvedMountConfig,
@@ -299,6 +326,12 @@ impl UpContext {
         );
         let default_workspace_folder =
             compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
+
+        let lifecycle_secrets = if let Some(ref path) = args.build.secrets_file {
+            parse_secrets_file(path)?
+        } else {
+            Vec::new()
+        };
 
         let build_secrets = args
             .build
@@ -347,6 +380,7 @@ impl UpContext {
             compose_env_files: args.env_file.clone(),
             compose_pull_policy: args.pull_policy.as_ref().map(|p| p.as_str().to_string()),
             build_secrets,
+            lifecycle_secrets,
             extra_networks: Vec::new(),
             mount_config: ResolvedMountConfig {
                 additional_cli_mounts,
@@ -365,7 +399,7 @@ impl UpContext {
     /// path and options directly. Always sets `remove_container` and
     /// `build_no_cache` to false.
     pub async fn for_workspace(
-        workspace_path: &std::path::Path,
+        workspace_path: &Path,
         backend_args: &crate::backend::BackendArgs,
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
@@ -421,6 +455,7 @@ impl UpContext {
             compose_env_files: Vec::new(),
             compose_pull_policy: None,
             build_secrets: vec![],
+            lifecycle_secrets: Vec::new(),
             extra_networks: Vec::new(),
             mount_config: ResolvedMountConfig {
                 additional_cli_mounts: Vec::new(),
@@ -602,10 +637,15 @@ impl UpContext {
                 .or(probed_env)
         };
 
-        let lifecycle_env = final_probed.as_ref().map_or_else(
+        let mut lifecycle_env = final_probed.as_ref().map_or_else(
             || remote_env.to_vec(),
             |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
         );
+        if !self.lifecycle_secrets.is_empty() {
+            let mut env_with_secrets = self.lifecycle_secrets.clone();
+            env_with_secrets.append(&mut lifecycle_env);
+            lifecycle_env = env_with_secrets;
+        }
 
         (final_probed, lifecycle_env)
     }
@@ -644,7 +684,7 @@ pub struct UpResult {
 
 struct CliUpHooks<'a> {
     config: &'a serde_json::Value,
-    workspace_root: &'a std::path::Path,
+    workspace_root: &'a Path,
     managed_agent: bool,
     backend_kind: String,
     docker_host: Option<String>,
@@ -821,6 +861,7 @@ impl UpContext {
                 mount_workspace_git_root: self.mount_config.mount_workspace_git_root,
                 mount_git_worktree_common_dir: self.mount_config.mount_git_worktree_common_dir,
             },
+            lifecycle_secrets: &self.lifecycle_secrets,
         };
 
         let result =
@@ -1126,7 +1167,7 @@ async fn inject_cella_path(client: &dyn ContainerBackend, container_id: &str, re
 async fn seed_gh_credentials(
     client: &dyn ContainerBackend,
     container_id: &str,
-    workspace_root: &std::path::Path,
+    workspace_root: &Path,
     remote_user: &str,
 ) {
     cella_orchestrator::container_setup::seed_gh_credentials(
@@ -1549,6 +1590,71 @@ mod tests {
         let cli = crate::Cli::try_parse_from(["cella", "up", "--output", "json"]).unwrap();
         if let crate::commands::Command::Up(args) = &cli.command {
             assert!(!args.is_text_output());
+        }
+    }
+
+    // ── parse_secrets_file ────────────────────────────────────────
+
+    #[test]
+    fn parse_valid_secrets_file() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"{{"API_KEY": "secret123", "DB_PASS": "hunter2"}}"#).unwrap();
+        let secrets = parse_secrets_file(f.path()).unwrap();
+        assert_eq!(secrets.len(), 2);
+        assert!(secrets.contains(&"API_KEY=secret123".to_string()));
+        assert!(secrets.contains(&"DB_PASS=hunter2".to_string()));
+    }
+
+    #[test]
+    fn parse_secrets_file_empty_object() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{{}}").unwrap();
+        let secrets = parse_secrets_file(f.path()).unwrap();
+        assert!(secrets.is_empty());
+    }
+
+    #[test]
+    fn parse_secrets_file_rejects_array() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"["not", "an", "object"]"#).unwrap();
+        let err = parse_secrets_file(f.path()).unwrap_err();
+        assert!(err.to_string().contains("must contain a JSON object"));
+    }
+
+    #[test]
+    fn parse_secrets_file_rejects_non_string_values() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"{{"KEY": 42}}"#).unwrap();
+        let err = parse_secrets_file(f.path()).unwrap_err();
+        assert!(err.to_string().contains("must be a string value"));
+    }
+
+    #[test]
+    fn parse_secrets_file_missing_file() {
+        let err = parse_secrets_file(Path::new("/nonexistent/secrets.json")).unwrap_err();
+        assert!(err.to_string().contains("Failed to read secrets file"));
+    }
+
+    #[test]
+    fn parse_secrets_file_invalid_json() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "not json").unwrap();
+        let err = parse_secrets_file(f.path()).unwrap_err();
+        assert!(err.to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn secrets_file_clap_flag() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["cella", "up", "--secrets-file", "/tmp/s.json"]).unwrap();
+        if let crate::commands::Command::Up(args) = &cli.command {
+            assert_eq!(args.build.secrets_file, Some(PathBuf::from("/tmp/s.json")));
         }
     }
 }
