@@ -13,3 +13,13 @@ async fn macro_works_any_runtime() {}
 async fn macro_works_with_network() {
     let _stream = tokio::net::TcpStream::connect("ghcr.io:443").await.unwrap();
 }
+
+#[runtime_test(podman)]
+async fn macro_works_with_podman() {
+    let status = tokio::process::Command::new("podman")
+        .args(["version", "--format", "{{.Client.Version}}"])
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+}
