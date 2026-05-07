@@ -385,8 +385,8 @@ mod tests {
     //! Regression tests for compose + features user resolution.
     //!
     //! Pure-function tests; the `resolve_build_image_user` paths that call
-    //! `inspect_image_details` are covered by integration tests gated on the
-    //! `integration-tests` feature of `cella-compose`.
+    //! `inspect_image_details` are covered by integration tests using
+    //! `#[runtime_test(docker, compose)]`.
 
     use crate::{FEATURES_TARGET_STAGE, find_stage_base_image, find_user_statement};
     use cella_features::dockerfile::generate_dockerfile;
