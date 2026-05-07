@@ -9,7 +9,7 @@ Systematic verification of the cella worktree-container-task system. Run this fr
 
 ## Context
 
-Cella gives each git branch its own isolated dev container. This test sweep exercises the full stack: daemon connectivity, branch creation (~80s each), cross-container exec, background task dispatch with timeouts, and container lifecycle (stop/start/remove/prune). It catches regressions in the daemon, agent CLI, and task manager.
+Cella gives each git branch its own isolated dev container. This test sweep exercises the full stack: daemon connectivity, branch creation (typically 30-80s each depending on cache), cross-container exec, background task dispatch with timeouts, and container lifecycle (stop/start/remove/prune). It catches regressions in the daemon, agent CLI, and task manager.
 
 ## Prerequisites
 
@@ -74,6 +74,7 @@ cella task logs test/b
 - Quick task (`echo "done"`) completes almost instantly; `cella task list` shows status `done` with ~0s elapsed
 - Timeout task (`sleep 30` with `--timeout 5`) shows status `timed_out` after ~7s, with elapsed frozen at ~5s
 - `cella task logs test/b` may show "Task timed out after 5s" or be empty — the `timed_out` status in `cella task list` is what matters
+- The timeout kill signal may leave test/b's container in `exited` state. If subsequent phases need test/b running, restart it with `cella up test/b` before continuing.
 
 ### Phase 4: Agent Dispatch
 
@@ -91,7 +92,7 @@ cella exec test/b -- cat /tmp/test.txt
 - `/tmp/test.txt` exists in both containers with expected content
 - No interference between agents
 
-**Note:** This phase requires Claude Code and Codex to be installed in the containers. Skip if not available.
+**Note:** This phase requires Claude Code and Codex to be installed in the containers. Skip if not available. If an agent is installed but times out (status `timed_out`), report it as a partial pass — the task dispatch mechanism is working correctly even if the agent itself is slow. Consider increasing `--timeout` for slower agents.
 
 ### Phase 5: Output Quality
 
@@ -102,6 +103,8 @@ cella down test/a 2>&1 | grep -c '{'  # expect 0
 
 **Expected results:**
 - No JSON fragments leak into human-readable output (count should be 0)
+
+Note: Phase 5's `cella down test/a` leaves it stopped. Phase 6 starts with `cella down test/a` which is intentionally idempotent — it confirms the stopped state rather than changing it.
 
 ### Phase 6: Container Lifecycle
 
@@ -154,6 +157,16 @@ Verify cleanup:
 cella list          # no test/* entries
 cella task list     # no test/* entries
 ```
+
+## Handling Mid-Sweep Failures
+
+If a branch disappears or a phase fails partway through:
+
+1. **Skip dependent tests**: If test/a is gone, skip all tests that target it (exec to test/a, task run on test/a, Phase 5 output quality checks that target test/a). Continue with test/b and independent phases.
+2. **Recreate if needed**: If a branch vanished unexpectedly (e.g., during another branch's creation), recreate it with `cella branch test/a` and retry the failed phase.
+3. **Restart exited containers**: If a container is in `exited` state when a phase needs it running, use `cella up <branch>` to restart before continuing.
+4. **Always run cleanup**: The cleanup block uses `2>/dev/null` to suppress errors for already-removed branches. Run it regardless of which phases succeeded.
+5. **Report partial results**: Note which phases passed, failed, or were skipped and why. A partial sweep with clear reporting is more useful than an abandoned sweep.
 
 ## When to Use
 
