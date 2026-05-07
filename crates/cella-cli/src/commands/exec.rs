@@ -224,6 +224,11 @@ async fn run_exec(
         }
     } else {
         let title_guard = push_for_container(container, service, "exec");
+        let mut env = env;
+        env.push(format!(
+            "CELLA_TITLE={}",
+            crate::title::title_for_container(container, service, "exec")
+        ));
         let exit_code = client
             .exec_interactive(
                 &container.id,

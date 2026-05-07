@@ -19,9 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static TITLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEEDS_TMUX_WRAP: AtomicBool = AtomicBool::new(false);
+static IS_WEZTERM: AtomicBool = AtomicBool::new(false);
 
 const RESTORE_PLAIN: &[u8] = b"\x1b[23;0t";
 const RESTORE_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b[23;0t\x1b\\";
+const WEZTERM_RESET_PLAIN: &[u8] = b"\x1b]0;wezterm\x07";
+const WEZTERM_RESET_TMUX: &[u8] = b"\x1bPtmux;\x1b\x1b]0;wezterm\x07\x1b\\";
 
 /// Strip the `"cella-"` prefix so the title doesn't repeat the brand already
 /// present in the `" \u{2014} cella <subcommand>"` suffix. No-op if the prefix
@@ -96,8 +99,22 @@ impl TitleGuard {
         let _ = emit_set(&mut stderr, &content.format(), tmux);
         let _ = stderr.flush();
         NEEDS_TMUX_WRAP.store(tmux, Ordering::Release);
+        IS_WEZTERM.store(is_wezterm(), Ordering::Release);
         TITLE_ACTIVE.store(true, Ordering::Release);
         Some(Self(()))
+    }
+}
+
+fn content_for_container(
+    container: &cella_backend::ContainerInfo,
+    service: Option<&str>,
+    subcommand: &'static str,
+) -> TitleContent {
+    TitleContent {
+        name: title_name(base_name(container)).to_string(),
+        service: service.map(str::to_string),
+        branch: container.labels.get("dev.cella.branch").cloned(),
+        subcommand,
     }
 }
 
@@ -111,12 +128,17 @@ pub fn push_for_container(
     service: Option<&str>,
     subcommand: &'static str,
 ) -> Option<TitleGuard> {
-    TitleGuard::push(&TitleContent {
-        name: title_name(base_name(container)).to_string(),
-        service: service.map(str::to_string),
-        branch: container.labels.get("dev.cella.branch").cloned(),
-        subcommand,
-    })
+    TitleGuard::push(&content_for_container(container, service, subcommand))
+}
+
+/// Format the title string for a container without emitting any escape
+/// sequences. Used to set the `CELLA_TITLE` env var.
+pub fn title_for_container(
+    container: &cella_backend::ContainerInfo,
+    service: Option<&str>,
+    subcommand: &'static str,
+) -> String {
+    content_for_container(container, service, subcommand).format()
 }
 
 /// Look up the existing container for `workspace_root` and derive a guard from
@@ -201,10 +223,27 @@ fn emit_set(w: &mut impl Write, title: &str, in_tmux: bool) -> io::Result<()> {
     }
 }
 
-// Pop the title stack. Terminals with stack support (xterm, kitty, iTerm2)
-// restore the prior title; terminals without (WezTerm) silently ignore the
-// pop and leave the cella title until the shell prompt overwrites it.
+fn is_wezterm() -> bool {
+    std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "WezTerm")
+}
+
+fn emit_wezterm_reset(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
+    let bytes: &[u8] = b"\x1b]0;wezterm\x07";
+    if in_tmux {
+        w.write_all(&tmux_wrap(bytes))
+    } else {
+        w.write_all(bytes)
+    }
+}
+
 fn emit_restore(w: &mut impl Write, in_tmux: bool) -> io::Result<()> {
+    emit_restore_impl(w, in_tmux, IS_WEZTERM.load(Ordering::Acquire))
+}
+
+fn emit_restore_impl(w: &mut impl Write, in_tmux: bool, wezterm: bool) -> io::Result<()> {
+    if wezterm {
+        emit_wezterm_reset(w, in_tmux)?;
+    }
     emit_pop(w, in_tmux)
 }
 
@@ -259,11 +298,23 @@ pub fn install_signal_handlers() {
 
 extern "C" fn restore_title_on_signal(sig: nix::libc::c_int) {
     if TITLE_ACTIVE.load(Ordering::Acquire) {
-        let bytes = if NEEDS_TMUX_WRAP.load(Ordering::Acquire) {
-            RESTORE_TMUX
-        } else {
-            RESTORE_PLAIN
-        };
+        let tmux = NEEDS_TMUX_WRAP.load(Ordering::Acquire);
+
+        if IS_WEZTERM.load(Ordering::Acquire) {
+            let bytes = if tmux {
+                WEZTERM_RESET_TMUX
+            } else {
+                WEZTERM_RESET_PLAIN
+            };
+            #[allow(unsafe_code)]
+            // SAFETY: libc::write on STDERR_FILENO is async-signal-safe.
+            unsafe {
+                let _ =
+                    nix::libc::write(nix::libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+            }
+        }
+
+        let bytes = if tmux { RESTORE_TMUX } else { RESTORE_PLAIN };
         #[allow(unsafe_code)]
         // SAFETY: libc::write on STDERR_FILENO is async-signal-safe.
         unsafe {
@@ -622,6 +673,102 @@ mod tests {
         ]
         .concat();
         assert_eq!(out, expected);
+    }
+
+    // ── emit_restore_impl (WezTerm) ────────────────────────────────
+
+    #[test]
+    fn emit_restore_wezterm_plain_emits_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore_impl(&mut out, false, true).unwrap();
+        let expected = [b"\x1b]0;wezterm\x07".as_slice(), b"\x1b[23;0t".as_slice()].concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn emit_restore_wezterm_tmux_emits_wrapped_reset_then_pop() {
+        let mut out = Vec::new();
+        emit_restore_impl(&mut out, true, true).unwrap();
+        let expected = [
+            tmux_wrap(b"\x1b]0;wezterm\x07").as_slice(),
+            tmux_wrap(b"\x1b[23;0t").as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn emit_restore_non_wezterm_unchanged() {
+        let mut out = Vec::new();
+        emit_restore_impl(&mut out, false, false).unwrap();
+        assert_eq!(out, b"\x1b[23;0t");
+    }
+
+    // ── emit_wezterm_reset constants ──────────────────────────────
+
+    #[test]
+    fn wezterm_reset_plain_matches_emit_output() {
+        let mut out = Vec::new();
+        emit_wezterm_reset(&mut out, false).unwrap();
+        assert_eq!(out.as_slice(), WEZTERM_RESET_PLAIN);
+    }
+
+    #[test]
+    fn wezterm_reset_tmux_matches_emit_output() {
+        let mut out = Vec::new();
+        emit_wezterm_reset(&mut out, true).unwrap();
+        assert_eq!(out.as_slice(), WEZTERM_RESET_TMUX);
+    }
+
+    // ── full lifecycle (WezTerm) ────────────────────────────────────
+
+    #[test]
+    fn full_push_set_restore_lifecycle_wezterm_plain() {
+        let mut out = Vec::new();
+        emit_push(&mut out, false).unwrap();
+        emit_set(&mut out, "x \u{2014} cella exec", false).unwrap();
+        emit_restore_impl(&mut out, false, true).unwrap();
+
+        let expected = [
+            b"\x1b[22;0t".as_slice(),
+            b"\x1b]0;x \xe2\x80\x94 cella exec\x07".as_slice(),
+            b"\x1b]0;wezterm\x07".as_slice(),
+            b"\x1b[23;0t".as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn full_push_set_restore_lifecycle_wezterm_tmux() {
+        let mut out = Vec::new();
+        emit_push(&mut out, true).unwrap();
+        emit_set(&mut out, "x", true).unwrap();
+        emit_restore_impl(&mut out, true, true).unwrap();
+
+        let expected = [
+            tmux_wrap(b"\x1b[22;0t").as_slice(),
+            tmux_wrap(b"\x1b]0;x\x07").as_slice(),
+            tmux_wrap(b"\x1b]0;wezterm\x07").as_slice(),
+            tmux_wrap(b"\x1b[23;0t").as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    // ── title_for_container ─────────────────────────────────────────
+
+    #[test]
+    fn title_for_container_matches_push_format() {
+        let c = container_with_labels("cella-myrepo-a1b2c3d4", &[]);
+        let title = title_for_container(&c, Some("api"), "shell");
+        let content = TitleContent {
+            name: title_name(base_name(&c)).to_string(),
+            service: Some("api".to_string()),
+            branch: None,
+            subcommand: "shell",
+        };
+        assert_eq!(title, content.format());
     }
 
     // ── public API reachability ──────────────────────────────────────
