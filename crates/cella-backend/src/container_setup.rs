@@ -413,19 +413,15 @@ async fn apply_git_config(
 /// Each block has its own idempotency guard so the function is safe to
 /// re-run and also patches containers that were created before the
 /// `~/.local/bin` block existed.
-pub async fn inject_cella_path(
+async fn inject_snippets(
     client: &dyn ContainerBackend,
     container_id: &str,
-    remote_user: &str,
+    home: &str,
+    snippets: &[(&str, &str)],
+    profiles: &[&str],
 ) {
-    let home = if remote_user == "root" {
-        "/root".to_string()
-    } else {
-        format!("/home/{remote_user}")
-    };
-
-    for (guard, snippet) in PATH_SNIPPETS.iter().chain(TITLE_SNIPPETS) {
-        for profile in &[".bashrc", ".zshrc", ".profile"] {
+    for (guard, snippet) in snippets {
+        for profile in profiles {
             let path = format!("{home}/{profile}");
             let cmd = format!(
                 "if [ -f '{path}' ] && ! grep -q '{guard}' '{path}'; then printf '%s\\n' '{escaped}' >> '{path}'; fi",
@@ -446,6 +442,38 @@ pub async fn inject_cella_path(
                 .await;
         }
     }
+}
+
+pub async fn inject_cella_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+) {
+    let home = if remote_user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{remote_user}")
+    };
+
+    // PATH_SNIPPETS are POSIX-safe → all profiles including .profile.
+    inject_snippets(
+        client,
+        container_id,
+        &home,
+        PATH_SNIPPETS,
+        &[".bashrc", ".zshrc", ".profile"],
+    )
+    .await;
+    // TITLE_SNIPPETS contain zsh-specific syntax (precmd_functions+=) that
+    // dash cannot parse even inside a dead branch → .bashrc/.zshrc only.
+    inject_snippets(
+        client,
+        container_id,
+        &home,
+        TITLE_SNIPPETS,
+        &[".bashrc", ".zshrc"],
+    )
+    .await;
 }
 
 const PATH_SNIPPETS: &[(&str, &str)] = &[
