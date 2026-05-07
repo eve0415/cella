@@ -30,17 +30,17 @@ pub struct UpdateArgs {
 
 /// A feature with an available update.
 #[derive(Debug, Clone)]
-struct UpdateCandidate {
+pub struct UpdateCandidate {
     /// Current full OCI reference (e.g. `ghcr.io/.../node:1`).
-    current_ref: String,
+    pub current_ref: String,
     /// Display name of the feature.
-    name: String,
+    pub name: String,
     /// Current tag.
-    current_tag: String,
+    pub current_tag: String,
     /// Latest available version from the collection.
-    latest_version: String,
+    pub latest_version: String,
     /// Updated full reference.
-    updated_ref: String,
+    pub updated_ref: String,
 }
 
 impl UpdateArgs {
@@ -222,7 +222,7 @@ fn apply_updates(
 }
 
 /// Check if a configured feature has an update available in the collection.
-async fn check_for_update(
+pub async fn check_for_update(
     reference: &str,
     collection: &cella_templates::types::FeatureCollectionIndex,
     cache: &TemplateCache,
