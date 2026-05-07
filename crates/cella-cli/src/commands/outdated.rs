@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::commands::OutputFormat;
 use crate::commands::features::resolve::{self, CommonFeatureFlags};
-use crate::commands::features::update::{self, UpdateCandidate};
+use crate::commands::features::update;
 use crate::table::{Column, Table};
 
 /// Show current and available versions.
@@ -66,23 +66,36 @@ impl OutdatedArgs {
         let collection =
             cella_templates::collection::fetch_feature_collection(registry, &cache, false).await?;
 
-        let mut candidates: Vec<OutdatedEntry> = Vec::new();
+        let mut entries: Vec<FeatureStatus> = Vec::new();
         for (reference, _) in &features {
             if let Some(candidate) = update::check_for_update(reference, &collection, &cache).await
             {
-                candidates.push(OutdatedEntry {
+                entries.push(FeatureStatus {
+                    name: candidate.name.clone(),
                     reference: reference.clone(),
-                    candidate,
+                    current: candidate.current_tag.clone(),
+                    latest: candidate.latest_version.clone(),
+                    outdated: true,
+                });
+            } else {
+                let current_tag = reference.rsplit_once(':').map_or("latest", |(_, tag)| tag);
+                let name = resolve::resolve_feature_name(reference, &cache).await;
+                entries.push(FeatureStatus {
+                    name,
+                    reference: reference.clone(),
+                    current: current_tag.to_owned(),
+                    latest: current_tag.to_owned(),
+                    outdated: false,
                 });
             }
         }
 
         match self.output {
-            OutputFormat::Text => print_table(&candidates),
-            OutputFormat::Json => print_json(&candidates)?,
+            OutputFormat::Text => print_table(&entries),
+            OutputFormat::Json => print_json(&entries)?,
         }
 
-        if self.check && !candidates.is_empty() {
+        if self.check && entries.iter().any(|e| e.outdated) {
             std::process::exit(1);
         }
 
@@ -90,12 +103,15 @@ impl OutdatedArgs {
     }
 }
 
-struct OutdatedEntry {
+struct FeatureStatus {
+    name: String,
     reference: String,
-    candidate: UpdateCandidate,
+    current: String,
+    latest: String,
+    outdated: bool,
 }
 
-fn print_table(entries: &[OutdatedEntry]) {
+fn print_table(entries: &[FeatureStatus]) {
     if entries.is_empty() {
         eprintln!("All features are up to date.");
         return;
@@ -104,31 +120,36 @@ fn print_table(entries: &[OutdatedEntry]) {
     let mut table = Table::new(vec![
         Column::shrinkable("FEATURE"),
         Column::fixed("CURRENT"),
-        Column::fixed("WANTED"),
         Column::fixed("LATEST"),
+        Column::fixed("STATUS"),
     ]);
 
     for entry in entries {
+        let status = if entry.outdated {
+            "outdated"
+        } else {
+            "up to date"
+        };
         table.add_row(vec![
-            entry.candidate.name.clone(),
-            entry.candidate.current_tag.clone(),
-            entry.candidate.latest_version.clone(),
-            entry.candidate.latest_version.clone(),
+            entry.name.clone(),
+            entry.current.clone(),
+            entry.latest.clone(),
+            status.to_owned(),
         ]);
     }
 
     table.eprint();
 }
 
-fn print_json(entries: &[OutdatedEntry]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn print_json(entries: &[FeatureStatus]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut features = serde_json::Map::new();
     for entry in entries {
         features.insert(
             entry.reference.clone(),
             json!({
-                "current": entry.candidate.current_tag,
-                "wanted": entry.candidate.latest_version,
-                "latest": entry.candidate.latest_version,
+                "current": entry.current,
+                "latest": entry.latest,
+                "updateAvailable": entry.outdated,
             }),
         );
     }
@@ -203,22 +224,19 @@ mod tests {
 
     #[test]
     fn print_json_empty_produces_valid_json() {
-        let entries: Vec<OutdatedEntry> = vec![];
+        let entries: Vec<FeatureStatus> = vec![];
         let result = print_json(&entries);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_json_with_entries_produces_valid_structure() {
-        let entries = vec![OutdatedEntry {
+        let entries = vec![FeatureStatus {
+            name: "Node.js".to_owned(),
             reference: "ghcr.io/devcontainers/features/node:1".to_owned(),
-            candidate: UpdateCandidate {
-                current_ref: "ghcr.io/devcontainers/features/node:1".to_owned(),
-                name: "Node.js".to_owned(),
-                current_tag: "1".to_owned(),
-                latest_version: "2.0.0".to_owned(),
-                updated_ref: "ghcr.io/devcontainers/features/node:2.0.0".to_owned(),
-            },
+            current: "1".to_owned(),
+            latest: "2.0.0".to_owned(),
+            outdated: true,
         }];
         let result = print_json(&entries);
         assert!(result.is_ok());
@@ -226,15 +244,12 @@ mod tests {
 
     #[test]
     fn print_table_with_entries_does_not_panic() {
-        let entries = vec![OutdatedEntry {
+        let entries = vec![FeatureStatus {
+            name: "Node.js".to_owned(),
             reference: "ghcr.io/devcontainers/features/node:1".to_owned(),
-            candidate: UpdateCandidate {
-                current_ref: "ghcr.io/devcontainers/features/node:1".to_owned(),
-                name: "Node.js".to_owned(),
-                current_tag: "1".to_owned(),
-                latest_version: "2.0.0".to_owned(),
-                updated_ref: "ghcr.io/devcontainers/features/node:2.0.0".to_owned(),
-            },
+            current: "1".to_owned(),
+            latest: "2.0.0".to_owned(),
+            outdated: true,
         }];
         print_table(&entries);
     }
