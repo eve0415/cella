@@ -25,6 +25,10 @@ async fn create_test_network(
     Ok(())
 }
 
+fn test_network_name(base: &str) -> String {
+    format!("{base}-{}", std::process::id())
+}
+
 /// Best-effort teardown. Used in `Drop`-style cleanup at end of each test.
 async fn force_remove(docker: &Docker, name: &str) {
     let _ = docker.remove_network(name).await;
@@ -34,24 +38,24 @@ async fn force_remove(docker: &Docker, name: &str) {
 #[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_removes_managed_empty_network() {
     let docker = Docker::connect_with_local_defaults().unwrap();
-    let name = "cella-integration-orphan-managed-empty";
+    let name = test_network_name("cella-it-orphan-managed");
 
-    force_remove(&docker, name).await;
+    force_remove(&docker, &name).await;
     create_test_network(
         &docker,
-        name,
+        &name,
         HashMap::from([("dev.cella.managed".to_string(), "true".to_string())]),
     )
     .await
     .expect("create test network");
 
-    let outcome = remove_network_if_orphan(&docker, name)
+    let outcome = remove_network_if_orphan(&docker, &name)
         .await
         .expect("remove_network_if_orphan");
     assert_eq!(outcome, RemovalOutcome::Removed);
 
     // Confirm it's actually gone.
-    let err = docker.inspect_network(name, None).await;
+    let err = docker.inspect_network(&name, None).await;
     assert!(
         matches!(
             err,
@@ -70,14 +74,14 @@ async fn remove_network_if_orphan_removes_managed_empty_network() {
 #[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_skips_unlabeled_empty_network() {
     let docker = Docker::connect_with_local_defaults().unwrap();
-    let name = "cella-integration-unlabeled-empty";
+    let name = test_network_name("cella-it-unlabeled");
 
-    force_remove(&docker, name).await;
-    create_test_network(&docker, name, HashMap::new())
+    force_remove(&docker, &name).await;
+    create_test_network(&docker, &name, HashMap::new())
         .await
         .expect("create test network");
 
-    let outcome = remove_network_if_orphan(&docker, name)
+    let outcome = remove_network_if_orphan(&docker, &name)
         .await
         .expect("remove_network_if_orphan");
     assert_eq!(
@@ -86,23 +90,23 @@ async fn remove_network_if_orphan_skips_unlabeled_empty_network() {
         "unlabeled network must not be removed"
     );
     // Confirm it still exists.
-    let inspect = docker.inspect_network(name, None).await;
+    let inspect = docker.inspect_network(&name, None).await;
     assert!(
         inspect.is_ok(),
         "network should still exist after skip, got {inspect:?}"
     );
 
-    force_remove(&docker, name).await;
+    force_remove(&docker, &name).await;
 }
 
 /// A missing network reports `NotFound` (idempotent success for callers).
 #[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_not_found_is_idempotent() {
     let docker = Docker::connect_with_local_defaults().unwrap();
-    let name = "cella-integration-does-not-exist-xyz-123";
-    force_remove(&docker, name).await; // extra safety
+    let name = test_network_name("cella-it-nonexistent");
+    force_remove(&docker, &name).await;
 
-    let outcome = remove_network_if_orphan(&docker, name)
+    let outcome = remove_network_if_orphan(&docker, &name)
         .await
         .expect("remove_network_if_orphan");
     assert_eq!(outcome, RemovalOutcome::NotFound);
@@ -113,14 +117,14 @@ async fn remove_network_if_orphan_not_found_is_idempotent() {
 #[cella_testing::runtime_test(docker)]
 async fn list_managed_networks_filters_by_label() {
     let docker = Docker::connect_with_local_defaults().unwrap();
-    let managed = "cella-integration-list-managed-xyz";
-    let unlabeled = "cella-integration-list-unlabeled-xyz";
+    let managed = test_network_name("cella-it-list-managed");
+    let unlabeled = test_network_name("cella-it-list-unlabeled");
 
-    force_remove(&docker, managed).await;
-    force_remove(&docker, unlabeled).await;
+    force_remove(&docker, &managed).await;
+    force_remove(&docker, &unlabeled).await;
     create_test_network(
         &docker,
-        managed,
+        &managed,
         HashMap::from([
             ("dev.cella.managed".to_string(), "true".to_string()),
             (
@@ -131,7 +135,7 @@ async fn list_managed_networks_filters_by_label() {
     )
     .await
     .expect("create managed network");
-    create_test_network(&docker, unlabeled, HashMap::new())
+    create_test_network(&docker, &unlabeled, HashMap::new())
         .await
         .expect("create unlabeled network");
 
@@ -141,11 +145,11 @@ async fn list_managed_networks_filters_by_label() {
     let names: Vec<&str> = listed.iter().map(|n| n.name.as_str()).collect();
 
     assert!(
-        names.contains(&managed),
+        names.contains(&managed.as_str()),
         "managed network should be listed: {names:?}"
     );
     assert!(
-        !names.contains(&unlabeled),
+        !names.contains(&unlabeled.as_str()),
         "unlabeled network must not be listed: {names:?}"
     );
 
@@ -154,8 +158,8 @@ async fn list_managed_networks_filters_by_label() {
     assert_eq!(entry.container_count, 0);
     assert_eq!(entry.repo_path.as_deref(), Some("/tmp/integration-test"));
 
-    force_remove(&docker, managed).await;
-    force_remove(&docker, unlabeled).await;
+    force_remove(&docker, &managed).await;
+    force_remove(&docker, &unlabeled).await;
 }
 
 /// `workspace_network_name` matches `repo_network_name` for the same
