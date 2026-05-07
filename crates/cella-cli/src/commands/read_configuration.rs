@@ -53,7 +53,7 @@ impl ReadConfigurationArgs {
 
         let config_path = self.override_config.as_deref().or(self.config.as_deref());
 
-        let (resolved, cwd) = if has_container_target {
+        let (mut resolved, cwd) = if has_container_target {
             let client = self.backend.resolve_client().await?;
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
@@ -75,6 +75,26 @@ impl ReadConfigurationArgs {
             let res = resolve::config(&ws, config_path)?;
             (res, ws)
         };
+
+        if let Some(ref additional) = self.additional_features {
+            let extra: serde_json::Value = serde_json::from_str(additional)
+                .map_err(|e| format!("--additional-features: invalid JSON: {e}"))?;
+            let obj = extra
+                .as_object()
+                .ok_or("--additional-features must be a JSON object")?;
+            let features = resolved
+                .config
+                .as_object_mut()
+                .expect("config is always an object")
+                .entry("features")
+                .or_insert_with(|| json!({}));
+            let features_obj = features
+                .as_object_mut()
+                .ok_or("existing features field is not an object")?;
+            for (k, v) in obj {
+                features_obj.insert(k.clone(), v.clone());
+            }
+        }
 
         let device_type = if resolved.config.get("dockerComposeFile").is_some() {
             "dockerCompose"
