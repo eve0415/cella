@@ -105,6 +105,19 @@ impl TitleGuard {
     }
 }
 
+fn content_for_container(
+    container: &cella_backend::ContainerInfo,
+    service: Option<&str>,
+    subcommand: &'static str,
+) -> TitleContent {
+    TitleContent {
+        name: title_name(base_name(container)).to_string(),
+        service: service.map(str::to_string),
+        branch: container.labels.get("dev.cella.branch").cloned(),
+        subcommand,
+    }
+}
+
 /// Convenience: build a guard from a resolved container. Pulls `branch` from
 /// the `dev.cella.branch` label when present, and `service` from the caller's
 /// explicit flag. For compose containers, prefers the `com.docker.compose.project`
@@ -115,12 +128,7 @@ pub fn push_for_container(
     service: Option<&str>,
     subcommand: &'static str,
 ) -> Option<TitleGuard> {
-    TitleGuard::push(&TitleContent {
-        name: title_name(base_name(container)).to_string(),
-        service: service.map(str::to_string),
-        branch: container.labels.get("dev.cella.branch").cloned(),
-        subcommand,
-    })
+    TitleGuard::push(&content_for_container(container, service, subcommand))
 }
 
 /// Format the title string for a container without emitting any escape
@@ -130,13 +138,7 @@ pub fn title_for_container(
     service: Option<&str>,
     subcommand: &'static str,
 ) -> String {
-    TitleContent {
-        name: title_name(base_name(container)).to_string(),
-        service: service.map(str::to_string),
-        branch: container.labels.get("dev.cella.branch").cloned(),
-        subcommand,
-    }
-    .format()
+    content_for_container(container, service, subcommand).format()
 }
 
 /// Look up the existing container for `workspace_root` and derive a guard from
