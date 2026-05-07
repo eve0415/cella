@@ -110,38 +110,15 @@ jobs:
       - name: Log in to ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Run unit tests with coverage
+      - name: Run tests with coverage
         run: cargo llvm-cov --no-report --workspace
 
-      - name: Run integration tests with coverage
-        run: >
-          cargo llvm-cov --no-report
-          -p cella-features
-          -p cella-daemon
-          -p cella-compose
-          -p cella-agent
-          -p cella-env
-          --features integration-tests
-
-      - name: Run Docker integration tests with coverage
+      - name: Run Docker integration tests serialized
         run: >
           cargo llvm-cov --no-report
           -p cella-docker
-          --features integration-tests
-          -- --ignored --test-threads=1
-
-      - name: Run Compose integration tests with coverage
-        run: >
-          cargo llvm-cov --no-report
           -p cella-compose
-          --features integration-tests
-          -- --ignored --test-threads=1
-
-      - name: Run template registry integration tests with coverage
-        run: >
-          cargo llvm-cov --no-report
-          -p cella-templates
-          --features integration-tests
+          -- --test-threads=1
 
       - name: Generate combined coverage report
         run: cargo llvm-cov report > coverage-report.txt
