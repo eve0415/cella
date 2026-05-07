@@ -204,7 +204,7 @@ Shows captured stdout/stderr from the task. With `--follow`, streams live output
 cella task wait <branch>
 ```
 
-Blocks until the task finishes. Returns the task's exit code.
+Blocks until the task finishes. The process exit code (`$?`) matches the task's exit code (see table below). Prints a summary line to stdout (`Task <branch> exited with code N`) when it observes the exit — if the task already completed before `wait` is called, it may return silently with just the exit code.
 
 ### Stop a Task
 
@@ -222,6 +222,8 @@ Aborts a running task (sends SIGTERM to the process tree).
 | 124 | Timed out (`timed_out`) |
 | 130 | Stopped by user (`failed`) |
 | Non-zero | Command failed (`failed`) |
+
+Note: `cella task list --json` does not include an exit code field — it only reports `status`. To get the numeric exit code, use `cella task wait <branch>` (via `$?`).
 
 ## Agent Dispatch Patterns
 
@@ -393,6 +395,7 @@ cella exec feat/auth -- cargo test -p middleware
 | Agent can't reach API endpoints | Cella containers share the host network by default; check DNS/firewall |
 | Agent teams can't communicate | All teammates must run in the same container, not across containers |
 | Task shows "timed_out" | Increase `--timeout` or break the task into smaller pieces |
+| `task wait` returns unexpected exit code after re-dispatch | If you re-dispatch a task on a branch that already had a completed/timed-out task, a concurrent `task wait` from the old dispatch may race with the replacement. Use `cella task list --json` to verify the current task status instead of relying solely on `task wait` exit codes |
 | Plan/task files not visible in worktree | Place shared files in `~/.claude/plans/` — this volume is mounted in ALL containers. Don't rely on git-tracked files for cross-worktree sharing |
 
 ## Best Practices
