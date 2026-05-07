@@ -9,6 +9,7 @@
       "nvmVersion": "latest"
     }
   },
+  "postCreateCommand": "cargo install cargo-insta",
   "postStartCommand": "npm install -g @openai/codex @google/gemini-cli",
   "customizations": {
     "vscode": {
