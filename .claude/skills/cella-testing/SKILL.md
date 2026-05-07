@@ -162,8 +162,8 @@ cella task list     # no test/* entries
 
 If a branch disappears or a phase fails partway through:
 
-1. **Skip dependent tests**: If test/a is gone, skip all tests that target it (exec to test/a, task run on test/a, Phase 5 output quality checks that target test/a). Continue with test/b and independent phases.
-2. **Recreate if needed**: If a branch vanished unexpectedly (e.g., during another branch's creation), recreate it with `cella branch test/a` and retry the failed phase.
+1. **Skip dependent tests**: If test/a is gone, skip all tests that target it (exec to test/a, task run on test/a, Phase 5 output quality checks that target test/a). If all tests in a phase depend on the missing branch, skip the entire phase. Continue with test/b and independent phases.
+2. **Recreate only for unexpected disappearances**: If a branch vanished unexpectedly (e.g., race condition during another branch's creation), recreate it with `cella branch test/a` and retry. If the removal was deliberate (testing failure handling), skip dependent tests instead — don't recreate.
 3. **Restart exited containers**: If a container is in `exited` state when a phase needs it running, use `cella up <branch>` to restart before continuing.
 4. **Always run cleanup**: The cleanup block uses `2>/dev/null` to suppress errors for already-removed branches. Run it regardless of which phases succeeded.
 5. **Report partial results**: Note which phases passed, failed, or were skipped and why. A partial sweep with clear reporting is more useful than an abandoned sweep.
