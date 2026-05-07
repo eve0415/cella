@@ -290,7 +290,6 @@ use cella_oci::{build_registry_auth, extract_layer, is_extractable_layer};
 mod tests {
     use super::*;
 
-    #[cfg(feature = "integration-tests")]
     use crate::test_utils::test_platform;
 
     #[test]
@@ -316,8 +315,7 @@ mod tests {
     // Integration test -- requires network access
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn fetch_node_feature_from_ghcr() {
         let fetcher = OciFetcher::new();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -350,8 +348,7 @@ mod tests {
         assert_eq!(path, path2, "second fetch should return cached path");
     }
 
-    #[tokio::test]
-    #[cfg(feature = "integration-tests")]
+    #[cella_testing::runtime_test(network)]
     async fn fetch_github_cli_feature_from_ghcr() {
         let fetcher = OciFetcher::new();
         let cache_dir = tempfile::tempdir().unwrap();

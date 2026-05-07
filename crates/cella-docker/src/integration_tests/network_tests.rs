@@ -9,24 +9,6 @@ use crate::network::{
     list_managed_networks, remove_network_if_orphan, repo_network_name, workspace_network_name,
 };
 
-/// Connect to Docker using local defaults. Skip the test if unreachable
-/// so a failed daemon doesn't look like a cella regression.
-async fn docker_or_skip(test_name: &str) -> Option<Docker> {
-    match Docker::connect_with_local_defaults() {
-        Ok(docker) => match docker.ping().await {
-            Ok(_) => Some(docker),
-            Err(e) => {
-                eprintln!("{test_name}: Docker ping failed ({e}); skipping");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("{test_name}: Docker unreachable ({e}); skipping");
-            None
-        }
-    }
-}
-
 /// Create a bridge network with the given labels. Returns the network name.
 async fn create_test_network(
     docker: &Docker,
@@ -49,14 +31,9 @@ async fn force_remove(docker: &Docker, name: &str) {
 }
 
 /// A managed orphan (no endpoints, `dev.cella.managed=true`) is removed.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_removes_managed_empty_network() {
-    let Some(docker) =
-        docker_or_skip("remove_network_if_orphan_removes_managed_empty_network").await
-    else {
-        return;
-    };
+    let docker = Docker::connect_with_local_defaults().unwrap();
     let name = "cella-integration-orphan-managed-empty";
 
     force_remove(&docker, name).await;
@@ -90,14 +67,9 @@ async fn remove_network_if_orphan_removes_managed_empty_network() {
 /// A network missing the `dev.cella.managed` label is never touched,
 /// even if it has zero endpoints — we must not remove user-owned
 /// networks that happen to be idle.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_skips_unlabeled_empty_network() {
-    let Some(docker) =
-        docker_or_skip("remove_network_if_orphan_skips_unlabeled_empty_network").await
-    else {
-        return;
-    };
+    let docker = Docker::connect_with_local_defaults().unwrap();
     let name = "cella-integration-unlabeled-empty";
 
     force_remove(&docker, name).await;
@@ -124,13 +96,9 @@ async fn remove_network_if_orphan_skips_unlabeled_empty_network() {
 }
 
 /// A missing network reports `NotFound` (idempotent success for callers).
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker)]
 async fn remove_network_if_orphan_not_found_is_idempotent() {
-    let Some(docker) = docker_or_skip("remove_network_if_orphan_not_found_is_idempotent").await
-    else {
-        return;
-    };
+    let docker = Docker::connect_with_local_defaults().unwrap();
     let name = "cella-integration-does-not-exist-xyz-123";
     force_remove(&docker, name).await; // extra safety
 
@@ -142,12 +110,9 @@ async fn remove_network_if_orphan_not_found_is_idempotent() {
 
 /// `list_managed_networks` reports only labeled networks and omits
 /// unlabeled ones.
-#[tokio::test]
-#[ignore = "requires Docker daemon"]
+#[cella_testing::runtime_test(docker)]
 async fn list_managed_networks_filters_by_label() {
-    let Some(docker) = docker_or_skip("list_managed_networks_filters_by_label").await else {
-        return;
-    };
+    let docker = Docker::connect_with_local_defaults().unwrap();
     let managed = "cella-integration-list-managed-xyz";
     let unlabeled = "cella-integration-list-unlabeled-xyz";
 
@@ -197,7 +162,6 @@ async fn list_managed_networks_filters_by_label() {
 /// canonicalized path — the contract `cella down --rm` relies on to
 /// find the network it's trying to remove.
 #[tokio::test]
-#[ignore = "requires Docker daemon"]
 async fn workspace_network_name_matches_repo_network_name_for_real_path() {
     let tmpdir =
         std::env::temp_dir().join(format!("cella-integration-wsroot-{}", std::process::id()));

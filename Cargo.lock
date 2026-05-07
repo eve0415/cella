@@ -412,6 +412,7 @@ dependencies = [
  "cella-features",
  "cella-git",
  "cella-network",
+ "cella-testing",
  "cella-tool-install",
  "hex",
  "insta",
@@ -453,6 +454,7 @@ name = "cella-container"
 version = "0.0.51"
 dependencies = [
  "cella-backend",
+ "cella-testing",
  "serde",
  "serde_json",
  "tempfile",
@@ -469,6 +471,7 @@ dependencies = [
  "cella-port",
  "cella-protocol",
  "cella-proxy",
+ "cella-testing",
  "hex",
  "miette",
  "nix 0.31.2",
@@ -501,6 +504,7 @@ version = "0.0.51"
 dependencies = [
  "bollard",
  "cella-backend",
+ "cella-testing",
  "chrono",
  "crossterm",
  "futures-util",
@@ -549,6 +553,7 @@ name = "cella-features"
 version = "0.0.51"
 dependencies = [
  "cella-oci",
+ "cella-testing",
  "dirs",
  "flate2",
  "futures-util",
@@ -681,6 +686,7 @@ version = "0.0.51"
 dependencies = [
  "cella-jsonc",
  "cella-oci",
+ "cella-testing",
  "dirs",
  "filetime",
  "flate2",
@@ -697,6 +703,24 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cella-test-macros"
+version = "0.0.51"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "cella-testing"
+version = "0.0.51"
+dependencies = [
+ "bollard",
+ "cella-test-macros",
+ "tokio",
 ]
 
 [[package]]

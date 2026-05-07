@@ -1002,7 +1002,6 @@ mod tests {
         server.abort();
     }
 
-    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn query_status_reports_connected_after_bare_handshake() {
         use tokio::io::AsyncWriteExt;

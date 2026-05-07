@@ -31,5 +31,5 @@ pub use error::CellaComposeError;
 pub use override_file::{ComposeSecret, OverrideConfig};
 pub use project::{ComposeProject, ShutdownAction};
 
-#[cfg(all(test, feature = "integration-tests"))]
+#[cfg(test)]
 mod integration_tests;

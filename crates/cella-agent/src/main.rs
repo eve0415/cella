@@ -15,7 +15,7 @@ mod clipboard;
 mod control;
 mod credential;
 mod forward_proxy;
-#[cfg(all(test, feature = "integration-tests"))]
+#[cfg(test)]
 mod integration_tests;
 mod mitm;
 mod plugin_sync;

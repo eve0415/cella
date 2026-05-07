@@ -11,9 +11,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-[features]
-integration-tests = []
-
 [dev-dependencies]
 tempfile.workspace = true
 

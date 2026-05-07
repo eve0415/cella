@@ -1,5 +1,3 @@
-#![cfg(feature = "integration-tests")]
-
 use cella_env::platform::DockerRuntime;
 use cella_env::ssh_agent::{is_ssh_mount_error, ssh_skip_warning};
 

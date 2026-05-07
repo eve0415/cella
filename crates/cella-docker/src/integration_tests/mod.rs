@@ -1,10 +1,6 @@
-//! Integration tests gated on `--features integration-tests`.
+//! Integration tests using `#[runtime_test]` for runtime detection.
 //!
-//! These tests require a reachable Docker daemon and are marked
-//! `#[ignore = "requires Docker daemon"]` so they don't run by default.
-//! Execute with:
-//! ```sh
-//! cargo test -p cella-docker --features integration-tests -- --ignored
-//! ```
+//! Tests that need Docker use `#[runtime_test(docker)]` and skip
+//! gracefully when Docker is unavailable.
 
 mod network_tests;
