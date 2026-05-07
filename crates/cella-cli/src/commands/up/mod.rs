@@ -642,9 +642,7 @@ impl UpContext {
             |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
         );
         if !self.lifecycle_secrets.is_empty() {
-            let mut env_with_secrets = self.lifecycle_secrets.clone();
-            env_with_secrets.append(&mut lifecycle_env);
-            lifecycle_env = env_with_secrets;
+            lifecycle_env.extend(self.lifecycle_secrets.iter().cloned());
         }
 
         (final_probed, lifecycle_env)
