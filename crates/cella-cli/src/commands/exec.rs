@@ -5,7 +5,7 @@ use tracing::warn;
 
 use cella_backend::{ContainerTarget, ExecOptions, InteractiveExecOptions};
 use cella_orchestrator::env_cache::{ensure_ssh_auth_sock, read_probed_env_cache};
-use cella_orchestrator::shell_detect::{detect_shell, wrap_in_login_shell};
+use cella_orchestrator::shell_detect::{ShellSource, resolve_shell, wrap_in_login_shell};
 use cella_orchestrator::tool_install::ToolName;
 
 use crate::picker;
@@ -166,8 +166,22 @@ async fn resolve_exec_context(
     let mut env = build_exec_env(client, container, &user, label_env).await;
     env.extend(remote_env);
 
-    let shell = detect_shell(client, &container.id, &user).await;
-    let cmd = wrap_in_login_shell(&shell, command);
+    let preferred = crate::commands::load_shell_preferred(&container.labels);
+    let resolution = resolve_shell(client, &container.id, &user, &preferred).await;
+
+    if !preferred.is_empty()
+        && !matches!(
+            resolution.source,
+            ShellSource::Preferred | ShellSource::CliFlag
+        )
+    {
+        warn!(
+            "Preferred shells not available, falling back to {}",
+            resolution.shell,
+        );
+    }
+
+    let cmd = wrap_in_login_shell(&resolution.shell, command);
 
     Ok((user, working_dir, env, cmd))
 }
