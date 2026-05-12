@@ -400,4 +400,295 @@ mod tests {
         assert!(!is_valid_shell_name("sh && echo pwned"));
         assert!(!is_valid_shell_name("zsh\nmalicious"));
     }
+
+    // ── Mock backend for async resolve_shell tests ─────────────────
+
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use cella_backend::{BackendCapabilities, BackendError, BackendKind, BoxFuture, ExecResult};
+
+    struct MockBackend {
+        responses: Mutex<VecDeque<ExecResult>>,
+    }
+
+    impl MockBackend {
+        fn from_responses(responses: Vec<ExecResult>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    fn ok_result(stdout: &str) -> ExecResult {
+        ExecResult {
+            exit_code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    fn fail_result() -> ExecResult {
+        ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    macro_rules! panic_method {
+        ($name:ident, $($arg:ident: $ty:ty),* => $ret:ty) => {
+            fn $name<'a>(&'a self, $(_: $ty),*) -> BoxFuture<'a, $ret> {
+                panic!(concat!(stringify!($name), " should not be called"));
+            }
+        };
+    }
+
+    impl ContainerBackend for MockBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Docker
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                compose: false,
+                managed_agent: false,
+            }
+        }
+
+        fn exec_command<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            let result = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockBackend: no exec_command response configured");
+            Box::pin(async move { Ok(result) })
+        }
+
+        panic_method!(find_container, w: &'a Path => Result<Option<cella_backend::ContainerInfo>, BackendError>);
+        panic_method!(create_container, o: &'a cella_backend::CreateContainerOptions => Result<String, BackendError>);
+        panic_method!(start_container, id: &'a str => Result<(), BackendError>);
+        panic_method!(stop_container, id: &'a str => Result<(), BackendError>);
+        fn remove_container<'a>(
+            &'a self,
+            _id: &'a str,
+            _remove_volumes: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("remove_container should not be called");
+        }
+        panic_method!(inspect_container, id: &'a str => Result<cella_backend::ContainerInfo, BackendError>);
+        fn list_cella_containers(
+            &self,
+            _running_only: bool,
+        ) -> BoxFuture<'_, Result<Vec<cella_backend::ContainerInfo>, BackendError>> {
+            panic!("list_cella_containers should not be called");
+        }
+        fn find_compose_service<'a>(
+            &'a self,
+            _project: &'a str,
+            _service: &'a str,
+        ) -> BoxFuture<'a, Result<Option<cella_backend::ContainerInfo>, BackendError>> {
+            panic!("find_compose_service should not be called");
+        }
+        fn find_container_by_label<'a>(
+            &'a self,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<Option<cella_backend::ContainerInfo>, BackendError>> {
+            panic!("find_container_by_label should not be called");
+        }
+        fn container_logs<'a>(
+            &'a self,
+            _id: &'a str,
+            _tail: u32,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("container_logs should not be called");
+        }
+        fn exec_stream<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a ExecOptions,
+            _stdout: Box<dyn std::io::Write + Send + 'a>,
+            _stderr: Box<dyn std::io::Write + Send + 'a>,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            panic!("exec_stream should not be called");
+        }
+        fn exec_interactive<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a cella_backend::InteractiveExecOptions,
+        ) -> BoxFuture<'a, Result<i64, BackendError>> {
+            panic!("exec_interactive should not be called");
+        }
+        fn exec_detached<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _opts: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("exec_detached should not be called");
+        }
+        panic_method!(pull_image, image: &'a str => Result<(), BackendError>);
+        panic_method!(build_image, opts: &'a cella_backend::BuildOptions => Result<String, BackendError>);
+        panic_method!(image_exists, image: &'a str => Result<bool, BackendError>);
+        panic_method!(inspect_image_details, image: &'a str => Result<cella_backend::ImageDetails, BackendError>);
+        fn upload_files<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _files: &'a [cella_backend::FileToUpload],
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("upload_files should not be called");
+        }
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            panic!("ping should not be called");
+        }
+        fn host_gateway(&self) -> &'static str {
+            "host.docker.internal"
+        }
+        fn detect_platform(&self) -> BoxFuture<'_, Result<cella_backend::Platform, BackendError>> {
+            panic!("detect_platform should not be called");
+        }
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            panic!("detect_container_arch should not be called");
+        }
+        fn inspect_image_env<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            panic!("inspect_image_env should not be called");
+        }
+        fn inspect_image_user<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            panic!("inspect_image_user should not be called");
+        }
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            panic!("ensure_network should not be called");
+        }
+        fn ensure_container_network<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _repo_path: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("ensure_container_network should not be called");
+        }
+        fn get_container_ip<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            panic!("get_container_ip should not be called");
+        }
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _version: &'a str,
+            _arch: &'a str,
+            _skip_checksum: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("ensure_agent_provisioned should not be called");
+        }
+        fn write_agent_addr<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _addr: &'a str,
+            _token: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("write_agent_addr should not be called");
+        }
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            panic!("agent_volume_mount should not be called");
+        }
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _current_version: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("prune_old_agent_versions should not be called");
+        }
+    }
+
+    // ── Async resolve_shell tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_picks_first_available_preferred() {
+        let mock = MockBackend::from_responses(vec![
+            ok_result("/usr/bin/fish"), // command -v fish
+        ]);
+        let res = resolve_shell(&mock, "ctr", "user", &["fish".to_string()]).await;
+        assert_eq!(res.shell, "/usr/bin/fish");
+        assert_eq!(res.source, ShellSource::Preferred);
+    }
+
+    #[tokio::test]
+    async fn resolve_skips_unavailable_tries_next() {
+        let mock = MockBackend::from_responses(vec![
+            fail_result(),          // command -v fish
+            fail_result(),          // test -x /bin/fish
+            fail_result(),          // test -x /usr/bin/fish
+            fail_result(),          // test -x /usr/local/bin/fish
+            ok_result("/bin/bash"), // command -v bash
+        ]);
+        let res = resolve_shell(
+            &mock,
+            "ctr",
+            "user",
+            &["fish".to_string(), "bash".to_string()],
+        )
+        .await;
+        assert_eq!(res.shell, "/bin/bash");
+        assert_eq!(res.source, ShellSource::Preferred);
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_through_when_no_preferred_available() {
+        let mock = MockBackend::from_responses(vec![
+            fail_result(),          // command -v nonexistent
+            fail_result(),          // test -x /bin/nonexistent
+            fail_result(),          // test -x /usr/bin/nonexistent
+            fail_result(),          // test -x /usr/local/bin/nonexistent
+            ok_result("/bin/bash"), // detect_shell: echo $SHELL
+        ]);
+        let res = resolve_shell(&mock, "ctr", "user", &["nonexistent".to_string()]).await;
+        assert_eq!(res.shell, "/bin/bash");
+        assert_eq!(res.source, ShellSource::Detected);
+    }
+
+    #[tokio::test]
+    async fn resolve_empty_preferred_uses_detection() {
+        let mock = MockBackend::from_responses(vec![
+            ok_result("/bin/zsh"), // detect_shell: echo $SHELL
+        ]);
+        let res = resolve_shell(&mock, "ctr", "user", &[]).await;
+        assert_eq!(res.shell, "/bin/zsh");
+        assert_eq!(res.source, ShellSource::Detected);
+    }
+
+    #[tokio::test]
+    async fn resolve_full_path_probed_directly() {
+        let mock = MockBackend::from_responses(vec![
+            ok_result(""), // test -x /home/linuxbrew/.linuxbrew/bin/fish
+        ]);
+        let res = resolve_shell(
+            &mock,
+            "ctr",
+            "user",
+            &["/home/linuxbrew/.linuxbrew/bin/fish".to_string()],
+        )
+        .await;
+        assert_eq!(res.shell, "/home/linuxbrew/.linuxbrew/bin/fish");
+        assert_eq!(res.source, ShellSource::Preferred);
+    }
+
+    #[tokio::test]
+    async fn resolve_fallback_when_detection_returns_bin_sh() {
+        let mock = MockBackend::from_responses(vec![
+            ok_result("/bin/sh"), // detect_shell: echo $SHELL
+        ]);
+        let res = resolve_shell(&mock, "ctr", "user", &[]).await;
+        assert_eq!(res.shell, "/bin/sh");
+        assert_eq!(res.source, ShellSource::Fallback);
+    }
 }
