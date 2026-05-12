@@ -12,7 +12,7 @@ pub use cli::{Cli, CliBuild, OutputFormat, PullPolicy};
 pub use error::CellaConfigError;
 pub use security::{Security, SecurityMode};
 
-use crate::settings::{Credentials, Network, Tools};
+use crate::settings::{Credentials, Network, Shell, Tools};
 
 use self::format::load_layer;
 use self::merge::merge_layers;
@@ -31,6 +31,9 @@ pub struct CellaConfig {
 
     #[serde(default)]
     pub network: Network,
+
+    #[serde(default)]
+    pub shell: Shell,
 
     #[serde(default)]
     pub cli: Cli,
@@ -87,7 +90,19 @@ impl CellaConfig {
             layers.push(val);
         }
 
-        let merged = merge_layers(&layers);
+        let mut merged = merge_layers(&layers);
+
+        // shell.preferred uses replacement semantics: highest-priority layer wins
+        // entirely, instead of the default array-prepend merge behavior.
+        for layer in layers.iter().rev() {
+            if let Some(preferred) = layer.pointer("/shell/preferred")
+                && let Some(obj) = merged.pointer_mut("/shell").and_then(|v| v.as_object_mut())
+            {
+                obj.insert("preferred".to_string(), preferred.clone());
+                break;
+            }
+        }
+
         serde_json::from_value(merged).map_err(|e| CellaConfigError::Deserialization { source: e })
     }
 }
@@ -287,5 +302,48 @@ mod tests {
         assert!(cfg.credentials.ai.enabled);
         assert!(!cfg.credentials.ai.is_provider_enabled("openai"));
         assert!(!cfg.credentials.ai.is_provider_enabled("anthropic"));
+    }
+
+    #[test]
+    fn shell_preferred_replacement_semantics() {
+        let global = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            global.path().join("config.toml"),
+            "[shell]\npreferred = [\"zsh\", \"bash\", \"sh\"]\n",
+        )
+        .unwrap();
+        let devcontainer = ws.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer).unwrap();
+        std::fs::write(
+            devcontainer.join("cella.toml"),
+            "[shell]\npreferred = [\"bash\", \"sh\"]\n",
+        )
+        .unwrap();
+        let cfg = CellaConfig::load_with_global(ws.path(), None, Some(global.path())).unwrap();
+        assert_eq!(cfg.shell.preferred, vec!["bash", "sh"]);
+    }
+
+    #[test]
+    fn shell_preferred_from_customizations() {
+        let ws = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        let resolved = make_resolved(json!({
+            "customizations": {
+                "cella": {
+                    "shell": {"preferred": ["fish", "zsh", "bash", "sh"]}
+                }
+            }
+        }));
+        let cfg =
+            CellaConfig::load_with_global(ws.path(), Some(&resolved), Some(global.path())).unwrap();
+        assert_eq!(cfg.shell.preferred, vec!["fish", "zsh", "bash", "sh"]);
+    }
+
+    #[test]
+    fn no_shell_config_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = CellaConfig::load_with_global(tmp.path(), None, Some(tmp.path())).unwrap();
+        assert!(cfg.shell.preferred.is_empty());
     }
 }

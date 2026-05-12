@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use cella_backend::{ContainerTarget, InteractiveExecOptions};
+use cella_orchestrator::shell_detect::{ShellResolution, ShellSource};
 
 use crate::picker;
 
@@ -92,15 +93,9 @@ impl ShellArgs {
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
 
-        // Detect shell
-        let shell = if let Some(s) = self.shell {
-            s
-        } else {
-            cella_orchestrator::shell_detect::detect_shell(client.as_ref(), &container.id, &user)
-                .await
-        };
-
-        debug!("Using shell: {shell}");
+        let resolution =
+            resolve_preferred_shell(client.as_ref(), &container, &user, self.shell).await;
+        debug!("Using shell: {}", resolution.shell);
 
         // Build environment: probed env (merged with label env) + terminal env
         let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
@@ -141,7 +136,7 @@ impl ShellArgs {
             .exec_interactive(
                 &container.id,
                 &InteractiveExecOptions {
-                    cmd: vec![shell, "-l".to_string()],
+                    cmd: vec![resolution.shell, "-l".to_string()],
                     user: Some(user),
                     env: Some(env),
                     working_dir,
@@ -154,4 +149,37 @@ impl ShellArgs {
         drop(title_guard);
         std::process::exit(i32::try_from(exit_code).unwrap_or(125));
     }
+}
+
+async fn resolve_preferred_shell(
+    client: &dyn cella_backend::ContainerBackend,
+    container: &cella_backend::ContainerInfo,
+    user: &str,
+    cli_shell: Option<String>,
+) -> ShellResolution {
+    if let Some(s) = cli_shell {
+        return ShellResolution {
+            shell: s,
+            source: ShellSource::CliFlag,
+        };
+    }
+
+    let preferred = super::load_shell_preferred(&container.labels);
+    let resolution =
+        cella_orchestrator::shell_detect::resolve_shell(client, &container.id, user, &preferred)
+            .await;
+
+    if !preferred.is_empty()
+        && !matches!(
+            resolution.source,
+            ShellSource::Preferred | ShellSource::CliFlag
+        )
+    {
+        warn!(
+            "Preferred shells not available, falling back to {}",
+            resolution.shell,
+        );
+    }
+
+    resolution
 }

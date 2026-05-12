@@ -5,6 +5,7 @@ mod credentials;
 mod gemini;
 pub mod network;
 mod nvim;
+mod shell;
 mod tmux;
 mod tools;
 
@@ -15,5 +16,6 @@ pub use credentials::Credentials;
 pub use gemini::Gemini;
 pub use network::Network;
 pub use nvim::Nvim;
+pub use shell::Shell;
 pub use tmux::Tmux;
 pub use tools::Tools;

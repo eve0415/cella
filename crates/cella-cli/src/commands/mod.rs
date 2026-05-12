@@ -301,6 +301,26 @@ pub async fn resolve_service_container(
         .ok_or_else(|| format!("Service '{svc}' not found in compose project '{project}'").into())
 }
 
+/// Load shell preferences from cella config.
+///
+/// Uses the container's workspace path label to find project-level config.
+/// Returns an empty list if the workspace label is missing or config is unavailable.
+pub fn load_shell_preferred(labels: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let Some(workspace_path) = labels
+        .get("dev.cella.workspace_path")
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let workspace = std::path::Path::new(workspace_path);
+    let resolved = cella_config::devcontainer::resolve::config(workspace, None).ok();
+    let Ok(settings) = cella_config::CellaConfig::load(workspace, resolved.as_ref()) else {
+        return Vec::new();
+    };
+    settings.shell.preferred
+}
+
 /// Append AI provider API keys from the host environment into `env`.
 ///
 /// Loads settings from the workspace path label on the container,
