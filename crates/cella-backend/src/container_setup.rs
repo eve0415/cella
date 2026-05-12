@@ -512,7 +512,7 @@ if [ -n "$CELLA_TITLE" ]; then
         __cella_title() { printf '\033]0;%s\007' "$CELLA_TITLE"; }
         PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__cella_title"
     elif [ -n "$ZSH_VERSION" ]; then
-        __cella_title() { printf '\033]0;%s\007' "$CELLA_TITLE" }
+        __cella_title() { printf '\033]0;%s\007' "$CELLA_TITLE"; }
         precmd_functions+=(__cella_title)
     fi
 fi
@@ -664,6 +664,22 @@ mod tests {
         let guards: Vec<&str> = PATH_SNIPPETS.iter().map(|(g, _)| *g).collect();
         let unique: std::collections::HashSet<&str> = guards.iter().copied().collect();
         assert_eq!(guards.len(), unique.len());
+    }
+
+    // ── TITLE_SNIPPETS ────────────────────────────────────────────────────
+
+    #[test]
+    fn title_snippet_is_valid_bash() {
+        let (_, snippet) = TITLE_SNIPPETS[0];
+        let output = std::process::Command::new("bash")
+            .args(["-n", "-c", snippet])
+            .output()
+            .expect("bash should be available");
+        assert!(
+            output.status.success(),
+            "TITLE_SNIPPETS must be valid bash syntax: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     // ── map_env_object ───────────────────────────────────────────────────
