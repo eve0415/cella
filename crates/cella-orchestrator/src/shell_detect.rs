@@ -4,6 +4,47 @@ use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ExecOptions};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellSource {
+    CliFlag,
+    Preferred,
+    Detected,
+    Fallback,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellResolution {
+    pub shell: String,
+    pub source: ShellSource,
+}
+
+/// Resolve the shell to use, respecting user preferences.
+///
+/// Priority: preference list (probed) -> existing detection -> /bin/sh.
+pub async fn resolve_shell(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    preferred: &[String],
+) -> ShellResolution {
+    if !preferred.is_empty()
+        && let Some(shell) = probe_preferred(client, container_id, user, preferred).await
+    {
+        return ShellResolution {
+            shell,
+            source: ShellSource::Preferred,
+        };
+    }
+
+    let shell = detect_shell(client, container_id, user).await;
+    let source = if shell == "/bin/sh" {
+        ShellSource::Fallback
+    } else {
+        ShellSource::Detected
+    };
+    ShellResolution { shell, source }
+}
+
 /// Detect the best available shell for a user inside a container.
 pub async fn detect_shell(client: &dyn ContainerBackend, container_id: &str, user: &str) -> String {
     if let Some(shell) = detect_shell_from_env(client, container_id, user).await {
@@ -154,6 +195,118 @@ async fn detect_shell_by_probing(
     None
 }
 
+async fn probe_preferred(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    preferred: &[String],
+) -> Option<String> {
+    for candidate in preferred {
+        let resolved = if candidate.contains('/') {
+            probe_full_path(client, container_id, user, candidate).await
+        } else {
+            probe_short_name(client, container_id, user, candidate).await
+        };
+        if let Some(shell) = resolved {
+            debug!("Resolved preferred shell {candidate} -> {shell}");
+            return Some(shell);
+        }
+        debug!("Preferred shell {candidate} not available");
+    }
+    None
+}
+
+fn is_valid_shell_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || b == b'_'
+                || b == b'.'
+                || b == b'/'
+                || b == b'-'
+                || b == b'+'
+        })
+}
+
+async fn probe_short_name(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    name: &str,
+) -> Option<String> {
+    if !is_valid_shell_name(name) {
+        warn!("Ignoring invalid shell name in preference: {name:?}");
+        return None;
+    }
+
+    let quoted = shell_quote(&[name.to_string()]);
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("command -v {quoted}"),
+                ],
+                user: Some(user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()?;
+
+    if result.exit_code == 0 {
+        let path = result.stdout.trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+
+    for prefix in &["/bin/", "/usr/bin/", "/usr/local/bin/"] {
+        let path = format!("{prefix}{name}");
+        if probe_full_path(client, container_id, user, &path)
+            .await
+            .is_some()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn probe_full_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    path: &str,
+) -> Option<String> {
+    if !is_valid_shell_name(path) {
+        warn!("Ignoring invalid shell path in preference: {path:?}");
+        return None;
+    }
+
+    let result = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["test".to_string(), "-x".to_string(), path.to_string()],
+                user: Some(user.to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()?;
+
+    if result.exit_code == 0 {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +370,34 @@ mod tests {
                 "exec 'claude' '--dangerously-skip-permissions'"
             ]
         );
+    }
+
+    #[test]
+    fn shell_resolution_types() {
+        let res = ShellResolution {
+            shell: "/bin/zsh".to_string(),
+            source: ShellSource::Preferred,
+        };
+        assert_eq!(res.source, ShellSource::Preferred);
+    }
+
+    #[test]
+    fn valid_shell_names_accepted() {
+        assert!(is_valid_shell_name("zsh"));
+        assert!(is_valid_shell_name("bash"));
+        assert!(is_valid_shell_name("/bin/zsh"));
+        assert!(is_valid_shell_name("/usr/local/bin/fish"));
+        assert!(is_valid_shell_name("my-shell_v2.0"));
+        assert!(is_valid_shell_name("shell+extra"));
+    }
+
+    #[test]
+    fn injection_shell_names_rejected() {
+        assert!(!is_valid_shell_name(""));
+        assert!(!is_valid_shell_name("zsh; rm -rf /"));
+        assert!(!is_valid_shell_name("$(evil)"));
+        assert!(!is_valid_shell_name("shell`whoami`"));
+        assert!(!is_valid_shell_name("sh && echo pwned"));
+        assert!(!is_valid_shell_name("zsh\nmalicious"));
     }
 }
