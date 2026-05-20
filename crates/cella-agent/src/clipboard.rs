@@ -75,6 +75,89 @@ pub async fn handle_xclip(args: &[String]) -> Result<(), CellaPortError> {
     execute_clipboard_op(op, filter).await
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct WlPasteOptions {
+    pub mime_type: String,
+    pub list_types: bool,
+    pub no_newline: bool,
+}
+
+pub fn parse_wl_paste_args(args: &[String]) -> WlPasteOptions {
+    let mut mime_type = DEFAULT_MIME_TYPE.to_string();
+    let mut list_types = false;
+    let mut no_newline = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list-types" | "-l" => list_types = true,
+            "--type" | "-t" => {
+                i += 1;
+                if let Some(t) = args.get(i) {
+                    mime_type.clone_from(t);
+                }
+            }
+            "-n" | "--no-newline" => no_newline = true,
+            "--primary" | "--seat" => {
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    WlPasteOptions {
+        mime_type,
+        list_types,
+        no_newline,
+    }
+}
+
+pub fn parse_wl_copy_args(args: &[String]) -> ClipboardOp {
+    let mut mime_type = DEFAULT_MIME_TYPE.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--clear" | "-c" => return ClipboardOp::Clear,
+            "--type" | "-t" => {
+                i += 1;
+                if let Some(t) = args.get(i) {
+                    mime_type.clone_from(t);
+                }
+            }
+            "--primary" | "--seat" | "--foreground" | "--paste-once" => {
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    ClipboardOp::Copy { mime_type }
+}
+
+pub async fn handle_wl_paste(args: &[String]) -> Result<(), CellaPortError> {
+    let opts = parse_wl_paste_args(args);
+    let mime = if opts.list_types {
+        "TARGETS".to_string()
+    } else {
+        opts.mime_type
+    };
+    let data = request_clipboard_paste(&mime).await?;
+    let output = if opts.no_newline {
+        data.strip_suffix(b"\n").unwrap_or(&data).to_vec()
+    } else {
+        data
+    };
+    std::io::stdout()
+        .write_all(&output)
+        .map_err(|e| CellaPortError::ControlSocket {
+            message: format!("failed to write stdout: {e}"),
+        })
+}
+
+pub async fn handle_wl_copy(args: &[String]) -> Result<(), CellaPortError> {
+    let op = parse_wl_copy_args(args);
+    execute_clipboard_op(op, false).await
+}
+
 async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), CellaPortError> {
     match op {
         ClipboardOp::Copy { mime_type } => {
@@ -273,5 +356,68 @@ mod tests {
             "-o".to_string(),
         ]);
         assert!(matches!(op, ClipboardOp::Paste { mime_type } if mime_type == "TARGETS"));
+    }
+
+    #[test]
+    fn parse_wl_paste_list_types() {
+        let opts = parse_wl_paste_args(&["--list-types".to_string()]);
+        assert!(opts.list_types);
+    }
+
+    #[test]
+    fn parse_wl_paste_type_flag() {
+        let opts = parse_wl_paste_args(&["--type".to_string(), "image/png".to_string()]);
+        assert_eq!(opts.mime_type, "image/png");
+        assert!(!opts.list_types);
+    }
+
+    #[test]
+    fn parse_wl_paste_short_type_flag() {
+        let opts = parse_wl_paste_args(&["-t".to_string(), "image/jpeg".to_string()]);
+        assert_eq!(opts.mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn parse_wl_paste_short_list_flag() {
+        let opts = parse_wl_paste_args(&["-l".to_string()]);
+        assert!(opts.list_types);
+    }
+
+    #[test]
+    fn parse_wl_paste_no_newline_flag() {
+        let opts = parse_wl_paste_args(&["-n".to_string()]);
+        assert!(opts.no_newline);
+    }
+
+    #[test]
+    fn parse_wl_paste_defaults() {
+        let opts = parse_wl_paste_args(&[]);
+        assert_eq!(opts.mime_type, "text/plain");
+        assert!(!opts.list_types);
+        assert!(!opts.no_newline);
+    }
+
+    #[test]
+    fn parse_wl_copy_defaults_to_copy() {
+        let op = parse_wl_copy_args(&[]);
+        assert!(matches!(op, ClipboardOp::Copy { mime_type } if mime_type == "text/plain"));
+    }
+
+    #[test]
+    fn parse_wl_copy_type_flag() {
+        let op = parse_wl_copy_args(&["--type".to_string(), "image/png".to_string()]);
+        assert!(matches!(op, ClipboardOp::Copy { mime_type } if mime_type == "image/png"));
+    }
+
+    #[test]
+    fn parse_wl_copy_clear_flag() {
+        assert!(matches!(
+            parse_wl_copy_args(&["--clear".to_string()]),
+            ClipboardOp::Clear
+        ));
+        assert!(matches!(
+            parse_wl_copy_args(&["-c".to_string()]),
+            ClipboardOp::Clear
+        ));
     }
 }
