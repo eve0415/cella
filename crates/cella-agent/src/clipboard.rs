@@ -45,7 +45,7 @@ pub fn parse_xclip_args(args: &[String]) -> ClipboardOp {
         match args[i].as_str() {
             "-i" | "-in" => mode = Some("input"),
             "-o" | "-out" => mode = Some("output"),
-            "-target" => {
+            "-target" | "-t" => {
                 i += 1;
                 if let Some(t) = args.get(i) {
                     mime_type.clone_from(t);
@@ -255,5 +255,23 @@ mod tests {
         assert!(args.iter().any(|a| a == "-f" || a == "-filter"));
         let args2 = ["-filter".to_string()];
         assert!(args2.iter().any(|a| a == "-f" || a == "-filter"));
+    }
+
+    #[test]
+    fn parse_xclip_short_target_flag() {
+        let op = parse_xclip_args(&["-t".to_string(), "image/png".to_string(), "-o".to_string()]);
+        assert!(matches!(op, ClipboardOp::Paste { mime_type } if mime_type == "image/png"));
+    }
+
+    #[test]
+    fn parse_xclip_short_target_with_targets() {
+        let op = parse_xclip_args(&[
+            "-selection".to_string(),
+            "clipboard".to_string(),
+            "-t".to_string(),
+            "TARGETS".to_string(),
+            "-o".to_string(),
+        ]);
+        assert!(matches!(op, ClipboardOp::Paste { mime_type } if mime_type == "TARGETS"));
     }
 }
