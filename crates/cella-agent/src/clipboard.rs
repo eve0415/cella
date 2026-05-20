@@ -90,14 +90,14 @@ pub fn parse_wl_paste_args(args: &[String]) -> WlPasteOptions {
     while i < args.len() {
         match args[i].as_str() {
             "--list-types" | "-l" => list_types = true,
+            "-n" | "--no-newline" => no_newline = true,
             "--type" | "-t" => {
                 i += 1;
                 if let Some(t) = args.get(i) {
                     mime_type.clone_from(t);
                 }
             }
-            "-n" | "--no-newline" => no_newline = true,
-            "--primary" | "--seat" => {
+            "--seat" => {
                 i += 1;
             }
             _ => {}
@@ -123,7 +123,7 @@ pub fn parse_wl_copy_args(args: &[String]) -> ClipboardOp {
                     mime_type.clone_from(t);
                 }
             }
-            "--primary" | "--seat" | "--foreground" | "--paste-once" => {
+            "--seat" => {
                 i += 1;
             }
             _ => {}

@@ -117,7 +117,7 @@ const JXA_TARGETS: &str = r"ObjC.import('AppKit');
 var pb=$.NSPasteboard.generalPasteboard;
 var types=pb.types;
 var m=['TARGETS','text/plain'];
-var map={'public.png':'image/png','public.tiff':'image/png','public.jpeg':'image/jpeg'};
+var map={'public.png':'image/png','public.tiff':'image/png'};
 for(var i=0;i<types.count;i++){var t=types.objectAtIndex(i).js;if(map[t]&&m.indexOf(map[t])===-1)m.push(map[t]);}
 m.join('\n');";
 
@@ -166,7 +166,7 @@ impl ClipboardBackend for PbcopyBackend {
 
     fn copy(&self, data: &[u8], mime_type: &str) -> Result<(), String> {
         #[cfg(target_os = "macos")]
-        if mime_type.starts_with("image/") {
+        if mime_type == "image/png" {
             use base64::Engine;
             let encoded = base64::engine::general_purpose::STANDARD.encode(data);
             let script = format!(
