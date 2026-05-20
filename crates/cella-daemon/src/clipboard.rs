@@ -103,22 +103,106 @@ impl ClipboardBackend for NullBackend {
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        if mime_type == "TARGETS" {
+            return Ok((b"TARGETS\ntext/plain\n".to_vec(), "text/plain".to_string()));
+        }
         Ok((Vec::new(), mime_type.to_string()))
     }
 }
 
 struct PbcopyBackend;
 
+#[cfg(target_os = "macos")]
+const JXA_TARGETS: &str = r#"ObjC.import('AppKit');
+var pb=$.NSPasteboard.generalPasteboard;
+var types=pb.types;
+var m=['TARGETS','text/plain'];
+var map={'public.png':'image/png','public.tiff':'image/png','public.jpeg':'image/jpeg'};
+for(var i=0;i<types.count;i++){var t=types.objectAtIndex(i).js;if(map[t]&&m.indexOf(map[t])===-1)m.push(map[t]);}
+m.join('\n');"#;
+
+#[cfg(target_os = "macos")]
+const JXA_IMAGE_PASTE: &str = r#"ObjC.import('AppKit');ObjC.import('Foundation');
+var pb=$.NSPasteboard.generalPasteboard;
+var types=['public.png','public.tiff','public.jpeg'];
+var data=null;
+for(var i=0;i<types.length;i++){data=pb.dataForType(types[i]);if(data&&!data.isNil()&&data.length>0)break;data=null;}
+if(!data||data.isNil())'';
+else{var rep=$.NSBitmapImageRep.imageRepWithData(data);
+var png=rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$.NSDictionary.dictionary);
+png.base64EncodedStringWithOptions(0).js;}"#;
+
+#[cfg(target_os = "macos")]
+fn run_jxa(script: &str) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("osascript: {e}"))?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .map_err(|e| format!("osascript stdin: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("osascript wait: {e}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("osascript exited with {}: {stderr}", output.status))
+    }
+}
+
 impl ClipboardBackend for PbcopyBackend {
     fn name(&self) -> &'static str {
         "pbcopy"
     }
 
-    fn copy(&self, data: &[u8], _mime_type: &str) -> Result<(), String> {
+    fn copy(&self, data: &[u8], mime_type: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if mime_type.starts_with("image/") {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            let script = format!(
+                "ObjC.import('AppKit');ObjC.import('Foundation');\
+                 var data=$.NSData.alloc.initWithBase64EncodedStringOptions($('{}'),0);\
+                 var pb=$.NSPasteboard.generalPasteboard;pb.clearContents;\
+                 pb.setDataForType(data,$.NSPasteboardTypePNG);'ok';",
+                encoded
+            );
+            return run_jxa(&script).map(|_| ());
+        }
+        let _ = mime_type;
         pipe_to_command("pbcopy", &[], data)
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        #[cfg(target_os = "macos")]
+        {
+            if mime_type == "TARGETS" {
+                let output = run_jxa(JXA_TARGETS)?;
+                return Ok((output, "text/plain".to_string()));
+            }
+            if mime_type.starts_with("image/") {
+                let output = run_jxa(JXA_IMAGE_PASTE)?;
+                let text = String::from_utf8_lossy(&output);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Ok((Vec::new(), mime_type.to_string()));
+                }
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(trimmed)
+                    .map_err(|e| format!("jxa base64 decode: {e}"))?;
+                return Ok((bytes, "image/png".to_string()));
+            }
+        }
         let output = run_command("pbpaste", &[])?;
         Ok((output, mime_type.to_string()))
     }
@@ -136,6 +220,10 @@ impl ClipboardBackend for WlClipboardBackend {
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        if mime_type == "TARGETS" {
+            let output = run_command("wl-paste", &["--list-types"])?;
+            return Ok((output, "text/plain".to_string()));
+        }
         let output = run_command("wl-paste", &["--type", mime_type])?;
         Ok((output, mime_type.to_string()))
     }
@@ -153,6 +241,9 @@ impl ClipboardBackend for XselBackend {
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        if mime_type == "TARGETS" {
+            return Ok((b"TARGETS\ntext/plain\n".to_vec(), "text/plain".to_string()));
+        }
         let output = run_command("xsel", &["--clipboard", "--output"])?;
         Ok((output, mime_type.to_string()))
     }
@@ -202,6 +293,9 @@ impl ClipboardBackend for Osc52Backend {
     }
 
     fn paste(&self, mime_type: &str) -> Result<(Vec<u8>, String), String> {
+        if mime_type == "TARGETS" {
+            return Ok((b"TARGETS\ntext/plain\n".to_vec(), "text/plain".to_string()));
+        }
         debug!("OSC 52 paste not supported, returning empty");
         Ok((Vec::new(), mime_type.to_string()))
     }
@@ -284,5 +378,15 @@ mod tests {
         let handler = ClipboardHandler::null();
         let (_, mime) = handler.paste("image/png").await.unwrap();
         assert_eq!(mime, "image/png");
+    }
+
+    #[tokio::test]
+    async fn null_backend_targets_returns_text_plain() {
+        let handler = ClipboardHandler::null();
+        let (data, mime) = handler.paste("TARGETS").await.unwrap();
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.contains("text/plain"));
+        assert!(text.contains("TARGETS"));
+        assert_eq!(mime, "text/plain");
     }
 }
