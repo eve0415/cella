@@ -113,16 +113,16 @@ impl ClipboardBackend for NullBackend {
 struct PbcopyBackend;
 
 #[cfg(target_os = "macos")]
-const JXA_TARGETS: &str = r#"ObjC.import('AppKit');
+const JXA_TARGETS: &str = r"ObjC.import('AppKit');
 var pb=$.NSPasteboard.generalPasteboard;
 var types=pb.types;
 var m=['TARGETS','text/plain'];
 var map={'public.png':'image/png','public.tiff':'image/png','public.jpeg':'image/jpeg'};
 for(var i=0;i<types.count;i++){var t=types.objectAtIndex(i).js;if(map[t]&&m.indexOf(map[t])===-1)m.push(map[t]);}
-m.join('\n');"#;
+m.join('\n');";
 
 #[cfg(target_os = "macos")]
-const JXA_IMAGE_PASTE: &str = r#"ObjC.import('AppKit');ObjC.import('Foundation');
+const JXA_IMAGE_PASTE: &str = r"ObjC.import('AppKit');ObjC.import('Foundation');
 var pb=$.NSPasteboard.generalPasteboard;
 var types=['public.png','public.tiff','public.jpeg'];
 var data=null;
@@ -130,7 +130,7 @@ for(var i=0;i<types.length;i++){data=pb.dataForType(types[i]);if(data&&!data.isN
 if(!data||data.isNil())'';
 else{var rep=$.NSBitmapImageRep.imageRepWithData(data);
 var png=rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$.NSDictionary.dictionary);
-png.base64EncodedStringWithOptions(0).js;}"#;
+png.base64EncodedStringWithOptions(0).js;}";
 
 #[cfg(target_os = "macos")]
 fn run_jxa(script: &str) -> Result<Vec<u8>, String> {
@@ -171,10 +171,9 @@ impl ClipboardBackend for PbcopyBackend {
             let encoded = base64::engine::general_purpose::STANDARD.encode(data);
             let script = format!(
                 "ObjC.import('AppKit');ObjC.import('Foundation');\
-                 var data=$.NSData.alloc.initWithBase64EncodedStringOptions($('{}'),0);\
+                 var data=$.NSData.alloc.initWithBase64EncodedStringOptions($('{encoded}'),0);\
                  var pb=$.NSPasteboard.generalPasteboard;pb.clearContents;\
-                 pb.setDataForType(data,$.NSPasteboardTypePNG);'ok';",
-                encoded
+                 pb.setDataForType(data,$.NSPasteboardTypePNG);'ok';"
             );
             return run_jxa(&script).map(|_| ());
         }
@@ -190,13 +189,13 @@ impl ClipboardBackend for PbcopyBackend {
                 return Ok((output, "text/plain".to_string()));
             }
             if mime_type.starts_with("image/") {
+                use base64::Engine;
                 let output = run_jxa(JXA_IMAGE_PASTE)?;
                 let text = String::from_utf8_lossy(&output);
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
                     return Ok((Vec::new(), mime_type.to_string()));
                 }
-                use base64::Engine;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(trimmed)
                     .map_err(|e| format!("jxa base64 decode: {e}"))?;
