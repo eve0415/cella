@@ -52,6 +52,10 @@ enum AgentCommand {
     Xsel { args: Vec<String> },
     /// Handle xclip-compatible clipboard command.
     Xclip { args: Vec<String> },
+    /// Handle wl-paste-compatible clipboard command.
+    WlPaste { args: Vec<String> },
+    /// Handle wl-copy-compatible clipboard command.
+    WlCopy { args: Vec<String> },
 }
 
 fn parse_args() -> Result<AgentArgs, String> {
@@ -119,6 +123,16 @@ fn parse_args_from(args: &[String]) -> Result<AgentArgs, String> {
         }),
         "xclip" => Ok(AgentArgs {
             command: AgentCommand::Xclip {
+                args: args[2..].to_vec(),
+            },
+        }),
+        "wl-paste" => Ok(AgentArgs {
+            command: AgentCommand::WlPaste {
+                args: args[2..].to_vec(),
+            },
+        }),
+        "wl-copy" => Ok(AgentArgs {
+            command: AgentCommand::WlCopy {
                 args: args[2..].to_vec(),
             },
         }),
@@ -211,6 +225,18 @@ async fn main() {
         AgentCommand::Xclip { args } => {
             if let Err(e) = clipboard::handle_xclip(&args).await {
                 error!("Clipboard (xclip) error: {e}");
+                std::process::exit(1);
+            }
+        }
+        AgentCommand::WlPaste { args } => {
+            if let Err(e) = clipboard::handle_wl_paste(&args).await {
+                error!("Clipboard (wl-paste) error: {e}");
+                std::process::exit(1);
+            }
+        }
+        AgentCommand::WlCopy { args } => {
+            if let Err(e) = clipboard::handle_wl_copy(&args).await {
+                error!("Clipboard (wl-copy) error: {e}");
                 std::process::exit(1);
             }
         }
@@ -526,6 +552,26 @@ mod tests {
         ]))
         .unwrap();
         assert!(matches!(a.command, AgentCommand::Xclip { args } if args.len() == 5));
+    }
+
+    #[test]
+    fn parse_wl_paste_command() {
+        let a = parse_args_from(&args(&["cella-agent", "wl-paste", "--list-types"])).unwrap();
+        assert!(
+            matches!(a.command, AgentCommand::WlPaste { args } if args == vec!["--list-types"])
+        );
+    }
+
+    #[test]
+    fn parse_wl_paste_no_args() {
+        let a = parse_args_from(&args(&["cella-agent", "wl-paste"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::WlPaste { args } if args.is_empty()));
+    }
+
+    #[test]
+    fn parse_wl_copy_command() {
+        let a = parse_args_from(&args(&["cella-agent", "wl-copy", "-t", "image/png"])).unwrap();
+        assert!(matches!(a.command, AgentCommand::WlCopy { args } if args.len() == 2));
     }
 
     #[test]
