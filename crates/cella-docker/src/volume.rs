@@ -208,6 +208,34 @@ exec "{agent_path}" xclip "$@"
     .into_bytes()
 }
 
+/// Generate the wl-paste shim script content.
+///
+/// Placed at `/cella/bin/wl-paste` to shadow the real wl-paste binary.
+/// Forwards all arguments to the agent's clipboard handler.
+pub fn wl_paste_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" wl-paste "$@"
+"#
+    )
+    .into_bytes()
+}
+
+/// Generate the wl-copy shim script content.
+///
+/// Placed at `/cella/bin/wl-copy` to shadow the real wl-copy binary.
+/// Forwards all arguments to the agent's clipboard handler.
+pub fn wl_copy_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" wl-copy "$@"
+"#
+    )
+    .into_bytes()
+}
+
 /// Version marker file path inside the volume.
 pub const fn version_marker_path() -> &'static str {
     "/cella/.version"
@@ -308,6 +336,8 @@ async fn populate_volume(
         browser: &browser_helper_script(),
         xsel: &xsel_helper_script(),
         xclip: &xclip_helper_script(),
+        wl_paste: &wl_paste_helper_script(),
+        wl_copy: &wl_copy_helper_script(),
     };
 
     upload_to_volume(
@@ -930,6 +960,25 @@ struct VolumeTarScripts<'a> {
     browser: &'a [u8],
     xsel: &'a [u8],
     xclip: &'a [u8],
+    wl_paste: &'a [u8],
+    wl_copy: &'a [u8],
+}
+
+fn tar_append_file(
+    archive: &mut tar::Builder<&mut Vec<u8>>,
+    path: &str,
+    data: &[u8],
+    mode: u32,
+) -> Result<(), CellaDockerError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(mode);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, data)
+        .map_err(|e| CellaDockerError::AgentVolume {
+            message: format!("tar append {path}: {e}"),
+        })
 }
 
 fn build_volume_tar(
@@ -939,57 +988,22 @@ fn build_volume_tar(
     scripts: &VolumeTarScripts<'_>,
     version_marker: &str,
 ) -> Result<Vec<u8>, CellaDockerError> {
-    let browser_script = scripts.browser;
-    let xsel_script = scripts.xsel;
-    let xclip_script = scripts.xclip;
     let mut buf = Vec::new();
     {
         let mut archive = tar::Builder::new(&mut buf);
 
-        // Agent binary: /cella/v{version}/{arch}/cella-agent
         let agent_path = format!("cella/v{version}/{arch}/cella-agent");
-        let mut header = tar::Header::new_gnu();
-        header.set_size(agent_bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, &agent_path, agent_bytes)
-            .map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("tar append agent: {e}"),
-            })?;
-
-        // Browser helper: /cella/bin/cella-browser
-        let mut header = tar::Header::new_gnu();
-        header.set_size(browser_script.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "cella/bin/cella-browser", browser_script)
-            .map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("tar append browser: {e}"),
-            })?;
-
-        // xsel shim: /cella/bin/xsel
-        let mut header = tar::Header::new_gnu();
-        header.set_size(xsel_script.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "cella/bin/xsel", xsel_script)
-            .map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("tar append xsel: {e}"),
-            })?;
-
-        // xclip shim: /cella/bin/xclip
-        let mut header = tar::Header::new_gnu();
-        header.set_size(xclip_script.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "cella/bin/xclip", xclip_script)
-            .map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("tar append xclip: {e}"),
-            })?;
+        tar_append_file(&mut archive, &agent_path, agent_bytes, 0o755)?;
+        tar_append_file(
+            &mut archive,
+            "cella/bin/cella-browser",
+            scripts.browser,
+            0o755,
+        )?;
+        tar_append_file(&mut archive, "cella/bin/xsel", scripts.xsel, 0o755)?;
+        tar_append_file(&mut archive, "cella/bin/xclip", scripts.xclip, 0o755)?;
+        tar_append_file(&mut archive, "cella/bin/wl-paste", scripts.wl_paste, 0o755)?;
+        tar_append_file(&mut archive, "cella/bin/wl-copy", scripts.wl_copy, 0o755)?;
 
         // Stable agent symlink: /cella/bin/cella-agent -> versioned binary
         // Survives version upgrades so CMD paths and credential helpers keep working.
@@ -1018,17 +1032,12 @@ fn build_volume_tar(
                 message: format!("tar append cella symlink: {e}"),
             })?;
 
-        // Version marker: /cella/.version
-        let marker_bytes = version_marker.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(marker_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "cella/.version", marker_bytes)
-            .map_err(|e| CellaDockerError::AgentVolume {
-                message: format!("tar append version: {e}"),
-            })?;
+        tar_append_file(
+            &mut archive,
+            "cella/.version",
+            version_marker.as_bytes(),
+            0o644,
+        )?;
 
         archive
             .finish()
@@ -1432,6 +1441,8 @@ mod tests {
                 browser: browser_bytes,
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             marker,
         )
@@ -1459,6 +1470,14 @@ mod tests {
         assert!(
             entries.iter().any(|e| e == "cella/bin/xclip"),
             "tar must contain xclip shim"
+        );
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/wl-paste"),
+            "tar must contain wl-paste shim"
+        );
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/wl-copy"),
+            "tar must contain wl-copy shim"
         );
     }
 
@@ -1489,6 +1508,8 @@ mod tests {
                 browser: browser_bytes,
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             marker,
         )
@@ -1534,6 +1555,8 @@ mod tests {
                 browser: browser_bytes,
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             marker,
         )
@@ -1712,6 +1735,34 @@ mod tests {
     }
 
     #[test]
+    fn wl_paste_helper_script_starts_with_shebang() {
+        let bytes = wl_paste_helper_script();
+        assert!(String::from_utf8_lossy(&bytes).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn wl_paste_helper_script_execs_agent() {
+        let bytes = wl_paste_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("wl-paste"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
+    fn wl_copy_helper_script_starts_with_shebang() {
+        let bytes = wl_copy_helper_script();
+        assert!(String::from_utf8_lossy(&bytes).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn wl_copy_helper_script_execs_agent() {
+        let bytes = wl_copy_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("wl-copy"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
     fn version_marker_path_is_under_cella() {
         let path = version_marker_path();
         assert_eq!(path, "/cella/.version");
@@ -1823,6 +1874,8 @@ abc333  artifact-c
                 browser: browser_bytes,
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             marker,
         )
@@ -1852,6 +1905,8 @@ abc333  artifact-c
                 browser: b"#!/bin/sh",
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "m",
         )
@@ -1905,7 +1960,7 @@ abc333  artifact-c
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_volume_tar_contains_exactly_seven_entries() {
+    fn build_volume_tar_contains_exactly_nine_entries() {
         let tar_bytes = build_volume_tar(
             "2.0.0",
             "aarch64",
@@ -1914,6 +1969,8 @@ abc333  artifact-c
                 browser: b"#!/bin/sh",
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "2.0.0/aarch64\n",
         )
@@ -1929,11 +1986,11 @@ abc333  artifact-c
             })
             .collect();
 
-        // agent binary, browser script, xsel shim, xclip shim, agent symlink, cella symlink, .version
+        // agent binary, browser script, xsel shim, xclip shim, wl-paste shim, wl-copy shim, agent symlink, cella symlink, .version
         assert_eq!(
             entries.len(),
-            7,
-            "expected 7 entries in volume tar, got {}: {entries:?}",
+            9,
+            "expected 9 entries in volume tar, got {}: {entries:?}",
             entries.len()
         );
     }
@@ -1949,6 +2006,8 @@ abc333  artifact-c
                 browser: b"script",
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "marker",
         )
@@ -1979,6 +2038,8 @@ abc333  artifact-c
                 browser: browser_content,
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "marker",
         )
@@ -2008,6 +2069,8 @@ abc333  artifact-c
                 browser: b"script",
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "1.0.0/x86_64\n",
         )
@@ -2040,6 +2103,8 @@ abc333  artifact-c
                 browser: b"script",
                 xsel: b"s",
                 xclip: b"s",
+                wl_paste: b"s",
+                wl_copy: b"s",
             },
             "marker",
         )
@@ -2054,7 +2119,7 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
-        assert_eq!(entries.len(), 7);
+        assert_eq!(entries.len(), 9);
     }
 
     // -----------------------------------------------------------------------
