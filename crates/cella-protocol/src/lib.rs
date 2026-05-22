@@ -39,6 +39,12 @@ pub struct PhantomTokenEntry {
     pub phantom_token: String,
     pub env_var: String,
     pub domain: String,
+    /// HTTP header name for credential injection.
+    #[serde(default)]
+    pub header: String,
+    /// Header value prefix (e.g., `"Bearer "`).
+    #[serde(default)]
+    pub prefix: String,
 }
 
 /// Sent by the agent as the first message after connecting.
@@ -1781,6 +1787,8 @@ mod tests {
             phantom_token: "pt-550e8400-e29b-41d4-a716-446655440000".to_string(),
             env_var: "ANTHROPIC_API_KEY".to_string(),
             domain: "api.anthropic.com".to_string(),
+            header: "x-api-key".to_string(),
+            prefix: String::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: PhantomTokenEntry = serde_json::from_str(&json).unwrap();
@@ -1797,6 +1805,8 @@ mod tests {
                 phantom_token: "pt-abc".to_string(),
                 env_var: "ANTHROPIC_API_KEY".to_string(),
                 domain: "api.anthropic.com".to_string(),
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
             }],
         };
         let json = serde_json::to_string(&req).unwrap();

@@ -11,6 +11,7 @@ pub use cella_compose::mount_parity as compose_mounts;
 pub use cella_compose::orchestrate as compose_up;
 pub mod config;
 pub use cella_backend::container_setup;
+pub mod credential_protect;
 pub use cella_config::config_map;
 pub mod daemon_registration;
 pub mod docker_helpers;

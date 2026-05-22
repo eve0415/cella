@@ -6,6 +6,14 @@
 
 use std::collections::HashMap;
 
+/// Stored provider metadata for credential resolution.
+#[derive(Debug, Clone)]
+pub struct StoredProviderMeta {
+    pub env_var: String,
+    pub header: String,
+    pub prefix: String,
+}
+
 /// Registry of phantom tokens across all credential-protected containers.
 #[derive(Debug, Default)]
 pub struct PhantomRegistry {
@@ -15,6 +23,8 @@ pub struct PhantomRegistry {
     reverse: HashMap<String, HashMap<String, String>>,
     /// `container_name -> (provider_id -> env_var)`
     env_vars: HashMap<String, HashMap<String, String>>,
+    /// `container_name -> (provider_id -> meta)`
+    meta: HashMap<String, HashMap<String, StoredProviderMeta>>,
 }
 
 impl PhantomRegistry {
@@ -31,16 +41,26 @@ impl PhantomRegistry {
         let mut forward = HashMap::new();
         let mut reverse = HashMap::new();
         let mut env = HashMap::new();
+        let mut meta_map = HashMap::new();
 
         for entry in entries {
             forward.insert(entry.phantom_token.clone(), entry.provider_id.clone());
             reverse.insert(entry.provider_id.clone(), entry.phantom_token.clone());
             env.insert(entry.provider_id.clone(), entry.env_var.clone());
+            meta_map.insert(
+                entry.provider_id.clone(),
+                StoredProviderMeta {
+                    env_var: entry.env_var.clone(),
+                    header: entry.header.clone(),
+                    prefix: entry.prefix.clone(),
+                },
+            );
         }
 
         self.forward.insert(container_name.to_string(), forward);
         self.reverse.insert(container_name.to_string(), reverse);
         self.env_vars.insert(container_name.to_string(), env);
+        self.meta.insert(container_name.to_string(), meta_map);
     }
 
     /// Look up a phantom token → provider ID for a container.
@@ -69,11 +89,21 @@ impl PhantomRegistry {
         result
     }
 
+    /// Get provider metadata for a resolved provider in a container.
+    pub fn get_provider_meta(
+        &self,
+        container_name: &str,
+        provider_id: &str,
+    ) -> Option<&StoredProviderMeta> {
+        self.meta.get(container_name)?.get(provider_id)
+    }
+
     /// Remove all phantom tokens for a container.
     pub fn remove_container(&mut self, container_name: &str) {
         self.forward.remove(container_name);
         self.reverse.remove(container_name);
         self.env_vars.remove(container_name);
+        self.meta.remove(container_name);
     }
 
     /// Number of containers with registered phantom tokens.
@@ -100,12 +130,16 @@ mod tests {
                 phantom_token: "pt-aaa".to_string(),
                 env_var: "ANTHROPIC_API_KEY".to_string(),
                 domain: "api.anthropic.com".to_string(),
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
             },
             PhantomTokenEntry {
                 provider_id: "openai".to_string(),
                 phantom_token: "pt-bbb".to_string(),
                 env_var: "OPENAI_API_KEY".to_string(),
                 domain: "api.openai.com".to_string(),
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
             },
         ]
     }
@@ -181,6 +215,8 @@ mod tests {
             phantom_token: "pt-ccc".to_string(),
             env_var: "GH_TOKEN".to_string(),
             domain: "api.github.com".to_string(),
+            header: "Authorization".to_string(),
+            prefix: "token ".to_string(),
         }];
         reg.register("ctr-1", &new_entries);
 

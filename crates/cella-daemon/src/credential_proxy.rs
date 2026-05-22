@@ -107,69 +107,29 @@ async fn handle_credential_proxy_inner(
         Vec::new()
     };
 
-    let phantom_token = extract_phantom_token(&req_envelope.headers, &handshake.provider_id);
+    let resolved = validate_and_resolve(handshake, &req_envelope, phantom_registry).await;
 
-    let provider_id = if let Some(ref pt) = phantom_token {
-        phantom_registry
-            .lock()
-            .await
-            .lookup(&handshake.container_name, pt)
-            .map(String::from)
-    } else {
-        None
-    };
-
-    let Some(resolved_provider_id) = provider_id else {
-        warn!(
-            "Credential proxy: unknown phantom token from {} for provider {}",
-            handshake.container_name, handshake.provider_id
-        );
-        let error_resp = HttpResponseEnvelope {
-            status: 403,
-            headers: vec![],
-        };
-        write_response_envelope(writer, &error_resp).await?;
+    let Some((cred, phantom_token)) = resolved else {
+        write_response_envelope(
+            writer,
+            &HttpResponseEnvelope {
+                status: 403,
+                headers: vec![],
+            },
+        )
+        .await?;
         write_body_end(writer).await?;
         return Ok(());
     };
 
-    if resolved_provider_id != handshake.provider_id {
-        warn!(
-            "Credential proxy: provider mismatch (handshake={}, resolved={})",
-            handshake.provider_id, resolved_provider_id
-        );
-        let error_resp = HttpResponseEnvelope {
-            status: 403,
-            headers: vec![],
-        };
-        write_response_envelope(writer, &error_resp).await?;
-        write_body_end(writer).await?;
-        return Ok(());
-    }
-
-    let meta = build_provider_meta(&req_envelope.headers, &handshake.provider_id);
-    let credential = credential_resolver::resolve_credential(&resolved_provider_id, &meta);
-
-    let Some(cred) = credential else {
-        warn!(
-            "Credential proxy: failed to resolve credential for provider {}",
-            handshake.provider_id
-        );
-        let error_resp = HttpResponseEnvelope {
-            status: 502,
-            headers: vec![(
-                "x-cella-error".to_string(),
-                "credential-unavailable".to_string(),
-            )],
-        };
-        write_response_envelope(writer, &error_resp).await?;
-        write_body_end(writer).await?;
-        return Ok(());
-    };
-
-    let pt = phantom_token.unwrap_or_default();
-    let upstream_resp =
-        make_upstream_request(&req_envelope, &body, &handshake.domain, &cred, &pt).await?;
+    let upstream_resp = make_upstream_request(
+        &req_envelope,
+        &body,
+        &handshake.domain,
+        &cred,
+        &phantom_token,
+    )
+    .await?;
 
     let status = stream_upstream_response(upstream_resp, writer).await?;
 
@@ -179,6 +139,44 @@ async fn handle_credential_proxy_inner(
     );
 
     Ok(())
+}
+
+async fn validate_and_resolve(
+    handshake: &cella_protocol::CredentialProxyHandshake,
+    req_envelope: &HttpRequestEnvelope,
+    phantom_registry: &Arc<Mutex<PhantomRegistry>>,
+) -> Option<(ResolvedCredential, String)> {
+    let phantom_token = extract_phantom_token(&req_envelope.headers, &handshake.provider_id)?;
+
+    let provider_id = phantom_registry
+        .lock()
+        .await
+        .lookup(&handshake.container_name, &phantom_token)
+        .map(String::from)?;
+
+    if provider_id != handshake.provider_id {
+        warn!(
+            "Credential proxy: provider mismatch (handshake={}, resolved={provider_id})",
+            handshake.provider_id,
+        );
+        return None;
+    }
+
+    let meta = phantom_registry
+        .lock()
+        .await
+        .get_provider_meta(&handshake.container_name, &provider_id)
+        .map_or_else(
+            || build_provider_meta(&req_envelope.headers, &handshake.provider_id),
+            |m| ProviderMeta {
+                env_var: m.env_var.clone(),
+                header: m.header.clone(),
+                prefix: m.prefix.clone(),
+            },
+        );
+
+    let cred = credential_resolver::resolve_credential(&provider_id, &meta)?;
+    Some((cred, phantom_token))
 }
 
 async fn stream_upstream_response(

@@ -327,6 +327,15 @@ pub fn load_shell_preferred(labels: &std::collections::HashMap<String, String>) 
 /// then detects keys that are present on the host, enabled in config,
 /// and not already set by the user (via `remoteEnv` / `containerEnv`).
 pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<String, String>) {
+    // Credential protection: inject phantom tokens from daemon, not real keys.
+    if labels
+        .get("dev.cella.credential_protect")
+        .is_some_and(|v| v == "true")
+    {
+        append_phantom_ai_keys(env, labels);
+        return;
+    }
+
     // Fast path: skip settings I/O when no AI key env vars exist on the host.
     if !cella_env::ai_keys::any_ai_key_present() {
         return;
@@ -359,6 +368,53 @@ pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<
         cella_env::ai_keys::detect_ai_keys(&|id| ai.is_provider_enabled(id), &existing_keys);
     for (key, value) in ai_keys {
         env.push(format!("{key}={value}"));
+    }
+}
+
+fn append_phantom_ai_keys(
+    env: &mut Vec<String>,
+    labels: &std::collections::HashMap<String, String>,
+) {
+    let Some(container_name) = labels.get("dev.cella.container_name") else {
+        return;
+    };
+
+    let phantom_tokens = query_daemon_phantom_tokens(container_name);
+    if phantom_tokens.is_empty() {
+        tracing::debug!("Credential protection active but no phantom tokens from daemon");
+        return;
+    }
+
+    for (env_var, phantom_value) in phantom_tokens {
+        env.push(format!("{env_var}={phantom_value}"));
+    }
+}
+
+fn query_daemon_phantom_tokens(container_name: &str) -> std::collections::HashMap<String, String> {
+    use cella_env::paths::cella_data_dir;
+
+    let Some(data_dir) = cella_data_dir() else {
+        return std::collections::HashMap::new();
+    };
+    let socket_path = data_dir.join("daemon.sock");
+    if !socket_path.exists() {
+        return std::collections::HashMap::new();
+    }
+
+    let req = cella_protocol::ManagementRequest::GetPhantomTokens {
+        container_name: container_name.to_string(),
+    };
+
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return std::collections::HashMap::new();
+    };
+
+    let result = rt
+        .block_on(async { cella_daemon_client::send_management_request(&socket_path, &req).await });
+
+    match result {
+        Ok(cella_protocol::ManagementResponse::PhantomTokenValues { tokens }) => tokens,
+        _ => std::collections::HashMap::new(),
     }
 }
 

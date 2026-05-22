@@ -7,8 +7,8 @@ use tracing::{debug, info, warn};
 
 use cella_backend::agent::restart_agent_in_container;
 use cella_backend::{
-    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
-    LifecycleContext, MountConfig, agent_env_vars, container_labels,
+    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, FileToUpload,
+    ImageDetails, LifecycleContext, MountConfig, agent_env_vars, container_labels,
 };
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
@@ -728,6 +728,98 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
+    async fn setup_credential_protection(
+        &self,
+        container_id: &str,
+        settings: &cella_config::CellaConfig,
+        remote_user: &str,
+    ) {
+        let phantom_set = crate::credential_protect::generate_phantom_tokens(settings);
+
+        if phantom_set.entries.is_empty() {
+            tracing::debug!("Credential protection enabled but no providers detected");
+            return;
+        }
+
+        let socket_path = cella_env::paths::cella_data_dir()
+            .map(|d| d.join("daemon.sock"))
+            .unwrap_or_default();
+
+        let container_name = self.config.container_name.to_string();
+        let registered = crate::credential_protect::register_with_daemon(
+            &socket_path,
+            &container_name,
+            &phantom_set.entries,
+        )
+        .await;
+
+        if !registered {
+            tracing::warn!("Phantom token registration failed, falling back to unprotected mode");
+            if settings.credentials.gh {
+                crate::container_setup::seed_gh_credentials(
+                    self.client,
+                    container_id,
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                )
+                .await;
+            }
+            return;
+        }
+
+        if settings.credentials.gh {
+            if let Some(ref gh_phantom) = phantom_set.gh_phantom {
+                if let Some(gh_creds) = cella_env::gh_credential::prepare_gh_credentials_phantom(
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                    gh_phantom,
+                ) {
+                    let config_dir = cella_env::gh_credential::gh_config_dir_for_user(remote_user);
+                    let files: Vec<FileToUpload> = gh_creds
+                        .file_uploads
+                        .iter()
+                        .map(|f| FileToUpload {
+                            path: f.container_path.clone(),
+                            content: f.content.clone(),
+                            mode: f.mode,
+                        })
+                        .collect();
+                    let _ = self
+                        .client
+                        .exec_command(
+                            container_id,
+                            &ExecOptions {
+                                cmd: vec![
+                                    "sh".to_string(),
+                                    "-c".to_string(),
+                                    format!("mkdir -p {config_dir} && chmod 700 {config_dir}"),
+                                ],
+                                user: Some("root".to_string()),
+                                env: None,
+                                working_dir: None,
+                            },
+                        )
+                        .await;
+                    let _ = self.client.upload_files(container_id, &files).await;
+                    tracing::debug!("Seeded phantom gh credentials into container");
+                }
+            } else {
+                crate::container_setup::seed_gh_credentials(
+                    self.client,
+                    container_id,
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                )
+                .await;
+            }
+        }
+
+        tracing::info!(
+            "Credential protection active: {} providers protected",
+            phantom_set.entries.len()
+        );
+    }
+
     fn build_labels(
         &self,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
@@ -1032,26 +1124,30 @@ impl EnsureUpContext<'_> {
 
         crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
 
-        if settings.credentials.gh {
-            crate::container_setup::seed_gh_credentials(
-                self.client,
-                container_id,
-                &self.config.resolved.workspace_root,
-                remote_user,
-            )
-            .await;
-        }
+        if settings.credentials.protect {
+            self.setup_credential_protection(container_id, settings, remote_user)
+                .await;
+        } else {
+            if settings.credentials.gh {
+                crate::container_setup::seed_gh_credentials(
+                    self.client,
+                    container_id,
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                )
+                .await;
+            }
 
-        // Log detected AI API keys (names only, never values)
-        if settings.credentials.ai.enabled {
-            let ai = &settings.credentials.ai;
-            let detected =
-                cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
-            if !detected.is_empty() {
-                tracing::debug!(
-                    "AI API keys detected for exec/shell forwarding: {}",
-                    detected.join(", ")
-                );
+            if settings.credentials.ai.enabled {
+                let ai = &settings.credentials.ai;
+                let detected =
+                    cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
+                if !detected.is_empty() {
+                    tracing::debug!(
+                        "AI API keys detected for exec/shell forwarding: {}",
+                        detected.join(", ")
+                    );
+                }
             }
         }
 

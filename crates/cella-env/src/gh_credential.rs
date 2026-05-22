@@ -69,6 +69,55 @@ pub fn prepare_gh_credentials(
     })
 }
 
+/// Prepare gh credential files with a phantom token instead of a real OAuth token.
+///
+/// Writes a `hosts.yml` containing the phantom UUID as `oauth_token`.
+/// The real token is resolved by the daemon at proxy time.
+pub fn prepare_gh_credentials_phantom(
+    workspace_root: &Path,
+    remote_user: &str,
+    phantom_token: &str,
+) -> Option<GhCredentialForwarding> {
+    let hostnames = github_hostnames_from_remotes(workspace_root);
+    let hostnames = if hostnames.is_empty() {
+        vec!["github.com".to_string()]
+    } else {
+        hostnames
+    };
+
+    let hosts_yml = build_phantom_hosts_yml(&hostnames, phantom_token);
+    let config_dir = gh_config_dir_for_user(remote_user);
+
+    let mut uploads = vec![FileUpload {
+        container_path: format!("{config_dir}/hosts.yml"),
+        content: hosts_yml.into_bytes(),
+        mode: 0o600,
+    }];
+
+    if let Some(config_yml) = read_host_gh_config() {
+        uploads.push(FileUpload {
+            container_path: format!("{config_dir}/config.yml"),
+            content: config_yml.into_bytes(),
+            mode: 0o600,
+        });
+    }
+
+    Some(GhCredentialForwarding {
+        file_uploads: uploads,
+    })
+}
+
+fn build_phantom_hosts_yml(hostnames: &[String], phantom_token: &str) -> String {
+    use std::fmt::Write;
+    let mut yaml = String::new();
+    for hostname in hostnames {
+        let _ = writeln!(yaml, "{hostname}:");
+        let _ = writeln!(yaml, "    oauth_token: {phantom_token}");
+        let _ = writeln!(yaml, "    git_protocol: https");
+    }
+    yaml
+}
+
 /// Container-side gh config directory for a given user.
 pub fn gh_config_dir_for_user(remote_user: &str) -> String {
     if remote_user == "root" {
