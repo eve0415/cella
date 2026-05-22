@@ -12,7 +12,7 @@ mod tools;
 pub use ai_credentials::AiCredentials;
 pub use claude_code::ClaudeCode;
 pub use codex::Codex;
-pub use credentials::Credentials;
+pub use credentials::{Credentials, CustomCredentialProvider};
 pub use gemini::Gemini;
 pub use network::Network;
 pub use nvim::Nvim;
