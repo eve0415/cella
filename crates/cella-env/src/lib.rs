@@ -8,6 +8,7 @@ pub mod ai_keys;
 pub mod ca_bundle;
 pub mod claude_code;
 pub mod codex;
+pub mod credential_providers;
 mod error;
 pub mod gemini;
 pub mod gh_credential;
