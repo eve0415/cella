@@ -36,6 +36,7 @@ pub async fn check_docker(ctx: &CheckContext) -> CategoryReport {
     }
 
     checks.push(check_docker_cli().await);
+    checks.push(check_engine_version().await);
     checks.push(check_buildx().await);
     checks.push(check_compose().await);
 
@@ -142,6 +143,87 @@ async fn check_compose() -> CheckResult {
                 "Install Docker Compose V2: https://docs.docker.com/compose/install/".into(),
             ),
         },
+    }
+}
+
+/// Check Docker Engine version for security-relevant thresholds.
+///
+/// - >= 29.0: default seccomp profile blocks AF_ALG (CVE-2026-31431 mitigation)
+/// - >= 29.3.1: CVE-2026-34040 AuthZ bypass fixed
+async fn check_engine_version() -> CheckResult {
+    let output = tokio::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return CheckResult {
+            name: "engine version".into(),
+            severity: Severity::Warning,
+            detail: "could not query Docker Engine version".into(),
+            fix_hint: Some("Is Docker running?".into()),
+        };
+    };
+
+    if !output.status.success() {
+        return CheckResult {
+            name: "engine version".into(),
+            severity: Severity::Warning,
+            detail: "docker version command failed".into(),
+            fix_hint: None,
+        };
+    }
+
+    let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parts: Vec<u32> = version_str
+        .split('.')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    let (major, minor, patch) = match parts.as_slice() {
+        [maj, min, pat, ..] => (*maj, *min, *pat),
+        [maj, min] => (*maj, *min, 0),
+        [maj] => (*maj, 0, 0),
+        _ => {
+            return CheckResult {
+                name: "engine version".into(),
+                severity: Severity::Info,
+                detail: format!("Docker Engine {version_str} (could not parse)"),
+                fix_hint: None,
+            };
+        }
+    };
+
+    if major >= 29 && (major > 29 || minor > 3 || (minor == 3 && patch >= 1)) {
+        return CheckResult {
+            name: "engine version".into(),
+            severity: Severity::Pass,
+            detail: format!("Docker Engine {version_str}"),
+            fix_hint: None,
+        };
+    }
+
+    if major >= 29 {
+        return CheckResult {
+            name: "engine version".into(),
+            severity: Severity::Warning,
+            detail: format!(
+                "Docker Engine {version_str} — upgrade to 29.3.1+ \
+                 (CVE-2026-34040: AuthZ bypass via oversized requests)"
+            ),
+            fix_hint: Some("Update Docker Engine to 29.3.1+".into()),
+        };
+    }
+
+    CheckResult {
+        name: "engine version".into(),
+        severity: Severity::Warning,
+        detail: format!(
+            "Docker Engine {version_str} — upgrade to 29+ \
+             (default seccomp profile does not block AF_ALG; \
+             credential protection benefits from 29+ hardening)"
+        ),
+        fix_hint: Some("Update Docker Engine to 29+".into()),
     }
 }
 
