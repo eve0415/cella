@@ -98,6 +98,7 @@ pub(crate) async fn run_management_server(
             task_manager: crate::task_manager::new_shared(),
             cella_bin: crate::control_server::resolve_cella_binary(),
             tunnel_broker: ctx.tunnel_broker.clone(),
+            phantom_registry: ctx.phantom_registry.clone(),
             is_orbstack: ctx.is_orbstack,
             hostname_route_table: ctx.hostname_route_table.clone(),
         };

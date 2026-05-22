@@ -37,6 +37,7 @@ pub(crate) struct ControlContext {
     /// that in-container `cargo build` cannot clobber it via the bind mount.
     pub cella_bin: std::path::PathBuf,
     pub tunnel_broker: Arc<TunnelBroker>,
+    pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
     pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
 }
@@ -127,6 +128,22 @@ async fn handle_incoming_connection(
 
     if let Ok(tunnel_hs) = serde_json::from_str::<TunnelHandshake>(trimmed) {
         handle_tunnel_connection(tunnel_hs, reader, writer, ctx).await;
+        return Ok(());
+    }
+
+    if let Ok(cred_hs) = serde_json::from_str::<cella_protocol::CredentialProxyHandshake>(trimmed) {
+        if cred_hs.auth_token != ctx.auth_token {
+            warn!("Credential proxy connection rejected: invalid auth token");
+            send_reject(&mut writer, "invalid auth token".to_string()).await;
+            return Ok(());
+        }
+        let _ = crate::credential_proxy::handle_credential_proxy(
+            cred_hs,
+            reader,
+            writer,
+            &ctx.phantom_registry,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2904,6 +2921,7 @@ mod tests {
             task_manager: crate::task_manager::new_shared(),
             cella_bin: std::path::PathBuf::from("/nonexistent"),
             tunnel_broker: Arc::new(TunnelBroker::new()),
+            phantom_registry: Arc::new(Mutex::new(crate::phantom_registry::PhantomRegistry::new())),
             is_orbstack: false,
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
