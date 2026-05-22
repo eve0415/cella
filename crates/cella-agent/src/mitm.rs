@@ -266,6 +266,18 @@ async fn handle_request(
     config: &AgentProxyConfig,
     sender: &Mutex<UpstreamSender>,
 ) -> Result<Response<BoxBody>, std::convert::Infallible> {
+    if let Some(route) = config.credential_route_for_domain(host)
+        && let (Some(addr), Some(token), Some(name)) = (
+            &config.daemon_addr,
+            &config.daemon_token,
+            &config.container_name,
+        )
+    {
+        return Ok(
+            super::credential_tunnel::tunnel_request(req, host, route, addr, token, name).await,
+        );
+    }
+
     let path = super::forward_proxy::strip_query(req.uri().path());
     let verdict = config.matcher.evaluate(host, path);
 

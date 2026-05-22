@@ -126,10 +126,11 @@ async fn handle_connect(
         return;
     };
 
+    let is_credential_domain = config.credential_route_for_domain(&host).is_some();
     let needs_path_inspection = config.matcher.domain_needs_path_inspection(&host);
     let has_mitm = config.ca_cert_pem.is_some() && config.ca_key_pem.is_some();
 
-    if needs_path_inspection && has_mitm {
+    if (is_credential_domain || needs_path_inspection) && has_mitm {
         // Domain has path-level rules and MITM is available — allow the CONNECT
         // and defer the actual allow/block decision to the MITM path where we
         // can inspect request paths.
