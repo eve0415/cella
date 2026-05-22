@@ -175,6 +175,46 @@ async fn sync_gh(
     Ok(())
 }
 
+fn print_settings_section(
+    cwd: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let resolved = cella_config::devcontainer::resolve::config(cwd, None).ok();
+    let settings = cella_config::CellaConfig::load(cwd, resolved.as_ref())?;
+    eprintln!();
+    eprintln!("Settings:");
+    eprintln!(
+        "  credentials.gh = {} ({})",
+        settings.credentials.gh,
+        if settings.credentials.gh {
+            "auto-forward"
+        } else {
+            "disabled"
+        }
+    );
+    eprintln!(
+        "  credentials.protect = {} ({})",
+        settings.credentials.protect,
+        if settings.credentials.protect {
+            "phantom tokens active"
+        } else {
+            "real credentials forwarded"
+        }
+    );
+    if !settings.credentials.providers.is_empty() {
+        eprintln!(
+            "  custom providers: {}",
+            settings
+                .credentials
+                .providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 async fn run_status(
     args: StatusArgs,
     backend: &crate::backend::BackendArgs,
@@ -200,26 +240,12 @@ async fn run_status(
         eprintln!("  gh CLI: not authenticated");
     }
 
-    // Config section
     let cwd = if let Some(ref wf) = args.workspace_folder {
         wf.canonicalize().unwrap_or_else(|_| wf.clone())
     } else {
         std::env::current_dir()?
     };
-
-    let resolved = cella_config::devcontainer::resolve::config(&cwd, None).ok();
-    let settings = cella_config::CellaConfig::load(&cwd, resolved.as_ref())?;
-    eprintln!();
-    eprintln!("Settings:");
-    eprintln!(
-        "  credentials.gh = {} ({})",
-        settings.credentials.gh,
-        if settings.credentials.gh {
-            "auto-forward"
-        } else {
-            "disabled"
-        }
-    );
+    print_settings_section(&cwd)?;
 
     // Container section
     let client = backend.resolve_client().await?;
@@ -263,6 +289,14 @@ async fn run_status(
                 eprintln!("  gh credentials: present ({config_dir}/hosts.yml)");
             } else {
                 eprintln!("  gh credentials: not found");
+            }
+
+            let is_protected = container
+                .labels
+                .get("dev.cella.credential_protect")
+                .is_some_and(|v| v == "true");
+            if is_protected {
+                eprintln!("  credential protection: active");
             }
         }
         Err(e) => {
