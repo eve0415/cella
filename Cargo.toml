@@ -151,6 +151,9 @@ syn = { version = "=2.0.117", features = ["full"] }
 quote = "=1.0.45"
 proc-macro2 = "=1.0.106"
 
+# UUID generation (phantom tokens)
+uuid = { version = "=1.23.1", features = ["v4"] }
+
 # Testing
 tempfile = "=3.27.0"
 filetime = "=0.2.29"

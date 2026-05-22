@@ -230,7 +230,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let ctx = ManagementContext {
+    let ctx = build_management_context(
         last_activity,
         port_manager,
         browser_handler,
@@ -245,9 +245,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         ssh_proxy_manager,
         container_handles,
         tunnel_broker,
-        hostname_route_table: hostname_proxy.route_table,
-        hostname_proxy: hostname_proxy.status,
-    };
+        hostname_proxy,
+    );
 
     // Run the management server (CLI protocol) — blocks until shutdown
     let result = run_management_server(socket_path, ctx, shutdown_rx, control_listener).await;
@@ -271,6 +270,51 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     }
 
     result
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_management_context(
+    last_activity: Arc<AtomicU64>,
+    port_manager: Arc<tokio::sync::Mutex<PortManager>>,
+    browser_handler: Arc<BrowserHandler>,
+    clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
+    proxy_cmd_tx: tokio::sync::mpsc::Sender<crate::proxy::ProxyCommand>,
+    start_time: std::time::Instant,
+    is_orbstack: bool,
+    daemon_started_at: u64,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    auth_token: String,
+    control_port: u16,
+    ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
+    container_handles: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, crate::control_server::ContainerHandle>,
+        >,
+    >,
+    tunnel_broker: Arc<TunnelBroker>,
+    hostname_proxy: HostnameProxyRuntime,
+) -> ManagementContext {
+    ManagementContext {
+        last_activity,
+        port_manager,
+        browser_handler,
+        clipboard_handler,
+        proxy_cmd_tx,
+        start_time,
+        is_orbstack,
+        daemon_started_at,
+        shutdown_tx,
+        auth_token,
+        control_port,
+        ssh_proxy_manager,
+        container_handles,
+        tunnel_broker,
+        hostname_route_table: hostname_proxy.route_table,
+        hostname_proxy: hostname_proxy.status,
+        phantom_registry: Arc::new(tokio::sync::Mutex::new(
+            crate::phantom_registry::PhantomRegistry::new(),
+        )),
+    }
 }
 
 /// Generate a hex-encoded random auth token.
