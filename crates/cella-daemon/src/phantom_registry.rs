@@ -12,6 +12,7 @@ pub struct StoredProviderMeta {
     pub env_var: String,
     pub header: String,
     pub prefix: String,
+    pub domains: Vec<String>,
 }
 
 /// Registry of phantom tokens across all credential-protected containers.
@@ -53,6 +54,7 @@ impl PhantomRegistry {
                     env_var: entry.env_var.clone(),
                     header: entry.header.clone(),
                     prefix: entry.prefix.clone(),
+                    domains: entry.domains.clone(),
                 },
             );
         }
@@ -98,6 +100,14 @@ impl PhantomRegistry {
         self.meta.get(container_name)?.get(provider_id)
     }
 
+    /// Get registered domains for a provider in a container.
+    pub fn provider_domains(&self, container_name: &str, provider_id: &str) -> Option<&[String]> {
+        self.meta
+            .get(container_name)?
+            .get(provider_id)
+            .map(|m| m.domains.as_slice())
+    }
+
     /// Remove all phantom tokens for a container.
     pub fn remove_container(&mut self, container_name: &str) {
         self.forward.remove(container_name);
@@ -129,7 +139,7 @@ mod tests {
                 provider_id: "anthropic".to_string(),
                 phantom_token: "pt-aaa".to_string(),
                 env_var: "ANTHROPIC_API_KEY".to_string(),
-                domain: "api.anthropic.com".to_string(),
+                domains: vec!["api.anthropic.com".to_string()],
                 header: "x-api-key".to_string(),
                 prefix: String::new(),
             },
@@ -137,7 +147,7 @@ mod tests {
                 provider_id: "openai".to_string(),
                 phantom_token: "pt-bbb".to_string(),
                 env_var: "OPENAI_API_KEY".to_string(),
-                domain: "api.openai.com".to_string(),
+                domains: vec!["api.openai.com".to_string()],
                 header: "Authorization".to_string(),
                 prefix: "Bearer ".to_string(),
             },
@@ -214,7 +224,7 @@ mod tests {
             provider_id: "github".to_string(),
             phantom_token: "pt-ccc".to_string(),
             env_var: "GH_TOKEN".to_string(),
-            domain: "api.github.com".to_string(),
+            domains: vec!["github.com".to_string(), "api.github.com".to_string()],
             header: "Authorization".to_string(),
             prefix: "token ".to_string(),
         }];

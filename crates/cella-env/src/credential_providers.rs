@@ -5,15 +5,15 @@
 //! in cella.toml are merged at runtime.
 
 /// A credential provider that maps a host-side secret to an HTTP header
-/// injection on a specific domain.
+/// injection on one or more domains.
 #[derive(Debug, Clone)]
 pub struct CredentialProvider {
     /// Short identifier (e.g., `"anthropic"`, `"github"`).
     pub id: &'static str,
     /// Host environment variable holding the real credential.
     pub env_var: &'static str,
-    /// API domain this provider protects.
-    pub domain: &'static str,
+    /// API domains this provider protects.
+    pub domains: &'static [&'static str],
     /// HTTP header name for injection.
     pub header: &'static str,
     /// Header value prefix (e.g., `"Bearer "`).
@@ -25,84 +25,84 @@ pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
     CredentialProvider {
         id: "github",
         env_var: "GH_TOKEN",
-        domain: "api.github.com",
+        domains: &["github.com", "api.github.com"],
         header: "Authorization",
         prefix: "token ",
     },
     CredentialProvider {
         id: "anthropic",
         env_var: "ANTHROPIC_API_KEY",
-        domain: "api.anthropic.com",
+        domains: &["api.anthropic.com"],
         header: "x-api-key",
         prefix: "",
     },
     CredentialProvider {
         id: "openai",
         env_var: "OPENAI_API_KEY",
-        domain: "api.openai.com",
+        domains: &["api.openai.com"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "gemini",
         env_var: "GEMINI_API_KEY",
-        domain: "generativelanguage.googleapis.com",
+        domains: &["generativelanguage.googleapis.com"],
         header: "x-goog-api-key",
         prefix: "",
     },
     CredentialProvider {
         id: "groq",
         env_var: "GROQ_API_KEY",
-        domain: "api.groq.com",
+        domains: &["api.groq.com"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "mistral",
         env_var: "MISTRAL_API_KEY",
-        domain: "api.mistral.ai",
+        domains: &["api.mistral.ai"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "deepseek",
         env_var: "DEEPSEEK_API_KEY",
-        domain: "api.deepseek.com",
+        domains: &["api.deepseek.com"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "xai",
         env_var: "XAI_API_KEY",
-        domain: "api.x.ai",
+        domains: &["api.x.ai"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "fireworks",
         env_var: "FIREWORKS_API_KEY",
-        domain: "api.fireworks.ai",
+        domains: &["api.fireworks.ai"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "together",
         env_var: "TOGETHER_API_KEY",
-        domain: "api.together.xyz",
+        domains: &["api.together.xyz"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "perplexity",
         env_var: "PERPLEXITY_API_KEY",
-        domain: "api.perplexity.ai",
+        domains: &["api.perplexity.ai"],
         header: "Authorization",
         prefix: "Bearer ",
     },
     CredentialProvider {
         id: "cohere",
         env_var: "COHERE_API_KEY",
-        domain: "api.cohere.com",
+        domains: &["api.cohere.com"],
         header: "Authorization",
         prefix: "Bearer ",
     },
@@ -113,7 +113,7 @@ pub const CREDENTIAL_PROVIDERS: &[CredentialProvider] = &[
 pub struct MergedProvider {
     pub id: String,
     pub env_var: String,
-    pub domain: String,
+    pub domains: Vec<String>,
     pub header: String,
     pub prefix: String,
 }
@@ -123,7 +123,7 @@ impl From<&CredentialProvider> for MergedProvider {
         Self {
             id: p.id.to_string(),
             env_var: p.env_var.to_string(),
-            domain: p.domain.to_string(),
+            domains: p.domains.iter().map(|&d| d.to_string()).collect(),
             header: p.header.to_string(),
             prefix: p.prefix.to_string(),
         }
@@ -155,7 +155,7 @@ pub fn merge_with_custom(custom: &[CustomProviderInput<'_>]) -> Vec<MergedProvid
         result.push(MergedProvider {
             id: c.name.to_string(),
             env_var: c.env.to_string(),
-            domain: c.domain.to_string(),
+            domains: vec![c.domain.to_string()],
             header: c.header.to_string(),
             prefix: c.prefix.to_string(),
         });
@@ -169,7 +169,9 @@ pub fn provider_for_domain<'a>(
     providers: &'a [MergedProvider],
     domain: &str,
 ) -> Option<&'a MergedProvider> {
-    providers.iter().find(|p| p.domain == domain)
+    providers
+        .iter()
+        .find(|p| p.domains.iter().any(|d| d == domain))
 }
 
 #[cfg(test)]
@@ -193,7 +195,9 @@ mod tests {
     fn unique_domains() {
         let mut seen = std::collections::HashSet::new();
         for p in CREDENTIAL_PROVIDERS {
-            assert!(seen.insert(p.domain), "duplicate domain: {}", p.domain);
+            for d in p.domains {
+                assert!(seen.insert(d), "duplicate domain: {d}");
+            }
         }
     }
 
@@ -211,7 +215,7 @@ mod tests {
             .iter()
             .find(|p| p.id == "github")
             .unwrap();
-        assert_eq!(gh.domain, "api.github.com");
+        assert_eq!(gh.domains, &["github.com", "api.github.com"]);
         assert_eq!(gh.header, "Authorization");
         assert_eq!(gh.prefix, "token ");
     }
@@ -222,7 +226,7 @@ mod tests {
             .iter()
             .find(|p| p.id == "anthropic")
             .unwrap();
-        assert_eq!(p.domain, "api.anthropic.com");
+        assert_eq!(p.domains, &["api.anthropic.com"]);
         assert_eq!(p.header, "x-api-key");
         assert_eq!(p.prefix, "");
     }
@@ -259,7 +263,7 @@ mod tests {
         let merged = merge_with_custom(&custom);
         assert_eq!(merged.len(), CREDENTIAL_PROVIDERS.len());
         let anthropic = merged.iter().find(|p| p.id == "anthropic").unwrap();
-        assert_eq!(anthropic.domain, "custom-anthropic.corp");
+        assert_eq!(anthropic.domains, vec!["custom-anthropic.corp"]);
         assert_eq!(anthropic.env_var, "MY_ANTHROPIC_KEY");
     }
 

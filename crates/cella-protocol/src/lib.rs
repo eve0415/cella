@@ -38,7 +38,7 @@ pub struct PhantomTokenEntry {
     pub provider_id: String,
     pub phantom_token: String,
     pub env_var: String,
-    pub domain: String,
+    pub domains: Vec<String>,
     /// HTTP header name for credential injection.
     #[serde(default)]
     pub header: String,
@@ -1786,7 +1786,7 @@ mod tests {
             provider_id: "anthropic".to_string(),
             phantom_token: "pt-550e8400-e29b-41d4-a716-446655440000".to_string(),
             env_var: "ANTHROPIC_API_KEY".to_string(),
-            domain: "api.anthropic.com".to_string(),
+            domains: vec!["api.anthropic.com".to_string()],
             header: "x-api-key".to_string(),
             prefix: String::new(),
         };
@@ -1804,7 +1804,7 @@ mod tests {
                 provider_id: "anthropic".to_string(),
                 phantom_token: "pt-abc".to_string(),
                 env_var: "ANTHROPIC_API_KEY".to_string(),
-                domain: "api.anthropic.com".to_string(),
+                domains: vec!["api.anthropic.com".to_string()],
                 header: "x-api-key".to_string(),
                 prefix: String::new(),
             }],

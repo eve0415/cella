@@ -60,7 +60,7 @@ fn build_entry(provider: &MergedProvider, phantom_token: String) -> PhantomToken
         provider_id: provider.id.clone(),
         phantom_token,
         env_var: provider.env_var.clone(),
-        domain: provider.domain.clone(),
+        domains: provider.domains.clone(),
         header: provider.header.clone(),
         prefix: provider.prefix.clone(),
     }
@@ -105,14 +105,21 @@ pub async fn register_with_daemon(
 }
 
 /// Build credential route configs from phantom token entries.
+///
+/// Generates one route per domain per provider, so multi-domain providers
+/// (e.g. GitHub with `github.com` + `api.github.com`) get separate routes.
 pub fn build_credential_routes(
     entries: &[PhantomTokenEntry],
 ) -> Vec<cella_env::proxy::CredentialRouteConfig> {
     entries
         .iter()
-        .map(|e| cella_env::proxy::CredentialRouteConfig {
-            domain: e.domain.clone(),
-            provider_id: e.provider_id.clone(),
+        .flat_map(|e| {
+            e.domains
+                .iter()
+                .map(move |domain| cella_env::proxy::CredentialRouteConfig {
+                    domain: domain.clone(),
+                    provider_id: e.provider_id.clone(),
+                })
         })
         .collect()
 }
@@ -141,7 +148,7 @@ mod tests {
         let provider = MergedProvider {
             id: "anthropic".to_string(),
             env_var: "ANTHROPIC_API_KEY".to_string(),
-            domain: "api.anthropic.com".to_string(),
+            domains: vec!["api.anthropic.com".to_string()],
             header: "x-api-key".to_string(),
             prefix: String::new(),
         };
@@ -158,7 +165,7 @@ mod tests {
             provider_id: "anthropic".to_string(),
             phantom_token: "pt-abc".to_string(),
             env_var: "ANTHROPIC_API_KEY".to_string(),
-            domain: "api.anthropic.com".to_string(),
+            domains: vec!["api.anthropic.com".to_string()],
             header: "x-api-key".to_string(),
             prefix: String::new(),
         }];
@@ -166,6 +173,23 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].domain, "api.anthropic.com");
         assert_eq!(routes[0].provider_id, "anthropic");
+    }
+
+    #[test]
+    fn build_credential_routes_expands_multi_domain() {
+        let entries = vec![PhantomTokenEntry {
+            provider_id: "github".to_string(),
+            phantom_token: "pt-gh".to_string(),
+            env_var: "GH_TOKEN".to_string(),
+            domains: vec!["github.com".to_string(), "api.github.com".to_string()],
+            header: "Authorization".to_string(),
+            prefix: "token ".to_string(),
+        }];
+        let routes = build_credential_routes(&entries);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].domain, "github.com");
+        assert_eq!(routes[1].domain, "api.github.com");
+        assert!(routes.iter().all(|r| r.provider_id == "github"));
     }
 
     #[test]
