@@ -33,13 +33,19 @@ pub fn generate_phantom_tokens(settings: &cella_config::CellaConfig) -> PhantomT
     let mut entries = Vec::new();
     let mut gh_phantom = None;
 
+    let ai = &settings.credentials.ai;
+
     for provider in &providers {
         if provider.id == "github" {
-            if cella_env::gh_credential::gh_is_authenticated() {
+            if settings.credentials.gh && cella_env::gh_credential::gh_is_authenticated() {
                 let token = format!("pt-{}", uuid::Uuid::new_v4());
                 gh_phantom = Some(token.clone());
                 entries.push(build_entry(provider, token));
             }
+            continue;
+        }
+
+        if !ai.enabled || !ai.is_provider_enabled(&provider.id) {
             continue;
         }
 
