@@ -754,16 +754,10 @@ impl EnsureUpContext<'_> {
         .await;
 
         if !registered {
-            tracing::warn!("Phantom token registration failed, falling back to unprotected mode");
-            if settings.credentials.gh {
-                crate::container_setup::seed_gh_credentials(
-                    self.client,
-                    container_id,
-                    &self.config.resolved.workspace_root,
-                    remote_user,
-                )
-                .await;
-            }
+            tracing::warn!(
+                "Phantom token registration failed — credentials will be unavailable \
+                 (credential protection does not fall back to real credentials)"
+            );
             return;
         }
 
@@ -1296,14 +1290,11 @@ impl EnsureUpContext<'_> {
         // direct passthrough, but disable blocking rules (which require the
         // agent-side proxy that won't be provisioned).
         let managed_agent = self.client.capabilities().managed_agent;
+        let needs_proxy = (has_rules || settings.credentials.protect) && managed_agent;
         let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
             proxy: net_config.proxy.clone(),
-            has_blocking_rules: has_rules && managed_agent,
-            full_config: if has_rules && managed_agent {
-                Some(net_config)
-            } else {
-                None
-            },
+            has_blocking_rules: needs_proxy,
+            full_config: if needs_proxy { Some(net_config) } else { None },
             container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
         });
         let mut env_fwd =
@@ -1317,6 +1308,18 @@ impl EnsureUpContext<'_> {
                 .post_start
                 .git_config_commands
                 .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
+        }
+
+        if settings.credentials.protect && managed_agent {
+            let phantom_set = crate::credential_protect::generate_phantom_tokens(&settings);
+            if !phantom_set.entries.is_empty() {
+                let routes =
+                    crate::credential_protect::build_credential_routes(&phantom_set.entries);
+                let daemon_info = crate::credential_protect::read_daemon_connection_info();
+                if let Some(daemon) = daemon_info {
+                    crate::credential_protect::patch_proxy_config(&mut env_fwd, &routes, &daemon);
+                }
+            }
         }
 
         let mut labels = self.build_labels(

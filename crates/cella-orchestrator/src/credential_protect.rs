@@ -124,6 +124,40 @@ pub fn build_credential_routes(
         .collect()
 }
 
+/// Read daemon control connection info (addr + token) for credential proxying.
+pub fn read_daemon_connection_info() -> Option<cella_env::proxy::DaemonConnectionInfo> {
+    let data_dir = cella_env::paths::cella_data_dir()?;
+    let control_path = data_dir.join("daemon.control");
+    let content = std::fs::read_to_string(&control_path).ok()?;
+    let mut lines = content.lines();
+    let port: u16 = lines.next()?.parse().ok()?;
+    let token = lines.next()?.to_string();
+    Some(cella_env::proxy::DaemonConnectionInfo {
+        addr: format!("127.0.0.1:{port}"),
+        token,
+        container_name: String::new(),
+    })
+}
+
+/// Inject credential routes into the proxy config file upload.
+pub fn patch_proxy_config(
+    env_fwd: &mut cella_env::EnvForwarding,
+    routes: &[cella_env::proxy::CredentialRouteConfig],
+    daemon: &cella_env::proxy::DaemonConnectionInfo,
+) {
+    let proxy_config_path = cella_env::PROXY_CONFIG_PATH;
+    if let Some(upload) = env_fwd
+        .post_start
+        .file_uploads
+        .iter_mut()
+        .find(|f| f.container_path == proxy_config_path)
+    {
+        let base_json = String::from_utf8_lossy(&upload.content);
+        let patched = cella_env::proxy::inject_credential_routes(&base_json, routes, daemon);
+        upload.content = patched.into_bytes();
+    }
+}
+
 /// Add the credential protection label to container labels.
 pub fn add_protect_label<S: std::hash::BuildHasher>(
     labels: &mut HashMap<String, String, S>,
