@@ -14,6 +14,8 @@ use tracing::{info, warn};
 use crate::credential_resolver::{self, ProviderMeta, ResolvedCredential};
 use crate::phantom_registry::PhantomRegistry;
 
+const MAX_BODY_LEN: u32 = 256 * 1024 * 1024;
+
 /// JSON envelope for an HTTP request sent through the credential tunnel.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct HttpRequestEnvelope {
@@ -28,21 +30,6 @@ pub struct HttpRequestEnvelope {
 pub struct HttpResponseEnvelope {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-}
-
-/// Provider metadata needed by the proxy to resolve and inject credentials.
-#[derive(Debug, Clone)]
-pub struct ProxyProviderMeta {
-    pub env_var: String,
-    pub header: String,
-    pub prefix: String,
-    pub domain: String,
-}
-
-/// Shared state for credential proxy connections.
-pub struct CredentialProxyContext {
-    pub phantom_registry: Arc<Mutex<PhantomRegistry>>,
-    pub providers: Arc<Mutex<std::collections::HashMap<String, ProxyProviderMeta>>>,
 }
 
 /// Handle a credential proxy connection after the handshake has been parsed.
@@ -93,6 +80,15 @@ async fn handle_credential_proxy_inner(
         serde_json::from_str(req_line.trim()).map_err(|e| crate::CellaDaemonError::Protocol {
             message: format!("credential proxy: invalid request envelope: {e}"),
         })?;
+
+    if req_envelope.body_len > MAX_BODY_LEN {
+        return Err(crate::CellaDaemonError::Protocol {
+            message: format!(
+                "credential proxy: body_len {} exceeds limit {MAX_BODY_LEN}",
+                req_envelope.body_len
+            ),
+        });
+    }
 
     let body = if req_envelope.body_len > 0 {
         let mut buf = vec![0u8; req_envelope.body_len as usize];
@@ -146,11 +142,21 @@ async fn validate_and_resolve(
     req_envelope: &HttpRequestEnvelope,
     phantom_registry: &Arc<Mutex<PhantomRegistry>>,
 ) -> Option<(ResolvedCredential, String)> {
-    let phantom_token = extract_phantom_token(&req_envelope.headers, &handshake.provider_id)?;
+    let registry = phantom_registry.lock().await;
 
-    let provider_id = phantom_registry
-        .lock()
-        .await
+    let header_name = registry
+        .get_provider_meta(&handshake.container_name, &handshake.provider_id)
+        .map(|m| m.header.clone())
+        .unwrap_or_else(|| {
+            cella_env::credential_providers::CREDENTIAL_PROVIDERS
+                .iter()
+                .find(|p| p.id == handshake.provider_id)
+                .map_or("Authorization".to_string(), |p| p.header.to_string())
+        });
+
+    let phantom_token = extract_phantom_token(&req_envelope.headers, &header_name)?;
+
+    let provider_id = registry
         .lookup(&handshake.container_name, &phantom_token)
         .map(String::from)?;
 
@@ -162,12 +168,24 @@ async fn validate_and_resolve(
         return None;
     }
 
-    let meta = phantom_registry
-        .lock()
-        .await
+    if let Some(domains) = registry.provider_domains(&handshake.container_name, &provider_id) {
+        if !domains.iter().any(|d| d == &handshake.domain) {
+            warn!(
+                "Credential proxy: domain {} not registered for provider {provider_id} (allowed: {domains:?})",
+                handshake.domain
+            );
+            return None;
+        }
+    }
+
+    let meta = registry
         .get_provider_meta(&handshake.container_name, &provider_id)
         .map_or_else(
-            || build_provider_meta(&req_envelope.headers, &handshake.provider_id),
+            || ProviderMeta {
+                env_var: format!("{}_API_KEY", provider_id.to_uppercase()),
+                header: header_name.clone(),
+                prefix: String::new(),
+            },
             |m| ProviderMeta {
                 env_var: m.env_var.clone(),
                 header: m.header.clone(),
@@ -175,7 +193,14 @@ async fn validate_and_resolve(
             },
         );
 
-    let cred = credential_resolver::resolve_credential(&provider_id, &meta)?;
+    let hostname = registry
+        .provider_domains(&handshake.container_name, &provider_id)
+        .and_then(|d| d.first())
+        .cloned()
+        .unwrap_or_else(|| "github.com".to_string());
+    drop(registry);
+
+    let cred = credential_resolver::resolve_credential(&provider_id, &meta, &hostname).await?;
     Some((cred, phantom_token))
 }
 
@@ -214,13 +239,7 @@ async fn stream_upstream_response(
     Ok(status)
 }
 
-fn extract_phantom_token(headers: &[(String, String)], provider_id: &str) -> Option<String> {
-    let header_name = match provider_id {
-        "anthropic" => "x-api-key",
-        "gemini" => "x-goog-api-key",
-        _ => "authorization",
-    };
-
+fn extract_phantom_token(headers: &[(String, String)], header_name: &str) -> Option<String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(header_name))
@@ -232,33 +251,6 @@ fn extract_phantom_token(headers: &[(String, String)], provider_id: &str) -> Opt
                 .unwrap_or(v)
                 .to_string()
         })
-}
-
-fn build_provider_meta(headers: &[(String, String)], provider_id: &str) -> ProviderMeta {
-    use cella_env::credential_providers::CREDENTIAL_PROVIDERS;
-
-    if let Some(builtin) = CREDENTIAL_PROVIDERS.iter().find(|p| p.id == provider_id) {
-        return ProviderMeta {
-            env_var: builtin.env_var.to_string(),
-            header: builtin.header.to_string(),
-            prefix: builtin.prefix.to_string(),
-        };
-    }
-
-    let header_name = headers
-        .iter()
-        .find(|(k, _)| {
-            k.eq_ignore_ascii_case("authorization")
-                || k.eq_ignore_ascii_case("x-api-key")
-                || k.eq_ignore_ascii_case("x-goog-api-key")
-        })
-        .map_or_else(|| "Authorization".to_string(), |(k, _)| k.clone());
-
-    ProviderMeta {
-        env_var: format!("{}_API_KEY", provider_id.to_uppercase()),
-        header: header_name,
-        prefix: String::new(),
-    }
 }
 
 async fn make_upstream_request(
@@ -388,44 +380,28 @@ mod tests {
     #[test]
     fn extract_phantom_token_bearer() {
         let headers = vec![("Authorization".to_string(), "Bearer pt-abc".to_string())];
-        let token = extract_phantom_token(&headers, "openai");
+        let token = extract_phantom_token(&headers, "Authorization");
         assert_eq!(token.as_deref(), Some("pt-abc"));
     }
 
     #[test]
     fn extract_phantom_token_xapikey() {
         let headers = vec![("x-api-key".to_string(), "pt-def".to_string())];
-        let token = extract_phantom_token(&headers, "anthropic");
+        let token = extract_phantom_token(&headers, "x-api-key");
         assert_eq!(token.as_deref(), Some("pt-def"));
     }
 
     #[test]
     fn extract_phantom_token_github() {
         let headers = vec![("Authorization".to_string(), "token pt-ghi".to_string())];
-        let token = extract_phantom_token(&headers, "github");
+        let token = extract_phantom_token(&headers, "Authorization");
         assert_eq!(token.as_deref(), Some("pt-ghi"));
     }
 
     #[test]
     fn extract_phantom_token_missing() {
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
-        let token = extract_phantom_token(&headers, "anthropic");
+        let token = extract_phantom_token(&headers, "x-api-key");
         assert!(token.is_none());
-    }
-
-    #[test]
-    fn build_provider_meta_builtin() {
-        let headers = vec![];
-        let meta = build_provider_meta(&headers, "anthropic");
-        assert_eq!(meta.env_var, "ANTHROPIC_API_KEY");
-        assert_eq!(meta.header, "x-api-key");
-        assert_eq!(meta.prefix, "");
-    }
-
-    #[test]
-    fn build_provider_meta_unknown_provider() {
-        let headers = vec![("x-custom-key".to_string(), "val".to_string())];
-        let meta = build_provider_meta(&headers, "custom_provider");
-        assert_eq!(meta.env_var, "CUSTOM_PROVIDER_API_KEY");
     }
 }

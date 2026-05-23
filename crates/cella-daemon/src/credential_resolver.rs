@@ -4,8 +4,6 @@
 //! For AI providers, reads the host environment variable live.
 //! For GitHub, invokes `gh auth token`.
 
-use std::process::Command;
-
 /// A resolved credential ready for HTTP header injection.
 #[derive(Debug, Clone)]
 pub struct ResolvedCredential {
@@ -24,9 +22,13 @@ pub struct ProviderMeta {
 ///
 /// Returns `None` if the credential is unavailable (env var unset,
 /// gh CLI not authenticated, etc.).
-pub fn resolve_credential(provider_id: &str, meta: &ProviderMeta) -> Option<ResolvedCredential> {
+pub async fn resolve_credential(
+    provider_id: &str,
+    meta: &ProviderMeta,
+    hostname: &str,
+) -> Option<ResolvedCredential> {
     let raw_value = if provider_id == "github" {
-        resolve_github_token()
+        resolve_github_token(hostname).await
     } else {
         std::env::var(&meta.env_var).ok().filter(|v| !v.is_empty())
     }?;
@@ -39,10 +41,11 @@ pub fn resolve_credential(provider_id: &str, meta: &ProviderMeta) -> Option<Reso
     })
 }
 
-fn resolve_github_token() -> Option<String> {
-    Command::new("gh")
-        .args(["auth", "token", "-h", "github.com"])
+async fn resolve_github_token(hostname: &str) -> Option<String> {
+    tokio::process::Command::new("gh")
+        .args(["auth", "token", "-h", hostname])
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -55,8 +58,8 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn resolve_from_env_var() {
+    #[tokio::test]
+    async fn resolve_from_env_var() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -71,7 +74,7 @@ mod tests {
             prefix: "Bearer ".to_string(),
         };
 
-        let result = resolve_credential("anthropic", &meta);
+        let result = resolve_credential("anthropic", &meta, "api.anthropic.com").await;
         assert!(result.is_some());
         let cred = result.unwrap();
         assert_eq!(cred.header_name, "Authorization");
@@ -83,8 +86,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_missing_env_var() {
+    #[tokio::test]
+    async fn resolve_missing_env_var() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -99,11 +102,15 @@ mod tests {
             prefix: String::new(),
         };
 
-        assert!(resolve_credential("openai", &meta).is_none());
+        assert!(
+            resolve_credential("openai", &meta, "api.openai.com")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
-    fn resolve_empty_env_var() {
+    #[tokio::test]
+    async fn resolve_empty_env_var() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -118,7 +125,11 @@ mod tests {
             prefix: String::new(),
         };
 
-        assert!(resolve_credential("test", &meta).is_none());
+        assert!(
+            resolve_credential("test", &meta, "example.com")
+                .await
+                .is_none()
+        );
 
         #[allow(unsafe_code)]
         unsafe {
@@ -126,8 +137,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_no_prefix() {
+    #[tokio::test]
+    async fn resolve_no_prefix() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -142,7 +153,9 @@ mod tests {
             prefix: String::new(),
         };
 
-        let cred = resolve_credential("test", &meta).unwrap();
+        let cred = resolve_credential("test", &meta, "example.com")
+            .await
+            .unwrap();
         assert_eq!(cred.header_value, "raw-key");
 
         #[allow(unsafe_code)]

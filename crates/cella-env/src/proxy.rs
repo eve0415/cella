@@ -127,6 +127,9 @@ pub fn inject_credential_routes(
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(base_json) else {
         return base_json.to_string();
     };
+    if !json.is_object() {
+        return base_json.to_string();
+    }
 
     let route_values: Vec<serde_json::Value> = routes
         .iter()
