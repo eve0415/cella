@@ -146,13 +146,15 @@ async fn validate_and_resolve(
 
     let header_name = registry
         .get_provider_meta(&handshake.container_name, &handshake.provider_id)
-        .map(|m| m.header.clone())
-        .unwrap_or_else(|| {
-            cella_env::credential_providers::CREDENTIAL_PROVIDERS
-                .iter()
-                .find(|p| p.id == handshake.provider_id)
-                .map_or("Authorization".to_string(), |p| p.header.to_string())
-        });
+        .map_or_else(
+            || {
+                cella_env::credential_providers::CREDENTIAL_PROVIDERS
+                    .iter()
+                    .find(|p| p.id == handshake.provider_id)
+                    .map_or_else(|| "Authorization".to_string(), |p| p.header.to_string())
+            },
+            |m| m.header.clone(),
+        );
 
     let phantom_token = extract_phantom_token(&req_envelope.headers, &header_name)?;
 
@@ -168,14 +170,14 @@ async fn validate_and_resolve(
         return None;
     }
 
-    if let Some(domains) = registry.provider_domains(&handshake.container_name, &provider_id) {
-        if !domains.iter().any(|d| d == &handshake.domain) {
-            warn!(
-                "Credential proxy: domain {} not registered for provider {provider_id} (allowed: {domains:?})",
-                handshake.domain
-            );
-            return None;
-        }
+    if let Some(domains) = registry.provider_domains(&handshake.container_name, &provider_id)
+        && !domains.iter().any(|d| d == &handshake.domain)
+    {
+        warn!(
+            "Credential proxy: domain {} not registered for provider {provider_id} (allowed: {domains:?})",
+            handshake.domain
+        );
+        return None;
     }
 
     let meta = registry

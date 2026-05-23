@@ -800,7 +800,7 @@ mod tests {
     // ── append_ai_keys ─────────────────────────────────────────────
 
     /// Serialize tests that mutate the process environment.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn append_ai_keys_skips_without_workspace_label() {
@@ -828,9 +828,7 @@ mod tests {
     #[tokio::test]
     #[allow(unsafe_code)]
     async fn append_ai_keys_forwards_host_key() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         unsafe { std::env::set_var("COHERE_API_KEY", "test-cohere") };
 
         let tmp = std::env::temp_dir();
@@ -852,9 +850,7 @@ mod tests {
     #[tokio::test]
     #[allow(unsafe_code)]
     async fn append_ai_keys_skips_existing_override() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         unsafe { std::env::set_var("OPENAI_API_KEY", "host-key") };
 
         let tmp = std::env::temp_dir();
@@ -880,9 +876,7 @@ mod tests {
     #[tokio::test]
     #[allow(unsafe_code)]
     async fn append_ai_keys_respects_config_disables() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         unsafe { std::env::set_var("OPENAI_API_KEY", "host-key") };
 
         let workspace = std::env::temp_dir().join(format!(

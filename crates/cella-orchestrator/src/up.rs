@@ -1327,7 +1327,7 @@ impl EnsureUpContext<'_> {
         );
 
         if settings.credentials.protect {
-            crate::credential_protect::add_protect_label(&mut labels, &self.config.container_name);
+            crate::credential_protect::add_protect_label(&mut labels, self.config.container_name);
         }
 
         let subst_ctx = crate::subst_ctx(self.config.resolved);

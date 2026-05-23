@@ -56,13 +56,11 @@ async fn resolve_github_token(hostname: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn resolve_from_env_var() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("TEST_CRED_RESOLVE_KEY", "sk-test-123");
@@ -88,9 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_missing_env_var() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("TEST_CRED_MISSING_KEY");
@@ -111,9 +107,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_empty_env_var() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("TEST_CRED_EMPTY_KEY", "");
@@ -139,9 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_no_prefix() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK.lock().await;
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("TEST_CRED_NOPREFIX", "raw-key");
