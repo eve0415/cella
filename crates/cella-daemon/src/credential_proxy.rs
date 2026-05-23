@@ -105,7 +105,7 @@ async fn handle_credential_proxy_inner(
 
     let resolved = validate_and_resolve(handshake, &req_envelope, phantom_registry).await;
 
-    let Some((cred, phantom_token)) = resolved else {
+    let Some(cred) = resolved else {
         write_response_envelope(
             writer,
             &HttpResponseEnvelope {
@@ -118,14 +118,8 @@ async fn handle_credential_proxy_inner(
         return Ok(());
     };
 
-    let upstream_resp = make_upstream_request(
-        &req_envelope,
-        &body,
-        &handshake.domain,
-        &cred,
-        &phantom_token,
-    )
-    .await?;
+    let upstream_resp =
+        make_upstream_request(&req_envelope, &body, &handshake.domain, &cred).await?;
 
     let status = stream_upstream_response(upstream_resp, writer).await?;
 
@@ -141,7 +135,7 @@ async fn validate_and_resolve(
     handshake: &cella_protocol::CredentialProxyHandshake,
     req_envelope: &HttpRequestEnvelope,
     phantom_registry: &Arc<Mutex<PhantomRegistry>>,
-) -> Option<(ResolvedCredential, String)> {
+) -> Option<ResolvedCredential> {
     let registry = phantom_registry.lock().await;
 
     let stored_meta = registry.get_provider_meta(&handshake.container_name, &handshake.provider_id);
@@ -170,9 +164,11 @@ async fn validate_and_resolve(
         return None;
     }
 
-    if let Some(domains) = registry.provider_domains(&handshake.container_name, &provider_id)
-        && !domains.iter().any(|d| d == &handshake.domain)
-    {
+    let Some(domains) = registry.provider_domains(&handshake.container_name, &provider_id) else {
+        warn!("Credential proxy: no registered domains for provider {provider_id}");
+        return None;
+    };
+    if !domains.iter().any(|d| d == &handshake.domain) {
         warn!(
             "Credential proxy: domain {} not registered for provider {provider_id} (allowed: {domains:?})",
             handshake.domain
@@ -199,8 +195,7 @@ async fn validate_and_resolve(
         .unwrap_or_else(|| handshake.domain.clone());
     drop(registry);
 
-    let cred = credential_resolver::resolve_credential(&provider_id, &meta, &hostname).await?;
-    Some((cred, phantom_token))
+    credential_resolver::resolve_credential(&provider_id, &meta, &hostname).await
 }
 
 async fn stream_upstream_response(
@@ -257,12 +252,16 @@ async fn make_upstream_request(
     body: &[u8],
     domain: &str,
     credential: &ResolvedCredential,
-    phantom_token: &str,
 ) -> Result<reqwest::Response, crate::CellaDaemonError> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
     let url = format!("https://{domain}{}", envelope.uri);
-    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default()
+    });
 
     let method: reqwest::Method = envelope.method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -275,11 +274,7 @@ async fn make_upstream_request(
         if key.eq_ignore_ascii_case("host") {
             continue;
         }
-        let clean_value = value.replace(phantom_token, "");
-        if clean_value.trim().is_empty() {
-            continue;
-        }
-        builder = builder.header(key.as_str(), clean_value);
+        builder = builder.header(key.as_str(), value.as_str());
     }
 
     builder = builder.header(&credential.header_name, &credential.header_value);
