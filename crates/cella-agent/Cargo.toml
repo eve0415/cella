@@ -31,6 +31,7 @@ http-body-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+tokio-stream = "=0.1.18"
 
 [dev-dependencies]
 tempfile.workspace = true

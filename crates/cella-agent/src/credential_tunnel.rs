@@ -1,9 +1,9 @@
 //! Agent-side credential tunnel relay.
 //!
 //! Connects to the daemon's credential proxy, sends the HTTP request
-//! envelope, and reads the response envelope + streamed body.
+//! envelope, and reads the response envelope + streamed body chunks.
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -13,6 +13,8 @@ use crate::proxy_config::CredentialRoute;
 
 type BoxBody =
     http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024;
 
 /// JSON envelope for an HTTP request sent through the credential tunnel.
 #[derive(Debug, serde::Serialize)]
@@ -63,10 +65,13 @@ async fn tunnel_request_inner(
 ) -> Result<hyper::Response<BoxBody>, Box<dyn std::error::Error + Send + Sync>> {
     let (parts, body) = req.into_parts();
 
-    let body_bytes = http_body_util::BodyExt::collect(body)
-        .await?
-        .to_bytes()
-        .to_vec();
+    let body_bytes = body.collect().await?.to_bytes().to_vec();
+
+    if body_bytes.len() > MAX_REQUEST_BODY {
+        return Ok(hyper::Response::builder()
+            .status(413)
+            .body(full("Request body too large"))?);
+    }
 
     let headers: Vec<(String, String)> = parts
         .headers
@@ -115,37 +120,46 @@ async fn tunnel_request_inner(
     reader.read_line(&mut resp_line).await?;
     let resp_envelope: HttpResponseEnvelope = serde_json::from_str(resp_line.trim())?;
 
-    let mut body_data = Vec::new();
-    loop {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let chunk_len = u32::from_be_bytes(len_buf) as usize;
-        if chunk_len == 0 {
-            break;
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
+    >(16);
+
+    tokio::spawn(async move {
+        loop {
+            let mut len_buf = [0u8; 4];
+            if reader.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let chunk_len = u32::from_be_bytes(len_buf) as usize;
+            if chunk_len == 0 {
+                break;
+            }
+            let mut chunk = vec![0u8; chunk_len];
+            if reader.read_exact(&mut chunk).await.is_err() {
+                break;
+            }
+            if tx
+                .send(Ok(hyper::body::Frame::data(Bytes::from(chunk))))
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
-        let mut chunk = vec![0u8; chunk_len];
-        reader.read_exact(&mut chunk).await?;
-        body_data.extend_from_slice(&chunk);
-    }
+    });
+
+    let body = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
 
     let mut builder = hyper::Response::builder().status(resp_envelope.status);
     for (key, value) in &resp_envelope.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }
 
-    Ok(builder.body(full_vec(body_data))?)
+    Ok(builder.body(body.boxed())?)
 }
 
 fn full(s: &str) -> BoxBody {
-    use http_body_util::BodyExt;
     Full::new(Bytes::from(s.to_string()))
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        .boxed()
-}
-
-fn full_vec(data: Vec<u8>) -> BoxBody {
-    use http_body_util::BodyExt;
-    Full::new(Bytes::from(data))
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         .boxed()
 }
