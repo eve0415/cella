@@ -389,6 +389,9 @@ async fn append_phantom_ai_keys(
     }
 
     for (env_var, phantom_value) in phantom_tokens {
+        if env.iter().any(|e| e.starts_with(&format!("{env_var}="))) {
+            continue;
+        }
         env.push(format!("{env_var}={phantom_value}"));
     }
 }

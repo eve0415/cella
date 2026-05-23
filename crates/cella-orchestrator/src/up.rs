@@ -741,9 +741,10 @@ impl EnsureUpContext<'_> {
             return;
         }
 
-        let socket_path = cella_env::paths::cella_data_dir()
-            .map(|d| d.join("daemon.sock"))
-            .unwrap_or_default();
+        let Some(socket_path) = cella_env::paths::daemon_socket_path() else {
+            tracing::warn!("Cannot determine daemon socket path, skipping credential protection");
+            return;
+        };
 
         let container_name = self.config.container_name.to_string();
         let registered = crate::credential_protect::register_with_daemon(
@@ -1311,15 +1312,11 @@ impl EnsureUpContext<'_> {
         }
 
         if settings.credentials.protect && managed_agent {
-            let phantom_set = crate::credential_protect::generate_phantom_tokens(&settings);
-            if !phantom_set.entries.is_empty() {
-                let routes =
-                    crate::credential_protect::build_credential_routes(&phantom_set.entries);
-                let daemon_info = crate::credential_protect::read_daemon_connection_info();
-                if let Some(daemon) = daemon_info {
-                    crate::credential_protect::patch_proxy_config(&mut env_fwd, &routes, &daemon);
-                }
-            }
+            crate::credential_protect::inject_routes_into_proxy_config(
+                &settings,
+                self.config.container_name,
+                &mut env_fwd,
+            );
         }
 
         let mut labels = self.build_labels(

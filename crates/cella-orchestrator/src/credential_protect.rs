@@ -131,7 +131,9 @@ pub fn build_credential_routes(
 }
 
 /// Read daemon control connection info (addr + token) for credential proxying.
-pub fn read_daemon_connection_info() -> Option<cella_env::proxy::DaemonConnectionInfo> {
+pub fn read_daemon_connection_info(
+    container_name: &str,
+) -> Option<cella_env::proxy::DaemonConnectionInfo> {
     let data_dir = cella_env::paths::cella_data_dir()?;
     let control_path = data_dir.join("daemon.control");
     let content = std::fs::read_to_string(&control_path).ok()?;
@@ -141,8 +143,25 @@ pub fn read_daemon_connection_info() -> Option<cella_env::proxy::DaemonConnectio
     Some(cella_env::proxy::DaemonConnectionInfo {
         addr: format!("127.0.0.1:{port}"),
         token,
-        container_name: String::new(),
+        container_name: container_name.to_string(),
     })
+}
+
+/// Generate phantom tokens and inject credential routes into the proxy config.
+pub fn inject_routes_into_proxy_config(
+    settings: &cella_config::CellaConfig,
+    container_name: &str,
+    env_fwd: &mut cella_env::EnvForwarding,
+) {
+    let phantom_set = generate_phantom_tokens(settings);
+    if phantom_set.entries.is_empty() {
+        return;
+    }
+    let routes = build_credential_routes(&phantom_set.entries);
+    let Some(daemon) = read_daemon_connection_info(container_name) else {
+        return;
+    };
+    patch_proxy_config(env_fwd, &routes, &daemon);
 }
 
 /// Inject credential routes into the proxy config file upload.

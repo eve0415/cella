@@ -136,7 +136,7 @@ async fn handle_connect(
         );
         let _ = client
             .get_mut()
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 59\r\n\r\nCredential protection requires TLS interception (no MITM).")
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 58\r\n\r\nCredential protection requires TLS interception (no MITM).")
             .await;
         return;
     }

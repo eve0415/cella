@@ -131,6 +131,7 @@ rustls = { version = "=0.23.40", default-features = false, features = ["ring", "
 rustls-native-certs = "=0.8.3"
 rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.4"
+tokio-stream = "=0.1.18"
 
 # HTTP proxy (MITM relay)
 hyper = { version = "=1.9.0", features = ["server", "client", "http1", "http2"] }

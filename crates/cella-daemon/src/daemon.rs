@@ -45,6 +45,12 @@ fn write_control_file(
             message: format!("failed to write daemon.control: {e}"),
         }
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            std::fs::set_permissions(&control_file_path, std::fs::Permissions::from_mode(0o600));
+    }
     info!("Control TCP server on 127.0.0.1:{control_port}");
     Ok(control_file_path)
 }
