@@ -311,9 +311,11 @@ fn build_management_context(
         tunnel_broker,
         hostname_route_table: hostname_proxy.route_table,
         hostname_proxy: hostname_proxy.status,
-        phantom_registry: Arc::new(tokio::sync::Mutex::new(
-            crate::phantom_registry::PhantomRegistry::new(),
-        )),
+        phantom_registry: {
+            let mut reg = crate::phantom_registry::PhantomRegistry::new();
+            reg.reclaim_from_state_file();
+            Arc::new(tokio::sync::Mutex::new(reg))
+        },
     }
 }
 

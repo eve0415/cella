@@ -5,6 +5,11 @@
 //! credential to inject for a given phantom token.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+use tracing::{info, warn};
+
+const PHANTOM_REGISTRY_SCHEMA_VERSION: u32 = 1;
 
 /// Stored provider metadata for credential resolution.
 #[derive(Debug, Clone)]
@@ -33,8 +38,17 @@ impl PhantomRegistry {
         Self::default()
     }
 
-    /// Register phantom tokens for a container.
+    /// Register phantom tokens for a container and persist to disk.
     pub fn register(
+        &mut self,
+        container_name: &str,
+        entries: &[cella_protocol::PhantomTokenEntry],
+    ) {
+        self.register_without_persist(container_name, entries);
+        self.persist_state();
+    }
+
+    fn register_without_persist(
         &mut self,
         container_name: &str,
         entries: &[cella_protocol::PhantomTokenEntry],
@@ -108,12 +122,13 @@ impl PhantomRegistry {
             .map(|m| m.domains.as_slice())
     }
 
-    /// Remove all phantom tokens for a container.
+    /// Remove all phantom tokens for a container and persist to disk.
     pub fn remove_container(&mut self, container_name: &str) {
         self.forward.remove(container_name);
         self.reverse.remove(container_name);
         self.env_vars.remove(container_name);
         self.meta.remove(container_name);
+        self.persist_state();
     }
 
     /// Number of containers with registered phantom tokens.
@@ -124,6 +139,136 @@ impl PhantomRegistry {
     /// Number of phantom tokens registered for a container.
     pub fn token_count(&self, container_name: &str) -> usize {
         self.forward.get(container_name).map_or(0, HashMap::len)
+    }
+
+    fn state_file_path() -> PathBuf {
+        cella_env::paths::cella_data_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/.cella"))
+            .join("phantom-registry.state")
+    }
+
+    pub fn persist_state(&self) {
+        let containers: serde_json::Map<String, serde_json::Value> = self
+            .forward
+            .keys()
+            .filter_map(|container_name| {
+                let forward = self.forward.get(container_name)?;
+                let meta = self.meta.get(container_name)?;
+
+                let tokens: Vec<serde_json::Value> = forward
+                    .iter()
+                    .filter_map(|(phantom_token, provider_id)| {
+                        let m = meta.get(provider_id)?;
+                        Some(serde_json::json!({
+                            "provider_id": provider_id,
+                            "phantom_token": phantom_token,
+                            "env_var": m.env_var,
+                            "domains": m.domains,
+                            "header": m.header,
+                            "prefix": m.prefix,
+                        }))
+                    })
+                    .collect();
+
+                Some((
+                    container_name.clone(),
+                    serde_json::json!({ "tokens": tokens }),
+                ))
+            })
+            .collect();
+
+        let snapshot = serde_json::json!({
+            "schema_version": PHANTOM_REGISTRY_SCHEMA_VERSION,
+            "daemon_pid": std::process::id(),
+            "written_at_unix_sec": crate::shared::current_time_secs(),
+            "containers": containers,
+        });
+
+        let path = Self::state_file_path();
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("phantom registry: state-file serialize failed: {e}");
+                return;
+            }
+        };
+
+        let tmp = path.with_extension("state.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            warn!("phantom registry: state-file write failed: {e}");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            warn!("phantom registry: state-file rename failed: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    pub fn reclaim_from_state_file(&mut self) {
+        let path = Self::state_file_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!("phantom registry: state-file read failed: {e}");
+                return;
+            }
+        };
+
+        let snapshot: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("phantom registry: state-file parse failed: {e}");
+                return;
+            }
+        };
+
+        let version = snapshot["schema_version"].as_u64().unwrap_or(0);
+        if version != u64::from(PHANTOM_REGISTRY_SCHEMA_VERSION) {
+            warn!("phantom registry: unknown schema version {version}, skipping");
+            return;
+        }
+
+        let Some(containers) = snapshot["containers"].as_object() else {
+            return;
+        };
+
+        for (container_name, data) in containers {
+            let Some(tokens) = data["tokens"].as_array() else {
+                continue;
+            };
+            let entries: Vec<cella_protocol::PhantomTokenEntry> = tokens
+                .iter()
+                .filter_map(|t| {
+                    Some(cella_protocol::PhantomTokenEntry {
+                        provider_id: t["provider_id"].as_str()?.to_string(),
+                        phantom_token: t["phantom_token"].as_str()?.to_string(),
+                        env_var: t["env_var"].as_str()?.to_string(),
+                        domains: t["domains"]
+                            .as_array()?
+                            .iter()
+                            .filter_map(|d| d.as_str().map(String::from))
+                            .collect(),
+                        header: t["header"].as_str().unwrap_or("Authorization").to_string(),
+                        prefix: t["prefix"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect();
+
+            if !entries.is_empty() {
+                self.register_without_persist(container_name, &entries);
+            }
+        }
+
+        info!(
+            "Reclaimed phantom registry: {} containers from state file",
+            self.container_count()
+        );
     }
 }
 
