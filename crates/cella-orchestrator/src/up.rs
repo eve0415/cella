@@ -790,9 +790,11 @@ impl EnsureUpContext<'_> {
                             container_id,
                             &ExecOptions {
                                 cmd: vec![
-                                    "sh".to_string(),
-                                    "-c".to_string(),
-                                    format!("mkdir -p {config_dir} && chmod 700 {config_dir}"),
+                                    "mkdir".to_string(),
+                                    "-p".to_string(),
+                                    "-m".to_string(),
+                                    "700".to_string(),
+                                    config_dir.clone(),
                                 ],
                                 user: Some("root".to_string()),
                                 env: None,
@@ -1317,12 +1319,16 @@ impl EnsureUpContext<'_> {
                 .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
         }
 
-        let labels = self.build_labels(
+        let mut labels = self.build_labels(
             resolved_features,
             base_image_details.metadata.as_deref(),
             &env_fwd,
             &remote_user,
         );
+
+        if settings.credentials.protect {
+            crate::credential_protect::add_protect_label(&mut labels, &self.config.container_name);
+        }
 
         let subst_ctx = crate::subst_ctx(self.config.resolved);
         let substituted_feature_config = resolved_features.map(|r| {

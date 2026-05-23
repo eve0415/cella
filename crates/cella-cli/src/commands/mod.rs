@@ -326,13 +326,16 @@ pub fn load_shell_preferred(labels: &std::collections::HashMap<String, String>) 
 /// Loads settings from the workspace path label on the container,
 /// then detects keys that are present on the host, enabled in config,
 /// and not already set by the user (via `remoteEnv` / `containerEnv`).
-pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<String, String>) {
+pub async fn append_ai_keys(
+    env: &mut Vec<String>,
+    labels: &std::collections::HashMap<String, String>,
+) {
     // Credential protection: inject phantom tokens from daemon, not real keys.
     if labels
         .get("dev.cella.credential_protect")
         .is_some_and(|v| v == "true")
     {
-        append_phantom_ai_keys(env, labels);
+        append_phantom_ai_keys(env, labels).await;
         return;
     }
 
@@ -371,7 +374,7 @@ pub fn append_ai_keys(env: &mut Vec<String>, labels: &std::collections::HashMap<
     }
 }
 
-fn append_phantom_ai_keys(
+async fn append_phantom_ai_keys(
     env: &mut Vec<String>,
     labels: &std::collections::HashMap<String, String>,
 ) {
@@ -379,7 +382,7 @@ fn append_phantom_ai_keys(
         return;
     };
 
-    let phantom_tokens = query_daemon_phantom_tokens(container_name);
+    let phantom_tokens = query_daemon_phantom_tokens(container_name).await;
     if phantom_tokens.is_empty() {
         tracing::debug!("Credential protection active but no phantom tokens from daemon");
         return;
@@ -390,7 +393,9 @@ fn append_phantom_ai_keys(
     }
 }
 
-fn query_daemon_phantom_tokens(container_name: &str) -> std::collections::HashMap<String, String> {
+async fn query_daemon_phantom_tokens(
+    container_name: &str,
+) -> std::collections::HashMap<String, String> {
     use cella_env::paths::cella_data_dir;
 
     let Some(data_dir) = cella_data_dir() else {
@@ -405,14 +410,7 @@ fn query_daemon_phantom_tokens(container_name: &str) -> std::collections::HashMa
         container_name: container_name.to_string(),
     };
 
-    let Ok(rt) = tokio::runtime::Handle::try_current() else {
-        return std::collections::HashMap::new();
-    };
-
-    let result = rt
-        .block_on(async { cella_daemon_client::send_management_request(&socket_path, &req).await });
-
-    match result {
+    match cella_daemon_client::send_management_request(&socket_path, &req).await {
         Ok(cella_protocol::ManagementResponse::PhantomTokenValues { tokens }) => tokens,
         _ => std::collections::HashMap::new(),
     }
@@ -804,38 +802,37 @@ mod tests {
     /// Serialize tests that mutate the process environment.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn append_ai_keys_skips_without_workspace_label() {
+    #[tokio::test]
+    async fn append_ai_keys_skips_without_workspace_label() {
         let labels = std::collections::HashMap::new();
         let mut env = Vec::new();
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
         assert!(
             env.is_empty(),
             "no keys should be forwarded without workspace label"
         );
     }
 
-    #[test]
-    fn append_ai_keys_skips_empty_workspace_label() {
+    #[tokio::test]
+    async fn append_ai_keys_skips_empty_workspace_label() {
         let mut labels = std::collections::HashMap::new();
         labels.insert("dev.cella.workspace_path".to_string(), "  ".to_string());
         let mut env = Vec::new();
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
         assert!(
             env.is_empty(),
             "no keys should be forwarded with empty workspace label"
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(unsafe_code)]
-    fn append_ai_keys_forwards_host_key() {
+    async fn append_ai_keys_forwards_host_key() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("COHERE_API_KEY", "test-cohere") };
 
-        // Use a temp dir that has no config files → default settings (all enabled)
         let tmp = std::env::temp_dir();
         let mut labels = std::collections::HashMap::new();
         labels.insert(
@@ -844,7 +841,7 @@ mod tests {
         );
 
         let mut env = Vec::new();
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
         assert!(
             env.iter().any(|e| e == "COHERE_API_KEY=test-cohere"),
             "host COHERE_API_KEY should be forwarded"
@@ -852,9 +849,9 @@ mod tests {
         unsafe { std::env::remove_var("COHERE_API_KEY") };
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(unsafe_code)]
-    fn append_ai_keys_skips_existing_override() {
+    async fn append_ai_keys_skips_existing_override() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -867,11 +864,9 @@ mod tests {
             tmp.to_string_lossy().to_string(),
         );
 
-        // Simulate a user override via remoteEnv/containerEnv
         let mut env = vec!["OPENAI_API_KEY=user-override".to_string()];
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
 
-        // Should still have exactly the original entry, not a duplicate
         let count = env
             .iter()
             .filter(|e| e.starts_with("OPENAI_API_KEY="))
@@ -882,9 +877,9 @@ mod tests {
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(unsafe_code)]
-    fn append_ai_keys_respects_config_disables() {
+    async fn append_ai_keys_respects_config_disables() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -906,7 +901,6 @@ mod tests {
             workspace.to_string_lossy().to_string(),
         );
 
-        // Global disable: [credentials.ai] enabled = false
         std::fs::write(
             devcontainer_dir.join("cella.toml"),
             "[credentials.ai]\nenabled = false\n",
@@ -914,13 +908,12 @@ mod tests {
         .expect("write disabled AI config");
 
         let mut env = Vec::new();
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
         assert!(
             !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
             "OPENAI_API_KEY should not be forwarded when [credentials.ai] enabled = false"
         );
 
-        // Per-provider disable: openai = false
         std::fs::write(
             devcontainer_dir.join("cella.toml"),
             "[credentials.ai]\nopenai = false\n",
@@ -928,7 +921,7 @@ mod tests {
         .expect("write provider-disabled AI config");
 
         let mut env = Vec::new();
-        append_ai_keys(&mut env, &labels);
+        append_ai_keys(&mut env, &labels).await;
         assert!(
             !env.iter().any(|e| e.starts_with("OPENAI_API_KEY=")),
             "OPENAI_API_KEY should not be forwarded when [credentials.ai] openai = false"

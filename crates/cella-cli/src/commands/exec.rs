@@ -284,7 +284,7 @@ async fn build_exec_env(
     };
     let mut env = base_env;
     ensure_ssh_auth_sock(client, &container.id, user, &mut env).await;
-    super::append_ai_keys(&mut env, &container.labels);
+    super::append_ai_keys(&mut env, &container.labels).await;
     for var in super::TERMINAL_ENV_VARS {
         if let Ok(val) = std::env::var(var) {
             env.push(format!("{var}={val}"));
