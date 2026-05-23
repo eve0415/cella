@@ -396,15 +396,9 @@ async fn append_phantom_ai_keys(
 async fn query_daemon_phantom_tokens(
     container_name: &str,
 ) -> std::collections::HashMap<String, String> {
-    use cella_env::paths::cella_data_dir;
-
-    let Some(data_dir) = cella_data_dir() else {
+    let Some(socket_path) = cella_env::paths::daemon_socket_path() else {
         return std::collections::HashMap::new();
     };
-    let socket_path = data_dir.join("daemon.sock");
-    if !socket_path.exists() {
-        return std::collections::HashMap::new();
-    }
 
     let req = cella_protocol::ManagementRequest::GetPhantomTokens {
         container_name: container_name.to_string(),

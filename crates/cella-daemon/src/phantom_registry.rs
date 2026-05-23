@@ -254,7 +254,7 @@ impl PhantomRegistry {
                             .iter()
                             .filter_map(|d| d.as_str().map(String::from))
                             .collect(),
-                        header: t["header"].as_str().unwrap_or("Authorization").to_string(),
+                        header: t["header"].as_str().unwrap_or_default().to_string(),
                         prefix: t["prefix"].as_str().unwrap_or("").to_string(),
                     })
                 })

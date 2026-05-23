@@ -65,7 +65,7 @@ async fn tunnel_request_inner(
 ) -> Result<hyper::Response<BoxBody>, Box<dyn std::error::Error + Send + Sync>> {
     let (parts, body) = req.into_parts();
 
-    let body_bytes = body.collect().await?.to_bytes().to_vec();
+    let body_bytes = body.collect().await?.to_bytes();
 
     if body_bytes.len() > MAX_REQUEST_BODY {
         return Ok(hyper::Response::builder()

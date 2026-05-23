@@ -144,17 +144,17 @@ async fn validate_and_resolve(
 ) -> Option<(ResolvedCredential, String)> {
     let registry = phantom_registry.lock().await;
 
-    let header_name = registry
-        .get_provider_meta(&handshake.container_name, &handshake.provider_id)
-        .map_or_else(
-            || {
-                cella_env::credential_providers::CREDENTIAL_PROVIDERS
-                    .iter()
-                    .find(|p| p.id == handshake.provider_id)
-                    .map_or_else(|| "Authorization".to_string(), |p| p.header.to_string())
-            },
-            |m| m.header.clone(),
-        );
+    let stored_meta = registry.get_provider_meta(&handshake.container_name, &handshake.provider_id);
+
+    let header_name = stored_meta.map_or_else(
+        || {
+            cella_env::credential_providers::CREDENTIAL_PROVIDERS
+                .iter()
+                .find(|p| p.id == handshake.provider_id)
+                .map_or_else(|| "Authorization".to_string(), |p| p.header.to_string())
+        },
+        |m| m.header.clone(),
+    );
 
     let phantom_token = extract_phantom_token(&req_envelope.headers, &header_name)?;
 
@@ -180,26 +180,23 @@ async fn validate_and_resolve(
         return None;
     }
 
-    let meta = registry
-        .get_provider_meta(&handshake.container_name, &provider_id)
-        .map_or_else(
-            || ProviderMeta {
-                env_var: format!("{}_API_KEY", provider_id.to_uppercase()),
-                header: header_name.clone(),
-                prefix: String::new(),
-            },
-            |m| ProviderMeta {
-                env_var: m.env_var.clone(),
-                header: m.header.clone(),
-                prefix: m.prefix.clone(),
-            },
-        );
+    let meta = stored_meta.map_or_else(
+        || ProviderMeta {
+            env_var: format!("{}_API_KEY", provider_id.to_uppercase()),
+            header: header_name.clone(),
+            prefix: String::new(),
+        },
+        |m| ProviderMeta {
+            env_var: m.env_var.clone(),
+            header: m.header.clone(),
+            prefix: m.prefix.clone(),
+        },
+    );
 
-    let hostname = registry
-        .provider_domains(&handshake.container_name, &provider_id)
-        .and_then(|d| d.first())
+    let hostname = stored_meta
+        .and_then(|m| m.domains.first())
         .cloned()
-        .unwrap_or_else(|| "github.com".to_string());
+        .unwrap_or_else(|| handshake.domain.clone());
     drop(registry);
 
     let cred = credential_resolver::resolve_credential(&provider_id, &meta, &hostname).await?;
@@ -262,8 +259,10 @@ async fn make_upstream_request(
     credential: &ResolvedCredential,
     phantom_token: &str,
 ) -> Result<reqwest::Response, crate::CellaDaemonError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
     let url = format!("https://{domain}{}", envelope.uri);
-    let client = reqwest::Client::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
 
     let method: reqwest::Method = envelope.method.parse().unwrap_or(reqwest::Method::GET);
 
