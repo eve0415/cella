@@ -53,21 +53,22 @@ A configuration adversary controls the project's `cella.toml` or `devcontainer.j
 | Container processes | Untrusted | Only see phantom tokens via environment variables |
 | Upstream APIs | External | TLS-protected; daemon is the HTTPS client |
 
-### In Scope / Out of Scope
+### Scope
 
-| In Scope (v1) | Out of Scope (v1) |
-|---|---|
-| Phantom token substitution for all built-in and approved custom providers | Credential **abuse** — using real keys via the daemon proxy for unauthorized purposes |
-| Daemon-side credential resolution with TTL cache | Rate limiting or policy-based access control on proxied requests |
-| Per-provider enable/disable toggles | Multi-account credential profiles |
-| Custom provider registration with user consent | `.env` file interception |
-| Per-container identity binding via nonce | Per-container credential scoping beyond provider-level |
-| Multiplexed credential tunnel | HTTP/2, HTTP/3, WebSocket upstream |
-| Streaming request and response bodies | Credential rotation or TTL-based phantom token renewal |
-| Structured JSONL audit logging | Browser-based OAuth flows |
-| State persistence with file locking | Vault/keychain credential sources |
+**In scope:**
 
-Credential abuse (a container using the daemon proxy to make excessive or unauthorized API calls with real credentials) is an acknowledged non-goal for v1. The system prevents credential *disclosure* — it does not prevent credential *use* through the authorized proxy channel. A policy engine for method/path/rate restrictions is planned as a future feature.
+- Phantom token substitution for all built-in and approved custom providers
+- Daemon-side credential resolution with TTL cache
+- Per-provider enable/disable toggles
+- Custom provider registration with user consent
+- Per-container identity binding via nonce
+- Multiplexed credential tunnel with streaming request and response bodies
+- Structured JSONL audit logging
+- State persistence with file locking and Docker API reconciliation
+
+**Non-goals:**
+
+Credential abuse (a container using the daemon proxy to make excessive or unauthorized API calls with real credentials) is an explicit non-goal. The system prevents credential *disclosure* — it does not prevent credential *use* through the authorized proxy channel. See [Extensions](#extensions) for a policy engine that addresses this.
 
 ### Security Invariants
 
@@ -886,9 +887,9 @@ Credential proxy requests are logged to a structured JSONL audit log for securit
 | 29.0 – 29.3.0 | Warning | CVE-2026-34040: AuthZ bypass via oversized requests. Upgrade to 29.3.1+. |
 | >= 29.3.1 | Pass | All known security-relevant patches applied. |
 
-## Future Architecture
+## Extensions
 
-This section describes architectural provisions for planned features. Each subsection defines the data model extension points and integration strategy without committing to implementation details.
+This section describes architectural extension points beyond the core credential protection system. Each subsection defines the data model changes and integration strategy.
 
 ### Multi-account Profiles
 
@@ -979,18 +980,13 @@ Fine-grained access control for credential proxy requests:
 - **Evaluation:** Every credential proxy request is checked against the policy before upstream dispatch. Denied requests return 403 with `policy_denied` category.
 - **Audit-only mode:** Policies can be set to `mode = "audit"` to log violations without blocking, enabling gradual rollout.
 
-## Limitations (v1)
+## Limitations
 
 1. `credentials.protect` defaults to `false` — opt-in only.
 2. `/proc/[pid]/environ` readability — phantom tokens injected as environment variables are readable by any process in the container with the same UID via `/proc`. This is an acceptable trade-off: phantom tokens are not real credentials, and a runtime adversary who can read `/proc` can already make HTTP requests through the MITM proxy.
-3. **Proxy bypass** — a container process can unset `HTTPS_PROXY`, use raw sockets, or connect directly to credential domains, bypassing the MITM proxy. Without network-level enforcement (future work), credential protection relies on the proxy being the path of least resistance, not a hard boundary.
+3. **Proxy bypass** — a container process can unset `HTTPS_PROXY`, use raw sockets, or connect directly to credential domains, bypassing the MITM proxy. Without network-level enforcement, credential protection relies on the proxy being the path of least resistance, not a hard boundary. See [Network-level Enforcement](#network-level-enforcement) for the iptables extension.
 4. Custom providers support a single domain per entry. Multi-domain custom providers require multiple `[[credentials.providers]]` entries with the same `name`.
-5. No HTTP/2, WebSocket, or non-standard port support for the credential tunnel or upstream requests.
-6. Phantom tokens are static for the lifetime of a container registration. No rotation or TTL.
-7. No audit log for credential usage beyond daemon tracing until the structured audit log is implemented.
-8. State file is not encrypted — relies on filesystem permissions (0600) for protection.
-9. No support for credentials stored in keychains, vaults, or secret managers (only env vars and `gh auth token`).
-10. `credentials.profile` is plumbed in config but has no consumer. Multi-account scoping is deferred.
-11. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
-12. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an acknowledged non-goal for v1.
-13. Network-level enforcement is not implemented — credential domain blocking via iptables/nftables is planned as a future feature.
+5. The credential tunnel uses HTTP/1.1 semantics over a custom framed protocol. HTTP/2, WebSocket, and non-standard port upstream connections are not supported. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade path.
+6. State file is not encrypted — relies on filesystem permissions (0600) for protection.
+7. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
+8. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an explicit non-goal. See [Policy Engine](#policy-engine) for the extension that addresses this.
