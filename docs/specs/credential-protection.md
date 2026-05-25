@@ -356,9 +356,9 @@ Multiple requests with different `request_id` values can be in flight simultaneo
 |---|---|---|
 | `Init` | `HANDSHAKE` | → `Handshaken` (or `Terminal` on validation failure) |
 | `Handshaken` | `REQUEST_ENVELOPE` | → `EnvelopeReceived` (or `Terminal` on validation failure) |
-| `EnvelopeReceived` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `CHUNK` → `Streaming`, `END` → `UpstreamPending`, `CANCEL` → `Terminal` |
-| `Streaming` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `END` → `UpstreamPending`, `CANCEL` → `Terminal` |
-| `UpstreamPending` | _(daemon processing)_ | → `Responding` (on `RESPONSE_ENVELOPE` sent) or `Terminal` (on error) |
+| `EnvelopeReceived` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `CHUNK` → `Streaming` (daemon opens upstream connection, forwards chunks as they arrive), `END` → `AwaitingResponse`, `CANCEL` → `Terminal` |
+| `Streaming` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `END` → `AwaitingResponse`, `CANCEL` → `Terminal` |
+| `AwaitingResponse` | `CANCEL` | → `Responding` (on `RESPONSE_ENVELOPE` sent), `CANCEL` → `Terminal`, or `Terminal` (on error) |
 | `Responding` | `CANCEL` | `RESPONSE_END` sent → `Terminal`, `CANCEL` → `Terminal` |
 | `Terminal` | _(none)_ | Request ID released; not reusable on this connection |
 
@@ -381,7 +381,7 @@ The `request_id` is not reusable on the same connection after cancellation. Canc
 **Connection lifecycle:**
 - **Idle timeout:** Connections with no in-flight requests for 5 minutes are closed by the daemon
 - **Reconnect:** On connection loss, all in-flight requests fail with 502 at the agent. The agent reconnects with exponential backoff (1s, 2s, 4s, max 30s)
-- **Daemon shutdown:** The daemon closes all credential tunnel connections. In-flight requests receive `ERROR` frames with category `upstream_error`
+- **Daemon shutdown:** The daemon closes all credential tunnel connections. In-flight requests receive `ERROR` frames with category `connection_closing`
 - **Nonce invalidation:** Re-registration generates a new nonce, invalidating the old connection. The agent must reconnect with the new nonce
 
 ### CredentialProxyHandshake
@@ -458,7 +458,7 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 |---|---|---|
 | `category` | `string` | Error category (see [Error Taxonomy](#error-taxonomy)) |
 | `message` | `string` | Human-readable diagnostic message. Never contains credentials or phantom tokens. |
-| `trace_id` | `string` | Trace ID from the handshake (for audit correlation) |
+| `trace_id` | `string?` | Trace ID from the handshake (for audit correlation). Null for pre-handshake errors (e.g. payload too large, concurrent limit exceeded). |
 
 **Error categories:**
 
@@ -474,6 +474,7 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 | `timeout` | Per-phase or total timeout exceeded |
 | `nonce_invalid` | Container nonce does not match the registered nonce |
 | `too_many_requests` | Concurrent request limit exceeded on this connection |
+| `connection_closing` | Daemon is shutting down or the tunnel connection is being closed |
 
 ### Resource Limits
 
@@ -625,15 +626,14 @@ When a container process makes an HTTP request to a credential domain (e.g. `api
    c. Verify handshake `provider_id` matches the resolved `provider_id`
    d. Verify `domain` is in the provider's registered domain list
    e. On failure: send `ERROR` frame, reject — no further frames accepted for this stream
-7. The agent streams the request body as `REQUEST_CHUNK` frames, ending with `REQUEST_END`
-8. The daemon resolves the real credential:
+7. The daemon resolves the real credential:
    a. Check the TTL cache for `(provider_id, domain)`
    b. On cache miss: read the host env var (or run `gh auth token -h <hostname>` for GitHub)
    c. On cache hit: use the cached value
    d. Store/refresh the cache entry with the configured TTL
-9. The daemon strips the phantom token auth header and injects the real credential header
-10. The daemon opens the upstream connection and streams request body chunks to upstream as they arrive (no full buffering)
-11. The daemon makes the upstream HTTPS request (no redirect following)
+8. The daemon strips the phantom token auth header, injects the real credential header, and opens the upstream HTTPS connection (no redirect following)
+9. The agent streams the request body as `REQUEST_CHUNK` frames — the daemon forwards each chunk to the upstream connection as it arrives (no full buffering)
+10. The agent sends `REQUEST_END`; the daemon finishes sending the upstream request body
 12. The daemon streams the response back via `RESPONSE_ENVELOPE`, `RESPONSE_CHUNK`, and `RESPONSE_END` frames
 13. The daemon writes an audit log entry at request completion (both success and failure paths)
 
@@ -704,7 +704,7 @@ Each container is authenticated by a per-container nonce rather than a global da
 
 Every credential proxy request passes through a four-step validation:
 
-1. **Token lookup** — The phantom token is extracted from the auth header (stripping `Bearer `, `bearer `, `token `, `Token ` prefixes, or using the raw value). Looked up in the registry by `(container_name, phantom_token)` → `provider_id`.
+1. **Token lookup** — The phantom token is extracted from the HTTP header specified by the provider's `header` field, stripping the provider's configured `prefix` (case-insensitive match). Only the configured header is checked; tokens in URLs or the request body are ignored. Looked up in the registry by `(container_name, phantom_token)` → `provider_id`.
 2. **Provider mismatch check** — The resolved `provider_id` must match the `provider_id` in the `CredentialProxyHandshake`. Prevents a container from using one provider's phantom token to access another provider's credential.
 3. **Domain verification** — The `domain` in the handshake must be in the provider's registered domain list. Prevents tunneling requests to arbitrary domains.
 4. **Credential resolution** — The real credential is resolved (cache lookup, then env var read or `gh auth token` on miss). If the credential is unavailable, the request fails.
