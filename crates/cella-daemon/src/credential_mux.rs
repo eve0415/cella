@@ -54,6 +54,10 @@ const FRAME_HEADER_SIZE: usize = 9;
 // ---------------------------------------------------------------------------
 
 /// States a single multiplexed request can be in.
+///
+/// The spec defines a `Responding` phase between `AwaitingResponse` and
+/// `Terminal`. Here, response streaming is handled entirely within the
+/// spawned upstream task, so `Responding` is collapsed into `AwaitingResponse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestPhase {
     Init,
@@ -221,6 +225,8 @@ async fn run_frame_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin + Send + 'st
                     debug!("Credential mux: idle timeout, closing connection");
                     break;
                 }
+                // Requests still in flight — reset timer to avoid busy-loop.
+                last_activity = tokio::time::Instant::now();
                 continue;
             }
         };
@@ -344,10 +350,18 @@ async fn dispatch_frame<W: AsyncWrite + Unpin + Send + 'static>(
             .await;
         }
         FRAME_REQUEST_ENVELOPE => {
-            process_envelope(request_id, payload, requests, writer, phantom_registry).await;
+            process_envelope(
+                request_id,
+                payload,
+                requests,
+                writer,
+                phantom_registry,
+                in_flight,
+            )
+            .await;
         }
         FRAME_REQUEST_CHUNK => {
-            process_chunk(request_id, payload, requests, writer).await;
+            process_chunk(request_id, payload, requests, writer, in_flight).await;
         }
         FRAME_REQUEST_END => {
             process_request_end(request_id, requests, writer, phantom_registry, in_flight).await;
@@ -475,6 +489,7 @@ async fn process_envelope<W: AsyncWrite + Unpin>(
     requests: &mut HashMap<u32, RequestState>,
     writer: &SharedWriter<W>,
     phantom_registry: &Arc<Mutex<PhantomRegistry>>,
+    in_flight: &Arc<AtomicUsize>,
 ) {
     let tid = trace_id_for(requests, request_id);
 
@@ -492,7 +507,7 @@ async fn process_envelope<W: AsyncWrite + Unpin>(
     if state.phase != RequestPhase::Handshaken {
         let msg = format!("unexpected REQUEST_ENVELOPE in state {:?}", state.phase);
         send_protocol_violation(writer, request_id, &msg, tid.as_deref()).await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -506,7 +521,7 @@ async fn process_envelope<W: AsyncWrite + Unpin>(
                 tid.as_deref(),
             )
             .await;
-            mark_terminal(state);
+            mark_terminal(state, in_flight);
             return;
         }
     };
@@ -519,7 +534,7 @@ async fn process_envelope<W: AsyncWrite + Unpin>(
             tid.as_deref(),
         )
         .await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -532,7 +547,7 @@ async fn process_envelope<W: AsyncWrite + Unpin>(
         validate_token_and_provider(handshake, &envelope, phantom_registry).await
     {
         write_error_frame(writer, request_id, &cat, &msg, tid.as_deref()).await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -623,6 +638,7 @@ async fn process_chunk<W: AsyncWrite + Unpin>(
     payload: &[u8],
     requests: &mut HashMap<u32, RequestState>,
     writer: &SharedWriter<W>,
+    in_flight: &Arc<AtomicUsize>,
 ) {
     let tid = trace_id_for(requests, request_id);
 
@@ -640,7 +656,7 @@ async fn process_chunk<W: AsyncWrite + Unpin>(
     if state.phase != RequestPhase::EnvelopeReceived && state.phase != RequestPhase::Streaming {
         let msg = format!("unexpected REQUEST_CHUNK in state {:?}", state.phase);
         send_protocol_violation(writer, request_id, &msg, tid.as_deref()).await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -654,7 +670,7 @@ async fn process_chunk<W: AsyncWrite + Unpin>(
             tid.as_deref(),
         )
         .await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -693,7 +709,7 @@ async fn process_request_end<W: AsyncWrite + Unpin + Send + 'static>(
     if !valid {
         let msg = format!("unexpected REQUEST_END in state {:?}", state.phase);
         send_protocol_violation(writer, request_id, &msg, tid.as_deref()).await;
-        mark_terminal(state);
+        mark_terminal(state, in_flight);
         return;
     }
 
@@ -912,7 +928,8 @@ fn process_cancel(
         in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    mark_terminal(state);
+    // Set Terminal directly — we already handled the in_flight decrement above.
+    state.phase = RequestPhase::Terminal;
     debug!("Credential mux: request {request_id} cancelled");
 }
 
@@ -920,7 +937,19 @@ fn process_cancel(
 // Helpers
 // ---------------------------------------------------------------------------
 
-const fn mark_terminal(state: &mut RequestState) {
+/// Transition a request to Terminal state.
+///
+/// If the request was counted in `in_flight` but no upstream task was
+/// spawned (so no `InFlightGuard` will handle the decrement), this
+/// decrements the counter to prevent counter leaks.
+fn mark_terminal(state: &mut RequestState, in_flight: &Arc<AtomicUsize>) {
+    if state.phase == RequestPhase::Terminal {
+        return;
+    }
+    // If no task was spawned, we own the in-flight count for this request.
+    if state.task_handle.is_none() && state.phase != RequestPhase::Init {
+        in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
     state.phase = RequestPhase::Terminal;
 }
 
@@ -1161,12 +1190,12 @@ mod tests {
         let (server_r, server_w) = tokio::io::split(server);
         let writer: SharedWriter<_> = Arc::new(Mutex::new(server_w));
         let registry = Arc::new(Mutex::new(PhantomRegistry::new()));
+        let in_flight = Arc::new(AtomicUsize::new(1));
 
-        // Insert a request in Init state (normally never happens — handshake
-        // moves straight to Handshaken, but tests the guard)
+        // Insert a request in EnvelopeReceived state — wrong for another envelope
         let mut requests = HashMap::new();
         let mut state = RequestState::new();
-        state.phase = RequestPhase::EnvelopeReceived; // wrong state for another envelope
+        state.phase = RequestPhase::EnvelopeReceived;
         state.handshake = Some(cella_protocol::CredentialProxyHandshake {
             auth_token: String::new(),
             container_name: "c".to_string(),
@@ -1178,10 +1207,11 @@ mod tests {
         });
         requests.insert(1, state);
 
-        process_envelope(1, b"{}", &mut requests, &writer, &registry).await;
+        process_envelope(1, b"{}", &mut requests, &writer, &registry, &in_flight).await;
 
-        // State should be terminal
+        // State should be terminal and in_flight decremented
         assert_eq!(requests.get(&1).unwrap().phase, RequestPhase::Terminal);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
 
         drop(writer);
         drop(server_r);
