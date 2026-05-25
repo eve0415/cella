@@ -121,9 +121,9 @@ flowchart LR
 | `cella-env` | Built-in provider registry (`CREDENTIAL_PROVIDERS`), proxy config injection, `CredentialRouteConfig`, provider merging |
 | `cella-protocol` | `CredentialProxyHandshake`, `PhantomTokenEntry`, `RegisterPhantomTokens`/`GetPhantomTokens` management messages, frame types |
 | `cella-orchestrator` | Phantom token generation, daemon registration (with nonce retrieval), credential route building, container label injection |
-| `cella-daemon` | Phantom registry (persistence + lookup), credential proxy handler (validation + upstream request), credential resolver (with TTL cache), audit logger, custom provider consent |
+| `cella-daemon` | Phantom registry (persistence + lookup), credential proxy handler (validation + upstream request), credential resolver (with TTL cache), audit logger |
 | `cella-agent` | MITM proxy credential domain routing, multiplexed credential tunnel, connection management |
-| `cella-cli` | Wires credential protection into `up`/`exec` flows |
+| `cella-cli` | Wires credential protection into `up`/`exec` flows, custom provider consent prompt |
 | `cella-doctor` | Docker Engine version checks for security-relevant thresholds |
 
 ### Design Rationale
@@ -146,7 +146,7 @@ flowchart LR
 
 | ID | Env Var | Domains | Header | Prefix |
 |---|---|---|---|---|
-| `github` | `GH_TOKEN` | `github.com`, `api.github.com` | `Authorization` | `token ` |
+| `github` | `GH_TOKEN`† | `github.com`, `api.github.com` | `Authorization` | `token ` |
 | `anthropic` | `ANTHROPIC_API_KEY` | `api.anthropic.com` | `x-api-key` | _(none)_ |
 | `openai` | `OPENAI_API_KEY` | `api.openai.com` | `Authorization` | `Bearer ` |
 | `gemini` | `GEMINI_API_KEY` | `generativelanguage.googleapis.com` | `x-goog-api-key` | _(none)_ |
@@ -158,6 +158,8 @@ flowchart LR
 | `together` | `TOGETHER_API_KEY` | `api.together.xyz` | `Authorization` | `Bearer ` |
 | `perplexity` | `PERPLEXITY_API_KEY` | `api.perplexity.ai` | `Authorization` | `Bearer ` |
 | `cohere` | `COHERE_API_KEY` | `api.cohere.com` | `Authorization` | `Bearer ` |
+
+†The GitHub provider resolves credentials via `gh auth token -h <hostname>` subprocess invocation, not by reading `GH_TOKEN` directly. `GH_TOKEN` is used only as the phantom token injection target (the env var name set inside the container).
 
 **GitHub special-casing:** The GitHub provider uses `gh auth token -h <hostname>` for credential resolution instead of reading an env var directly. This supports GitHub Enterprise multi-host configurations and respects the user's `gh` CLI authentication state. The GitHub provider is gated on `credentials.gh` (default: `true`) and `gh auth status` succeeding at container startup.
 
@@ -179,7 +181,7 @@ Add custom providers in `cella.toml` with `[[credentials.providers]]`:
 [[credentials.providers]]
 name = "internal-api"
 env = "INTERNAL_API_KEY"
-domain = "api.internal.corp"
+domains = ["api.internal.corp"]
 header = "Authorization"
 prefix = "Bearer "
 ```
@@ -188,7 +190,7 @@ prefix = "Bearer "
 |---|---|---|---|---|---|
 | `name` | `string` | yes | — | Non-empty, ASCII alphanumeric + `-_` | Short identifier; if it matches a built-in ID, overrides that provider |
 | `env` | `string` | yes | — | Non-empty, valid env var name | Host environment variable holding the real credential |
-| `domain` | `string` | yes | — | Non-empty, valid hostname (no port, no scheme) | Target domain this provider protects |
+| `domains` | `string[]` | yes | — | Non-empty, each entry a valid hostname (no port, no scheme, `^[a-zA-Z0-9.-]+$`) | Target domains this provider protects |
 | `header` | `string` | yes | — | Non-empty, valid HTTP header name | HTTP header name for credential injection |
 | `prefix` | `string` | no | `""` | — | Value prefix prepended to the credential (e.g. `"Bearer "`) |
 
@@ -211,14 +213,17 @@ Custom providers introduce a configuration adversary risk: a malicious `cella.to
    This will send the value of INTERNAL_API_KEY to api.internal.corp.
    Approve? [y/N]
    ```
-2. If approved, the provider is added to `~/.cella/approved-providers.json`:
+2. If approved, the complete provider definition is stored in `~/.cella/approved-providers.json`:
    ```json
    {
+     "schema_version": 1,
      "approved": [
        {
          "name": "internal-api",
          "env": "INTERNAL_API_KEY",
-         "domain": "api.internal.corp",
+         "domains": ["api.internal.corp"],
+         "header": "Authorization",
+         "prefix": "Bearer ",
          "approved_at": "2026-05-25T12:00:00Z"
        }
      ]
@@ -226,7 +231,7 @@ Custom providers introduce a configuration adversary risk: a malicious `cella.to
    ```
 3. If denied, the provider is skipped — no phantom token is generated, no credential route is registered. The container starts without that provider's protection.
 4. On subsequent runs, approved providers are loaded from the allowlist and proceed without prompting.
-5. If a provider's `env` or `domain` changes from the approved version, re-approval is required.
+5. If **any** field of a provider changes from the approved version (`name`, `env`, `domains`, `header`, or `prefix`), re-approval is required. The approval stores the complete provider definition to detect changes.
 6. Built-in providers never require consent — they are implicitly trusted.
 
 **Approval file permissions:** `0600` on Unix. The file is user-scoped (not project-scoped) to prevent a project from pre-populating approvals.
@@ -259,13 +264,13 @@ groq = false
 [[credentials.providers]]
 name = "internal-api"
 env = "INTERNAL_API_KEY"
-domain = "api.internal.corp"
+domains = ["api.internal.corp"]
 header = "x-api-key"
 
 [[credentials.providers]]
 name = "anthropic"        # Overrides the built-in anthropic provider
 env = "MY_ANTHROPIC_KEY"
-domain = "custom-anthropic.corp"
+domains = ["custom-anthropic.corp"]
 header = "Authorization"
 prefix = "Bearer "
 ```
@@ -294,12 +299,14 @@ Three connection types share the daemon's control TCP port. A 1-byte magic byte 
 
 The magic byte is the first byte on the TCP stream. After reading it, the daemon knows which parser to invoke for the remainder of the connection.
 
-**Backward compatibility:** If the first byte is `{` (0x7B, start of JSON), the daemon falls back to field-based trial deserialization for agents that predate magic byte framing:
+**Backward compatibility:** If the first byte is `{` (0x7B, start of JSON), the daemon peeks (without consuming) up to `MAX_HANDSHAKE_PAYLOAD` bytes and falls back to field-based trial deserialization for agents that predate magic byte framing:
 
 1. Try `CredentialProxyHandshake` (has `provider_id` + `request_id`)
 2. Try `TunnelHandshake` (has `connection_id`)
 3. Try `AgentHello` (has `protocol_version`)
 4. Reject with "unrecognized first message"
+
+The three message types have mutually exclusive required fields, so a valid payload cannot match more than one type. If multiple parsers succeed (indicating a future field collision), the daemon rejects the message as ambiguous. This fallback is deprecated — new agents MUST use magic byte framing.
 
 ### Multiplexed Credential Tunnel
 
@@ -321,27 +328,61 @@ After the `0x03` magic byte selects the credential connection type, all subseque
 | `HANDSHAKE` | `0x01` | agent → daemon | JSON `CredentialProxyHandshake` | Initiate a new proxied request |
 | `REQUEST_ENVELOPE` | `0x02` | agent → daemon | JSON `HttpRequestEnvelope` | HTTP request metadata |
 | `REQUEST_CHUNK` | `0x03` | agent → daemon | Raw bytes | Request body chunk |
-| `REQUEST_END` | `0x04` | agent → daemon | Empty | End of request body |
+| `REQUEST_END` | `0x04` | agent → daemon | Empty (`payload_len` MUST be 0) | End of request body |
 | `RESPONSE_ENVELOPE` | `0x05` | daemon → agent | JSON `HttpResponseEnvelope` | HTTP response metadata |
 | `RESPONSE_CHUNK` | `0x06` | daemon → agent | Raw bytes | Response body chunk |
-| `RESPONSE_END` | `0x07` | daemon → agent | Empty | End of response body |
+| `RESPONSE_END` | `0x07` | daemon → agent | Empty (`payload_len` MUST be 0) | End of response body |
 | `ERROR` | `0x08` | daemon → agent | JSON `ErrorEnvelope` | Request-scoped error |
-| `CANCEL` | `0x09` | agent → daemon | Empty | Cancel in-flight request |
+| `CANCEL` | `0x09` | agent → daemon | Empty (`payload_len` MUST be 0) | Cancel in-flight request |
 
 **Flow for a single request:**
 
 1. Agent sends `HANDSHAKE` frame with `CredentialProxyHandshake` payload
-2. Agent sends `REQUEST_ENVELOPE` frame with `HttpRequestEnvelope` payload
-3. Agent sends zero or more `REQUEST_CHUNK` frames with body data
-4. Agent sends `REQUEST_END` frame (empty payload)
-5. Daemon validates, resolves credential, makes upstream request
-6. Daemon sends `RESPONSE_ENVELOPE` frame with `HttpResponseEnvelope` payload
-7. Daemon sends zero or more `RESPONSE_CHUNK` frames with response body data
-8. Daemon sends `RESPONSE_END` frame (empty payload)
+2. Daemon validates nonce and container identity **immediately** — sends `ERROR` frame if invalid (fail-fast, no further frames accepted for this request_id)
+3. Agent sends `REQUEST_ENVELOPE` frame with `HttpRequestEnvelope` payload
+4. Daemon extracts phantom token from headers, validates token/provider/domain **immediately** — sends `ERROR` frame if invalid
+5. Agent sends zero or more `REQUEST_CHUNK` frames with body data
+6. Agent sends `REQUEST_END` frame (empty payload)
+7. Daemon resolves credential, opens upstream connection, streams request body chunks to upstream as they arrive
+8. Daemon sends `RESPONSE_ENVELOPE` frame with `HttpResponseEnvelope` payload
+9. Daemon sends zero or more `RESPONSE_CHUNK` frames with response body data
+10. Daemon sends `RESPONSE_END` frame (empty payload)
 
 Multiple requests with different `request_id` values can be in flight simultaneously. The daemon processes them concurrently and may respond out of order.
 
-**Backpressure:** If the agent stops reading, TCP flow control applies naturally. The daemon does not buffer more than `MAX_RESPONSE_CHUNK` bytes per frame. If the daemon's write buffer fills, it pauses reading from the upstream response.
+**Per-request state machine:**
+
+| State | Valid Incoming Frames | Transitions |
+|---|---|---|
+| `Init` | `HANDSHAKE` | → `Handshaken` (or `Terminal` on validation failure) |
+| `Handshaken` | `REQUEST_ENVELOPE` | → `EnvelopeReceived` (or `Terminal` on validation failure) |
+| `EnvelopeReceived` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `CHUNK` → `Streaming`, `END` → `UpstreamPending`, `CANCEL` → `Terminal` |
+| `Streaming` | `REQUEST_CHUNK`, `REQUEST_END`, `CANCEL` | `END` → `UpstreamPending`, `CANCEL` → `Terminal` |
+| `UpstreamPending` | _(daemon processing)_ | → `Responding` (on `RESPONSE_ENVELOPE` sent) or `Terminal` (on error) |
+| `Responding` | `CANCEL` | `RESPONSE_END` sent → `Terminal`, `CANCEL` → `Terminal` |
+| `Terminal` | _(none)_ | Request ID released; not reusable on this connection |
+
+Any frame received in an invalid state for that request_id results in an `ERROR` frame with category `protocol_violation`. Unknown frame types are rejected with `protocol_violation`.
+
+**Request cancellation:** When the agent sends a `CANCEL` frame for a `request_id`:
+
+1. The daemon aborts any in-flight upstream request for that `request_id`
+2. The daemon stops sending `RESPONSE_CHUNK` frames for that `request_id`
+3. The daemon sends a `RESPONSE_END` frame to close the stream (the agent may ignore it)
+4. The daemon releases all resources for that `request_id`
+5. If the daemon has already sent `RESPONSE_END` before receiving `CANCEL`, the `CANCEL` is a no-op
+
+The `request_id` is not reusable on the same connection after cancellation. Cancellation is agent-initiated only; the daemon does not send `CANCEL` frames.
+
+**Concurrency limit:** When the number of in-flight requests reaches `MAX_CONCURRENT_REQUESTS` (64), the daemon rejects additional `HANDSHAKE` frames with an `ERROR` frame (category `too_many_requests`). A request is "in-flight" from `HANDSHAKE` receipt until `RESPONSE_END` or `ERROR` is sent for that `request_id`.
+
+**Backpressure:** TCP flow control provides connection-level backpressure. Additionally, the daemon enforces per-stream output buffering: each stream may have at most one `RESPONSE_CHUNK` frame pending write. If a stream's write buffer is full due to a slow reader, the daemon pauses reading from that stream's upstream response. This prevents one slow stream from blocking all other streams via head-of-line blocking on the shared TCP connection. The daemon uses round-robin scheduling across active response streams.
+
+**Connection lifecycle:**
+- **Idle timeout:** Connections with no in-flight requests for 5 minutes are closed by the daemon
+- **Reconnect:** On connection loss, all in-flight requests fail with 502 at the agent. The agent reconnects with exponential backoff (1s, 2s, 4s, max 30s)
+- **Daemon shutdown:** The daemon closes all credential tunnel connections. In-flight requests receive `ERROR` frames with category `upstream_error`
+- **Nonce invalidation:** Re-registration generates a new nonce, invalidating the old connection. The agent must reconnect with the new nonce
 
 ### CredentialProxyHandshake
 
@@ -351,12 +392,14 @@ Sent as the payload of a `HANDSHAKE` frame to initiate a credential proxy reques
 |---|---|---|---|
 | `container_nonce` | `string` | 64 bytes | Per-container nonce for authentication (replaces global auth token) |
 | `container_name` | `string` | 256 bytes | Container name for registry lookups |
-| `request_id` | `string` | 64 bytes | Unique request ID for multiplexing and logging |
-| `domain` | `string` | 253 bytes | Target API domain (e.g. `api.anthropic.com`) |
+| `trace_id` | `string` | 64 bytes | Unique identifier for audit logging and request correlation |
+| `domain` | `string` | 253 bytes | Target API domain (e.g. `api.anthropic.com`). Must match `^[a-zA-Z0-9.-]+$`. |
 | `provider_id` | `string` | 128 bytes | Provider ID (e.g. `anthropic`) |
 
+The frame header's `request_id` (u32) is used for multiplexing: it routes frames to the correct request handler. The handshake `trace_id` (string) is used for audit logging and correlation. The daemon associates the `trace_id` with the frame's numeric `request_id` upon receiving the `HANDSHAKE` frame. The frame `request_id` must be unique among active streams on the connection; duplicate active IDs result in `protocol_violation`.
+
 ```json
-{"container_nonce":"a1b2c3...","container_name":"cella-myapp-main","request_id":"cred-1","domain":"api.anthropic.com","provider_id":"anthropic"}
+{"container_nonce":"a1b2c3...","container_name":"cella-myapp-main","trace_id":"cred-550e8400","domain":"api.anthropic.com","provider_id":"anthropic"}
 ```
 
 ### HttpRequestEnvelope
@@ -384,10 +427,10 @@ Request bodies are streamed as a sequence of `REQUEST_CHUNK` frames:
 
 Sent as the payload of a `RESPONSE_ENVELOPE` frame.
 
-| Field | Type | Description |
-|---|---|---|
-| `status` | `u16` | HTTP response status code |
-| `headers` | `[string, string][]` | Response header key-value pairs (max 100 entries, 64KB per line) |
+| Field | Type | Max Length | Description |
+|---|---|---|---|
+| `status` | `u16` | — | HTTP response status code |
+| `headers` | `[string, string][]` | 100 entries, 64KB per pair | Response header key-value pairs |
 
 ### Streamed Response Body
 
@@ -396,7 +439,8 @@ Response bodies are streamed as a sequence of `RESPONSE_CHUNK` frames:
 - Each chunk payload contains raw body bytes, up to `MAX_RESPONSE_CHUNK` (16 MB)
 - The daemon sends `RESPONSE_END` (empty payload) to signal the body is complete
 - Total response body across all chunks must not exceed `MAX_RESPONSE_TOTAL` (1 GB)
-- If the upstream response exceeds the limit, the daemon truncates and sends `RESPONSE_END`
+- If the upstream response exceeds the limit: the daemon stops reading from upstream, sends an `ERROR` frame with category `body_exceeded` for that `request_id`, and the agent closes the client response body. Since `RESPONSE_ENVELOPE` (with the upstream status code) may already have been sent, the agent cannot change the HTTP status — the `ERROR` frame signals truncation in-band
+- If `Content-Length` is present in the upstream response and exceeds `MAX_RESPONSE_TOTAL`, the daemon sends an `ERROR` frame with category `body_exceeded` instead of `RESPONSE_ENVELOPE` (the agent returns 502)
 
 ### Error Envelope
 
@@ -406,7 +450,7 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 {
   "category": "token_invalid",
   "message": "Phantom token not found in registry",
-  "request_id": "cred-1"
+  "trace_id": "cred-550e8400"
 }
 ```
 
@@ -414,7 +458,7 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 |---|---|---|
 | `category` | `string` | Error category (see [Error Taxonomy](#error-taxonomy)) |
 | `message` | `string` | Human-readable diagnostic message. Never contains credentials or phantom tokens. |
-| `request_id` | `string` | Request ID from the handshake |
+| `trace_id` | `string` | Trace ID from the handshake (for audit correlation) |
 
 **Error categories:**
 
@@ -429,20 +473,26 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 | `body_exceeded` | Request or response body exceeded size limit |
 | `timeout` | Per-phase or total timeout exceeded |
 | `nonce_invalid` | Container nonce does not match the registered nonce |
+| `too_many_requests` | Concurrent request limit exceeded on this connection |
 
 ### Resource Limits
 
 | Limit | Value | Scope |
 |---|---|---|
-| `MAX_HEADER_LINE` | 64 KB | Single serialized header key+value pair |
+| `MAX_HEADER_PAIR` | 64 KB | Single serialized header key+value pair |
 | `MAX_HEADERS` | 100 | Maximum number of headers per request or response envelope |
-| `MAX_REQUEST_CHUNK` | 16 MB | Maximum payload size per `REQUEST_CHUNK` frame |
-| `MAX_RESPONSE_CHUNK` | 16 MB | Maximum payload size per `RESPONSE_CHUNK` frame |
+| `MAX_REQUEST_CHUNK` | 16 MB | Maximum `payload_len` for `REQUEST_CHUNK` frames |
+| `MAX_RESPONSE_CHUNK` | 16 MB | Maximum `payload_len` for `RESPONSE_CHUNK` frames |
 | `MAX_REQUEST_BODY` | 256 MB | Total request body across all chunks |
 | `MAX_RESPONSE_TOTAL` | 1 GB | Total response body across all chunks |
-| `MAX_HANDSHAKE_LINE` | 8 KB | Maximum size of JSON handshake line |
-| `MAX_ENVELOPE_LINE` | 256 KB | Maximum size of JSON envelope line |
+| `MAX_HANDSHAKE_PAYLOAD` | 8 KB | Maximum `payload_len` for `HANDSHAKE` frames |
+| `MAX_ENVELOPE_PAYLOAD` | 8 MB | Maximum `payload_len` for `REQUEST_ENVELOPE` and `RESPONSE_ENVELOPE` frames |
+| `MAX_ERROR_PAYLOAD` | 8 KB | Maximum `payload_len` for `ERROR` frames |
 | `MAX_CONCURRENT_REQUESTS` | 64 | Maximum in-flight requests per multiplexed connection |
+
+`MAX_ENVELOPE_PAYLOAD` is the authoritative cap on envelope frame size. It accommodates up to `MAX_HEADERS` (100) headers of `MAX_HEADER_PAIR` (64 KB) each plus method/URI overhead. Receivers validate `payload_len` against the frame-type-specific cap **before allocating memory** — a `HANDSHAKE` frame with `payload_len > 8 KB` is rejected without reading the payload.
+
+All resource limits are compile-time constants. They are not user-configurable. `cache_ttl_seconds` (see [Configuration Reference](#configuration-reference)) is the only configurable parameter affecting resource behavior.
 
 ### Timeout Policy
 
@@ -456,7 +506,9 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 | Streaming idle | 60 s | Maximum gap between response body chunks |
 | Total | 5 min | Maximum wall-clock time for a single proxied request |
 
-Timeouts are per-request within the multiplexed connection. A timeout on one request does not affect other in-flight requests.
+Timeouts are per-request within the multiplexed connection. A timeout on one request does not affect other in-flight requests. The `Total` timeout is an absolute wall-clock deadline starting from `HANDSHAKE` receipt — each phase timeout is clamped to `min(phase_timeout, remaining_total)`. A response that sends one chunk every 59 seconds will be terminated by the 5-minute total deadline, not kept alive indefinitely by the 60-second idle timeout.
+
+All timeout values are compile-time constants and not user-configurable.
 
 ### Management Messages
 
@@ -503,10 +555,10 @@ Response: `phantom_token_values`
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `provider_id` | `string` | — | Provider identifier |
-| `phantom_token` | `string` | — | Opaque replacement token (`pt-<uuid>`) |
+| `phantom_token` | `string` | — | Opaque replacement token. Format: `pt-` followed by a UUID v4 in lowercase hyphenated form (39 bytes total, e.g. `pt-550e8400-e29b-41d4-a716-446655440000`). |
 | `env_var` | `string` | — | Host env var name |
 | `domains` | `string[]` | — | API domains this token is valid for |
-| `header` | `string` | `""` | HTTP header name for injection |
+| `header` | `string` | — | HTTP header name for injection |
 | `prefix` | `string` | `""` | Header value prefix |
 
 ## Phantom Token Lifecycle
@@ -544,12 +596,7 @@ Credential routes and authentication info are injected into the agent's proxy co
 | `container_nonce` | `string` | Per-container nonce for tunnel authentication |
 | `container_name` | `string` | Container identifier for registry lookups |
 
-Container labels are added for mode signaling:
-
-| Label | Value | Purpose |
-|---|---|---|
-| `dev.cella.credential_protect` | `"true"` | Indicates phantom token protection is active |
-| `dev.cella.container_name` | Container name | Links the container to its phantom registry entry |
+Container labels are added for mode signaling (see [Container Labels](#container-labels)).
 
 ### 4. Exec-time Injection
 
@@ -567,24 +614,28 @@ When a container process makes an HTTP request to a credential domain (e.g. `api
 
 1. The agent's MITM proxy intercepts the HTTPS request (see proxy spec for CA/TLS details)
 2. The agent matches the request domain against its credential routes
-3. The agent sends a `HANDSHAKE` frame on the multiplexed tunnel with a new unique `request_id`
-4. The agent sends a `REQUEST_ENVELOPE` frame with the HTTP method, URI, and headers
-5. The agent streams the request body as `REQUEST_CHUNK` frames, ending with `REQUEST_END`
-6. The daemon validates the handshake:
+3. The agent sends a `HANDSHAKE` frame on the multiplexed tunnel with a new unique `request_id` (u32) and `trace_id` (string)
+4. The daemon validates nonce and container identity **immediately** (fail-fast):
    a. Verify `container_nonce` matches the registered nonce for `container_name`
-   b. Extract the phantom token from the auth header (stripping `Bearer `, `token `, or raw value)
-   c. Look up `(container_name, phantom_token)` → `provider_id` in the registry
-   d. Verify handshake `provider_id` matches the resolved `provider_id`
-   e. Verify `domain` is in the provider's registered domain list
-7. The daemon resolves the real credential:
+   b. On failure: send `ERROR` frame, reject — no further frames accepted for this stream
+5. The agent sends a `REQUEST_ENVELOPE` frame with the HTTP method, URI, and headers
+6. The daemon validates the phantom token **immediately** (fail-fast):
+   a. Extract the phantom token from the header specified by the provider's `header` field (stripping the provider's `prefix`, case-insensitive)
+   b. Look up `(container_name, phantom_token)` → `provider_id` in the registry
+   c. Verify handshake `provider_id` matches the resolved `provider_id`
+   d. Verify `domain` is in the provider's registered domain list
+   e. On failure: send `ERROR` frame, reject — no further frames accepted for this stream
+7. The agent streams the request body as `REQUEST_CHUNK` frames, ending with `REQUEST_END`
+8. The daemon resolves the real credential:
    a. Check the TTL cache for `(provider_id, domain)`
    b. On cache miss: read the host env var (or run `gh auth token -h <hostname>` for GitHub)
    c. On cache hit: use the cached value
    d. Store/refresh the cache entry with the configured TTL
-8. The daemon strips the phantom token auth header and injects the real credential header
-9. The daemon makes the upstream HTTPS request (no redirect following)
-10. The daemon streams the response back via `RESPONSE_ENVELOPE`, `RESPONSE_CHUNK`, and `RESPONSE_END` frames
-11. The daemon writes an audit log entry
+9. The daemon strips the phantom token auth header and injects the real credential header
+10. The daemon opens the upstream connection and streams request body chunks to upstream as they arrive (no full buffering)
+11. The daemon makes the upstream HTTPS request (no redirect following)
+12. The daemon streams the response back via `RESPONSE_ENVELOPE`, `RESPONSE_CHUNK`, and `RESPONSE_END` frames
+13. The daemon writes an audit log entry at request completion (both success and failure paths)
 
 ### 6. Persistence
 
@@ -621,7 +672,7 @@ The phantom registry is persisted to `~/.cella/phantom-registry.state` on every 
 - **File permissions** — `0600` on Unix (owner read/write only).
 - **Advisory file locking** — Acquire an `fd-lock` advisory lock before writing the state file. Prevents concurrent daemon instances from corrupting the file.
 - **Recovery with Docker API reconciliation** — On daemon startup, after restoring from the state file, verify each container still exists via the Docker API. Remove stale entries for containers that no longer exist.
-- **Single-daemon enforcement** — A PID file (`~/.cella/daemon.pid`) prevents multiple daemon instances. On startup, check if the recorded PID is still running; if not, reclaim.
+- **Single-daemon enforcement** — A PID file (`~/.cella/daemon.pid`) prevents multiple daemon instances. On startup, check if the recorded PID is still running via `kill(pid, 0)`. If the PID is not running, delete the stale PID file, write the new daemon's PID, and proceed. If the PID is still running, exit with an error indicating another daemon instance is active.
 
 **Schema version:** The `schema_version` field enables forward-compatible state file evolution. If the daemon reads a state file with an unknown schema version, it logs a warning and starts with an empty registry rather than corrupting data.
 
@@ -667,13 +718,15 @@ Credentials are resolved with a short-TTL in-memory cache to balance latency and
 | Parameter | Value | Notes |
 |---|---|---|
 | TTL | 60 s (default) | Configurable via `credentials.cache_ttl_seconds` |
-| Cache key | `(provider_id, hostname)` | Per-provider, per-domain caching |
+| Cache key | `(provider_id, domain)` | Per-provider, per-domain caching |
 | Eviction | On TTL expiry | Cache entries are zeroized (overwritten with zeros) before deallocation |
 | Cache miss | Read env var / run `gh auth token -h <hostname>` | Subprocess spawn for GitHub only |
 | Cache scope | Daemon process memory only | Never persisted to disk |
 | Disable | Set `cache_ttl_seconds = 0` | Falls back to per-request resolution |
 
-**Zeroization:** When a cached credential expires or is evicted, its memory is overwritten with zeros before deallocation. This prevents stale credentials from lingering in process memory after rotation.
+The cache is daemon-wide, shared across all connections and requests. Eviction is passive (TTL checked on access); there is no background sweeper. When `cache_ttl_seconds = 0`, the cache is bypassed entirely — no entries are stored.
+
+**Zeroization:** When a cached credential expires or is evicted, its memory is overwritten with zeros via the `zeroize` crate's `Zeroize` trait before deallocation. This prevents stale credentials from lingering in process memory after rotation.
 
 **GitHub special case:** `gh auth token -h <hostname>` is invoked on cache miss. The subprocess is spawned with a 5-second timeout. Empty or whitespace-only output is treated as a failure.
 
@@ -747,9 +800,9 @@ Credential domains are routed through the agent's MITM proxy. The proxy spec (se
 Custom providers are subject to the user consent flow described in [Custom Provider Configuration](#custom-provider-configuration). The consent mechanism is the primary mitigation against configuration adversary attacks.
 
 **Trust properties:**
-- A custom provider cannot exfiltrate credentials without explicit user approval of the `(env, domain)` pair
+- A custom provider cannot exfiltrate credentials without explicit user approval of the full provider definition
 - Approval is per-user, not per-project — a project cannot pre-approve its own custom providers
-- Changes to a provider's `env` or `domain` invalidate the approval
+- Changes to **any** field of a provider invalidate the approval (the complete definition is stored and compared)
 - The approval file is protected by filesystem permissions (0600)
 - Built-in providers are implicitly trusted and never require consent
 
@@ -780,7 +833,9 @@ Labels are set at container creation and are immutable for the container's lifet
 | Invalid request envelope | 502 | `protocol_violation` | `protocol_violation` | "Failed to parse request envelope" |
 | Invalid frame sequence | 502 | `protocol_violation` | `protocol_violation` | "Unexpected frame type {type} in state {state}" |
 | Request body exceeds limit | 502 | `body_exceeded` | `body_exceeded` | "Request body exceeds {MAX_REQUEST_BODY} bytes" |
-| Response body exceeds limit | 502 | `body_exceeded` | `body_exceeded` | "Response body exceeds {MAX_RESPONSE_TOTAL} bytes" |
+| Response body exceeds limit (before headers sent) | 502 | `body_exceeded` | `body_exceeded` | "Response body exceeds {MAX_RESPONSE_TOTAL} bytes" |
+| Response body exceeds limit (after headers sent) | _(upstream)_ | `body_exceeded` | — | ERROR frame sent in-band; agent closes client body |
+| Concurrent request limit exceeded | 503 | `too_many_requests` | `too_many_requests` | "Concurrent request limit exceeded" |
 | Upstream DNS/TLS/connection failure | 502 | `upstream_error` | `upstream_error` | "Upstream request failed: {error}" |
 | Upstream timeout | 502 | `timeout` | `timeout` | "Upstream request timed out after {duration}" |
 | Handshake timeout | 502 | `timeout` | `timeout` | "Handshake not received within 5s" |
@@ -805,7 +860,7 @@ Credential proxy requests are logged to a structured JSONL audit log for securit
   "path": "/v1/messages",
   "status": 200,
   "duration_ms": 142,
-  "request_id": "cred-550e8400",
+  "trace_id": "cred-550e8400",
   "denial_reason": null
 }
 ```
@@ -817,10 +872,10 @@ Credential proxy requests are logged to a structured JSONL audit log for securit
 | `provider_id` | `string` | Provider that handled the request |
 | `domain` | `string` | Target domain |
 | `method` | `string` | HTTP method |
-| `path` | `string` | Request path (no query string) |
+| `path` | `string` | Request path (query string stripped: everything from the first `?` onward is removed before logging) |
 | `status` | `u16` | HTTP status returned to the container (upstream status or error status) |
 | `duration_ms` | `u64` | Total request duration in milliseconds |
-| `request_id` | `string` | Unique request identifier for correlation |
+| `trace_id` | `string` | Trace ID from the handshake, for correlation |
 | `denial_reason` | `string?` | Error category if the request was denied, `null` if allowed |
 
 **Log redaction rules:**
@@ -854,28 +909,18 @@ Credential proxy requests are logged to a structured JSONL audit log for securit
 
 ## Failure Modes
 
-| Condition | Behavior | Status | Rationale |
-|---|---|---|---|
-| Container nonce invalid | Reject | 401 | Authentication failure |
-| Phantom token not found in auth header | Reject | 403 | No credential to resolve |
-| Phantom token not in registry | Reject | 403 | Unknown or expired token |
-| Provider ID mismatch (handshake vs registry) | Reject | 403 | Prevents cross-provider credential access |
-| Domain not in provider's registered domains | Reject | 403 | Prevents credential use on unregistered domains |
-| Real credential unavailable (env var unset/empty) | Reject | 403 | Cannot resolve — fail closed |
-| `gh auth token` fails or returns empty | Reject | 403 | GitHub CLI not authenticated |
-| Custom provider not approved | Skip at registration | — | No phantom token generated; no route registered |
-| Invalid request envelope (malformed JSON) | Error | 502 | Protocol violation |
-| Invalid frame type or sequence | Error | 502 | Protocol violation |
-| Request body exceeds 256 MB | Error | 502 | Body size limit exceeded |
-| Response body exceeds 1 GB | Truncate + end | 502 | Response size limit exceeded |
-| Per-phase timeout exceeded | Error | 502 | Timeout |
-| Total request timeout (5 min) exceeded | Error | 502 | Timeout |
-| Socket I/O failure | Error | 502 | Connection lost |
-| Upstream request failure (DNS, TLS, timeout) | Error | 502 | Cannot reach upstream API |
-| Daemon registration failure | Log warning, continue | — | Best-effort; fail-closed at request time |
-| State file locked by another process | Retry with backoff, then warn | — | Advisory lock contention |
-| State file corrupted or version mismatch | Warn, start empty | — | Forward compatibility |
-| Stale container in state file | Remove on reconciliation | — | Container no longer exists in Docker |
+For request-path errors (validation failures, upstream errors, timeouts), see [Error Taxonomy](#error-taxonomy). This section covers non-request-path failures:
+
+| Condition | Behavior | Rationale |
+|---|---|---|
+| Custom provider not approved | Skip at registration — no phantom token generated, no route registered | User consent not granted |
+| Daemon registration failure | Log warning, continue | Best-effort registration; fail-closed at request time |
+| State file locked by another process | Retry with backoff (100ms, 200ms, 400ms), then warn and proceed without persistence | Advisory lock contention |
+| State file corrupted or version mismatch | Warn, start with empty registry | Forward compatibility |
+| Stale container in state file | Remove on Docker API reconciliation | Container no longer exists |
+| PID file held by running daemon | Exit with error | Single-daemon enforcement |
+| Connection lost to multiplexed tunnel | All in-flight requests fail with 502 at the agent | Reconnect with backoff |
+| Concurrent request limit reached | `ERROR` frame with `too_many_requests`; agent returns 503 | Backpressure |
 
 ## Container Hardening
 
@@ -985,8 +1030,8 @@ Fine-grained access control for credential proxy requests:
 1. `credentials.protect` defaults to `false` — opt-in only.
 2. `/proc/[pid]/environ` readability — phantom tokens injected as environment variables are readable by any process in the container with the same UID via `/proc`. This is an acceptable trade-off: phantom tokens are not real credentials, and a runtime adversary who can read `/proc` can already make HTTP requests through the MITM proxy.
 3. **Proxy bypass** — a container process can unset `HTTPS_PROXY`, use raw sockets, or connect directly to credential domains, bypassing the MITM proxy. Without network-level enforcement, credential protection relies on the proxy being the path of least resistance, not a hard boundary. See [Network-level Enforcement](#network-level-enforcement) for the iptables extension.
-4. Custom providers support a single domain per entry. Multi-domain custom providers require multiple `[[credentials.providers]]` entries with the same `name`.
-5. The credential tunnel uses HTTP/1.1 semantics over a custom framed protocol. HTTP/2, WebSocket, and non-standard port upstream connections are not supported. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade path.
-6. State file is not encrypted — relies on filesystem permissions (0600) for protection.
-7. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
-8. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an explicit non-goal. See [Policy Engine](#policy-engine) for the extension that addresses this.
+4. The credential tunnel uses HTTP/1.1 semantics over a custom framed protocol. HTTP/2, WebSocket, and non-standard port upstream connections are not supported. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade path.
+5. State file is not encrypted — relies on filesystem permissions (0600) for protection.
+6. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
+7. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an explicit non-goal. See [Policy Engine](#policy-engine) for the extension that addresses this.
+8. Head-of-line blocking on the multiplexed TCP connection — a slow stream can affect other streams despite per-stream buffering. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade to standardized multiplexing.
