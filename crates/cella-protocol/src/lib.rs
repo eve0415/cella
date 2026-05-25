@@ -4,6 +4,7 @@
 //! Management messages (CLI↔daemon) use the same framing over a Unix socket.
 
 pub mod credential;
+pub mod credential_frame;
 
 use serde::{Deserialize, Serialize};
 
