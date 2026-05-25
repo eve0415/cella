@@ -16,6 +16,17 @@ use crate::phantom_registry::PhantomRegistry;
 
 const MAX_BODY_LEN: u32 = 256 * 1024 * 1024;
 
+const STRIP_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "transfer-encoding",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "upgrade",
+    "keep-alive",
+];
+
 /// JSON envelope for an HTTP request sent through the credential tunnel.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct HttpRequestEnvelope {
@@ -80,6 +91,15 @@ async fn handle_credential_proxy_inner(
         serde_json::from_str(req_line.trim()).map_err(|e| crate::CellaDaemonError::Protocol {
             message: format!("credential proxy: invalid request envelope: {e}"),
         })?;
+
+    if let Err(reason) = validate_uri(&req_envelope.uri) {
+        return Err(crate::CellaDaemonError::Protocol {
+            message: format!(
+                "credential proxy: invalid URI '{}': {reason}",
+                req_envelope.uri
+            ),
+        });
+    }
 
     if req_envelope.body_len > MAX_BODY_LEN {
         return Err(crate::CellaDaemonError::Protocol {
@@ -257,6 +277,26 @@ fn extract_phantom_token(headers: &[(String, String)], header_name: &str) -> Opt
         })
 }
 
+fn validate_uri(uri: &str) -> Result<(), &'static str> {
+    if !uri.starts_with('/') {
+        return Err("URI must be relative (start with '/')");
+    }
+    if uri.contains('#') {
+        return Err("URI must not contain fragments");
+    }
+    if uri.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err("URI must not contain control characters");
+    }
+    Ok(())
+}
+
+fn should_strip_header(key: &str, credential_header: &str) -> bool {
+    if key.eq_ignore_ascii_case(credential_header) {
+        return true;
+    }
+    STRIP_HEADERS.iter().any(|h| key.eq_ignore_ascii_case(h))
+}
+
 async fn make_upstream_request(
     envelope: &HttpRequestEnvelope,
     body: &[u8],
@@ -278,10 +318,7 @@ async fn make_upstream_request(
     let mut builder = client.request(method, &url);
 
     for (key, value) in &envelope.headers {
-        if key.eq_ignore_ascii_case(&credential.header_name) {
-            continue;
-        }
-        if key.eq_ignore_ascii_case("host") {
+        if should_strip_header(key, &credential.header_name) {
             continue;
         }
         builder = builder.header(key.as_str(), value.as_str());
@@ -409,5 +446,53 @@ mod tests {
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
         let token = extract_phantom_token(&headers, "x-api-key");
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn validate_uri_accepts_relative() {
+        assert!(validate_uri("/v1/messages").is_ok());
+        assert!(validate_uri("/path/to/resource?query=1").is_ok());
+        assert!(validate_uri("/").is_ok());
+    }
+
+    #[test]
+    fn validate_uri_rejects_absolute() {
+        assert!(validate_uri("https://evil.com/path").is_err());
+        assert!(validate_uri("http://evil.com").is_err());
+    }
+
+    #[test]
+    fn validate_uri_rejects_fragment() {
+        assert!(validate_uri("/path#fragment").is_err());
+    }
+
+    #[test]
+    fn validate_uri_rejects_control_chars() {
+        assert!(validate_uri("/path\x00evil").is_err());
+        assert!(validate_uri("/path\x1Fevil").is_err());
+    }
+
+    #[test]
+    fn should_strip_hop_by_hop_headers() {
+        assert!(should_strip_header("Connection", "x-api-key"));
+        assert!(should_strip_header("transfer-encoding", "x-api-key"));
+        assert!(should_strip_header("Proxy-Authorization", "x-api-key"));
+        assert!(should_strip_header("TE", "x-api-key"));
+        assert!(should_strip_header("Upgrade", "x-api-key"));
+        assert!(should_strip_header("Keep-Alive", "x-api-key"));
+        assert!(should_strip_header("Host", "x-api-key"));
+    }
+
+    #[test]
+    fn should_strip_credential_header() {
+        assert!(should_strip_header("x-api-key", "x-api-key"));
+        assert!(should_strip_header("X-Api-Key", "x-api-key"));
+    }
+
+    #[test]
+    fn should_not_strip_normal_headers() {
+        assert!(!should_strip_header("content-type", "x-api-key"));
+        assert!(!should_strip_header("accept", "x-api-key"));
+        assert!(!should_strip_header("user-agent", "x-api-key"));
     }
 }
