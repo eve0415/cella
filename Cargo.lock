@@ -486,6 +486,7 @@ dependencies = [
  "cella-testing",
  "chrono",
  "dirs",
+ "fs4",
  "futures-util",
  "hex",
  "miette",

@@ -105,17 +105,75 @@ fn handle_accept_result(
     }
 }
 
+// Magic byte constants for connection type discrimination.
+// Future: 0x01 = AgentHello, 0x02 = TunnelHandshake
+const MAGIC_CREDENTIAL: u8 = 0x03;
+
 /// Discriminate the first message to determine connection type.
+///
+/// A 1-byte magic prefix selects the protocol handler for the remainder of
+/// the connection. If the first byte is `{` (0x7B), the connection falls
+/// back to deprecated JSON trial deserialization for pre-magic-byte agents.
 async fn handle_incoming_connection(
     stream: tokio::net::TcpStream,
     ctx: &ControlContext,
 ) -> Result<(), CellaDaemonError> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    use tokio::io::AsyncReadExt;
 
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+
+    // Peek at the first byte to decide connection type.
+    let first_byte = match reader.read_u8().await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => {
+            return Err(CellaDaemonError::Socket {
+                message: format!("first byte read error: {e}"),
+            });
+        }
+    };
+
+    match first_byte {
+        MAGIC_CREDENTIAL => {
+            // Reassemble the underlying TcpStream for the mux handler.
+            let stream = reader.into_inner().unsplit(writer);
+            let _ = crate::credential_mux::handle_credential_connection(
+                stream,
+                ctx.phantom_registry.clone(),
+            )
+            .await;
+            Ok(())
+        }
+        // JSON start — fall back to legacy trial deserialization.
+        // Prepend the consumed `{` byte so the JSON line reader sees it.
+        b'{' => handle_json_connection(first_byte, reader, writer, ctx).await,
+        _ => {
+            warn!("Unknown magic byte 0x{first_byte:02x}, closing connection");
+            let mut writer = writer;
+            send_reject(
+                &mut writer,
+                format!("unknown magic byte 0x{first_byte:02x}"),
+            )
+            .await;
+            Ok(())
+        }
+    }
+}
+
+/// Handle a connection whose first byte was `{`, using JSON trial deserialization.
+///
+/// This is the deprecated path for agents that predate magic byte framing.
+async fn handle_json_connection(
+    first_byte: u8,
+    mut reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    mut writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    ctx: &ControlContext,
+) -> Result<(), CellaDaemonError> {
+    // Read the rest of the first line, then prepend the consumed `{`.
+    let mut rest = String::new();
     let n = reader
-        .read_line(&mut line)
+        .read_line(&mut rest)
         .await
         .map_err(|e| CellaDaemonError::Socket {
             message: format!("first message read error: {e}"),
@@ -124,6 +182,9 @@ async fn handle_incoming_connection(
         return Ok(());
     }
 
+    let mut line = String::with_capacity(1 + rest.len());
+    line.push(char::from(first_byte));
+    line.push_str(&rest);
     let trimmed = line.trim();
 
     if let Ok(tunnel_hs) = serde_json::from_str::<TunnelHandshake>(trimmed) {

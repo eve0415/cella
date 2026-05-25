@@ -16,7 +16,7 @@ use crate::phantom_registry::PhantomRegistry;
 
 const MAX_BODY_LEN: u32 = 256 * 1024 * 1024;
 
-const STRIP_HEADERS: &[&str] = &[
+pub(crate) const STRIP_HEADERS: &[&str] = &[
     "host",
     "connection",
     "transfer-encoding",
@@ -263,7 +263,10 @@ async fn stream_upstream_response(
     Ok(status)
 }
 
-fn extract_phantom_token(headers: &[(String, String)], header_name: &str) -> Option<String> {
+pub(crate) fn extract_phantom_token(
+    headers: &[(String, String)],
+    header_name: &str,
+) -> Option<String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(header_name))
@@ -277,7 +280,7 @@ fn extract_phantom_token(headers: &[(String, String)], header_name: &str) -> Opt
         })
 }
 
-fn validate_uri(uri: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_uri(uri: &str) -> Result<(), &'static str> {
     if !uri.starts_with('/') {
         return Err("URI must be relative (start with '/')");
     }
@@ -290,14 +293,14 @@ fn validate_uri(uri: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn should_strip_header(key: &str, credential_header: &str) -> bool {
+pub(crate) fn should_strip_header(key: &str, credential_header: &str) -> bool {
     if key.eq_ignore_ascii_case(credential_header) {
         return true;
     }
     STRIP_HEADERS.iter().any(|h| key.eq_ignore_ascii_case(h))
 }
 
-async fn make_upstream_request(
+pub(crate) async fn make_upstream_request(
     envelope: &HttpRequestEnvelope,
     body: &[u8],
     domain: &str,
