@@ -273,7 +273,8 @@ async fn handle_management_request(
             container_name,
             tokens,
         } => {
-            ctx.phantom_registry
+            let nonce = ctx
+                .phantom_registry
                 .lock()
                 .await
                 .register(&container_name, &tokens);
@@ -281,7 +282,10 @@ async fn handle_management_request(
                 "Registered {} phantom tokens for {container_name}",
                 tokens.len()
             );
-            ManagementResponse::PhantomTokensRegistered { container_name }
+            ManagementResponse::PhantomTokensRegistered {
+                container_name,
+                container_nonce: Some(nonce),
+            }
         }
         ManagementRequest::GetPhantomTokens { container_name } => {
             let tokens = ctx

@@ -80,13 +80,14 @@ fn has_env_var(name: &str) -> bool {
 }
 
 /// Register phantom tokens with the daemon via management socket.
+/// Returns the per-container nonce on success.
 pub async fn register_with_daemon(
     socket_path: &Path,
     container_name: &str,
     entries: &[PhantomTokenEntry],
-) -> bool {
+) -> Option<String> {
     if entries.is_empty() {
-        return true;
+        return None;
     }
 
     let req = cella_protocol::ManagementRequest::RegisterPhantomTokens {
@@ -95,20 +96,22 @@ pub async fn register_with_daemon(
     };
 
     match cella_daemon_client::send_management_request(socket_path, &req).await {
-        Ok(cella_protocol::ManagementResponse::PhantomTokensRegistered { .. }) => {
+        Ok(cella_protocol::ManagementResponse::PhantomTokensRegistered {
+            container_nonce, ..
+        }) => {
             info!(
                 "Registered {} phantom tokens for {container_name}",
                 entries.len()
             );
-            true
+            container_nonce
         }
         Ok(resp) => {
             warn!("Unexpected daemon response for phantom registration: {resp:?}");
-            false
+            None
         }
         Err(e) => {
             warn!("Failed to register phantom tokens with daemon: {e}");
-            false
+            None
         }
     }
 }
@@ -147,6 +150,7 @@ pub fn read_daemon_connection_info(
         addr: format!("127.0.0.1:{port}"),
         token,
         container_name: container_name.to_string(),
+        container_nonce: None,
     })
 }
 

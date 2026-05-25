@@ -747,14 +747,14 @@ impl EnsureUpContext<'_> {
         };
 
         let container_name = self.config.container_name.to_string();
-        let registered = crate::credential_protect::register_with_daemon(
+        let nonce = crate::credential_protect::register_with_daemon(
             &socket_path,
             &container_name,
             &phantom_set.entries,
         )
         .await;
 
-        if !registered {
+        if nonce.is_none() {
             tracing::warn!(
                 "Phantom token registration failed — credentials will be unavailable \
                  (credential protection does not fall back to real credentials)"

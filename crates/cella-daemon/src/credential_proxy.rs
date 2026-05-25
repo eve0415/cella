@@ -138,6 +138,16 @@ async fn validate_and_resolve(
 ) -> Option<ResolvedCredential> {
     let registry = phantom_registry.lock().await;
 
+    if let Some(nonce) = &handshake.container_nonce
+        && !registry.validate_nonce(&handshake.container_name, nonce)
+    {
+        warn!(
+            "Credential proxy: invalid container nonce for {}",
+            handshake.container_name
+        );
+        return None;
+    }
+
     let stored_meta = registry.get_provider_meta(&handshake.container_name, &handshake.provider_id);
 
     let header_name = stored_meta.map_or_else(

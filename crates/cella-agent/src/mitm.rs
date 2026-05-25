@@ -273,9 +273,16 @@ async fn handle_request(
             &config.container_name,
         )
     {
-        return Ok(
-            super::credential_tunnel::tunnel_request(req, host, route, addr, token, name).await,
-        );
+        return Ok(super::credential_tunnel::tunnel_request(
+            req,
+            host,
+            route,
+            addr,
+            token,
+            name,
+            config.container_nonce.as_deref(),
+        )
+        .await);
     }
 
     let path = super::forward_proxy::strip_query(req.uri().path());

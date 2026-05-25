@@ -31,6 +31,8 @@ pub struct PhantomRegistry {
     env_vars: HashMap<String, HashMap<String, String>>,
     /// `container_name -> (provider_id -> meta)`
     meta: HashMap<String, HashMap<String, StoredProviderMeta>>,
+    /// `container_name -> nonce` (per-container authentication)
+    nonces: HashMap<String, String>,
 }
 
 impl PhantomRegistry {
@@ -39,13 +41,18 @@ impl PhantomRegistry {
     }
 
     /// Register phantom tokens for a container and persist to disk.
+    /// Returns the per-container nonce for credential tunnel authentication.
     pub fn register(
         &mut self,
         container_name: &str,
         entries: &[cella_protocol::PhantomTokenEntry],
-    ) {
+    ) -> String {
         self.register_without_persist(container_name, entries);
+        let nonce = generate_nonce();
+        self.nonces
+            .insert(container_name.to_string(), nonce.clone());
         self.persist_state();
+        nonce
     }
 
     fn register_without_persist(
@@ -122,12 +129,20 @@ impl PhantomRegistry {
             .map(|m| m.domains.as_slice())
     }
 
+    /// Validate a per-container nonce.
+    pub fn validate_nonce(&self, container_name: &str, nonce: &str) -> bool {
+        self.nonces
+            .get(container_name)
+            .is_some_and(|stored| stored == nonce)
+    }
+
     /// Remove all phantom tokens for a container and persist to disk.
     pub fn remove_container(&mut self, container_name: &str) {
         self.forward.remove(container_name);
         self.reverse.remove(container_name);
         self.env_vars.remove(container_name);
         self.meta.remove(container_name);
+        self.nonces.remove(container_name);
         self.persist_state();
     }
 
@@ -170,9 +185,10 @@ impl PhantomRegistry {
                     })
                     .collect();
 
+                let nonce = self.nonces.get(container_name).cloned().unwrap_or_default();
                 Some((
                     container_name.clone(),
-                    serde_json::json!({ "tokens": tokens }),
+                    serde_json::json!({ "nonce": nonce, "tokens": tokens }),
                 ))
             })
             .collect();
@@ -262,6 +278,16 @@ impl PhantomRegistry {
 
             if !entries.is_empty() {
                 self.register_without_persist(container_name, &entries);
+                if let Some(nonce) = data["nonce"].as_str() {
+                    self.nonces
+                        .insert(container_name.clone(), nonce.to_string());
+                }
+            }
+        }
+
+        for container_name in self.forward.keys() {
+            if !self.nonces.contains_key(container_name) {
+                self.nonces.insert(container_name.clone(), generate_nonce());
             }
         }
 
@@ -270,6 +296,14 @@ impl PhantomRegistry {
             self.container_count()
         );
     }
+}
+
+fn generate_nonce() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().as_simple(),
+        uuid::Uuid::new_v4().as_simple()
+    )
 }
 
 #[cfg(test)]

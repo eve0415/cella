@@ -56,6 +56,9 @@ pub struct AgentProxyConfig {
 
     /// Container name (for credential proxy handshake).
     pub container_name: Option<String>,
+
+    /// Per-container nonce for credential tunnel authentication.
+    pub container_nonce: Option<String>,
 }
 
 impl AgentProxyConfig {
@@ -117,6 +120,7 @@ impl AgentProxyConfig {
             daemon_addr: raw.daemon_addr,
             daemon_token: raw.daemon_token,
             container_name: raw.container_name,
+            container_nonce: raw.container_nonce,
         })
     }
 
@@ -194,6 +198,8 @@ struct ProxyConfigJson {
     daemon_token: Option<String>,
     #[serde(default)]
     container_name: Option<String>,
+    #[serde(default)]
+    container_nonce: Option<String>,
 }
 
 /// A rule in the JSON config.

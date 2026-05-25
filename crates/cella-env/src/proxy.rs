@@ -113,6 +113,7 @@ pub struct DaemonConnectionInfo {
     pub addr: String,
     pub token: String,
     pub container_name: String,
+    pub container_nonce: Option<String>,
 }
 
 /// Inject credential routing into an existing proxy config JSON string.
@@ -145,6 +146,9 @@ pub fn inject_credential_routes(
     json["daemon_addr"] = serde_json::json!(daemon.addr);
     json["daemon_token"] = serde_json::json!(daemon.token);
     json["container_name"] = serde_json::json!(daemon.container_name);
+    if let Some(nonce) = &daemon.container_nonce {
+        json["container_nonce"] = serde_json::json!(nonce);
+    }
 
     json.to_string()
 }

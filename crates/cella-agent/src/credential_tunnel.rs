@@ -42,8 +42,19 @@ pub async fn tunnel_request(
     daemon_addr: &str,
     daemon_token: &str,
     container_name: &str,
+    container_nonce: Option<&str>,
 ) -> hyper::Response<BoxBody> {
-    match tunnel_request_inner(req, host, route, daemon_addr, daemon_token, container_name).await {
+    match tunnel_request_inner(
+        req,
+        host,
+        route,
+        daemon_addr,
+        daemon_token,
+        container_name,
+        container_nonce,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             warn!("Credential tunnel to daemon failed: {e}");
@@ -62,6 +73,7 @@ async fn tunnel_request_inner(
     daemon_addr: &str,
     daemon_token: &str,
     container_name: &str,
+    container_nonce: Option<&str>,
 ) -> Result<hyper::Response<BoxBody>, Box<dyn std::error::Error + Send + Sync>> {
     let (parts, body) = req.into_parts();
 
@@ -96,12 +108,15 @@ async fn tunnel_request_inner(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
+    let request_id = uuid::Uuid::new_v4().to_string();
     let handshake = cella_protocol::CredentialProxyHandshake {
         auth_token: daemon_token.to_string(),
         container_name: container_name.to_string(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: request_id.clone(),
         domain: host.to_string(),
         provider_id: route.provider_id.clone(),
+        container_nonce: container_nonce.map(String::from),
+        trace_id: Some(format!("cred-{}", &request_id[..8])),
     };
     let mut hs_json = serde_json::to_string(&handshake)?;
     hs_json.push('\n');

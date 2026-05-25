@@ -30,6 +30,12 @@ pub struct CredentialProxyHandshake {
     pub request_id: String,
     pub domain: String,
     pub provider_id: String,
+    /// Per-container nonce for tunnel authentication (replaces global auth token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_nonce: Option<String>,
+    /// Unique identifier for audit logging and request correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 /// A phantom token entry mapping a provider to its opaque replacement value.
@@ -342,7 +348,12 @@ pub enum ManagementResponse {
     /// Pong response.
     Pong,
     /// Phantom tokens registered for a container.
-    PhantomTokensRegistered { container_name: String },
+    PhantomTokensRegistered {
+        container_name: String,
+        /// Per-container nonce for credential tunnel authentication.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container_nonce: Option<String>,
+    },
     /// Phantom token values for exec-time injection.
     PhantomTokenValues {
         /// Map of env var name → phantom token value.
@@ -1744,12 +1755,40 @@ mod tests {
             request_id: "req-1".to_string(),
             domain: "api.anthropic.com".to_string(),
             provider_id: "anthropic".to_string(),
+            container_nonce: Some("abc123".to_string()),
+            trace_id: Some("cred-550e8400".to_string()),
         };
         let json = serde_json::to_string(&hs).unwrap();
         let decoded: CredentialProxyHandshake = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.provider_id, "anthropic");
         assert_eq!(decoded.domain, "api.anthropic.com");
         assert_eq!(decoded.request_id, "req-1");
+        assert_eq!(decoded.container_nonce.as_deref(), Some("abc123"));
+        assert_eq!(decoded.trace_id.as_deref(), Some("cred-550e8400"));
+    }
+
+    #[test]
+    fn credential_proxy_handshake_backward_compat() {
+        let json = r#"{"auth_token":"tok","container_name":"c","request_id":"r","domain":"d","provider_id":"p"}"#;
+        let decoded: CredentialProxyHandshake = serde_json::from_str(json).unwrap();
+        assert!(decoded.container_nonce.is_none());
+        assert!(decoded.trace_id.is_none());
+    }
+
+    #[test]
+    fn credential_proxy_handshake_nonce_omitted_when_none() {
+        let hs = CredentialProxyHandshake {
+            auth_token: "tok".to_string(),
+            container_name: "c".to_string(),
+            request_id: "r".to_string(),
+            domain: "d".to_string(),
+            provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(!json.contains("container_nonce"));
+        assert!(!json.contains("trace_id"));
     }
 
     #[test]
@@ -1760,6 +1799,8 @@ mod tests {
             request_id: "r".to_string(),
             domain: "d".to_string(),
             provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
         };
         let json = serde_json::to_string(&hs).unwrap();
         let result = serde_json::from_str::<TunnelHandshake>(&json);
@@ -1774,6 +1815,8 @@ mod tests {
             request_id: "r".to_string(),
             domain: "d".to_string(),
             provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
         };
         let json = serde_json::to_string(&hs).unwrap();
         let result = serde_json::from_str::<AgentHello>(&json);
@@ -1836,13 +1879,32 @@ mod tests {
     fn roundtrip_phantom_tokens_registered() {
         let resp = ManagementResponse::PhantomTokensRegistered {
             container_name: "test".to_string(),
+            container_nonce: Some("nonce123".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            decoded,
-            ManagementResponse::PhantomTokensRegistered { .. }
-        ));
+        if let ManagementResponse::PhantomTokensRegistered {
+            container_nonce, ..
+        } = decoded
+        {
+            assert_eq!(container_nonce.as_deref(), Some("nonce123"));
+        } else {
+            panic!("expected PhantomTokensRegistered");
+        }
+    }
+
+    #[test]
+    fn phantom_tokens_registered_backward_compat() {
+        let json = r#"{"type":"phantom_tokens_registered","container_name":"test"}"#;
+        let decoded: ManagementResponse = serde_json::from_str(json).unwrap();
+        if let ManagementResponse::PhantomTokensRegistered {
+            container_nonce, ..
+        } = decoded
+        {
+            assert!(container_nonce.is_none());
+        } else {
+            panic!("expected PhantomTokensRegistered");
+        }
     }
 
     #[test]
