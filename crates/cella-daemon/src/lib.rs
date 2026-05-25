@@ -8,6 +8,7 @@ pub mod browser;
 pub mod clipboard;
 pub mod control_server;
 pub mod credential;
+pub mod credential_cache;
 pub mod credential_proxy;
 pub mod credential_resolver;
 pub mod daemon;

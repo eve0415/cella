@@ -155,6 +155,9 @@ proc-macro2 = "=1.0.106"
 # UUID generation (phantom tokens)
 uuid = { version = "=1.23.1", features = ["v4"] }
 
+# Credential cache memory safety
+zeroize = "=1.8.2"
+
 # Testing
 tempfile = "=3.27.0"
 filetime = "=0.2.29"
