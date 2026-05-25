@@ -210,6 +210,12 @@ impl PhantomRegistry {
         };
 
         let tmp = path.with_extension("state.tmp");
+
+        let lock_result = acquire_state_lock(&path);
+        if lock_result.is_none() {
+            warn!("phantom registry: could not acquire state-file lock, proceeding without");
+        }
+
         if let Err(e) = std::fs::write(&tmp, &bytes) {
             warn!("phantom registry: state-file write failed: {e}");
             return;
@@ -296,6 +302,25 @@ impl PhantomRegistry {
             self.container_count()
         );
     }
+}
+
+fn acquire_state_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    let lock_path = path.with_extension("lock");
+    let delays = [100, 200, 400];
+    for delay_ms in delays {
+        match std::fs::File::create(&lock_path) {
+            Ok(file) => {
+                if file.try_lock().is_ok() {
+                    return Some(file);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+    }
+    None
 }
 
 fn generate_nonce() -> String {

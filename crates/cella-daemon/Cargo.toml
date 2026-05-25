@@ -9,6 +9,7 @@ base64.workspace = true
 cella-env.workspace = true
 cella-port.workspace = true
 cella-protocol.workspace = true
+fs4.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 cella-proxy.workspace = true

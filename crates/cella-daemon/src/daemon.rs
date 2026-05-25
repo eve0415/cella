@@ -145,8 +145,28 @@ fn persist_hostname_proxy_port(socket_path: &Path, port: u16, using_fallback_por
 ///
 /// # Errors
 ///
-/// Returns error if socket binding or PID file creation fails.
+fn enforce_single_instance(pid_path: &Path) -> Result<(), CellaDaemonError> {
+    if let Some(existing_pid) = read_pid_file(pid_path) {
+        if crate::shared::is_process_alive(existing_pid) {
+            return Err(CellaDaemonError::PidFile {
+                message: format!(
+                    "Another daemon instance is running (PID {existing_pid}). \
+                     Stop it first or delete {pid_path}",
+                    pid_path = pid_path.display()
+                ),
+            });
+        }
+        info!("Stale PID file found (PID {existing_pid}), taking over");
+    }
+    Ok(())
+}
+
+/// # Errors
+///
+/// Returns error if another daemon is already running, or if socket
+/// binding or PID file creation fails.
 pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), CellaDaemonError> {
+    enforce_single_instance(pid_path)?;
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
     // Prepare the SSH-agent proxy run directory and sweep any stale sockets
