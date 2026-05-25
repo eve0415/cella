@@ -52,31 +52,26 @@ Real-world incidents motivating this design:
 
 ## Architecture
 
-```
-Container                           Host
-┌──────────────────────────────┐    ┌──────────────────────────────────────────┐
-│                              │    │                                          │
-│  process ──► HTTP request    │    │                                          │
-│      │  (phantom token in    │    │                                          │
-│      │   auth header)        │    │                                          │
-│      ▼                       │    │                                          │
-│  agent MITM proxy            │    │                                          │
-│      │  matches credential   │    │                                          │
-│      │  domain route         │    │                                          │
-│      ▼                       │    │                                          │
-│  credential tunnel ─────TCP──┼───►│  daemon control port                     │
-│  (CredentialProxyHandshake)  │    │      │                                   │
-│                              │    │      ▼                                   │
-│                              │    │  credential_proxy handler                │
-│                              │    │      │  1. validate phantom token        │
-│                              │    │      │  2. check provider match          │
-│                              │    │      │  3. verify domain registration    │
-│                              │    │      │  4. resolve real credential       │
-│                              │    │      │  5. make upstream HTTPS request   │
-│                              │    │      ▼                                   │
-│  ◄── streamed response ─────┼────│  upstream API (api.anthropic.com, etc.)  │
-│                              │    │                                          │
-└──────────────────────────────┘    └──────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Container
+        process["process<br/>(phantom token in auth header)"]
+        mitm["agent MITM proxy"]
+        tunnel["credential tunnel"]
+    end
+
+    subgraph Host
+        control["daemon control port"]
+        handler["credential_proxy handler"]
+        upstream["upstream API"]
+    end
+
+    process -->|HTTP request| mitm
+    mitm -->|matches credential<br/>domain route| tunnel
+    tunnel -->|"TCP (CredentialProxyHandshake)"| control
+    control --> handler
+    handler -->|"1. validate phantom token<br/>2. check provider match<br/>3. verify domain registration<br/>4. resolve real credential<br/>5. make upstream HTTPS request"| upstream
+    upstream -->|streamed response| tunnel
 ```
 
 ### Crate Responsibilities
