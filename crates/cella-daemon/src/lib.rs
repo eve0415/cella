@@ -3,6 +3,7 @@
 //! Single daemon that manages credential forwarding, port forwarding, and
 //! browser-open requests from in-container agents.
 
+pub mod audit;
 pub mod browser;
 pub mod clipboard;
 pub mod control_server;
