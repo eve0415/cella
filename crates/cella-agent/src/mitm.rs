@@ -273,16 +273,7 @@ async fn handle_request(
             &config.container_name,
         )
     {
-        return Ok(super::credential_tunnel::tunnel_request(
-            req,
-            host,
-            route,
-            addr,
-            token,
-            name,
-            config.container_nonce.as_deref(),
-        )
-        .await);
+        return Ok(route_credential_request(req, host, route, addr, token, name, config).await);
     }
 
     let path = super::forward_proxy::strip_query(req.uri().path());
@@ -368,6 +359,81 @@ fn prepare_forwarded_request(
     }
 
     Request::from_parts(parts, body)
+}
+
+/// Route a credential request through the mux client, falling back to the
+/// legacy per-request tunnel on initial connection failure.
+async fn route_credential_request(
+    req: Request<Incoming>,
+    host: &str,
+    route: &crate::proxy_config::CredentialRoute,
+    daemon_addr: &str,
+    daemon_token: &str,
+    container_name: &str,
+    config: &AgentProxyConfig,
+) -> Response<BoxBody> {
+    let mux = get_or_connect_mux(config, daemon_addr).await;
+
+    if let Some(client) = mux {
+        match client
+            .proxy_request(
+                req,
+                host,
+                route,
+                daemon_token,
+                container_name,
+                config.container_nonce.as_deref(),
+            )
+            .await
+        {
+            Ok(resp) => return resp,
+            Err(e) => {
+                warn!("Credential mux request failed: {e}");
+            }
+        }
+    } else {
+        // Mux unavailable — fall back to legacy per-request tunnel.
+        return super::credential_tunnel::tunnel_request(
+            req,
+            host,
+            route,
+            daemon_addr,
+            daemon_token,
+            container_name,
+            config.container_nonce.as_deref(),
+        )
+        .await;
+    }
+
+    Response::builder()
+        .status(502)
+        .body(full("Credential proxy unavailable"))
+        .expect("building 502 response")
+}
+
+/// Get or lazily initialize the mux client.
+async fn get_or_connect_mux(
+    config: &AgentProxyConfig,
+    daemon_addr: &str,
+) -> Option<Arc<super::credential_mux::CredentialMuxClient>> {
+    let mut guard = config.credential_mux.lock().await;
+    if let Some(ref client) = *guard {
+        return Some(client.clone());
+    }
+
+    match super::credential_mux::CredentialMuxClient::connect(daemon_addr).await {
+        Ok(client) => {
+            let client = Arc::new(client);
+            *guard = Some(client.clone());
+            drop(guard);
+            debug!("Credential mux connected to {daemon_addr}");
+            Some(client)
+        }
+        Err(e) => {
+            debug!("Credential mux connect failed, using legacy tunnel: {e}");
+            None
+        }
+    }
 }
 
 fn full(data: &'static str) -> BoxBody {

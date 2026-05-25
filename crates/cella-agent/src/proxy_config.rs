@@ -59,6 +59,10 @@ pub struct AgentProxyConfig {
 
     /// Per-container nonce for credential tunnel authentication.
     pub container_nonce: Option<String>,
+
+    /// Lazy-initialized multiplexed credential tunnel client.
+    pub credential_mux:
+        tokio::sync::Mutex<Option<std::sync::Arc<crate::credential_mux::CredentialMuxClient>>>,
 }
 
 impl AgentProxyConfig {
@@ -121,6 +125,7 @@ impl AgentProxyConfig {
             daemon_token: raw.daemon_token,
             container_name: raw.container_name,
             container_nonce: raw.container_nonce,
+            credential_mux: tokio::sync::Mutex::new(None),
         })
     }
 
