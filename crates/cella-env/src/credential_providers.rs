@@ -134,7 +134,7 @@ impl From<&CredentialProvider> for MergedProvider {
 pub struct CustomProviderInput<'a> {
     pub name: &'a str,
     pub env: &'a str,
-    pub domain: &'a str,
+    pub domains: &'a [String],
     pub header: &'a str,
     pub prefix: &'a str,
 }
@@ -155,7 +155,7 @@ pub fn merge_with_custom(custom: &[CustomProviderInput<'_>]) -> Vec<MergedProvid
         result.push(MergedProvider {
             id: c.name.to_string(),
             env_var: c.env.to_string(),
-            domains: vec![c.domain.to_string()],
+            domains: c.domains.to_vec(),
             header: c.header.to_string(),
             prefix: c.prefix.to_string(),
         });
@@ -239,10 +239,11 @@ mod tests {
 
     #[test]
     fn merge_custom_adds_provider() {
+        let domains = vec!["api.internal.corp".to_string()];
         let custom = vec![CustomProviderInput {
             name: "internal",
             env: "INTERNAL_KEY",
-            domain: "api.internal.corp",
+            domains: &domains,
             header: "x-api-key",
             prefix: "",
         }];
@@ -253,10 +254,11 @@ mod tests {
 
     #[test]
     fn merge_custom_overrides_builtin() {
+        let domains = vec!["custom-anthropic.corp".to_string()];
         let custom = vec![CustomProviderInput {
             name: "anthropic",
             env: "MY_ANTHROPIC_KEY",
-            domain: "custom-anthropic.corp",
+            domains: &domains,
             header: "Authorization",
             prefix: "Bearer ",
         }];

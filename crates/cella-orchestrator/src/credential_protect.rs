@@ -22,7 +22,7 @@ pub fn generate_phantom_tokens(settings: &cella_config::CellaConfig) -> PhantomT
         .map(|c| CustomProviderInput {
             name: &c.name,
             env: &c.env,
-            domain: &c.domain,
+            domains: &c.domains,
             header: &c.header,
             prefix: &c.prefix,
         })

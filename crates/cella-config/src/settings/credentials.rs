@@ -6,6 +6,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_cache_ttl() -> u32 {
+    60
+}
+
 /// Credential forwarding settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +30,10 @@ pub struct Credentials {
     #[serde(default)]
     pub protect: bool,
 
+    /// Credential resolution cache TTL in seconds. 0 disables caching.
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_seconds: u32,
+
     /// Custom credential providers beyond the built-in set.
     #[serde(default)]
     pub providers: Vec<CustomCredentialProvider>,
@@ -43,8 +51,8 @@ pub struct CustomCredentialProvider {
     pub name: String,
     /// Host environment variable holding the real credential.
     pub env: String,
-    /// Target domain this provider protects.
-    pub domain: String,
+    /// Target domains this provider protects.
+    pub domains: Vec<String>,
     /// HTTP header name for injection.
     pub header: String,
     /// Header value prefix (e.g., `"Bearer "`).
@@ -58,6 +66,7 @@ impl Default for Credentials {
             gh: true,
             ai: AiCredentials::default(),
             protect: false,
+            cache_ttl_seconds: 60,
             providers: Vec::new(),
             profile: None,
         }
@@ -74,6 +83,7 @@ mod tests {
         assert!(settings.gh);
         assert!(settings.ai.enabled);
         assert!(!settings.protect);
+        assert_eq!(settings.cache_ttl_seconds, 60);
         assert!(settings.providers.is_empty());
         assert!(settings.profile.is_none());
     }
@@ -84,6 +94,7 @@ mod tests {
         assert!(settings.gh);
         assert!(settings.ai.enabled);
         assert!(!settings.protect);
+        assert_eq!(settings.cache_ttl_seconds, 60);
     }
 
     #[test]
@@ -120,7 +131,7 @@ mod tests {
 [[providers]]
 name = "internal-api"
 env = "INTERNAL_API_KEY"
-domain = "api.internal.corp"
+domains = ["api.internal.corp"]
 header = "Authorization"
 prefix = "Bearer "
 "#;
@@ -128,7 +139,7 @@ prefix = "Bearer "
         assert_eq!(settings.providers.len(), 1);
         assert_eq!(settings.providers[0].name, "internal-api");
         assert_eq!(settings.providers[0].env, "INTERNAL_API_KEY");
-        assert_eq!(settings.providers[0].domain, "api.internal.corp");
+        assert_eq!(settings.providers[0].domains, ["api.internal.corp"]);
         assert_eq!(settings.providers[0].header, "Authorization");
         assert_eq!(settings.providers[0].prefix, "Bearer ");
     }
@@ -139,11 +150,26 @@ prefix = "Bearer "
 [[providers]]
 name = "simple"
 env = "API_KEY"
-domain = "api.example.com"
+domains = ["api.example.com"]
 header = "x-api-key"
 "#;
         let settings: Credentials = toml::from_str(toml).unwrap();
         assert_eq!(settings.providers[0].prefix, "");
+    }
+
+    #[test]
+    fn deserialize_custom_provider_multi_domain() {
+        let toml = r#"
+[[providers]]
+name = "multi"
+env = "API_KEY"
+domains = ["api.example.com", "api2.example.com"]
+header = "Authorization"
+"#;
+        let settings: Credentials = toml::from_str(toml).unwrap();
+        assert_eq!(settings.providers[0].domains.len(), 2);
+        assert_eq!(settings.providers[0].domains[0], "api.example.com");
+        assert_eq!(settings.providers[0].domains[1], "api2.example.com");
     }
 
     #[test]
@@ -154,19 +180,31 @@ protect = true
 [[providers]]
 name = "a"
 env = "A_KEY"
-domain = "a.example.com"
+domains = ["a.example.com"]
 header = "x-api-key"
 
 [[providers]]
 name = "b"
 env = "B_KEY"
-domain = "b.example.com"
+domains = ["b.example.com"]
 header = "Authorization"
 prefix = "Token "
 "#;
         let settings: Credentials = toml::from_str(toml).unwrap();
         assert!(settings.protect);
         assert_eq!(settings.providers.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_cache_ttl() {
+        let settings: Credentials = toml::from_str("cache_ttl_seconds = 120").unwrap();
+        assert_eq!(settings.cache_ttl_seconds, 120);
+    }
+
+    #[test]
+    fn deserialize_cache_ttl_zero_disables() {
+        let settings: Credentials = toml::from_str("cache_ttl_seconds = 0").unwrap();
+        assert_eq!(settings.cache_ttl_seconds, 0);
     }
 
     #[test]
@@ -187,7 +225,7 @@ prefix = "Token "
 [[providers]]
 name = "x"
 env = "X"
-domain = "x.com"
+domains = ["x.com"]
 header = "h"
 bogus = "nope"
 "#;
