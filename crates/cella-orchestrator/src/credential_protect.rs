@@ -3,9 +3,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use cella_config::settings::CustomCredentialProvider;
 use cella_env::credential_providers::{self, CustomProviderInput, MergedProvider};
 use cella_protocol::PhantomTokenEntry;
 use tracing::{info, warn};
+
+use crate::approved_providers::ApprovedProviders;
 
 /// Generated phantom tokens ready for daemon registration and container injection.
 pub struct PhantomTokenSet {
@@ -198,6 +201,31 @@ pub fn add_protect_label<S: std::hash::BuildHasher>(
     );
 }
 
+/// Partition custom providers into approved and unapproved groups.
+///
+/// Returns `(approved, needs_approval)`. Providers whose configuration
+/// has changed since last approval appear in `needs_approval`.
+pub fn filter_custom_providers<'a>(
+    providers: &'a [CustomCredentialProvider],
+    approved: &ApprovedProviders,
+) -> (
+    Vec<&'a CustomCredentialProvider>,
+    Vec<&'a CustomCredentialProvider>,
+) {
+    let mut ok = Vec::new();
+    let mut pending = Vec::new();
+
+    for provider in providers {
+        if approved.is_approved(provider) {
+            ok.push(provider);
+        } else {
+            pending.push(provider);
+        }
+    }
+
+    (ok, pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +285,53 @@ mod tests {
         add_protect_label(&mut labels, "cella-test-main");
         assert_eq!(labels["dev.cella.credential_protect"], "true");
         assert_eq!(labels["dev.cella.container_name"], "cella-test-main");
+    }
+
+    fn test_provider(name: &str) -> CustomCredentialProvider {
+        CustomCredentialProvider {
+            name: name.to_string(),
+            env: "KEY".to_string(),
+            domains: vec!["api.example.com".to_string()],
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_separates_approved_from_pending() {
+        let mut store = ApprovedProviders::load(Path::new("/nonexistent"));
+        let a = test_provider("approved-one");
+        let b = test_provider("pending-one");
+        store.approve(&a);
+
+        let providers = vec![a, b];
+        let (ok, pending) = filter_custom_providers(&providers, &store);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "approved-one");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "pending-one");
+    }
+
+    #[test]
+    fn filter_empty_providers_returns_empty() {
+        let store = ApprovedProviders::load(Path::new("/nonexistent"));
+        let (ok, pending) = filter_custom_providers(&[], &store);
+        assert!(ok.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn filter_changed_provider_needs_reapproval() {
+        let mut store = ApprovedProviders::load(Path::new("/nonexistent"));
+        let original = test_provider("evolving");
+        store.approve(&original);
+
+        let mut changed = original;
+        changed.domains = vec!["evil.example.com".to_string()];
+        let providers = vec![changed];
+
+        let (ok, pending) = filter_custom_providers(&providers, &store);
+        assert!(ok.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 }
