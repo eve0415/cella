@@ -48,12 +48,15 @@ Container and image naming conventions live here so that all backends use consis
 | `resolve` | Container target resolution (`ContainerTarget`) |
 | `mount` | Mount specification types and helpers |
 | `network` | Network configuration types |
+| `container_setup` | Post-creation container setup (user resolution, lifecycle commands, SSH/git injection) |
+| `progress` | Channel-based progress reporting (`ProgressSender`, `ProgressEvent`, handle types) |
+| `uid_image` | Build-time UID remap layer for `updateRemoteUserUID` support |
 
 ## Crate Dependencies
 
-**Depends on:** none (foundation crate — only `sha2`, `hex`, `chrono`, `thiserror`)
+**Depends on:** [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-proxy](../cella-proxy)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-compose](../cella-compose), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container), [cella-docker](../cella-docker), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator), [cella-tool-install](../cella-tool-install)
 
 ## Testing
 
