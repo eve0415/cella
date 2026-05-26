@@ -421,7 +421,13 @@ Tool installation failures are non-fatal to `cella up` -- other tools and the co
 | Host env var is unset or empty | That provider's key is not injected. No error -- other keys proceed. |
 | Phantom token registration fails | Warning logged. Container starts without protection for that provider. Fail-closed at request time (see [Credential Protection](credential-protection.md)). |
 
-## Extensions
+## Config Forwarding Diagnostics
+
+When a host config directory is absent and pre-creation fails, cella emits a warning diagnostic identifying the missing path and which tool is affected. The mount spec is omitted (the tool uses container-local defaults), but the user is informed rather than left guessing.
+
+## Robust Plugin Manifest Rewriting
+
+Plugin manifest path rewriting uses the container's actual home directory (resolved from `/etc/passwd` or `$HOME`) instead of heuristic regex patterns. The rewriter reads the source manifest, identifies home directory references, and substitutes the resolved container home path.
 
 ### Custom Tool Definitions
 
@@ -453,5 +459,3 @@ Tools that support pre-downloaded archives can be installed from local sources:
 3. **Alpine Claude Code dependencies** -- the Alpine dependency list (`libgcc`, `libstdc++`, `ripgrep`) is hardcoded. If the Claude Code native installer changes its requirements, the dependency list requires a cella update.
 4. **tmux has no version pinning** -- the system package manager determines the tmux version. Different base images ship different tmux versions.
 5. **Neovim architecture support** -- only `x86_64` and `aarch64` Linux binaries are available from GitHub releases. Other architectures (e.g., `riscv64`, `s390x`) require the user to pre-install nvim in their container image.
-6. **Config forwarding requires host paths to exist** -- if the host config directory is absent and pre-creation fails (e.g., permission error), the mount spec is silently omitted. The tool works but uses container-local defaults instead of the user's configuration.
-7. **Plugin manifest path rewriting is heuristic** -- the regex-based sed for Claude Code plugin manifests assumes home directories follow `/home/<user>`, `/Users/<user>`, or `/root` patterns. Non-standard home directory layouts may not be rewritten correctly.
