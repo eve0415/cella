@@ -187,7 +187,7 @@ All variants are tagged with `"type"` in snake_case.
 | Field | Type | Description |
 |---|---|---|
 | `uptime_secs` | `u64` | Agent uptime in seconds |
-| `ports_detected` | `usize` | Number of currently detected port listeners |
+| `ports_detected` | `usize` | Number of detected port listeners |
 
 ```json
 {"type":"health","uptime_secs":120,"ports_detected":2}
@@ -955,7 +955,7 @@ All variants are tagged with `"type"` in snake_case.
 |---|---|---|
 | `container_name` | `string` | Container name |
 | `container_id` | `string` | Docker container ID |
-| `forwarded_port_count` | `usize` | Number of currently forwarded ports |
+| `forwarded_port_count` | `usize` | Number of forwarded ports |
 | `agent_connected` | `bool` | Whether the agent TCP connection is active |
 | `last_seen_secs` | `u64` | Seconds since last agent heartbeat (default: `0`) |
 | `agent_version` | `string?` | Agent version from the `AgentHello` handshake, if connected (default: `null`) |

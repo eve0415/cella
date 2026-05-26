@@ -808,7 +808,7 @@ Labels are set at container creation and are immutable for the container's lifet
 
 | Condition | HTTP Status | Error Category | X-Cella-Error | Diagnostic Message |
 |---|---|---|---|---|
-| Container nonce invalid or missing | 401 | `nonce_invalid` | `nonce_invalid` | "Container nonce does not match registered nonce" |
+| Container nonce invalid or absent | 401 | `nonce_invalid` | `nonce_invalid` | "Container nonce does not match registered nonce" |
 | Phantom token not in auth header | 403 | `token_invalid` | `token_invalid` | "No phantom token found in {header} header" |
 | Phantom token not in registry | 403 | `token_invalid` | `token_invalid` | "Phantom token not found in registry for container {name}" |
 | Provider ID mismatch | 403 | `provider_mismatch` | `provider_mismatch` | "Handshake provider {a} does not match token provider {b}" |

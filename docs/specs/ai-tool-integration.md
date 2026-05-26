@@ -298,7 +298,7 @@ Constraints:
 - `--version` MUST NOT be combined with `--all`.
 - `--version` is not supported for tmux (system package manager controls the version).
 
-When `--version` is specified, the idempotency check is bypassed -- the installer runs regardless of what version is currently installed.
+When `--version` is specified, the idempotency check is bypassed -- the installer runs regardless of the installed version.
 
 ### Latest Resolution
 
