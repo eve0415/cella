@@ -6,7 +6,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 cella's worktree-container binding system maps each git worktree to its own dev container, enabling parallel branch development with isolated environments. A single devcontainer configuration produces multiple independent containers -- one per active branch -- with non-conflicting port assignments, separate filesystems, and full lifecycle management from either the host or any container.
 
-The system spans four crates: `cella-git` (worktree creation, listing, removal, path computation), `cella-daemon` (task manager, worktree operation dispatch, port coordination), `cella-cli` (host-side command parsing and container pipeline), and `cella-agent` (in-container CLI mode with daemon delegation). See [architecture.md](../architecture.md) for full crate responsibilities.
+The system spans four crates: `cella-git` (worktree creation, listing, removal, path computation), `cella-daemon` (task manager, worktree operation dispatch, port coordination), `cella-cli` (host-side command parsing and container pipeline), and `cella-agent` (in-container CLI mode with daemon delegation). See [architecture.md](architecture.md) for full crate responsibilities.
 
 ## Architecture
 
@@ -301,7 +301,7 @@ Ports are released when a container is deregistered from the daemon (via `releas
 
 ### Hostname Routing
 
-When hostname-based port forwarding is active (see [hostname-proxy.md](hostname-proxy.md)), each worktree container gets unique hostnames derived from its branch name:
+When hostname-based port forwarding is active (see [Port Forwarding](port-forwarding.md)), each worktree container gets unique hostnames derived from its branch name:
 
 ```
 {port}.{branch}.{project}.localhost
