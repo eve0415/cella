@@ -538,17 +538,48 @@ Discovery errors:
 
 All configuration errors are fatal -- cella does not proceed with partial configuration.
 
-## Extensions
+## Dual Config File Warning
 
-### Config Profiles
+When both `cella.toml` and `cella.json` exist in the same directory, cella emits a warning diagnostic identifying both files and indicating which one is used (TOML takes precedence). The JSON file is not silently ignored.
 
-Named configuration profiles enabling quick switching between settings sets:
+## Unified Merge Semantics
+
+Merge behavior is documented in a single reference table covering both cella settings layers and devcontainer.json layers:
+
+| Property Category | Cella Settings Merge | devcontainer.json Merge |
+|---|---|---|
+| Scalars | Higher-priority wins | Last wins |
+| Objects | Recursive deep merge | Deep merge (selected properties) |
+| Arrays (general) | Higher-priority prepended | Property-specific (union, concat, or last-wins) |
+| `shell.preferred` | Replacement (entire array) | N/A (cella-only) |
+| `network.rules` | Prepended (first-match-wins) | N/A (cella-only) |
+| `forwardPorts` | N/A (devcontainer-only) | Union (no duplicates) |
+| `mounts`, `runArgs` | N/A (devcontainer-only) | Concatenated |
+| `features`, `containerEnv` | N/A (devcontainer-only) | Deep merge |
+| `hostRequirements` | N/A (devcontainer-only) | Per-field maximum |
+
+Where behaviors differ between the two systems, the table explicitly notes the difference.
+
+## Extended Variable Substitution
+
+Variable substitution operates on all JSON value types:
+
+| Value Type | Behavior |
+|---|---|
+| String | Substituted (existing behavior) |
+| Number | Parsed as integer or float after substitution |
+| Boolean | Parsed as `true`/`false` after substitution |
+| Object keys | Not processed |
+
+## Config Profiles
+
+Named configuration profiles enable quick switching between settings sets:
 
 - `cella config use <profile>` activates a profile from `~/.cella/profiles/<name>.toml`
-- Active profile is loaded as an additional layer between global and workspace customizations
+- The active profile is loaded as an additional layer between global and workspace customizations
 - `cella config list` shows available profiles
 
-### Remote Config
+## Remote Config
 
 Organization-wide configuration distribution:
 
@@ -559,9 +590,6 @@ Organization-wide configuration distribution:
 
 ## Limitations
 
-1. TOML and JSON config files are mutually exclusive per directory -- when both exist, the JSON file is silently ignored rather than producing a warning.
+1. `${containerEnv:VARIABLE}` always resolves to the default value (or empty string) at configuration time because the container is not running at configuration time.
 2. The `customizations.cella` section in devcontainer.json is extracted as raw JSON and re-deserialized through the same TOML-compatible schema. TOML-specific syntax (inline tables, multi-line strings) is not available in the JSON embedding.
-3. Array merge behavior differs between cella settings layers (prepend) and devcontainer.json layers (property-specific: union, concatenate, or last-wins). Users working with both systems should consult the specific merge rules.
-4. Variable substitution operates on string values only. Variables in object keys, numeric values, or boolean values are not processed.
-5. `${containerEnv:VARIABLE}` always resolves to the default value (or empty string) at configuration time because the container is not running at configuration time.
-6. The `shell.preferred` replacement semantics are an exception to the general array merge behavior. This is intentional but may surprise users expecting concatenation.
+3. The `shell.preferred` replacement semantics are an exception to the general array merge behavior. This is intentional but may surprise users expecting concatenation.
