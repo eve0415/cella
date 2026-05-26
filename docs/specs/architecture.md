@@ -403,14 +403,38 @@ cella is designed for extension at several well-defined boundaries:
 
 **Network rules**: Rule definitions are extensible via the glob-based matching engine in `cella-network`. New rule types can be added by extending the `NetworkRule` enum and `RuleAction` without changing the merge or evaluation logic.
 
+## Daemon State Persistence
+
+The daemon persists its runtime state to a SQLite database at `~/.cella/state.db` using WAL (Write-Ahead Logging) mode for concurrent read access. Schema migrations are managed via rusqlite's built-in migration support.
+
+Persisted state includes:
+
+| Table | Contents |
+|---|---|
+| `port_allocations` | Host-port assignments per container |
+| `container_registrations` | Container identity, IP, labels, backend kind |
+| `ssh_agent_proxies` | SSH agent bridge ports and refcounts per workspace |
+
+State survives daemon restart. Containers do not need to re-register after a daemon restart — the daemon restores their registrations from the database and reconciles against the Docker API to remove stale entries for containers that no longer exist.
+
+Depends on: This is a foundational capability. See [IPC Protocol § Transport Upgrade: HTTP/2](ipc-protocol.md#transport-upgrade-http2) and [Worktrees § Background Tasks](worktrees.md#background-tasks) for features that build on persistent state.
+
+## Rolling Agent Upgrade
+
+The agent binary version matches the daemon/CLI version. On daemon start or binary update, the daemon signals connected agents one at a time to restart. The upgrade sequence:
+
+1. Select the next agent to upgrade (round-robin by connection order).
+2. Send a restart signal to the agent over the control connection.
+3. Wait for the agent to reconnect and pass a health check (version match, heartbeat received).
+4. Proceed to the next agent.
+
+Configurable concurrency controls how many agents upgrade simultaneously (default: 1). If an agent fails to reconnect within the timeout (30 seconds), the daemon pauses the rollout and emits a warning diagnostic identifying the stalled container.
+
+This replaces the current behavior where all agents are affected simultaneously by volume updates.
+
 ## Limitations
 
 1. The hostname HTTP proxy handles HTTP traffic only. No CA installation or HTTPS termination is performed for hostname-based routing. Non-HTTP traffic (databases, raw TCP, UDP) uses port-based allocation exclusively.
 2. The hostname proxy binds to loopback only. No LAN exposure or arbitrary TLD support.
-3. Daemon state (port allocations, container registrations, SSH agent proxy refcounts) is held in memory only and is lost on daemon restart. Containers re-register on agent reconnection.
-4. Docker container labels and environment variables are immutable after creation. Configuration changes that affect labels or environment require container recreation.
-5. The `cella-agent` Docker volume is shared across ALL containers. Agent binary updates affect every running container. The agent entrypoint runs in a restart loop; `restart_agent_in_container()` uses `pkill`-then-verify for graceful upgrade with a backward-compatible fallback for containers created before the restart loop.
-6. Cookie leakage can occur across branches when services set `Domain=myapp.localhost` cookies, as the hostname scheme uses the same parent domain for all branches of a project.
-7. Safari `.localhost` hostname resolution may be inconsistent across macOS versions.
-8. Dev servers with strict host validation (Vite, Next.js, Django, Rails) MAY reject requests with hostname-based `Host` headers and require per-server configuration.
-9. The Apple Container backend does not support Docker Compose workflows or managed agent provisioning (`compose` and `managed_agent` capabilities are both `false`).
+3. Docker container labels and environment variables are immutable after creation. Configuration changes that affect labels or environment require container recreation.
+4. The Apple Container backend does not support Docker Compose workflows or managed agent provisioning (`compose` and `managed_agent` capabilities are both `false`).
