@@ -485,46 +485,69 @@ Failed to generate CA for MITM: {error}. Path-level blocking will be domain-only
 
 The proxy config JSON sets `ca_cert_pem` and `ca_key_pem` to `null`, and the agent operates without MITM capability.
 
-## Extensions
+## Encrypted Client Hello (ECH)
 
-### Encrypted Client Hello (ECH)
+ECH encrypts the TLS SNI field, preventing the proxy from determining the target domain during CONNECT. The proxy uses DNS-based routing as the alternative:
 
-ECH encrypts the TLS SNI field, preventing the proxy from determining the target domain during CONNECT. When ECH is widely deployed, the proxy requires alternative domain resolution:
+- **DNS-based routing:** DNS queries are intercepted to extract the target domain before the TLS connection begins. Resolved IPs are mapped back to domains for rule evaluation.
+- **Config:** `network.proxy.ech_strategy = "dns"` selects the resolution strategy.
+- **Fallback:** When ECH is detected and no alternative resolution is available, the mode's default disposition applies (allow for denylist, block for allowlist) and a warning is logged.
 
-- **DNS-based routing**: Intercept DNS queries to extract the target domain before the TLS connection begins. Map resolved IPs back to domains for rule evaluation.
-- **Config extension**: `network.proxy.ech_strategy = "dns"` selects the resolution strategy.
-- **Fallback**: When ECH is detected and no alternative resolution is available, apply the mode's default disposition (allow for denylist, block for allowlist) and log a warning.
+## HTTP/2 Inspection
 
-### HTTP/2 Inspection
+The MITM proxy inspects HTTP/2 traffic at the stream level:
 
-The MITM proxy handles HTTP/1.1 over TLS. HTTP/2 multiplexes multiple request streams over a single TLS connection:
+- **Stream-level evaluation:** HTTP/2 frames are demultiplexed and each stream's `:path` pseudo-header is evaluated against the rule set independently.
+- **ALPN negotiation:** During the MITM TLS handshake, HTTP/2 is negotiated with the container process and upstream server when both support it.
+- **Mixed verdicts:** Different streams on the same connection may receive different verdicts. Blocked streams receive RST_STREAM; allowed streams are forwarded.
 
-- **Stream-level evaluation**: Demultiplex HTTP/2 frames and evaluate each stream's `:path` pseudo-header against the rule set independently.
-- **ALPN negotiation**: During MITM TLS handshake, negotiate HTTP/2 with the container process and upstream server when both support it.
-- **Mixed verdicts**: Different streams on the same connection may receive different verdicts. Blocked streams receive RST_STREAM; allowed streams are forwarded.
+Depends on: [IPC Protocol § Transport Upgrade: HTTP/2](ipc-protocol.md#transport-upgrade-http2)
 
-### Per-container Rules
+## Per-container Rules
 
-Different network policies for different containers within a workspace:
+Different network policies apply to different containers within a workspace:
 
-- **Config extension**: `network.containers.<name>.mode` and `network.containers.<name>.rules` override the global network config for specific containers.
-- **Rule merging**: Per-container rules are merged with global rules, with per-container taking precedence. The merge follows the same union-with-dedup logic as cella.toml/devcontainer.json merging.
-- **Implementation**: The agent receives its container-specific merged rule set via `CELLA_PROXY_CONFIG`. No runtime rule resolution is needed.
+- **Config:** `network.containers.<name>.mode` and `network.containers.<name>.rules` override the global network config for specific containers.
+- **Rule merging:** Per-container rules are merged with global rules, with per-container taking precedence. The merge follows the same union-with-dedup logic as cella.toml/devcontainer.json merging.
+- **Implementation:** The agent receives its container-specific merged rule set via `CELLA_PROXY_CONFIG`. No runtime rule resolution is needed.
 
-### QUIC/HTTP/3 Interception
+## QUIC/HTTP/3 Interception
 
-QUIC-based connections bypass the TCP-level CONNECT proxy entirely:
+QUIC-based connections are intercepted at the UDP level:
 
-- **UDP interception**: Intercept outbound UDP traffic on port 443 (QUIC) and apply domain-level rules based on the SNI in the QUIC Initial packet.
-- **QUIC MITM**: Terminate the QUIC connection, inspect HTTP/3 frames, and forward via a separate QUIC connection to the upstream server.
-- **Alt-Svc suppression**: Strip `Alt-Svc` headers from HTTP/1.1 and HTTP/2 responses to prevent clients from upgrading to QUIC, keeping traffic on the interceptable TCP path.
+- **UDP interception:** Outbound UDP traffic on port 443 (QUIC) is intercepted. Domain-level rules are applied based on the SNI in the QUIC Initial packet.
+- **QUIC MITM:** The QUIC connection is terminated, HTTP/3 frames are inspected, and traffic is forwarded via a separate QUIC connection to the upstream server.
+- **Alt-Svc suppression:** `Alt-Svc` headers are stripped from HTTP/1.1 and HTTP/2 responses to prevent clients from upgrading to QUIC, keeping traffic on the interceptable TCP path.
+
+Depends on: [IPC Protocol § Transport Upgrade: QUIC/HTTP/3](ipc-protocol.md#transport-upgrade-quichttp3)
+
+## Multi-label Wildcards
+
+The `**` wildcard matches zero or more domain labels. `**.example.com` matches `a.example.com` and `a.b.example.com`. Single `*` behavior is unchanged (matches exactly one label).
+
+| Pattern | Matches | Does Not Match |
+|---|---|---|
+| `**.example.com` | `foo.example.com`, `a.b.example.com` | `example.com` |
+| `*` (single label) | `foo.example.com` (one label in position) | `foo.bar.example.com` (two labels in position) |
+
+## Rule Hot-reload
+
+The daemon watches `cella.toml` and `devcontainer.json` for changes. On rule change, the daemon pushes the new merged ruleset to all connected agents via the control connection. No container restart is required. The agent applies the new rules atomically — in-flight requests complete under the old ruleset.
+
+## Trust Store Coverage
+
+Trust store injection covers the following distributions:
+
+| Distribution Family | Package Manager | Update Command |
+|---|---|---|
+| Debian (Ubuntu, Mint) | apt | `update-ca-certificates` |
+| RHEL (Fedora, CentOS, Rocky, Alma) | yum/dnf | `update-ca-trust` |
+| Alpine | apk | `update-ca-certificates` |
+| Arch | pacman | `update-ca-trust` |
+| SUSE (openSUSE) | zypper | `update-ca-trust` |
+
+Custom base images with non-standard trust store locations require manual CA installation.
 
 ## Limitations
 
-1. **HTTP/1.1 only** -- The MITM proxy handles HTTP/1.1 over TLS. HTTP/2 and HTTP/3 streams are not inspected at the path level. Domain-level blocking still applies to all protocols via CONNECT interception.
-2. **Certificate pinning** -- Tools that pin TLS certificates (some `curl` builds, mobile SDKs, security-hardened clients) reject MITM certificates. These tools cannot use path-level network filtering.
-3. **Proxy bypass** -- A container process can unset proxy environment variables, use raw sockets, or connect directly to destinations, bypassing the proxy entirely. Network proxy rules are enforced at the proxy level, not the network level.
-4. **Single `*` domain wildcard** -- `*` matches exactly one domain label. There is no `**` multi-label wildcard. `*.example.com` does not match `a.b.example.com`; each depth requires an explicit rule.
-5. **No runtime rule updates** -- Rules are loaded at container startup and baked into `CELLA_PROXY_CONFIG`. Changing rules requires restarting the container.
-6. **Trust store coverage** -- Trust store injection covers Debian-family and RHEL-family distributions. Other distributions or custom base images may require manual CA installation.
-7. **ECH** -- Encrypted Client Hello hides the SNI field from the proxy, preventing domain-based routing decisions for ECH-enabled clients. See [Extensions](#encrypted-client-hello-ech) for the mitigation path.
+1. **Certificate pinning** -- Tools that pin TLS certificates (some `curl` builds, mobile SDKs, security-hardened clients) reject MITM certificates. These tools cannot use path-level network filtering.
