@@ -258,6 +258,11 @@ async fn run_frame_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin + Send + 'st
             &in_flight,
         )
         .await;
+
+        requests.retain(|_, state| {
+            state.phase != RequestPhase::Terminal
+                || state.task_handle.as_ref().is_some_and(|h| !h.is_finished())
+        });
     }
 
     abort_in_flight(&mut requests);
