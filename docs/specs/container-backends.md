@@ -531,6 +531,24 @@ All backends map their internal errors to `BackendError`, a unified error type w
 
 Each variant carries user-facing `help` text where appropriate (e.g., `ContainerNotFound` suggests `cella up` or `cella list`). Backends MUST map their SDK-specific errors (bollard errors, subprocess failures) into these variants rather than exposing implementation details.
 
+## Podman Backend
+
+The Podman backend implements `ContainerBackend` via Podman's Docker-compatible API. cella detects Podman by checking the API's `/info` endpoint for the `Podman` server field.
+
+Podman-specific handling includes:
+
+| Aspect | Behavior |
+|---|---|
+| Rootless networking | slirp4netns/pasta support |
+| Volume semantics | `:Z`/`:z` SELinux label support |
+| Build cache | Podman-specific cache behavior |
+
+The backend capability flags match Docker except where Podman's API diverges.
+
+## Colima SSH Agent Auto-detection
+
+When running under Colima, cella detects the Colima VM and checks `colima.yaml` for SSH agent forwarding configuration. If `forwardAgent` is not enabled, cella emits a diagnostic with the exact configuration change needed (`forwardAgent: true` in `~/.colima/default/colima.yaml` or `colima start --ssh-agent`). On Linux, cella detects native Docker and uses Unix domain socket forwarding directly.
+
 ## Extensions
 
 ### Kubernetes Backend
@@ -544,11 +562,8 @@ The Docker backend's `connect_with_host` method accepts TCP URLs, enabling conne
 ## Limitations
 
 - **Apple Container CLI stability.** The `container` CLI output format is pre-1.0 and may change between macOS releases. The backend uses best-effort JSON parsing with multiple key-path fallbacks to tolerate format changes.
-- **Agent volume sharing.** The `cella-agent` Docker volume is shared across ALL containers. Binary upgrades via `ensure_agent_provisioned` affect every running container simultaneously. There is no per-container agent isolation.
-- **Daemon state volatility.** Port allocations and container registrations held by the daemon are in-memory only. Daemon restart loses all state, requiring containers to re-register.
 - **Container label immutability.** Docker container labels and environment variables are immutable after creation. Configuration changes that affect labels require container recreation.
 - **macOS container-IP routing.** Colima and Docker Desktop for Mac run containers inside a VM. Container IPs are not routable from the host. Port access requires explicit forwarding through the daemon's tunnel infrastructure. OrbStack is the exception -- its native `.local` domain routing provides direct container access.
-- **Podman compatibility.** Podman's Docker-compatible API covers the core surface but may diverge on edge cases (rootless networking, volume semantics, build cache behavior). cella connects via the Docker backend and does not account for Podman-specific API differences.
 
 ---
 
