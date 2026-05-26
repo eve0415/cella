@@ -1,20 +1,45 @@
 # IPC Protocol Specification
 
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
+
+## Summary
+
 cella uses three IPC protocols for communication between host and container components:
 
-1. **Agent <-> Daemon** -- TCP, for runtime communication between the in-container agent and the host daemon
-2. **CLI <-> Daemon Management** -- Unix socket (`~/.cella/daemon.sock`), for CLI tooling to query and control the daemon
-3. **Git Credential Helper** -- stdin/stdout, for forwarding git credentials from host to container
+1. **Agent <-> Daemon** — TCP, for runtime communication between the in-container agent and the host daemon
+2. **CLI <-> Daemon Management** — Unix socket (`~/.cella/daemon.sock`), for CLI tooling to query and control the daemon
+3. **Git Credential Helper** — stdin/stdout, for forwarding git credentials from host to container
 
 ## Wire Format
 
-Layers 1 and 2 use **newline-delimited JSON** (NDJSON): each message is a single JSON object terminated by `\n`. Messages must not contain embedded newlines. Enum messages are internally tagged via `#[serde(tag = "type", rename_all = "snake_case")]`, meaning every JSON object contains a `"type"` field that identifies the variant. Field names use `snake_case`.
+Layers 1 and 2 use **newline-delimited JSON** (NDJSON): each message is a single JSON object terminated by `\n`. Messages MUST NOT contain embedded newlines. Enum messages are internally tagged via `#[serde(tag = "type", rename_all = "snake_case")]`, meaning every JSON object contains a `"type"` field that identifies the variant. Field names use `snake_case`.
 
 Layer 3 (Git Credential Helper) does **not** use JSON. It uses the git credential helper protocol: `key=value` lines terminated by a blank line over stdin/stdout.
 
 ```
 PROTOCOL_VERSION = 1
 ```
+
+## Connection Multiplexing
+
+Three connection types share the daemon's control TCP port. A 1-byte magic byte prefix discriminates connection types before any JSON parsing:
+
+| Magic Byte | Value | Connection Type | Description |
+|---|---|---|---|
+| `0x01` | AgentHello | Agent control connection | Protocol negotiation, NDJSON management messages |
+| `0x02` | TunnelHandshake | Reverse tunnel | Port forwarding tunnel connection |
+| `0x03` | CredentialProxy | Credential tunnel | Multiplexed credential proxy (see [Credential Protection](credential-protection.md#multiplexed-credential-tunnel)) |
+
+The magic byte is the first byte on the TCP stream. After reading it, the daemon MUST invoke the appropriate parser for the remainder of the connection.
+
+**Backward compatibility:** If the first byte is `{` (0x7B, start of JSON), the daemon peeks (without consuming) up to `MAX_HANDSHAKE_PAYLOAD` bytes and falls back to field-based trial deserialization for agents that predate magic byte framing:
+
+1. Try `CredentialProxyHandshake` (has `provider_id` + `request_id`)
+2. Try `TunnelHandshake` (has `connection_id`)
+3. Try `AgentHello` (has `protocol_version`)
+4. Reject with "unrecognized first message"
+
+The three message types have mutually exclusive required fields, so a valid payload MUST NOT match more than one type. If multiple parsers succeed (indicating a future field collision), the daemon MUST reject the message as ambiguous. This fallback is deprecated — new agents MUST use magic byte framing.
 
 ---
 
@@ -25,7 +50,7 @@ PROTOCOL_VERSION = 1
 1. Agent opens a TCP connection to the daemon's control port.
 2. Agent sends `AgentHello` as the first message.
 3. Daemon responds with `DaemonHello`.
-4. If `DaemonHello.error` is set, the daemon is rejecting the connection -- agent must disconnect.
+4. If `DaemonHello.error` is set, the daemon is rejecting the connection — the agent MUST disconnect.
 5. On success, bidirectional `AgentMessage` / `DaemonMessage` exchange begins.
 
 ### Handshake Messages
@@ -36,7 +61,7 @@ Sent by the agent as the first message after connecting. Not internally tagged -
 
 | Field | Type | Description |
 |---|---|---|
-| `protocol_version` | `u32` | Must match `PROTOCOL_VERSION` (1) |
+| `protocol_version` | `u32` | MUST match `PROTOCOL_VERSION` (1) |
 | `agent_version` | `string` | Agent binary version |
 | `container_name` | `string` | Container name for routing (agent self-identifies) |
 | `auth_token` | `string` | Auth token for validating the connection |
@@ -700,7 +725,7 @@ The agent responds by opening a **new** TCP connection to the daemon's control p
 
 ## Layer 2: CLI <-> Daemon Management (Unix Socket)
 
-Management messages use the same NDJSON wire format over a Unix domain socket at `~/.cella/daemon.sock`. Each request gets exactly one response.
+Management messages use the same NDJSON wire format over a Unix domain socket at `~/.cella/daemon.sock`. Each request MUST receive exactly one response.
 
 ### ManagementRequest
 
@@ -955,8 +980,8 @@ password=ghp_xxxx
 
 ### Parsing Rules
 
-- Each non-empty line must contain `key=value` (split on the first `=`).
-- Lines without `=` are silently skipped.
+- Each non-empty line MUST contain `key=value` (split on the first `=`).
+- Lines without `=` SHOULD be silently skipped.
 - A blank line (empty string or just `\n`) terminates the field set.
 - Order of fields is not significant.
 
