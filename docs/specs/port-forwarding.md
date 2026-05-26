@@ -233,13 +233,17 @@ On OrbStack, containers are directly reachable by IP. The daemon detects OrbStac
 
 ## devcontainer.json Properties
 
+### Port String Format
+
+`forwardPorts` accepts both numeric ports (`8080`) and `"host:container"` string format (`"8080:3000"`). The string format maps the container's port to a different host port. When a string entry is provided, the host port takes precedence over automatic allocation.
+
 ### forwardPorts
 
-An array of port numbers to forward. These ports are pre-allocated at container registration -- before the agent detects them -- guaranteeing stable host port assignments.
+An array of port numbers or `"host:container"` strings to forward. These ports are pre-allocated at container registration -- before the agent detects them -- guaranteeing stable host port assignments.
 
 ```jsonc
 {
-  "forwardPorts": [3000, 8080, 5432]
+  "forwardPorts": [3000, "8080:3000", 5432]
 }
 ```
 
