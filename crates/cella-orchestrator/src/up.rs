@@ -7,8 +7,8 @@ use tracing::{debug, info, warn};
 
 use cella_backend::agent::restart_agent_in_container;
 use cella_backend::{
-    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, ImageDetails,
-    LifecycleContext, MountConfig, agent_env_vars, container_labels,
+    BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, FileToUpload,
+    ImageDetails, LifecycleContext, MountConfig, agent_env_vars, container_labels,
 };
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
@@ -728,6 +728,95 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
+    async fn setup_credential_protection(
+        &self,
+        container_id: &str,
+        settings: &cella_config::CellaConfig,
+        remote_user: &str,
+    ) {
+        let phantom_set = crate::credential_protect::generate_phantom_tokens(settings);
+
+        if phantom_set.entries.is_empty() {
+            tracing::debug!("Credential protection enabled but no providers detected");
+            return;
+        }
+
+        let Some(socket_path) = cella_env::paths::daemon_socket_path() else {
+            tracing::warn!("Cannot determine daemon socket path, skipping credential protection");
+            return;
+        };
+
+        let container_name = self.config.container_name.to_string();
+        let nonce = crate::credential_protect::register_with_daemon(
+            &socket_path,
+            &container_name,
+            &phantom_set.entries,
+        )
+        .await;
+
+        if nonce.is_none() {
+            tracing::warn!(
+                "Phantom token registration failed — credentials will be unavailable \
+                 (credential protection does not fall back to real credentials)"
+            );
+            return;
+        }
+
+        if settings.credentials.gh {
+            if let Some(ref gh_phantom) = phantom_set.gh_phantom {
+                if let Some(gh_creds) = cella_env::gh_credential::prepare_gh_credentials_phantom(
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                    gh_phantom,
+                ) {
+                    let config_dir = cella_env::gh_credential::gh_config_dir_for_user(remote_user);
+                    let files: Vec<FileToUpload> = gh_creds
+                        .file_uploads
+                        .iter()
+                        .map(|f| FileToUpload {
+                            path: f.container_path.clone(),
+                            content: f.content.clone(),
+                            mode: f.mode,
+                        })
+                        .collect();
+                    let _ = self
+                        .client
+                        .exec_command(
+                            container_id,
+                            &ExecOptions {
+                                cmd: vec![
+                                    "mkdir".to_string(),
+                                    "-p".to_string(),
+                                    "-m".to_string(),
+                                    "700".to_string(),
+                                    config_dir.clone(),
+                                ],
+                                user: Some("root".to_string()),
+                                env: None,
+                                working_dir: None,
+                            },
+                        )
+                        .await;
+                    let _ = self.client.upload_files(container_id, &files).await;
+                    tracing::debug!("Seeded phantom gh credentials into container");
+                }
+            } else {
+                crate::container_setup::seed_gh_credentials(
+                    self.client,
+                    container_id,
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                )
+                .await;
+            }
+        }
+
+        tracing::info!(
+            "Credential protection active: {} providers protected",
+            phantom_set.entries.len()
+        );
+    }
+
     fn build_labels(
         &self,
         resolved_features: Option<&cella_features::ResolvedFeatures>,
@@ -1032,26 +1121,30 @@ impl EnsureUpContext<'_> {
 
         crate::container_setup::inject_cella_path(self.client, container_id, remote_user).await;
 
-        if settings.credentials.gh {
-            crate::container_setup::seed_gh_credentials(
-                self.client,
-                container_id,
-                &self.config.resolved.workspace_root,
-                remote_user,
-            )
-            .await;
-        }
+        if settings.credentials.protect {
+            self.setup_credential_protection(container_id, settings, remote_user)
+                .await;
+        } else {
+            if settings.credentials.gh {
+                crate::container_setup::seed_gh_credentials(
+                    self.client,
+                    container_id,
+                    &self.config.resolved.workspace_root,
+                    remote_user,
+                )
+                .await;
+            }
 
-        // Log detected AI API keys (names only, never values)
-        if settings.credentials.ai.enabled {
-            let ai = &settings.credentials.ai;
-            let detected =
-                cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
-            if !detected.is_empty() {
-                tracing::debug!(
-                    "AI API keys detected for exec/shell forwarding: {}",
-                    detected.join(", ")
-                );
+            if settings.credentials.ai.enabled {
+                let ai = &settings.credentials.ai;
+                let detected =
+                    cella_env::ai_keys::detect_ai_key_names(&|id| ai.is_provider_enabled(id));
+                if !detected.is_empty() {
+                    tracing::debug!(
+                        "AI API keys detected for exec/shell forwarding: {}",
+                        detected.join(", ")
+                    );
+                }
             }
         }
 
@@ -1198,14 +1291,11 @@ impl EnsureUpContext<'_> {
         // direct passthrough, but disable blocking rules (which require the
         // agent-side proxy that won't be provisioned).
         let managed_agent = self.client.capabilities().managed_agent;
+        let needs_proxy = (has_rules || settings.credentials.protect) && managed_agent;
         let proxy_fwd = Some(cella_env::ProxyForwardingConfig {
             proxy: net_config.proxy.clone(),
-            has_blocking_rules: has_rules && managed_agent,
-            full_config: if has_rules && managed_agent {
-                Some(net_config)
-            } else {
-                None
-            },
+            has_blocking_rules: needs_proxy,
+            full_config: if needs_proxy { Some(net_config) } else { None },
             container_distro: cella_env::ca_bundle::ContainerDistro::Unknown,
         });
         let mut env_fwd =
@@ -1221,12 +1311,24 @@ impl EnsureUpContext<'_> {
                 .retain(|cmd| !cmd.iter().any(|s| s.contains("cella-agent")));
         }
 
-        let labels = self.build_labels(
+        if settings.credentials.protect && managed_agent {
+            crate::credential_protect::inject_routes_into_proxy_config(
+                &settings,
+                self.config.container_name,
+                &mut env_fwd,
+            );
+        }
+
+        let mut labels = self.build_labels(
             resolved_features,
             base_image_details.metadata.as_deref(),
             &env_fwd,
             &remote_user,
         );
+
+        if settings.credentials.protect {
+            crate::credential_protect::add_protect_label(&mut labels, self.config.container_name);
+        }
 
         let subst_ctx = crate::subst_ctx(self.config.resolved);
         let substituted_feature_config = resolved_features.map(|r| {

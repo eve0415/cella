@@ -126,13 +126,22 @@ async fn handle_connect(
         return;
     };
 
+    let is_credential_domain = config.credential_route_for_domain(&host).is_some();
     let needs_path_inspection = config.matcher.domain_needs_path_inspection(&host);
     let has_mitm = config.ca_cert_pem.is_some() && config.ca_key_pem.is_some();
 
-    if needs_path_inspection && has_mitm {
-        // Domain has path-level rules and MITM is available — allow the CONNECT
-        // and defer the actual allow/block decision to the MITM path where we
-        // can inspect request paths.
+    if is_credential_domain && !has_mitm {
+        warn!(
+            "CONNECT to {host}: credential protection requires TLS interception but MITM is unavailable"
+        );
+        let _ = client
+            .get_mut()
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 58\r\n\r\nCredential protection requires TLS interception (no MITM).")
+            .await;
+        return;
+    }
+
+    if (is_credential_domain || needs_path_inspection) && has_mitm {
         let mut client_tcp = client.into_inner();
         if client_tcp
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")

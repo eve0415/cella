@@ -40,6 +40,7 @@ pub(crate) struct ManagementContext {
     pub tunnel_broker: Arc<crate::tunnel::TunnelBroker>,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
     pub hostname_proxy: Option<cella_protocol::HostnameProxyStatus>,
+    pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
 }
 
 /// Bind the management Unix socket, cleaning up stale sockets and setting permissions.
@@ -97,6 +98,7 @@ pub(crate) async fn run_management_server(
             task_manager: crate::task_manager::new_shared(),
             cella_bin: crate::control_server::resolve_cella_binary(),
             tunnel_broker: ctx.tunnel_broker.clone(),
+            phantom_registry: ctx.phantom_registry.clone(),
             is_orbstack: ctx.is_orbstack,
             hostname_route_table: ctx.hostname_route_table.clone(),
         };
@@ -221,6 +223,10 @@ async fn handle_management_request(
             handle_register(reg, ctx, container_handles).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
+            ctx.phantom_registry
+                .lock()
+                .await
+                .remove_container(&container_name);
             handle_deregister(
                 &container_name,
                 &ctx.port_manager,
@@ -262,6 +268,32 @@ async fn handle_management_request(
         }
         ManagementRequest::ReleaseSshAgentProxy { workspace } => {
             handle_release_ssh_agent_proxy(&workspace, &ctx.ssh_proxy_manager).await
+        }
+        ManagementRequest::RegisterPhantomTokens {
+            container_name,
+            tokens,
+        } => {
+            let nonce = ctx
+                .phantom_registry
+                .lock()
+                .await
+                .register(&container_name, &tokens);
+            info!(
+                "Registered {} phantom tokens for {container_name}",
+                tokens.len()
+            );
+            ManagementResponse::PhantomTokensRegistered {
+                container_name,
+                container_nonce: Some(nonce),
+            }
+        }
+        ManagementRequest::GetPhantomTokens { container_name } => {
+            let tokens = ctx
+                .phantom_registry
+                .lock()
+                .await
+                .get_tokens_for_container(&container_name);
+            ManagementResponse::PhantomTokenValues { tokens }
         }
         ManagementRequest::Shutdown => {
             let pid = std::process::id();
@@ -617,6 +649,7 @@ mod tests {
                 port: Some(80),
                 using_fallback_port: false,
             }),
+            phantom_registry: Arc::new(Mutex::new(crate::phantom_registry::PhantomRegistry::new())),
         };
         (ctx, srx)
     }

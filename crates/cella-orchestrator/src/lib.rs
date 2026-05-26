@@ -4,6 +4,7 @@
 //! the CLI (`cella`) and daemon (`cella-daemon`) can call the same Rust
 //! functions instead of the daemon shelling out to CLI subprocesses.
 
+pub mod approved_providers;
 pub mod branch;
 pub use cella_compose::build_features as compose_build;
 pub use cella_compose::combined_dockerfile_build as compose_features;
@@ -11,6 +12,7 @@ pub use cella_compose::mount_parity as compose_mounts;
 pub use cella_compose::orchestrate as compose_up;
 pub mod config;
 pub use cella_backend::container_setup;
+pub mod credential_protect;
 pub use cella_config::config_map;
 pub mod daemon_registration;
 pub mod docker_helpers;

@@ -4,6 +4,7 @@
 //! Management messages (CLI↔daemon) use the same framing over a Unix socket.
 
 pub mod credential;
+pub mod credential_frame;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,40 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct TunnelHandshake {
     pub auth_token: String,
     pub connection_id: u64,
+}
+
+/// Credential proxy handshake sent by the agent.
+///
+/// Discriminated from [`TunnelHandshake`] by the `provider_id` field
+/// and from [`AgentHello`] by the `request_id` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialProxyHandshake {
+    pub auth_token: String,
+    pub container_name: String,
+    pub request_id: String,
+    pub domain: String,
+    pub provider_id: String,
+    /// Per-container nonce for tunnel authentication (replaces global auth token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_nonce: Option<String>,
+    /// Unique identifier for audit logging and request correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
+
+/// A phantom token entry mapping a provider to its opaque replacement value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhantomTokenEntry {
+    pub provider_id: String,
+    pub phantom_token: String,
+    pub env_var: String,
+    pub domains: Vec<String>,
+    /// HTTP header name for credential injection.
+    #[serde(default)]
+    pub header: String,
+    /// Header value prefix (e.g., `"Bearer "`).
+    #[serde(default)]
+    pub prefix: String,
 }
 
 /// Sent by the agent as the first message after connecting.
@@ -262,6 +297,13 @@ pub enum ManagementRequest {
     /// the listener and unlinks the socket file when the count reaches
     /// zero. No-op for an unknown workspace.
     ReleaseSshAgentProxy { workspace: String },
+    /// Register phantom tokens for a credential-protected container.
+    RegisterPhantomTokens {
+        container_name: String,
+        tokens: Vec<PhantomTokenEntry>,
+    },
+    /// Retrieve phantom token values for a container (used at exec time).
+    GetPhantomTokens { container_name: String },
     /// Request graceful shutdown of the daemon.
     Shutdown,
 }
@@ -306,6 +348,18 @@ pub enum ManagementResponse {
     ContainerIpUpdated { container_id: String },
     /// Pong response.
     Pong,
+    /// Phantom tokens registered for a container.
+    PhantomTokensRegistered {
+        container_name: String,
+        /// Per-container nonce for credential tunnel authentication.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container_nonce: Option<String>,
+    },
+    /// Phantom token values for exec-time injection.
+    PhantomTokenValues {
+        /// Map of env var name → phantom token value.
+        tokens: std::collections::HashMap<String, String>,
+    },
     /// SSH-agent bridge registered (or refcount bumped). `bridge_port` is
     /// the localhost TCP port the in-container `cella-agent` should
     /// connect to (reachable from the container as `host.docker.internal`,
@@ -1689,6 +1743,197 @@ mod tests {
         assert!(matches!(
             decoded,
             DaemonMessage::TaskWaitResult { exit_code: 0, .. }
+        ));
+    }
+
+    // -- Credential proxy protocol tests --------------------------------------
+
+    #[test]
+    fn roundtrip_credential_proxy_handshake() {
+        let hs = CredentialProxyHandshake {
+            auth_token: "tok".to_string(),
+            container_name: "cella-proj-main".to_string(),
+            request_id: "req-1".to_string(),
+            domain: "api.anthropic.com".to_string(),
+            provider_id: "anthropic".to_string(),
+            container_nonce: Some("abc123".to_string()),
+            trace_id: Some("cred-550e8400".to_string()),
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let decoded: CredentialProxyHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.provider_id, "anthropic");
+        assert_eq!(decoded.domain, "api.anthropic.com");
+        assert_eq!(decoded.request_id, "req-1");
+        assert_eq!(decoded.container_nonce.as_deref(), Some("abc123"));
+        assert_eq!(decoded.trace_id.as_deref(), Some("cred-550e8400"));
+    }
+
+    #[test]
+    fn credential_proxy_handshake_backward_compat() {
+        let json = r#"{"auth_token":"tok","container_name":"c","request_id":"r","domain":"d","provider_id":"p"}"#;
+        let decoded: CredentialProxyHandshake = serde_json::from_str(json).unwrap();
+        assert!(decoded.container_nonce.is_none());
+        assert!(decoded.trace_id.is_none());
+    }
+
+    #[test]
+    fn credential_proxy_handshake_nonce_omitted_when_none() {
+        let hs = CredentialProxyHandshake {
+            auth_token: "tok".to_string(),
+            container_name: "c".to_string(),
+            request_id: "r".to_string(),
+            domain: "d".to_string(),
+            provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(!json.contains("container_nonce"));
+        assert!(!json.contains("trace_id"));
+    }
+
+    #[test]
+    fn credential_proxy_handshake_not_parseable_as_tunnel() {
+        let hs = CredentialProxyHandshake {
+            auth_token: "tok".to_string(),
+            container_name: "c".to_string(),
+            request_id: "r".to_string(),
+            domain: "d".to_string(),
+            provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let result = serde_json::from_str::<TunnelHandshake>(&json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn credential_proxy_handshake_not_parseable_as_agent_hello() {
+        let hs = CredentialProxyHandshake {
+            auth_token: "tok".to_string(),
+            container_name: "c".to_string(),
+            request_id: "r".to_string(),
+            domain: "d".to_string(),
+            provider_id: "p".to_string(),
+            container_nonce: None,
+            trace_id: None,
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let result = serde_json::from_str::<AgentHello>(&json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roundtrip_phantom_token_entry() {
+        let entry = PhantomTokenEntry {
+            provider_id: "anthropic".to_string(),
+            phantom_token: "pt-550e8400-e29b-41d4-a716-446655440000".to_string(),
+            env_var: "ANTHROPIC_API_KEY".to_string(),
+            domains: vec!["api.anthropic.com".to_string()],
+            header: "x-api-key".to_string(),
+            prefix: String::new(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: PhantomTokenEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.provider_id, "anthropic");
+        assert!(decoded.phantom_token.starts_with("pt-"));
+    }
+
+    #[test]
+    fn roundtrip_register_phantom_tokens() {
+        let req = ManagementRequest::RegisterPhantomTokens {
+            container_name: "cella-proj-main".to_string(),
+            tokens: vec![PhantomTokenEntry {
+                provider_id: "anthropic".to_string(),
+                phantom_token: "pt-abc".to_string(),
+                env_var: "ANTHROPIC_API_KEY".to_string(),
+                domains: vec!["api.anthropic.com".to_string()],
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"register_phantom_tokens\""));
+        let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementRequest::RegisterPhantomTokens { .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_get_phantom_tokens() {
+        let req = ManagementRequest::GetPhantomTokens {
+            container_name: "cella-proj-main".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"get_phantom_tokens\""));
+        let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementRequest::GetPhantomTokens { .. }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_phantom_tokens_registered() {
+        let resp = ManagementResponse::PhantomTokensRegistered {
+            container_name: "test".to_string(),
+            container_nonce: Some("nonce123".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+        if let ManagementResponse::PhantomTokensRegistered {
+            container_nonce, ..
+        } = decoded
+        {
+            assert_eq!(container_nonce.as_deref(), Some("nonce123"));
+        } else {
+            panic!("expected PhantomTokensRegistered");
+        }
+    }
+
+    #[test]
+    fn phantom_tokens_registered_backward_compat() {
+        let json = r#"{"type":"phantom_tokens_registered","container_name":"test"}"#;
+        let decoded: ManagementResponse = serde_json::from_str(json).unwrap();
+        if let ManagementResponse::PhantomTokensRegistered {
+            container_nonce, ..
+        } = decoded
+        {
+            assert!(container_nonce.is_none());
+        } else {
+            panic!("expected PhantomTokensRegistered");
+        }
+    }
+
+    #[test]
+    fn roundtrip_phantom_token_values() {
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert("ANTHROPIC_API_KEY".to_string(), "pt-abc-123".to_string());
+        tokens.insert("OPENAI_API_KEY".to_string(), "pt-def-456".to_string());
+        let resp = ManagementResponse::PhantomTokenValues { tokens };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+        if let ManagementResponse::PhantomTokenValues { tokens } = decoded {
+            assert_eq!(tokens.len(), 2);
+            assert_eq!(tokens["ANTHROPIC_API_KEY"], "pt-abc-123");
+        } else {
+            panic!("expected PhantomTokenValues");
+        }
+    }
+
+    #[test]
+    fn phantom_token_values_empty_map() {
+        let resp = ManagementResponse::PhantomTokenValues {
+            tokens: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementResponse::PhantomTokenValues { tokens } if tokens.is_empty()
         ));
     }
 }

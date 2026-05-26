@@ -45,6 +45,12 @@ fn write_control_file(
             message: format!("failed to write daemon.control: {e}"),
         }
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            std::fs::set_permissions(&control_file_path, std::fs::Permissions::from_mode(0o600));
+    }
     info!("Control TCP server on 127.0.0.1:{control_port}");
     Ok(control_file_path)
 }
@@ -139,8 +145,28 @@ fn persist_hostname_proxy_port(socket_path: &Path, port: u16, using_fallback_por
 ///
 /// # Errors
 ///
-/// Returns error if socket binding or PID file creation fails.
+fn enforce_single_instance(pid_path: &Path) -> Result<(), CellaDaemonError> {
+    if let Some(existing_pid) = read_pid_file(pid_path) {
+        if crate::shared::is_process_alive(existing_pid) {
+            return Err(CellaDaemonError::PidFile {
+                message: format!(
+                    "Another daemon instance is running (PID {existing_pid}). \
+                     Stop it first or delete {pid_path}",
+                    pid_path = pid_path.display()
+                ),
+            });
+        }
+        info!("Stale PID file found (PID {existing_pid}), taking over");
+    }
+    Ok(())
+}
+
+/// # Errors
+///
+/// Returns error if another daemon is already running, or if socket
+/// binding or PID file creation fails.
 pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), CellaDaemonError> {
+    enforce_single_instance(pid_path)?;
     write_pid_and_ensure_dir(socket_path, pid_path)?;
 
     // Prepare the SSH-agent proxy run directory and sweep any stale sockets
@@ -230,7 +256,7 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let ctx = ManagementContext {
+    let ctx = build_management_context(
         last_activity,
         port_manager,
         browser_handler,
@@ -245,9 +271,8 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
         ssh_proxy_manager,
         container_handles,
         tunnel_broker,
-        hostname_route_table: hostname_proxy.route_table,
-        hostname_proxy: hostname_proxy.status,
-    };
+        hostname_proxy,
+    );
 
     // Run the management server (CLI protocol) — blocks until shutdown
     let result = run_management_server(socket_path, ctx, shutdown_rx, control_listener).await;
@@ -271,6 +296,53 @@ pub async fn run_daemon(socket_path: &Path, pid_path: &Path) -> Result<(), Cella
     }
 
     result
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_management_context(
+    last_activity: Arc<AtomicU64>,
+    port_manager: Arc<tokio::sync::Mutex<PortManager>>,
+    browser_handler: Arc<BrowserHandler>,
+    clipboard_handler: Arc<crate::clipboard::ClipboardHandler>,
+    proxy_cmd_tx: tokio::sync::mpsc::Sender<crate::proxy::ProxyCommand>,
+    start_time: std::time::Instant,
+    is_orbstack: bool,
+    daemon_started_at: u64,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    auth_token: String,
+    control_port: u16,
+    ssh_proxy_manager: crate::ssh_proxy::SharedSshProxyManager,
+    container_handles: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, crate::control_server::ContainerHandle>,
+        >,
+    >,
+    tunnel_broker: Arc<TunnelBroker>,
+    hostname_proxy: HostnameProxyRuntime,
+) -> ManagementContext {
+    ManagementContext {
+        last_activity,
+        port_manager,
+        browser_handler,
+        clipboard_handler,
+        proxy_cmd_tx,
+        start_time,
+        is_orbstack,
+        daemon_started_at,
+        shutdown_tx,
+        auth_token,
+        control_port,
+        ssh_proxy_manager,
+        container_handles,
+        tunnel_broker,
+        hostname_route_table: hostname_proxy.route_table,
+        hostname_proxy: hostname_proxy.status,
+        phantom_registry: {
+            let mut reg = crate::phantom_registry::PhantomRegistry::new();
+            reg.reclaim_from_state_file();
+            Arc::new(tokio::sync::Mutex::new(reg))
+        },
+    }
 }
 
 /// Generate a hex-encoded random auth token.

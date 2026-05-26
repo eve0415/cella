@@ -12,6 +12,13 @@ use cella_network::config::{NetworkConfig, NetworkMode, NetworkRule, RuleAction}
 use cella_network::rules::RuleMatcher;
 use rustls::pki_types::CertificateDer;
 
+/// A credential-protected domain route.
+#[derive(Debug, Clone)]
+pub struct CredentialRoute {
+    pub domain: String,
+    pub provider_id: String,
+}
+
 /// Runtime configuration for the forward proxy.
 pub struct AgentProxyConfig {
     /// Port to listen on.
@@ -37,6 +44,25 @@ pub struct AgentProxyConfig {
 
     /// Domains already warned about missing MITM (prevents log spam).
     warned_no_mitm: Mutex<HashSet<String>>,
+
+    /// Credential-protected domain routes for daemon-side injection.
+    pub credential_routes: Vec<CredentialRoute>,
+
+    /// Daemon address for credential proxy connections.
+    pub daemon_addr: Option<String>,
+
+    /// Daemon auth token for credential proxy connections.
+    pub daemon_token: Option<String>,
+
+    /// Container name (for credential proxy handshake).
+    pub container_name: Option<String>,
+
+    /// Per-container nonce for credential tunnel authentication.
+    pub container_nonce: Option<String>,
+
+    /// Lazy-initialized multiplexed credential tunnel client.
+    pub credential_mux:
+        tokio::sync::Mutex<Option<std::sync::Arc<crate::credential_mux::CredentialMuxClient>>>,
 }
 
 impl AgentProxyConfig {
@@ -76,6 +102,15 @@ impl AgentProxyConfig {
             rustls_pemfile::certs(&mut reader).find_map(Result::ok)
         });
 
+        let credential_routes = raw
+            .credential_routes
+            .into_iter()
+            .map(|r| CredentialRoute {
+                domain: r.domain,
+                provider_id: r.provider_id,
+            })
+            .collect();
+
         Ok(Self {
             listen_port: raw.listen_port,
             matcher,
@@ -85,7 +120,18 @@ impl AgentProxyConfig {
             ca_cert_der,
             log_file: Mutex::new(log_file),
             warned_no_mitm: Mutex::new(HashSet::new()),
+            credential_routes,
+            daemon_addr: raw.daemon_addr,
+            daemon_token: raw.daemon_token,
+            container_name: raw.container_name,
+            container_nonce: raw.container_nonce,
+            credential_mux: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Find a credential route for a given domain.
+    pub fn credential_route_for_domain(&self, domain: &str) -> Option<&CredentialRoute> {
+        self.credential_routes.iter().find(|r| r.domain == domain)
     }
 
     /// Log a blocked request to the proxy log file.
@@ -149,6 +195,16 @@ struct ProxyConfigJson {
     ca_cert_pem: Option<String>,
     ca_key_pem: Option<String>,
     log_path: Option<String>,
+    #[serde(default)]
+    credential_routes: Vec<CredentialRouteJson>,
+    #[serde(default)]
+    daemon_addr: Option<String>,
+    #[serde(default)]
+    daemon_token: Option<String>,
+    #[serde(default)]
+    container_name: Option<String>,
+    #[serde(default)]
+    container_nonce: Option<String>,
 }
 
 /// A rule in the JSON config.
@@ -158,6 +214,13 @@ struct RuleJson {
     #[serde(default)]
     paths: Vec<String>,
     action: String,
+}
+
+/// A credential route in the JSON config.
+#[derive(serde::Deserialize)]
+struct CredentialRouteJson {
+    domain: String,
+    provider_id: String,
 }
 
 #[cfg(test)]

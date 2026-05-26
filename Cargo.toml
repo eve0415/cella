@@ -106,7 +106,7 @@ chrono = { version = "=0.4.44", default-features = false, features = ["clock"] }
 tar = "=0.4.46"
 
 # HTTP client
-reqwest = { version = "=0.13.3", default-features = false, features = ["rustls"] }
+reqwest = { version = "=0.13.3", default-features = false, features = ["rustls", "stream"] }
 
 # Filesystem
 dirs = "=6.0.0"
@@ -131,6 +131,7 @@ rustls = { version = "=0.23.40", default-features = false, features = ["ring", "
 rustls-native-certs = "=0.8.3"
 rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.4"
+tokio-stream = "=0.1.18"
 
 # HTTP proxy (MITM relay)
 hyper = { version = "=1.9.0", features = ["server", "client", "http1", "http2"] }
@@ -150,6 +151,12 @@ portable-pty = "=0.9.0"
 syn = { version = "=2.0.117", features = ["full"] }
 quote = "=1.0.45"
 proc-macro2 = "=1.0.106"
+
+# UUID generation (phantom tokens)
+uuid = { version = "=1.23.1", features = ["v4"] }
+
+# Credential cache memory safety
+zeroize = "=1.8.2"
 
 # Testing
 tempfile = "=3.27.0"

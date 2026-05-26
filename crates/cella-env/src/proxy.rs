@@ -102,6 +102,57 @@ pub fn build_agent_proxy_config_json(config: &NetworkConfig) -> String {
     json.to_string()
 }
 
+/// Credential route for the agent proxy config.
+pub struct CredentialRouteConfig {
+    pub domain: String,
+    pub provider_id: String,
+}
+
+/// Daemon connection info for credential proxying.
+pub struct DaemonConnectionInfo {
+    pub addr: String,
+    pub token: String,
+    pub container_name: String,
+    pub container_nonce: Option<String>,
+}
+
+/// Inject credential routing into an existing proxy config JSON string.
+///
+/// Adds credential routes, daemon address/token, and container name
+/// fields that the agent uses to tunnel credential-protected requests.
+pub fn inject_credential_routes(
+    base_json: &str,
+    routes: &[CredentialRouteConfig],
+    daemon: &DaemonConnectionInfo,
+) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(base_json) else {
+        return base_json.to_string();
+    };
+    if !json.is_object() {
+        return base_json.to_string();
+    }
+
+    let route_values: Vec<serde_json::Value> = routes
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "domain": r.domain,
+                "provider_id": r.provider_id,
+            })
+        })
+        .collect();
+
+    json["credential_routes"] = serde_json::json!(route_values);
+    json["daemon_addr"] = serde_json::json!(daemon.addr);
+    json["daemon_token"] = serde_json::json!(daemon.token);
+    json["container_name"] = serde_json::json!(daemon.container_name);
+    if let Some(nonce) = &daemon.container_nonce {
+        json["container_nonce"] = serde_json::json!(nonce);
+    }
+
+    json.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

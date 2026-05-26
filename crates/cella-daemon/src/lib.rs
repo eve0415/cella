@@ -3,16 +3,22 @@
 //! Single daemon that manages credential forwarding, port forwarding, and
 //! browser-open requests from in-container agents.
 
+pub mod audit;
 pub mod browser;
 pub mod clipboard;
 pub mod control_server;
 pub mod credential;
+pub mod credential_cache;
+pub mod credential_mux;
+pub mod credential_proxy;
+pub mod credential_resolver;
 pub mod daemon;
 mod error;
 pub mod health;
 pub mod logging;
 pub mod management;
 pub mod orbstack;
+pub mod phantom_registry;
 pub mod port_manager;
 pub mod proxy;
 pub mod shared;

@@ -14,6 +14,8 @@ mod cli;
 mod clipboard;
 mod control;
 mod credential;
+mod credential_mux;
+mod credential_tunnel;
 mod forward_proxy;
 #[cfg(test)]
 mod integration_tests;
