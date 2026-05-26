@@ -313,7 +313,7 @@ pub(crate) async fn make_upstream_request(
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            .expect("reqwest client builder should not fail")
     });
 
     let method: reqwest::Method = envelope.method.parse().unwrap_or(reqwest::Method::GET);
