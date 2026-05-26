@@ -1,8 +1,8 @@
 # Devcontainer Spec Compliance Audit
 
-Audit of cella against the official devcontainer specification (containers.dev) and reference CLI (devcontainers/cli).
+Audit of cella against the official devcontainer specification (containers.dev) and reference CLI (devcontainers/cli). This audit measures implementation status against the cella specification. MISSING and PARTIAL items are specified behavior not yet implemented.
 
-Date: 2026-04-29
+Date: 2026-05-26 (updated from 2026-04-29)
 
 ## Legend
 
@@ -241,6 +241,45 @@ These flags are cella-only. They do not conflict with any spec flag name and can
 | Template commands | apply/publish/metadata/generate-docs | Low |
 | Git root mount | `--mount-workspace-git-root` | Medium |
 | Variable substitution | `${devcontainerId}`, `${localEnv:...}`, `${localWorkspaceFolder}`, etc. | High |
+| SQLite persistence | Daemon state persistence to `~/.cella/state.db` | High |
+| Rolling agent upgrade | One-at-a-time agent binary update with health checks | High |
+| HTTP/2 transport | Agent↔daemon control connection upgrade | Medium |
+| QUIC/HTTP/3 transport | UDP transport for reduced head-of-line blocking | Low |
+| Streaming lifecycle progress | Real-time lifecycle phase events over control connection | Medium |
+| Multi-account profiles | Credential profile switching (`credentials.profile`) | Medium |
+| .env file protection | Phantom token injection into `.env` file reads | Medium |
+| Dynamic provider plugins | Provider definitions from `~/.cella/providers.d/` | Low |
+| Credential rotation/TTL | Short-lived phantom tokens with automatic renewal | Medium |
+| Vault/keychain integration | `CredentialResolver` trait for HashiCorp Vault, 1Password, etc. | Medium |
+| Per-container credential scoping | Different credential sets per container | Low |
+| Browser-based OAuth flows | Interactive authentication with OAuth callback server | Low |
+| Network-level enforcement | iptables/nftables rules blocking proxy bypass | High |
+| SPIFFE workload identity | Cryptographic container identity via X.509 certificates | Low |
+| Policy engine | Fine-grained access control for credential proxy requests | Medium |
+| ECH support | DNS-based routing when TLS SNI is encrypted | Low |
+| HTTP/2 MITM inspection | Stream-level HTTP/2 path evaluation | Medium |
+| Per-container network rules | Container-specific network policies | Low |
+| QUIC/HTTP/3 interception | UDP-level QUIC traffic interception | Low |
+| Multi-label domain wildcards | `**` wildcard matching zero or more domain labels | Medium |
+| Rule hot-reload | Daemon pushes rule changes to agents without restart | Medium |
+| Task dependencies | `--after` flag for sequencing background tasks | Low |
+| Task timeout | `--timeout` flag for automatic task stop | Low |
+| SSH agent port renegotiation | Fresh SSH bridge port on agent reconnection | High |
+| Port string format | `"host:container"` string entries in `forwardPorts` | High |
+| Podman backend | Explicit Podman support via Docker-compatible API | Medium |
+| Colima SSH auto-detection | Diagnostic for missing Colima SSH agent config | Medium |
+| Extensible git config | User-extensible git config forwarding allowlist | Medium |
+| Compressed clipboard | zstd compression for clipboard payloads > 64 KB | Low |
+| Browser response channel | Feedback on `browser_open` success/failure | Low |
+| Rootless CA injection | Environment variable-based CA for rootless containers | Medium |
+| Windows SSH agent | Named pipe transport for Windows hosts | Medium |
+| Dual config warning | Warning when both TOML and JSON config exist | Low |
+| Unified merge semantics | Single reference table for all merge behaviors | Low |
+| Extended variable substitution | Variable substitution for numbers and booleans | Low |
+| Config profiles | Named configuration profile switching | Low |
+| Remote config | Organization-wide config distribution via URL | Low |
+| Config forwarding diagnostics | Warning when host config path is absent | Low |
+| Robust plugin manifest rewriting | Home dir resolution from `/etc/passwd` | Low |
 
 ---
 
@@ -271,3 +310,14 @@ These flags are cella-only. They do not conflict with any spec flag name and can
 | `--pull` semantics | Uniform `always`/`missing`/`never` on `up` and `build` | Match Docker's own pull policy vocabulary rather than invent a new one |
 | BuildKit secrets | `--secret id=X[,src=Y][,env=Z]` (repeatable) | Reuse BuildKit's established secret syntax so existing `Dockerfile` `RUN --mount=type=secret` works unchanged |
 | Prebuilt image lifecycle | Run lifecycle hooks baked into the image's `devcontainer.metadata` label | Prebuilds skip building but still need postCreate/postStart to run; follows spec metadata semantics |
+| SQLite persistence | SQLite at `~/.cella/state.db` with WAL mode | Survives daemon restart; eliminates re-registration overhead |
+| Rolling agent upgrade | One-at-a-time with health checks (default concurrency: 1) | Prevents simultaneous disruption across all containers |
+| CAP_NET_ADMIN auto-request | Auto-add when credential protection is enabled | Network enforcement is the real security boundary |
+| HTTP/2 + QUIC transport | HTTP/2 first, QUIC later (builds on HTTP/2 framing) | Standardized multiplexing eliminates custom frame protocol |
+| Policy engine | Access control without rotation (rotation is separate) | Credential abuse prevention is the explicit non-goal that policy engine addresses |
+| All credential extensions | All 11 extensions promoted to spec | Complete credential protection surface area |
+| CLI flag coverage | All 25 `up` flags + all `build` flags targeted | Full spec parity is the goal |
+| Consumer commands only | No feature/template authoring commands | Focus on container consumer workflows |
+| Feature option validation | Strict rejection (not warn) | Spec requires rejection; warnings mask typos |
+| Port string format | `"host:container"` strings in `forwardPorts` | Spec compliance — the official CLI supports this |
+| Podman backend | Explicit Podman support via Docker-compatible API | Growing Podman adoption; SELinux/rootless needs explicit handling |
