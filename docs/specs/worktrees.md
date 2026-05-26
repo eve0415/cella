@@ -193,7 +193,9 @@ Task output is captured in a 1 MB ring buffer (`TaskOutput`). Two access modes:
 
 ### State Lifetime
 
-Task state is in-memory only. It is lost when the daemon restarts. Completed tasks remain in the task manager until the daemon shuts down, allowing post-completion log retrieval.
+Task state persists to SQLite via the daemon's state database. Task output is stored with configurable retention (default: keep last 10 MB per task). Older output is pruned on task completion. Completed tasks remain in the database for post-completion log retrieval.
+
+Depends on: [Architecture § Daemon State Persistence](architecture.md#daemon-state-persistence)
 
 ## In-Container CLI Mode
 
@@ -337,6 +339,14 @@ Worktree containers inherit the same `devcontainer.json` configuration as the pa
 
 Git command failures are retried with exponential backoff when caused by lock contention (`.git/index.lock`). Other git errors propagate immediately.
 
+## Task Dependencies
+
+The task system supports dependency graphs between background tasks. `cella task run <branch-b> --after <branch-a>` sequences operations: the `TaskManager` tracks predecessor-successor relationships and defers dispatch until dependencies complete.
+
+## Task Timeout
+
+Background tasks accept an optional `--timeout` flag specifying maximum runtime in seconds. When a task exceeds its timeout, it is stopped as if `cella task stop` were invoked.
+
 ## Extensions
 
 ### Worktree Templates
@@ -347,19 +357,7 @@ Worktree containers MAY support per-branch devcontainer overrides via a template
 
 Worktree containers within the same repository MAY share read-only volumes for expensive build artifacts (dependency caches, compiled intermediates). A `shared_volumes` configuration would declare named volumes mounted across all worktree containers for the repository, reducing duplication without sacrificing isolation.
 
-### Task Dependencies
-
-The task system MAY support dependency graphs between background tasks, enabling `cella task run <branch-b> --after <branch-a>` to sequence operations. The `TaskManager` would track predecessor-successor relationships and defer dispatch until dependencies complete.
-
-### Task Timeout
-
-Background tasks accept an optional `--timeout` flag specifying maximum runtime in seconds. When a task exceeds its timeout, it is stopped as if `cella task stop` were invoked.
-
 ## Limitations
 
 - **One task per branch.** The task manager keys on branch name, so only one background task can run per worktree at a time.
-- **Task state is ephemeral.** All task state (output buffers, exit codes, metadata) lives in daemon memory and is lost on daemon restart.
-- **Daemon state is in-memory.** Port allocations and container registrations are not persisted. After a daemon restart, containers must re-register (which happens automatically when the agent reconnects).
-- **Labels are immutable.** Docker container labels cannot be updated after creation. `--label` flags on `cella branch` are ignored when the container already exists.
 - **Shared devcontainer config.** All worktree containers for a repository use the same `devcontainer.json`. Per-branch configuration requires the worktree templates extension.
-- **Output buffer is bounded.** Task output is captured in a 1 MB ring buffer. Long-running tasks with verbose output lose earlier output.
