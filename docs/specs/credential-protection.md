@@ -917,106 +917,98 @@ For request-path errors (validation failures, upstream errors, timeouts), see [E
 | 29.0 – 29.3.0 | Warning | CVE-2026-34040: AuthZ bypass via oversized requests. Upgrade to 29.3.1+. |
 | >= 29.3.1 | Pass | All known security-relevant patches applied. |
 
-## Extensions
+## Multi-account Profiles
 
-This section describes architectural extension points beyond the core credential protection system. Each subsection defines the data model changes and integration strategy.
+Multiple credential profiles (e.g. `work`, `personal`) are scoped via `credentials.profile`:
 
-### Multi-account Profiles
-
-Support for multiple credential profiles (e.g. `work`, `personal`) scoped via `credentials.profile`:
-
-- **Config extension:** `credentials.profile = "work"` selects a named profile
-- **Registry data model:** Add `profile` field to `PhantomTokenEntry` and registry keys. Container registration includes the active profile. Token lookup is scoped to `(container_name, profile, phantom_token)`.
+- **Config:** `credentials.profile = "work"` selects a named profile.
+- **Registry data model:** The `profile` field on `PhantomTokenEntry` and registry keys scopes token lookup to `(container_name, profile, phantom_token)`. Container registration includes the active profile.
 - **Profile switching:** `cella profile switch <name>` re-registers phantom tokens with the new profile's credentials. Requires container re-injection (exec-time only; running processes keep old tokens until next exec).
 
-### .env File Protection
+## .env File Protection
 
-Intercept `.env` file reads inside the container and inject phantom tokens instead of real credential values:
+Phantom tokens are injected into `.env` file reads inside the container:
 
-- **File-based injection:** Write phantom tokens to `/run/secrets/cella/<env_var>` on a tmpfs mount with `0400` permissions. Configure dev tools to read from this path.
-- **FUSE-based interception (advanced):** Mount a FUSE filesystem at `.env` locations that returns phantom token values for known credential variables. Transparent to all tools that read `.env` files.
-- **Container setup:** Create tmpfs mount at container start, write phantom token files during registration.
+- **File-based injection:** Phantom tokens are written to `/run/secrets/cella/<env_var>` on a tmpfs mount with `0400` permissions. Dev tools are configured to read from this path.
+- **FUSE-based interception:** A FUSE filesystem mounted at `.env` locations returns phantom token values for known credential variables. Transparent to all tools that read `.env` files.
+- **Container setup:** The tmpfs mount is created at container start; phantom token files are written during registration.
 
-### Dynamic Provider Plugins
+## Dynamic Provider Plugins
 
-Load provider definitions from external files without modifying `cella.toml`:
+Provider definitions are loaded from external files without modifying `cella.toml`:
 
-- **Plugin registry format:** TOML or JSON files in `~/.cella/providers.d/` defining provider metadata (same schema as `[[credentials.providers]]`)
-- **Discovery:** Scan the directory at daemon startup and on SIGHUP
-- **Trust:** Plugin providers follow the same user consent flow as custom TOML providers
+- **Plugin registry format:** TOML or JSON files in `~/.cella/providers.d/` define provider metadata (same schema as `[[credentials.providers]]`).
+- **Discovery:** The directory is scanned at daemon startup and on SIGHUP.
+- **Trust:** Plugin providers follow the same user consent flow as custom TOML providers.
 
-### HTTP/2 and HTTP/3
+## Transport
 
-Upgrade the credential tunnel transport from the custom framed protocol:
+The credential tunnel upgrades from the custom framed protocol to standard HTTP/2 and QUIC transports:
 
-- **HTTP/2 multiplexing:** Replace the custom frame protocol with HTTP/2 streams between agent and daemon. Each credential proxy request becomes an HTTP/2 request on a shared connection. This provides standardized flow control, prioritization, and multiplexing.
-- **QUIC/HTTP/3:** For environments where TCP head-of-line blocking is a concern. Requires QUIC transport between agent and daemon.
-- **Upstream HTTP/2:** Use HTTP/2 for upstream API requests when supported by the provider.
+- **HTTP/2 multiplexing:** HTTP/2 streams between agent and daemon replace the custom frame protocol. Each credential proxy request becomes an HTTP/2 request on a shared connection, providing standardized flow control, prioritization, and multiplexing.
+- **QUIC/HTTP/3:** For environments where TCP head-of-line blocking affects concurrent operations, QUIC transport is available between agent and daemon.
+- **Upstream HTTP/2:** Upstream API requests use HTTP/2 when supported by the provider.
 
-### Credential Rotation / TTL
+Depends on: [IPC Protocol § Transport Upgrade: HTTP/2](ipc-protocol.md#transport-upgrade-http2)
 
-Short-lived phantom tokens with automatic renewal:
+## Credential Rotation / TTL
 
-- **TTL-scoped phantom tokens:** Phantom tokens have an expiry time. The agent requests a new token before expiry via a `RENEW_TOKEN` management message.
-- **Re-registration protocol:** Daemon generates a new phantom token, updates the registry atomically, and notifies the agent. In-flight requests with the old token complete normally.
+Phantom tokens have configurable lifetimes with automatic renewal:
+
+- **TTL-scoped phantom tokens:** Phantom tokens carry an expiry time. The agent requests a new token before expiry via a `RENEW_TOKEN` management message.
+- **Re-registration protocol:** The daemon generates a new phantom token, updates the registry atomically, and notifies the agent. In-flight requests with the old token complete normally.
 - **Rotation trigger:** Configurable per-provider (e.g. rotate every 15 minutes).
 
-### Vault / Keychain Integration
+## Vault / Keychain Integration
 
-Resolve credentials from sources beyond environment variables:
+Credentials are resolved from sources beyond environment variables:
 
-- **Async resolver trait:** `CredentialResolver` trait with methods `resolve(provider_id, hostname) → Option<String>`. Default implementation reads env vars; additional implementations for HashiCorp Vault, 1Password CLI, macOS Keychain, Windows Credential Manager.
-- **Provider metadata extension:** `source` field in provider config: `env` (default), `vault`, `keychain`, `1password`. Each source has source-specific configuration fields.
+- **Async resolver trait:** `CredentialResolver` trait with `resolve(provider_id, hostname) → Option<String>`. The default implementation reads env vars; additional implementations cover HashiCorp Vault, 1Password CLI, macOS Keychain, and Windows Credential Manager.
+- **Provider metadata extension:** The `source` field in provider config selects the resolver: `env` (default), `vault`, `keychain`, `1password`. Each source has source-specific configuration fields.
 - **Caching interaction:** Vault/keychain responses are cached with the same TTL mechanism as env var reads.
 
-### Per-container Credential Scoping
+## Per-container Credential Scoping
 
-Different credential sets per container within a workspace:
+Different credential sets are available per container within a workspace:
 
-- **Config extension:** `credentials.containers.<name>.providers` overrides which providers are available to specific containers
-- **Policy engine:** Per-provider access policies defining allowed HTTP methods, URL path patterns, and request rate limits
+- **Config:** `credentials.containers.<name>.providers` overrides which providers are available to specific containers.
 - **Implementation:** Registry lookup gains a container-scoped provider filter. Requests outside the allowed scope return 403 with `policy_denied` category.
 
-### Browser-based OAuth Flows
+## Browser-based OAuth Flows
 
-Support providers that require interactive authentication:
+Providers that require interactive authentication are supported:
 
-- **OAuth callback server:** Daemon runs a temporary HTTP server on localhost for OAuth redirects
-- **Authorization flow:** `cella auth <provider>` opens a browser for the OAuth consent screen, receives the callback, and stores the token
-- **Token storage:** OAuth tokens stored in the daemon's credential cache with provider-specific refresh logic
+- **OAuth callback server:** The daemon runs a temporary HTTP server on localhost for OAuth redirects.
+- **Authorization flow:** `cella auth <provider>` opens a browser for the OAuth consent screen, receives the callback, and stores the token.
+- **Token storage:** OAuth tokens are stored in the daemon's credential cache with provider-specific refresh logic.
 
-### Network-level Enforcement
+## Network-level Enforcement
 
-Prevent credential domain access that bypasses the MITM proxy:
+Direct access to credential domains that bypasses the MITM proxy is blocked at the network level:
 
-- **iptables/nftables rules:** Block direct outbound connections to credential domains from the container network namespace. Only the agent's MITM proxy is allowed to connect.
-- **CAP_NET_ADMIN requirement:** Container must have `CAP_NET_ADMIN` capability for iptables rules (or rules are applied from the host network namespace).
-- **Fallback:** When network enforcement is unavailable (no capability, unsupported platform), fall back to transparent proxy mode and document the bypass risk.
+- **iptables/nftables rules:** Direct outbound connections to credential domains from the container network namespace are blocked. Only the agent's MITM proxy is allowed to connect.
+- **CAP_NET_ADMIN:** The container requires `CAP_NET_ADMIN` capability for iptables rules. cella auto-requests this capability when credential protection is enabled. Rules can alternatively be applied from the host network namespace.
+- **Fallback:** When network enforcement is unavailable (no capability, unsupported platform), the system falls back to transparent proxy mode and logs the bypass risk.
 
-### SPIFFE-style Workload Identity
+Depends on: [Container Lifecycle § Dynamic SSH Agent Port Renegotiation](container-lifecycle.md#dynamic-ssh-agent-port-renegotiation) (shared CAP_NET_ADMIN auto-request)
 
-Replace nonce-based container identity with cryptographic workload identity:
+## SPIFFE-style Workload Identity
+
+Nonce-based container identity is replaced with cryptographic workload identity:
 
 - **Container identity certificates:** The daemon issues short-lived X.509 certificates to each container at registration, encoding container name and allowed providers in the certificate's SPIFFE ID.
 - **mTLS tunnel:** The credential tunnel uses mutual TLS with the container's identity certificate. The daemon validates the certificate on every connection.
-- **Credential broker pattern:** Integrate with cloud provider workload identity federation (GCP Workload Identity, AWS IAM Roles Anywhere) to eliminate static credentials entirely.
+- **Credential broker pattern:** Integration with cloud provider workload identity federation (GCP Workload Identity, AWS IAM Roles Anywhere) eliminates static credentials entirely.
 
-### Policy Engine
+## Policy Engine
 
-Fine-grained access control for credential proxy requests:
+Fine-grained access control governs credential proxy requests:
 
-- **Policy definition:** Per-provider policies specifying allowed HTTP methods, URL path patterns (glob), request body size limits, and rate limits (requests per minute).
+- **Policy definition:** Per-provider policies specify allowed HTTP methods, URL path patterns (glob), request body size limits, and rate limits (requests per minute).
 - **Policy format:** TOML in `cella.toml` or external policy files. Future consideration for OPA/Cedar-style policy languages.
 - **Evaluation:** Every credential proxy request is checked against the policy before upstream dispatch. Denied requests return 403 with `policy_denied` category.
-- **Audit-only mode:** Policies can be set to `mode = "audit"` to log violations without blocking, enabling gradual rollout.
+- **Audit-only mode:** Policies set to `mode = "audit"` log violations without blocking, enabling gradual rollout.
 
 ## Limitations
 
 1. `credentials.protect` defaults to `false` — opt-in only.
-2. `/proc/[pid]/environ` readability — phantom tokens injected as environment variables are readable by any process in the container with the same UID via `/proc`. This is an acceptable trade-off: phantom tokens are not real credentials, and a runtime adversary who can read `/proc` can already make HTTP requests through the MITM proxy.
-3. **Proxy bypass** — a container process can unset `HTTPS_PROXY`, use raw sockets, or connect directly to credential domains, bypassing the MITM proxy. Without network-level enforcement, credential protection relies on the proxy being the path of least resistance, not a hard boundary. See [Network-level Enforcement](#network-level-enforcement) for the iptables extension.
-4. The credential tunnel uses HTTP/1.1 semantics over a custom framed protocol. HTTP/2, WebSocket, and non-standard port upstream connections are not supported. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade path.
-5. State file is not encrypted — relies on filesystem permissions (0600) for protection.
-6. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
-7. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an explicit non-goal. See [Policy Engine](#policy-engine) for the extension that addresses this.
-8. Head-of-line blocking on the multiplexed TCP connection — a slow stream can affect other streams despite per-stream buffering. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade to standardized multiplexing.
