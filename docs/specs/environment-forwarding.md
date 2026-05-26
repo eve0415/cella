@@ -519,15 +519,29 @@ Environment forwarding follows a **never-fails** principle: `prepare_env_forward
 
 The orchestrator's SSH fallback retry logic is the only case where a Phase 1 failure triggers a retry cycle. All other Phase 1 failures are prevented by pre-checking (e.g., socket file existence) during detection.
 
-## Extensions
+## Extensible Git Config Forwarding
 
-### Custom Environment Variable Forwarding
+The git config forwarding allowlist is user-extensible via `git.forward_config_keys` in `cella.toml`. Users specify additional git config keys (e.g., organization-specific keys) beyond the built-in safe subset. Keys are validated against a denylist of security-sensitive keys (`core.sshCommand`, `core.gitProxy`, etc.) that are never forwarded regardless of user configuration.
 
-Additional host environment variables beyond the built-in set can be forwarded via `containerEnv` and `remoteEnv` in `devcontainer.json`, using the `${localEnv:VAR_NAME}` syntax defined by the devcontainer spec. cella does not duplicate this mechanism -- it provides the transport, and the user configures which variables to forward.
+## Compressed Clipboard Transport
+
+Clipboard payloads exceeding 64 KB are zstd-compressed before JSON encoding. The receiving end detects the compression header and decompresses transparently. Maximum payload size is 16 MB (post-compression). Payloads exceeding this limit are rejected with a diagnostic message.
+
+## Browser Response Channel
+
+The `browser_open` message includes a response that reports whether the URL was successfully opened and which handler was used. The agent surfaces this to tools that requested the browser open. Timeout: 5 seconds; if no response, the message is treated as successful (backward compatible with fire-and-forget behavior).
+
+## Rootless CA Injection
+
+When the container user lacks root access, CA certificates are injected via `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` environment variables pointing to a user-writable certificate bundle. This covers Python (requests, urllib3), Node.js, curl, and wget. Applications using system trust stores without environment variable support still require root access.
+
+## Windows SSH Agent Transport
+
+On Windows hosts, SSH agent forwarding uses Windows named pipes (`\\.\pipe\openssh-ssh-agent`) instead of Unix domain sockets. The daemon bridges between the named pipe and the TCP-based agent connection. Both OpenSSH for Windows and 1Password SSH agent are supported.
 
 ### .env File Protection
 
-When credential protection is active, `.env` files inside the container that contain known provider env var names can be intercepted to inject phantom tokens instead of real values. See [Credential Protection](credential-protection.md#env-file-protection) for the design.
+When credential protection is active, `.env` files inside the container that contain known provider env var names are intercepted to inject phantom tokens instead of real values. See [Credential Protection](credential-protection.md#env-file-protection).
 
 ### User Environment Probing
 
@@ -543,10 +557,4 @@ The `userEnvProbe` devcontainer property controls how the container user's shell
 ## Limitations
 
 1. **Phase 1 immutability** -- Bind mounts and environment variables set at container creation cannot be changed without recreating the container. If a host path (e.g., `SSH_AUTH_SOCK`) changes location, the container must be rebuilt.
-2. **AI keys read at exec time** -- API keys are read from the host process environment on each `exec`/`shell` invocation. If the host shell has not sourced the updated environment, new keys are not visible.
-3. **Git config allowlist** -- Only a curated subset of git config keys is forwarded. Organization-specific git config keys outside the allowlist require manual `containerEnv` configuration.
-4. **SSH agent forwarding on Colima** -- Colima's virtiofs layer rejects `mkdir` for Unix socket paths created on the macOS host. The daemon-managed TCP bridge requires `forwardAgent: true` in `~/.colima/default/colima.yaml` or starting with `colima start --ssh-agent`.
-5. **Clipboard size** -- Clipboard data is base64-encoded and transmitted as JSON over the NDJSON control connection. Very large clipboard contents (multi-megabyte images) may be slow or fail due to message size limits.
-6. **Browser integration is fire-and-forget** -- The `browser_open` message has no response beyond an `ack`. The container cannot detect whether the URL was successfully opened or which browser was used.
-7. **CA bundle injection requires root** -- Trust store update commands execute as root inside the container. Rootless containers without `sudo` access cannot update the system trust store.
-8. **No Windows host support for SSH agent** -- SSH agent forwarding strategies assume Unix domain sockets. Windows named pipes (used by OpenSSH for Windows and 1Password) require a different transport mechanism.
+2. **Security: API keys read at exec time** -- API keys are read from the host process environment on each `exec`/`shell` invocation. Keys are never baked into the container image, labels, or persistent environment. If the host shell has not sourced the updated environment, new keys are not visible.
