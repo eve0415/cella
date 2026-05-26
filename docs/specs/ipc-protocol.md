@@ -1019,3 +1019,37 @@ username=user
 password=ghp_xxxx
 
 ```
+
+---
+
+## Transport Upgrade: HTTP/2
+
+The agent↔daemon control connection upgrades from NDJSON-over-TCP to HTTP/2 streams. Each message type (port events, credential requests, clipboard, browser, lifecycle status) maps to an HTTP/2 stream.
+
+The 1-byte magic byte prefix is retained for backward compatibility with pre-HTTP/2 agents. The server detects the prefix and falls back to NDJSON when the magic byte is not the HTTP/2 connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`).
+
+Depends on: [Architecture § Daemon State Persistence](architecture.md#daemon-state-persistence) (for persistent stream state)
+
+## Transport Upgrade: QUIC/HTTP/3
+
+For environments where TCP head-of-line blocking affects concurrent operations, the agent↔daemon connection supports QUIC transport. The daemon listens on a UDP port alongside the TCP port. The agent negotiates QUIC when available, falling back to TCP/HTTP/2.
+
+Depends on: [Transport Upgrade: HTTP/2](#transport-upgrade-http2) (QUIC builds on the HTTP/2 framing)
+
+## Streaming Lifecycle Progress
+
+Background lifecycle phases emit real-time progress events over the agent↔daemon connection. Each phase reports:
+
+| Field | Type | Description |
+|---|---|---|
+| `phase` | `string` | Lifecycle phase name (e.g. `postCreateCommand`) |
+| `command_index` | `u32` | Index within parallel command set |
+| `stream` | `OutputStream` | `"stdout"` or `"stderr"` |
+| `data` | `string` | Output line |
+| `exit_code` | `i32?` | Set when the command completes |
+
+The daemon aggregates progress from all active containers and forwards events to the CLI via the management socket.
+
+## Limitations
+
+1. Docker container labels and environment variables are immutable after creation. Reconnecting agents re-identify via container name, not labels.
