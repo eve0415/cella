@@ -500,11 +500,9 @@ The orchestrator uses structured error types via `thiserror` with user-facing di
 
 Pre-registration with the daemon is rolled back if the container fails to start. This prevents stale entries in the daemon's container registry.
 
-## Extensions
+## Feature `dependsOn`
 
-### Feature `dependsOn`
-
-Features declare ordering hints via `installsAfter` in their `devcontainer-feature.json`. These are soft dependencies: the feature installs successfully even if the dependency is absent from the user's feature set. The dependency merely influences install order when both are present.
+Features with `dependsOn` declarations trigger hard recursive dependency resolution. Missing dependencies are auto-pulled from the feature's registry. This is distinct from `installsAfter` (soft ordering hint that only influences order when both features are present).
 
 ### Credential Protection
 
@@ -514,10 +512,12 @@ When credential protection is enabled, the orchestrator generates phantom tokens
 
 cella supports automatic installation of development tools (Claude Code, Codex, etc.) into containers. Tool installation runs after environment probing and triggers a second env probe pass to capture any PATH changes.
 
+## Dynamic SSH Agent Port Renegotiation
+
+On agent reconnection, the daemon allocates a fresh SSH agent bridge port and pushes it to the agent. The agent updates the container's `SSH_AUTH_SOCK` environment for new sessions. Running sessions retain the old socket until reconnection. This eliminates the need for `cella down && cella up` after daemon restart.
+
+Depends on: [Architecture § Daemon State Persistence](architecture.md#daemon-state-persistence)
+
 ## Limitations
 
 - **Label immutability** -- Docker container labels and environment variables are immutable after creation. Config changes require `cella up --rebuild` to take effect. The pipeline warns on config drift but does not auto-rebuild.
-- **Daemon state volatility** -- Daemon state (port allocations, container registrations) is held in memory. A daemon restart loses all registrations; containers re-register on the next `cella up` or agent reconnect.
-- **Shared agent volume** -- The `cella-agent` Docker volume is shared across all containers. Agent binary updates affect every running container. Version pruning removes old agent versions after a successful update.
-- **SSH agent on restart** -- Stopped containers retain the SSH agent bridge port baked into their environment at creation time. The daemon reclaims bridge ports from its state file on startup. If reclamation fails (port conflict, stale state), recovery requires `cella down && cella up`.
-- **Background lifecycle observability** -- Background lifecycle phases write status to `/tmp/.cella/lifecycle_status.json` but provide no streaming progress. Failures surface only on the next `cella up` invocation.
