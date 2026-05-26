@@ -36,19 +36,23 @@ Implements the Docker Compose portions of the [Dev Container specification](http
 
 | Module | Purpose |
 |--------|---------|
+| `build_features` | Feature installation support for compose builds |
 | `cli` | `ComposeCommand` — shells out to `docker compose` V2 with project/file arguments |
+| `combined_dockerfile_build` | Combined Dockerfile generation for compose + features |
+| `config` | Typed resolution of `docker compose config` output (variable substitution, service build/image info) |
 | `discovery` | Finds compose-managed containers by Docker labels after `docker compose up` |
+| `dockerfile` | Dockerfile reading, stage naming, and combined Dockerfile generation for compose + features support |
 | `error` | `CellaComposeError` enum |
 | `hash` | Multi-file SHA-256 hashing for compose config change detection |
+| `mount_parity` | Mount parity helpers ensuring compose containers match single-container behavior |
+| `orchestrate` | High-level compose orchestration pipeline |
 | `override_file` | Generates cella override YAML (mounts, env vars, labels, entrypoint, capabilities) |
-| `config` | Typed resolution of `docker compose config` output (variable substitution, service build/image info) |
-| `dockerfile` | Dockerfile reading, stage naming, and combined Dockerfile generation for compose + features support |
 | `parse` | Minimal YAML parsing — validates structure, extracts service names and primary service |
 | `project` | `ComposeProject` lifecycle — initialization, startup, container resolution, shutdown |
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend)
+**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon-client](../cella-daemon-client), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-network](../cella-network), [cella-tool-install](../cella-tool-install)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-orchestrator](../cella-orchestrator)
 
