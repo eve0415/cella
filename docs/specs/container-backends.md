@@ -218,6 +218,39 @@ GPU requests from `RunArgsOverrides.gpus` take precedence over `CreateContainerO
 
 Unrecognized `runArgs` flags are collected in `RunArgsOverrides.unrecognized` and emitted as warnings.
 
+### Image Build
+
+When a `build` object is present in devcontainer.json, cella builds a Docker image from the specified Dockerfile. The `parse_build_options` function in `cella-orchestrator` extracts build parameters from the config and produces a `BuildOptions` struct.
+
+**Forwarded build properties:**
+
+| Property | `BuildOptions` Field | Default | Notes |
+|---|---|---|---|
+| `build.dockerfile` | `dockerfile` | `"Dockerfile"` | Relative to context path |
+| `build.context` | `context_path` | `"."` | Resolved relative to `.devcontainer/` directory; absolute paths used as-is |
+| `build.args` | `args` | `{}` | Key-value map forwarded as `--build-arg` flags |
+| `build.target` | `target` | none | Multi-stage build target, forwarded as `--target` |
+| `build.cacheFrom` | `cache_from` | `[]` | Array of image references forwarded as `--cache-from` |
+| `build.options` | `options` | `[]` | Additional Docker build CLI flags passed through verbatim |
+
+All six properties MUST be forwarded to the Docker build command. `context`, `args`, `target`, and `cacheFrom` MUST NOT be silently dropped.
+
+The build context path MUST be resolved relative to the directory containing `devcontainer.json` (the `.devcontainer/` directory), not the workspace root. When `context` is an absolute path, it MUST be used as-is without further resolution.
+
+**Build secrets:**
+
+`BuildOptions` also carries a `secrets` list (`Vec<BuildSecret>`), where each secret has an `id` and either a `src` (file path) or `env` (environment variable name). These are forwarded as `--secret` flags to the Docker build.
+
+**Build metadata label:**
+
+When the image build is the final layer (no features will be applied on top), cella MUST embed a `devcontainer.metadata` label in the built image via `--label=devcontainer.metadata=...`. This label carries lifecycle commands (e.g., `postCreateCommand`, `onCreateCommand`) so that prebuilt images remain self-describing. When features will be layered on top, the metadata label is omitted from the base build to avoid duplication -- the features build produces its own metadata label.
+
+**No-cache and pull policy:**
+
+When `--no-cache` is requested, `--no-cache` and `--pull` flags are appended to `options`. When pull policy is `"always"`, only `--pull` is appended. When pull policy is `"never"`, neither flag is added (Docker's default behavior is to not pull base images unless `--pull` is passed).
+
+Reference: [build property](https://containers.dev/implementors/json_reference/) in the devcontainer specification.
+
 ### Mount Handling
 
 The `MountSpec` type provides a backend-neutral mount representation with adapters for both the Docker API (`to_mount_config`) and Docker Compose YAML (`to_compose_yaml_entry`).
@@ -233,7 +266,48 @@ Supported mount kinds:
 
 All backends MUST honor the `read_only` flag on mounts. The `consistency` hint (`cached`, `delegated`, `consistent`) is forwarded when present.
 
-When multiple mounts target the same container path, the last occurrence wins. The deduplication operates across workspace mounts and additional mounts uniformly.
+When multiple mounts target the same container path, the last occurrence wins. The deduplication operates across workspace mounts and additional mounts uniformly. The dedup algorithm reverses the mount list, retains the first occurrence per target path, then reverses back -- ensuring the last-specified mount for a given target path is the one that takes effect.
+
+#### Mount Validation
+
+Mount entries in the `mounts` array accept two formats: an object or a comma-delimited string.
+
+**Object format:**
+
+The `target` field MUST be present and non-empty; entries with an empty or missing target are silently dropped. The `source` field is OPTIONAL -- volume mounts may omit it. The `type` field SHOULD be present; when absent, cella defaults to `"bind"`.
+
+> **Note:** The [upstream spec](https://containers.dev/implementors/json_reference/) defines mount `type` as required with an enum of exactly `bind` or `volume`. cella is more permissive: it defaults missing `type` to `"bind"` and accepts `tmpfs` and `npipe` as extensions beyond the spec's enum. This matches Docker's mount type vocabulary and avoids rejecting valid Docker mount configurations.
+
+The `readOnly` boolean field defaults to `false` when absent.
+
+**String format:**
+
+String-format mounts use comma-separated `key=value` pairs. Recognized keys:
+
+| Key | Aliases | Default | Notes |
+|---|---|---|---|
+| `type` | -- | `"bind"` | Mount type |
+| `source` | `src` | `""` | Host path or volume name |
+| `target` | `dst`, `destination` | -- | Container path (REQUIRED) |
+| `consistency` | -- | none | `cached`, `delegated`, or `consistent` |
+| `external` | -- | `false` | Whether the volume is externally managed |
+
+Bare tokens `ro` and `readonly` (without `=`) set `read_only` to `true`. Whitespace around `=` is trimmed.
+
+A string-format mount MUST have a non-empty `target` after parsing; entries without one return `None` and are skipped.
+
+**Mount type support by backend:**
+
+| Type | Spec | Docker | Apple Container |
+|---|---|---|---|
+| `bind` | Yes | Yes | Yes (via `--volume`) |
+| `volume` | Yes | Yes | No |
+| `tmpfs` | **cella extension** | Yes | No |
+| `npipe` | **cella extension** | Yes (Windows) | No |
+
+Unsupported mount types MUST be logged and skipped, not silently demoted to a different type. The `MountSpec::from_mount_config` adapter returns `None` for unrecognized type strings, and callers SHOULD log a warning.
+
+Reference: [mounts property](https://containers.dev/implementors/json_reference/) in the devcontainer specification.
 
 ### Networking
 
@@ -339,6 +413,62 @@ When Docker-specific creation flags are present, the Apple Container backend MUS
 | `--gpus` / `gpu_request` | Warning emitted, ignored |
 | `--device` | Warning emitted, ignored |
 | Unrecognized `runArgs` | Warning emitted, ignored |
+
+## Docker Compose Configuration
+
+Docker Compose mode is activated when `dockerComposeFile` is present in devcontainer.json. The `cella-compose` crate handles project extraction, override YAML generation, and service orchestration. The Docker backend reports `compose: true` in its capabilities; Apple Container reports `compose: false`.
+
+### Container Type Selection
+
+Exactly one of `image`, `build` (containing `dockerfile`), or `dockerComposeFile` MUST determine the container type. These three properties are mutually exclusive -- specifying more than one is a configuration error.
+
+| Container Type | Determining Property | Required Companion Properties |
+|---|---|---|
+| Image | `image` | -- |
+| Dockerfile | `build.dockerfile` | -- |
+| Compose | `dockerComposeFile` | `service`, `workspaceFolder` |
+
+This mutual exclusivity is enforced at the configuration layer. See [configuration.md](./configuration.md) for the full config resolution pipeline.
+
+### Required Compose Properties
+
+A Compose-mode configuration MUST include all three of `dockerComposeFile`, `service`, and `workspaceFolder`. `ComposeProject::from_resolved` returns `CellaComposeError::MissingField` if `service` or `workspaceFolder` is absent. The `dockerComposeFile` extraction returns an error if the field is missing or is neither a string nor an array of strings.
+
+`dockerComposeFile` accepts a single string or an array of strings. Paths are resolved relative to the directory containing `devcontainer.json`. Each resolved path MUST exist on disk; a missing compose file produces `CellaComposeError::FileNotFound`.
+
+### Property Scoping
+
+The devcontainer specification divides properties into `composeContainer` and `nonComposeBase` groups. Properties in `nonComposeBase` (e.g., `runArgs`, `build`, `appPort`, `workspaceMount`, `containerEnv`) apply only to image and Dockerfile container types and MUST NOT be used with Compose containers. Properties in `composeContainer` (e.g., `dockerComposeFile`, `service`, `runServices`, `workspaceFolder`) apply only to Compose mode. The two groups are mutually exclusive.
+
+General properties (lifecycle commands, `customizations`, `features`, `forwardPorts`, `remoteUser`, etc.) apply to all container types.
+
+Reference: [JSON reference](https://containers.dev/implementors/json_reference/) -- see the "Type" column for per-property applicability.
+
+### Default Differences by Container Type
+
+Several properties have different default values depending on the container type:
+
+| Property | Image / Dockerfile Default | Compose Default |
+|---|---|---|
+| `overrideCommand` | `true` | `false` |
+| `shutdownAction` | `"stopContainer"` | `"stopCompose"` |
+
+`overrideCommand` controls whether cella overrides the container's entrypoint/CMD with a sleep command to keep it alive. For Compose containers, the service's own command is preserved by default.
+
+`shutdownAction` controls what happens when the user disconnects:
+
+| Container Type | Allowed Values | Default |
+|---|---|---|
+| Image / Dockerfile | `"none"`, `"stopContainer"` | `"stopContainer"` |
+| Compose | `"none"`, `"stopCompose"` | `"stopCompose"` |
+
+> **Note:** cella's Compose `ShutdownAction` parser treats any string other than `"none"` as `StopCompose`. Invalid values are not rejected -- they silently fall through to the default. This is more permissive than the spec's strict enum.
+
+### runServices
+
+`runServices` specifies which Compose services to start. When not specified (or `null`), ALL services defined in the compose file(s) are started. When specified as an array of strings, only those services are started with `docker compose up`.
+
+Service names in `runServices` MUST match services defined in the compose file(s). `validate_run_services` checks each name against the parsed service list and returns an error for unknown services.
 
 ## Runtime Detection
 
@@ -476,6 +606,70 @@ Resource limits from `runArgs` are forwarded to the Docker Engine's host config:
 | Process | `--pids-limit` |
 | Shared memory | `--shm-size` |
 | Ulimits | `--ulimit name=soft:hard` |
+
+## Host Requirements Validation
+
+The `hostRequirements` object in devcontainer.json declares minimum host capabilities. cella validates these during `cella up` and reports which requirements are met. Validation is informational -- unmet requirements produce warnings but do not block container creation (except when all checks fail, which triggers a user-facing diagnostic).
+
+When `hostRequirements` is absent or `null`, validation is skipped and all requirements are considered met.
+
+### Accepted Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `cpus` | integer | Minimum CPU core count (checked against `available_parallelism`) |
+| `memory` | string | Minimum system memory (e.g., `"8gb"`, `"512mb"`) |
+| `storage` | string | Minimum available disk space at workspace root |
+| `gpu` | boolean, `"optional"`, or object | GPU availability requirement |
+
+No other properties are accepted. The spec defines `hostRequirements` with `unevaluatedProperties: false`.
+
+### GPU Requirement
+
+`hostRequirements.gpu` MUST accept the following value shapes:
+
+| Value | `required` | `optional` | Behavior |
+|---|---|---|---|
+| `undefined` / absent | -- | -- | No GPU check performed |
+| `false` | false | false | No GPU check performed |
+| `true` | true | false | GPU MUST be available; unmet requirement is a failure |
+| `"optional"` | true | true | GPU is checked but absence is not a failure |
+| `{ cores?, memory? }` | true | false | GPU MUST be available; object fields are informational |
+
+When `gpu` is `true`, `"optional"`, or an object, cella checks for GPU presence by probing `/dev/nvidia0` and running `nvidia-smi`. A boolean `true` value maps to `required=true, optional=false`. A boolean `false` value skips the check entirely (no `RequirementCheck` is produced).
+
+> **Note:** The object form (e.g., `{"cores": 4, "memory": "8gb"}`) currently sets `required=true` but does not validate the specific `cores` or `memory` constraints against the actual GPU hardware -- only GPU presence is checked. This is a known limitation.
+
+Object form constraints:
+
+| Field | Type | Constraint |
+|---|---|---|
+| `cores` | integer | Minimum 1 |
+| `memory` | string | Pattern: `[0-9]+(tb|gb|mb|kb)?` |
+
+### Memory and Storage Parsing
+
+Memory and storage strings are parsed by `parse_byte_size`, which accepts numeric values with optional suffixes. Parsing is case-insensitive.
+
+| Suffix | Multiplier | Example |
+|---|---|---|
+| `tb` or `t` | 1024^4 | `"1tb"` = 1 TiB |
+| `gb` or `g` | 1024^3 | `"8gb"` = 8 GiB |
+| `mb` or `m` | 1024^2 | `"512mb"` = 512 MiB |
+| `kb` or `k` | 1024 | `"1024kb"` = 1 MiB |
+| none | 1 (bytes) | `"1048576"` = 1 MiB |
+
+> **cella extension:** The spec defines suffixes as exactly `tb`, `gb`, `mb`, `kb`. cella also accepts single-character shorthand (`t`, `g`, `m`, `k`), providing more lenient parsing than the spec requires.
+
+Invalid memory strings (e.g., `"not-a-size"`) are silently skipped -- no `RequirementCheck` is produced and no error is raised.
+
+Numeric overflow during parsing MUST NOT cause a panic. Values that exceed `u64` range are rejected by `u64::try_from` and treated as a parse failure.
+
+### Merge Semantics
+
+When host requirements come from multiple sources (e.g., devcontainer.json and feature metadata), the merged result MUST take the maximum value per dimension. For numeric dimensions (`cpus`, `memory`, `storage`), the higher value wins. For `gpu`, any source requesting GPU access elevates the merged requirement to required.
+
+Reference: [hostRequirements](https://containers.dev/implementors/json_reference/) in the devcontainer specification.
 
 ## Configuration Reference
 

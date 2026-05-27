@@ -162,56 +162,11 @@ When `dockerComposeFile` is specified, the pipeline delegates to the compose orc
 
 ## Feature Resolution
 
-Devcontainer features extend the base image with additional tools and configuration. Feature resolution is handled by `cella-features` and follows the [devcontainer features spec](https://containers.dev/implementors/features/).
+Devcontainer features extend the base image with additional tools and configuration. The orchestrator invokes `cella-features` during the creation path to resolve, order, and install features as an image layer on top of the base image.
 
-### Resolution Pipeline
+At a high level, the pipeline: parses feature references from config, fetches artifacts (OCI, HTTPS, or local), resolves dependencies and computes install order, generates a `Dockerfile.features`, builds the feature layer, and merges metadata into the `devcontainer.metadata` label.
 
-1. **Parse** -- Extract the `features` object from config. Each key is parsed as a `FeatureRef` (OCI reference, local path, or URL).
-2. **Normalize** -- Resolve shorthand references to fully qualified OCI references.
-3. **Fetch** -- Download all feature artifacts concurrently. OCI features are fetched from registries; local features are read from disk; URL features are downloaded as tarballs.
-4. **Validate** -- Parse `devcontainer-feature.json` metadata from each artifact. Validate user-provided options against declared option schemas.
-5. **Order** -- Compute install order via topological sort over `installsAfter` dependencies.
-6. **Generate** -- Write a `Dockerfile.features` and build context with install scripts.
-7. **Build** -- Build the features layer image on top of the base image.
-8. **Merge** -- Combine feature metadata into the `devcontainer.metadata` label.
-
-### Dependency Ordering
-
-Install order is computed using Kahn's algorithm with the following rules:
-
-1. `installsAfter` declares soft dependencies (the dependency does not need to be present).
-2. Official features (`ghcr.io/devcontainers/features/*`) sort before third-party features during tiebreaking.
-3. Among equal-priority features with no dependency relationship, declaration order is preserved.
-4. `overrideFeatureInstallOrder` takes absolute precedence: listed features install first in the specified order, unlisted features are appended in topological order.
-5. Cyclic dependencies emit a warning and fall back to declaration order for the affected features.
-
-### Feature Cache
-
-Features are cached on disk at `$CACHE_DIR/cella/features/`:
-
-- **OCI features** -- Stored by `oci/<registry>/<repository>/<digest>`.
-- **URL features** -- Stored by `urls/<sha256-prefix-16>`.
-- **Build contexts** -- Stored by `builds/<config_hash>`.
-
-All writes use atomic staging: content is written to `<name>.partial-<pid>`, then committed via `rename()`. Concurrent fetches of the same feature are safe -- the first writer wins, subsequent renames overwrite with identical content.
-
-### Feature Lockfile
-
-The feature lockfile at `.devcontainer/devcontainer-lock.json` records the resolved OCI digest for each feature reference. This ensures reproducible builds: subsequent resolutions use the locked digest rather than re-resolving tags to potentially different content.
-
-The lockfile uses the upstream devcontainer CLI format, with entries nested under a `"features"` key:
-
-```json
-{
-  "features": {
-    "ghcr.io/devcontainers/features/node:1": {
-      "version": "1.5.0",
-      "resolved": "ghcr.io/devcontainers/features/node@sha256:abc123...",
-      "integrity": "sha256:abc123..."
-    }
-  }
-}
-```
+See [features.md](features.md) for the full feature specification, including metadata schema, option types, reference formats, dependency resolution algorithm, installation execution, metadata merge rules, caching, and lockfile integrity.
 
 ## Template Lifecycle
 
@@ -221,137 +176,15 @@ Templates provide scaffolding for new devcontainer configurations. The template 
 
 Template collections are fetched from OCI registries. The default collection is `ghcr.io/devcontainers/templates`. Collection indexes are cached on disk with a 24-hour TTL.
 
-### Application Pipeline
-
-1. **Selection** -- User selects a template from a collection index (interactive picker or CLI argument).
-2. **Fetch** -- Download the template artifact tarball from the OCI registry.
-3. **Options** -- Resolve template option values: user-provided values override defaults, required options without values produce an error.
-4. **Extract** -- Write template files to the `.devcontainer/` directory.
-5. **Substitute** -- Replace `${templateOption:<key>}` placeholders in all extracted files with resolved option values.
-6. **Features** -- Merge selected features into the generated `devcontainer.json`.
-7. **Format** -- Write the final config as JSON or JSONC based on user preference.
+See [templates.md](templates.md) for the full template specification, including metadata schema, option types, OCI distribution, application pipeline, option substitution, and output format.
 
 ## Lifecycle Hooks
 
-cella implements the six devcontainer lifecycle hook phases. Hooks execute in a fixed order and each phase completes before the next begins (for foreground phases).
-
-### Execution Order
-
-| Phase | Runs on | When | Runs every time? |
-|---|---|---|---|
-| `initializeCommand` | Host | Before any container operation | Yes |
-| `onCreateCommand` | Container | After first creation | No |
-| `updateContentCommand` | Container | After creation or content change | Conditional |
-| `postCreateCommand` | Container | After `updateContentCommand` | No |
-| `postStartCommand` | Container | After container starts | Yes |
-| `postAttachCommand` | Container | After client attaches | Yes |
-
-`initializeCommand` runs on the host machine. All other hooks run inside the container as the `remoteUser`, in the configured `workspaceFolder`, with the probed user environment.
-
-### Command Formats
-
-Each lifecycle hook supports three command formats:
-
-- **String** -- Executed as `sh -c "<command>"`.
-- **Array** -- Executed as a direct command (no shell interpretation).
-- **Object** -- Keys are names, values are commands. All commands run in parallel.
-
-### Parallel Execution
-
-When a lifecycle hook is specified as an object, all named commands execute concurrently via `try_join_all`. On first failure, all remaining in-flight commands are cancelled (their futures are dropped). The failed command's exit code and stderr are reported.
-
-### `waitFor` and Background Phases
-
-The `waitFor` property controls which phases run in the foreground before `cella up` returns:
-
-| `waitFor` value | Foreground phases | Background phases |
-|---|---|---|
-| `initializeCommand` | None | All five container phases |
-| `onCreateCommand` | `onCreateCommand` | Remaining four |
-| `updateContentCommand` (default) | `onCreate`, `updateContent` | Remaining three |
-| `postCreateCommand` | First three | Remaining two |
-| `postStartCommand` | First four | `postAttachCommand` only |
-
-Background phases are spawned via `exec_detached` as a single shell script. On completion, the script writes status to `/tmp/.cella/lifecycle_status.json`:
-
-```json
-{"status": "completed"}
-```
-
-On failure:
-
-```json
-{"status": "failed"}
-```
-
-The `onCreateCommand` completion state is tracked separately in `/tmp/.cella/lifecycle_state.json` so that prebuilt images can detect whether `onCreateCommand` needs to run on first start.
-
-### Content Update Detection
-
-`updateContentCommand` runs conditionally based on workspace content changes. After lifecycle hooks complete, a content hash of the workspace is written to the container. On subsequent starts, the stored hash is compared against the current workspace; `updateContentCommand` only re-runs when the hash differs.
-
-### Failure Handling
-
-Lifecycle hook failures cascade as follows:
-
-- **During creation**: The container is stopped, removed, and the error propagates to the caller. No partial container is left behind.
-- **During restart**: The error propagates but the container remains (it was already running before).
-- **Background phases**: Failure is recorded in `/tmp/.cella/lifecycle_status.json`. On the next `cella up`, a warning is displayed with a hint to check `cella logs --lifecycle`.
-- **`initializeCommand` failure**: The pipeline aborts immediately; no container operations occur.
-
-### Feature Lifecycle Commands
-
-Features MAY declare their own lifecycle hooks in `devcontainer-feature.json`. These are merged into the `devcontainer.metadata` label during feature resolution. At execution time, lifecycle entries are collected from both the metadata label (feature-contributed) and the user's `devcontainer.json`, then run in order: feature entries first (in install order), user entries last.
-
-### Variable Substitution
-
-Lifecycle commands support `${devcontainerId}`, `${localWorkspaceFolder}`, `${containerWorkspaceFolder}`, and other spec-defined variables. Substitution is applied after entry resolution but before execution.
+See [lifecycle-hooks.md](lifecycle-hooks.md) for the full lifecycle hooks specification, including phase ordering, command formats, parallel execution, `waitFor` semantics, failure handling, feature lifecycle commands, and variable substitution.
 
 ## Container Identity
 
-### Labels
-
-Every cella-managed container carries two sets of labels:
-
-**cella-specific labels (`dev.cella.*`)**:
-
-| Label | Value |
-|---|---|
-| `dev.cella.tool` | `"cella"` |
-| `dev.cella.workspace_path` | Canonical host workspace path |
-| `dev.cella.config_path` | Canonical config file path |
-| `dev.cella.config_hash` | SHA-256 hex of canonical config JSON |
-| `dev.cella.docker_runtime` | Docker runtime identifier (e.g., `docker-desktop`, `orbstack`) |
-| `dev.cella.created_at` | RFC 3339 timestamp |
-| `dev.cella.backend` | Backend kind (`docker`, `podman`) |
-| `dev.cella.remote_user` | Resolved remote user |
-| `dev.cella.version` | cella version at creation time |
-| `dev.cella.workspace_folder` | Workspace folder path inside container |
-| `dev.cella.remote_env` | JSON array of forwarded env vars |
-| `dev.cella.ports_attributes` | Serialized port attributes |
-| `dev.cella.shutdown_action` | Shutdown behavior (`none`, `stopContainer`, `stopCompose`) |
-
-**Spec-standard labels (`devcontainer.*`)**:
-
-| Label | Value |
-|---|---|
-| `devcontainer.local_folder` | Canonical host workspace path |
-| `devcontainer.config_file` | Canonical config file path |
-| `devcontainer.metadata` | JSON array of merged feature + user metadata |
-
-Compose-managed containers additionally carry `dev.cella.compose_project` and `dev.cella.primary_service`. Worktree containers carry `dev.cella.worktree`, `dev.cella.branch`, and `dev.cella.parent_repo`.
-
-### `devcontainerId` Computation
-
-The `devcontainerId` is a deterministic 52-character identifier computed per the [devcontainer spec](https://containers.dev/implementors/spec/#devcontainerid):
-
-1. Construct a JSON object with exactly two keys: `devcontainer.local_folder` (canonical workspace path) and `devcontainer.config_file` (canonical config path).
-2. Serialize the object with keys in sorted order (BTreeMap guarantees this).
-3. Compute the SHA-256 hash of the serialized JSON string.
-4. Encode the hash as a base-32 integer (big-endian byte interpretation).
-5. Left-pad the result with zeros to exactly 52 characters.
-
-The `devcontainerId` is used in variable substitution (`${devcontainerId}`) for lifecycle commands, feature mounts, and entrypoints. This ensures stable, workspace-scoped identifiers for volumes and other resources that persist across container rebuilds.
+See [lifecycle-hooks.md](lifecycle-hooks.md#container-labels) for container labels (spec-standard and cella-specific) and the `devcontainerId` computation algorithm.
 
 ## UID Remapping
 
@@ -401,7 +234,7 @@ GPU requirements with value `"optional"` are always considered met, regardless o
 
 ## Docker Compose Integration
 
-When `dockerComposeFile` is present, cella delegates container management to Docker Compose V2 while maintaining feature parity with the single-container pipeline.
+When `dockerComposeFile` is present, cella delegates container management to Docker Compose V2 while maintaining feature parity with the single-container pipeline. See [container-backends.md](container-backends.md) for backend-level compose capabilities and mount handling.
 
 ### Override File Generation
 
@@ -442,6 +275,14 @@ The `shutdownAction` property controls what happens when the last client disconn
 | `none` | Container keeps running |
 | `stopContainer` | Stop the primary container |
 | `stopCompose` | Run `docker compose down` for the project |
+
+## Credential Protection
+
+When credential protection is enabled, the orchestrator generates phantom tokens and registers them with the daemon before seeding credentials into the container. Credential resolution is deferred to the daemon, which injects real credentials at request time via the in-container proxy. See [credential-protection.md](credential-protection.md).
+
+## Tool Installation
+
+cella supports automatic installation of development tools (Claude Code, Codex, etc.) into containers. Tool installation runs after environment probing and triggers a second env probe pass to capture any PATH changes.
 
 ## Configuration Reference
 
@@ -499,18 +340,6 @@ The orchestrator uses structured error types via `thiserror` with user-facing di
 ### Rollback
 
 Pre-registration with the daemon is rolled back if the container fails to start. This prevents stale entries in the daemon's container registry.
-
-## Feature `dependsOn`
-
-Features with `dependsOn` declarations trigger hard recursive dependency resolution. Missing dependencies are auto-pulled from the feature's registry. This is distinct from `installsAfter` (soft ordering hint that only influences order when both features are present).
-
-### Credential Protection
-
-When credential protection is enabled, the orchestrator generates phantom tokens and registers them with the daemon before seeding credentials into the container. Credential resolution is deferred to the daemon, which injects real credentials at request time via the in-container proxy. See [credential-protection.md](credential-protection.md).
-
-### Tool Installation
-
-cella supports automatic installation of development tools (Claude Code, Codex, etc.) into containers. Tool installation runs after environment probing and triggers a second env probe pass to capture any PATH changes.
 
 ## Dynamic SSH Agent Port Renegotiation
 

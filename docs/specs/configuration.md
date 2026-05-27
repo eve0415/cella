@@ -2,34 +2,23 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
 
+This document covers cella-specific configuration: the layered settings system, cella config files, and cella settings. For devcontainer.json semantics (config discovery, merge semantics, variable substitution, orchestration types), see [devcontainer-reference.md](devcontainer-reference.md).
+
 ## Summary
 
-cella uses a layered configuration system that merges settings from three sources in priority order: global defaults, workspace-embedded customizations, and project-level overrides. Configuration files use TOML (preferred) or JSON with JSONC comments. The devcontainer.json file is parsed as JSONC with schema validation via build-time code generation from the devcontainer JSON schema. Variable substitution resolves eight expression patterns before the configuration is consumed.
+cella uses a layered configuration system that merges settings from three sources in priority order: global defaults, workspace-embedded customizations, and project-level overrides. Configuration files use TOML (preferred) or JSON with JSONC comments. The devcontainer.json file is parsed as JSONC with schema validation via build-time code generation from the devcontainer JSON schema.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph "Config Sources"
+    subgraph "Cella Config Sources"
         global["~/.cella/config.toml<br/>(global defaults)"]
         workspace["customizations.cella<br/>in devcontainer.json"]
         project[".devcontainer/cella.toml<br/>(project overrides)"]
     end
 
-    subgraph "devcontainer.json Sources"
-        dc_primary[".devcontainer/devcontainer.json"]
-        dc_root[".devcontainer.json"]
-        dc_global["~/.config/cella/global.jsonc"]
-        dc_local[".devcontainer/devcontainer.local.jsonc"]
-    end
-
     subgraph "Processing"
-        dc_discover["Config Discovery"]
-        dc_parse["JSONC Preprocessing<br/>+ JSON Parse"]
-        dc_validate["Schema Validation<br/>(codegen)"]
-        dc_merge["devcontainer Layer Merge"]
-        dc_subst["Variable Substitution"]
-
         cella_load["Load Layers"]
         cella_merge["Cella Settings Merge"]
         cella_deser["Strict Deserialization"]
@@ -40,39 +29,21 @@ flowchart TB
         cella_config["CellaConfig<br/>(settings)"]
     end
 
-    dc_primary --> dc_discover
-    dc_root --> dc_discover
-    dc_discover --> dc_parse --> dc_validate
-    dc_global --> dc_merge
-    dc_validate --> dc_merge
-    dc_local --> dc_merge
-    dc_merge --> dc_subst --> resolved
+    resolved -.-> |"customizations.cella<br/>extracted"| workspace
 
     global --> cella_load
-    workspace -.-> |"extracted from<br/>resolved devcontainer.json"| cella_load
+    workspace --> cella_load
     project --> cella_load
     cella_load --> cella_merge --> cella_deser --> cella_config
 ```
+
+For the full devcontainer.json processing pipeline (discovery, parsing, merge, variable substitution), see [devcontainer-reference.md](devcontainer-reference.md).
 
 | Crate | Role |
 |---|---|
 | `cella-config` | Schema types, TOML/JSON loading, settings merge, devcontainer discovery/parsing/resolution, variable substitution |
 | `cella-codegen` | JSON schema to Rust type generation (build-time) |
 | `cella-jsonc` | JSONC preprocessing (comment and trailing comma removal) |
-
-## Config Discovery
-
-cella discovers devcontainer.json from the workspace root without parent directory traversal. The search order is:
-
-| Priority | Path | Notes |
-|---|---|---|
-| 1 (highest) | `{root}/.devcontainer/devcontainer.json` | Primary location |
-| 2 | `{root}/.devcontainer.json` | Root-level shorthand |
-| 3 | `{root}/.devcontainer/<subfolder>/devcontainer.json` | One level deep only |
-
-If priority 1 or 2 matches, discovery stops immediately. At priority 3, if multiple subfolders contain a `devcontainer.json`, discovery fails with an ambiguous configuration error and the user MUST specify `--file` to select one.
-
-When `--file` is provided, discovery is bypassed entirely and the given path is used directly.
 
 ### devcontainer.json Layer Merging
 
@@ -81,7 +52,7 @@ After discovering the primary devcontainer.json, two additional devcontainer.jso
 1. **devcontainer.json global override** (`~/.config/cella/global.jsonc`) -- merged as a base layer beneath the primary config. This is distinct from the cella settings global config (`~/.cella/config.toml`); they use different paths, different formats, and different merge algorithms.
 2. **devcontainer.json local override** (`.devcontainer/devcontainer.local.jsonc`) -- merged on top of the primary config
 
-These layers use devcontainer merge semantics (see [devcontainer.json Merge Semantics](#devcontainerjson-merge-semantics)).
+These layers use devcontainer merge semantics (see [devcontainer-reference.md § Property Merge Semantics](devcontainer-reference.md#property-merge-semantics)).
 
 ## Configuration Layers
 
@@ -166,20 +137,7 @@ openai = false           # preserved from global
 anthropic = false        # added by project
 ```
 
-### devcontainer.json Merge Semantics
-
-When merging devcontainer.json layers (global.jsonc, primary config, local override), the merge algorithm applies property-specific rules per the devcontainer specification:
-
-| Category | Properties | Behavior |
-|---|---|---|
-| Deep merge (object) | `features`, `containerEnv`, `remoteEnv`, `customizations`, `portsAttributes`, `otherPortsAttributes` | Recursive key-by-key merge; sibling keys preserved |
-| Union (array, no duplicates) | `forwardPorts`, `capAdd`, `securityOpt` | Entries from all layers combined; duplicates removed |
-| Concatenate (array, duplicates allowed) | `mounts`, `runArgs`, `overrideFeatureInstallOrder` | Entries from all layers appended in order |
-| Boolean OR | `init`, `privileged` | Any `true` value wins |
-| Max value | `hostRequirements` (per field) | Numeric fields take the maximum; memory strings (e.g., `"4gb"`) are parsed and compared by byte count |
-| Last wins (scalar) | All other properties (`name`, `image`, `remoteUser`, `containerUser`, `waitFor`, `shutdownAction`, `overrideCommand`, `updateRemoteUserUID`, `userEnvProbe`, lifecycle commands) | Higher-priority layer's value replaces the lower |
-
-Memory string parsing for `hostRequirements` recognizes the suffixes `tb`, `gb`, `mb`, `kb` (case-insensitive). Bare numbers are interpreted as bytes.
+For devcontainer.json merge semantics (property-specific rules, merge strategies, memory string parsing), see [devcontainer-reference.md § Property Merge Semantics](devcontainer-reference.md#property-merge-semantics).
 
 ## devcontainer.json Parsing
 
@@ -228,51 +186,7 @@ Diagnostics include:
 
 Deprecation warnings are emitted for legacy properties. For example, `appPort` produces a warning recommending `forwardPorts`.
 
-## Variable Substitution
-
-After merging devcontainer.json layers, cella resolves variable expressions in string values. Seven keywords are recognized:
-
-| Pattern | Resolution | Notes |
-|---|---|---|
-| `${localEnv:VARIABLE[:default]}` | Host environment variable value | Empty string if unset and no default provided. An empty value (`VAR=""`) is considered set -- the default is not used. |
-| `${containerEnv:VARIABLE[:default]}` | Container environment variable | Always resolves to the default (or empty string) at config time -- the container is not running yet. |
-| `${localWorkspaceFolder}` | Canonicalized host workspace path | -- |
-| `${containerWorkspaceFolder}` | Container workspace path | Defaults to `/workspaces/<basename>` when `workspaceFolder` is not set |
-| `${localWorkspaceFolderBasename}` | Last path component of host workspace | -- |
-| `${containerWorkspaceFolderBasename}` | Last path component of container workspace | -- |
-| `${devcontainerId}` | Computed container identifier (52 chars) | -- |
-
-### Resolution Rules
-
-- Variables are resolved left-to-right in a single pass. Substituted values are NOT rescanned for further variable expressions.
-- Object keys are NOT substituted -- only string values within objects and arrays.
-- Default values in `${localEnv:VAR:default}` consume everything after the second colon, including additional colons. `${localEnv:UNSET:/usr/bin:/usr/local/bin}` resolves to `/usr/bin:/usr/local/bin`.
-- Unrecognized variable names are passed through verbatim: `${unknownVar:foo}` remains `${unknownVar:foo}`.
-- A `${` without a matching `}` is passed through literally.
-
-### Two-pass workspaceFolder Resolution
-
-`workspaceFolder` is resolved in a first pass so that `${containerWorkspaceFolder}` references in other fields use the substituted value. For example:
-
-```jsonc
-{
-  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
-  "mounts": ["source=data,target=${containerWorkspaceFolder}/data,type=volume"]
-}
-```
-
-The mount target resolves to `/workspaces/<basename>/data`, using the already-substituted `workspaceFolder` value.
-
-### devcontainerId Computation
-
-The `devcontainerId` is a 52-character alphanumeric string computed as:
-
-1. Construct a sorted JSON object with keys `devcontainer.local_folder` (canonicalized workspace path) and `devcontainer.config_file` (canonicalized config file path)
-2. SHA-256 hash the JSON serialization
-3. Encode the hash as a big integer in base-32 (digits `0-9`, letters `a-v`)
-4. Left-pad with zeros to exactly 52 characters
-
-The ID is deterministic for a given workspace root and config file path, and differs across workspaces.
+For variable substitution (supported patterns, resolution rules, `workspaceFolder` two-pass resolution, `devcontainerId` computation), see [devcontainer-reference.md § Variable Substitution](devcontainer-reference.md#variable-substitution).
 
 ## Settings Reference
 
@@ -528,48 +442,13 @@ Configuration errors are reported via `miette` diagnostics with structured conte
 | `JsoncStrip` | JSONC preprocessing failure (unterminated block comment) | "check for unterminated block comments" |
 | `Deserialization` | Schema validation failure (unknown fields, type mismatches) | "check field names and value types against the cella config schema" |
 
-Discovery errors:
-
-| Error | Cause | Resolution |
-|---|---|---|
-| `NotFound` | No devcontainer.json in standard locations | Create `.devcontainer/devcontainer.json` |
-| `Ambiguous` | Multiple subfolder configs found | Specify `--file` to select one |
-| `ReadDir` | Directory unreadable during discovery | Check filesystem permissions |
+For devcontainer.json discovery errors (`NotFound`, `Ambiguous`, `ReadDir`), see [devcontainer-reference.md § Config Discovery](devcontainer-reference.md#config-discovery).
 
 All configuration errors are fatal -- cella does not proceed with partial configuration.
 
 ## Dual Config File Warning
 
 When both `cella.toml` and `cella.json` exist in the same directory, cella emits a warning diagnostic identifying both files and indicating which one is used (TOML takes precedence). The JSON file is not silently ignored.
-
-## Unified Merge Semantics
-
-Merge behavior is documented in a single reference table covering both cella settings layers and devcontainer.json layers:
-
-| Property Category | Cella Settings Merge | devcontainer.json Merge |
-|---|---|---|
-| Scalars | Higher-priority wins | Last wins |
-| Objects | Recursive deep merge | Deep merge (selected properties) |
-| Arrays (general) | Higher-priority prepended | Property-specific (union, concat, or last-wins) |
-| `shell.preferred` | Replacement (entire array) | N/A (cella-only) |
-| `network.rules` | Prepended (first-match-wins) | N/A (cella-only) |
-| `forwardPorts` | N/A (devcontainer-only) | Union (no duplicates) |
-| `mounts`, `runArgs` | N/A (devcontainer-only) | Concatenated |
-| `features`, `containerEnv` | N/A (devcontainer-only) | Deep merge |
-| `hostRequirements` | N/A (devcontainer-only) | Per-field maximum |
-
-Where behaviors differ between the two systems, the table explicitly notes the difference.
-
-## Extended Variable Substitution
-
-Variable substitution operates on all JSON value types:
-
-| Value Type | Behavior |
-|---|---|
-| String | Substituted (existing behavior) |
-| Number | Parsed as integer or float after substitution |
-| Boolean | Parsed as `true`/`false` after substitution |
-| Object keys | Not processed |
 
 ## Config Profiles
 
@@ -590,6 +469,5 @@ Organization-wide configuration distribution:
 
 ## Limitations
 
-1. `${containerEnv:VARIABLE}` always resolves to the default value (or empty string) at configuration time because the container is not running at configuration time.
-2. The `customizations.cella` section in devcontainer.json is extracted as raw JSON and re-deserialized through the same TOML-compatible schema. TOML-specific syntax (inline tables, multi-line strings) is not available in the JSON embedding.
-3. The `shell.preferred` replacement semantics are an exception to the general array merge behavior. This is intentional but may surprise users expecting concatenation.
+1. The `customizations.cella` section in devcontainer.json is extracted as raw JSON and re-deserialized through the same TOML-compatible schema. TOML-specific syntax (inline tables, multi-line strings) is not available in the JSON embedding.
+2. The `shell.preferred` replacement semantics are an exception to the general array merge behavior. This is intentional but may surprise users expecting concatenation.
