@@ -50,6 +50,7 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 | `settings/gemini` | Gemini agent configuration |
 | `settings/network` | Network settings (proxy, DNS) |
 | `settings/nvim` | Neovim forwarding configuration |
+| `settings/shell` | Shell configuration and detection settings |
 | `settings/tmux` | Tmux forwarding configuration |
 | `settings/tools` | Tool detection and forwarding configuration |
 | `schema` | Auto-generated types from devcontainer JSON Schema (via `build.rs`) |
@@ -60,9 +61,9 @@ Parses all devcontainer.json properties defined in the [Dev Container specificat
 
 ## Crate Dependencies
 
-**Depends on:** [cella-codegen](../cella-codegen) (build-time), [cella-env](../cella-env), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network)
+**Depends on:** [cella-backend](../cella-backend), [cella-codegen](../cella-codegen) (build-time), [cella-env](../cella-env), [cella-features](../cella-features), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network), [cella-protocol](../cella-protocol)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
+**Depended on by:** [cella-cli](../cella-cli), [cella-compose](../cella-compose), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 
 ## Testing
 

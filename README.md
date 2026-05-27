@@ -82,6 +82,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | Git credential forwarding | gh CLI via socket + TCP, auto-on | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/4202) |
 | BROWSER interception | Host browser opens for OAuth | No — [VS Code extension only](https://github.com/microsoft/vscode-remote-release/issues/9935) |
 | Clipboard forwarding | Bidirectional (xsel/xclip) | No — VS Code extension only |
+| Credential protection | Phantom tokens — real credentials never stored in container | No |
 | Container listing | `cella list` | No ([cli#843](https://github.com/devcontainers/cli/issues/843)) |
 | `runArgs` | 30+ docker create flags parsed | Yes |
 | `hostRequirements` | CPU/memory/storage/GPU validation | Partial (informational only) |
@@ -105,7 +106,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] `cella doctor` — system diagnostics with PII redaction
 - [x] `read-configuration` — resolved devcontainer config output (devcontainer CLI compatible)
 - [x] Docker Compose support (`dockerComposeFile`)
-- [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/worktrees.md)
+- [x] Git worktree integration (`cella branch`, `cella switch`, `cella prune`) — [guide](docs/guides/worktrees.md)
 - [x] Devcontainer Features (OCI registry resolution, install ordering, caching)
 - [x] Feature management (`cella features edit`, `cella features list`, `cella features update`)
 - [x] Project initialization (`cella init`) — interactive wizard with OCI template/feature selection
@@ -125,6 +126,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 - [x] User environment probing
 - [x] Bidirectional clipboard forwarding (xsel/xclip)
 - [x] Bubblewrap installed for Codex sandbox support
+- [x] Credential protection — phantom tokens replace real credentials inside containers, daemon injects real values at request time ([guide](docs/guides/credential-protection.md))
 
 ### Spec Compliance
 
@@ -146,7 +148,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 ### Network Proxy
 
-- [x] Path-level HTTPS blocking (denylist and allowlist modes) — [guide](docs/network-proxy.md)
+- [x] Path-level HTTPS blocking (denylist and allowlist modes) — [guide](docs/guides/network-proxy.md)
 - [x] Auto-generated CA certificates for HTTPS interception
 - [x] Host proxy environment forwarding (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
 - [x] Glob-based domain and path matching rules
@@ -190,6 +192,9 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `cella list` | List all dev containers with status and ports |
 | `cella logs` | View container logs (`--follow` for streaming) |
 | `cella init` | Initialize a devcontainer configuration (interactive wizard) |
+| `cella status` | Show current container and workspace status |
+| `cella install` | Install AI coding tools into a running container |
+| `cella outdated` | Check for outdated devcontainer features |
 
 ### Git Worktrees
 
@@ -201,7 +206,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `cella switch <name>` | Switch to a different worktree-backed branch |
 | `cella prune` | Remove stale worktrees and their associated containers |
 
-See the [worktree guide](docs/worktrees.md) for the full workflow, in-container commands, and background task system.
+See the [worktree guide](docs/guides/worktrees.md) for the full workflow, in-container commands, and background task system.
 
 ### Features & Templates
 
@@ -238,7 +243,7 @@ See the [worktree guide](docs/worktrees.md) for the full workflow, in-container 
 
 ## Architecture
 
-cella is a Rust workspace with 19 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
+cella is a Rust workspace with 25 focused crates. The CLI delegates all business logic to library crates — no logic lives in the binary entry point.
 
 ```mermaid
 graph TD
@@ -259,6 +264,7 @@ graph TD
         config[cella-config<br><i>devcontainer parsing</i>]
         features[cella-features<br><i>OCI feature resolution</i>]
         templates[cella-templates<br><i>template resolution</i>]
+        toolinstall[cella-tool-install<br><i>AI tool installation</i>]
     end
 
     subgraph "Tier 3 — Foundation"
@@ -268,23 +274,41 @@ graph TD
         network[cella-network<br><i>network proxy</i>]
         protocol[cella-protocol<br><i>wire format</i>]
         jsonc[cella-jsonc<br><i>JSONC preprocessor</i>]
+        oci[cella-oci<br><i>OCI credential & layer extraction</i>]
+        proxy[cella-proxy<br><i>HTTP reverse proxy</i>]
+        daemonclient[cella-daemon-client<br><i>daemon IPC client</i>]
+    end
+
+    subgraph "Testing"
+        testing[cella-testing<br><i>runtime detection</i>]
+        testmacros[cella-test-macros<br><i>#runtime_test macro</i>]
     end
 
     cli --> docker & container & compose & git & env & daemon & doctor & orchestrator & config & features & templates
-    docker & container & compose --> backend
+    cli --> daemonclient
+    docker & container --> backend
+    compose --> backend & config & daemonclient & env & features & git & network & toolinstall
+    orchestrator --> backend & compose & config & daemonclient & env & features & git & network & protocol & toolinstall
     agent & daemon --> port
+    daemon --> env & protocol & proxy
+    daemonclient --> env & protocol
     config --> codegen
-    config & templates --> jsonc
-    agent & config & env & orchestrator --> network
-    templates --> features
+    config --> backend & env & features & jsonc & network & protocol
+    templates --> jsonc & oci
+    agent --> network & protocol
+    features --> oci
+    backend --> env & features & git & proxy
+    doctor --> backend & config & daemon & daemonclient & docker & env & protocol
+    toolinstall --> backend & config & env
+    env --> network
     port --> protocol
 ```
 
-See [docs/architecture.md](docs/architecture.md) for details.
+See [docs/specs/architecture.md](docs/specs/architecture.md) for details.
 
 ## Contributing
 
-Contributions welcome. See the [contributing guide](docs/contributing.md) for build instructions and code style.
+Contributions welcome. See the [contributing guide](docs/dev/contributing.md) for build instructions and code style.
 
 - Questions and ideas: [GitHub Discussions](https://github.com/eve0415/cella/discussions)
 - Bug reports: [GitHub Issues](https://github.com/eve0415/cella/issues)

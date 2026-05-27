@@ -37,6 +37,9 @@ Error reporting uses miette's graphical handler for source-positioned diagnostic
 | `features` | Manage devcontainer features (edit, list, update) |
 | `completion` | Generate shell completions |
 | `read-configuration` | Read and output the resolved devcontainer configuration (JSON) |
+| `status` | Show current container and workspace status |
+| `install` | Install AI coding tools into a running container |
+| `outdated` | Check for outdated devcontainer features |
 
 Hidden internal commands: `daemon`.
 
@@ -83,6 +86,9 @@ Hidden internal commands: `daemon`.
 | `commands/network.rs` | Network proxy management |
 | `commands/completion.rs` | Shell completion generation |
 | `commands/features/` | Feature management (mod.rs, edit.rs, jsonc_edit.rs, list.rs, prompts.rs, resolve.rs, update.rs) |
+| `commands/install.rs` | AI tool installation into running containers |
+| `commands/outdated.rs` | Outdated feature detection |
+| `commands/status.rs` | Container and workspace status display |
 | `backend.rs` | Backend selection and auto-detection (`--backend` flag resolution) |
 | `picker.rs` | Interactive selection picker |
 | `progress.rs` | Progress reporting (indicatif spinners, verbosity) |
@@ -94,7 +100,7 @@ Each command file defines an args struct and an `execute()` method.
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container) (macOS only, gated on `cfg(target_os = "macos")`), [cella-daemon](../cella-daemon), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-git](../cella-git), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-protocol](../cella-protocol), [cella-templates](../cella-templates)
+**Depends on:** [cella-backend](../cella-backend), [cella-compose](../cella-compose), [cella-config](../cella-config), [cella-container](../cella-container) (macOS only, gated on `cfg(target_os = "macos")`), [cella-daemon](../cella-daemon), [cella-daemon-client](../cella-daemon-client), [cella-doctor](../cella-doctor), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-features](../cella-features), [cella-git](../cella-git), [cella-jsonc](../cella-jsonc), [cella-network](../cella-network), [cella-orchestrator](../cella-orchestrator), [cella-protocol](../cella-protocol), [cella-templates](../cella-templates)
 
 **Depended on by:** none (top of the dependency tree)
 

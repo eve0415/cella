@@ -6,7 +6,7 @@ Part of the [cella](../../README.md) workspace.
 
 ## Overview
 
-cella-daemon is the host-side counterpart to the in-container cella-agent. It runs as a background process on the host and provides six services:
+cella-daemon is the host-side counterpart to the in-container cella-agent. It runs as a background process on the host and provides seven services:
 
 1. **Port management** — receives port detection events from in-container agents and sets up host-side port forwarding
 2. **Credential proxying** — forwards git credential requests from containers to the host's credential store
@@ -14,6 +14,7 @@ cella-daemon is the host-side counterpart to the in-container cella-agent. It ru
 4. **Clipboard forwarding** — bidirectional clipboard sync between host and containers (copy/paste via platform-native backends)
 5. **SSH agent bridging** — TCP bridge from the host's `$SSH_AUTH_SOCK` into containers, avoiding virtiofs bind-mount issues
 6. **Reverse tunnelling** — broker that matches pending tunnel requests with incoming agent tunnel connections
+7. **Credential protection** — phantom token registry, credential caching, multiplexed credential resolution, and audit logging for credential access
 
 The daemon consolidates what was previously a standalone credential proxy into a single process. It manages PID files for lifecycle tracking, generates authentication tokens for agent connections, and includes health monitoring to detect stale connections.
 
@@ -45,10 +46,17 @@ The daemon has special handling for OrbStack, which provides its own port forwar
 | `ssh_proxy` | Per-workspace SSH-agent TCP bridge — forwards the host's `$SSH_AUTH_SOCK` over TCP so containers get a working `SSH_AUTH_SOCK` without bind mounts |
 | `tunnel` | Reverse-tunnel broker — matches pending tunnel requests with incoming agent tunnel connections |
 | `logging` | File-based tracing to `~/.cella/daemon.log` with size rotation |
+| `credential_cache` | Caches resolved credentials to avoid repeated host lookups |
+| `credential_mux` | Multiplexes credential requests across providers |
+| `credential_proxy` | Proxies credential requests from containers to host providers |
+| `credential_resolver` | Resolves credentials from configured providers |
+| `phantom_registry` | Manages phantom tokens that replace real credentials inside containers |
+| `audit` | Audit logging for credential access events |
+| `error` | `CellaDaemonError` unified error type |
 
 ## Crate Dependencies
 
-**Depends on:** [cella-port](../cella-port), [cella-protocol](../cella-protocol)
+**Depends on:** [cella-env](../cella-env), [cella-port](../cella-port), [cella-protocol](../cella-protocol), [cella-proxy](../cella-proxy)
 
 **Depended on by:** [cella-cli](../cella-cli), [cella-doctor](../cella-doctor), [cella-orchestrator](../cella-orchestrator)
 

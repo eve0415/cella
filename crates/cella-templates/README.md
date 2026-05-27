@@ -40,7 +40,7 @@ Templates are fetched from OCI registries (default: `ghcr.io/devcontainers/templ
 
 ## Crate Dependencies
 
-**Depends on:** [cella-features](../cella-features), [cella-jsonc](../cella-jsonc)
+**Depends on:** [cella-jsonc](../cella-jsonc), [cella-oci](../cella-oci)
 
 **Depended on by:** [cella-cli](../cella-cli)
 

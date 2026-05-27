@@ -34,7 +34,7 @@ Each check category runs with a 5-second timeout to prevent hangs from unrespons
 
 ## Crate Dependencies
 
-**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-protocol](../cella-protocol)
+**Depends on:** [cella-backend](../cella-backend), [cella-config](../cella-config), [cella-daemon](../cella-daemon), [cella-daemon-client](../cella-daemon-client), [cella-docker](../cella-docker), [cella-env](../cella-env), [cella-protocol](../cella-protocol)
 
 **Depended on by:** [cella-cli](../cella-cli)
 

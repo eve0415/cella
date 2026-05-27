@@ -1,6 +1,8 @@
 # Credential Protection
 
-## Executive Summary
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
+
+## Summary
 
 Credential protection prevents dev container processes from accessing real API keys and tokens. Instead of forwarding credentials as environment variables, cella injects opaque **phantom tokens** (UUID-based placeholders) that are meaningless outside the host daemon. When a container process makes an API request to a known credential domain, the in-container agent's MITM proxy intercepts the request, tunnels it over a multiplexed TCP connection to the host daemon, which replaces the phantom token with the real credential and makes the upstream HTTPS request.
 
@@ -72,14 +74,14 @@ Credential abuse (a container using the daemon proxy to make excessive or unauth
 
 ### Security Invariants
 
-These properties must hold at all times when credential protection is active:
+These properties MUST hold at all times when credential protection is active:
 
-1. **Non-disclosure** — Real credentials never enter container memory, filesystem, or environment variables. Only phantom tokens (opaque UUIDs) are visible inside the container.
-2. **Opacity** — Phantom tokens are bearer capabilities scoped to a single container registration. They cannot be used to derive, reconstruct, or correlate with real credentials.
-3. **Fail-closed** — When credential protection is active, requests to credential domains that cannot be tunneled to the daemon receive HTTP 502. There is no fallback to passing phantom tokens through to upstream APIs.
-4. **Identity binding** — Each container is authenticated by a per-container nonce generated at registration. The nonce is used for tunnel authentication instead of a global daemon token.
-5. **Domain confinement** — Real credentials are only sent to domains explicitly registered for that provider. A phantom token for provider X cannot be used to send provider X's real credential to an unregistered domain.
-6. **Provider isolation** — A phantom token registered for provider X cannot be used to resolve provider Y's credential, even within the same container.
+1. **Non-disclosure** — Real credentials MUST NOT enter container memory, filesystem, or environment variables. Only phantom tokens (opaque UUIDs) are visible inside the container.
+2. **Opacity** — Phantom tokens are bearer capabilities scoped to a single container registration. They MUST NOT be used to derive, reconstruct, or correlate with real credentials.
+3. **Fail-closed** — When credential protection is active, requests to credential domains that cannot be tunneled to the daemon MUST receive HTTP 502. There is no fallback to passing phantom tokens through to upstream APIs.
+4. **Identity binding** — Each container MUST be authenticated by a per-container nonce generated at registration. The nonce is used for tunnel authentication instead of a global daemon token.
+5. **Domain confinement** — Real credentials MUST only be sent to domains explicitly registered for that provider. A phantom token for provider X MUST NOT be used to send provider X's real credential to an unregistered domain.
+6. **Provider isolation** — A phantom token registered for provider X MUST NOT be used to resolve provider Y's credential, even within the same container.
 
 ## Architecture
 
@@ -142,7 +144,7 @@ flowchart LR
 
 ## Built-in Providers
 
-12 providers ship built-in. Custom providers can override any built-in by matching the `name`/`id`.
+12 providers ship built-in. Custom providers MAY override any built-in by matching the `name`/`id`.
 
 | ID | Env Var | Domains | Header | Prefix |
 |---|---|---|---|---|
@@ -188,15 +190,15 @@ prefix = "Bearer "
 
 | Field | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|
-| `name` | `string` | yes | — | Non-empty, ASCII alphanumeric + `-_` | Short identifier; if it matches a built-in ID, overrides that provider |
-| `env` | `string` | yes | — | Non-empty, valid env var name | Host environment variable holding the real credential |
-| `domains` | `string[]` | yes | — | Non-empty, each entry a valid hostname (no port, no scheme, `^[a-zA-Z0-9.-]+$`) | Target domains this provider protects |
-| `header` | `string` | yes | — | Non-empty, valid HTTP header name | HTTP header name for credential injection |
+| `name` | `string` | yes | — | MUST be non-empty, ASCII alphanumeric + `-_` | Short identifier; if it matches a built-in ID, overrides that provider |
+| `env` | `string` | yes | — | MUST be non-empty, valid env var name | Host environment variable holding the real credential |
+| `domains` | `string[]` | yes | — | MUST be non-empty, each entry a valid hostname (no port, no scheme, `^[a-zA-Z0-9.-]+$`) | Target domains this provider protects |
+| `header` | `string` | yes | — | MUST be non-empty, valid HTTP header name | HTTP header name for credential injection |
 | `prefix` | `string` | no | `""` | — | Value prefix prepended to the credential (e.g. `"Bearer "`) |
 
 **Override semantics:** A custom provider with the same `name` as a built-in completely replaces the built-in. The built-in's domains, header, and env var are discarded.
 
-Unknown fields in `[[credentials.providers]]` are rejected (`deny_unknown_fields`).
+Unknown fields in `[[credentials.providers]]` MUST be rejected (`deny_unknown_fields`).
 
 ### User Consent Flow
 
@@ -231,8 +233,8 @@ Custom providers introduce a configuration adversary risk: a malicious `cella.to
    ```
 3. If denied, the provider is skipped — no phantom token is generated, no credential route is registered. The container starts without that provider's protection.
 4. On subsequent runs, approved providers are loaded from the allowlist and proceed without prompting.
-5. If **any** field of a provider changes from the approved version (`name`, `env`, `domains`, `header`, or `prefix`), re-approval is required. The approval stores the complete provider definition to detect changes.
-6. Built-in providers never require consent — they are implicitly trusted.
+5. If **any** field of a provider changes from the approved version (`name`, `env`, `domains`, `header`, or `prefix`), re-approval MUST be required. The approval stores the complete provider definition to detect changes.
+6. Built-in providers MUST NOT require consent — they are implicitly trusted.
 
 **Approval file permissions:** `0600` on Unix. The file is user-scoped (not project-scoped) to prevent a project from pre-populating approvals.
 
@@ -289,24 +291,7 @@ prefix = "Bearer "
 
 ### Connection Framing
 
-Three connection types share the daemon's control TCP port. A 1-byte magic byte prefix discriminates connection types before any JSON parsing:
-
-| Magic Byte | Value | Connection Type | Description |
-|---|---|---|---|
-| `0x01` | AgentHello | Agent control connection | Protocol negotiation, management messages |
-| `0x02` | TunnelHandshake | Reverse tunnel | Port forwarding tunnel connection |
-| `0x03` | CredentialProxy | Credential tunnel | Multiplexed credential proxy connection |
-
-The magic byte is the first byte on the TCP stream. After reading it, the daemon knows which parser to invoke for the remainder of the connection.
-
-**Backward compatibility:** If the first byte is `{` (0x7B, start of JSON), the daemon peeks (without consuming) up to `MAX_HANDSHAKE_PAYLOAD` bytes and falls back to field-based trial deserialization for agents that predate magic byte framing:
-
-1. Try `CredentialProxyHandshake` (has `provider_id` + `request_id`)
-2. Try `TunnelHandshake` (has `connection_id`)
-3. Try `AgentHello` (has `protocol_version`)
-4. Reject with "unrecognized first message"
-
-The three message types have mutually exclusive required fields, so a valid payload cannot match more than one type. If multiple parsers succeed (indicating a future field collision), the daemon rejects the message as ambiguous. This fallback is deprecated — new agents MUST use magic byte framing.
+The credential tunnel uses magic byte `0x03` on the daemon's shared control TCP port. See the [IPC Protocol](ipc-protocol.md#connection-multiplexing) for the full dispatch table and backward-compatibility handling. New agents MUST use magic byte framing.
 
 ### Multiplexed Credential Tunnel
 
@@ -362,7 +347,7 @@ Multiple requests with different `request_id` values can be in flight simultaneo
 | `Responding` | `CANCEL` | `RESPONSE_END` sent → `Terminal`, `CANCEL` → `Terminal` |
 | `Terminal` | _(none)_ | Request ID released; not reusable on this connection |
 
-Any frame received in an invalid state for that request_id results in an `ERROR` frame with category `protocol_violation`. Unknown frame types are rejected with `protocol_violation`.
+Any frame received in an invalid state for that request_id MUST result in an `ERROR` frame with category `protocol_violation`. Unknown frame types MUST be rejected with `protocol_violation`.
 
 **Request cancellation:** When the agent sends a `CANCEL` frame for a `request_id`:
 
@@ -372,7 +357,7 @@ Any frame received in an invalid state for that request_id results in an `ERROR`
 4. The daemon releases all resources for that `request_id`
 5. If the daemon has already sent `RESPONSE_END` before receiving `CANCEL`, the `CANCEL` is a no-op
 
-The `request_id` is not reusable on the same connection after cancellation. Cancellation is agent-initiated only; the daemon does not send `CANCEL` frames.
+The `request_id` MUST NOT be reused on the same connection after cancellation. Cancellation is agent-initiated only; the daemon MUST NOT send `CANCEL` frames.
 
 **Concurrency limit:** When the number of in-flight requests reaches `MAX_CONCURRENT_REQUESTS` (64), the daemon rejects additional `HANDSHAKE` frames with an `ERROR` frame (category `too_many_requests`). A request is "in-flight" from `HANDSHAKE` receipt until `RESPONSE_END` or `ERROR` is sent for that `request_id`.
 
@@ -393,10 +378,10 @@ Sent as the payload of a `HANDSHAKE` frame to initiate a credential proxy reques
 | `container_nonce` | `string` | 64 bytes | Per-container nonce for authentication (replaces global auth token) |
 | `container_name` | `string` | 256 bytes | Container name for registry lookups |
 | `trace_id` | `string` | 64 bytes | Unique identifier for audit logging and request correlation |
-| `domain` | `string` | 253 bytes | Target API domain (e.g. `api.anthropic.com`). Must match `^[a-zA-Z0-9.-]+$`. |
+| `domain` | `string` | 253 bytes | Target API domain (e.g. `api.anthropic.com`). MUST match `^[a-zA-Z0-9.-]+$`. |
 | `provider_id` | `string` | 128 bytes | Provider ID (e.g. `anthropic`) |
 
-The frame header's `request_id` (u32) is used for multiplexing: it routes frames to the correct request handler. The handshake `trace_id` (string) is used for audit logging and correlation. The daemon associates the `trace_id` with the frame's numeric `request_id` upon receiving the `HANDSHAKE` frame. The frame `request_id` must be unique among active streams on the connection; duplicate active IDs result in `protocol_violation`.
+The frame header's `request_id` (u32) is used for multiplexing: it routes frames to the correct request handler. The handshake `trace_id` (string) is used for audit logging and correlation. The daemon associates the `trace_id` with the frame's numeric `request_id` upon receiving the `HANDSHAKE` frame. The frame `request_id` MUST be unique among active streams on the connection; duplicate active IDs result in `protocol_violation`.
 
 ```json
 {"container_nonce":"a1b2c3...","container_name":"cella-myapp-main","trace_id":"cred-550e8400","domain":"api.anthropic.com","provider_id":"anthropic"}
@@ -409,7 +394,7 @@ Sent as the payload of a `REQUEST_ENVELOPE` frame.
 | Field | Type | Max Length | Description |
 |---|---|---|---|
 | `method` | `string` | 16 bytes | HTTP method (`GET`, `POST`, etc.) |
-| `uri` | `string` | 8192 bytes | Request path + query (e.g. `/v1/messages`). Must be relative (no scheme/authority). No fragments. No control characters. |
+| `uri` | `string` | 8192 bytes | Request path + query (e.g. `/v1/messages`). MUST be relative (no scheme/authority). MUST NOT contain fragments or control characters. |
 | `headers` | `[string, string][]` | 100 entries, 64KB per line | HTTP header key-value pairs |
 
 The request body is streamed via `REQUEST_CHUNK` frames — no `body_len` field in the envelope.
@@ -491,9 +476,9 @@ Sent as the payload of an `ERROR` frame. Also returned as an HTTP response body 
 | `MAX_ERROR_PAYLOAD` | 8 KB | Maximum `payload_len` for `ERROR` frames |
 | `MAX_CONCURRENT_REQUESTS` | 64 | Maximum in-flight requests per multiplexed connection |
 
-`MAX_ENVELOPE_PAYLOAD` is the authoritative cap on envelope frame size. It accommodates up to `MAX_HEADERS` (100) headers of `MAX_HEADER_PAIR` (64 KB) each plus method/URI overhead. Receivers validate `payload_len` against the frame-type-specific cap **before allocating memory** — a `HANDSHAKE` frame with `payload_len > 8 KB` is rejected without reading the payload.
+`MAX_ENVELOPE_PAYLOAD` is the authoritative cap on envelope frame size. It accommodates up to `MAX_HEADERS` (100) headers of `MAX_HEADER_PAIR` (64 KB) each plus method/URI overhead. Receivers MUST validate `payload_len` against the frame-type-specific cap **before allocating memory** — a `HANDSHAKE` frame with `payload_len > 8 KB` MUST be rejected without reading the payload.
 
-All resource limits are compile-time constants. They are not user-configurable. `cache_ttl_seconds` (see [Configuration Reference](#configuration-reference)) is the only configurable parameter affecting resource behavior.
+All resource limits are compile-time constants. They MUST NOT be user-configurable. `cache_ttl_seconds` (see [Configuration Reference](#configuration-reference)) is the only configurable parameter affecting resource behavior.
 
 ### Timeout Policy
 
@@ -509,7 +494,7 @@ All resource limits are compile-time constants. They are not user-configurable. 
 
 Timeouts are per-request within the multiplexed connection. A timeout on one request does not affect other in-flight requests. The `Total` timeout is an absolute wall-clock deadline starting from `HANDSHAKE` receipt — each phase timeout is clamped to `min(phase_timeout, remaining_total)`. A response that sends one chunk every 59 seconds will be terminated by the 5-minute total deadline, not kept alive indefinitely by the 60-second idle timeout.
 
-All timeout values are compile-time constants and not user-configurable.
+All timeout values are compile-time constants and MUST NOT be user-configurable.
 
 ### Management Messages
 
@@ -823,7 +808,7 @@ Labels are set at container creation and are immutable for the container's lifet
 
 | Condition | HTTP Status | Error Category | X-Cella-Error | Diagnostic Message |
 |---|---|---|---|---|
-| Container nonce invalid or missing | 401 | `nonce_invalid` | `nonce_invalid` | "Container nonce does not match registered nonce" |
+| Container nonce invalid or absent | 401 | `nonce_invalid` | `nonce_invalid` | "Container nonce does not match registered nonce" |
 | Phantom token not in auth header | 403 | `token_invalid` | `token_invalid` | "No phantom token found in {header} header" |
 | Phantom token not in registry | 403 | `token_invalid` | `token_invalid` | "Phantom token not found in registry for container {name}" |
 | Provider ID mismatch | 403 | `provider_mismatch` | `provider_mismatch` | "Handshake provider {a} does not match token provider {b}" |
@@ -879,9 +864,9 @@ Credential proxy requests are logged to a structured JSONL audit log for securit
 | `denial_reason` | `string?` | Error category if the request was denied, `null` if allowed |
 
 **Log redaction rules:**
-- Never log real credentials, phantom tokens, or request/response bodies
-- Never log query strings (may contain tokens)
-- Never log header values (only header names in trace-level daemon logs)
+- Implementations MUST NOT log real credentials, phantom tokens, or request/response bodies
+- Implementations MUST NOT log query strings (these may contain tokens)
+- Implementations MUST NOT log header values (only header names in trace-level daemon logs)
 
 **Rotation policy:** The audit log is rotated when it exceeds 50 MB. The current log is renamed to `credential-audit.log.1` and a new file is created. Only one rotated file is retained (older rotations are deleted). Applications requiring longer retention should configure external log collection.
 
@@ -932,106 +917,98 @@ For request-path errors (validation failures, upstream errors, timeouts), see [E
 | 29.0 – 29.3.0 | Warning | CVE-2026-34040: AuthZ bypass via oversized requests. Upgrade to 29.3.1+. |
 | >= 29.3.1 | Pass | All known security-relevant patches applied. |
 
-## Extensions
+## Multi-account Profiles
 
-This section describes architectural extension points beyond the core credential protection system. Each subsection defines the data model changes and integration strategy.
+Multiple credential profiles (e.g. `work`, `personal`) are scoped via `credentials.profile`:
 
-### Multi-account Profiles
-
-Support for multiple credential profiles (e.g. `work`, `personal`) scoped via `credentials.profile`:
-
-- **Config extension:** `credentials.profile = "work"` selects a named profile
-- **Registry data model:** Add `profile` field to `PhantomTokenEntry` and registry keys. Container registration includes the active profile. Token lookup is scoped to `(container_name, profile, phantom_token)`.
+- **Config:** `credentials.profile = "work"` selects a named profile.
+- **Registry data model:** The `profile` field on `PhantomTokenEntry` and registry keys scopes token lookup to `(container_name, profile, phantom_token)`. Container registration includes the active profile.
 - **Profile switching:** `cella profile switch <name>` re-registers phantom tokens with the new profile's credentials. Requires container re-injection (exec-time only; running processes keep old tokens until next exec).
 
-### .env File Protection
+## .env File Protection
 
-Intercept `.env` file reads inside the container and inject phantom tokens instead of real credential values:
+Phantom tokens are injected into `.env` file reads inside the container:
 
-- **File-based injection:** Write phantom tokens to `/run/secrets/cella/<env_var>` on a tmpfs mount with `0400` permissions. Configure dev tools to read from this path.
-- **FUSE-based interception (advanced):** Mount a FUSE filesystem at `.env` locations that returns phantom token values for known credential variables. Transparent to all tools that read `.env` files.
-- **Container setup:** Create tmpfs mount at container start, write phantom token files during registration.
+- **File-based injection:** Phantom tokens are written to `/run/secrets/cella/<env_var>` on a tmpfs mount with `0400` permissions. Dev tools are configured to read from this path.
+- **FUSE-based interception:** A FUSE filesystem mounted at `.env` locations returns phantom token values for known credential variables. Transparent to all tools that read `.env` files.
+- **Container setup:** The tmpfs mount is created at container start; phantom token files are written during registration.
 
-### Dynamic Provider Plugins
+## Dynamic Provider Plugins
 
-Load provider definitions from external files without modifying `cella.toml`:
+Provider definitions are loaded from external files without modifying `cella.toml`:
 
-- **Plugin registry format:** TOML or JSON files in `~/.cella/providers.d/` defining provider metadata (same schema as `[[credentials.providers]]`)
-- **Discovery:** Scan the directory at daemon startup and on SIGHUP
-- **Trust:** Plugin providers follow the same user consent flow as custom TOML providers
+- **Plugin registry format:** TOML or JSON files in `~/.cella/providers.d/` define provider metadata (same schema as `[[credentials.providers]]`).
+- **Discovery:** The directory is scanned at daemon startup and on SIGHUP.
+- **Trust:** Plugin providers follow the same user consent flow as custom TOML providers.
 
-### HTTP/2 and HTTP/3
+## Transport
 
-Upgrade the credential tunnel transport from the custom framed protocol:
+The credential tunnel upgrades from the custom framed protocol to standard HTTP/2 and QUIC transports:
 
-- **HTTP/2 multiplexing:** Replace the custom frame protocol with HTTP/2 streams between agent and daemon. Each credential proxy request becomes an HTTP/2 request on a shared connection. This provides standardized flow control, prioritization, and multiplexing.
-- **QUIC/HTTP/3:** For environments where TCP head-of-line blocking is a concern. Requires QUIC transport between agent and daemon.
-- **Upstream HTTP/2:** Use HTTP/2 for upstream API requests when supported by the provider.
+- **HTTP/2 multiplexing:** HTTP/2 streams between agent and daemon replace the custom frame protocol. Each credential proxy request becomes an HTTP/2 request on a shared connection, providing standardized flow control, prioritization, and multiplexing.
+- **QUIC/HTTP/3:** For environments where TCP head-of-line blocking affects concurrent operations, QUIC transport is available between agent and daemon.
+- **Upstream HTTP/2:** Upstream API requests use HTTP/2 when supported by the provider.
 
-### Credential Rotation / TTL
+Depends on: [IPC Protocol § Transport Upgrade: HTTP/2](ipc-protocol.md#transport-upgrade-http2)
 
-Short-lived phantom tokens with automatic renewal:
+## Credential Rotation / TTL
 
-- **TTL-scoped phantom tokens:** Phantom tokens have an expiry time. The agent requests a new token before expiry via a `RENEW_TOKEN` management message.
-- **Re-registration protocol:** Daemon generates a new phantom token, updates the registry atomically, and notifies the agent. In-flight requests with the old token complete normally.
+Phantom tokens have configurable lifetimes with automatic renewal:
+
+- **TTL-scoped phantom tokens:** Phantom tokens carry an expiry time. The agent requests a new token before expiry via a `RENEW_TOKEN` management message.
+- **Re-registration protocol:** The daemon generates a new phantom token, updates the registry atomically, and notifies the agent. In-flight requests with the old token complete normally.
 - **Rotation trigger:** Configurable per-provider (e.g. rotate every 15 minutes).
 
-### Vault / Keychain Integration
+## Vault / Keychain Integration
 
-Resolve credentials from sources beyond environment variables:
+Credentials are resolved from sources beyond environment variables:
 
-- **Async resolver trait:** `CredentialResolver` trait with methods `resolve(provider_id, hostname) → Option<String>`. Default implementation reads env vars; additional implementations for HashiCorp Vault, 1Password CLI, macOS Keychain, Windows Credential Manager.
-- **Provider metadata extension:** `source` field in provider config: `env` (default), `vault`, `keychain`, `1password`. Each source has source-specific configuration fields.
+- **Async resolver trait:** `CredentialResolver` trait with `resolve(provider_id, hostname) → Option<String>`. The default implementation reads env vars; additional implementations cover HashiCorp Vault, 1Password CLI, macOS Keychain, and Windows Credential Manager.
+- **Provider metadata extension:** The `source` field in provider config selects the resolver: `env` (default), `vault`, `keychain`, `1password`. Each source has source-specific configuration fields.
 - **Caching interaction:** Vault/keychain responses are cached with the same TTL mechanism as env var reads.
 
-### Per-container Credential Scoping
+## Per-container Credential Scoping
 
-Different credential sets per container within a workspace:
+Different credential sets are available per container within a workspace:
 
-- **Config extension:** `credentials.containers.<name>.providers` overrides which providers are available to specific containers
-- **Policy engine:** Per-provider access policies defining allowed HTTP methods, URL path patterns, and request rate limits
+- **Config:** `credentials.containers.<name>.providers` overrides which providers are available to specific containers.
 - **Implementation:** Registry lookup gains a container-scoped provider filter. Requests outside the allowed scope return 403 with `policy_denied` category.
 
-### Browser-based OAuth Flows
+## Browser-based OAuth Flows
 
-Support providers that require interactive authentication:
+Providers that require interactive authentication are supported:
 
-- **OAuth callback server:** Daemon runs a temporary HTTP server on localhost for OAuth redirects
-- **Authorization flow:** `cella auth <provider>` opens a browser for the OAuth consent screen, receives the callback, and stores the token
-- **Token storage:** OAuth tokens stored in the daemon's credential cache with provider-specific refresh logic
+- **OAuth callback server:** The daemon runs a temporary HTTP server on localhost for OAuth redirects.
+- **Authorization flow:** `cella auth <provider>` opens a browser for the OAuth consent screen, receives the callback, and stores the token.
+- **Token storage:** OAuth tokens are stored in the daemon's credential cache with provider-specific refresh logic.
 
-### Network-level Enforcement
+## Network-level Enforcement
 
-Prevent credential domain access that bypasses the MITM proxy:
+Direct access to credential domains that bypasses the MITM proxy is blocked at the network level:
 
-- **iptables/nftables rules:** Block direct outbound connections to credential domains from the container network namespace. Only the agent's MITM proxy is allowed to connect.
-- **CAP_NET_ADMIN requirement:** Container must have `CAP_NET_ADMIN` capability for iptables rules (or rules are applied from the host network namespace).
-- **Fallback:** When network enforcement is unavailable (no capability, unsupported platform), fall back to transparent proxy mode and document the bypass risk.
+- **iptables/nftables rules:** Direct outbound connections to credential domains from the container network namespace are blocked. Only the agent's MITM proxy is allowed to connect.
+- **CAP_NET_ADMIN:** The container requires `CAP_NET_ADMIN` capability for iptables rules. cella auto-requests this capability when credential protection is enabled. Rules can alternatively be applied from the host network namespace.
+- **Fallback:** When network enforcement is unavailable (no capability, unsupported platform), the system falls back to transparent proxy mode and logs the bypass risk.
 
-### SPIFFE-style Workload Identity
+Depends on: [Container Lifecycle § Dynamic SSH Agent Port Renegotiation](container-lifecycle.md#dynamic-ssh-agent-port-renegotiation) (shared CAP_NET_ADMIN auto-request)
 
-Replace nonce-based container identity with cryptographic workload identity:
+## SPIFFE-style Workload Identity
+
+Nonce-based container identity is replaced with cryptographic workload identity:
 
 - **Container identity certificates:** The daemon issues short-lived X.509 certificates to each container at registration, encoding container name and allowed providers in the certificate's SPIFFE ID.
 - **mTLS tunnel:** The credential tunnel uses mutual TLS with the container's identity certificate. The daemon validates the certificate on every connection.
-- **Credential broker pattern:** Integrate with cloud provider workload identity federation (GCP Workload Identity, AWS IAM Roles Anywhere) to eliminate static credentials entirely.
+- **Credential broker pattern:** Integration with cloud provider workload identity federation (GCP Workload Identity, AWS IAM Roles Anywhere) eliminates static credentials entirely.
 
-### Policy Engine
+## Policy Engine
 
-Fine-grained access control for credential proxy requests:
+Fine-grained access control governs credential proxy requests:
 
-- **Policy definition:** Per-provider policies specifying allowed HTTP methods, URL path patterns (glob), request body size limits, and rate limits (requests per minute).
+- **Policy definition:** Per-provider policies specify allowed HTTP methods, URL path patterns (glob), request body size limits, and rate limits (requests per minute).
 - **Policy format:** TOML in `cella.toml` or external policy files. Future consideration for OPA/Cedar-style policy languages.
 - **Evaluation:** Every credential proxy request is checked against the policy before upstream dispatch. Denied requests return 403 with `policy_denied` category.
-- **Audit-only mode:** Policies can be set to `mode = "audit"` to log violations without blocking, enabling gradual rollout.
+- **Audit-only mode:** Policies set to `mode = "audit"` log violations without blocking, enabling gradual rollout.
 
 ## Limitations
 
 1. `credentials.protect` defaults to `false` — opt-in only.
-2. `/proc/[pid]/environ` readability — phantom tokens injected as environment variables are readable by any process in the container with the same UID via `/proc`. This is an acceptable trade-off: phantom tokens are not real credentials, and a runtime adversary who can read `/proc` can already make HTTP requests through the MITM proxy.
-3. **Proxy bypass** — a container process can unset `HTTPS_PROXY`, use raw sockets, or connect directly to credential domains, bypassing the MITM proxy. Without network-level enforcement, credential protection relies on the proxy being the path of least resistance, not a hard boundary. See [Network-level Enforcement](#network-level-enforcement) for the iptables extension.
-4. The credential tunnel uses HTTP/1.1 semantics over a custom framed protocol. HTTP/2, WebSocket, and non-standard port upstream connections are not supported. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade path.
-5. State file is not encrypted — relies on filesystem permissions (0600) for protection.
-6. Credential resolution cache has no size limit — a daemon handling many providers could accumulate entries. Bounded by the number of registered providers (typically < 20).
-7. No credential abuse prevention — a container can use the daemon proxy to make unlimited API calls with real credentials. This is an explicit non-goal. See [Policy Engine](#policy-engine) for the extension that addresses this.
-8. Head-of-line blocking on the multiplexed TCP connection — a slow stream can affect other streams despite per-stream buffering. See [HTTP/2 and HTTP/3](#http2-and-http3) for the upgrade to standardized multiplexing.

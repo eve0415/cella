@@ -69,9 +69,9 @@ Implements the `features` property from the [Dev Container specification](https:
 
 ## Crate Dependencies
 
-**Depends on:** none (uses oci-distribution, reqwest, bollard, flate2, tar directly)
+**Depends on:** [cella-oci](../cella-oci)
 
-**Depended on by:** [cella-cli](../cella-cli), [cella-orchestrator](../cella-orchestrator), [cella-templates](../cella-templates)
+**Depended on by:** [cella-cli](../cella-cli), [cella-config](../cella-config), [cella-orchestrator](../cella-orchestrator), [cella-templates](../cella-templates)
 
 ## Testing
 

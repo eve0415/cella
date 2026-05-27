@@ -40,6 +40,7 @@ Implements the container lifecycle portions of the [Dev Container specification]
 | `container` | `ContainerInfo`, `ContainerState`, status inspection |
 | `config_map/` | `CreateContainerOptions`, `MountConfig` assembly from devcontainer config (mounts, ports, run_args consolidated here) |
 | `config_map/env` | Environment variable assembly (`containerEnv`, `remoteEnv`, forwarded vars) |
+| `error` | `DockerError` unified error type |
 | `discovery` | Docker socket auto-discovery (Colima, Podman, Rancher Desktop, standard paths) |
 | `exec` | Command execution (interactive with PTY and detached) |
 | `image` | Image building via Docker build API |
