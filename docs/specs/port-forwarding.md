@@ -237,6 +237,10 @@ On OrbStack, containers are directly reachable by IP. The daemon detects OrbStac
 
 `forwardPorts` accepts both numeric ports (`8080`) and `"host:container"` string format (`"8080:3000"`). The string format maps the container's port to a different host port. When a string entry is provided, the host port takes precedence over automatic allocation.
 
+Port values MUST be valid port numbers in the range 1--65535, both for bare numeric entries and for each component of the `"host:container"` string format. Entries outside this range MUST be rejected during configuration validation.
+
+Reference: [containers.dev/implementors/json_reference](https://containers.dev/implementors/json_reference/) (`forwardPorts`)
+
 ### forwardPorts
 
 An array of port numbers or `"host:container"` strings to forward. These ports are pre-allocated at container registration -- before the agent detects them -- guaranteeing stable host port assignments.
@@ -260,6 +264,8 @@ Per-port configuration keyed by port number or pattern. Each entry MAY specify:
 | `protocol` | `string` | `http` | Protocol hint for URL generation |
 | `requireLocalPort` | `bool` | `false` | Require the exact host port; fail if unavailable |
 | `elevateIfNeeded` | `bool` | `false` | Attempt elevated access for privileged ports |
+
+**Attribute defaults.** When a port attribute is absent from both `portsAttributes` and `otherPortsAttributes`, the implementation SHOULD apply the following defaults: `onAutoForward` to `notify`, `protocol` to `http`, `label` to the empty string, `requireLocalPort` to `false`, and `elevateIfNeeded` to `false`. The `protocol` attribute enum is exactly `http` and `https` -- no other values are valid.
 
 **`onAutoForward` values:**
 
@@ -295,6 +301,17 @@ Port patterns support exact matches (`"3000"`) and ranges.
 }
 ```
 
+### Attribute Resolution Priority
+
+Port attribute lookup MUST follow this precedence order, stopping at the first match:
+
+1. Exact port match in `portsAttributes` (e.g., `"3000"`)
+2. Range match in `portsAttributes` (e.g., `"40000-55000"`)
+3. Regex match in `portsAttributes`
+4. `otherPortsAttributes`
+
+When no entry matches at any level, the attribute defaults described above apply.
+
 ### otherPortsAttributes
 
 Default attributes applied to any auto-detected port that does not match a specific `portsAttributes` entry.
@@ -306,6 +323,10 @@ Default attributes applied to any auto-detected port that does not match a speci
   }
 }
 ```
+
+### Array Merge Semantics
+
+When multiple configuration sources define `forwardPorts`, the arrays MUST be merged using set-union semantics -- entries from all sources are combined and duplicates removed. For `portsAttributes`, merge is per-port last-value-wins: a later source replaces the entire attribute object for a given port key, but sibling port keys from earlier sources are preserved. See [devcontainer-reference.md § Property Merge Semantics](devcontainer-reference.md#property-merge-semantics) for the full merge strategy table.
 
 ## Configuration Reference
 
