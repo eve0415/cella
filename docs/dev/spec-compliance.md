@@ -66,7 +66,7 @@ Date: 2026-05-26 (updated from 2026-04-29)
 | `--log-level` | `info` | Has as `--verbose` (boolean) | PARTIAL |
 | `--log-format` | `text` | Has as `--output` (`text`, `json`) | PARTIAL (name differs) |
 | `--terminal-columns/rows` | - | Not implemented | MISSING |
-| `--default-user-env-probe` | `loginInteractiveShell` | Not implemented | MISSING |
+| `--default-user-env-probe` | `loginInteractiveShell` | Has it (on `up` and `exec`) | PASS |
 | `--update-remote-user-uid-default` | `on` | Not implemented | MISSING |
 | `--remove-existing-container` | `false` | Has as `--remove-existing-container` | PASS |
 | `--build-no-cache` | `false` | Has as `--build-no-cache` | PASS |
