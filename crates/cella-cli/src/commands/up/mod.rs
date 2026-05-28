@@ -577,6 +577,7 @@ impl UpContext {
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
+        let probe_type = self.probe_type();
         let probed_env = self
             .progress
             .run_step(
@@ -585,7 +586,7 @@ impl UpContext {
                     self.client.as_ref(),
                     container_id,
                     remote_user,
-                    self.probe_type(),
+                    probe_type,
                     &shell,
                 ),
             )
@@ -639,7 +640,7 @@ impl UpContext {
                         self.client.as_ref(),
                         container_id,
                         remote_user,
-                        self.probe_type(),
+                        probe_type,
                         &shell,
                     ),
                 )

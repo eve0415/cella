@@ -9,15 +9,12 @@ use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "cli", clap(rename_all = "camelCase"))]
 pub enum UserEnvProbe {
-    #[cfg_attr(feature = "cli", value(name = "none"))]
     None,
-    #[cfg_attr(feature = "cli", value(name = "loginShell"))]
     LoginShell,
-    #[cfg_attr(feature = "cli", value(name = "interactiveShell"))]
     InteractiveShell,
     #[default]
-    #[cfg_attr(feature = "cli", value(name = "loginInteractiveShell"))]
     LoginInteractiveShell,
 }
 
