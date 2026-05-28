@@ -136,6 +136,7 @@ impl BranchArgs {
             extra_labels,
             progress.clone(),
             self.output.clone(),
+            cella_env::user_env_probe::UserEnvProbe::default(),
         )
         .await?;
         let _title_guard = crate::title::push_for_workspace(

@@ -14,7 +14,7 @@ use crate::title::push_for_container;
 /// Execute a command inside the running dev container.
 #[derive(Args)]
 pub struct ExecArgs {
-    /// Default value for userEnvProbe when reading the probe cache.
+    /// Default userEnvProbe type when the container has no probe label.
     #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
     default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 

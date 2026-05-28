@@ -411,6 +411,7 @@ impl UpContext {
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
+        default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = workspace_path
             .canonicalize()
@@ -470,7 +471,7 @@ impl UpContext {
                 mount_workspace_git_root: true,
                 mount_git_worktree_common_dir: false,
             },
-            default_user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            default_user_env_probe,
         })
     }
 
@@ -923,6 +924,7 @@ impl UpArgs {
             extra_labels,
             progress,
             self.output.clone(),
+            self.default_user_env_probe,
         )
         .await?;
         let _title_guard = crate::title::push_for_workspace(
@@ -948,7 +950,6 @@ impl UpArgs {
         } else {
             NetworkRulePolicy::Enforce
         };
-        ctx.default_user_env_probe = self.default_user_env_probe;
 
         let result = if ctx.is_compose() {
             let progress = ctx.progress.clone();

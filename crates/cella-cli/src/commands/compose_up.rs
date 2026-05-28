@@ -36,6 +36,7 @@ pub async fn compose_ensure_up(
         env_files: ctx.compose_env_files.clone(),
         pull_policy: ctx.compose_pull_policy.clone(),
         network_rule_policy: ctx.network_rules,
+        user_env_probe: ctx.probe_type(),
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);

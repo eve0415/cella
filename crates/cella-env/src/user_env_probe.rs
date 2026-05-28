@@ -7,14 +7,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
-#[serde(rename_all = "camelCase")]
 pub enum UserEnvProbe {
+    #[cfg_attr(feature = "cli", value(name = "none"))]
     None,
+    #[cfg_attr(feature = "cli", value(name = "loginShell"))]
     LoginShell,
+    #[cfg_attr(feature = "cli", value(name = "interactiveShell"))]
     InteractiveShell,
     #[default]
+    #[cfg_attr(feature = "cli", value(name = "loginInteractiveShell"))]
     LoginInteractiveShell,
 }
 
@@ -45,7 +48,7 @@ impl fmt::Display for UserEnvProbe {
 }
 
 impl FromStr for UserEnvProbe {
-    type Err = String;
+    type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -53,7 +56,7 @@ impl FromStr for UserEnvProbe {
             "loginShell" => Ok(Self::LoginShell),
             "interactiveShell" => Ok(Self::InteractiveShell),
             "loginInteractiveShell" => Ok(Self::LoginInteractiveShell),
-            other => Err(format!("unknown userEnvProbe value: {other}")),
+            _ => Err(()),
         }
     }
 }

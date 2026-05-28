@@ -26,6 +26,9 @@ pub async fn read_probed_env_cache(
     user: &str,
     probe_type: UserEnvProbe,
 ) -> Option<HashMap<String, String>> {
+    if probe_type == UserEnvProbe::None {
+        return None;
+    }
     let path = cache_path(user, probe_type);
     let result = client
         .exec_command(
