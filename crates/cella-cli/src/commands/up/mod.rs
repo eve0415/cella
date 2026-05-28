@@ -119,6 +119,10 @@ pub struct UpArgs {
 
     #[command(flatten)]
     pub(crate) mounts: UpMountArgs,
+
+    /// Default value for userEnvProbe when devcontainer.json doesn't specify one.
+    #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
+    pub(crate) default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 impl UpArgs {
@@ -285,6 +289,8 @@ pub struct UpContext {
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
     mount_config: ResolvedMountConfig,
+    /// Resolved user env probe type (config value or CLI default).
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 impl UpContext {
@@ -390,6 +396,7 @@ impl UpContext {
                 mount_workspace_git_root: args.mounts.mount_workspace_git_root,
                 mount_git_worktree_common_dir: args.mounts.mount_git_worktree_common_dir,
             },
+            default_user_env_probe: args.default_user_env_probe,
         })
     }
 
@@ -463,6 +470,7 @@ impl UpContext {
                 mount_workspace_git_root: true,
                 mount_git_worktree_common_dir: false,
             },
+            default_user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
         })
     }
 
@@ -478,11 +486,12 @@ impl UpContext {
         self.workspace_folder_from_config.as_deref()
     }
 
-    pub(crate) fn probe_type(&self) -> &str {
+    pub(crate) fn probe_type(&self) -> cella_env::user_env_probe::UserEnvProbe {
         self.config()
             .get("userEnvProbe")
             .and_then(|v| v.as_str())
-            .unwrap_or("loginInteractiveShell")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(self.default_user_env_probe)
     }
 
     /// Register the container with the daemon for port management.
@@ -860,6 +869,7 @@ impl UpContext {
                 mount_git_worktree_common_dir: self.mount_config.mount_git_worktree_common_dir,
             },
             lifecycle_secrets: &self.lifecycle_secrets,
+            user_env_probe: self.probe_type(),
         };
 
         let result =
