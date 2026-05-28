@@ -14,6 +14,10 @@ use crate::title::push_for_container;
 /// Execute a command inside the running dev container.
 #[derive(Args)]
 pub struct ExecArgs {
+    /// Default userEnvProbe type when the container has no probe label.
+    #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
+
     /// Explicit workspace folder path (defaults to current directory).
     #[arg(long)]
     workspace_folder: Option<PathBuf>,
@@ -73,6 +77,7 @@ impl ExecArgs {
         let service = self.service;
         let detach = self.detach;
         let output = self.output;
+        let default_user_env_probe = self.default_user_env_probe;
 
         let target = ContainerTarget {
             container_id: self.container_id,
@@ -114,6 +119,7 @@ impl ExecArgs {
             workdir_opt,
             remote_env,
             &command,
+            default_user_env_probe,
         )
         .await?;
 
@@ -140,6 +146,7 @@ async fn resolve_exec_context(
     workdir_opt: Option<String>,
     remote_env: Vec<String>,
     command: &[String],
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 ) -> Result<
     (String, Option<String>, Vec<String>, Vec<String>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -163,7 +170,7 @@ async fn resolve_exec_context(
 
     let working_dir = workdir_opt.or(label_workdir);
 
-    let mut env = build_exec_env(client, container, &user, label_env).await;
+    let mut env = build_exec_env(client, container, &user, label_env, default_user_env_probe).await;
     env.extend(remote_env);
 
     let preferred = crate::commands::load_shell_preferred(&container.labels);
@@ -276,8 +283,13 @@ async fn build_exec_env(
     container: &cella_backend::ContainerInfo,
     user: &str,
     label_env: Vec<String>,
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 ) -> Vec<String> {
-    let base_env = if let Some(probed) = read_probed_env_cache(client, &container.id, user).await {
+    let probe_type =
+        super::resolve_probe_type_from_labels(&container.labels, default_user_env_probe);
+    let base_env = if let Some(probed) =
+        read_probed_env_cache(client, &container.id, user, probe_type).await
+    {
         cella_env::user_env_probe::merge_env(&probed, &label_env)
     } else {
         label_env

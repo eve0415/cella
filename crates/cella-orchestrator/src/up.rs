@@ -178,13 +178,6 @@ impl EnsureUpContext<'_> {
             .unwrap_or(self.config.default_workspace_folder)
     }
 
-    fn probe_type(&self) -> &str {
-        self.config_json()
-            .get("userEnvProbe")
-            .and_then(|v| v.as_str())
-            .unwrap_or("loginInteractiveShell")
-    }
-
     fn build_lifecycle_ctx<'b>(
         &'b self,
         container_id: &'b str,
@@ -289,7 +282,7 @@ impl EnsureUpContext<'_> {
                     self.client,
                     container_id,
                     remote_user,
-                    self.probe_type(),
+                    self.config.user_env_probe,
                     &shell,
                 )
                 .await,
@@ -335,7 +328,7 @@ impl EnsureUpContext<'_> {
                         self.client,
                         container_id,
                         remote_user,
-                        self.probe_type(),
+                        self.config.user_env_probe,
                         &shell,
                     )
                     .await
@@ -846,6 +839,10 @@ impl EnsureUpContext<'_> {
             "dev.cella.workspace_folder".to_string(),
             self.workspace_folder_str().to_string(),
         );
+        labels.insert(
+            "dev.cella.user_env_probe".to_string(),
+            self.config.user_env_probe.to_string(),
+        );
 
         let mut label_remote_env = self.config.remote_env.to_vec();
         for e in &env_fwd.env {
@@ -1155,7 +1152,7 @@ impl EnsureUpContext<'_> {
                     self.client,
                     container_id,
                     remote_user,
-                    self.probe_type(),
+                    self.config.user_env_probe,
                     &shell,
                 )
                 .await,
@@ -1237,7 +1234,7 @@ impl EnsureUpContext<'_> {
                         self.client,
                         container_id,
                         remote_user,
-                        self.probe_type(),
+                        self.config.user_env_probe,
                         shell,
                     )
                     .await

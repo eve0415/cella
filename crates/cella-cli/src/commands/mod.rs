@@ -321,6 +321,17 @@ pub fn load_shell_preferred(labels: &std::collections::HashMap<String, String>) 
     settings.shell.preferred
 }
 
+/// Resolve the `userEnvProbe` type from container labels, falling back to the given default.
+pub fn resolve_probe_type_from_labels(
+    labels: &std::collections::HashMap<String, String>,
+    default: cella_env::user_env_probe::UserEnvProbe,
+) -> cella_env::user_env_probe::UserEnvProbe {
+    labels
+        .get("dev.cella.user_env_probe")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Append AI provider API keys from the host environment into `env`.
 ///
 /// Loads settings from the workspace path label on the container,

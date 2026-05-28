@@ -561,6 +561,7 @@ name = "cella-env"
 version = "0.2.0"
 dependencies = [
  "cella-network",
+ "clap",
  "miette",
  "serde_json",
  "tempfile",

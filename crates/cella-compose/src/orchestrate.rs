@@ -57,6 +57,8 @@ pub struct ComposeUpConfig<'a> {
     pub pull_policy: Option<String>,
     /// Network rule enforcement policy.
     pub network_rule_policy: cella_network::NetworkRulePolicy,
+    /// Resolved userEnvProbe type (from config or CLI default).
+    pub user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1073,10 @@ fn build_compose_labels(
         "dev.cella.docker_runtime".to_string(),
         cella_env::platform::detect_runtime().as_label().to_string(),
     );
+    labels.insert(
+        "dev.cella.user_env_probe".to_string(),
+        cfg.user_env_probe.to_string(),
+    );
 
     // Spec-standard labels for VS Code / tooling interop.
     labels.insert("devcontainer.local_folder".to_string(), workspace_str);
@@ -1416,6 +1422,7 @@ mod tests {
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
+            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1439,6 +1446,10 @@ mod tests {
             .get("dev.cella.version")
             .expect("compose labels must include dev.cella.version");
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            labels.get("dev.cella.user_env_probe").map(String::as_str),
+            Some("loginInteractiveShell")
+        );
     }
 
     #[test]
@@ -1471,6 +1482,7 @@ mod tests {
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
+            user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),

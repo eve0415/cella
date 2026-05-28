@@ -1,17 +1,19 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ExecOptions, FileToUpload};
 use cella_env::platform::DockerRuntime;
+use cella_env::user_env_probe::UserEnvProbe;
 
-/// Compute the per-user cache path for the probed environment.
+/// Compute the per-user, per-probe-type cache path for the probed environment.
 ///
-/// Stores under `$HOME/.cella/probed-env.json` so it survives container
-/// restarts (unlike `/tmp` which can be cleared).
-fn cache_path(user: &str) -> String {
+/// Stores under `$HOME/.cella/env-{probeType}.json` so different probe types
+/// don't serve stale results from a previous probe configuration.
+fn cache_path(user: &str, probe_type: UserEnvProbe) -> String {
     let home = cella_env::claude_code::container_home(user);
-    format!("{home}/.cella/probed-env.json")
+    format!("{home}/.cella/env-{probe_type}.json")
 }
 
 /// Read the cached probed environment from a running container.
@@ -22,8 +24,12 @@ pub async fn read_probed_env_cache(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
+    probe_type: UserEnvProbe,
 ) -> Option<HashMap<String, String>> {
-    let path = cache_path(user);
+    if probe_type == UserEnvProbe::None {
+        return None;
+    }
+    let path = cache_path(user, probe_type);
     let result = client
         .exec_command(
             container_id,
@@ -54,38 +60,46 @@ pub async fn probe_and_cache_user_env(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
-    probe_type: &str,
+    probe_type: UserEnvProbe,
     shell: &str,
 ) -> Option<HashMap<String, String>> {
     let env = run_env_probe(client, container_id, user, probe_type, shell).await?;
-    write_env_cache(client, container_id, user, &env).await;
+    write_env_cache(client, container_id, user, probe_type, &env).await;
     Some(env)
 }
 
 /// Execute the environment probe command and parse the output.
+///
+/// Applies a 10-second timeout to prevent indefinite hangs from shell
+/// startup scripts that wait for user input.
 async fn run_env_probe(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
-    probe_type: &str,
+    probe_type: UserEnvProbe,
     shell: &str,
 ) -> Option<HashMap<String, String>> {
     let probe_cmd = cella_env::user_env_probe::probe_command(probe_type, shell)?;
 
     debug!("Running userEnvProbe ({probe_type}) with {shell}: {probe_cmd:?}");
 
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: probe_cmd,
-                user: Some(user.to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .ok()?;
+    let exec_opts = ExecOptions {
+        cmd: probe_cmd,
+        user: Some(user.to_string()),
+        env: None,
+        working_dir: None,
+    };
+    let exec_future = client.exec_command(container_id, &exec_opts);
+
+    let result = if let Ok(r) = tokio::time::timeout(Duration::from_secs(10), exec_future).await {
+        r.ok()?
+    } else {
+        warn!(
+            "userEnvProbe timed out after 10s \
+             — avoid waiting for user input in shell startup scripts"
+        );
+        return None;
+    };
 
     if result.exit_code != 0 {
         debug!(
@@ -107,13 +121,14 @@ async fn write_env_cache(
     client: &dyn ContainerBackend,
     container_id: &str,
     user: &str,
+    probe_type: UserEnvProbe,
     env: &HashMap<String, String>,
 ) {
     let Some(json) = serde_json::to_string(env).ok() else {
         return;
     };
 
-    let path = cache_path(user);
+    let path = cache_path(user, probe_type);
 
     let home = cella_env::claude_code::container_home(user);
     let dir_path = format!("{home}/.cella");
@@ -193,23 +208,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_path_root_user() {
-        let path = cache_path("root");
-        assert!(path.contains("root"));
-        assert!(path.ends_with("/.cella/probed-env.json"));
-    }
-
-    #[test]
-    fn cache_path_regular_user() {
-        let path = cache_path("vscode");
+    fn cache_path_includes_probe_type() {
+        let path = cache_path("vscode", UserEnvProbe::LoginInteractiveShell);
         assert!(path.contains("vscode"));
-        assert!(path.ends_with("/.cella/probed-env.json"));
+        assert!(path.ends_with("/.cella/env-loginInteractiveShell.json"));
     }
 
     #[test]
-    fn cache_path_custom_user() {
-        let path = cache_path("devuser");
-        assert!(path.contains("devuser"));
-        assert!(path.ends_with("probed-env.json"));
+    fn cache_path_none_probe() {
+        let path = cache_path("vscode", UserEnvProbe::None);
+        assert!(path.ends_with("/.cella/env-none.json"));
+    }
+
+    #[test]
+    fn cache_path_root_user() {
+        let path = cache_path("root", UserEnvProbe::LoginShell);
+        assert!(path.contains("root"));
+        assert!(path.ends_with("/.cella/env-loginShell.json"));
+    }
+
+    #[test]
+    fn cache_path_interactive_shell() {
+        let path = cache_path("devuser", UserEnvProbe::InteractiveShell);
+        assert!(path.ends_with("/.cella/env-interactiveShell.json"));
     }
 }

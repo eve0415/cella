@@ -82,10 +82,15 @@ impl SwitchArgs {
         debug!("Using shell: {shell}");
 
         // Build environment: probed env (merged with label env) + terminal env
+        let probe_type = super::resolve_probe_type_from_labels(
+            &container.labels,
+            cella_env::user_env_probe::UserEnvProbe::default(),
+        );
         let base_env = if let Some(probed) = cella_orchestrator::env_cache::read_probed_env_cache(
             client.as_ref(),
             &container.id,
             &user,
+            probe_type,
         )
         .await
         {

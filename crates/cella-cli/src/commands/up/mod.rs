@@ -119,6 +119,10 @@ pub struct UpArgs {
 
     #[command(flatten)]
     pub(crate) mounts: UpMountArgs,
+
+    /// Default value for userEnvProbe when devcontainer.json doesn't specify one.
+    #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
+    pub(crate) default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 impl UpArgs {
@@ -285,6 +289,8 @@ pub struct UpContext {
     /// Extra Docker networks to connect after container start (before lifecycle hooks).
     pub(crate) extra_networks: Vec<String>,
     mount_config: ResolvedMountConfig,
+    /// Resolved user env probe type (config value or CLI default).
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 impl UpContext {
@@ -390,6 +396,7 @@ impl UpContext {
                 mount_workspace_git_root: args.mounts.mount_workspace_git_root,
                 mount_git_worktree_common_dir: args.mounts.mount_git_worktree_common_dir,
             },
+            default_user_env_probe: args.default_user_env_probe,
         })
     }
 
@@ -404,6 +411,7 @@ impl UpContext {
         extra_labels: std::collections::HashMap<String, String>,
         progress: crate::progress::Progress,
         output: OutputFormat,
+        default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = workspace_path
             .canonicalize()
@@ -463,6 +471,7 @@ impl UpContext {
                 mount_workspace_git_root: true,
                 mount_git_worktree_common_dir: false,
             },
+            default_user_env_probe,
         })
     }
 
@@ -478,11 +487,12 @@ impl UpContext {
         self.workspace_folder_from_config.as_deref()
     }
 
-    pub(crate) fn probe_type(&self) -> &str {
+    pub(crate) fn probe_type(&self) -> cella_env::user_env_probe::UserEnvProbe {
         self.config()
             .get("userEnvProbe")
             .and_then(|v| v.as_str())
-            .unwrap_or("loginInteractiveShell")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(self.default_user_env_probe)
     }
 
     /// Register the container with the daemon for port management.
@@ -567,6 +577,7 @@ impl UpContext {
 
         // Probe user environment first so tool installs can use feature-provided PATH
         // (e.g., nvm adds /usr/local/share/nvm/current/bin via login shell profiles)
+        let probe_type = self.probe_type();
         let probed_env = self
             .progress
             .run_step(
@@ -575,7 +586,7 @@ impl UpContext {
                     self.client.as_ref(),
                     container_id,
                     remote_user,
-                    self.probe_type(),
+                    probe_type,
                     &shell,
                 ),
             )
@@ -629,7 +640,7 @@ impl UpContext {
                         self.client.as_ref(),
                         container_id,
                         remote_user,
-                        self.probe_type(),
+                        probe_type,
                         &shell,
                     ),
                 )
@@ -860,6 +871,7 @@ impl UpContext {
                 mount_git_worktree_common_dir: self.mount_config.mount_git_worktree_common_dir,
             },
             lifecycle_secrets: &self.lifecycle_secrets,
+            user_env_probe: self.probe_type(),
         };
 
         let result =
@@ -913,6 +925,7 @@ impl UpArgs {
             extra_labels,
             progress,
             self.output.clone(),
+            self.default_user_env_probe,
         )
         .await?;
         let _title_guard = crate::title::push_for_workspace(

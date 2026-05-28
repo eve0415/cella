@@ -38,6 +38,10 @@ pub struct BranchArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     output: OutputFormat,
+
+    /// Default value for userEnvProbe when devcontainer.json doesn't specify one.
+    #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
+    default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 impl BranchArgs {
@@ -136,6 +140,7 @@ impl BranchArgs {
             extra_labels,
             progress.clone(),
             self.output.clone(),
+            self.default_user_env_probe,
         )
         .await?;
         let _title_guard = crate::title::push_for_workspace(
