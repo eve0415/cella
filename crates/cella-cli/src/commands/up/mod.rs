@@ -948,6 +948,7 @@ impl UpArgs {
         } else {
             NetworkRulePolicy::Enforce
         };
+        ctx.default_user_env_probe = self.default_user_env_probe;
 
         let result = if ctx.is_compose() {
             let progress = ctx.progress.clone();
