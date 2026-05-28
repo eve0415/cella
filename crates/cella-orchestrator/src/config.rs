@@ -55,6 +55,8 @@ pub struct UpConfig<'a> {
     /// Secrets injected into lifecycle commands as environment variables.
     /// Runtime-only — must NOT be stored in labels or image layers.
     pub lifecycle_secrets: &'a [String],
+    /// Resolved `userEnvProbe` type (config value or CLI default).
+    pub user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 }
 
 /// How the up pipeline should handle the container image.
