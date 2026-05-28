@@ -88,15 +88,14 @@ async fn run_env_probe(
     };
     let exec_future = client.exec_command(container_id, &exec_opts);
 
-    let result = match tokio::time::timeout(Duration::from_secs(10), exec_future).await {
-        Ok(r) => r.ok()?,
-        Err(_) => {
-            warn!(
-                "userEnvProbe timed out after 10s \
-                 — avoid waiting for user input in shell startup scripts"
-            );
-            return None;
-        }
+    let result = if let Ok(r) = tokio::time::timeout(Duration::from_secs(10), exec_future).await {
+        r.ok()?
+    } else {
+        warn!(
+            "userEnvProbe timed out after 10s \
+             — avoid waiting for user input in shell startup scripts"
+        );
+        return None;
     };
 
     if result.exit_code != 0 {
