@@ -4,23 +4,65 @@
 //! and parses the null-delimited output.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "camelCase")]
+pub enum UserEnvProbe {
+    None,
+    LoginShell,
+    InteractiveShell,
+    #[default]
+    LoginInteractiveShell,
+}
+
+impl UserEnvProbe {
+    pub const fn shell_flags(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::LoginShell => Some("-l"),
+            Self::InteractiveShell => Some("-i"),
+            Self::LoginInteractiveShell => Some("-li"),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LoginShell => "loginShell",
+            Self::InteractiveShell => "interactiveShell",
+            Self::LoginInteractiveShell => "loginInteractiveShell",
+        }
+    }
+}
+
+impl fmt::Display for UserEnvProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UserEnvProbe {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "loginShell" => Ok(Self::LoginShell),
+            "interactiveShell" => Ok(Self::InteractiveShell),
+            "loginInteractiveShell" => Ok(Self::LoginInteractiveShell),
+            other => Err(format!("unknown userEnvProbe value: {other}")),
+        }
+    }
+}
 
 /// Generate the shell command to probe the user's environment.
 ///
-/// Returns `None` if `probe_type` is `"none"`.
-///
-/// # Arguments
-/// * `probe_type` - The `userEnvProbe` config value
-/// * `shell` - The user's shell (e.g., "/bin/bash")
-pub fn probe_command(probe_type: &str, shell: &str) -> Option<Vec<String>> {
-    let flags = match probe_type {
-        "none" => return None,
-        "loginShell" => "-l",
-        "interactiveShell" => "-i",
-        // Default per spec (loginInteractiveShell, empty, or unknown)
-        _ => "-li",
-    };
-
+/// Returns `None` if `probe_type` is `None`.
+pub fn probe_command(probe_type: UserEnvProbe, shell: &str) -> Option<Vec<String>> {
+    let flags = probe_type.shell_flags()?;
     Some(vec![
         shell.to_string(),
         flags.to_string(),
@@ -30,12 +72,18 @@ pub fn probe_command(probe_type: &str, shell: &str) -> Option<Vec<String>> {
 }
 
 /// Parse null-delimited environment output into a map.
+///
+/// Filters out `PWD` — the probed working directory is meaningless
+/// (it's the probe command's cwd) and can interfere with exec sessions.
 pub fn parse_probed_env(output: &str) -> HashMap<String, String> {
     output
         .split('\0')
         .filter(|s| !s.is_empty())
         .filter_map(|entry| {
             let (key, value) = entry.split_once('=')?;
+            if key == "PWD" {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()
@@ -69,30 +117,24 @@ mod tests {
 
     #[test]
     fn probe_command_none() {
-        assert!(probe_command("none", "/bin/bash").is_none());
+        assert!(probe_command(UserEnvProbe::None, "/bin/bash").is_none());
     }
 
     #[test]
     fn probe_command_login_shell() {
-        let cmd = probe_command("loginShell", "/bin/bash").unwrap();
+        let cmd = probe_command(UserEnvProbe::LoginShell, "/bin/bash").unwrap();
         assert_eq!(cmd, vec!["/bin/bash", "-l", "-c", "env -0"]);
     }
 
     #[test]
     fn probe_command_interactive_shell() {
-        let cmd = probe_command("interactiveShell", "/bin/zsh").unwrap();
+        let cmd = probe_command(UserEnvProbe::InteractiveShell, "/bin/zsh").unwrap();
         assert_eq!(cmd, vec!["/bin/zsh", "-i", "-c", "env -0"]);
     }
 
     #[test]
     fn probe_command_default() {
-        let cmd = probe_command("loginInteractiveShell", "/bin/bash").unwrap();
-        assert_eq!(cmd, vec!["/bin/bash", "-li", "-c", "env -0"]);
-    }
-
-    #[test]
-    fn probe_command_empty_defaults() {
-        let cmd = probe_command("", "/bin/bash").unwrap();
+        let cmd = probe_command(UserEnvProbe::LoginInteractiveShell, "/bin/bash").unwrap();
         assert_eq!(cmd, vec!["/bin/bash", "-li", "-c", "env -0"]);
     }
 
@@ -114,12 +156,42 @@ mod tests {
 
     #[test]
     fn parse_entry_without_equals() {
-        // Malformed entries should be skipped
         let output = "GOOD=value\0BADENTRY\0ALSO_GOOD=val2\0";
         let env = parse_probed_env(output);
         assert_eq!(env.len(), 2);
         assert!(env.contains_key("GOOD"));
         assert!(env.contains_key("ALSO_GOOD"));
+    }
+
+    #[test]
+    fn parse_env_filters_pwd() {
+        let output = "HOME=/home/user\0PWD=/tmp\0SHELL=/bin/bash\0";
+        let env = parse_probed_env(output);
+        assert_eq!(env.len(), 2);
+        assert!(!env.contains_key("PWD"));
+        assert_eq!(env.get("HOME"), Some(&"/home/user".to_string()));
+    }
+
+    #[test]
+    fn from_str_roundtrip() {
+        for variant in [
+            UserEnvProbe::None,
+            UserEnvProbe::LoginShell,
+            UserEnvProbe::InteractiveShell,
+            UserEnvProbe::LoginInteractiveShell,
+        ] {
+            assert_eq!(UserEnvProbe::from_str(variant.as_str()).unwrap(), variant);
+        }
+    }
+
+    #[test]
+    fn from_str_invalid() {
+        assert!(UserEnvProbe::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn default_is_login_interactive() {
+        assert_eq!(UserEnvProbe::default(), UserEnvProbe::LoginInteractiveShell);
     }
 
     #[test]
