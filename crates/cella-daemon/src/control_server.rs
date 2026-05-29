@@ -2006,8 +2006,11 @@ fn parse_up_json_output(stdout: &str) -> cella_protocol::WorktreeOperationResult
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            // `cella up --output json` emits `remoteWorkspaceFolder`; accept
+            // the legacy `workspaceFolder` key as a fallback.
             let worktree_path = v
-                .get("workspaceFolder")
+                .get("remoteWorkspaceFolder")
+                .or_else(|| v.get("workspaceFolder"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
@@ -3340,7 +3343,7 @@ branch refs/heads/feat-b
 
     #[test]
     fn parse_branch_json_with_outcome() {
-        let json = r#"{"outcome":"created","containerId":"c1","workspaceFolder":"/ws"}"#;
+        let json = r#"{"outcome":"success","state":"created","containerId":"c1","remoteWorkspaceFolder":"/ws"}"#;
         let result = parse_branch_json_output(json);
         assert!(result.is_some());
     }
@@ -3541,6 +3544,26 @@ branch refs/heads/feat-b
             } => {
                 assert_eq!(container_name, "c1");
                 assert_eq!(worktree_path, "/workspace");
+            }
+            cella_protocol::WorktreeOperationResult::Error { .. } => {
+                panic!("Expected Success")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_up_json_reads_remote_workspace_folder() {
+        // `cella up --output json` emits `remoteWorkspaceFolder`, not the
+        // legacy `workspaceFolder` key.
+        let json = r#"{"outcome":"success","state":"running","containerId":"c1","remoteWorkspaceFolder":"/remote/ws"}"#;
+        let result = parse_up_json_output(json);
+        match result {
+            cella_protocol::WorktreeOperationResult::Success {
+                container_name,
+                worktree_path,
+            } => {
+                assert_eq!(container_name, "c1");
+                assert_eq!(worktree_path, "/remote/ws");
             }
             cella_protocol::WorktreeOperationResult::Error { .. } => {
                 panic!("Expected Success")

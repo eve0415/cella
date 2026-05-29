@@ -36,7 +36,7 @@ impl StatusArgs {
                     serde_json::to_string_pretty(&result).unwrap_or_default()
                 );
             }
-            super::OutputFormat::Text => {
+            super::OutputFormat::Auto | super::OutputFormat::Text => {
                 print_text(&containers, &worktrees, &daemon, &docker);
             }
         }

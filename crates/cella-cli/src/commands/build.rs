@@ -59,7 +59,7 @@ pub struct BuildArgs {
 
 impl BuildArgs {
     pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Text)
+        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
     }
 
     pub async fn execute(
@@ -161,7 +161,7 @@ impl BuildArgs {
 /// Print the build result in the requested output format.
 fn print_result(output: &OutputFormat, image_name: &str, compose: bool) {
     match output {
-        OutputFormat::Text => {
+        OutputFormat::Auto | OutputFormat::Text => {
             if compose {
                 eprintln!("Compose services built. Primary image: {image_name}");
             } else {

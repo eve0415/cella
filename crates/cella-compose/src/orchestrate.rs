@@ -77,6 +77,9 @@ pub struct ComposeUpResult {
     pub remote_user: String,
     /// Workspace folder path inside the container.
     pub workspace_folder: String,
+    /// Docker Compose project name (the `-p`/`COMPOSE_PROJECT_NAME` value).
+    /// Surfaced as `composeProjectName` in the `up` result envelope.
+    pub project_name: String,
     /// Whether the container was freshly created or already running.
     pub outcome: ComposeUpOutcome,
     /// SSH-agent proxy status, when an SSH-agent forwarding decision
@@ -527,6 +530,7 @@ async fn finalize_compose(
         container_id: primary.id,
         remote_user: remote_user.to_string(),
         workspace_folder: project.workspace_folder.clone(),
+        project_name: project.project_name.clone(),
         outcome: ComposeUpOutcome::Created,
         ssh_agent_proxy: None,
     })
@@ -651,6 +655,7 @@ async fn handle_compose_running(
         container_id: container.id.clone(),
         remote_user,
         workspace_folder: project.workspace_folder.clone(),
+        project_name: project.project_name.clone(),
         outcome: ComposeUpOutcome::Running,
         ssh_agent_proxy: None,
     })

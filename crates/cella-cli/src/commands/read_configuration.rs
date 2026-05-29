@@ -131,7 +131,15 @@ impl ReadConfigurationArgs {
     }
 }
 
-async fn resolve_merged_config(
+/// Build the features-merged configuration for a resolved devcontainer.
+///
+/// Reused by `up --include-merged-configuration`.
+///
+/// KNOWN GAP: this performs an additive overwrite that keeps lifecycle keys
+/// SINGULAR (`onCreateCommand`), whereas the official `mergeConfiguration`
+/// emits PLURAL arrays (`onCreateCommands` etc.), a `customizations` Record,
+/// and boolean-OR/union/last-wins scalar resolution. Tracked for a follow-up.
+pub async fn resolve_merged_config(
     config: &serde_json::Value,
     config_path: &std::path::Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {

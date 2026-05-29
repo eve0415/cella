@@ -25,6 +25,8 @@ mod switch;
 mod template;
 pub mod up;
 
+use std::io::IsTerminal;
+
 use clap::{Args, Subcommand, ValueEnum};
 use tracing::warn;
 
@@ -41,8 +43,34 @@ pub struct VerboseArgs {
 /// Output format for container commands.
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
+    /// Resolve at runtime: `Json` when stdout is not a terminal
+    /// (piped/scripted), `Text` when attached to a terminal.
+    Auto,
     Text,
     Json,
+}
+
+impl OutputFormat {
+    /// Collapse `Auto` to a concrete `Text`/`Json` variant.
+    ///
+    /// `Auto` resolves to `Json` when stdout is not a terminal (the output is
+    /// being piped or captured by a script) and `Text` otherwise. `Text` and
+    /// `Json` pass through unchanged, so callers can `match` on the result
+    /// without ever seeing `Auto`.
+    #[must_use]
+    pub fn resolve(&self) -> Self {
+        match self {
+            Self::Auto => {
+                if std::io::stdout().is_terminal() {
+                    Self::Text
+                } else {
+                    Self::Json
+                }
+            }
+            Self::Text => Self::Text,
+            Self::Json => Self::Json,
+        }
+    }
 }
 
 /// Image pull policy for container builds.

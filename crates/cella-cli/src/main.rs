@@ -586,7 +586,9 @@ mod tests {
     // ── Command::is_text_output / verbosity / is_daemon_start ──────
 
     #[test]
-    fn up_default_is_text_output() {
+    fn up_default_keeps_spinners_on() {
+        // Default `--output auto` must keep spinners enabled (is_text_output
+        // is the spinner gate, independent of the resolved stdout format).
         let cli = parse(&["cella", "up"]).unwrap();
         assert!(cli.command.is_text_output());
     }

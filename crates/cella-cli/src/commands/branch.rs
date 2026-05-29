@@ -191,7 +191,7 @@ impl BranchArgs {
 
         // Summary
         match self.output {
-            OutputFormat::Text => {
+            OutputFormat::Auto | OutputFormat::Text => {
                 eprintln!(
                     "Ready: {} (container: {})",
                     wt_path.display(),

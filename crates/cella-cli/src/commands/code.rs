@@ -8,7 +8,7 @@ use tracing::debug;
 use cella_backend::ExecOptions;
 
 use super::OutputFormat;
-use super::up::{UpArgs, UpContext, output_result};
+use super::up::{UpArgs, UpContext, UpRenderData, UpResult, output_result};
 
 /// Editor to open for the dev container.
 #[derive(Clone, ValueEnum)]
@@ -64,7 +64,7 @@ impl CodeArgs {
         // 3. Ensure container is up
         let build_no_cache = self.up.build.build_no_cache;
         let strict = self.up.strict.clone();
-        let output_format = self.up.output.clone();
+        let output_format = self.up.output.resolve();
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
         let ctx = UpContext::new(&up, progress).await?;
@@ -143,33 +143,51 @@ impl CodeArgs {
         }
 
         // 8. Output result
-        match output_format {
-            OutputFormat::Json => {
-                let output = json!({
-                    "outcome": result.outcome,
-                    "containerId": container_id,
-                    "remoteUser": result.remote_user,
-                    "remoteWorkspaceFolder": result.workspace_folder,
-                    "uri": uri,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).unwrap_or_default()
-                );
-            }
-            OutputFormat::Text => {
-                output_result(
-                    &OutputFormat::Text,
-                    &result.outcome,
-                    &container_id,
-                    &result.remote_user,
-                    &result.workspace_folder,
-                    result.ssh_agent_proxy.as_ref(),
-                );
-            }
-        }
+        emit_code_result(&output_format, &result, &container_id, &uri);
 
         Ok(())
+    }
+}
+
+/// Emit the `cella code` result.
+///
+/// `code` has no official devcontainer-CLI analogue, so its JSON shape keeps
+/// the granular `outcome` (running/started/created) plus a `uri` key. The
+/// text path reuses the shared `up` renderer.
+fn emit_code_result(
+    output_format: &OutputFormat,
+    result: &UpResult,
+    container_id: &str,
+    uri: &str,
+) {
+    match output_format {
+        OutputFormat::Json => {
+            let output = json!({
+                "outcome": result.outcome,
+                "containerId": container_id,
+                "remoteUser": result.remote_user,
+                "remoteWorkspaceFolder": result.workspace_folder,
+                "uri": uri,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            );
+        }
+        OutputFormat::Auto | OutputFormat::Text => {
+            output_result(&UpRenderData {
+                format: &OutputFormat::Text,
+                outcome: "success",
+                state: &result.outcome,
+                container_id,
+                remote_user: &result.remote_user,
+                workspace_folder: &result.workspace_folder,
+                ssh_agent_proxy: result.ssh_agent_proxy.as_ref(),
+                compose_project_name: result.compose_project_name.as_deref(),
+                configuration: result.configuration.as_ref(),
+                merged_configuration: result.merged_configuration.as_ref(),
+            });
+        }
     }
 }
 

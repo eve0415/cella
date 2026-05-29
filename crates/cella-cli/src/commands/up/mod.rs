@@ -290,8 +290,10 @@ pub struct UpArgs {
     #[arg(long)]
     pub(crate) config: Option<PathBuf>,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "text")]
+    /// Output format. `auto` (default) emits the JSON result envelope when
+    /// stdout is piped/scripted and the human text line when attached to a
+    /// terminal; `text`/`json` force the respective format.
+    #[arg(long, value_enum, default_value = "auto")]
     pub(crate) output: OutputFormat,
 
     /// Strictness level for validation.
@@ -349,8 +351,12 @@ pub struct UpArgs {
 }
 
 impl UpArgs {
+    /// Whether spinners should run. Spinners are independent of the resolved
+    /// stdout result format: they stay on in `Auto`/`Text` mode and are only
+    /// disabled by an explicit `--output json`. (main.rs additionally gates
+    /// them on a TTY stderr and an unset `RUST_LOG`.)
     pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Text)
+        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
     }
 
     /// Emit a debug trace acknowledging every devcontainer-CLI-parity flag.
@@ -995,9 +1001,21 @@ impl UpContext {
 pub struct UpResult {
     pub container_id: String,
     pub remote_user: String,
+    /// cella's granular provisioning state (`running`/`started`/`created`).
+    /// Surfaced as the `state` key in the JSON envelope; the official
+    /// `outcome` literal (`success`/`error`) is set separately at render time.
     pub outcome: String,
     pub workspace_folder: String,
     pub ssh_agent_proxy: Option<cella_orchestrator::SshAgentProxyStatus>,
+    /// Docker Compose project name (compose path only; `None` for
+    /// single-container). Emitted as `composeProjectName`.
+    pub compose_project_name: Option<String>,
+    /// Post-host-substitution devcontainer.json, populated only when
+    /// `--include-configuration` is set. Emitted as `configuration`.
+    pub configuration: Option<serde_json::Value>,
+    /// Features-merged configuration, populated only when
+    /// `--include-merged-configuration` is set. Emitted as `mergedConfiguration`.
+    pub merged_configuration: Option<serde_json::Value>,
 }
 
 struct CliUpHooks<'a> {
@@ -1205,6 +1223,12 @@ impl UpContext {
             },
             workspace_folder: result.workspace_folder,
             ssh_agent_proxy: result.ssh_agent_proxy,
+            // Single-container path has no compose project; the
+            // include-* config keys are populated by the caller in
+            // `execute`/`execute_branch` when the flags are set.
+            compose_project_name: None,
+            configuration: None,
+            merged_configuration: None,
         })
     }
 }
@@ -1235,7 +1259,7 @@ impl UpArgs {
             &self.backend,
             extra_labels,
             progress,
-            self.output.clone(),
+            self.output.resolve(),
             self.default_user_env_probe,
         )
         .await?;
@@ -1263,7 +1287,7 @@ impl UpArgs {
             NetworkRulePolicy::Enforce
         };
 
-        let result = if ctx.is_compose() {
+        let mut result = if ctx.is_compose() {
             let progress = ctx.progress.clone();
             super::branch::run_compose_branch(
                 &mut ctx,
@@ -1277,18 +1301,39 @@ impl UpArgs {
             ctx.ensure_up(self.build.build_no_cache, &self.strict)
                 .await?
         };
-        output_result(
-            &ctx.output,
-            &result.outcome,
-            &result.container_id,
-            &result.remote_user,
-            &result.workspace_folder,
-            result.ssh_agent_proxy.as_ref(),
-        );
+        populate_envelope_extras(&self.result, &ctx, &mut result).await?;
+        output_result(&result_render_data(&ctx.output, &result));
         Ok(())
     }
 
+    /// Entry point for `cella up`.
+    ///
+    /// Wraps [`Self::execute_inner`] so that, when the resolved output format
+    /// is JSON (explicit `--output json` or auto-resolved because stdout is
+    /// piped), a failure is reported as the official error envelope on STDOUT
+    /// with exit code 1 — matching the official CLI's always-stdout result
+    /// contract. In text/TTY mode the error propagates unchanged for the
+    /// normal human diagnostic path.
     pub async fn execute(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let resolved_format = self.output.resolve();
+        // The `up` argument surface is large; box the inner future to keep
+        // the wrapper's frame small (clippy::large_futures).
+        match Box::pin(self.execute_inner(progress)).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if matches!(resolved_format, OutputFormat::Json) {
+                    output_error_result(&e.to_string());
+                    std::process::exit(1);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn execute_inner(
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1298,7 +1343,10 @@ impl UpArgs {
             return self.execute_branch(branch_name, progress).await;
         }
 
-        let ctx = UpContext::new(&self, progress).await?;
+        let mut ctx = UpContext::new(&self, progress).await?;
+        // Collapse `Auto` so the renderers (and the compose delegate) only
+        // ever see concrete `Text`/`Json`.
+        ctx.output = ctx.output.resolve();
         let _title_guard = crate::title::push_for_workspace(
             ctx.client.as_ref(),
             &ctx.resolved.workspace_root,
@@ -1311,21 +1359,88 @@ impl UpArgs {
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {
-            return super::compose_up::compose_up(ctx).await;
+            return super::compose_up::compose_up(ctx, &self.result).await;
         }
 
-        let result = ctx
+        let mut result = ctx
             .ensure_up(self.build.build_no_cache, &self.strict)
             .await?;
-        output_result(
-            &ctx.output,
-            &result.outcome,
-            &result.container_id,
-            &result.remote_user,
-            &result.workspace_folder,
-            result.ssh_agent_proxy.as_ref(),
-        );
+        populate_envelope_extras(&self.result, &ctx, &mut result).await?;
+        output_result(&result_render_data(&ctx.output, &result));
         Ok(())
+    }
+}
+
+/// Populate the optional `--include-configuration` /
+/// `--include-merged-configuration` envelope fields on `result`.
+///
+/// `configuration` is a clone of the post-host-substitution
+/// devcontainer.json with a `configFilePath` URI object injected (cella's
+/// resolved config does not carry it; see [`super::read_configuration`]).
+///
+/// KNOWN GAP: container-env `${containerEnv:...}` substitution is host-time
+/// only — refs are collapsed at resolve time, not against the live container.
+pub async fn populate_envelope_extras(
+    flags: &UpResultArgs,
+    ctx: &UpContext,
+    result: &mut UpResult,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if flags.include_configuration {
+        let mut cfg = ctx.config().clone();
+        inject_config_file_path(&mut cfg, &ctx.resolved.config_path);
+        result.configuration = Some(cfg);
+    }
+    if flags.include_merged_configuration {
+        // KNOWN GAP: merged shape diverges from official mergeConfiguration
+        // (plural lifecycle arrays, customizations Record); tracked for a
+        // follow-up.
+        result.merged_configuration = Some(
+            super::read_configuration::resolve_merged_config(
+                ctx.config(),
+                &ctx.resolved.config_path,
+            )
+            .await?,
+        );
+    }
+    Ok(())
+}
+
+/// Inject a `configFilePath` URI object into a cloned `configuration`,
+/// matching the shape the official CLI embeds (and the one
+/// [`super::read_configuration`] emits as a sibling key).
+fn inject_config_file_path(config: &mut serde_json::Value, config_path: &Path) {
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "configFilePath".to_string(),
+            json!({
+                "fsPath": path_str,
+                "$mid": 1,
+                "path": path_str,
+                "scheme": "file",
+            }),
+        );
+    }
+}
+
+/// Borrow a [`UpResult`] (plus the chosen format) as a [`UpRenderData`] with
+/// the official `outcome: "success"` literal and cella's granular value as
+/// `state`.
+pub fn result_render_data<'a>(format: &'a OutputFormat, result: &'a UpResult) -> UpRenderData<'a> {
+    UpRenderData {
+        format,
+        outcome: "success",
+        state: &result.outcome,
+        container_id: &result.container_id,
+        remote_user: &result.remote_user,
+        workspace_folder: &result.workspace_folder,
+        ssh_agent_proxy: result.ssh_agent_proxy.as_ref(),
+        compose_project_name: result.compose_project_name.as_deref(),
+        configuration: result.configuration.as_ref(),
+        merged_configuration: result.merged_configuration.as_ref(),
     }
 }
 
@@ -1344,91 +1459,136 @@ fn effective_docker_host(args: &crate::backend::BackendArgs) -> Option<String> {
         .or_else(|| std::env::var("DOCKER_HOST").ok())
 }
 
-pub fn output_result(
-    format: &OutputFormat,
-    outcome: &str,
-    container_id: &str,
-    remote_user: &str,
-    workspace_folder: &str,
-    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
-) {
-    let rendered = render_up_result(
-        format,
-        outcome,
-        container_id,
-        remote_user,
-        workspace_folder,
-        ssh_agent_proxy,
-    );
-    match format {
-        OutputFormat::Text => eprint!("{rendered}"),
+/// Everything the `up` success-result renderers need, gathered into one
+/// borrow so [`output_result`] / [`render_up_result`] keep a single
+/// argument (and stay clear of `clippy::too_many_arguments`).
+///
+/// `outcome` is the official fixed literal (`"success"`); `state` carries
+/// cella's granular `running`/`started`/`created` value. The three trailing
+/// `Option`s are the optional envelope keys — absent unless populated.
+pub struct UpRenderData<'a> {
+    pub format: &'a OutputFormat,
+    pub outcome: &'a str,
+    pub state: &'a str,
+    pub container_id: &'a str,
+    pub remote_user: &'a str,
+    pub workspace_folder: &'a str,
+    pub ssh_agent_proxy: Option<&'a cella_orchestrator::SshAgentProxyStatus>,
+    pub compose_project_name: Option<&'a str>,
+    pub configuration: Option<&'a serde_json::Value>,
+    pub merged_configuration: Option<&'a serde_json::Value>,
+}
+
+pub fn output_result(data: &UpRenderData<'_>) {
+    let rendered = render_up_result(data);
+    match data.format {
+        // `Auto` is resolved to `Text`/`Json` before reaching the renderers;
+        // treat any non-Json value as the human (stderr) path.
         OutputFormat::Json => println!("{rendered}"),
+        OutputFormat::Auto | OutputFormat::Text => eprint!("{rendered}"),
     }
+}
+
+/// Render the JSON error envelope and write it to STDOUT.
+///
+/// Mirrors the official CLI's failure result: `{ outcome: "error", message,
+/// description }`. cella has no structured container error carrying
+/// `containerId`/`didStopContainer`/`disallowedFeatureId`/`learnMoreUrl`, so
+/// those keys are simply absent (documented gap).
+pub fn output_error_result(message: &str) {
+    println!("{}", render_error_result(message));
+}
+
+/// Pure formatter for the error envelope (single-line JSON, no trailing
+/// newline) so the shape can be unit-tested without capturing stdout.
+#[must_use]
+pub fn render_error_result(message: &str) -> String {
+    let output = json!({
+        "outcome": "error",
+        "message": message,
+        "description": "An error occurred setting up the container.",
+    });
+    serde_json::to_string(&output).unwrap_or_default()
 }
 
 /// Pure formatter for the `cella up` success output. Returns the exact
 /// bytes that `output_result` would write (Text → trailing newlines
 /// included; Json → single-line, no trailing newline) so unit tests can
 /// snapshot the output without capturing stderr/stdout.
-pub fn render_up_result(
-    format: &OutputFormat,
-    outcome: &str,
-    container_id: &str,
-    remote_user: &str,
-    workspace_folder: &str,
-    ssh_agent_proxy: Option<&cella_orchestrator::SshAgentProxyStatus>,
-) -> String {
-    match format {
-        OutputFormat::Text => {
-            let short_id = &container_id[..12.min(container_id.len())];
-            let mut out =
-                format!("Container {outcome}. ID: {short_id} Workspace: {workspace_folder}\n");
-            if let Some(status) = ssh_agent_proxy {
-                match status {
-                    cella_orchestrator::SshAgentProxyStatus::Bridged {
-                        host_endpoint,
-                        refcount,
-                    } => {
-                        use std::fmt::Write;
-                        let _ = writeln!(
-                            out,
-                            "ssh-agent proxy: bridged via {host_endpoint} (refcount {refcount})"
-                        );
-                    }
-                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
-                        use std::fmt::Write;
-                        let _ = writeln!(out, "ssh-agent proxy: skipped — {reason}");
-                    }
-                }
+#[must_use]
+pub fn render_up_result(data: &UpRenderData<'_>) -> String {
+    match data.format {
+        OutputFormat::Auto | OutputFormat::Text => render_up_result_text(data),
+        OutputFormat::Json => render_up_result_json(data),
+    }
+}
+
+fn render_up_result_text(data: &UpRenderData<'_>) -> String {
+    let container_id = data.container_id;
+    let short_id = &container_id[..12.min(container_id.len())];
+    let state = data.state;
+    let workspace_folder = data.workspace_folder;
+    let mut out = format!("Container {state}. ID: {short_id} Workspace: {workspace_folder}\n");
+    if let Some(status) = data.ssh_agent_proxy {
+        match status {
+            cella_orchestrator::SshAgentProxyStatus::Bridged {
+                host_endpoint,
+                refcount,
+            } => {
+                use std::fmt::Write;
+                let _ = writeln!(
+                    out,
+                    "ssh-agent proxy: bridged via {host_endpoint} (refcount {refcount})"
+                );
             }
-            out
-        }
-        OutputFormat::Json => {
-            let mut output = serde_json::Map::new();
-            output.insert("outcome".to_string(), json!(outcome));
-            output.insert("containerId".to_string(), json!(container_id));
-            output.insert("remoteUser".to_string(), json!(remote_user));
-            output.insert("remoteWorkspaceFolder".to_string(), json!(workspace_folder));
-            if let Some(status) = ssh_agent_proxy {
-                let value = match status {
-                    cella_orchestrator::SshAgentProxyStatus::Bridged {
-                        host_endpoint,
-                        refcount,
-                    } => json!({
-                        "state": "bridged",
-                        "hostEndpoint": host_endpoint,
-                        "refcount": refcount,
-                    }),
-                    cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => json!({
-                        "state": "skipped",
-                        "reason": reason,
-                    }),
-                };
-                output.insert("sshAgentProxy".to_string(), value);
+            cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => {
+                use std::fmt::Write;
+                let _ = writeln!(out, "ssh-agent proxy: skipped — {reason}");
             }
-            serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
         }
     }
+    out
+}
+
+fn render_up_result_json(data: &UpRenderData<'_>) -> String {
+    let mut output = serde_json::Map::new();
+    // `outcome` is the official fixed literal; cella's granular state lives
+    // under `state` so no information is lost.
+    output.insert("outcome".to_string(), json!(data.outcome));
+    output.insert("state".to_string(), json!(data.state));
+    output.insert("containerId".to_string(), json!(data.container_id));
+    if let Some(name) = data.compose_project_name {
+        output.insert("composeProjectName".to_string(), json!(name));
+    }
+    output.insert("remoteUser".to_string(), json!(data.remote_user));
+    output.insert(
+        "remoteWorkspaceFolder".to_string(),
+        json!(data.workspace_folder),
+    );
+    if let Some(status) = data.ssh_agent_proxy {
+        let value = match status {
+            cella_orchestrator::SshAgentProxyStatus::Bridged {
+                host_endpoint,
+                refcount,
+            } => json!({
+                "state": "bridged",
+                "hostEndpoint": host_endpoint,
+                "refcount": refcount,
+            }),
+            cella_orchestrator::SshAgentProxyStatus::Skipped { reason } => json!({
+                "state": "skipped",
+                "reason": reason,
+            }),
+        };
+        output.insert("sshAgentProxy".to_string(), value);
+    }
+    if let Some(cfg) = data.configuration {
+        output.insert("configuration".to_string(), cfg.clone());
+    }
+    if let Some(merged) = data.merged_configuration {
+        output.insert("mergedConfiguration".to_string(), merged.clone());
+    }
+    serde_json::to_string(&serde_json::Value::Object(output)).unwrap_or_default()
 }
 
 /// Query the daemon for control port + auth token, returning env vars to inject.
@@ -1688,35 +1848,56 @@ mod tests {
         assert!(result.iter().any(|e| e.starts_with("FOO=")));
     }
 
+    // ── output_result / render_up_result helpers ───────────────────
+
+    /// Build a minimal [`UpRenderData`] for a render test: official
+    /// `outcome: "success"`, the given granular `state`, and no optional
+    /// envelope keys. Callers tweak fields on the returned value as needed.
+    fn render_data<'a>(
+        format: &'a OutputFormat,
+        state: &'a str,
+        container_id: &'a str,
+        ssh_agent_proxy: Option<&'a cella_orchestrator::SshAgentProxyStatus>,
+    ) -> UpRenderData<'a> {
+        UpRenderData {
+            format,
+            outcome: "success",
+            state,
+            container_id,
+            remote_user: "vscode",
+            workspace_folder: "/workspaces/test",
+            ssh_agent_proxy,
+            compose_project_name: None,
+            configuration: None,
+            merged_configuration: None,
+        }
+    }
+
     // ── output_result ──────────────────────────────────────────────
 
     #[test]
     fn output_result_text_mode_does_not_panic() {
         // Text mode writes to stderr, just verify it doesn't panic
-        output_result(
+        output_result(&render_data(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             None,
-        );
+        ));
     }
 
     #[test]
     fn output_result_json_mode_does_not_panic() {
         // JSON mode writes to stdout, just verify it doesn't panic
-        output_result(
+        output_result(&render_data(
             &OutputFormat::Json,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             None,
-        );
+        ));
     }
 
-    // ── render_up_result snapshots (Phase 5) ───────────────────────
+    // ── render_up_result snapshots ─────────────────────────────────
     //
     // Snapshot the exact bytes that `output_result` writes so a future
     // change to the user-facing string (or its JSON shape) shows up as
@@ -1727,14 +1908,12 @@ mod tests {
         // The trailing newline is load-bearing: without it, the next
         // shell prompt would consume the status line. Snapshot the full
         // string (newline included) to lock that property in.
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             None,
-        );
+        ));
         insta::assert_snapshot!(
             out,
             @"Container created. ID: abcdef123456 Workspace: /workspaces/test\n"
@@ -1747,14 +1926,12 @@ mod tests {
             host_endpoint: "host.docker.internal:54321".to_string(),
             refcount: 1,
         };
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             Some(&status),
-        );
+        ));
         // Both lines end with `\n`; final newline is load-bearing.
         insta::assert_snapshot!(out, @r"
         Container created. ID: abcdef123456 Workspace: /workspaces/test
@@ -1767,14 +1944,12 @@ mod tests {
         let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
             reason: "daemon socket not found".to_string(),
         };
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Text,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             Some(&status),
-        );
+        ));
         insta::assert_snapshot!(out, @r"
         Container created. ID: abcdef123456 Workspace: /workspaces/test
         ssh-agent proxy: skipped — daemon socket not found
@@ -1791,14 +1966,12 @@ mod tests {
     fn render_up_result_text_uses_short_container_id() {
         // Long container IDs are truncated to 12 hex chars for the
         // status line — matches docker's own short-id convention.
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Text,
             "created",
             "abcdef0123456789cafef00ddeadbeef",
-            "vscode",
-            "/workspaces/test",
             None,
-        );
+        ));
         insta::assert_snapshot!(
             out,
             @"Container created. ID: abcdef012345 Workspace: /workspaces/test\n"
@@ -1807,17 +1980,17 @@ mod tests {
 
     #[test]
     fn render_up_result_json_no_ssh_agent_proxy() {
-        let out = render_up_result(
+        // `outcome` is the official literal; cella's granular value moves
+        // to `state`.
+        let out = render_up_result(&render_data(
             &OutputFormat::Json,
             "running",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             None,
-        );
+        ));
         insta::assert_snapshot!(
             out,
-            @r#"{"containerId":"abcdef123456","outcome":"running","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test"}"#
+            @r#"{"containerId":"abcdef123456","outcome":"success","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","state":"running"}"#
         );
     }
 
@@ -1827,17 +2000,15 @@ mod tests {
             host_endpoint: "host.docker.internal:54321".to_string(),
             refcount: 2,
         };
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Json,
             "started",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             Some(&status),
-        );
+        ));
         insta::assert_snapshot!(
             out,
-            @r#"{"containerId":"abcdef123456","outcome":"started","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"hostEndpoint":"host.docker.internal:54321","refcount":2,"state":"bridged"}}"#
+            @r#"{"containerId":"abcdef123456","outcome":"success","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"hostEndpoint":"host.docker.internal:54321","refcount":2,"state":"bridged"},"state":"started"}"#
         );
     }
 
@@ -1846,17 +2017,102 @@ mod tests {
         let status = cella_orchestrator::SshAgentProxyStatus::Skipped {
             reason: "host SSH_AUTH_SOCK unset".to_string(),
         };
-        let out = render_up_result(
+        let out = render_up_result(&render_data(
             &OutputFormat::Json,
             "created",
             "abcdef123456",
-            "vscode",
-            "/workspaces/test",
             Some(&status),
-        );
+        ));
         insta::assert_snapshot!(
             out,
-            @r#"{"containerId":"abcdef123456","outcome":"created","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"reason":"host SSH_AUTH_SOCK unset","state":"skipped"}}"#
+            @r#"{"containerId":"abcdef123456","outcome":"success","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","sshAgentProxy":{"reason":"host SSH_AUTH_SOCK unset","state":"skipped"},"state":"created"}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_compose_project_name() {
+        // The compose path threads `composeProjectName`; single-container
+        // omits it.
+        let mut data = render_data(&OutputFormat::Json, "running", "abcdef123456", None);
+        data.compose_project_name = Some("cella-myapp-abc12345");
+        insta::assert_snapshot!(
+            render_up_result(&data),
+            @r#"{"composeProjectName":"cella-myapp-abc12345","containerId":"abcdef123456","outcome":"success","remoteUser":"vscode","remoteWorkspaceFolder":"/workspaces/test","state":"running"}"#
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_includes_configuration_when_set() {
+        let cfg = json!({
+            "image": "ubuntu:24.04",
+            "configFilePath": {
+                "fsPath": "/ws/.devcontainer/devcontainer.json",
+                "$mid": 1,
+                "path": "/ws/.devcontainer/devcontainer.json",
+                "scheme": "file"
+            }
+        });
+        let mut data = render_data(&OutputFormat::Json, "created", "abcdef123456", None);
+        data.configuration = Some(&cfg);
+        let parsed: serde_json::Value = serde_json::from_str(&render_up_result(&data)).unwrap();
+        assert_eq!(parsed["configuration"]["image"], json!("ubuntu:24.04"));
+        assert_eq!(
+            parsed["configuration"]["configFilePath"]["scheme"],
+            json!("file")
+        );
+    }
+
+    #[test]
+    fn render_up_result_json_omits_configuration_by_default() {
+        // No flag set → the key must be entirely absent (never null).
+        let out = render_up_result(&render_data(
+            &OutputFormat::Json,
+            "created",
+            "abcdef123456",
+            None,
+        ));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed.get("configuration").is_none());
+        assert!(parsed.get("mergedConfiguration").is_none());
+    }
+
+    #[test]
+    fn render_up_result_json_includes_merged_configuration_when_set() {
+        let merged = json!({"image": "ubuntu:24.04", "onCreateCommand": "echo hi"});
+        let mut data = render_data(&OutputFormat::Json, "created", "abcdef123456", None);
+        data.merged_configuration = Some(&merged);
+        let parsed: serde_json::Value = serde_json::from_str(&render_up_result(&data)).unwrap();
+        assert_eq!(
+            parsed["mergedConfiguration"]["image"],
+            json!("ubuntu:24.04")
+        );
+    }
+
+    #[test]
+    fn render_error_result_shape() {
+        // The error envelope carries only outcome/message/description —
+        // cella has no structured ContainerError, so containerId and the
+        // other partial-failure keys are absent.
+        let out = render_error_result("could not resolve devcontainer.json");
+        insta::assert_snapshot!(
+            out,
+            @r#"{"description":"An error occurred setting up the container.","message":"could not resolve devcontainer.json","outcome":"error"}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed.get("containerId").is_none());
+        assert!(parsed.get("didStopContainer").is_none());
+    }
+
+    #[test]
+    fn inject_config_file_path_adds_uri_object() {
+        let mut cfg = json!({"image": "ubuntu"});
+        inject_config_file_path(&mut cfg, Path::new("/ws/.devcontainer/devcontainer.json"));
+        assert_eq!(cfg["configFilePath"]["scheme"], json!("file"));
+        assert_eq!(cfg["configFilePath"]["$mid"], json!(1));
+        // fsPath and path mirror each other.
+        assert_eq!(
+            cfg["configFilePath"]["fsPath"],
+            cfg["configFilePath"]["path"]
         );
     }
 

@@ -57,22 +57,25 @@ pub async fn compose_ensure_up(
             ComposeUpOutcome::Running => "running".to_string(),
         },
         ssh_agent_proxy: result.ssh_agent_proxy,
+        compose_project_name: Some(result.project_name),
+        configuration: None,
+        merged_configuration: None,
     })
 }
 
 /// Run the Docker Compose orchestration flow.
 ///
-/// Called from `UpArgs::execute()` when the resolved config contains `dockerComposeFile`.
-pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = compose_ensure_up(&ctx).await?;
-    output_result(
-        &ctx.output,
-        &result.outcome,
-        &result.container_id,
-        &result.remote_user,
-        &result.workspace_folder,
-        result.ssh_agent_proxy.as_ref(),
-    );
+/// Called from `UpArgs::execute()` when the resolved config contains
+/// `dockerComposeFile`. `result_flags` carries the `--include-configuration`
+/// / `--include-merged-configuration` toggles so the compose envelope matches
+/// the single-container one.
+pub async fn compose_up(
+    ctx: UpContext,
+    result_flags: &super::up::UpResultArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut result = compose_ensure_up(&ctx).await?;
+    super::up::populate_envelope_extras(result_flags, &ctx, &mut result).await?;
+    output_result(&super::up::result_render_data(&ctx.output, &result));
     Ok(())
 }
 
