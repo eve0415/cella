@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## Summary
 
-cella installs and configures AI coding tools and supporting development tools inside dev containers. Three AI coding tools (Claude Code, Codex CLI, Gemini CLI) and two supporting tools (Neovim, tmux) are managed through a unified installation pipeline, host configuration forwarding via bind mounts, and live credential injection at exec time. Tools are opt-in -- none are installed by default. The `cella-tool-install` crate centralizes all installation logic so that `cella up` and `cella install` share the same code paths, idempotency checks, and verification steps.
+cella installs and configures AI coding tools and supporting development tools inside dev containers. Three AI coding tools (Claude Code, Codex CLI, Gemini CLI) and two supporting tools (Neovim, tmux) are managed through a unified installation pipeline, host configuration forwarding (directory bind mounts plus seeded copies for single-file configs, with live bidirectional sync for `~/.claude.json`), and live credential injection at exec time. Tools are opt-in -- none are installed by default. The `cella-tool-install` crate centralizes all installation logic so that `cella up` and `cella install` share the same code paths, idempotency checks, and verification steps.
 
 ## Architecture
 
@@ -172,23 +172,54 @@ This gives maximum parallelism: Claude Code, Neovim, and tmux install simultaneo
 
 ## Configuration Forwarding
 
-Configuration forwarding bind-mounts host tool configuration directories into the container at creation time. This preserves the user's settings, CLAUDE.md files, MCP server configurations, and plugin state across container rebuilds.
+Configuration forwarding shares host tool configuration into the container at creation time. Directories are bind-mounted; the two single-file configs are seeded as regular files (see [Single-File Configs](#single-file-configs-copy-instead-of-mount)). This preserves the user's settings, CLAUDE.md files, MCP server configurations, and plugin state across container rebuilds.
 
 ### Per-Tool Forwarding
 
-Each tool's `forward_config` setting (default: `true`) controls whether its host config is mounted. When enabled, cella pre-creates any absent config paths on the host before building mount specs.
+Each tool's `forward_config` setting (default: `true`) controls whether its host config is forwarded. When enabled, cella pre-creates any absent config paths on the host before building mount specs.
 
-| Tool | Host Path(s) | Container Path(s) | Pre-created |
+| Tool | Host Path(s) | Container Path(s) | Mechanism |
 |---|---|---|---|
-| Claude Code | `~/.claude.json` | `$HOME/.claude.json` | Empty file `{}`, mode 0600 |
-| Claude Code | `~/.claude/` | `$HOME/.claude/` | Empty directory, mode 0700 |
-| Codex | `~/.codex/` | `$HOME/.codex/` | Empty directory, mode 0700 |
-| Gemini | `~/.gemini/` | `$HOME/.gemini/` | Empty directory, mode 0700 |
-| Neovim | `~/.config/nvim/` (or `config_path`) | `$HOME/.config/nvim/` | Empty directory, mode 0700 |
-| tmux | `~/.tmux.conf` | `$HOME/.tmux.conf` | Empty file, mode 0600 |
-| tmux | `~/.config/tmux/` (or `config_path`) | `$HOME/.config/tmux/` | N/A |
+| Claude Code | `~/.claude.json` | `$HOME/.claude.json` | **Seeded copy + live sync** (not a mount) |
+| Claude Code | `~/.claude/` | `$HOME/.claude/` | Bind mount (empty dir pre-created, mode 0700) |
+| Codex | `~/.codex/` | `$HOME/.codex/` | Bind mount (empty dir pre-created, mode 0700) |
+| Gemini | `~/.gemini/` | `$HOME/.gemini/` | Bind mount (empty dir pre-created, mode 0700) |
+| Neovim | `~/.config/nvim/` (or `config_path`) | `$HOME/.config/nvim/` | Bind mount (empty dir pre-created, mode 0700) |
+| tmux | `~/.tmux.conf` | `$HOME/.tmux.conf` | **Seeded copy at create** (not a mount) |
+| tmux | `~/.config/tmux/` (or `config_path`) | `$HOME/.config/tmux/` | Bind mount |
 
-Container paths are computed from the remote user: `/home/<user>` for regular users, `/root` for root.
+Container paths are computed from the remote user: `/home/<user>` for regular users, `/root` for root. Directory configs are bind-mounted; the two single-file configs (`~/.claude.json`, `~/.tmux.conf`) are **seeded as regular files** rather than bind-mounted — see below.
+
+### Single-File Configs: Copy Instead of Mount
+
+`~/.claude.json` and `~/.tmux.conf` are *not* bind-mounted. A single-file bind mount over a virtualized share (VirtioFS on OrbStack/macOS) ghosts the moment the host atomically replaces the file (`write temp` + `rename`, which Claude Code does on **every** config write): the guest's handle goes stale and the path becomes an unreadable, unremovable mountpoint (`-????????? ? … .claude.json`, source marked `//deleted`). Directory mounts are immune — the directory inode is stable.
+
+Instead, cella **uploads the host file into the container as a regular file** at create time (`upload_files`, chowned to the remote user, mode 0600). A regular file cannot ghost on host replace. `~/.claude.json` is seeded only if absent, since its ongoing updates are owned by the live-sync layer below; `~/.tmux.conf` is seeded once at create (read-mostly).
+
+#### `~/.claude.json` Bidirectional Live Sync
+
+For a *running* container, `~/.claude.json` stays in sync between host and every opted-in container via the cella daemon (opt-in mirrors `forward_config`; the orchestrator sets `CELLA_SYNC_CLAUDE_CONFIG=1` and pins `CELLA_CLAUDE_JSON_PATH` at create time):
+
+- The daemon (host-native) holds a canonical JSON value, watches the host `~/.claude.json`, and broadcasts changes to opted-in agents.
+- Each agent watches its container `~/.claude.json` and reports changes back; the daemon **deep-merges** and writes the host file, then re-broadcasts to the *other* containers.
+- Loop suppression: each side records the SHA-256 of the bytes it last wrote/observed and drops watcher events that match. Watchers watch the *parent directory* (filtered to the filename) so they survive atomic-replace, and all writes are atomic (temp + rename).
+- Opt-in is enforced on **both** directions: the daemon only broadcasts to agents that advertised sync, and it only *ingests* a container's `ClaudeConfigChanged` if that container opted in. A container without config forwarding can neither read pushes nor write the host/peer config.
+
+**Deep-merge semantics.** Objects merge key-by-key; on a shared scalar, the incoming write wins (last-writer-wins). The `projects` map is path-namespaced — host keys (`/Users/...`) and container keys (`/workspaces/...`) are disjoint — so the merge **unions** them, preserving folder-trust and history on both sides rather than thrashing them as a whole-file overwrite would.
+
+**Known, accepted limitations:**
+- **Propagation is effectively between `claude` runs, not mid-session.** Claude Code holds `~/.claude.json` in memory and rewrites it wholesale on change, so a sync write landing while a `claude` session is live is overwritten by that session's next save. (This was equally true of the old shared bind mount — not a regression.)
+- **Deletions don't propagate.** Removing a key (e.g. disabling an MCP server) in one place can reappear via the merge from the other side.
+- **`projects` accumulates** across the host and every container (keys are unioned), so the map grows with each environment's paths.
+- **Legacy containers** created before this change keep the old (potentially ghosting) single-file mount; daemon pushes to them are best-effort no-ops until they are rebuilt. Migration is out of scope.
+
+Observe / reproduce (inside a container after `cella up`):
+```sh
+findmnt -T ~/.claude.json      # expect: no output (regular file, not a mount)
+stat ~/.claude.json && cat ~/.claude.json   # expect: succeeds, valid JSON (no ? ghost)
+# host: edit ~/.claude.json (add an mcpServers entry) -> container reflects it within ~1s
+# host: trigger Claude Code's atomic save repeatedly -> the container copy never ghosts
+```
 
 ### Claude Code Specifics
 
