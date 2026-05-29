@@ -11,10 +11,12 @@
 //! The shared `last_hash` is updated *before* writing so the resulting watcher
 //! event is recognised as the agent's own and dropped, preventing a sync loop.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cella_port::CellaPortError;
 use cella_protocol::AgentMessage;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
@@ -136,32 +138,98 @@ async fn run_watcher(
     };
     debug!("claude sync: watching {}", path.display());
 
+    let control = &control;
     while handle.changes.recv().await.is_some() {
         let Ok(content) = tokio::fs::read_to_string(&path).await else {
             continue; // mid-rename or transiently unreadable; next event covers it
         };
-        let hash = cella_filesync::sha256_hex(content.as_bytes());
-        {
-            let mut lh = last_hash.lock().await;
-            if *lh == hash {
-                continue; // our own (daemon-applied) write — don't echo it back
-            }
-            *lh = hash;
-        }
-        if let Err(e) = control
-            .lock()
-            .await
-            .send(&AgentMessage::ClaudeConfigChanged { content })
-            .await
-        {
-            warn!("claude sync: failed to send config change to daemon: {e}");
-        }
+        forward_change(&last_hash, content, |msg| async move {
+            control.lock().await.send(&msg).await
+        })
+        .await;
+    }
+}
+
+/// Forward a container-side edit to the daemon, advancing `last_hash` only on a
+/// successful send.
+///
+/// Recording the hash *after* a successful send (not before) is the fix for a
+/// silent data-loss bug: if the daemon is unreachable, a failed send leaves
+/// `last_hash` unchanged so the edit is re-sent on the next watcher event or on
+/// reconnect, instead of being marked already-synced and later clobbered by a
+/// stale daemon push. Content whose hash already matches `last_hash` is the
+/// agent's own (daemon-applied) write and is skipped without sending.
+async fn forward_change<F, Fut>(last_hash: &SharedHash, content: String, send: F)
+where
+    F: FnOnce(AgentMessage) -> Fut,
+    Fut: Future<Output = Result<(), CellaPortError>>,
+{
+    let hash = cella_filesync::sha256_hex(content.as_bytes());
+    if *last_hash.lock().await == hash {
+        return; // our own (daemon-applied) write — don't echo it back
+    }
+    match send(AgentMessage::ClaudeConfigChanged { content }).await {
+        Ok(()) => *last_hash.lock().await = hash,
+        Err(e) => warn!("claude sync: failed to send config change to daemon: {e}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn forward_change_keeps_hash_when_send_fails() {
+        // The fix for silent offline-edit loss: a failed send must NOT advance
+        // the hash, so the edit stays eligible for re-send on the next event or
+        // on reconnect (rather than being marked synced and later clobbered).
+        let last_hash: SharedHash = Arc::new(Mutex::new(String::new()));
+        forward_change(&last_hash, r#"{"a":1}"#.to_string(), |_msg| async {
+            Err(CellaPortError::ControlSocket {
+                message: "daemon down".to_string(),
+            })
+        })
+        .await;
+        assert!(
+            last_hash.lock().await.is_empty(),
+            "a failed send must not advance last_hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_change_advances_hash_on_success() {
+        let last_hash: SharedHash = Arc::new(Mutex::new(String::new()));
+        forward_change(&last_hash, r#"{"a":1}"#.to_string(), |_msg| async {
+            Ok(())
+        })
+        .await;
+        assert_eq!(
+            *last_hash.lock().await,
+            cella_filesync::sha256_hex(br#"{"a":1}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_change_skips_unchanged_content() {
+        // Content whose hash already matches is the agent's own daemon-applied
+        // write; it must not be sent back, preventing an echo loop.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let content = r#"{"a":1}"#;
+        let hash = cella_filesync::sha256_hex(content.as_bytes());
+        let last_hash: SharedHash = Arc::new(Mutex::new(hash.clone()));
+        let sent = Arc::new(AtomicBool::new(false));
+        let sent_in_closure = sent.clone();
+        forward_change(&last_hash, content.to_string(), |_msg| {
+            sent_in_closure.store(true, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert!(
+            !sent.load(Ordering::SeqCst),
+            "matching content must not be sent"
+        );
+        assert_eq!(*last_hash.lock().await, hash, "hash must stay unchanged");
+    }
 
     #[test]
     fn resolve_config_path_prefers_pinned_over_home() {
