@@ -109,6 +109,9 @@ pub struct EnsureImageInput<'a> {
     /// Build/backend tuning. Toolchain inputs (`docker_path`, `use_buildkit`)
     /// apply to every build site; cache I/O applies to the base build only.
     pub build_tuning: crate::config::BuildTuning<'a>,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// generated `devcontainer.metadata` label baked into the built image.
+    pub omit_remote_env_from_metadata: bool,
     pub progress: &'a ProgressSender,
 }
 
@@ -155,6 +158,7 @@ pub async fn ensure_image(
         base_image_details: &base_image_details,
         no_cache: input.no_cache,
         build_tuning: input.build_tuning,
+        omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
         progress: input.progress,
     };
     let (features_image, resolved) = resolve_and_build_features(&features_input).await?;
@@ -246,7 +250,12 @@ async fn resolve_base_image(
         build_opts.secrets = input.secrets.to_vec();
 
         if !will_build_features {
-            let metadata_label = cella_features::generate_metadata_label(&[], input.config, None);
+            let metadata_label = cella_features::generate_metadata_label(
+                &[],
+                input.config,
+                None,
+                input.omit_remote_env_from_metadata,
+            );
             build_opts
                 .options
                 .push(format!("--label=devcontainer.metadata={metadata_label}"));
@@ -288,6 +297,7 @@ struct FeaturesBuildInput<'a> {
     base_image_details: &'a ImageDetails,
     no_cache: bool,
     build_tuning: crate::config::BuildTuning<'a>,
+    omit_remote_env_from_metadata: bool,
     progress: &'a ProgressSender,
 }
 
@@ -314,6 +324,7 @@ async fn resolve_and_build_features(
             base_image: input.base_image_tag,
             image_user: &input.base_image_details.user,
             metadata: input.base_image_details.metadata.as_deref(),
+            omit_remote_env: input.omit_remote_env_from_metadata,
         },
         false, // non-compose: build context IS the features dir, bare COPY works
     )

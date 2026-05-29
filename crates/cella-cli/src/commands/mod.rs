@@ -326,6 +326,35 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
+    /// The `--log-level` value, if the subcommand carries one.
+    ///
+    /// Only `up` (and `code`, which embeds the `up` arg surface) expose
+    /// `--log-level`; every other variant returns `None`. main.rs reads this
+    /// once, before subcommand dispatch, to seed the global tracing filter —
+    /// the level can't be applied inside `execute()` because the subscriber is
+    /// already installed by then.
+    pub const fn log_level(&self) -> Option<LogLevel> {
+        match self {
+            Self::Up(args) => args.compat.log_level,
+            Self::Code(args) => args.up.compat.log_level,
+            _ => None,
+        }
+    }
+
+    /// The `--log-format` value (defaults to `Text`).
+    ///
+    /// Only `up`/`code` expose `--log-format`; every other variant returns
+    /// `Text`. Read once in main.rs to select the tracing formatter and to
+    /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
+    /// machine-readable JSON log lines on stderr).
+    pub const fn log_format(&self) -> LogFormat {
+        match self {
+            Self::Up(args) => args.compat.log_format,
+            Self::Code(args) => args.up.compat.log_format,
+            _ => LogFormat::Text,
+        }
+    }
+
     pub async fn execute(
         self,
         progress: Progress,

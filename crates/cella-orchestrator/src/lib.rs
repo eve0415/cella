@@ -34,8 +34,8 @@ pub mod up;
 use crate::config_map::subst_ctx;
 
 pub use config::{
-    BranchConfig, BuildTuning, HostRequirementPolicy, ImageStrategy, MountFlags, NetworkRulePolicy,
-    PruneConfig, UpConfig,
+    BranchConfig, BuildTuning, HostRequirementPolicy, ImageStrategy, MetadataOptions, MountFlags,
+    NetworkRulePolicy, PruneConfig, UpConfig,
 };
 pub use error::OrchestratorError;
 pub use progress::{PhaseChildHandle, PhaseHandle, ProgressEvent, ProgressSender, StepHandle};

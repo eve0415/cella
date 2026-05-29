@@ -935,7 +935,12 @@ impl EnsureUpContext<'_> {
             // No features and no base image metadata -- generate from config.
             labels.insert(
                 "devcontainer.metadata".to_string(),
-                cella_features::generate_metadata_label(&[], config, None),
+                cella_features::generate_metadata_label(
+                    &[],
+                    config,
+                    None,
+                    self.config.metadata_options.omit_remote_env,
+                ),
             );
         }
 
@@ -1720,6 +1725,7 @@ impl EnsureUpContext<'_> {
                 pull_policy: self.config.pull_policy,
                 secrets: &self.config.build_secrets,
                 build_tuning: self.config.build_tuning,
+                omit_remote_env_from_metadata: self.config.metadata_options.omit_remote_env,
                 progress: &self.progress,
             })
             .await?;

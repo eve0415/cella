@@ -72,6 +72,9 @@ pub async fn compose_build(
         config,
         config_path,
         &project,
+        // `cella build` does not yet expose --omit-config-remote-env-from-metadata
+        // (it's wired on the `up` path only); keep the full metadata label here.
+        false,
         progress,
     )
     .await?;

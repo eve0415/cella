@@ -11,7 +11,55 @@ use std::io::IsTerminal;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use commands::{LogFormat, LogLevel};
 use progress::{IndicatifMakeWriter, Progress};
+
+/// Map `--log-level` (and `RUST_LOG` precedence) to a tracing `EnvFilter`
+/// directive string.
+///
+/// Precedence: `RUST_LOG` (highest) > `--log-level` > default `info`. When
+/// `RUST_LOG` is set we return `None` so the caller falls back to
+/// `EnvFilter::from_default_env()` and the developer's env var wins untouched.
+///
+/// `--log-level debug`/`trace` is scoped to the `cella` crates with a lower
+/// `info` global fallback (`cella=debug,info`) so raising cella's verbosity
+/// doesn't drown stderr in dependency-crate logs (bollard, hyper, gix). This
+/// crate-scoping is a cella choice; the official CLI has a flat numeric level.
+fn resolve_log_directive(rust_log_set: bool, level: Option<LogLevel>) -> Option<String> {
+    if rust_log_set {
+        return None;
+    }
+    Some(match level.unwrap_or(LogLevel::Info) {
+        // Default/info: a flat `info` directive matches the official default
+        // (events at info and above are shown).
+        LogLevel::Info => "info".to_string(),
+        // debug/trace: raise cella's crates only, keep the rest at info.
+        LogLevel::Debug => "cella=debug,info".to_string(),
+        LogLevel::Trace => "cella=trace,info".to_string(),
+    })
+}
+
+/// Decide whether indicatif spinners may render on stderr.
+///
+/// Spinners require all of: text output mode, no `RUST_LOG` (its logs would
+/// interleave with spinner frames), a TTY, and a non-`Json` log format —
+/// `--log-format json` writes machine-readable JSON log lines to stderr and
+/// indicatif's ANSI escapes would corrupt them.
+const fn spinners_enabled(
+    is_text_output: bool,
+    rust_log_set: bool,
+    is_tty: bool,
+    log_format: LogFormat,
+) -> bool {
+    is_text_output && !rust_log_set && is_tty && matches!(log_format, LogFormat::Text)
+}
+
+/// Build the `EnvFilter` for the global subscriber, honoring `RUST_LOG` first
+/// and falling back to the `--log-level`-derived directive.
+fn build_env_filter(rust_log_set: bool, level: Option<LogLevel>) -> EnvFilter {
+    resolve_log_directive(rust_log_set, level)
+        .map_or_else(EnvFilter::from_default_env, EnvFilter::new)
+}
 
 /// cella — Dev containers reinvented for the AI age
 #[derive(Parser)]
@@ -42,27 +90,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let verbosity = cli.command.verbosity();
 
-    // Spinners are active when: text output mode AND no RUST_LOG AND stderr is a TTY.
+    // `--log-level` / `--log-format` are parsed into the `up` subcommand args,
+    // but the global subscriber is installed here, once, before dispatch — so
+    // read them off the parsed command rather than inside `execute()`.
     let rust_log_set = std::env::var_os("RUST_LOG").is_some();
     let is_tty = std::io::stderr().is_terminal();
-    let spinners_enabled = cli.command.is_text_output() && !rust_log_set && is_tty;
+    let log_format = cli.command.log_format();
+    let spinners_enabled = spinners_enabled(
+        cli.command.is_text_output(),
+        rust_log_set,
+        is_tty,
+        log_format,
+    );
 
     let progress = Progress::new(spinners_enabled, verbosity);
 
     // The daemon subprocess initializes its own file-based tracing.
     // Skip the normal indicatif-based tracing for daemon start.
     if !cli.command.is_daemon_start() {
-        if spinners_enabled {
+        let env_filter = build_env_filter(rust_log_set, cli.command.log_level());
+        if matches!(log_format, LogFormat::Json) {
+            // `--log-format json`: emit JSON log lines on stderr. Spinners are
+            // already forced off above. Note: cella's tracing `.json()` shape
+            // (string level, target/span fields) is its own schema, NOT the
+            // official LogEvent shape (numeric level, epoch timestamps) — a
+            // deliberate divergence, see the logging-terminal spec.
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .with_writer(std::io::stderr)
+                .init();
+        } else if spinners_enabled {
             // Route tracing through indicatif so log lines don't corrupt spinners.
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(env_filter)
                 .with_writer(IndicatifMakeWriter::new(progress.multi().clone()))
                 .init();
         } else {
-            // No spinners (JSON mode, RUST_LOG set, non-TTY): write directly to stderr.
+            // No spinners (RUST_LOG set, non-TTY): write directly to stderr.
             // Spec requires stdout = JSON only, stderr = logs only.
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(env_filter)
                 .with_writer(std::io::stderr)
                 .init();
         }
@@ -810,5 +878,281 @@ mod tests {
     fn parse_switch_with_name() {
         let cli = parse(&["cella", "switch", "feat/new"]).unwrap();
         assert!(matches!(cli.command, super::commands::Command::Switch(_)));
+    }
+
+    // ── log-level / log-format accessors ────────────────────────────
+
+    #[test]
+    fn up_log_level_accessor() {
+        use super::commands::LogLevel;
+        let cli = parse(&["cella", "up", "--log-level", "trace"]).unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Trace)));
+    }
+
+    #[test]
+    fn up_without_log_level_is_none() {
+        let cli = parse(&["cella", "up"]).unwrap();
+        assert!(cli.command.log_level().is_none());
+    }
+
+    #[test]
+    fn non_up_command_log_level_is_none() {
+        // Commands that don't carry --log-level return None.
+        let cli = parse(&["cella", "list"]).unwrap();
+        assert!(cli.command.log_level().is_none());
+    }
+
+    #[test]
+    fn up_log_format_json_accessor() {
+        use super::commands::LogFormat;
+        let cli = parse(&["cella", "up", "--log-format", "json"]).unwrap();
+        assert!(matches!(cli.command.log_format(), LogFormat::Json));
+    }
+
+    #[test]
+    fn up_default_log_format_is_text() {
+        use super::commands::LogFormat;
+        let cli = parse(&["cella", "up"]).unwrap();
+        assert!(matches!(cli.command.log_format(), LogFormat::Text));
+    }
+
+    #[test]
+    fn non_up_command_log_format_is_text() {
+        use super::commands::LogFormat;
+        let cli = parse(&["cella", "list"]).unwrap();
+        assert!(matches!(cli.command.log_format(), LogFormat::Text));
+    }
+
+    #[test]
+    fn code_inherits_up_log_flags() {
+        use super::commands::{LogFormat, LogLevel};
+        let cli = parse(&[
+            "cella",
+            "code",
+            "--log-level",
+            "debug",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Debug)));
+        assert!(matches!(cli.command.log_format(), LogFormat::Json));
+    }
+
+    // ── terminal-columns / terminal-rows pairing ────────────────────
+
+    #[test]
+    fn parse_up_terminal_columns_alone_is_error() {
+        // clap `requires` enforces the official both-required pairing.
+        let result = parse(&["cella", "up", "--terminal-columns", "80"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_up_terminal_rows_alone_is_error() {
+        let result = parse(&["cella", "up", "--terminal-rows", "24"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_up_terminal_pair_is_ok() {
+        let cli = parse(&[
+            "cella",
+            "up",
+            "--terminal-columns",
+            "80",
+            "--terminal-rows",
+            "24",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+
+    // ── omit-syntax-directive (hidden, parseable no-op) ─────────────
+
+    #[test]
+    fn parse_up_omit_syntax_directive_is_ok() {
+        let cli = parse(&["cella", "up", "--omit-syntax-directive"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+
+    // ── omit-config-remote-env-from-metadata (hidden, parseable) ────
+
+    #[test]
+    fn parse_up_omit_config_remote_env_from_metadata_is_ok() {
+        let cli = parse(&["cella", "up", "--omit-config-remote-env-from-metadata"]).unwrap();
+        assert!(matches!(cli.command, super::commands::Command::Up(_)));
+    }
+}
+
+// ── log directive / spinner predicate helpers ───────────────────────
+
+#[cfg(test)]
+mod log_init_tests {
+    use super::{LogFormat, LogLevel, resolve_log_directive, spinners_enabled};
+
+    #[test]
+    fn directive_default_is_info() {
+        // No RUST_LOG, no --log-level => plain `info`.
+        assert_eq!(resolve_log_directive(false, None).as_deref(), Some("info"));
+    }
+
+    #[test]
+    fn directive_explicit_info() {
+        assert_eq!(
+            resolve_log_directive(false, Some(LogLevel::Info)).as_deref(),
+            Some("info")
+        );
+    }
+
+    #[test]
+    fn directive_debug_scopes_to_cella() {
+        assert_eq!(
+            resolve_log_directive(false, Some(LogLevel::Debug)).as_deref(),
+            Some("cella=debug,info")
+        );
+    }
+
+    #[test]
+    fn directive_trace_scopes_to_cella() {
+        assert_eq!(
+            resolve_log_directive(false, Some(LogLevel::Trace)).as_deref(),
+            Some("cella=trace,info")
+        );
+    }
+
+    #[test]
+    fn rust_log_wins_over_log_level() {
+        // When RUST_LOG is set, the directive is None so the caller falls back
+        // to EnvFilter::from_default_env() — RUST_LOG wins untouched.
+        assert!(resolve_log_directive(true, Some(LogLevel::Trace)).is_none());
+        assert!(resolve_log_directive(true, None).is_none());
+    }
+
+    #[test]
+    fn spinners_off_under_json_even_on_tty() {
+        // Json log-format disables spinners even on a TTY with no RUST_LOG.
+        assert!(!spinners_enabled(true, false, true, LogFormat::Json));
+    }
+
+    #[test]
+    fn spinners_on_for_text_tty_no_rust_log() {
+        assert!(spinners_enabled(true, false, true, LogFormat::Text));
+    }
+
+    #[test]
+    fn spinners_off_when_rust_log_set() {
+        assert!(!spinners_enabled(true, true, true, LogFormat::Text));
+    }
+
+    #[test]
+    fn spinners_off_when_not_tty() {
+        assert!(!spinners_enabled(true, false, false, LogFormat::Text));
+    }
+
+    #[test]
+    fn spinners_off_when_not_text_output() {
+        assert!(!spinners_enabled(false, false, true, LogFormat::Text));
+    }
+
+    // ── runtime effect of the resolved directive ────────────────────
+    //
+    // String-equality on the directive is not enough: what matters is which
+    // events the resulting `EnvFilter` actually lets through. These tests feed
+    // the real directive into a capture subscriber and assert the runtime
+    // effect against explicit event targets — so the `cella`-scoping decision
+    // is verified, not assumed.
+
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Emit a set of explicit-target debug events under the given directive and
+    /// return the captured stderr text.
+    fn capture_under_directive(directive: &str) -> String {
+        let buf = CaptureWriter::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(directive))
+            .with_writer(buf)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "cella", "binary-crate event");
+            tracing::debug!(target: "cella::commands::up", "binary-module event");
+            tracing::debug!(target: "cella_orchestrator::up", "library-crate event");
+            tracing::debug!(target: "cella_features::lib", "library-crate event 2");
+            tracing::info!(target: "cella_orchestrator::up", "library info event");
+            tracing::debug!(target: "h2::codec", "dependency event");
+        });
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn directive_debug_enables_all_cella_crates_not_deps() {
+        // The resolved `cella=debug,info` directive must raise EVERY cella crate
+        // (binary `cella` AND library `cella_*`) to debug, while keeping noisy
+        // dependency crates at the `info` floor (so their debug logs are hidden).
+        let directive = resolve_log_directive(false, Some(LogLevel::Debug)).unwrap();
+        let out = capture_under_directive(&directive);
+
+        assert!(
+            out.contains("binary-crate event"),
+            "binary crate missed: {out}"
+        );
+        assert!(
+            out.contains("library-crate event"),
+            "cella_orchestrator debug missed (scoping bug): {out}"
+        );
+        assert!(
+            out.contains("library-crate event 2"),
+            "cella_features debug missed (scoping bug): {out}"
+        );
+        // Dependency debug is suppressed by the `info` global floor.
+        assert!(
+            !out.contains("dependency event"),
+            "dependency debug should be hidden at info floor: {out}"
+        );
+    }
+
+    #[test]
+    fn directive_default_info_hides_all_debug() {
+        // Plain `info` must hide every debug event, cella or otherwise, while
+        // still letting info-level cella events through.
+        let directive = resolve_log_directive(false, None).unwrap();
+        let out = capture_under_directive(&directive);
+
+        assert!(
+            !out.contains("binary-crate event"),
+            "info leaked debug: {out}"
+        );
+        assert!(
+            !out.contains("library-crate event"),
+            "info leaked debug: {out}"
+        );
+        assert!(
+            out.contains("library info event"),
+            "info event missed: {out}"
+        );
     }
 }

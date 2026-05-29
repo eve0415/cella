@@ -139,6 +139,9 @@ impl BuildArgs {
             // `cella build` has no build-tuning flags yet; use defaults
             // (BuildKit auto, default docker binary, no CLI cache I/O).
             build_tuning: cella_orchestrator::BuildTuning::default(),
+            // `--omit-config-remote-env-from-metadata` is wired on `up` only;
+            // `cella build` keeps the full metadata label.
+            omit_remote_env_from_metadata: false,
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;

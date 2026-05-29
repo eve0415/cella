@@ -54,6 +54,20 @@ impl BuildTuning<'_> {
     }
 }
 
+/// Options that shape the persisted `devcontainer.metadata` image/container
+/// label.
+///
+/// Grouped so the label-shaping concern lives in one place and can grow
+/// additively (e.g. a future `pickConfigProperties` whitelist for full
+/// official parity) without widening `UpConfig`'s bool count.
+#[derive(Clone, Copy, Default)]
+pub struct MetadataOptions {
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// generated `devcontainer.metadata` label. Does NOT affect the runtime
+    /// `dev.cella.remote_env` label used to re-inject env across restarts.
+    pub omit_remote_env: bool,
+}
+
 /// Mount-related CLI flags for workspace configuration.
 pub struct MountFlags<'a> {
     /// Additional mount points from CLI `--mount` flags.
@@ -127,6 +141,8 @@ pub struct UpConfig<'a> {
     pub gpu_availability: cella_backend::GpuAvailability,
     /// `--update-remote-user-uid-default`: default for `updateRemoteUserUID`.
     pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+    /// Options shaping the persisted `devcontainer.metadata` label.
+    pub metadata_options: MetadataOptions,
 }
 
 /// How the up pipeline should handle the container image.

@@ -156,6 +156,9 @@ pub async fn resolve_merged_config(
         base_image,
         image_user: "root",
         metadata: None,
+        // read-configuration only merges config; no label is persisted, so the
+        // omit-remote-env flag does not apply here.
+        omit_remote_env: false,
     };
     let rf =
         cella_features::resolve_features(config, config_path, &platform, &cache, &base_ctx, false)

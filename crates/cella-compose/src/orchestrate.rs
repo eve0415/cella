@@ -72,6 +72,10 @@ pub struct ComposeUpConfig<'a> {
     pub gpu_availability: cella_backend::GpuAvailability,
     /// `--update-remote-user-uid-default`: default for `updateRemoteUserUID`.
     pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// generated `devcontainer.metadata` label. Does NOT affect the runtime
+    /// `dev.cella.remote_env` label.
+    pub omit_remote_env_from_metadata: bool,
 }
 
 /// Build/backend tuning inputs for the compose `up` path.
@@ -426,6 +430,7 @@ async fn prepare_and_start(
         config,
         cfg.config_path,
         project,
+        cfg.omit_remote_env_from_metadata,
         progress,
     )
     .await?;
@@ -1590,6 +1595,7 @@ mod tests {
             build_tuning: ComposeBuildTuning::default(),
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1654,6 +1660,7 @@ mod tests {
             build_tuning: ComposeBuildTuning::default(),
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),

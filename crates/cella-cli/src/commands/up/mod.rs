@@ -253,6 +253,17 @@ pub struct UpCompatArgs {
     #[arg(long = "log-format", value_enum, default_value = "text")]
     pub(crate) log_format: LogFormat,
 
+    // `--terminal-columns` / `--terminal-rows` are a true no-op for `up`. The
+    // official CLI feeds these to node-pty when sizing lifecycle subprocesses,
+    // but cella runs lifecycle commands through bollard capture exec
+    // (`ExecOptions`, which has no PTY/cols/rows) — there is no PTY to size on
+    // the `up` path. The only PTY-sizing code in cella is the interactive
+    // `exec`/`shell` path (cella-docker `exec_interactive`), which reads the
+    // live local terminal via `crossterm::terminal::size()` and is never
+    // reached by `up`. Accepted-and-ignored for drop-in parity; clap's
+    // `requires` enforces the official both-required pairing. If lifecycle ever
+    // moves to inherited-stdio/PTY shell-outs, exporting these as COLUMNS/LINES
+    // is the natural future home — do not wire a dead field now.
     /// Number of columns to render subprocess output for.
     #[arg(long = "terminal-columns", requires = "terminal_rows")]
     pub(crate) terminal_columns: Option<u16>,
@@ -265,6 +276,16 @@ pub struct UpCompatArgs {
     #[arg(long, hide = true)]
     pub(crate) experimental_frozen_lockfile: bool,
 
+    // `--omit-syntax-directive` is a true no-op in cella. The official CLI has
+    // two effects: (A) it parses the user's Dockerfile in JS and strips any
+    // `# syntax=` directive (a moby/buildkit#4556 workaround), and (B) it
+    // suppresses the `# syntax=` line it would otherwise prepend to its
+    // generated feature-extension Dockerfile. cella does NEITHER: it never
+    // parses Dockerfile content (`BuildOptions.dockerfile` is a filename passed
+    // verbatim as `-f`; the docker engine reads any `# syntax=` natively), and
+    // its generated feature Dockerfile emits no `# syntax=` line at all. So
+    // cella already behaves as if this flag is permanently on — there is
+    // nothing to suppress. Accepted-and-ignored for drop-in parity.
     /// Omit Dockerfile syntax directives (compatibility no-op).
     #[arg(long, hide = true)]
     pub(crate) omit_syntax_directive: bool,
@@ -660,6 +681,9 @@ pub struct UpContext {
     gpu_availability: cella_backend::GpuAvailability,
     /// `--update-remote-user-uid-default` policy.
     update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// `devcontainer.metadata` label.
+    omit_remote_env_from_metadata: bool,
 }
 
 /// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
@@ -804,6 +828,7 @@ impl UpContext {
             update_remote_user_uid_default: map_uid_default(
                 args.compat.update_remote_user_uid_default,
             ),
+            omit_remote_env_from_metadata: args.result.omit_config_remote_env_from_metadata,
         })
     }
 
@@ -890,6 +915,8 @@ impl UpContext {
             use_buildkit: true,
             gpu_availability: cella_backend::GpuAvailability::Detect,
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::On,
+            // Branch/auto-up keeps the full metadata label (no flag plumbed).
+            omit_remote_env_from_metadata: false,
         })
     }
 
@@ -924,6 +951,10 @@ impl UpContext {
         &self,
     ) -> cella_backend::UpdateRemoteUserUidDefault {
         self.update_remote_user_uid_default
+    }
+
+    pub(crate) const fn omit_remote_env_from_metadata(&self) -> bool {
+        self.omit_remote_env_from_metadata
     }
 
     pub(crate) fn probe_type(&self) -> cella_env::user_env_probe::UserEnvProbe {
@@ -1335,6 +1366,9 @@ impl UpContext {
             },
             gpu_availability: self.gpu_availability,
             update_remote_user_uid_default: self.update_remote_user_uid_default,
+            metadata_options: cella_orchestrator::MetadataOptions {
+                omit_remote_env: self.omit_remote_env_from_metadata,
+            },
         };
 
         let result =

@@ -45,6 +45,7 @@ pub async fn compose_ensure_up(
         build_tuning: ctx.compose_build_tuning(),
         gpu_availability: ctx.gpu_availability(),
         update_remote_user_uid_default: ctx.update_remote_user_uid_default(),
+        omit_remote_env_from_metadata: ctx.omit_remote_env_from_metadata(),
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
