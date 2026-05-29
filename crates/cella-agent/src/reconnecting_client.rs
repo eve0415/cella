@@ -48,6 +48,10 @@ pub struct ReconnectingClient {
     /// The `DaemonHello` received during the most recent handshake.
     daemon_hello: Option<DaemonHello>,
     tunnel_config: Option<crate::tunnel::TunnelConfig>,
+    /// Forwards daemon-pushed `~/.claude.json` content to the config writer.
+    /// `None` when this agent did not opt into config sync. Re-passed to
+    /// `start_reader` on every (re)connect so the reader survives reconnects.
+    claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 /// How often to surface a progress log while the initial connect retries.
@@ -63,6 +67,7 @@ impl ReconnectingClient {
         initial_addr: &str,
         container_name: &str,
         initial_token: &str,
+        claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
     ) -> Self {
         let start = tokio::time::Instant::now();
         let mut last_warn = start;
@@ -77,7 +82,7 @@ impl ReconnectingClient {
                         daemon_addr: addr.clone(),
                         auth_token: token.clone(),
                     });
-                    client.start_reader(tunnel_config.clone());
+                    client.start_reader(tunnel_config.clone(), claude_apply_tx.clone());
                     return Self {
                         addr,
                         container_name: container_name.to_string(),
@@ -86,6 +91,7 @@ impl ReconnectingClient {
                         reconnected: false,
                         daemon_hello: Some(hello),
                         tunnel_config,
+                        claude_apply_tx,
                     };
                 }
                 Err(e) => {
@@ -156,7 +162,7 @@ impl ReconnectingClient {
             daemon_addr: new_addr.clone(),
             auth_token: new_token.clone(),
         });
-        client.start_reader(tunnel_config.clone());
+        client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
         self.inner = Some(client);
         self.daemon_hello = Some(hello);
         self.addr = new_addr;
@@ -225,7 +231,7 @@ impl ReconnectingClient {
                     daemon_addr: self.addr.clone(),
                     auth_token: self.auth_token.clone(),
                 });
-                client.start_reader(tunnel_config.clone());
+                client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                 self.inner = Some(client);
                 self.daemon_hello = Some(hello);
                 self.reconnected = true;
@@ -252,7 +258,7 @@ impl ReconnectingClient {
                         daemon_addr: info.addr.clone(),
                         auth_token: info.token.clone(),
                     });
-                    client.start_reader(tunnel_config.clone());
+                    client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                     self.addr = info.addr;
                     self.auth_token = info.token;
                     self.inner = Some(client);
@@ -372,7 +378,7 @@ mod tests {
         // client. Callers then fell into `run_standalone` with no
         // reconnect loop, silently ignoring the daemon when it came up
         // later. The fix is to never return until connected.
-        let fut = ReconnectingClient::connect_with_retry("127.0.0.1:1", "test", "token");
+        let fut = ReconnectingClient::connect_with_retry("127.0.0.1:1", "test", "token", None);
         let result = tokio::time::timeout(Duration::from_secs(2), fut).await;
         assert!(
             result.is_err(),
@@ -390,6 +396,7 @@ mod tests {
             reconnected: true,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         assert!(client.take_reconnected());
@@ -406,6 +413,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         let msg = AgentMessage::Health {
@@ -426,6 +434,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         let result = client.recv().await;
@@ -444,6 +453,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
         assert!(!client.take_reconnected());
     }
@@ -458,6 +468,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
         let result = client.try_reconnect().await;
         assert!(result.is_err());
@@ -475,6 +486,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         let msg = AgentMessage::Health {
@@ -497,6 +509,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         let (addr, name, token) = client.connection_params();
@@ -515,6 +528,7 @@ mod tests {
             reconnected: false,
             daemon_hello: None,
             tunnel_config: None,
+            claude_apply_tx: None,
         };
 
         assert!(client.inner.is_none());

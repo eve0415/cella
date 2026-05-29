@@ -10,6 +10,7 @@
 //! worktree management commands that delegate to the host daemon.
 
 mod browser;
+mod claude_config_sync;
 mod cli;
 mod clipboard;
 mod control;
@@ -314,17 +315,35 @@ async fn run_daemon(poll_interval_ms: u64, proxy_config_json: Option<String>) {
     };
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
+    // `~/.claude.json` bidirectional sync (opt-in via CELLA_SYNC_CLAUDE_CONFIG).
+    // The apply channel must exist before connecting so the control reader can
+    // forward daemon-pushed config to the writer task spawned below.
+    let (claude_apply_tx, claude_apply_rx) = if claude_config_sync::sync_enabled() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Block until the daemon accepts the handshake. Retries forever so a
     // late-starting daemon (e.g., the common case where `cella up` spawns
     // the container before the daemon finishes binding) recovers on its
     // own instead of falling into permanent standalone mode.
-    let client =
-        reconnecting_client::ReconnectingClient::connect_with_retry(&addr, &container_name, &token)
-            .await;
+    let client = reconnecting_client::ReconnectingClient::connect_with_retry(
+        &addr,
+        &container_name,
+        &token,
+        claude_apply_tx,
+    )
+    .await;
 
     state_writer.set_connected(addr.clone());
 
     let control = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+
+    if let Some(apply_rx) = claude_apply_rx {
+        claude_config_sync::spawn(control.clone(), apply_rx);
+    }
     let reconnecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = std::time::Instant::now();
     let ports_detected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

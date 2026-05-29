@@ -50,6 +50,7 @@ impl ControlClient {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             container_name: container_name.to_string(),
             auth_token: auth_token.to_string(),
+            claude_config_sync: crate::claude_config_sync::sync_enabled(),
         };
         let mut json = serde_json::to_string(&hello)?;
         json.push('\n');
@@ -92,9 +93,14 @@ impl ControlClient {
         Ok((client, daemon_hello))
     }
 
-    /// Spawn a background reader task that dispatches `TunnelRequest` messages
-    /// to the tunnel handler and forwards everything else to the response channel.
-    pub fn start_reader(&mut self, tunnel_config: Option<crate::tunnel::TunnelConfig>) {
+    /// Spawn a background reader task that dispatches `TunnelRequest` and
+    /// `SyncClaudeConfig` messages to their handlers and forwards everything
+    /// else to the response channel.
+    pub fn start_reader(
+        &mut self,
+        tunnel_config: Option<crate::tunnel::TunnelConfig>,
+        claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) {
         let Some(reader) = self.reader.take() else {
             return;
         };
@@ -107,7 +113,7 @@ impl ControlClient {
         self.response_rx = Some(rx);
 
         self.reader_handle = Some(tokio::spawn(async move {
-            run_reader_loop(reader, tx, tunnel_config).await;
+            run_reader_loop(reader, tx, tunnel_config, claude_apply_tx).await;
         }));
     }
 
@@ -186,6 +192,7 @@ async fn run_reader_loop(
     mut reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     response_tx: tokio::sync::mpsc::Sender<DaemonMessage>,
     tunnel_config: Option<crate::tunnel::TunnelConfig>,
+    claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) {
     let mut line = String::new();
     loop {
@@ -198,19 +205,29 @@ async fn run_reader_loop(
             tracing::warn!("Invalid daemon message, skipping");
             continue;
         };
-        if let DaemonMessage::TunnelRequest {
-            connection_id,
-            target_port,
-        } = msg
-        {
-            if let Some(ref config) = tunnel_config {
-                let config = config.clone();
-                tokio::spawn(async move {
-                    crate::tunnel::handle_tunnel_request(connection_id, target_port, &config).await;
-                });
+        match msg {
+            DaemonMessage::TunnelRequest {
+                connection_id,
+                target_port,
+            } => {
+                if let Some(ref config) = tunnel_config {
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                        crate::tunnel::handle_tunnel_request(connection_id, target_port, &config)
+                            .await;
+                    });
+                }
             }
-        } else if response_tx.send(msg).await.is_err() {
-            break;
+            DaemonMessage::SyncClaudeConfig { content } => {
+                if let Some(ref tx) = claude_apply_tx {
+                    let _ = tx.send(content).await;
+                }
+            }
+            other => {
+                if response_tx.send(other).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -427,7 +444,7 @@ mod tests {
             ControlClient::connect(&addr.to_string(), "test-container", "token")
                 .await
                 .unwrap();
-        client.start_reader(None);
+        client.start_reader(None, None);
 
         // Send a message.
         let msg = AgentMessage::Health {
@@ -471,7 +488,7 @@ mod tests {
             ControlClient::connect(&addr.to_string(), "test-container", "token")
                 .await
                 .unwrap();
-        client.start_reader(None);
+        client.start_reader(None, None);
 
         let result = client.recv().await;
         assert!(result.is_err());
