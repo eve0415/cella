@@ -29,6 +29,7 @@ pub async fn compose_ensure_up(
         workspace_root: &ctx.resolved.workspace_root,
         container_name: &ctx.container_nm,
         remote_env: &ctx.remote_env,
+        cli_remote_env: &ctx.cli_remote_env,
         remove_container: ctx.remove_container,
         build_no_cache: ctx.build_no_cache,
         skip_checksum: ctx.skip_checksum,

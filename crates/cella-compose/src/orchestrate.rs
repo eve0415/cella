@@ -41,8 +41,12 @@ pub struct ComposeUpConfig<'a> {
     pub workspace_root: &'a Path,
     /// Container name for daemon registration.
     pub container_name: &'a str,
-    /// Extra environment variables to inject (`KEY=VALUE` format).
+    /// Extra environment variables to inject (`KEY=VALUE` format). From config
+    /// `remoteEnv`; used for lifecycle env AND the metadata label / containerEnv.
     pub remote_env: &'a [String],
+    /// CLI `--remote-env` entries. Lifecycle command env ONLY (config
+    /// `remote_env` wins on collision); never enters labels or `containerEnv`.
+    pub cli_remote_env: &'a [String],
     /// Whether to tear down and recreate existing containers.
     pub remove_container: bool,
     /// Whether to rebuild with `--no-cache`.
@@ -467,7 +471,15 @@ async fn finalize_compose(
         .register_container(client, &primary.id, config, cfg.container_name)
         .await;
 
-    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe)
+    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe).
+    // CLI --remote-env first, config remoteEnv last so config wins on collision
+    // (the hook merges later-wins). Lifecycle-only: never labels/containerEnv.
+    let lifecycle_remote_env: Vec<String> = cfg
+        .cli_remote_env
+        .iter()
+        .chain(cfg.remote_env.iter())
+        .cloned()
+        .collect();
     let lifecycle_env = hooks
         .post_create_setup(
             client,
@@ -475,7 +487,7 @@ async fn finalize_compose(
             remote_user,
             config,
             cfg.workspace_root,
-            cfg.remote_env,
+            &lifecycle_remote_env,
         )
         .await;
 
@@ -608,7 +620,13 @@ async fn handle_compose_running(
     if let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()
     {
-        let lifecycle_env: Vec<String> = cfg.remote_env.to_vec();
+        // CLI --remote-env first, config remoteEnv last so config wins.
+        let lifecycle_env: Vec<String> = cfg
+            .cli_remote_env
+            .iter()
+            .chain(cfg.remote_env.iter())
+            .cloned()
+            .collect();
         let lc_ctx = build_lifecycle_ctx(
             client,
             &container.id,
@@ -1415,6 +1433,7 @@ mod tests {
             workspace_root: &workspace_root,
             container_name: "test-container",
             remote_env: &[],
+            cli_remote_env: &[],
             remove_container: false,
             build_no_cache: false,
             skip_checksum: false,
@@ -1475,6 +1494,7 @@ mod tests {
             workspace_root: workspace_dir.path(),
             container_name: "test-container",
             remote_env: &[],
+            cli_remote_env: &[],
             remove_container: false,
             build_no_cache: false,
             skip_checksum: false,

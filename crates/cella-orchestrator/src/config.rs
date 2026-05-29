@@ -25,8 +25,13 @@ pub struct UpConfig<'a> {
     pub resolved: &'a ResolvedConfig,
     /// Resolved container name for this workspace.
     pub container_name: &'a str,
-    /// Remote environment entries from config.
+    /// Remote environment entries from config (`remoteEnv`). Used for lifecycle
+    /// command env AND persisted in the `dev.cella.remote_env` metadata label.
     pub remote_env: &'a [String],
+    /// Remote environment entries from the CLI `--remote-env` flag. Applied to
+    /// lifecycle command env ONLY (config `remote_env` wins on key collision);
+    /// runtime-only — must NOT enter labels, image layers, or `containerEnv`.
+    pub cli_remote_env: &'a [String],
     /// Optional workspace folder override from config.
     pub workspace_folder_from_config: Option<&'a str>,
     /// Default workspace folder inside the container.

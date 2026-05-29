@@ -340,9 +340,10 @@ impl EnsureUpContext<'_> {
             .flatten()
         };
 
+        let combined_remote_env = self.lifecycle_remote_env(self.config.remote_env);
         let mut lifecycle_env = final_probed.as_ref().map_or_else(
-            || self.config.remote_env.to_vec(),
-            |probed| cella_env::user_env_probe::merge_env(probed, self.config.remote_env),
+            || combined_remote_env.clone(),
+            |probed| cella_env::user_env_probe::merge_env(probed, &combined_remote_env),
         );
         if !self.config.lifecycle_secrets.is_empty() {
             lifecycle_env.extend_from_slice(self.config.lifecycle_secrets);
@@ -1564,6 +1565,18 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
+    /// Lifecycle command environment: CLI `--remote-env` first, then `base`
+    /// (config `remoteEnv`) so config wins on collision (merge is later-wins).
+    /// Lifecycle-only — never enters labels or `containerEnv`.
+    fn lifecycle_remote_env(&self, base: &[String]) -> Vec<String> {
+        self.config
+            .cli_remote_env
+            .iter()
+            .chain(base.iter())
+            .cloned()
+            .collect()
+    }
+
     async fn create_and_start(
         &self,
         build_no_cache: bool,
@@ -1640,13 +1653,14 @@ impl EnsureUpContext<'_> {
 
         self.start_and_notify(&container_id).await?;
 
+        let create_lifecycle_remote_env = self.lifecycle_remote_env(&create_opts.remote_env);
         let (_probed_env, lifecycle_env) = self
             .post_create_setup(
                 &container_id,
                 &remote_user,
                 &env_fwd,
                 &settings,
-                &create_opts.remote_env,
+                &create_lifecycle_remote_env,
             )
             .await;
 
