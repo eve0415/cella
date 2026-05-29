@@ -109,19 +109,16 @@ pub async fn on_host_change(
 
     let (out, host_needs_update, canonical_changed) = {
         let mut st = state.lock().await;
-        let prev = st
-            .snapshots
-            .get(HOST)
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let patch = cella_env::claude_code::diff_merge_patch(&prev, &incoming);
+        let empty = serde_json::json!({});
+        let prev = st.snapshots.get(HOST).unwrap_or(&empty);
+        let patch = cella_env::claude_code::diff_merge_patch(prev, &incoming);
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
         let canonical_changed = merged != st.canonical;
         st.canonical = merged;
-        st.snapshots.insert(HOST.to_string(), incoming.clone());
         // Canonical may still hold container-only keys the host file lacks; write
         // them back so the host file converges to the union.
         let host_needs_update = st.canonical != incoming;
+        st.snapshots.insert(HOST.to_string(), incoming);
         (st.canonical_string(), host_needs_update, canonical_changed)
     };
 
@@ -179,19 +176,16 @@ pub async fn on_agent_change(
 
     let (out, canonical_changed, needs_pushback) = {
         let mut st = state.lock().await;
-        let prev = st
-            .snapshots
-            .get(sender)
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let patch = cella_env::claude_code::diff_merge_patch(&prev, &incoming);
+        let empty = serde_json::json!({});
+        let prev = st.snapshots.get(sender).unwrap_or(&empty);
+        let patch = cella_env::claude_code::diff_merge_patch(prev, &incoming);
         let merged = cella_env::claude_code::apply_merge_patch(&st.canonical, &patch);
         let canonical_changed = merged != st.canonical;
         st.canonical = merged;
-        st.snapshots.insert(sender.to_string(), incoming.clone());
         // `apply` makes canonical a superset of `incoming`, so `!=` means the
         // sender is missing some canonical key and needs the full config back.
         let needs_pushback = st.canonical != incoming;
+        st.snapshots.insert(sender.to_string(), incoming);
         (st.canonical_string(), canonical_changed, needs_pushback)
     };
 
