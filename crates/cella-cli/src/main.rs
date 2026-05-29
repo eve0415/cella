@@ -68,7 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    cli.command.execute(progress).await
+    // The `up` argument surface is large (full devcontainer-CLI flag parity),
+    // so box the dispatch future to keep it off the stack.
+    Box::pin(cli.command.execute(progress)).await
 }
 
 #[cfg(test)]

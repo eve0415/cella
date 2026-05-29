@@ -6,7 +6,10 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
-use super::{ComposePullPolicy, ImagePullPolicy, MountConsistency, OutputFormat, StrictnessLevel};
+use super::{
+    BuildKitMode, ComposePullPolicy, GpuAvailability, ImagePullPolicy, LogFormat, LogLevel,
+    MountConsistency, OutputFormat, StrictnessLevel, UpdateRemoteUserUidDefault,
+};
 
 use cella_backend::{BuildSecret, ContainerBackend, ExecOptions, MountConfig, container_name};
 use cella_config::devcontainer::resolve::{self, ResolvedConfig};
@@ -41,6 +44,26 @@ pub struct UpBuildArgs {
     /// lifecycle commands only (never stored in labels or image layers).
     #[arg(long = "secrets-file")]
     pub(crate) secrets_file: Option<PathBuf>,
+
+    /// Additional image(s) to use as a layer cache during the build (repeatable).
+    #[arg(long = "cache-from")]
+    pub(crate) cache_from: Vec<String>,
+
+    /// Cache export destination for the build (`BuildKit` `--cache-to`).
+    #[arg(long = "cache-to")]
+    pub(crate) cache_to: Option<String>,
+
+    /// Control whether `BuildKit` is used when building images.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub(crate) buildkit: BuildKitMode,
+
+    /// Path to the Docker CLI binary (used for image builds and compose).
+    #[arg(long = "docker-path")]
+    pub(crate) docker_path: Option<String>,
+
+    /// Path to the Docker Compose CLI binary.
+    #[arg(long = "docker-compose-path")]
+    pub(crate) docker_compose_path: Option<String>,
 }
 
 /// Mount-related flags for an `up` invocation.
@@ -63,6 +86,188 @@ pub struct UpMountArgs {
     /// Requires the worktree to be created with relative paths.
     #[arg(long)]
     pub(crate) mount_git_worktree_common_dir: bool,
+}
+
+/// Validate an `--id-label` value (`name=value`, both non-empty).
+fn parse_id_label(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
+        _ => Err("id-label must match <name>=<value>".to_string()),
+    }
+}
+
+/// Validate a `--remote-env` value (`name=value`, value may be empty).
+fn parse_remote_env(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
+        _ => Err("remote-env must match <name>=<value>".to_string()),
+    }
+}
+
+/// Configuration-input flags: container targeting, config overrides, and the
+/// feature/lifecycle inputs that mirror the official `up` surface.
+#[derive(Args)]
+pub struct UpConfigInputArgs {
+    /// Id label(s) of the format `name=value`, used to find/tag the container
+    /// (repeatable). If omitted, one is inferred from the workspace folder.
+    #[arg(long = "id-label", value_parser = parse_id_label)]
+    pub(crate) id_label: Vec<String>,
+
+    /// devcontainer.json path that overrides any discovered config entirely.
+    #[arg(long = "override-config")]
+    pub(crate) override_config: Option<PathBuf>,
+
+    /// Additional features to apply (JSON, as in the "features" section).
+    #[arg(long = "additional-features")]
+    pub(crate) additional_features: Option<String>,
+
+    /// Remote environment variables of the format `name=value`, added when
+    /// running the user (lifecycle) commands (repeatable).
+    #[arg(long = "remote-env", value_parser = parse_remote_env)]
+    pub(crate) remote_env: Vec<String>,
+
+    /// Do not run postAttachCommand.
+    #[arg(long)]
+    pub(crate) skip_post_attach: bool,
+
+    /// Fail if the container does not already exist.
+    #[arg(long)]
+    pub(crate) expect_existing_container: bool,
+
+    /// Disable automatic feature id mapping (testing only).
+    #[arg(long, hide = true)]
+    pub(crate) skip_feature_auto_mapping: bool,
+}
+
+/// Lifecycle-gating flags for an `up` invocation.
+#[derive(Args)]
+pub struct UpLifecycleArgs {
+    /// Do not run onCreate/updateContent/postCreate/postStart/postAttach
+    /// commands and do not install dotfiles.
+    #[arg(long)]
+    pub(crate) skip_post_create: bool,
+
+    /// Stop running user commands after the `waitFor` phase (default
+    /// updateContentCommand).
+    #[arg(long)]
+    pub(crate) skip_non_blocking_commands: bool,
+
+    /// Stop after onCreateCommand and updateContentCommand.
+    #[arg(long)]
+    pub(crate) prebuild: bool,
+}
+
+/// Result-shaping flags for an `up` invocation's JSON output.
+#[derive(Args)]
+pub struct UpResultArgs {
+    /// Include the configuration in the JSON result.
+    #[arg(long)]
+    pub(crate) include_configuration: bool,
+
+    /// Include the merged configuration in the JSON result.
+    #[arg(long)]
+    pub(crate) include_merged_configuration: bool,
+
+    /// Omit remoteEnv from the container metadata label.
+    #[arg(long, hide = true)]
+    pub(crate) omit_config_remote_env_from_metadata: bool,
+}
+
+/// Feature-lockfile flags. cella does not use feature lockfiles; these are
+/// accepted for devcontainer-CLI compatibility and are no-ops.
+#[derive(Args)]
+pub struct UpLockfileArgs {
+    /// Disable lockfile generation and verification (compatibility no-op).
+    #[arg(
+        long,
+        conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
+    )]
+    pub(crate) no_lockfile: bool,
+
+    /// Ensure the lockfile remains unchanged (compatibility no-op).
+    #[arg(long)]
+    pub(crate) frozen_lockfile: bool,
+
+    /// Deprecated alias for lockfile writing (compatibility no-op).
+    #[arg(long, hide = true)]
+    pub(crate) experimental_lockfile: bool,
+}
+
+/// Dotfiles flags for an `up` invocation.
+#[derive(Args)]
+pub struct UpDotfilesArgs {
+    /// URL of a dotfiles Git repository to clone into the container.
+    #[arg(long = "dotfiles-repository")]
+    pub(crate) repository: Option<String>,
+
+    /// Command to run after cloning the dotfiles repository. Defaults to the
+    /// first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup.
+    #[arg(long = "dotfiles-install-command")]
+    pub(crate) install_command: Option<String>,
+
+    /// Path to clone the dotfiles repository to (default `~/dotfiles`).
+    #[arg(long = "dotfiles-target-path", default_value = "~/dotfiles")]
+    pub(crate) target_path: String,
+}
+
+/// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
+///
+/// The data-folder fields and `omit_syntax_directive`/`experimental_frozen_lockfile`
+/// are no-ops in cella (it manages its own data dirs and has no feature
+/// lockfiles); the rest are wired into behavior in later phases.
+#[derive(Args)]
+pub struct UpCompatArgs {
+    /// Container data folder for in-container user data (compatibility no-op).
+    #[arg(long = "container-data-folder")]
+    pub(crate) container_data_folder: Option<PathBuf>,
+
+    /// Container system data folder (compatibility no-op).
+    #[arg(long = "container-system-data-folder")]
+    pub(crate) container_system_data_folder: Option<PathBuf>,
+
+    /// Per-session cache folder inside the container (compatibility no-op).
+    #[arg(long = "container-session-data-folder")]
+    pub(crate) container_session_data_folder: Option<PathBuf>,
+
+    /// Host directory persisted across sessions (compatibility no-op).
+    #[arg(long = "user-data-folder")]
+    pub(crate) user_data_folder: Option<PathBuf>,
+
+    /// Availability of GPUs for dev containers that request one.
+    #[arg(long = "gpu-availability", value_enum, default_value = "detect")]
+    pub(crate) gpu_availability: GpuAvailability,
+
+    /// Default for updating the remote user's UID/GID to the local user's.
+    #[arg(
+        long = "update-remote-user-uid-default",
+        value_enum,
+        default_value = "on"
+    )]
+    pub(crate) update_remote_user_uid_default: UpdateRemoteUserUidDefault,
+
+    /// Log verbosity for lifecycle/terminal logging.
+    #[arg(long = "log-level", value_enum)]
+    pub(crate) log_level: Option<LogLevel>,
+
+    /// Log output format.
+    #[arg(long = "log-format", value_enum, default_value = "text")]
+    pub(crate) log_format: LogFormat,
+
+    /// Number of columns to render subprocess output for.
+    #[arg(long = "terminal-columns", requires = "terminal_rows")]
+    pub(crate) terminal_columns: Option<u16>,
+
+    /// Number of rows to render subprocess output for.
+    #[arg(long = "terminal-rows", requires = "terminal_columns")]
+    pub(crate) terminal_rows: Option<u16>,
+
+    /// Ensure the lockfile exists and remains unchanged (compatibility no-op).
+    #[arg(long, hide = true)]
+    pub(crate) experimental_frozen_lockfile: bool,
+
+    /// Omit Dockerfile syntax directives (compatibility no-op).
+    #[arg(long, hide = true)]
+    pub(crate) omit_syntax_directive: bool,
 }
 
 /// Start a dev container for the current workspace.
@@ -120,6 +325,24 @@ pub struct UpArgs {
     #[command(flatten)]
     pub(crate) mounts: UpMountArgs,
 
+    #[command(flatten)]
+    pub(crate) config_inputs: UpConfigInputArgs,
+
+    #[command(flatten)]
+    pub(crate) lifecycle: UpLifecycleArgs,
+
+    #[command(flatten)]
+    pub(crate) result: UpResultArgs,
+
+    #[command(flatten)]
+    pub(crate) lockfile: UpLockfileArgs,
+
+    #[command(flatten)]
+    pub(crate) dotfiles: UpDotfilesArgs,
+
+    #[command(flatten)]
+    pub(crate) compat: UpCompatArgs,
+
     /// Default value for userEnvProbe when devcontainer.json doesn't specify one.
     #[arg(long, value_enum, default_value_t = cella_env::user_env_probe::UserEnvProbe::LoginInteractiveShell)]
     pub(crate) default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
@@ -128,6 +351,72 @@ pub struct UpArgs {
 impl UpArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Text)
+    }
+
+    /// Emit a debug trace acknowledging every devcontainer-CLI-parity flag.
+    ///
+    /// Declaring the full official flag surface is what makes cella a drop-in
+    /// replacement (clap rejects unknown args), but the behavioral flags are
+    /// wired into the orchestrator in later phases. This trace both documents
+    /// accepted-but-not-yet-wired flags and is the complete, correct behavior
+    /// for the compatibility no-ops (data folders, lockfiles, syntax directive)
+    /// — cella has no equivalent state, so accepting and ignoring them yields
+    /// correct results.
+    fn acknowledge_compat_flags(&self) {
+        let ci = &self.config_inputs;
+        let lc = &self.lifecycle;
+        debug!(
+            id_labels = ci.id_label.len(),
+            override_config = ?ci.override_config,
+            additional_features = ci.additional_features.is_some(),
+            remote_env = ci.remote_env.len(),
+            skip_post_create = lc.skip_post_create,
+            skip_non_blocking_commands = lc.skip_non_blocking_commands,
+            prebuild = lc.prebuild,
+            skip_post_attach = ci.skip_post_attach,
+            expect_existing_container = ci.expect_existing_container,
+            skip_feature_auto_mapping = ci.skip_feature_auto_mapping,
+            "up: config/lifecycle flags accepted"
+        );
+
+        let b = &self.build;
+        let c = &self.compat;
+        let r = &self.result;
+        debug!(
+            cache_from = b.cache_from.len(),
+            cache_to = ?b.cache_to,
+            buildkit = b.buildkit.as_str(),
+            docker_path = ?b.docker_path,
+            docker_compose_path = ?b.docker_compose_path,
+            gpu_availability = c.gpu_availability.as_str(),
+            update_remote_user_uid_default = c.update_remote_user_uid_default.as_str(),
+            log_level = ?c.log_level.map(LogLevel::as_str),
+            log_format = c.log_format.as_str(),
+            terminal_columns = ?c.terminal_columns,
+            terminal_rows = ?c.terminal_rows,
+            include_configuration = r.include_configuration,
+            include_merged_configuration = r.include_merged_configuration,
+            omit_config_remote_env_from_metadata = r.omit_config_remote_env_from_metadata,
+            "up: build/backend/result flags accepted"
+        );
+
+        let lf = &self.lockfile;
+        let df = &self.dotfiles;
+        debug!(
+            container_data_folder = ?c.container_data_folder,
+            container_system_data_folder = ?c.container_system_data_folder,
+            container_session_data_folder = ?c.container_session_data_folder,
+            user_data_folder = ?c.user_data_folder,
+            no_lockfile = lf.no_lockfile,
+            frozen_lockfile = lf.frozen_lockfile,
+            experimental_lockfile = lf.experimental_lockfile,
+            experimental_frozen_lockfile = c.experimental_frozen_lockfile,
+            omit_syntax_directive = c.omit_syntax_directive,
+            dotfiles_repository = ?df.repository,
+            dotfiles_install_command = df.install_command.is_some(),
+            dotfiles_target_path = %df.target_path,
+            "up: compatibility no-op / dotfiles flags accepted"
+        );
     }
 }
 
@@ -981,6 +1270,8 @@ impl UpArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.acknowledge_compat_flags();
+
         if let Some(ref branch_name) = self.branch {
             return self.execute_branch(branch_name, progress).await;
         }
@@ -1667,5 +1958,138 @@ mod tests {
         if let crate::commands::Command::Up(args) = &cli.command {
             assert_eq!(args.build.secrets_file, Some(PathBuf::from("/tmp/s.json")));
         }
+    }
+
+    // ── devcontainer-CLI flag parity ───────────────────────────────
+    //
+    // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
+    // `provisionOptions` (the `up` command). Every official long flag MUST be
+    // declared on `UpArgs` so that no official invocation errors with an
+    // "unknown argument" — the core drop-in-replacement invariant. Re-derive
+    // this list when the official CLI adds flags.
+    const OFFICIAL_UP_FLAGS: &[&str] = &[
+        "docker-path",
+        "docker-compose-path",
+        "container-data-folder",
+        "container-system-data-folder",
+        "workspace-folder",
+        "workspace-mount-consistency",
+        "gpu-availability",
+        "mount-workspace-git-root",
+        "mount-git-worktree-common-dir",
+        "id-label",
+        "config",
+        "override-config",
+        "log-level",
+        "log-format",
+        "terminal-columns",
+        "terminal-rows",
+        "default-user-env-probe",
+        "update-remote-user-uid-default",
+        "remove-existing-container",
+        "build-no-cache",
+        "expect-existing-container",
+        "skip-post-create",
+        "skip-non-blocking-commands",
+        "prebuild",
+        "user-data-folder",
+        "mount",
+        "remote-env",
+        "cache-from",
+        "cache-to",
+        "buildkit",
+        "additional-features",
+        "skip-feature-auto-mapping",
+        "skip-post-attach",
+        "dotfiles-repository",
+        "dotfiles-install-command",
+        "dotfiles-target-path",
+        "container-session-data-folder",
+        "omit-config-remote-env-from-metadata",
+        "secrets-file",
+        "experimental-lockfile",
+        "experimental-frozen-lockfile",
+        "no-lockfile",
+        "frozen-lockfile",
+        "omit-syntax-directive",
+        "include-configuration",
+        "include-merged-configuration",
+    ];
+
+    #[test]
+    fn up_flag_parity() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+
+        let cli = crate::Cli::command();
+        let up = cli
+            .find_subcommand("up")
+            .expect("`up` subcommand must exist");
+        let longs: HashSet<&str> = up.get_arguments().filter_map(clap::Arg::get_long).collect();
+
+        let missing: Vec<&&str> = OFFICIAL_UP_FLAGS
+            .iter()
+            .filter(|f| !longs.contains(**f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`up` is missing official devcontainer-CLI flags: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn up_compat_flags_parse() {
+        use clap::Parser;
+        // Representative compat / behavioral flags must parse without error.
+        let r = crate::Cli::try_parse_from([
+            "cella",
+            "up",
+            "--workspace-folder",
+            ".",
+            "--user-data-folder",
+            "/tmp/x",
+            "--container-data-folder",
+            "/tmp/y",
+            "--container-system-data-folder",
+            "/tmp/z",
+            "--no-lockfile",
+            "--docker-path",
+            "docker",
+            "--docker-compose-path",
+            "docker-compose",
+            "--skip-feature-auto-mapping",
+            "--gpu-availability",
+            "none",
+            "--buildkit",
+            "never",
+            "--update-remote-user-uid-default",
+            "off",
+            "--id-label",
+            "foo=bar",
+            "--remote-env",
+            "A=1",
+            "--remote-env",
+            "EMPTY=",
+            "--cache-from",
+            "img:cache",
+            "--include-merged-configuration",
+        ]);
+        assert!(r.is_ok(), "compat flags should parse: {:?}", r.err());
+    }
+
+    #[test]
+    fn up_flag_validators_reject_bad_input() {
+        use clap::Parser;
+        // id-label requires name=value (both non-empty).
+        assert!(crate::Cli::try_parse_from(["cella", "up", "--id-label", "noequals"]).is_err());
+        // remote-env requires a name before '='.
+        assert!(crate::Cli::try_parse_from(["cella", "up", "--remote-env", "=novalue"]).is_err());
+        // --no-lockfile conflicts with --frozen-lockfile.
+        assert!(
+            crate::Cli::try_parse_from(["cella", "up", "--no-lockfile", "--frozen-lockfile"])
+                .is_err()
+        );
+        // terminal-columns requires terminal-rows.
+        assert!(crate::Cli::try_parse_from(["cella", "up", "--terminal-columns", "80"]).is_err());
     }
 }
