@@ -25,6 +25,7 @@ pub use cella_backend::lifecycle;
 pub use cella_backend::progress;
 pub mod prune;
 pub mod result;
+pub mod run_user_commands;
 pub mod shell_detect;
 pub use cella_backend::uid_image;
 pub use cella_daemon_client::ssh_proxy as ssh_proxy_client;

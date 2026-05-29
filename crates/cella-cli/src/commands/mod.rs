@@ -19,6 +19,7 @@ mod outdated;
 mod ports;
 mod prune;
 mod read_configuration;
+mod run_user_commands;
 mod shell;
 mod status;
 mod switch;
@@ -283,6 +284,9 @@ pub enum Command {
     /// Read and output the resolved devcontainer configuration.
     #[command(name = "read-configuration")]
     ReadConfiguration(read_configuration::ReadConfigurationArgs),
+    /// Re-run lifecycle hooks against an existing dev container.
+    #[command(name = "run-user-commands")]
+    RunUserCommands(run_user_commands::RunUserCommandsArgs),
     /// Generate shell completion scripts.
     Completion(completion::CompletionArgs),
     /// Manage the cella daemon.
@@ -298,7 +302,8 @@ impl Command {
             Self::Code(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
-            Self::ReadConfiguration(_) => false,
+            // Both emit a JSON envelope on stdout; spinners would fight it.
+            Self::ReadConfiguration(_) | Self::RunUserCommands(_) => false,
             _ => true,
         }
     }
@@ -337,6 +342,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
+            Self::RunUserCommands(args) => args.compat.log_level,
             _ => None,
         }
     }
@@ -351,6 +357,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_format,
             Self::Code(args) => args.up.compat.log_format,
+            Self::RunUserCommands(args) => args.compat.log_format,
             _ => LogFormat::Text,
         }
     }
@@ -374,6 +381,7 @@ impl Command {
             Self::Switch(args) => args.execute().await,
             Self::Prune(args) => args.execute().await,
             Self::ReadConfiguration(args) => args.execute().await,
+            Self::RunUserCommands(args) => args.execute(progress).await,
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,
