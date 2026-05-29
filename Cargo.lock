@@ -311,6 +311,7 @@ name = "cella-agent"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
+ "cella-filesync",
  "cella-network",
  "cella-port",
  "cella-protocol",
@@ -480,6 +481,7 @@ dependencies = [
  "base64 0.22.1",
  "cella-daemon-client",
  "cella-env",
+ "cella-filesync",
  "cella-port",
  "cella-protocol",
  "cella-proxy",
@@ -589,6 +591,18 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cella-filesync"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "notify",
+ "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tracing",
 ]
