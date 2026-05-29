@@ -108,14 +108,16 @@ pub async fn on_host_change(
     }
 }
 
-/// Write `out` to the host file, recording its hash as `last_hash` *before*
-/// writing so the self-triggered watcher event is recognised as our own and
-/// dropped. This guard ordering is the load-bearing loop-suppression invariant,
-/// so both write sites share this single helper.
+/// Write `out` to the host file, recording its hash as `last_hash` only on a
+/// successful write. The recorded hash lets the self-triggered watcher event be
+/// recognised as the daemon's own write and dropped; the watcher debounce is far
+/// longer than a write+hash, so the hash is in place before the event arrives.
+/// Recording it only on success means a failed write never leaves the daemon
+/// believing stale content is on disk. Both write sites share this helper.
 async fn write_host_guarded(state: &Arc<Mutex<ClaudeSyncState>>, path: &Path, out: &str) {
-    state.lock().await.last_hash = cella_filesync::sha256_hex(out.as_bytes());
-    if let Err(e) = cella_filesync::atomic_write(path, out.as_bytes(), 0o600) {
-        warn!("claude sync: failed to write host ~/.claude.json: {e}");
+    match cella_filesync::atomic_write(path, out.as_bytes(), 0o600) {
+        Ok(()) => state.lock().await.last_hash = cella_filesync::sha256_hex(out.as_bytes()),
+        Err(e) => warn!("claude sync: failed to write host ~/.claude.json: {e}"),
     }
 }
 
@@ -232,6 +234,36 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&host).unwrap()).unwrap();
         assert_eq!(written["projects"]["/Users/eve/p"]["k"], 1);
         assert_eq!(written["projects"]["/workspaces/p"]["k"], 2);
+    }
+
+    #[tokio::test]
+    async fn write_host_guarded_keeps_hash_when_write_fails() {
+        // On a write failure the hash must NOT advance — otherwise the daemon
+        // believes the (never-written) content is the host's on-disk state, and
+        // a restart would re-seed from a stale file.
+        let state = state_from(serde_json::json!({ "a": 1 }));
+        let before = state.lock().await.last_hash.clone();
+        // A path whose parent directory does not exist makes atomic_write fail.
+        let bad = Path::new("/nonexistent-cella-xyz/.claude.json");
+        write_host_guarded(&state, bad, r#"{"a":2}"#).await;
+        assert_eq!(
+            state.lock().await.last_hash,
+            before,
+            "a failed host write must not advance last_hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_host_guarded_advances_hash_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join(".claude.json");
+        let state = state_from(serde_json::json!({ "a": 1 }));
+        write_host_guarded(&state, &host, r#"{"a":2}"#).await;
+        assert_eq!(
+            state.lock().await.last_hash,
+            cella_filesync::sha256_hex(br#"{"a":2}"#)
+        );
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), r#"{"a":2}"#);
     }
 
     #[tokio::test]
