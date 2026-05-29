@@ -16,6 +16,7 @@ pub mod credential_protect;
 pub use cella_config::config_map;
 pub mod daemon_registration;
 pub mod docker_helpers;
+pub mod dotfiles;
 pub mod env_cache;
 pub mod error;
 pub mod host_requirements;
