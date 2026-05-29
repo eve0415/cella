@@ -151,16 +151,6 @@ pub enum GpuAvailability {
     None,
 }
 
-impl GpuAvailability {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Detect => "detect",
-            Self::None => "none",
-        }
-    }
-}
-
 /// Default for updating the remote user's UID/GID to the local user's.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum UpdateRemoteUserUidDefault {
@@ -172,32 +162,12 @@ pub enum UpdateRemoteUserUidDefault {
     Off,
 }
 
-impl UpdateRemoteUserUidDefault {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Never => "never",
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-}
-
 /// Log verbosity for lifecycle/terminal logging.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum LogLevel {
     Info,
     Debug,
     Trace,
-}
-
-impl LogLevel {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
-        }
-    }
 }
 
 /// Log output format.
@@ -207,15 +177,6 @@ pub enum LogFormat {
     Json,
 }
 
-impl LogFormat {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        }
-    }
-}
-
 /// Controls whether `BuildKit` is used when building images.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum BuildKitMode {
@@ -223,15 +184,6 @@ pub enum BuildKitMode {
     Auto,
     /// Never use `BuildKit`.
     Never,
-}
-
-impl BuildKitMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Never => "never",
-        }
-    }
 }
 
 /// Top-level CLI commands.

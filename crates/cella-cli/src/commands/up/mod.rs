@@ -380,55 +380,23 @@ impl UpArgs {
         matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
     }
 
-    /// Emit a debug trace acknowledging every devcontainer-CLI-parity flag.
+    /// Emit a debug trace recording the flags cella accepts purely for
+    /// devcontainer-CLI compatibility but deliberately does NOT act on.
     ///
-    /// Declaring the full official flag surface is what makes cella a drop-in
-    /// replacement (clap rejects unknown args), but the behavioral flags are
-    /// wired into the orchestrator in later phases. This trace both documents
-    /// accepted-but-not-yet-wired flags and is the complete, correct behavior
-    /// for the compatibility no-ops (data folders, lockfiles, syntax directive)
-    /// — cella has no equivalent state, so accepting and ignoring them yields
-    /// correct results.
+    /// cella has no equivalent state for these — it manages its own data
+    /// directories, has no feature lockfiles, lets the Docker engine read
+    /// Dockerfile syntax directives natively, and runs the `up` lifecycle via
+    /// capture exec (no PTY to size) — so accepting and ignoring them yields
+    /// correct results. Every OTHER official flag is wired to real behavior; only
+    /// genuine no-ops are listed here, which keeps this trace an honest record.
     fn acknowledge_compat_flags(&self) {
         let ci = &self.config_inputs;
-        let lc = &self.lifecycle;
-        debug!(
-            id_labels = ci.id_label.len(),
-            override_config = ?ci.override_config,
-            additional_features = ci.additional_features.is_some(),
-            remote_env = ci.remote_env.len(),
-            skip_post_create = lc.skip_post_create,
-            skip_non_blocking_commands = lc.skip_non_blocking_commands,
-            prebuild = lc.prebuild,
-            skip_post_attach = ci.skip_post_attach,
-            expect_existing_container = ci.expect_existing_container,
-            skip_feature_auto_mapping = ci.skip_feature_auto_mapping,
-            "up: config/lifecycle flags accepted"
-        );
-
-        let b = &self.build;
         let c = &self.compat;
-        let r = &self.result;
-        debug!(
-            cache_from = b.cache_from.len(),
-            cache_to = ?b.cache_to,
-            buildkit = b.buildkit.as_str(),
-            docker_path = ?b.docker_path,
-            docker_compose_path = ?b.docker_compose_path,
-            gpu_availability = c.gpu_availability.as_str(),
-            update_remote_user_uid_default = c.update_remote_user_uid_default.as_str(),
-            log_level = ?c.log_level.map(LogLevel::as_str),
-            log_format = c.log_format.as_str(),
-            terminal_columns = ?c.terminal_columns,
-            terminal_rows = ?c.terminal_rows,
-            include_configuration = r.include_configuration,
-            include_merged_configuration = r.include_merged_configuration,
-            omit_config_remote_env_from_metadata = r.omit_config_remote_env_from_metadata,
-            "up: build/backend/result flags accepted"
-        );
-
         let lf = &self.lockfile;
         debug!(
+            skip_feature_auto_mapping = ci.skip_feature_auto_mapping,
+            terminal_columns = ?c.terminal_columns,
+            terminal_rows = ?c.terminal_rows,
             container_data_folder = ?c.container_data_folder,
             container_system_data_folder = ?c.container_system_data_folder,
             container_session_data_folder = ?c.container_session_data_folder,
@@ -438,7 +406,7 @@ impl UpArgs {
             experimental_lockfile = lf.experimental_lockfile,
             experimental_frozen_lockfile = c.experimental_frozen_lockfile,
             omit_syntax_directive = c.omit_syntax_directive,
-            "up: compatibility no-op flags accepted"
+            "up: accepted devcontainer-CLI compatibility no-op flags"
         );
     }
 }

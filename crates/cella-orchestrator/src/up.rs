@@ -1995,13 +1995,15 @@ fn add_orbstack_hostname_labels(
 /// Whether dotfiles should be installed for this `up`.
 ///
 /// Dotfiles run iff a repository was given AND the gate would run
-/// `postCreateCommand` — they occupy the slot between `postCreate` and
-/// `postStart` in the official tool (`injectHeadless.ts:392`), so any flag that
-/// stops the lifecycle at or before `postCreate` also skips dotfiles:
-/// `--skip-post-create` (`gate.enabled == false`), `--prebuild`, and
-/// `--skip-non-blocking-commands` with the default `waitFor`.
+/// `postStartCommand` — in the official tool they occupy the slot AFTER the
+/// `postCreate` `skipNonBlocking` checkpoint (`injectHeadless.ts:392`, past the
+/// `return` at :388), so any flag that stops the lifecycle at or before
+/// `postCreate` also skips dotfiles. Keying on `postStartCommand` (not
+/// `postCreateCommand`) is what makes `--skip-non-blocking-commands` with
+/// `waitFor: postCreateCommand` correctly skip dotfiles, matching the official
+/// behavior across every `waitFor` value.
 fn should_run_dotfiles(gate: cella_backend::LifecycleGate, repository: Option<&str>) -> bool {
-    repository.is_some() && gate.enabled && gate.runs_phase("postCreateCommand")
+    repository.is_some() && gate.enabled && gate.runs_phase("postStartCommand")
 }
 
 fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
@@ -2298,6 +2300,24 @@ mod tests {
         // before postCreate -> skip dotfiles.
         let gate = LifecycleGate {
             wait_for: WaitForPhase::UpdateContent,
+            stop: StopAfter {
+                prebuild: false,
+                skip_non_blocking: true,
+            },
+            ..LifecycleGate::default()
+        };
+        assert!(!should_run_dotfiles(gate, Some("owner/repo")));
+    }
+
+    #[test]
+    fn dotfiles_skipped_under_skip_non_blocking_wait_for_post_create() {
+        // Regression: --skip-non-blocking-commands with waitFor=postCreateCommand
+        // stops right AFTER postCreate (before the dotfiles slot), so dotfiles
+        // must NOT install — matching official injectHeadless.ts (return at :388
+        // before the dotfiles call at :392). Gating on postCreate would wrongly
+        // install here; gating on postStart correctly skips.
+        let gate = LifecycleGate {
+            wait_for: WaitForPhase::PostCreate,
             stop: StopAfter {
                 prebuild: false,
                 skip_non_blocking: true,

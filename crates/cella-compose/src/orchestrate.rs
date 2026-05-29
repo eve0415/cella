@@ -660,12 +660,15 @@ async fn finalize_compose(
         );
         run_lifecycle_entries(&lc_ctx, phase, &entries, progress).await?;
 
-        // Dotfiles install runs immediately after postCreateCommand and before
-        // postStartCommand, matching official's slot (injectHeadless.ts:392).
-        // Reaching this iteration means the gate already permits postCreate, so
-        // only the repository needs to be armed. Non-fatal: a failure warns but
-        // never fails `up`.
-        if phase == "postCreateCommand" && cfg.dotfiles.repository.is_some() {
+        // Dotfiles install runs after postCreateCommand but past the postCreate
+        // skipNonBlocking checkpoint (official injectHeadless.ts:392, after the
+        // :388 return). Gate on postStartCommand (not postCreateCommand) so
+        // `--skip-non-blocking-commands` with `waitFor: postCreateCommand`
+        // correctly skips dotfiles. Non-fatal: a failure warns but never fails `up`.
+        if phase == "postCreateCommand"
+            && cfg.dotfiles.repository.is_some()
+            && gate.runs_phase("postStartCommand")
+        {
             install_dotfiles_step(ctx, &primary.id, remote_user, &lifecycle_env).await;
         }
     }
