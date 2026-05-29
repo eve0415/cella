@@ -83,6 +83,19 @@ pub struct ComposeUpConfig<'a> {
     pub dotfiles: DotfilesConfig,
 }
 
+impl ComposeUpConfig<'_> {
+    /// Lifecycle command environment: CLI `--remote-env` first, config
+    /// `remoteEnv` last so config wins on collision (the merge is later-wins).
+    /// Lifecycle-only — never enters labels or `containerEnv`.
+    fn lifecycle_remote_env(&self) -> Vec<String> {
+        self.cli_remote_env
+            .iter()
+            .chain(self.remote_env.iter())
+            .cloned()
+            .collect()
+    }
+}
+
 /// Dotfiles installation inputs resolved from the `--dotfiles-*` CLI flags.
 ///
 /// Mirrors `cella_orchestrator::config::DotfilesConfig` — duplicated here
@@ -601,14 +614,7 @@ async fn finalize_compose(
         .await;
 
     // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe).
-    // CLI --remote-env first, config remoteEnv last so config wins on collision
-    // (the hook merges later-wins). Lifecycle-only: never labels/containerEnv.
-    let lifecycle_remote_env: Vec<String> = cfg
-        .cli_remote_env
-        .iter()
-        .chain(cfg.remote_env.iter())
-        .cloned()
-        .collect();
+    let lifecycle_remote_env = cfg.lifecycle_remote_env();
     let lifecycle_env = hooks
         .post_create_setup(
             client,
@@ -806,13 +812,7 @@ async fn handle_compose_running(
         && let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()
     {
-        // CLI --remote-env first, config remoteEnv last so config wins.
-        let lifecycle_env: Vec<String> = cfg
-            .cli_remote_env
-            .iter()
-            .chain(cfg.remote_env.iter())
-            .cloned()
-            .collect();
+        let lifecycle_env = cfg.lifecycle_remote_env();
         let lc_ctx = build_lifecycle_ctx(
             client,
             &container.id,
