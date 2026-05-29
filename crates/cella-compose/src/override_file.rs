@@ -59,6 +59,11 @@ pub struct OverrideConfig {
     /// SSH/GPG, parent-git, user mounts, feature mounts). An empty `Vec`
     /// preserves the existing YAML output byte-for-byte.
     pub extra_volumes: Vec<MountSpec>,
+    /// Whether to grant the service a GPU. When `true`, emits a
+    /// `deploy.resources.reservations.devices` block requesting capabilities
+    /// `[gpu]` (matching the official compose GPU override). Decided by
+    /// `hostRequirements.gpu` AND `--gpu-availability`.
+    pub request_gpu: bool,
 }
 
 /// Generate the override compose YAML as a string.
@@ -125,6 +130,17 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         for (k, v) in &config.extra_labels {
             let _ = writeln!(yaml, "      {k}: \"{v}\"");
         }
+    }
+
+    // GPU reservation (mirrors official's compose GPU override). Always
+    // requests capabilities `[gpu]` with no count — parity with the single
+    // container `--gpus all`.
+    if config.request_gpu {
+        yaml.push_str("    deploy:\n");
+        yaml.push_str("      resources:\n");
+        yaml.push_str("        reservations:\n");
+        yaml.push_str("          devices:\n");
+        yaml.push_str("            - capabilities: [gpu]\n");
     }
 
     // Agent volume mount (read-only)
@@ -227,6 +243,7 @@ mod tests {
             additional_contexts: BTreeMap::new(),
             build_secrets: Vec::new(),
             extra_volumes: Vec::new(),
+            request_gpu: false,
         }
     }
 
@@ -252,6 +269,24 @@ mod tests {
         config.image_override = Some("cella-img-myapp-abc12345-def67890".to_string());
         let yaml = generate_override_yaml(&config);
         assert!(yaml.contains("image: \"cella-img-myapp-abc12345-def67890\""));
+    }
+
+    #[test]
+    fn gpu_request_emits_device_reservation() {
+        let mut config = base_config();
+        config.request_gpu = true;
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("deploy:"));
+        assert!(yaml.contains("reservations:"));
+        assert!(yaml.contains("- capabilities: [gpu]"));
+    }
+
+    #[test]
+    fn no_gpu_request_omits_device_reservation() {
+        let config = base_config();
+        let yaml = generate_override_yaml(&config);
+        assert!(!yaml.contains("deploy:"));
+        assert!(!yaml.contains("capabilities: [gpu]"));
     }
 
     #[test]

@@ -7,6 +7,53 @@ use cella_backend::BuildSecret;
 use cella_config::devcontainer::resolve::ResolvedConfig;
 pub use cella_network::NetworkRulePolicy;
 
+/// Build/backend tuning inputs resolved from the `up` CLI flags.
+///
+/// Split into toolchain inputs (`docker_path`, `use_buildkit`) that apply to
+/// every build site, and cache-I/O inputs (`cli_cache_from`, `cache_to`) that
+/// apply to the base Dockerfile build only — the analog of the user's own
+/// Dockerfile in the official single combined build.
+#[derive(Clone, Copy)]
+pub struct BuildTuning<'a> {
+    /// Path to the `docker` CLI binary (`--docker-path`). `None` = `docker`.
+    pub docker_path: Option<&'a str>,
+    /// Whether `BuildKit`/buildx may be used (`--buildkit auto`). `false`
+    /// forces the classic builder (`--buildkit never`).
+    pub use_buildkit: bool,
+    /// CLI `--cache-from` images, prepended before config `cacheFrom` on the
+    /// base Dockerfile build (skipped entirely under `--no-cache`).
+    pub cli_cache_from: &'a [String],
+    /// CLI `--cache-to` cache export (`BuildKit` only; dropped otherwise).
+    pub cache_to: Option<&'a str>,
+}
+
+impl Default for BuildTuning<'_> {
+    /// `BuildKit` enabled (auto-probe), no toolchain overrides, no cache I/O —
+    /// the standard build behavior for callers without `up` tuning flags.
+    fn default() -> Self {
+        Self {
+            docker_path: None,
+            use_buildkit: true,
+            cli_cache_from: &[],
+            cache_to: None,
+        }
+    }
+}
+
+impl BuildTuning<'_> {
+    /// Toolchain-only view (docker binary + `BuildKit` decision) for build
+    /// sites that must NOT inherit cache I/O (features layer, UID remap).
+    #[must_use]
+    pub const fn toolchain(self) -> Self {
+        Self {
+            docker_path: self.docker_path,
+            use_buildkit: self.use_buildkit,
+            cli_cache_from: &[],
+            cache_to: None,
+        }
+    }
+}
+
 /// Mount-related CLI flags for workspace configuration.
 pub struct MountFlags<'a> {
     /// Additional mount points from CLI `--mount` flags.
@@ -73,6 +120,13 @@ pub struct UpConfig<'a> {
     /// `--expect-existing-container`: when `true`, fail (rather than create)
     /// if no container is found for this workspace. Gates before any build.
     pub expect_existing_container: bool,
+    /// Build/backend tuning (`--docker-path`, `--buildkit`, `--cache-from`,
+    /// `--cache-to`).
+    pub build_tuning: BuildTuning<'a>,
+    /// `--gpu-availability`: whether a config-requested GPU is granted.
+    pub gpu_availability: cella_backend::GpuAvailability,
+    /// `--update-remote-user-uid-default`: default for `updateRemoteUserUID`.
+    pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
 }
 
 /// How the up pipeline should handle the container image.

@@ -321,6 +321,28 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn detect_gpu_support(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(async move {
+            // API equivalent of `docker info -f '{{.Runtimes.nvidia}}'`: the
+            // daemon exposes an `nvidia` runtime whose binary is the
+            // nvidia-container-runtime. Treat a missing runtimes map (older
+            // API versions) as "no GPU support".
+            let info = self
+                .inner()
+                .info()
+                .await
+                .map_err(|e| BackendError::Runtime(Box::new(e)))?;
+            let has_nvidia = info.runtimes.is_some_and(|runtimes| {
+                runtimes.get("nvidia").is_some_and(|rt| {
+                    rt.path
+                        .as_deref()
+                        .is_some_and(|p| p.contains("nvidia-container-runtime"))
+                })
+            });
+            Ok(has_nvidia)
+        })
+    }
+
     // -- Extended image inspection --
 
     fn inspect_image_env<'a>(

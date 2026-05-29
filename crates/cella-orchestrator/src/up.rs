@@ -1603,6 +1603,54 @@ impl EnsureUpContext<'_> {
         }
     }
 
+    /// Resolve whether a config-requested GPU should be granted.
+    ///
+    /// Mirrors official's `checkDockerSupportForGPU`: `All` always grants,
+    /// `None` never grants, `Detect` probes the daemon for an NVIDIA runtime.
+    async fn gpu_support_available(&self) -> bool {
+        match self.config.gpu_availability {
+            cella_backend::GpuAvailability::All => true,
+            cella_backend::GpuAvailability::None => false,
+            cella_backend::GpuAvailability::Detect => {
+                self.client.detect_gpu_support().await.unwrap_or(false)
+            }
+        }
+    }
+
+    /// Apply `--gpu-availability` to a config-derived GPU request.
+    ///
+    /// `create_opts.gpu_request` carries the `hostRequirements.gpu` request
+    /// (runArgs `--gpus` lives separately and is never touched here). When the
+    /// resolved policy declines GPU support, the request is stripped; a missing,
+    /// non-`optional` requirement then emits the official warning. When granted,
+    /// the request is normalized to `All` (official always emits `--gpus all` /
+    /// capabilities `[["gpu"]]` — a `cores` count is never honored).
+    async fn gate_gpu_request(
+        &self,
+        config: &serde_json::Value,
+        create_opts: &mut cella_backend::CreateContainerOptions,
+    ) {
+        if create_opts.gpu_request.is_none() {
+            return;
+        }
+
+        if self.gpu_support_available().await {
+            create_opts.gpu_request = Some(cella_backend::GpuRequest::All);
+        } else {
+            create_opts.gpu_request = None;
+            let is_optional = config
+                .get("hostRequirements")
+                .and_then(|h| h.get("gpu"))
+                .and_then(serde_json::Value::as_str)
+                == Some("optional");
+            if !is_optional {
+                self.progress.warn(
+                    "No GPU support found yet a GPU was required - consider marking it as \"optional\"",
+                );
+            }
+        }
+    }
+
     /// Build a UID-remapped image and update `create_opts.image` if needed.
     async fn maybe_remap_uid(
         &self,
@@ -1612,10 +1660,13 @@ impl EnsureUpContext<'_> {
         remote_user: &str,
         create_opts: &mut cella_backend::CreateContainerOptions,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let update_uid = config
+        let config_value = config
             .get("updateRemoteUserUID")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
+            .and_then(serde_json::Value::as_bool);
+        let update_uid = cella_backend::should_update_uid(
+            config_value,
+            self.config.update_remote_user_uid_default,
+        );
 
         if update_uid
             && let Some(uid_img) = crate::uid_image::build_uid_remap_image(
@@ -1623,6 +1674,10 @@ impl EnsureUpContext<'_> {
                 img_name,
                 image_user,
                 remote_user,
+                cella_backend::uid_image::BuildToolchain {
+                    docker_path: self.config.build_tuning.docker_path,
+                    use_buildkit: self.config.build_tuning.use_buildkit,
+                },
                 &self.progress,
             )
             .await?
@@ -1664,6 +1719,7 @@ impl EnsureUpContext<'_> {
                 no_cache: build_no_cache,
                 pull_policy: self.config.pull_policy,
                 secrets: &self.config.build_secrets,
+                build_tuning: self.config.build_tuning,
                 progress: &self.progress,
             })
             .await?;
@@ -1689,6 +1745,8 @@ impl EnsureUpContext<'_> {
         )?;
 
         let ssh_agent_proxy = self.resolve_ssh_agent_proxy(&mut env_fwd).await;
+
+        self.gate_gpu_request(config, &mut create_opts).await;
 
         self.maybe_remap_uid(
             config,

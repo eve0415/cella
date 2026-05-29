@@ -65,6 +65,41 @@ pub struct ComposeUpConfig<'a> {
     /// `--skip-post-create` / `--skip-non-blocking-commands` / `--prebuild` /
     /// `--skip-post-attach`). `Default` runs every phase.
     pub lifecycle_gate: cella_backend::LifecycleGate,
+    /// Build/backend tuning (`--docker-path`, `--docker-compose-path`,
+    /// `--buildkit`).
+    pub build_tuning: ComposeBuildTuning,
+    /// `--gpu-availability`: whether a config-requested GPU is granted.
+    pub gpu_availability: cella_backend::GpuAvailability,
+    /// `--update-remote-user-uid-default`: default for `updateRemoteUserUID`.
+    pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+}
+
+/// Build/backend tuning inputs for the compose `up` path.
+///
+/// `docker_path` selects the `docker` binary used for `docker compose`.
+/// `docker_compose_path` is the standalone (V1) `docker-compose` binary — cella
+/// is V2-only today, so it is accepted and stored but currently unused (see
+/// [`ComposeCommand`]). `use_buildkit` propagates the `--buildkit` decision to
+/// build sites cella owns (e.g. the UID-remap layer).
+#[derive(Debug, Clone, Default)]
+pub struct ComposeBuildTuning {
+    /// `docker` CLI binary path (`--docker-path`). `None` = `docker`.
+    pub docker_path: Option<String>,
+    /// Standalone `docker-compose` (V1) binary (`--docker-compose-path`).
+    /// Accepted-and-stored; reserved for a future V1 fallback.
+    pub docker_compose_path: Option<String>,
+    /// Whether `BuildKit`/buildx may be used (`false` = classic builder).
+    pub use_buildkit: bool,
+}
+
+impl ComposeUpConfig<'_> {
+    /// `(docker_path, docker_compose_path)` for [`ComposeCommand::with_docker_binaries`].
+    fn docker_binaries(&self) -> (Option<String>, Option<String>) {
+        (
+            self.build_tuning.docker_path.clone(),
+            self.build_tuning.docker_compose_path.clone(),
+        )
+    }
 }
 
 /// How to resolve an existing (or missing) compose container before building.
@@ -252,7 +287,9 @@ pub async fn compose_up(
 
         if cfg.resolution.remove_container || cfg.resolution.build_no_cache {
             run_step_result(&progress, "Stopping existing compose project...", async {
-                let compose_cmd = ComposeCommand::from_project_name(&project.project_name);
+                let (dp, dcp) = cfg.docker_binaries();
+                let compose_cmd = ComposeCommand::from_project_name(&project.project_name)
+                    .with_docker_binaries(dp, dcp);
                 compose_cmd.down().await
             })
             .await?;
@@ -333,8 +370,14 @@ async fn resolve_user_and_env(
 ) {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let (image_user, image_meta_user) =
-        resolve_compose_image_info(client, project, features_build, progress).await;
+    let (image_user, image_meta_user) = resolve_compose_image_info(
+        client,
+        project,
+        features_build,
+        cfg.docker_binaries(),
+        progress,
+    )
+    .await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
@@ -418,11 +461,14 @@ async fn prepare_and_start(
         extra_env: Vec::new(),
         labels: BTreeMap::new(),
         extra_volumes: Vec::new(),
+        // GPU reservation is emitted only in the final override, not at build.
+        request_gpu: false,
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
     // 9. Run docker compose build to ensure images exist for inspection.
-    let compose_cmd = ComposeCommand::new(project);
+    let (dp, dcp) = ctx.cfg.docker_binaries();
+    let compose_cmd = ComposeCommand::new(project).with_docker_binaries(dp, dcp);
     run_step_result(
         progress,
         "Building compose services...",
@@ -705,6 +751,9 @@ struct OverrideContext {
     extra_env: Vec<String>,
     labels: BTreeMap<String, String>,
     extra_volumes: Vec<MountSpec>,
+    /// Whether to emit the GPU reservation block (config requires a GPU AND
+    /// `--gpu-availability` grants it). Net-new compose GPU support.
+    request_gpu: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +782,9 @@ fn write_build_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
+        // The build-time override never needs the GPU reservation; it is
+        // emitted only in the final override used for `compose up`.
+        request_gpu: false,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -758,6 +810,7 @@ async fn resolve_compose_image_info(
     client: &dyn ContainerBackend,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
+    docker_binaries: (Option<String>, Option<String>),
     progress: &ProgressSender,
 ) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
     // If features resolved an image, its metadata was already extracted.
@@ -770,7 +823,8 @@ async fn resolve_compose_image_info(
     }
 
     // Resolve compose config to find the service's image source.
-    let compose_cmd = ComposeCommand::without_override(project);
+    let (dp, dcp) = docker_binaries;
+    let compose_cmd = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
     let resolved = match compose_cmd.config().await {
         Ok(r) => r,
         Err(e) => {
@@ -826,6 +880,42 @@ async fn resolve_compose_image_info(
 // UID remap
 // ---------------------------------------------------------------------------
 
+/// Whether the compose service should be granted a GPU.
+///
+/// Mirrors the single-container gate: the config must request a GPU
+/// (`hostRequirements.gpu` truthy) AND `--gpu-availability` must grant it
+/// (`all` => always, `none` => never, `detect` => daemon probe). When the
+/// config requires a GPU but support is declined, the official warning is
+/// emitted (unless the requirement was marked `optional`).
+async fn resolve_compose_gpu(ctx: &Ctx<'_>, config: &serde_json::Value) -> bool {
+    let gpu = config.get("hostRequirements").and_then(|h| h.get("gpu"));
+    let requires_gpu = matches!(
+        gpu,
+        Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+    ) || gpu.and_then(serde_json::Value::as_str) == Some("optional");
+    if !requires_gpu {
+        return false;
+    }
+
+    let supported = match ctx.cfg.gpu_availability {
+        cella_backend::GpuAvailability::All => true,
+        cella_backend::GpuAvailability::None => false,
+        cella_backend::GpuAvailability::Detect => {
+            ctx.client.detect_gpu_support().await.unwrap_or(false)
+        }
+    };
+
+    if !supported {
+        let is_optional = gpu.and_then(serde_json::Value::as_str) == Some("optional");
+        if !is_optional {
+            ctx.progress.warn(
+                "No GPU support found yet a GPU was required - consider marking it as \"optional\"",
+            );
+        }
+    }
+    supported
+}
+
 /// Build a UID-remapped image for the compose service.
 ///
 /// Returns the UID-remapped image name, or `None` if remap was skipped.
@@ -836,12 +926,13 @@ async fn build_uid_remap_image_compose(
     remote_user: &str,
     image_user: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let update_uid = ctx
+    let config_value = ctx
         .cfg
         .config
         .get("updateRemoteUserUID")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .and_then(serde_json::Value::as_bool);
+    let update_uid =
+        cella_backend::should_update_uid(config_value, ctx.cfg.update_remote_user_uid_default);
 
     if !update_uid {
         return Ok(None);
@@ -856,6 +947,10 @@ async fn build_uid_remap_image_compose(
         &compose_image,
         image_user,
         remote_user,
+        cella_backend::uid_image::BuildToolchain {
+            docker_path: ctx.cfg.build_tuning.docker_path.as_deref(),
+            use_buildkit: ctx.cfg.build_tuning.use_buildkit,
+        },
         ctx.progress,
     )
     .await
@@ -887,6 +982,7 @@ fn write_final_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
+        request_gpu: ov.request_gpu,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -936,8 +1032,11 @@ async fn build_override_and_start(
         subst_ctx: &subst_ctx,
         agent_vol_target: &agent_vol_target,
         agent_vol_name: &agent_vol_name,
+        docker_binaries: cfg.docker_binaries(),
     })
     .await?;
+
+    let request_gpu = resolve_compose_gpu(ctx, config).await;
 
     let mut ov_ctx = OverrideContext {
         agent_vol_name,
@@ -945,6 +1044,7 @@ async fn build_override_and_start(
         extra_env,
         labels,
         extra_volumes: mount_specs,
+        request_gpu,
     };
 
     let uid_image =
@@ -1200,6 +1300,8 @@ struct ComposeMountParams<'a> {
     /// Agent volume name (e.g., `cella-agent`). Volume mounts aliasing this
     /// source name are rejected regardless of their target path.
     agent_vol_name: &'a str,
+    /// `(docker_path, docker_compose_path)` for the compose-config probe.
+    docker_binaries: (Option<String>, Option<String>),
 }
 
 /// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
@@ -1292,7 +1394,8 @@ async fn build_compose_mount_specs(
     //
     // If `docker compose config` fails, emit a warning and skip both
     // validation and dedup — Docker Compose will surface any eventual collision.
-    let validation_cmd = ComposeCommand::without_override(p.project);
+    let (dp, dcp) = p.docker_binaries;
+    let validation_cmd = ComposeCommand::without_override(p.project).with_docker_binaries(dp, dcp);
     match validation_cmd.config().await {
         Ok(resolved) => {
             // Reject the whole `cella up` if the user's base compose file aliases
@@ -1484,6 +1587,9 @@ mod tests {
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
             lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1545,6 +1651,9 @@ mod tests {
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
             lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),

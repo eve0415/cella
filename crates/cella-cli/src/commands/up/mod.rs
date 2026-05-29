@@ -645,6 +645,46 @@ pub struct UpContext {
     default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
     /// Lifecycle phase gate built from the `--skip-*` / `--prebuild` flags.
     pub(crate) lifecycle_gate: cella_backend::LifecycleGate,
+    /// `docker` CLI binary path (`--docker-path`).
+    docker_path: Option<String>,
+    /// Standalone `docker-compose` (V1) binary (`--docker-compose-path`).
+    docker_compose_path: Option<String>,
+    /// CLI `--cache-from` images appended to the base build's cache sources.
+    cache_from: Vec<String>,
+    /// CLI `--cache-to` cache export (`BuildKit` only).
+    cache_to: Option<String>,
+    /// Whether `BuildKit`/buildx may be used (`--buildkit auto`); `false` for
+    /// `--buildkit never`.
+    use_buildkit: bool,
+    /// `--gpu-availability` policy.
+    gpu_availability: cella_backend::GpuAvailability,
+    /// `--update-remote-user-uid-default` policy.
+    update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+}
+
+/// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
+const fn buildkit_enabled(mode: BuildKitMode) -> bool {
+    !matches!(mode, BuildKitMode::Never)
+}
+
+/// Map the clap `--gpu-availability` enum to the backend policy.
+const fn map_gpu_availability(g: GpuAvailability) -> cella_backend::GpuAvailability {
+    match g {
+        GpuAvailability::All => cella_backend::GpuAvailability::All,
+        GpuAvailability::Detect => cella_backend::GpuAvailability::Detect,
+        GpuAvailability::None => cella_backend::GpuAvailability::None,
+    }
+}
+
+/// Map the clap `--update-remote-user-uid-default` enum to the backend policy.
+const fn map_uid_default(
+    u: UpdateRemoteUserUidDefault,
+) -> cella_backend::UpdateRemoteUserUidDefault {
+    match u {
+        UpdateRemoteUserUidDefault::Never => cella_backend::UpdateRemoteUserUidDefault::Never,
+        UpdateRemoteUserUidDefault::On => cella_backend::UpdateRemoteUserUidDefault::On,
+        UpdateRemoteUserUidDefault::Off => cella_backend::UpdateRemoteUserUidDefault::Off,
+    }
 }
 
 impl UpContext {
@@ -755,6 +795,15 @@ impl UpContext {
             },
             default_user_env_probe: args.default_user_env_probe,
             lifecycle_gate,
+            docker_path: args.build.docker_path.clone(),
+            docker_compose_path: args.build.docker_compose_path.clone(),
+            cache_from: args.build.cache_from.clone(),
+            cache_to: args.build.cache_to.clone(),
+            use_buildkit: buildkit_enabled(args.build.buildkit),
+            gpu_availability: map_gpu_availability(args.compat.gpu_availability),
+            update_remote_user_uid_default: map_uid_default(
+                args.compat.update_remote_user_uid_default,
+            ),
         })
     }
 
@@ -832,6 +881,15 @@ impl UpContext {
             },
             default_user_env_probe,
             lifecycle_gate: cella_backend::LifecycleGate::default(),
+            docker_path: None,
+            docker_compose_path: None,
+            cache_from: Vec::new(),
+            cache_to: None,
+            // Branch/auto-up uses the default toolchain: BuildKit auto, default
+            // GPU detection, and the standard UID-update default.
+            use_buildkit: true,
+            gpu_availability: cella_backend::GpuAvailability::Detect,
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::On,
         })
     }
 
@@ -845,6 +903,27 @@ impl UpContext {
 
     pub(crate) fn workspace_folder(&self) -> Option<&str> {
         self.workspace_folder_from_config.as_deref()
+    }
+
+    /// Build/backend tuning for the compose `up` path.
+    pub(crate) fn compose_build_tuning(
+        &self,
+    ) -> cella_orchestrator::compose_up::ComposeBuildTuning {
+        cella_orchestrator::compose_up::ComposeBuildTuning {
+            docker_path: self.docker_path.clone(),
+            docker_compose_path: self.docker_compose_path.clone(),
+            use_buildkit: self.use_buildkit,
+        }
+    }
+
+    pub(crate) const fn gpu_availability(&self) -> cella_backend::GpuAvailability {
+        self.gpu_availability
+    }
+
+    pub(crate) const fn update_remote_user_uid_default(
+        &self,
+    ) -> cella_backend::UpdateRemoteUserUidDefault {
+        self.update_remote_user_uid_default
     }
 
     pub(crate) fn probe_type(&self) -> cella_env::user_env_probe::UserEnvProbe {
@@ -1248,6 +1327,14 @@ impl UpContext {
             user_env_probe: self.probe_type(),
             lifecycle_gate: self.lifecycle_gate,
             expect_existing_container: self.resolution.expect_existing_container,
+            build_tuning: cella_orchestrator::BuildTuning {
+                docker_path: self.docker_path.as_deref(),
+                use_buildkit: self.use_buildkit,
+                cli_cache_from: &self.cache_from,
+                cache_to: self.cache_to.as_deref(),
+            },
+            gpu_availability: self.gpu_availability,
+            update_remote_user_uid_default: self.update_remote_user_uid_default,
         };
 
         let result =

@@ -106,6 +106,8 @@ pub async fn compose_build(
             additional_contexts: fb.additional_contexts.clone(),
             build_secrets: compose_secrets,
             extra_volumes: Vec::new(),
+            // GPU reservation is emitted only in the final override.
+            request_gpu: false,
         };
         let yaml = crate::override_file::generate_override_yaml(&override_config);
         crate::override_file::write_override_file(&project.override_file, &yaml)?;

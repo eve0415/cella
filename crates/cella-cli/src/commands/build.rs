@@ -136,6 +136,9 @@ impl BuildArgs {
             no_cache: self.no_cache,
             pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
+            // `cella build` has no build-tuning flags yet; use defaults
+            // (BuildKit auto, default docker binary, no CLI cache I/O).
+            build_tuning: cella_orchestrator::BuildTuning::default(),
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;

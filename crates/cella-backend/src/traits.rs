@@ -212,6 +212,17 @@ pub trait ContainerBackend: Send + Sync {
     /// Detect the architecture of images pulled by the runtime (e.g. `"amd64"`).
     fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>>;
 
+    /// Detect whether the runtime exposes GPU support (an NVIDIA container
+    /// runtime). Mirrors the official `docker info -f '{{.Runtimes.nvidia}}'`
+    /// probe used by `--gpu-availability detect`.
+    ///
+    /// The default returns `Ok(false)` so backends without GPU support need not
+    /// implement it; `detect` then declines the GPU exactly as the daemon
+    /// probe would on a non-NVIDIA host.
+    fn detect_gpu_support(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(async { Ok(false) })
+    }
+
     // -- Extended image inspection --
 
     /// Return the environment variables from an image's config.
