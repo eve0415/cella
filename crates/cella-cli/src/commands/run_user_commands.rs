@@ -1,16 +1,20 @@
 //! `cella run-user-commands` — re-run lifecycle hooks against an existing
 //! container.
 //!
-//! Mirrors the official devcontainer CLI `set-up` command (`setUpOptions` /
-//! `doSetUp`): it resolves an already-running container, reads its devcontainer
-//! config (from `--config` or the container's embedded metadata), and runs the
-//! user lifecycle commands against it, gated by the same lifecycle flags as
-//! `up`. The official `set-up` and `run-user-commands` share the same
-//! lifecycle machinery; cella exposes it under the `run-user-commands` name.
+//! Mirrors the official devcontainer CLI `run-user-commands` command
+//! (`runUserCommandsOptions` / `doRunUserCommands`, bound at
+//! `devContainersSpecCLI.ts` line 74 — NOT `set-up`/`doSetUp`): it resolves an
+//! already-running container, reads its devcontainer config (from `--config`
+//! or the container's embedded metadata), runs the user lifecycle commands
+//! against it via the official `runLifecycleHooks` gated-return order, and
+//! emits `{"outcome":"success","result":"<status>"}` on success or
+//! `{"outcome":"error","message":...,"description":...}` on failure (exit 1).
 //!
-//! Flag surface is `setUpOptions` verbatim plus two cella-ergonomic additions
-//! (`--id-label`, `--workspace-folder`) for resolving the target container when
-//! `--container-id` is not the convenient handle.
+//! Flag surface is `runUserCommandsOptions` verbatim. The data-folder fields,
+//! `--docker-path`/`--docker-compose-path`, `--mount-*`, `--secrets-file`,
+//! `--skip-feature-auto-mapping`, and the terminal-size flags are accepted for
+//! drop-in parity but are no-ops in cella (it manages its own data dirs, talks
+//! to the engine API directly, resolves no features here, and has no PTY).
 
 use std::path::PathBuf;
 
@@ -24,7 +28,7 @@ use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
-use super::up::{UpResult, map_env_object, output_result, result_render_data};
+use super::up::map_env_object;
 use super::{LogFormat, LogLevel};
 use crate::backend::BackendArgs;
 
@@ -44,42 +48,71 @@ fn parse_remote_env(s: &str) -> Result<String, String> {
     }
 }
 
-/// Container-targeting flags. `--container-id` is the documented primary; the
-/// repeatable `--id-label` and `--workspace-folder` are cella additions for
-/// resolving the container when an id is inconvenient.
+/// Container-targeting flags. Mirrors the official `run-user-commands`
+/// resolution surface: `--container-id` (highest priority), repeatable
+/// `--id-label`, or `--workspace-folder` (defaults to cwd when none given).
 #[derive(Args)]
 pub struct TargetArgs {
-    /// Id of the container to run the user commands in.
-    #[arg(
-        long = "container-id",
-        required_unless_present_any = ["id_label", "workspace_folder"],
-    )]
+    /// Id of the container to run the user commands for.
+    #[arg(long = "container-id")]
     container_id: Option<String>,
 
     /// Id label(s) of the format `name=value` used to find the container
-    /// (repeatable). cella addition; `--container-id` stays primary.
+    /// (repeatable). If no `--container-id` is given the id labels are used to
+    /// look up the container.
     #[arg(long = "id-label", value_parser = parse_id_label)]
     id_label: Vec<String>,
 
-    /// Workspace folder whose container should be targeted. cella addition.
+    /// Workspace folder path. The devcontainer.json is looked up relative to
+    /// this path. Defaults to the current directory when no container target
+    /// is given.
     #[arg(long = "workspace-folder")]
     workspace_folder: Option<PathBuf>,
 }
 
-/// Lifecycle-gating flags (subset of `setUpOptions` — no `--prebuild` or
-/// `--skip-post-attach`, which belong to the sibling `run-user-commands`
-/// handler in the official CLI; this command hardcodes both off).
+/// Config-sourcing flags. `--config` layers an on-disk devcontainer.json on
+/// top of the container's metadata; `--override-config` replaces it.
+#[derive(Args)]
+pub struct ConfigArgs {
+    /// devcontainer.json path. When omitted, lifecycle commands are sourced
+    /// from the container's embedded `devcontainer.metadata` label.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// devcontainer.json path to override any devcontainer.json in the
+    /// workspace folder (or built-in configuration).
+    #[arg(long = "override-config")]
+    override_config: Option<PathBuf>,
+}
+
+/// Stop-after lifecycle-gating flags. Mirrors `runUserCommandsOptions`: there
+/// is no `--skip-post-create` here (that belongs to `up`/`set-up`);
+/// `postCreate` is always eligible. Split from [`AttachArgs`] to keep each
+/// flattened sub-struct under the bool-count lint (clap flatten makes the
+/// split invisible on the CLI surface).
 #[derive(Args)]
 pub struct GateArgs {
-    /// Do not run onCreate/updateContent/postCreate/postStart/postAttach
-    /// commands and do not install dotfiles.
-    #[arg(long = "skip-post-create")]
-    skip_post_create: bool,
-
     /// Stop running user commands after the `waitFor` phase (default
-    /// updateContentCommand).
+    /// `updateContentCommand`).
     #[arg(long = "skip-non-blocking-commands")]
     skip_non_blocking_commands: bool,
+
+    /// Stop after `onCreateCommand` and `updateContentCommand`.
+    #[arg(long = "prebuild")]
+    prebuild: bool,
+
+    /// Stop for personalization (after dotfiles, before `postStartCommand`).
+    #[arg(long = "stop-for-personalization")]
+    stop_for_personalization: bool,
+}
+
+/// `postAttach`-related gating. Split from [`GateArgs`] purely to satisfy the
+/// bool-count lint; flattened it merges back into the same CLI surface.
+#[derive(Args)]
+pub struct AttachArgs {
+    /// Do not run `postAttachCommand`.
+    #[arg(long = "skip-post-attach")]
+    skip_post_attach: bool,
 }
 
 /// Dotfiles flags. Same surface as `up`.
@@ -99,30 +132,24 @@ pub struct DotfilesArgs {
     target_path: String,
 }
 
-/// Result-shaping flags. Same surface as `up`'s `--include-*`.
-#[derive(Args)]
-pub struct ResultArgs {
-    /// Include the configuration in the JSON result.
-    #[arg(long = "include-configuration")]
-    include_configuration: bool,
-
-    /// Include the merged configuration in the JSON result.
-    #[arg(long = "include-merged-configuration")]
-    include_merged_configuration: bool,
-}
-
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
 ///
-/// The data-folder fields and `--docker-path` are no-ops in cella (it manages
-/// its own data dirs and talks to the engine API directly, not the `docker`
-/// CLI). `--terminal-columns`/`--terminal-rows` size lifecycle subprocess
-/// output in the official CLI; cella's capture exec has no PTY, so they are
-/// accepted-and-ignored (clap's `requires` enforces the both-or-neither pair).
+/// The data-folder fields, `--docker-path`/`--docker-compose-path`, and the
+/// `--mount-*` flags are no-ops in cella (it manages its own data dirs and
+/// talks to the engine API directly, not the `docker` CLI; mount layout is
+/// fixed at create time). `--secrets-file` is accepted but not wired into the
+/// lifecycle env yet. `--terminal-columns`/`--terminal-rows` size lifecycle
+/// subprocess output in the official CLI; cella's capture exec has no PTY, so
+/// they are accepted-and-ignored (clap's `requires` enforces the pair).
 #[derive(Args)]
 pub struct CompatArgs {
     /// `docker` CLI binary path (compatibility no-op).
     #[arg(long = "docker-path")]
     docker_path: Option<String>,
+
+    /// `docker compose` CLI binary path (compatibility no-op).
+    #[arg(long = "docker-compose-path")]
+    docker_compose_path: Option<String>,
 
     /// Container data folder for in-container user data (compatibility no-op).
     #[arg(long = "container-data-folder")]
@@ -139,6 +166,23 @@ pub struct CompatArgs {
     /// Host directory persisted across sessions (compatibility no-op).
     #[arg(long = "user-data-folder")]
     user_data_folder: Option<PathBuf>,
+
+    /// Mount the workspace using its Git root (compatibility no-op).
+    #[arg(long = "mount-workspace-git-root", default_value_t = true)]
+    mount_workspace_git_root: bool,
+
+    /// Mount the Git worktree common dir (compatibility no-op).
+    #[arg(long = "mount-git-worktree-common-dir")]
+    mount_git_worktree_common_dir: bool,
+
+    /// Temporary option for testing; cella resolves no features on this path
+    /// (compatibility no-op, hidden — matches the official `hidden: true`).
+    #[arg(long = "skip-feature-auto-mapping", hide = true)]
+    skip_feature_auto_mapping: bool,
+
+    /// Path to a JSON file of secret env vars (compatibility no-op).
+    #[arg(long = "secrets-file")]
+    secrets_file: Option<PathBuf>,
 
     /// Log verbosity for lifecycle/terminal logging.
     #[arg(long = "log-level", value_enum)]
@@ -166,10 +210,8 @@ pub struct RunUserCommandsArgs {
     #[command(flatten)]
     target: TargetArgs,
 
-    /// Path to devcontainer.json. When omitted, lifecycle commands are sourced
-    /// from the container's embedded `devcontainer.metadata` label.
-    #[arg(long)]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    config: ConfigArgs,
 
     /// Default value for the devcontainer.json's `userEnvProbe`.
     #[arg(
@@ -188,10 +230,10 @@ pub struct RunUserCommandsArgs {
     gate: GateArgs,
 
     #[command(flatten)]
-    dotfiles: DotfilesArgs,
+    attach: AttachArgs,
 
     #[command(flatten)]
-    result: ResultArgs,
+    dotfiles: DotfilesArgs,
 
     #[command(flatten)]
     pub(crate) compat: CompatArgs,
@@ -201,17 +243,15 @@ impl RunUserCommandsArgs {
     /// Resolve the container, read its config, re-run lifecycle hooks, and emit
     /// the result envelope. The envelope ALWAYS lands on stdout as JSON (there
     /// is no `--output` flag on this command); a failure prints the error
-    /// envelope and exits 1, matching the official `set-up` contract.
+    /// envelope and exits 1, matching the official `run-user-commands`
+    /// contract.
     pub async fn execute(
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.run(progress).await {
-            Ok(result) => {
-                output_result(&result_render_data(
-                    &super::OutputFormat::Json,
-                    &result_for_render(&result),
-                ));
+            Ok(status) => {
+                println!("{}", render_success_envelope(status));
                 Ok(())
             }
             Err(e) => {
@@ -224,7 +264,7 @@ impl RunUserCommandsArgs {
     async fn run(
         self,
         progress: crate::progress::Progress,
-    ) -> Result<RunResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<&'static str, Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
         let target = ContainerTarget {
             container_id: self.target.container_id.clone(),
@@ -240,88 +280,95 @@ impl RunUserCommandsArgs {
             .map(PathBuf::from)
             .or_else(|| self.target.workspace_folder.clone());
 
-        let (config, config_path) = self.read_config(workspace.as_deref())?;
+        let config = self.read_config(workspace.as_deref())?;
         let metadata = container.labels.get("devcontainer.metadata").cloned();
 
         let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
         let lifecycle_env = self
-            .build_lifecycle_env(&*client, &container.id, &remote_user, &config)
+            .build_lifecycle_env(
+                &*client,
+                &container.id,
+                &remote_user,
+                &config,
+                metadata.as_deref(),
+            )
             .await;
 
-        let gate = self.build_gate(&config);
-        // Scope the borrows of `container.id` / `remote_user` /
-        // `workspace_folder` (held by `lc_ctx`/`input`) to this block so they
-        // can be moved into `RunResult` below.
-        {
-            let (sender, renderer) = crate::progress::bridge(&progress);
-            let lc_ctx = cella_backend::LifecycleContext {
-                client: &*client,
-                container_id: &container.id,
-                user: Some(&remote_user),
-                env: &lifecycle_env,
-                working_dir: Some(&workspace_folder),
-                is_text: false,
-                on_output: None,
-            };
-            let input = orchestrator::RunUserCommandsInput {
-                config: &config,
-                metadata: metadata.as_deref(),
-                gate,
-                dotfiles: orchestrator::DotfilesInputs {
-                    repository: self.dotfiles.repository.as_deref(),
-                    install_command: self.dotfiles.install_command.as_deref(),
-                    target_path: &self.dotfiles.target_path,
-                },
-            };
-            let run = orchestrator::run_user_commands(&lc_ctx, &input, &sender).await;
-            drop(sender);
-            let _ = renderer.await;
-            run?;
-        }
-
-        let (configuration, merged_configuration) = self
-            .build_envelope_extras(&config, config_path.as_deref())
-            .await?;
-        Ok(RunResult {
-            container_id: container.id,
-            remote_user,
-            workspace_folder,
-            configuration,
-            merged_configuration,
-        })
+        let gating = self.build_gating(&config);
+        let (sender, renderer) = crate::progress::bridge(&progress);
+        let lc_ctx = cella_backend::LifecycleContext {
+            client: &*client,
+            container_id: &container.id,
+            user: Some(&remote_user),
+            env: &lifecycle_env,
+            working_dir: Some(&workspace_folder),
+            is_text: false,
+            on_output: None,
+        };
+        let input = orchestrator::RunUserCommandsInput {
+            config: &config,
+            metadata: metadata.as_deref(),
+            gating,
+            dotfiles: orchestrator::DotfilesInputs {
+                repository: self.dotfiles.repository.as_deref(),
+                install_command: self.dotfiles.install_command.as_deref(),
+                target_path: &self.dotfiles.target_path,
+            },
+        };
+        let status = orchestrator::run_user_commands(&lc_ctx, &input, &sender).await;
+        drop(sender);
+        let _ = renderer.await;
+        status
     }
 
-    /// Read the devcontainer config. With `--config`, resolve it against the
-    /// container's workspace; otherwise return an empty object so lifecycle is
-    /// sourced entirely from the container's metadata label.
+    /// Read the devcontainer config. With `--config`/`--override-config`,
+    /// resolve it against the container's workspace; otherwise return an empty
+    /// object so lifecycle is sourced entirely from the container's metadata
+    /// label.
     fn read_config(
         &self,
         workspace: Option<&std::path::Path>,
-    ) -> Result<(Value, Option<PathBuf>), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(config_path) = self.config.as_deref() else {
-            return Ok((json!({}), None));
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(config_path) = self
+            .config
+            .override_config
+            .as_deref()
+            .or(self.config.config.as_deref())
+        else {
+            return Ok(json!({}));
         };
         let ws = workspace
             .map(std::path::Path::to_path_buf)
             .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        let resolved = resolve::config(&ws, Some(config_path))?;
-        Ok((resolved.config, Some(resolved.config_path)))
+        Ok(resolve::config(&ws, Some(config_path))?.config)
     }
 
     /// Probe the user environment and build the lifecycle env with the official
-    /// precedence: probed < `--remote-env` < config `remoteEnv`.
+    /// precedence: probed < `--remote-env` < (config + metadata) `remoteEnv`.
+    ///
+    /// The official `probeRemoteEnv(updatedMergedConfig)` spreads the
+    /// metadata-merged config's `remoteEnv`, not the raw on-disk one. cella's
+    /// `parse_image_metadata` does not expose `remoteEnv`, so the merged
+    /// `remoteEnv` is assembled here from (a) the metadata label's per-entry
+    /// `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config`
+    /// `remoteEnv` layered last — the on-disk user config is the final metadata
+    /// entry in the official merge, so it wins over earlier feature/base entries.
     async fn build_lifecycle_env(
         &self,
         client: &dyn cella_backend::ContainerBackend,
         container_id: &str,
         remote_user: &str,
         config: &Value,
+        metadata: Option<&str>,
     ) -> Vec<String> {
-        // config `remoteEnv` wins over CLI `--remote-env`, so order it last.
+        // Order the vec for merge_env's later-wins insert: probed first
+        // (provided by merge_env), then CLI --remote-env, then the merged
+        // metadata+config remoteEnv last so it wins.
         let mut remote_env = self.remote_env.clone();
+        remote_env.extend(orchestrator::metadata_remote_env(metadata));
         remote_env.extend(map_env_object(config.get("remoteEnv")));
 
         let probe_type = config
@@ -339,81 +386,31 @@ impl RunUserCommandsArgs {
         )
     }
 
-    /// Build the lifecycle gate. Per official `doSetUp`, `prebuild` and
-    /// `skipPostAttach` are hardcoded off; only `--skip-post-create` and
-    /// `--skip-non-blocking-commands` are honored.
-    fn build_gate(&self, config: &Value) -> cella_backend::LifecycleGate {
-        cella_backend::LifecycleGate::new(
-            cella_backend::WaitForPhase::from_config(config),
-            self.gate.skip_post_create,
-            cella_backend::StopAfter {
+    /// Build the lifecycle gating from the parity flags and resolved `waitFor`.
+    fn build_gating(&self, config: &Value) -> orchestrator::Gating {
+        orchestrator::Gating {
+            stop: cella_backend::StopAfter {
                 skip_non_blocking: self.gate.skip_non_blocking_commands,
-                prebuild: false,
+                prebuild: self.gate.prebuild,
             },
-            false,
-        )
-    }
-
-    /// Build the optional `configuration` / `mergedConfiguration` envelope
-    /// fields, honoring `--include-configuration` / `--include-merged-configuration`.
-    async fn build_envelope_extras(
-        &self,
-        config: &Value,
-        config_path: Option<&std::path::Path>,
-    ) -> Result<(Option<Value>, Option<Value>), Box<dyn std::error::Error + Send + Sync>> {
-        let configuration = if self.result.include_configuration {
-            let mut cfg = config.clone();
-            if let Some(path) = config_path {
-                inject_config_file_path(&mut cfg, path);
-            }
-            Some(cfg)
-        } else {
-            None
-        };
-
-        let merged_configuration = if self.result.include_merged_configuration {
-            let path = config_path.map_or_else(|| PathBuf::from("devcontainer.json"), Into::into);
-            Some(super::read_configuration::resolve_merged_config(config, &path).await?)
-        } else {
-            None
-        };
-
-        Ok((configuration, merged_configuration))
+            stop_for_personalization: self.gate.stop_for_personalization,
+            skip_post_attach: self.attach.skip_post_attach,
+            wait_for: cella_backend::WaitForPhase::from_config(config),
+        }
     }
 }
 
-/// Container-side result fields needed for the success envelope.
-struct RunResult {
-    container_id: String,
-    remote_user: String,
-    workspace_folder: String,
-    configuration: Option<Value>,
-    merged_configuration: Option<Value>,
-}
-
-/// Borrow a [`RunResult`] as an [`UpResult`] so the shared `up` renderer emits
-/// the official envelope keys (`containerId`, `remoteUser`,
-/// `remoteWorkspaceFolder`, and the optional config objects).
-fn result_for_render(result: &RunResult) -> UpResult {
-    UpResult {
-        container_id: result.container_id.clone(),
-        remote_user: result.remote_user.clone(),
-        // No granular provisioning state on this path; the container already
-        // existed, so report it as running.
-        outcome: "running".to_string(),
-        workspace_folder: result.workspace_folder.clone(),
-        ssh_agent_proxy: None,
-        compose_project_name: None,
-        configuration: result.configuration.clone(),
-        merged_configuration: result.merged_configuration.clone(),
-    }
+/// Render the JSON success envelope (single line). Matches official
+/// `doRunUserCommands`: `{ outcome: 'success', result, dispose }` serializes to
+/// `{"outcome":"success","result":"<status>"}` (`dispose` is a function, not
+/// serialized); `result` is the `runLifecycleHooks` status string.
+fn render_success_envelope(status: &str) -> String {
+    serde_json::to_string(&json!({ "outcome": "success", "result": status })).unwrap_or_default()
 }
 
 /// Render the JSON error envelope (single line, no trailing newline).
 ///
-/// Uses the official `set-up` failure description, which differs from `up`'s
-/// (`render_error_result` in the `up` module hardcodes the container-setup
-/// description), so this command keeps its own renderer.
+/// Matches official `doRunUserCommands`'s non-`ContainerError` description.
 fn render_error_envelope(message: &str) -> String {
     let output = json!({
         "outcome": "error",
@@ -423,35 +420,14 @@ fn render_error_envelope(message: &str) -> String {
     serde_json::to_string(&output).unwrap_or_default()
 }
 
-/// Inject a `configFilePath` URI object into a cloned `configuration`, matching
-/// the shape the official CLI embeds.
-fn inject_config_file_path(config: &mut Value, config_path: &std::path::Path) {
-    let canonical = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf());
-    let path_str = canonical.to_string_lossy();
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert(
-            "configFilePath".to_string(),
-            json!({
-                "fsPath": path_str,
-                "$mid": 1,
-                "path": path_str,
-                "scheme": "file",
-            }),
-        );
-    }
-}
-
 /// Resolve the in-container workspace folder.
 ///
 /// Priority: config `workspaceFolder` > the container's
 /// `dev.cella.workspace_folder` label (set at create time) > a
 /// `/workspaces/<basename>` derived from the `dev.cella.workspace_path` host
 /// label > `/workspaces`. The derivation mirrors cella's default mount target,
-/// so the lifecycle `working_dir` and the `remoteWorkspaceFolder` envelope
-/// value stay correct even when neither `--config` nor the folder label is
-/// present (the no-config, metadata-driven path).
+/// so the lifecycle `working_dir` stays correct even when neither `--config`
+/// nor the folder label is present (the no-config, metadata-driven path).
 fn workspace_folder_in_container(
     config: &Value,
     container: &cella_backend::ContainerInfo,
@@ -475,7 +451,6 @@ fn workspace_folder_in_container(
 
 #[cfg(test)]
 mod tests {
-    use super::super::up::UpRenderData;
     use super::*;
     use clap::CommandFactory;
     use std::collections::HashSet;
@@ -483,30 +458,37 @@ mod tests {
     // ── devcontainer-CLI flag parity ───────────────────────────────
     //
     // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
-    // `setUpOptions`. Every official long flag MUST be declared so no official
-    // invocation errors with "unknown argument". `--id-label` and
-    // `--workspace-folder` are cella additions (not in this list).
-    const OFFICIAL_SET_UP_FLAGS: &[&str] = &[
+    // `runUserCommandsOptions` (lines 786-815). Every official long flag MUST be
+    // declared so no official invocation errors with "unknown argument".
+    const OFFICIAL_RUN_USER_COMMANDS_FLAGS: &[&str] = &[
+        "user-data-folder",
         "docker-path",
+        "docker-compose-path",
         "container-data-folder",
         "container-system-data-folder",
+        "workspace-folder",
+        "mount-workspace-git-root",
+        "mount-git-worktree-common-dir",
         "container-id",
+        "id-label",
         "config",
+        "override-config",
         "log-level",
         "log-format",
         "terminal-columns",
         "terminal-rows",
         "default-user-env-probe",
-        "skip-post-create",
         "skip-non-blocking-commands",
-        "user-data-folder",
+        "prebuild",
+        "stop-for-personalization",
         "remote-env",
+        "skip-feature-auto-mapping",
+        "skip-post-attach",
         "dotfiles-repository",
         "dotfiles-install-command",
         "dotfiles-target-path",
         "container-session-data-folder",
-        "include-configuration",
-        "include-merged-configuration",
+        "secrets-file",
     ];
 
     #[test]
@@ -520,24 +502,23 @@ mod tests {
             .filter_map(clap::Arg::get_long)
             .collect();
 
-        let missing: Vec<&&str> = OFFICIAL_SET_UP_FLAGS
+        let missing: Vec<&&str> = OFFICIAL_RUN_USER_COMMANDS_FLAGS
             .iter()
             .filter(|f| !longs.contains(**f))
             .collect();
         assert!(
             missing.is_empty(),
-            "`run-user-commands` is missing official set-up flags: {missing:?}"
+            "`run-user-commands` is missing official flags: {missing:?}"
         );
     }
 
     #[test]
-    fn container_id_required_without_other_targets() {
+    fn no_target_flags_still_parses() {
         use clap::Parser;
+        // Official defaults --workspace-folder to cwd when no target is given,
+        // so an invocation with no targeting flag must parse (no required arg).
         let r = crate::Cli::try_parse_from(["cella", "run-user-commands"]);
-        assert!(
-            r.is_err(),
-            "must require a container target when none is given"
-        );
+        assert!(r.is_ok(), "no targeting flags should parse (cwd default)");
     }
 
     #[test]
@@ -551,10 +532,7 @@ mod tests {
     fn id_label_alone_parses() {
         use clap::Parser;
         let r = crate::Cli::try_parse_from(["cella", "run-user-commands", "--id-label", "foo=bar"]);
-        assert!(
-            r.is_ok(),
-            "--id-label alone should satisfy the target requirement"
-        );
+        assert!(r.is_ok(), "--id-label alone should parse");
     }
 
     #[test]
@@ -593,21 +571,72 @@ mod tests {
     }
 
     #[test]
-    fn skip_post_attach_is_not_a_flag() {
+    fn skip_post_create_is_not_a_flag() {
         use clap::Parser;
-        // --skip-post-attach belongs to the sibling official handler, not
-        // set-up; it must be rejected as an unknown argument here.
+        // --skip-post-create belongs to up/set-up, NOT run-user-commands
+        // (postCreate is always eligible here); it must be rejected.
         let r = crate::Cli::try_parse_from([
             "cella",
             "run-user-commands",
             "--container-id",
             "abc",
-            "--skip-post-attach",
+            "--skip-post-create",
         ]);
         assert!(
             r.is_err(),
-            "--skip-post-attach must not exist on this command"
+            "--skip-post-create must not exist on this command"
         );
+    }
+
+    #[test]
+    fn include_configuration_is_not_a_flag() {
+        use clap::Parser;
+        // run-user-commands' envelope carries only outcome+result; the
+        // configuration result flags belong to up/set-up.
+        let r = crate::Cli::try_parse_from([
+            "cella",
+            "run-user-commands",
+            "--container-id",
+            "abc",
+            "--include-configuration",
+        ]);
+        assert!(
+            r.is_err(),
+            "--include-configuration must not exist on this command"
+        );
+    }
+
+    #[test]
+    fn gating_flags_parse() {
+        use clap::Parser;
+        for flag in [
+            "--skip-non-blocking-commands",
+            "--prebuild",
+            "--stop-for-personalization",
+            "--skip-post-attach",
+            "--skip-feature-auto-mapping",
+        ] {
+            let r = crate::Cli::try_parse_from([
+                "cella",
+                "run-user-commands",
+                "--container-id",
+                "abc",
+                flag,
+            ]);
+            assert!(r.is_ok(), "{flag} should parse");
+        }
+    }
+
+    #[test]
+    fn success_envelope_shape() {
+        let parsed: Value =
+            serde_json::from_str(&render_success_envelope("done")).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "success");
+        assert_eq!(parsed["result"], "done");
+        // Must NOT carry the up/set-up container-centric keys.
+        assert!(parsed.get("containerId").is_none());
+        assert!(parsed.get("remoteUser").is_none());
+        assert!(parsed.get("configuration").is_none());
     }
 
     #[test]
@@ -666,24 +695,5 @@ mod tests {
             workspace_folder_in_container(&json!({}), &c),
             "/workspaces/cool-repo"
         );
-    }
-
-    #[test]
-    fn render_data_carries_official_keys() {
-        let result = RunResult {
-            container_id: "deadbeef".to_string(),
-            remote_user: "vscode".to_string(),
-            workspace_folder: "/workspaces/app".to_string(),
-            configuration: None,
-            merged_configuration: None,
-        };
-        let up = result_for_render(&result);
-        let data: UpRenderData<'_> = result_render_data(&super::super::OutputFormat::Json, &up);
-        let rendered = super::super::up::render_up_result(&data);
-        let parsed: Value = serde_json::from_str(&rendered).expect("valid JSON");
-        assert_eq!(parsed["outcome"], "success");
-        assert_eq!(parsed["containerId"], "deadbeef");
-        assert_eq!(parsed["remoteUser"], "vscode");
-        assert_eq!(parsed["remoteWorkspaceFolder"], "/workspaces/app");
     }
 }

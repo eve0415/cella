@@ -1,18 +1,42 @@
 //! Re-run devcontainer lifecycle hooks against an existing container.
 //!
 //! Backs the `run-user-commands` command, which mirrors the official
-//! devcontainer CLI `set-up` (`doSetUp` / `setupInContainer`) handler: it runs
-//! the user lifecycle commands against a container that already exists, gated
-//! by the same [`LifecycleGate`] used on the `up` path.
+//! devcontainer CLI `run-user-commands` handler (`doRunUserCommands` /
+//! `runLifecycleHooks`, NOT `set-up`/`doSetUp`): it runs the user lifecycle
+//! commands against a container that already exists and returns the
+//! `runLifecycleHooks` status string (`done`, `skipNonBlocking`, `prebuild`,
+//! `stopForPersonalization`).
 //!
-//! Unlike `up`, every gated phase runs in the FOREGROUND (awaited) so that a
-//! failing command surfaces as an error in the result envelope. Dotfiles are
-//! installed between `postCreate` and `postStart`, matching the official
-//! ordering in `src/spec-common/injectHeadless.ts`.
+//! Every phase runs in the FOREGROUND (awaited) so that a failing command
+//! surfaces as an error in the result envelope, and the gated-return order
+//! matches `injectHeadless.ts` `runLifecycleHooks` exactly:
+//!
+//! a. if `skip_non_blocking` && `waitFor == initializeCommand` → `skipNonBlocking`
+//! b. run `onCreateCommand`; gate
+//! c. run `updateContentCommand`; gate
+//! d. if `prebuild` → `prebuild`
+//! e. run `postCreateCommand`; gate
+//! f. install dotfiles (between `postCreate` and `postStart`)
+//! g. if `stop_for_personalization` → `stopForPersonalization`
+//! h. run `postStartCommand`; gate
+//! i. if `!skip_post_attach` → run `postAttachCommand`
+//! j. `done`
+//!
+//! `postAttachCommand` has no `skip_non_blocking` gate; the default `waitFor`
+//! is `updateContentCommand`.
+//!
+//! DIVERGENCE (documented): the official handler computes a per-phase
+//! `doRun` from `createdAt`/`startedAt` marker files, so against a freshly
+//! provisioned container it typically re-runs only `postAttachCommand`. cella
+//! has no createdAt/startedAt markers (its only analogs are the content hash
+//! and `oncreate_done` state used by `up`), so this runner re-runs every gated
+//! phase unconditionally. The observable difference is redundant re-execution
+//! of idempotent hooks, not a different final state or a different status
+//! string.
 
 use cella_backend::ContainerBackend;
 use cella_backend::lifecycle::{
-    LifecycleContext, LifecycleGate, lifecycle_entries_for_phase, run_lifecycle_entries,
+    LifecycleContext, StopAfter, WaitForPhase, lifecycle_entries_for_phase, run_lifecycle_entries,
 };
 use cella_backend::progress::ProgressSender;
 use serde_json::Value;
@@ -21,6 +45,16 @@ use crate::dotfiles::install_dotfiles;
 
 /// Boxed, thread-safe error type used across this module.
 type RunError = Box<dyn std::error::Error + Send + Sync>;
+
+/// `runLifecycleHooks` status string, returned as the `result` field of the
+/// `run-user-commands` success envelope.
+pub const STATUS_DONE: &str = "done";
+/// Stopped after the `waitFor` phase (`--skip-non-blocking-commands`).
+pub const STATUS_SKIP_NON_BLOCKING: &str = "skipNonBlocking";
+/// Stopped after `updateContentCommand` (`--prebuild`).
+pub const STATUS_PREBUILD: &str = "prebuild";
+/// Stopped after dotfiles, before `postStart` (`--stop-for-personalization`).
+pub const STATUS_STOP_FOR_PERSONALIZATION: &str = "stopForPersonalization";
 
 /// Dotfiles inputs for the foreground lifecycle run.
 ///
@@ -35,6 +69,26 @@ pub struct DotfilesInputs<'a> {
     pub target_path: &'a str,
 }
 
+/// Lifecycle-gating inputs for the foreground runner.
+///
+/// Modelled as a struct (not a `LifecycleGate`) because this command's gating
+/// is the official `runLifecycleHooks` gated-return order, which differs from
+/// `up`'s foreground/background split: `prebuild` short-circuits at a FIXED
+/// point (after `updateContent`, regardless of `waitFor`) and
+/// `stop_for_personalization` has no analog on the `up` path. The
+/// `skip_non_blocking` / `prebuild` pair reuses [`StopAfter`] (the same grouping
+/// `up` uses) to keep the bool count under the lint.
+pub struct Gating {
+    /// `--skip-non-blocking-commands` / `--prebuild` stop-after flags.
+    pub stop: StopAfter,
+    /// `--stop-for-personalization`: stop after dotfiles, before `postStart`.
+    pub stop_for_personalization: bool,
+    /// `--skip-post-attach`: do not run `postAttachCommand`.
+    pub skip_post_attach: bool,
+    /// Resolved `waitFor` phase, gating the `skip_non_blocking` short-circuits.
+    pub wait_for: WaitForPhase,
+}
+
 /// Everything the foreground lifecycle runner needs, gathered into one borrow
 /// to keep the argument count under the lint and group related inputs.
 pub struct RunUserCommandsInput<'a> {
@@ -44,27 +98,15 @@ pub struct RunUserCommandsInput<'a> {
     /// The container's `devcontainer.metadata` label, when present. Source of
     /// truth for lifecycle commands on an existing container.
     pub metadata: Option<&'a str>,
-    /// Phase-execution gate built from the parity flags.
-    pub gate: LifecycleGate,
+    /// Lifecycle-gating inputs.
+    pub gating: Gating,
     /// Dotfiles install inputs.
     pub dotfiles: DotfilesInputs<'a>,
 }
 
 /// Run the gated lifecycle phases in the foreground against an existing
-/// container, installing dotfiles between `postCreate` and `postStart`.
-///
-/// The phase order matches the official `runLifecycleHooks`: `onCreate`,
-/// `updateContent`, `postCreate`, dotfiles, `postStart`, `postAttach`. Each
-/// phase runs only if [`LifecycleGate::runs_phase`] allows it; a disabled gate
-/// (`--skip-post-create`) runs nothing, including dotfiles.
-///
-/// DIVERGENCE (documented): the official `set-up` skips phases whose per-phase
-/// `createdAt`/`startedAt` marker already matches (so against a freshly
-/// provisioned container it typically re-runs only `postAttach`). cella has no
-/// such marker mechanism — its only analogs are the content hash and
-/// `oncreate_done` state used by `up` — so this runner re-runs every gated
-/// phase unconditionally. The observable difference is redundant re-execution
-/// of idempotent hooks, not a different final state.
+/// container, installing dotfiles between `postCreate` and `postStart`,
+/// returning the `runLifecycleHooks` status string.
 ///
 /// # Errors
 ///
@@ -75,50 +117,84 @@ pub async fn run_user_commands(
     lc_ctx: &LifecycleContext<'_>,
     input: &RunUserCommandsInput<'_>,
     progress: &ProgressSender,
-) -> Result<(), RunError> {
-    if !input.gate.enabled {
-        return Ok(());
+) -> Result<&'static str, RunError> {
+    let g = &input.gating;
+
+    // (a) skip_non_blocking + waitFor == initializeCommand → stop immediately.
+    if stops_after(g, WaitForPhase::Initialize) {
+        return Ok(STATUS_SKIP_NON_BLOCKING);
     }
 
+    // (b) onCreate, then gate.
     run_phase(lc_ctx, input, "onCreateCommand", progress).await?;
-    run_phase(lc_ctx, input, "updateContentCommand", progress).await?;
-    run_phase(lc_ctx, input, "postCreateCommand", progress).await?;
+    if stops_after(g, WaitForPhase::OnCreate) {
+        return Ok(STATUS_SKIP_NON_BLOCKING);
+    }
 
+    // (c) updateContent, then gate.
+    run_phase(lc_ctx, input, "updateContentCommand", progress).await?;
+    if stops_after(g, WaitForPhase::UpdateContent) {
+        return Ok(STATUS_SKIP_NON_BLOCKING);
+    }
+
+    // (d) prebuild short-circuits at a fixed point, after updateContent.
+    if g.stop.prebuild {
+        return Ok(STATUS_PREBUILD);
+    }
+
+    // (e) postCreate, then gate.
+    run_phase(lc_ctx, input, "postCreateCommand", progress).await?;
+    if stops_after(g, WaitForPhase::PostCreate) {
+        return Ok(STATUS_SKIP_NON_BLOCKING);
+    }
+
+    // (f) dotfiles between postCreate and postStart.
     maybe_install_dotfiles(lc_ctx, input).await;
 
-    run_phase(lc_ctx, input, "postStartCommand", progress).await?;
-    run_phase(lc_ctx, input, "postAttachCommand", progress).await?;
+    // (g) stop_for_personalization fires after dotfiles, before postStart.
+    if g.stop_for_personalization {
+        return Ok(STATUS_STOP_FOR_PERSONALIZATION);
+    }
 
-    Ok(())
+    // (h) postStart, then gate.
+    run_phase(lc_ctx, input, "postStartCommand", progress).await?;
+    if stops_after(g, WaitForPhase::PostStart) {
+        return Ok(STATUS_SKIP_NON_BLOCKING);
+    }
+
+    // (i) postAttach, gated only by skip_post_attach.
+    if !g.skip_post_attach {
+        run_phase(lc_ctx, input, "postAttachCommand", progress).await?;
+    }
+
+    // (j) done.
+    Ok(STATUS_DONE)
 }
 
-/// Run a single lifecycle phase in the foreground if the gate allows it.
+/// Whether `skip_non_blocking` short-circuits at `phase` (i.e. `waitFor`
+/// resolves to `phase`). `postAttach` has no such gate, so it is never queried.
+fn stops_after(g: &Gating, phase: WaitForPhase) -> bool {
+    g.stop.skip_non_blocking && g.wait_for == phase
+}
+
+/// Run a single lifecycle phase in the foreground.
 async fn run_phase(
     lc_ctx: &LifecycleContext<'_>,
     input: &RunUserCommandsInput<'_>,
     phase: &str,
     progress: &ProgressSender,
 ) -> Result<(), RunError> {
-    if !input.gate.runs_phase(phase) {
-        return Ok(());
-    }
     let entries = lifecycle_entries_for_phase(input.metadata, input.config, phase);
     run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
     Ok(())
 }
 
-/// Install dotfiles between `postCreate` and `postStart`, gated identically to
-/// the official tool: every early-return that skips `postStart` also skips
-/// dotfiles, so `runs_phase("postStartCommand")` is the precise condition.
-///
-/// A failure is logged and swallowed (non-fatal), matching the official tool.
+/// Install dotfiles between `postCreate` and `postStart`. A failure is logged
+/// and swallowed (non-fatal), matching the official tool.
 async fn maybe_install_dotfiles(lc_ctx: &LifecycleContext<'_>, input: &RunUserCommandsInput<'_>) {
     let Some(repository) = input.dotfiles.repository else {
         return;
     };
-    if !input.gate.runs_phase("postStartCommand") {
-        return;
-    }
     let remote_user = lc_ctx.user.unwrap_or("root");
     if let Err(e) = install_dotfiles(
         lc_ctx.client,
@@ -175,58 +251,108 @@ pub async fn resolve_remote_user(
         .unwrap_or_else(|| "root".to_string())
 }
 
+/// Accumulate the `remoteEnv` entries from a `devcontainer.metadata` label.
+///
+/// The label is a JSON array of metadata entries (base image + each feature +
+/// the user config, in merge order). Each entry's `remoteEnv` object is
+/// accumulated with later-wins precedence, matching the official
+/// `mergeConfiguration` (which spreads each entry's `remoteEnv` in order). The
+/// returned `name=value` list is ordered for `merge_env`'s later-wins `HashMap`
+/// insert, so callers append it AFTER `--remote-env` to get the official
+/// precedence (probed < `--remote-env` < merged `remoteEnv`).
+#[must_use]
+pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
+    let Some(json) = metadata else {
+        return Vec::new();
+    };
+    let entries: Vec<Value> = serde_json::from_str(json).unwrap_or_default();
+    // Accumulate later-wins so the same key set across entries resolves to the
+    // last entry's value, matching mergeConfiguration.
+    let mut acc: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for entry in &entries {
+        if let Some(obj) = entry.get("remoteEnv").and_then(Value::as_object) {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    acc.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+    }
+    acc.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cella_backend::WaitForPhase;
+    use serde_json::json;
 
-    fn gate(skip_post_create: bool, skip_non_blocking: bool) -> LifecycleGate {
-        LifecycleGate::new(
-            WaitForPhase::UpdateContent,
-            skip_post_create,
-            cella_backend::StopAfter {
+    /// Build a `Gating` exercising only the `skip_non_blocking` short-circuit
+    /// path (the other flags are irrelevant to `stops_after`).
+    fn gating(skip_non_blocking: bool, wait_for: WaitForPhase) -> Gating {
+        Gating {
+            stop: StopAfter {
                 skip_non_blocking,
                 prebuild: false,
             },
-            false,
-        )
-    }
-
-    #[test]
-    fn default_gate_runs_all_phases() {
-        let g = gate(false, false);
-        for phase in [
-            "onCreateCommand",
-            "updateContentCommand",
-            "postCreateCommand",
-            "postStartCommand",
-            "postAttachCommand",
-        ] {
-            assert!(g.runs_phase(phase), "{phase} should run by default");
+            stop_for_personalization: false,
+            skip_post_attach: false,
+            wait_for,
         }
     }
 
     #[test]
-    fn skip_post_create_disables_gate() {
-        assert!(!gate(true, false).enabled);
+    fn skip_non_blocking_initialize_stops_immediately() {
+        let g = gating(true, WaitForPhase::Initialize);
+        assert!(stops_after(&g, WaitForPhase::Initialize));
     }
 
     #[test]
-    fn skip_non_blocking_skips_post_start_and_dotfiles() {
-        // Default waitFor = updateContent: stop after updateContent, so
-        // postStart/postAttach (and therefore dotfiles) do not run.
-        let g = gate(false, true);
-        assert!(g.runs_phase("onCreateCommand"));
-        assert!(g.runs_phase("updateContentCommand"));
-        assert!(!g.runs_phase("postStartCommand"));
-        assert!(!g.runs_phase("postAttachCommand"));
+    fn skip_non_blocking_gates_only_the_wait_for_phase() {
+        let g = gating(true, WaitForPhase::OnCreate);
+        assert!(!stops_after(&g, WaitForPhase::Initialize));
+        assert!(stops_after(&g, WaitForPhase::OnCreate));
+        assert!(!stops_after(&g, WaitForPhase::UpdateContent));
+    }
+
+    #[test]
+    fn no_skip_non_blocking_never_stops() {
+        let g = gating(false, WaitForPhase::OnCreate);
+        for phase in [
+            WaitForPhase::Initialize,
+            WaitForPhase::OnCreate,
+            WaitForPhase::UpdateContent,
+            WaitForPhase::PostCreate,
+            WaitForPhase::PostStart,
+        ] {
+            assert!(!stops_after(&g, phase));
+        }
+    }
+
+    #[test]
+    fn metadata_remote_env_accumulates_later_wins() {
+        let meta = json!([
+            {"remoteEnv": {"A": "1", "B": "1"}},
+            {"id": "feature", "remoteEnv": {"B": "2", "C": "2"}}
+        ])
+        .to_string();
+        let env = metadata_remote_env(Some(&meta));
+        assert!(env.contains(&"A=1".to_string()));
+        assert!(env.contains(&"B=2".to_string())); // later entry wins
+        assert!(env.contains(&"C=2".to_string()));
+    }
+
+    #[test]
+    fn metadata_remote_env_empty_without_label() {
+        assert!(metadata_remote_env(None).is_empty());
+        assert!(metadata_remote_env(Some("[]")).is_empty());
+        assert!(metadata_remote_env(Some("not json")).is_empty());
     }
 
     #[test]
     fn resolve_remote_user_prefers_config_remote_user() {
         // No backend call is reached when config carries remoteUser, so this
         // exercises the early-return path without a live client.
-        let config = serde_json::json!({"remoteUser": "vscode"});
+        let config = json!({"remoteUser": "vscode"});
         let user = config
             .get("remoteUser")
             .and_then(Value::as_str)
