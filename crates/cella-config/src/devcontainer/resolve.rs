@@ -294,6 +294,37 @@ pub fn config_with_override(
     })
 }
 
+/// Build a [`ResolvedConfig`] directly from an in-memory config `Value`,
+/// without reading or discovering any file.
+///
+/// Used by the `up` no-workspace path (`--id-label` with no `--override-config`
+/// and no cwd devcontainer.json) where the config is sourced from a found
+/// container's `devcontainer.metadata` label rather than the filesystem. The
+/// config hash, `devcontainerId`, and typed view are computed the same way as
+/// [`config_with_override`]; `workspace_root` is the nominal cwd and
+/// `config_path` the recorded (not-necessarily-existing) path.
+#[must_use]
+pub fn from_config_value(
+    config: serde_json::Value,
+    workspace_root: &Path,
+    config_path: PathBuf,
+) -> ResolvedConfig {
+    let devcontainer_id = devcontainer_id(workspace_root, &config_path);
+    let canonical = serde_json::to_string(&config).unwrap_or_default();
+    let hash = hex::encode(Sha256::digest(canonical.as_bytes()));
+    let typed = crate::schema::DevContainer::validate(&config, "").ok();
+
+    ResolvedConfig {
+        config,
+        config_path,
+        workspace_root: workspace_root.to_path_buf(),
+        config_hash: hash,
+        devcontainer_id,
+        warnings: Vec::new(),
+        typed,
+    }
+}
+
 /// Read a JSONC file and return it as a `serde_json::Value`.
 fn read_jsonc_value(path: &Path) -> Result<serde_json::Value, CellaConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|source| CellaConfigError::ReadFile {
@@ -328,6 +359,41 @@ mod tests {
         let resolved = config(tmp.path(), None).unwrap();
         assert_eq!(resolved.config["image"], "ubuntu");
         assert!(!resolved.config_hash.is_empty());
+    }
+
+    #[test]
+    fn from_config_value_computes_hash_and_id() {
+        let cfg = serde_json::json!({"image": "ubuntu", "workspaceMount": ""});
+        let resolved = from_config_value(
+            cfg,
+            Path::new("/cwd"),
+            PathBuf::from("/cwd/.devcontainer/devcontainer.json"),
+        );
+        assert_eq!(resolved.config["image"], "ubuntu");
+        assert_eq!(resolved.config["workspaceMount"], "");
+        assert!(!resolved.config_hash.is_empty());
+        assert_eq!(resolved.config_hash.len(), 64, "sha256 hex is 64 chars");
+        assert_eq!(resolved.devcontainer_id.len(), 52);
+        assert_eq!(resolved.workspace_root, Path::new("/cwd"));
+        assert!(
+            resolved.typed.is_some(),
+            "valid config parses to typed view"
+        );
+    }
+
+    #[test]
+    fn from_config_value_hash_matches_file_resolution() {
+        // Same content via file-discovery and via from_config_value must hash
+        // identically (canonical-JSON serialization, same algorithm).
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let from_file = config(tmp.path(), None).unwrap();
+        let from_value = from_config_value(
+            serde_json::json!({"image": "ubuntu"}),
+            tmp.path(),
+            from_file.config_path.clone(),
+        );
+        assert_eq!(from_file.config_hash, from_value.config_hash);
     }
 
     #[test]

@@ -755,23 +755,115 @@ const fn map_uid_default(
     }
 }
 
+/// Whether this `up` runs without a workspace folder.
+///
+/// Mirrors the official CLI's defaulting gate (`dcspec.ts:154-157`):
+/// `workspace-folder` defaults to cwd ONLY when none of `--workspace-folder`,
+/// `--id-label`, or `--override-config` is given. When `--id-label` or
+/// `--override-config` is supplied without `--workspace-folder`, the official
+/// tool leaves `workspaceFolder` undefined → no workspace bind-mount, the
+/// container is found purely by id-label (or driven by override-config), and
+/// there is no devcontainer.json discovery from cwd. cwd is still used as a
+/// nominal root for path substitution and labels.
+const fn no_workspace_requested(args: &UpArgs) -> bool {
+    args.workspace_folder.is_none()
+        && (!args.config_inputs.id_label.is_empty() || args.config_inputs.override_config.is_some())
+}
+
+/// Disable the workspace bind-mount by setting `workspaceMount` to the empty
+/// string when it is not already present.
+///
+/// `map_workspace_mount` returns `None` for an empty `workspaceMount`
+/// (`config_map/mounts.rs`), so injecting it here reproduces the official
+/// no-workspace path's "no workspace mount" behavior without touching the
+/// orchestrator's mount construction.
+///
+/// Divergence (documented, intentional per task scope): "inject only if
+/// absent" means an `--override-config` document that itself sets a *non-empty*
+/// `workspaceMount`, run without `--workspace-folder`, keeps that mount —
+/// whereas the official CLI produces no workspace mount regardless. This is the
+/// obscure case the task scoped to "if not already set".
+fn inject_skip_workspace_mount(config: &mut serde_json::Value) {
+    if let Some(obj) = config.as_object_mut()
+        && !obj.contains_key("workspaceMount")
+    {
+        obj.insert("workspaceMount".to_string(), json!(""));
+    }
+}
+
+/// Merge a container's `devcontainer.metadata` label (a JSON array of config
+/// fragments) into a single devcontainer-config object, scalars last-wins.
+///
+/// Used by the id-label-only no-workspace path to source the config from the
+/// found container when there is no `--override-config` and no cwd
+/// devcontainer.json. Only the keys cella needs downstream (name, users,
+/// `workspaceFolder`, remote/container env) are lifted; the full lifecycle is
+/// re-read from the container by the orchestrator's reuse path.
+fn config_from_metadata_label(metadata_json: &str) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(metadata_json).unwrap_or_default();
+    let mut merged = serde_json::Map::new();
+    for entry in &entries {
+        if let Some(obj) = entry.as_object() {
+            for (k, v) in obj {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+/// Build a [`ResolvedConfig`] for the id-label-only no-workspace path from a
+/// container found by `--id-label`.
+///
+/// The config content comes from the container's `devcontainer.metadata` label
+/// (merged) with the workspace mount disabled; `workspace_root` is the nominal
+/// cwd (used for substitution/labels only). The recorded `config_path` is the
+/// container's `dev.cella.config_path` label when present, else a synthetic
+/// path under the nominal root.
+fn resolved_from_container(
+    container: &cella_backend::ContainerInfo,
+    nominal_root: &Path,
+) -> ResolvedConfig {
+    let mut config = container
+        .labels
+        .get("devcontainer.metadata")
+        .map_or_else(|| json!({}), |m| config_from_metadata_label(m));
+    inject_skip_workspace_mount(&mut config);
+
+    let config_path = container.labels.get("dev.cella.config_path").map_or_else(
+        || nominal_root.join(".devcontainer/devcontainer.json"),
+        PathBuf::from,
+    );
+
+    resolve::from_config_value(config, nominal_root, config_path)
+}
+
 impl UpContext {
     pub(crate) async fn new(
         args: &UpArgs,
         progress: crate::progress::Progress,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
+        let no_workspace = no_workspace_requested(args);
 
-        // 1. Resolve config
-        let mut resolved = progress
-            .run_step("Resolving devcontainer configuration...", async {
-                resolve::config_with_override(
-                    &cwd,
-                    args.config.as_deref(),
-                    args.config_inputs.override_config.as_deref(),
-                )
-            })
+        // 1. Resolve config and connect to the backend. The no-workspace path
+        // (official `dcspec.ts:155`) does not discover a devcontainer.json from
+        // cwd: with --override-config the override supplies the content; with
+        // only --id-label the config comes from the found container's metadata.
+        // `resolve_no_workspace_config` owns the connect so the common path
+        // still resolves config first (its discovery error surfaces before any
+        // Docker connect), while the id-label-only path connects up front to
+        // find the container.
+        let (mut resolved, client) = progress
+            .run_step(
+                "Resolving devcontainer configuration...",
+                Self::resolve_no_workspace_config(args, &cwd, no_workspace),
+            )
             .await?;
+
+        if no_workspace {
+            inject_skip_workspace_mount(&mut resolved.config);
+        }
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
@@ -787,10 +879,6 @@ impl UpContext {
 
         let config = &resolved.config;
         let config_name = resolved.name();
-
-        // 2. Connect to backend
-        let client = args.backend.resolve_client().await?;
-        client.ping().await?;
 
         let container_nm = container_name(&resolved.workspace_root, config_name);
         let remote_env = map_env_object(config.get("remoteEnv"));
@@ -871,6 +959,66 @@ impl UpContext {
             omit_remote_env_from_metadata: args.result.omit_config_remote_env_from_metadata,
             dotfiles: build_dotfiles_config(&args.dotfiles),
         })
+    }
+
+    /// Resolve the devcontainer config for `new()`, honoring the no-workspace
+    /// path (official `dcspec.ts:154-157`).
+    ///
+    /// - Normal path (a workspace folder is in play): discover/read from cwd as
+    ///   before, with `--config` / `--override-config` applied.
+    /// - No-workspace + `--override-config`: the override supplies the content;
+    ///   `config_with_override` already falls back gracefully when cwd has no
+    ///   devcontainer.json, so cwd stays the nominal root and no discovery
+    ///   error is raised.
+    /// - No-workspace + only `--id-label`: source the config from the container
+    ///   found by id-label (its `devcontainer.metadata` label). If no container
+    ///   matches, error like the official tool (configContainer.ts:54).
+    ///
+    /// Returns the resolved config and the connected backend client. The
+    /// id-label-only branch must connect before resolving (to find the
+    /// container); every other path resolves config first so a missing-config
+    /// error surfaces before any Docker connect, preserving the common path's
+    /// error ordering.
+    async fn resolve_no_workspace_config(
+        args: &UpArgs,
+        cwd: &Path,
+        no_workspace: bool,
+    ) -> Result<(ResolvedConfig, Box<dyn ContainerBackend>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let id_label_only = no_workspace && args.config_inputs.override_config.is_none();
+        if id_label_only {
+            // DOCKER-ONLY GAP: this branch (find-by-id-label, read config from
+            // the found container's metadata, then start + run lifecycle via the
+            // orchestrator's existing reuse path) requires a live engine and a
+            // container created by an earlier `up`. It is exercised against
+            // Docker, not in unit tests; the pure pieces (gate, mount-skip
+            // injection, metadata→config parse, `resolved_from_container`) are
+            // unit-tested. The config supplied here disables the workspace mount
+            // and the orchestrator re-finds the same container by id-label.
+            let client = args.backend.resolve_client().await?;
+            client.ping().await?;
+            let found = client
+                .find_container_by_labels(&args.config_inputs.id_label)
+                .await?;
+            let Some(container) = found else {
+                return Err("No dev container config and no workspace found.".into());
+            };
+            return Ok((resolved_from_container(&container, cwd), client));
+        }
+
+        // Override-config and normal paths both go through `config_with_override`.
+        // With `--override-config` the override file supplies the content and
+        // the cwd-discovery error is already avoided by its internal fallback.
+        // Resolve config BEFORE connecting so the common path's discovery error
+        // is reported first.
+        let resolved = resolve::config_with_override(
+            cwd,
+            args.config.as_deref(),
+            args.config_inputs.override_config.as_deref(),
+        )?;
+        let client = args.backend.resolve_client().await?;
+        client.ping().await?;
+        Ok((resolved, client))
     }
 
     /// Create an `UpContext` for a workspace path (used by `cella branch`).
@@ -1940,6 +2088,188 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── no-workspace gate (dcspec.ts:154-157) ──────────────────────
+
+    fn up_args(extra: &[&str]) -> UpArgs {
+        use clap::Parser;
+        let mut argv = vec!["cella", "up"];
+        argv.extend_from_slice(extra);
+        let cli = crate::Cli::try_parse_from(argv).expect("up args parse");
+        match cli.command {
+            crate::commands::Command::Up(args) => args,
+            _ => panic!("expected up command"),
+        }
+    }
+
+    #[test]
+    fn gate_false_for_plain_up() {
+        // The common `cella up` (no flags) must default to cwd and mount the
+        // workspace — the gate must be FALSE so the normal path is unchanged.
+        assert!(!no_workspace_requested(&up_args(&[])));
+    }
+
+    #[test]
+    fn gate_false_with_explicit_workspace_folder() {
+        // An explicit --workspace-folder always wins; defaulting logic is off.
+        assert!(!no_workspace_requested(&up_args(&[
+            "--workspace-folder",
+            "/some/dir"
+        ])));
+    }
+
+    #[test]
+    fn gate_false_when_workspace_folder_paired_with_id_label() {
+        assert!(!no_workspace_requested(&up_args(&[
+            "--workspace-folder",
+            "/some/dir",
+            "--id-label",
+            "foo=bar",
+        ])));
+    }
+
+    #[test]
+    fn gate_true_with_id_label_only() {
+        assert!(no_workspace_requested(&up_args(&["--id-label", "foo=bar"])));
+    }
+
+    #[test]
+    fn gate_true_with_override_config_only() {
+        assert!(no_workspace_requested(&up_args(&[
+            "--override-config",
+            "/tmp/o.json"
+        ])));
+    }
+
+    #[test]
+    fn gate_true_with_both_id_label_and_override_config() {
+        assert!(no_workspace_requested(&up_args(&[
+            "--id-label",
+            "foo=bar",
+            "--override-config",
+            "/tmp/o.json",
+        ])));
+    }
+
+    // ── workspace-mount skip injection ─────────────────────────────
+
+    #[test]
+    fn inject_skip_mount_sets_empty_when_absent() {
+        let mut config = serde_json::json!({"image": "ubuntu"});
+        inject_skip_workspace_mount(&mut config);
+        assert_eq!(
+            config.get("workspaceMount").and_then(|v| v.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn inject_skip_mount_preserves_existing() {
+        // "inject only if absent": a config that already sets workspaceMount is
+        // left untouched (documented divergence for non-empty override mounts).
+        let mut config = serde_json::json!({"workspaceMount": "type=bind,source=/h,target=/c"});
+        inject_skip_workspace_mount(&mut config);
+        assert_eq!(
+            config.get("workspaceMount").and_then(|v| v.as_str()),
+            Some("type=bind,source=/h,target=/c")
+        );
+    }
+
+    #[test]
+    fn inject_skip_mount_noop_on_non_object() {
+        let mut config = serde_json::json!("not an object");
+        inject_skip_workspace_mount(&mut config);
+        assert!(config.is_string());
+    }
+
+    // The empty-string `workspaceMount` → no-mount contract that this injection
+    // relies on is verified by `map_workspace_mount_explicitly_disabled` in
+    // `cella-config`'s `config_map/mounts.rs` (the consumer of the injected
+    // value). The full no-mount/attach/start behavior of the no-workspace path
+    // is exercised only against a real Docker engine and is documented as a
+    // Docker-only gap.
+
+    // ── metadata-label → config (id-label-only path) ───────────────
+
+    #[test]
+    fn config_from_metadata_merges_entries_last_wins() {
+        let meta = serde_json::json!([
+            {"remoteUser": "root", "workspaceFolder": "/workspaces/old"},
+            {"id": "ghcr.io/x/y"},
+            {"remoteUser": "vscode", "workspaceFolder": "/workspaces/app"}
+        ])
+        .to_string();
+        let config = config_from_metadata_label(&meta);
+        assert_eq!(
+            config.get("remoteUser").and_then(|v| v.as_str()),
+            Some("vscode")
+        );
+        assert_eq!(
+            config.get("workspaceFolder").and_then(|v| v.as_str()),
+            Some("/workspaces/app")
+        );
+    }
+
+    #[test]
+    fn config_from_metadata_handles_garbage() {
+        assert_eq!(
+            config_from_metadata_label("not json"),
+            serde_json::json!({})
+        );
+        assert_eq!(config_from_metadata_label("[]"), serde_json::json!({}));
+    }
+
+    #[test]
+    fn resolved_from_container_skips_mount_and_reads_workspace_folder() {
+        let labels = [
+            (
+                "devcontainer.metadata".to_string(),
+                serde_json::json!([{"workspaceFolder": "/workspaces/app", "remoteUser": "vscode"}])
+                    .to_string(),
+            ),
+            (
+                "dev.cella.config_path".to_string(),
+                "/home/me/app/.devcontainer/devcontainer.json".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let container = cella_backend::ContainerInfo {
+            id: "abc".to_string(),
+            name: "abc".to_string(),
+            state: cella_backend::ContainerState::Running,
+            exit_code: None,
+            labels,
+            config_hash: None,
+            ports: Vec::new(),
+            created_at: None,
+            container_user: None,
+            image: None,
+            mounts: Vec::new(),
+            backend: cella_backend::BackendKind::Docker,
+        };
+        let resolved = resolved_from_container(&container, Path::new("/cwd"));
+        assert_eq!(
+            resolved
+                .config
+                .get("workspaceMount")
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "no-workspace path must disable the workspace mount"
+        );
+        assert_eq!(
+            resolved
+                .config
+                .get("workspaceFolder")
+                .and_then(|v| v.as_str()),
+            Some("/workspaces/app")
+        );
+        assert_eq!(resolved.workspace_root, Path::new("/cwd"));
+        assert_eq!(
+            resolved.config_path,
+            PathBuf::from("/home/me/app/.devcontainer/devcontainer.json")
+        );
+    }
 
     // ── parse_cli_mount ────────────────────────────────────────────
 
