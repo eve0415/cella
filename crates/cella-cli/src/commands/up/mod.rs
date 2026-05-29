@@ -598,7 +598,11 @@ impl UpContext {
         // 1. Resolve config
         let mut resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
-                resolve::config(&cwd, args.config.as_deref())
+                resolve::config_with_override(
+                    &cwd,
+                    args.config.as_deref(),
+                    args.config_inputs.override_config.as_deref(),
+                )
             })
             .await?;
 

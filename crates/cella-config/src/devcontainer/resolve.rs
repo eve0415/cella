@@ -156,20 +156,45 @@ pub fn config(
     workspace_root: &Path,
     config_path_override: Option<&Path>,
 ) -> Result<ResolvedConfig, CellaConfigError> {
+    config_with_override(workspace_root, config_path_override, None)
+}
+
+/// Resolve config with `--override-config` semantics.
+///
+/// `override_config_file` supplies the config *contents* (fully replacing any
+/// discovered devcontainer.json), while the recorded `config_path` stays the
+/// `--config` path or the discovered/default path so labels and the config hash
+/// key off the workspace's canonical location. When set, the global and
+/// workspace-local layer merges are bypassed for single-document parity with
+/// the official CLI.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or parsed.
+pub fn config_with_override(
+    workspace_root: &Path,
+    config_path_override: Option<&Path>,
+    override_config_file: Option<&Path>,
+) -> Result<ResolvedConfig, CellaConfigError> {
     let config_path = if let Some(override_path) = config_path_override {
         override_path.to_path_buf()
+    } else if override_config_file.is_some() {
+        discover::config(workspace_root)
+            .unwrap_or_else(|_| workspace_root.join(".devcontainer/devcontainer.json"))
     } else {
         discover::config(workspace_root)?
     };
 
+    // Content comes from the override file when provided, else from config_path.
+    let read_path = override_config_file.unwrap_or(config_path.as_path());
     let raw_text =
-        std::fs::read_to_string(&config_path).map_err(|source| CellaConfigError::ReadFile {
-            path: config_path.display().to_string(),
+        std::fs::read_to_string(read_path).map_err(|source| CellaConfigError::ReadFile {
+            path: read_path.display().to_string(),
             source,
         })?;
 
     // Parse for validation warnings (non-strict mode)
-    let warnings = match parse::devcontainer(&config_path.display().to_string(), &raw_text, false) {
+    let warnings = match parse::devcontainer(&read_path.display().to_string(), &raw_text, false) {
         Ok((_, warnings)) => warnings,
         Err(diags) => diags.diagnostics().to_vec(),
     };
@@ -178,26 +203,30 @@ pub fn config(
     let cleaned = jsonc::strip(&raw_text).map_err(|e| CellaConfigError::Jsonc(e.to_string()))?;
     let mut config: serde_json::Value = serde_json::from_str(&cleaned)?;
 
-    // Merge global config if exists (~/.config/cella/global.jsonc)
-    if let Some(home) = home_dir() {
-        let global_path = home.join(".config/cella/global.jsonc");
-        if global_path.is_file() {
-            debug!("merging global config from {}", global_path.display());
-            let global_value = read_jsonc_value(&global_path)?;
-            let mut merged = global_value;
-            merge::layers(&mut merged, &config);
-            config = merged;
+    // --override-config means "this exact document": skip cella's global and
+    // workspace-local layer merges to match the official single-read semantics.
+    if override_config_file.is_none() {
+        // Merge global config if exists (~/.config/cella/global.jsonc)
+        if let Some(home) = home_dir() {
+            let global_path = home.join(".config/cella/global.jsonc");
+            if global_path.is_file() {
+                debug!("merging global config from {}", global_path.display());
+                let global_value = read_jsonc_value(&global_path)?;
+                let mut merged = global_value;
+                merge::layers(&mut merged, &config);
+                config = merged;
+            }
         }
-    }
 
-    // Merge local override if exists
-    let local_path = workspace_root
-        .join(".devcontainer")
-        .join("devcontainer.local.jsonc");
-    if local_path.is_file() {
-        debug!("merging local override from {}", local_path.display());
-        let local_value = read_jsonc_value(&local_path)?;
-        merge::layers(&mut config, &local_value);
+        // Merge local override if exists
+        let local_path = workspace_root
+            .join(".devcontainer")
+            .join("devcontainer.local.jsonc");
+        if local_path.is_file() {
+            debug!("merging local override from {}", local_path.display());
+            let local_value = read_jsonc_value(&local_path)?;
+            merge::layers(&mut config, &local_value);
+        }
     }
 
     // Two-pass substitution: resolve workspaceFolder first so
@@ -309,6 +338,42 @@ mod tests {
         let r1 = config(tmp.path(), None).unwrap();
         let r2 = config(tmp.path(), None).unwrap();
         assert_eq!(r1.config_hash, r2.config_hash);
+    }
+
+    #[test]
+    fn override_config_replaces_content_but_records_default_path() {
+        let tmp = TempDir::new().unwrap();
+        // A workspace devcontainer.json that should be IGNORED for content.
+        create_devcontainer(tmp.path(), r#"{"image": "workspace-image"}"#);
+
+        let override_file = tmp.path().join("override.json");
+        std::fs::write(&override_file, r#"{"image": "override-image"}"#).unwrap();
+
+        let resolved =
+            config_with_override(tmp.path(), None, Some(override_file.as_path())).unwrap();
+
+        // Content comes from the override file.
+        assert_eq!(resolved.config["image"], "override-image");
+        // Recorded path is the discovered/default workspace config, NOT the
+        // override file — so labels/hash key off the canonical location.
+        assert!(
+            resolved
+                .config_path
+                .ends_with(".devcontainer/devcontainer.json")
+        );
+        assert_ne!(resolved.config_path, override_file);
+    }
+
+    #[test]
+    fn override_config_works_without_workspace_config() {
+        let tmp = TempDir::new().unwrap();
+        // No .devcontainer in the workspace at all.
+        let override_file = tmp.path().join("over.json");
+        std::fs::write(&override_file, r#"{"image": "only-override"}"#).unwrap();
+
+        let resolved =
+            config_with_override(tmp.path(), None, Some(override_file.as_path())).unwrap();
+        assert_eq!(resolved.config["image"], "only-override");
     }
 
     #[test]
