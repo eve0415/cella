@@ -433,8 +433,9 @@ async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
     hs: &HandshakeResult,
     writer: &mut W,
 ) -> Result<(), CellaDaemonError> {
-    // `~/.claude.json` sync: deep-merge into the canonical config, write the
-    // host file, and re-broadcast to the other agents.
+    // `~/.claude.json` sync: diff into a merge-patch, apply to the canonical
+    // config, write the host file, re-broadcast to the other agents, and push
+    // back to the sender if it is missing keys.
     //
     // Ingest is gated on the sender's opt-in (symmetric with the broadcast
     // gate): a container that wasn't granted config forwarding must not be able
@@ -3309,6 +3310,60 @@ mod tests {
         assert!(
             written["projects"]["/workspaces/p"].is_object(),
             "opted-in container's change should land on the host: {written}"
+        );
+    }
+
+    /// Reconnect/catch-up wiring: an opted-in container that re-announces a config
+    /// missing a key the canonical holds must get a push-back carrying it, routed
+    /// `dispatch_agent_message` -> `on_agent_change` -> the handle's `agent_tx`.
+    /// Covers the daemon half of the (re)connect reconcile end to end.
+    #[tokio::test]
+    async fn claude_config_changed_pushes_back_missing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join(".claude.json");
+        // Canonical (seeded from the host) holds a project the agent won't send.
+        std::fs::write(&host, br#"{"projects":{"/Users/h/p":{"k":1}}}"#).unwrap();
+
+        // Register the sender with an agent_tx so the push-back can be delivered.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
+        let mut map = HashMap::new();
+        map.insert(
+            "c".to_string(),
+            ContainerHandle {
+                container_id: "id".to_string(),
+                agent_state: Arc::new(AgentConnectionState::new()),
+                backend_kind: None,
+                docker_host: None,
+                agent_tx: Some(tx),
+                claude_config_sync: true,
+            },
+        );
+        let handles = Arc::new(Mutex::new(map));
+        let mut ctx = test_control_context(handles, "tok");
+        ctx.claude_json_path = Some(host.clone());
+        ctx.claude_sync = Arc::new(Mutex::new(
+            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
+        ));
+
+        // Agent re-announces a config lacking the canonical's project key.
+        let msg = AgentMessage::ClaudeConfigChanged {
+            content: r#"{"keep":true}"#.to_string(),
+        };
+        let (_d, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+        dispatch_agent_message(msg, &ctx, &handshake_for("c", true), &mut w)
+            .await
+            .unwrap();
+
+        let DaemonMessage::SyncClaudeConfig { content } =
+            rx.try_recv().expect("agent must receive a push-back")
+        else {
+            panic!("expected SyncClaudeConfig");
+        };
+        let pushed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            pushed["projects"]["/Users/h/p"]["k"], 1,
+            "push-back must carry the key the agent was missing"
         );
     }
 
