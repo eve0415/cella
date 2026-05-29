@@ -531,14 +531,10 @@ async fn handle_agent_connection_after_hello(
         }
     }
 
-    // Push the current canonical `~/.claude.json` to a sync-enabled agent as
-    // soon as it (re)connects so it catches up on host/peer edits it missed.
-    // Buffered on the channel until the message loop below drains it.
-    if hs.claude_config_sync {
-        let _ = daemon_tx
-            .send(crate::claude_config_sync::push_current(&ctx.claude_sync).await)
-            .await;
-    }
+    // The agent re-announces its current `~/.claude.json` on (re)connect (before
+    // its reader starts), so the daemon merges its state and pushes back whatever
+    // it is missing. No unconditional push here: a daemon-restart canonical would
+    // be stale (missing this container's keys) and would clobber its file.
 
     // --- Message loop ---
     let result: Result<(), CellaDaemonError> = loop {

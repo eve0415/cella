@@ -207,12 +207,6 @@ pub async fn on_agent_change(
     }
 }
 
-/// Push the current canonical config to a single just-connected agent.
-pub async fn push_current(state: &Arc<Mutex<ClaudeSyncState>>) -> DaemonMessage {
-    let content = state.lock().await.canonical_string();
-    DaemonMessage::SyncClaudeConfig { content }
-}
-
 /// Send `content` as a `SyncClaudeConfig` to every opted-in connected agent,
 /// optionally excluding one container (the origin of an inbound change).
 async fn broadcast(handles: &Handles, content: &str, exclude: Option<&str>) {

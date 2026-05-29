@@ -1,6 +1,7 @@
 //! Reconnecting wrapper around [`ControlClient`] that retries initial connection
 //! and transparently reconnects on TCP drops.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -52,6 +53,21 @@ pub struct ReconnectingClient {
     /// `None` when this agent did not opt into config sync. Re-passed to
     /// `start_reader` on every (re)connect so the reader survives reconnects.
     claude_apply_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Path of the `~/.claude.json` to re-announce to the daemon on every
+    /// (re)connect (before the reader starts). `None` when sync is disabled.
+    claude_config_path: Option<PathBuf>,
+}
+
+/// Re-announce the current `~/.claude.json` to the daemon over a freshly
+/// established connection, *before* the reader is started — so the read happens
+/// before any inbound push can clobber local edits, and the daemon can merge this
+/// container's state and push back whatever it is missing. No-op when sync is off.
+async fn reannounce_claude_config(client: &mut ControlClient, path: Option<&Path>) {
+    if let Some(msg) = crate::claude_config_sync::reannounce_message(path).await
+        && let Err(e) = client.send(&msg).await
+    {
+        debug!("claude sync: re-announce on connect failed: {e}");
+    }
 }
 
 /// How often to surface a progress log while the initial connect retries.
@@ -73,6 +89,10 @@ impl ReconnectingClient {
         let mut last_warn = start;
         let mut addr = initial_addr.to_string();
         let mut token = initial_token.to_string();
+        let claude_config_path = claude_apply_tx
+            .is_some()
+            .then(crate::claude_config_sync::config_path)
+            .flatten();
 
         loop {
             match ControlClient::connect(&addr, container_name, &token).await {
@@ -82,6 +102,7 @@ impl ReconnectingClient {
                         daemon_addr: addr.clone(),
                         auth_token: token.clone(),
                     });
+                    reannounce_claude_config(&mut client, claude_config_path.as_deref()).await;
                     client.start_reader(tunnel_config.clone(), claude_apply_tx.clone());
                     return Self {
                         addr,
@@ -92,6 +113,7 @@ impl ReconnectingClient {
                         daemon_hello: Some(hello),
                         tunnel_config,
                         claude_apply_tx,
+                        claude_config_path,
                     };
                 }
                 Err(e) => {
@@ -151,7 +173,7 @@ impl ReconnectingClient {
     /// Called by the background reconnection loop after it connects to the
     /// daemon outside the mutex. Updates the stored address and token so
     /// future inline reconnects use the new values.
-    pub fn install_connection(
+    pub async fn install_connection(
         &mut self,
         mut client: ControlClient,
         hello: DaemonHello,
@@ -162,6 +184,7 @@ impl ReconnectingClient {
             daemon_addr: new_addr.clone(),
             auth_token: new_token.clone(),
         });
+        reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
         client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
         self.inner = Some(client);
         self.daemon_hello = Some(hello);
@@ -231,6 +254,7 @@ impl ReconnectingClient {
                     daemon_addr: self.addr.clone(),
                     auth_token: self.auth_token.clone(),
                 });
+                reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
                 client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                 self.inner = Some(client);
                 self.daemon_hello = Some(hello);
@@ -258,6 +282,7 @@ impl ReconnectingClient {
                         daemon_addr: info.addr.clone(),
                         auth_token: info.token.clone(),
                     });
+                    reannounce_claude_config(&mut client, self.claude_config_path.as_deref()).await;
                     client.start_reader(tunnel_config.clone(), self.claude_apply_tx.clone());
                     self.addr = info.addr;
                     self.auth_token = info.token;
@@ -348,7 +373,8 @@ pub fn spawn_background_reconnect(
                     control
                         .lock()
                         .await
-                        .install_connection(client, hello, addr.clone(), token);
+                        .install_connection(client, hello, addr.clone(), token)
+                        .await;
                     if let Some(w) = &state_writer {
                         w.set_connected(addr);
                     }
@@ -397,6 +423,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         assert!(client.take_reconnected());
@@ -414,6 +441,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         let msg = AgentMessage::Health {
@@ -435,6 +463,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         let result = client.recv().await;
@@ -454,6 +483,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
         assert!(!client.take_reconnected());
     }
@@ -469,6 +499,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
         let result = client.try_reconnect().await;
         assert!(result.is_err());
@@ -487,6 +518,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         let msg = AgentMessage::Health {
@@ -510,6 +542,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         let (addr, name, token) = client.connection_params();
@@ -529,6 +562,7 @@ mod tests {
             daemon_hello: None,
             tunnel_config: None,
             claude_apply_tx: None,
+            claude_config_path: None,
         };
 
         assert!(client.inner.is_none());

@@ -12,7 +12,7 @@
 //! event is recognised as the agent's own and dropped, preventing a sync loop.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,11 +37,24 @@ pub fn sync_enabled() -> bool {
 }
 
 /// The exact `~/.claude.json` path to sync (reads process env).
-fn config_path() -> Option<PathBuf> {
+pub fn config_path() -> Option<PathBuf> {
     resolve_config_path(
         std::env::var("CELLA_CLAUDE_JSON_PATH").ok(),
         std::env::var("HOME").ok(),
     )
+}
+
+/// Read the current config file as a `ClaudeConfigChanged` to re-announce to the
+/// daemon on (re)connect.
+///
+/// Returns `None` when `path` is `None` (sync disabled) or the file is
+/// unreadable/absent. The caller sends this *before* starting the connection
+/// reader, so the read happens before any inbound daemon push can clobber the
+/// file — letting the daemon merge this container's state and push back anything
+/// it is missing, instead of a stale push overwriting local edits.
+pub async fn reannounce_message(path: Option<&Path>) -> Option<AgentMessage> {
+    let content = tokio::fs::read_to_string(path?).await.ok()?;
+    Some(AgentMessage::ClaudeConfigChanged { content })
 }
 
 /// Resolve the path to sync from the pinned env var and `$HOME`.
@@ -72,7 +85,7 @@ pub fn spawn(control: Arc<Mutex<ReconnectingClient>>, apply_rx: mpsc::Receiver<S
 }
 
 /// Hash of the file's current content, or empty if it doesn't exist yet.
-fn initial_hash(path: &std::path::Path) -> String {
+fn initial_hash(path: &Path) -> String {
     std::fs::read(path)
         .ok()
         .map(|b| cella_filesync::sha256_hex(&b))
@@ -106,7 +119,7 @@ async fn run_writer(path: PathBuf, mut apply_rx: mpsc::Receiver<String>, last_ha
 /// can't read. Chowning to the home directory's owner (best-effort, no-op when
 /// the agent already runs as that user) keeps the config readable.
 #[cfg(unix)]
-fn restore_owner(path: &std::path::Path) {
+fn restore_owner(path: &Path) {
     use std::os::unix::fs::MetadataExt;
     let Some(parent) = path.parent() else { return };
     let Ok(meta) = std::fs::metadata(parent) else {
@@ -121,7 +134,7 @@ fn restore_owner(path: &std::path::Path) {
 }
 
 #[cfg(not(unix))]
-fn restore_owner(_path: &std::path::Path) {}
+fn restore_owner(_path: &Path) {}
 
 /// Watch the container file and forward edits to the daemon (container → daemon).
 async fn run_watcher(
@@ -312,5 +325,30 @@ mod tests {
             !path.exists(),
             "writer must skip a write whose hash already matches"
         );
+    }
+
+    #[tokio::test]
+    async fn reannounce_message_reads_current_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        let Some(AgentMessage::ClaudeConfigChanged { content }) =
+            reannounce_message(Some(&path)).await
+        else {
+            panic!("expected a ClaudeConfigChanged re-announce");
+        };
+        assert_eq!(content, r#"{"a":1}"#);
+    }
+
+    #[tokio::test]
+    async fn reannounce_message_none_without_path() {
+        assert!(reannounce_message(None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reannounce_message_none_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        assert!(reannounce_message(Some(&path)).await.is_none());
     }
 }
