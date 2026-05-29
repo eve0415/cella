@@ -200,17 +200,19 @@ Instead, cella **uploads the host file into the container as a regular file** at
 
 For a *running* container, `~/.claude.json` stays in sync between host and every opted-in container via the cella daemon (opt-in mirrors `forward_config`; the orchestrator sets `CELLA_SYNC_CLAUDE_CONFIG=1` and pins `CELLA_CLAUDE_JSON_PATH` at create time):
 
-- The daemon (host-native) holds a canonical JSON value, watches the host `~/.claude.json`, and broadcasts changes to opted-in agents.
-- Each agent watches its container `~/.claude.json` and reports changes back; the daemon **deep-merges** and writes the host file, then re-broadcasts to the *other* containers.
+- The daemon (host-native) holds a canonical JSON value plus a per-source snapshot of the last content seen from the host and each container, watches the host `~/.claude.json`, and broadcasts changes to opted-in agents.
+- Each agent watches its container `~/.claude.json` and reports changes back; the daemon diffs each change against that source's snapshot to derive a merge-patch (capturing deletions), applies it to the canonical, writes the host file, and re-broadcasts to the *other* containers.
 - Loop suppression: each side records the SHA-256 of the bytes it last wrote/observed and drops watcher events that match. Watchers watch the *parent directory* (filtered to the filename) so they survive atomic-replace, and all writes are atomic (temp + rename).
+- On (re)connect an agent re-announces its current config *before* it starts processing pushes; the daemon merges it and pushes the canonical back only when that agent is missing keys. This converges a reconnecting or briefly-disconnected container without a stale push clobbering local edits, and replaces the old unconditional push-on-connect.
 - Opt-in is enforced on **both** directions: the daemon only broadcasts to agents that advertised sync, and it only *ingests* a container's `ClaudeConfigChanged` if that container opted in. A container without config forwarding can neither read pushes nor write the host/peer config.
 
-**Deep-merge semantics.** Objects merge key-by-key; on a shared scalar, the incoming write wins (last-writer-wins). The `projects` map is path-namespaced — host keys (`/Users/...`) and container keys (`/workspaces/...`) are disjoint — so the merge **unions** them, preserving folder-trust and history on both sides rather than thrashing them as a whole-file overwrite would.
+**Merge semantics (RFC 7386).** Each change is diffed against the daemon's last-seen snapshot of that source into a JSON Merge Patch — an added or changed key carries its new value, a removed key becomes an explicit `null` — which is applied to the canonical config: objects merge key-by-key, `null` deletes, and a shared scalar is last-writer-wins. The `projects` map is path-namespaced — host keys (`/Users/...`) and container keys (`/workspaces/...`) are disjoint — so unrelated entries are preserved rather than thrashed by a whole-file overwrite.
 
-**Known, accepted limitations:**
+**Behavior & accepted trade-offs:**
 - **Propagation is effectively between `claude` runs, not mid-session.** Claude Code holds `~/.claude.json` in memory and rewrites it wholesale on change, so a sync write landing while a `claude` session is live is overwritten by that session's next save. (This was equally true of the old shared bind mount — not a regression.)
-- **Deletions don't propagate.** Removing a key (e.g. disabling an MCP server) in one place can reappear via the merge from the other side.
-- **`projects` accumulates** across the host and every container (keys are unioned), so the map grows with each environment's paths.
+- **Deletions propagate.** Removing a key (e.g. disabling an MCP server) on the host or in a container removes it from the canonical config and from every other container. The only thing a merge-patch can't represent is setting a key to an explicit JSON `null` (RFC 7386), which `~/.claude.json` does not use.
+- **`projects` accumulates** across the host and every container (keys are unioned), so the map grows with each environment's paths. Because every push carries the full canonical, any container can in principle delete another's `projects` entry — acceptable for the "one synced file" model.
+- **Container→host is unrestricted (accepted risk).** A container can write any key — including executable config (`mcpServers`, `hooks`, `apiKeyHelper`, `env`) — and it is merged into the host `~/.claude.json` and executed on the host the next time Claude Code starts. This is the intended feature (configure once, sync everywhere) under the assumption that you trust what runs in your own containers. Note that `postCreateCommand`, build scripts, and dependencies also execute in a container, so a not-fully-trusted workspace can reach the host this way; no key allowlist is applied.
 - **Legacy containers** created before this change keep the old (potentially ghosting) single-file mount; daemon pushes to them are best-effort no-ops until they are rebuilt. Migration is out of scope.
 
 Observe / reproduce (inside a container after `cella up`):

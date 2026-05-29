@@ -8,8 +8,11 @@
 //! - **writer** (daemon → container): applies inbound `SyncClaudeConfig`
 //!   content via an atomic `0o600` write — unless it matches the last hash.
 //!
-//! The shared `last_hash` is updated *before* writing so the resulting watcher
-//! event is recognised as the agent's own and dropped, preventing a sync loop.
+//! The shared `last_hash` records what each half last wrote or sent: the writer
+//! updates it after a successful write, the watcher only after a successful send
+//! (so a failed send isn't mistaken for already-synced). A matching hash marks
+//! the agent's own write and is dropped, preventing a loop. On (re)connect the
+//! agent also re-announces the current file (see [`reannounce_message`]).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
