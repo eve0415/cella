@@ -30,14 +30,18 @@ pub async fn compose_ensure_up(
         container_name: &ctx.container_nm,
         remote_env: &ctx.remote_env,
         cli_remote_env: &ctx.cli_remote_env,
-        remove_container: ctx.remove_container,
-        build_no_cache: ctx.build_no_cache,
+        resolution: cella_orchestrator::compose_up::ContainerResolution {
+            remove_container: ctx.resolution.remove_container,
+            build_no_cache: ctx.resolution.build_no_cache,
+            expect_existing_container: ctx.resolution.expect_existing_container,
+        },
         skip_checksum: ctx.skip_checksum,
         profiles: ctx.compose_profiles.clone(),
         env_files: ctx.compose_env_files.clone(),
         pull_policy: ctx.compose_pull_policy.clone(),
         network_rule_policy: ctx.network_rules,
         user_env_probe: ctx.probe_type(),
+        lifecycle_gate: ctx.lifecycle_gate,
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);

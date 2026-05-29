@@ -13,8 +13,10 @@ use cella_backend::{
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
 use crate::error::OrchestratorError;
+use cella_backend::EXPECTED_CONTAINER_MISSING;
+
 use crate::lifecycle::{
-    LifecycleState, WaitForPhase, check_and_run_content_update, lifecycle_entries_for_phase,
+    LifecycleState, check_and_run_content_update, lifecycle_entries_for_phase,
     read_lifecycle_state, run_lifecycle_entries, run_lifecycle_phases_with_wait_for,
     write_content_hash, write_lifecycle_state,
 };
@@ -242,6 +244,65 @@ impl EnsureUpContext<'_> {
             })
     }
 
+    /// Run the `userEnvProbe`, unless `--skip-post-create` gates it. Returns
+    /// `None` when gated (official suppresses `probeRemoteEnv` under
+    /// `postCreateEnabled=false`) or when the probe yields nothing.
+    async fn probe_user_env_if_enabled(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        shell: &str,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        if !self.config.lifecycle_gate.enabled {
+            return None;
+        }
+        run_step_result(&self.progress, "Running userEnvProbe...", async {
+            Ok::<_, std::convert::Infallible>(
+                crate::env_cache::probe_and_cache_user_env(
+                    self.client,
+                    container_id,
+                    remote_user,
+                    self.config.user_env_probe,
+                    shell,
+                )
+                .await,
+            )
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Re-run the probe after tool installation, falling back to the prior
+    /// probe result. Gated by `--skip-post-create` (returns `None`).
+    async fn reprobe_user_env_if_enabled(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        shell: &str,
+        prior: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        if !self.config.lifecycle_gate.enabled {
+            return None;
+        }
+        run_step_result(&self.progress, "Updating environment cache...", async {
+            Ok::<_, std::convert::Infallible>(
+                crate::env_cache::probe_and_cache_user_env(
+                    self.client,
+                    container_id,
+                    remote_user,
+                    self.config.user_env_probe,
+                    shell,
+                )
+                .await
+                .or_else(|| prior.cloned()),
+            )
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     async fn prepare_container_env(
         &self,
         container_id: &str,
@@ -276,21 +337,12 @@ impl EnsureUpContext<'_> {
 
         let shell = crate::shell_detect::detect_shell(self.client, container_id, remote_user).await;
 
-        let probed_env = run_step_result(&self.progress, "Running userEnvProbe...", async {
-            Ok::<_, std::convert::Infallible>(
-                crate::env_cache::probe_and_cache_user_env(
-                    self.client,
-                    container_id,
-                    remote_user,
-                    self.config.user_env_probe,
-                    &shell,
-                )
-                .await,
-            )
-        })
-        .await
-        .ok()
-        .flatten();
+        // --skip-post-create gates the userEnvProbe (official: computeRemoteEnv
+        // === lifecycleHook.enabled, so probeRemoteEnv is suppressed). Env
+        // injection, agent registration, and tool install still run.
+        let probed_env = self
+            .probe_user_env_if_enabled(container_id, remote_user, &shell)
+            .await;
 
         let settings = cella_config::CellaConfig::load(
             &self.config.resolved.workspace_root,
@@ -322,22 +374,9 @@ impl EnsureUpContext<'_> {
         let final_probed = if tools_to_install.is_empty() {
             probed_env
         } else {
-            run_step_result(&self.progress, "Updating environment cache...", async {
-                Ok::<_, std::convert::Infallible>(
-                    crate::env_cache::probe_and_cache_user_env(
-                        self.client,
-                        container_id,
-                        remote_user,
-                        self.config.user_env_probe,
-                        &shell,
-                    )
-                    .await
-                    .or_else(|| probed_env.clone()),
-                )
-            })
-            .await
-            .ok()
-            .flatten()
+            self.reprobe_user_env_if_enabled(container_id, remote_user, &shell, probed_env.as_ref())
+                .await
+                .or(probed_env)
         };
 
         let combined_remote_env = self.lifecycle_remote_env(self.config.remote_env);
@@ -361,6 +400,11 @@ impl EnsureUpContext<'_> {
         metadata: &str,
         lifecycle_env: &[String],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // --skip-post-create gates every lifecycle hook, including the deferred
+        // onCreateCommand for prebuilt images.
+        if !self.config.lifecycle_gate.enabled {
+            return Ok(());
+        }
         let lc_state = read_lifecycle_state(self.client, container_id, remote_user).await;
         if lc_state.oncreate_done {
             return Ok(());
@@ -455,6 +499,7 @@ impl EnsureUpContext<'_> {
                 .await?;
         }
 
+        let gate = self.config.lifecycle_gate;
         let lc_ctx_content = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         let subst = crate::subst_ctx(self.config.resolved);
         let subst_clone = subst.clone();
@@ -464,20 +509,27 @@ impl EnsureUpContext<'_> {
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            gate,
             Some(&move |entries| {
                 crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
             }),
         )
         .await?;
 
-        let mut entries = lifecycle_entries_for_phase(
-            metadata.map(String::as_str),
-            self.config_json(),
-            "postAttachCommand",
-        );
-        crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
-        let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
-        run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
+        // postAttachCommand runs on every attach (no marker). Gate it for
+        // --skip-post-create (entire chain), --skip-post-attach (this phase),
+        // and the stop-after flags (--prebuild / --skip-non-blocking-commands
+        // stop before postAttach). plan_phases is the single source of truth.
+        if gate.runs_post_attach() {
+            let mut entries = lifecycle_entries_for_phase(
+                metadata.map(String::as_str),
+                self.config_json(),
+                "postAttachCommand",
+            );
+            crate::config_map::substitute_lifecycle_entries(&mut entries, &subst);
+            let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
+            run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
+        }
 
         Ok(UpResult {
             container_id: container.id.clone(),
@@ -506,6 +558,7 @@ impl EnsureUpContext<'_> {
                 .await?;
         }
 
+        let gate = self.config.lifecycle_gate;
         let lc_ctx = self.build_lifecycle_ctx(&container.id, remote_user, &lifecycle_env);
         let subst = crate::subst_ctx(self.config.resolved);
         let subst_clone = subst.clone();
@@ -515,12 +568,23 @@ impl EnsureUpContext<'_> {
             metadata.map(String::as_str),
             &self.config.resolved.workspace_root,
             &self.progress,
+            gate,
             Some(&move |entries| {
                 crate::config_map::substitute_lifecycle_entries(entries, &subst_clone);
             }),
         )
         .await?;
+        // Honor the gate: --skip-post-create drops both; the stop-after flags
+        // (--prebuild / --skip-non-blocking-commands) stop before postStart;
+        // --skip-post-attach drops only postAttachCommand.
         for phase in ["postStartCommand", "postAttachCommand"] {
+            let phase_enabled = match phase {
+                "postStartCommand" => gate.runs_post_start(),
+                _ => gate.runs_post_attach(),
+            };
+            if !phase_enabled {
+                continue;
+            }
             let mut entries = lifecycle_entries_for_phase(
                 metadata.map(String::as_str),
                 self.config_json(),
@@ -1154,21 +1218,9 @@ impl EnsureUpContext<'_> {
         }
 
         let shell = crate::shell_detect::detect_shell(self.client, container_id, remote_user).await;
-        let probed_env = run_step_result(&self.progress, "Running userEnvProbe...", async {
-            Ok::<_, std::convert::Infallible>(
-                crate::env_cache::probe_and_cache_user_env(
-                    self.client,
-                    container_id,
-                    remote_user,
-                    self.config.user_env_probe,
-                    &shell,
-                )
-                .await,
-            )
-        })
-        .await
-        .ok()
-        .flatten();
+        let probed_env = self
+            .probe_user_env_if_enabled(container_id, remote_user, &shell)
+            .await;
 
         let _ = self
             .client
@@ -1236,22 +1288,9 @@ impl EnsureUpContext<'_> {
         let final_probed = if tools_to_install.is_empty() {
             probed_env
         } else {
-            run_step_result(&self.progress, "Updating environment cache...", async {
-                Ok::<_, std::convert::Infallible>(
-                    crate::env_cache::probe_and_cache_user_env(
-                        self.client,
-                        container_id,
-                        remote_user,
-                        self.config.user_env_probe,
-                        shell,
-                    )
-                    .await
-                    .or_else(|| probed_env.clone()),
-                )
-            })
-            .await
-            .ok()
-            .flatten()
+            self.reprobe_user_env_if_enabled(container_id, remote_user, shell, probed_env.as_ref())
+                .await
+                .or(probed_env)
         };
 
         let mut lifecycle_env = final_probed.as_ref().map_or_else(
@@ -1398,7 +1437,7 @@ impl EnsureUpContext<'_> {
         image_metadata: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
-        let wait_for = WaitForPhase::from_config(config);
+        let gate = self.config.lifecycle_gate;
         let lc_ctx = self.build_lifecycle_ctx(container_id, remote_user, lifecycle_env);
         let subst = crate::subst_ctx(self.config.resolved);
         run_lifecycle_phases_with_wait_for(
@@ -1407,28 +1446,49 @@ impl EnsureUpContext<'_> {
             resolved_features,
             image_metadata,
             &self.progress,
-            wait_for,
+            gate,
             Some(&move |entries| {
                 crate::config_map::substitute_lifecycle_entries(entries, &subst);
             }),
         )
         .await?;
 
-        write_content_hash(
-            self.client,
-            container_id,
-            remote_user,
-            &self.config.resolved.workspace_root,
-        )
-        .await;
+        // --skip-post-create: nothing ran. Do NOT write the content hash —
+        // doing so would make a later un-gated `up` see a matching hash and
+        // permanently skip the deferred updateContent + postCreate. Force
+        // oncreate_done=false so onCreate also runs on the next invocation.
+        if !gate.enabled {
+            let state = LifecycleState {
+                oncreate_done: false,
+            };
+            write_lifecycle_state(self.client, container_id, remote_user, &state).await;
+            return Ok(());
+        }
 
-        // Mark onCreateCommand as done only when it actually ran in the
-        // foreground. The phases array is [onCreate, updateContent, postCreate,
-        // postStart, postAttach]. When waitFor is Initialize (ordinal 0), ALL
-        // phases are backgrounded and the background script writes the state
-        // file on completion. For any other waitFor value, onCreateCommand
-        // (index 0) ran synchronously before we got here.
-        let oncreate_foreground = !matches!(wait_for, WaitForPhase::Initialize);
+        // The content hash gates updateContent + postCreate together on reuse.
+        // Persist it only when postCreateCommand actually ran here — otherwise
+        // a later un-gated `up` would see a matching hash and skip the deferred
+        // postCreate. This mirrors check_and_run_content_update's reuse gating
+        // (both keyed on whether postCreate ran), so create and reuse agree.
+        // Backgrounded postCreate (standard `up`) is written by the background
+        // script, so we still write here for the foreground-or-background case.
+        if gate.runs_phase("postCreateCommand") {
+            write_content_hash(
+                self.client,
+                container_id,
+                remote_user,
+                &self.config.resolved.workspace_root,
+            )
+            .await;
+        }
+
+        // Mark onCreateCommand done only when it ran in the FOREGROUND. The
+        // phases array is [onCreate, updateContent, postCreate, postStart,
+        // postAttach]; onCreate (index 0) runs foreground iff the boundary is
+        // past it. When the boundary is 0 (waitFor=initializeCommand with no
+        // earlier stop) ALL phases are backgrounded and the background script
+        // writes the state file on completion, so we must NOT claim done here.
+        let oncreate_foreground = gate.foreground_boundary() > 0;
         let state = LifecycleState {
             oncreate_done: oncreate_foreground,
         };
@@ -1722,6 +1782,15 @@ impl EnsureUpContext<'_> {
                 .find_container_by_labels(self.config.id_labels)
                 .await?
         };
+
+        // --expect-existing-container: fail before any build/create if no
+        // container exists. Must precede the remove/create logic (matches
+        // official ordering: the expect check runs before removeOnStartup).
+        // A stopped container counts as existing (find returns it), so this
+        // only fires when nothing was found.
+        if existing.is_none() && self.config.expect_existing_container {
+            return Err(EXPECTED_CONTAINER_MISSING.into());
+        }
 
         if let Some(container) = existing {
             let remote_user = self.resolve_remote_user_from_container(&container).await;

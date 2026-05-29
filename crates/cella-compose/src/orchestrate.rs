@@ -47,10 +47,8 @@ pub struct ComposeUpConfig<'a> {
     /// CLI `--remote-env` entries. Lifecycle command env ONLY (config
     /// `remote_env` wins on collision); never enters labels or `containerEnv`.
     pub cli_remote_env: &'a [String],
-    /// Whether to tear down and recreate existing containers.
-    pub remove_container: bool,
-    /// Whether to rebuild with `--no-cache`.
-    pub build_no_cache: bool,
+    /// How to resolve an existing/missing container before building.
+    pub resolution: ContainerResolution,
     /// Skip agent checksum verification.
     pub skip_checksum: bool,
     /// Docker Compose profiles to activate (`--profile` flags).
@@ -63,6 +61,25 @@ pub struct ComposeUpConfig<'a> {
     pub network_rule_policy: cella_network::NetworkRulePolicy,
     /// Resolved userEnvProbe type (from config or CLI default).
     pub user_env_probe: cella_env::user_env_probe::UserEnvProbe,
+    /// Gates which lifecycle phases run for this compose `up` (built from
+    /// `--skip-post-create` / `--skip-non-blocking-commands` / `--prebuild` /
+    /// `--skip-post-attach`). `Default` runs every phase.
+    pub lifecycle_gate: cella_backend::LifecycleGate,
+}
+
+/// How to resolve an existing (or missing) compose container before building.
+///
+/// Groups the container-resolution flags so they live together and stay under
+/// the struct bool-count lint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContainerResolution {
+    /// Whether to tear down and recreate existing containers.
+    pub remove_container: bool,
+    /// Whether to rebuild with `--no-cache`.
+    pub build_no_cache: bool,
+    /// `--expect-existing-container`: fail (rather than create) if no compose
+    /// container is found. Gates before any build/up.
+    pub expect_existing_container: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,16 +234,23 @@ pub async fn compose_up(
     let existing =
         find_compose_container(client, &project.project_name, &project.primary_service).await?;
 
+    // --expect-existing-container: fail before any build/up if no container
+    // exists (matches the official compose path, identical error string). A
+    // stopped container counts as existing, so this only fires on a true miss.
+    if existing.is_none() && cfg.resolution.expect_existing_container {
+        return Err(cella_backend::EXPECTED_CONTAINER_MISSING.into());
+    }
+
     if let Some(ref container) = existing {
         if container.state == ContainerState::Running
-            && !cfg.remove_container
-            && !cfg.build_no_cache
+            && !cfg.resolution.remove_container
+            && !cfg.resolution.build_no_cache
         {
             info!("Compose project already running, running postAttachCommand only");
             return handle_compose_running(&ctx, &project, container).await;
         }
 
-        if cfg.remove_container || cfg.build_no_cache {
+        if cfg.resolution.remove_container || cfg.resolution.build_no_cache {
             run_step_result(&progress, "Stopping existing compose project...", async {
                 let compose_cmd = ComposeCommand::from_project_name(&project.project_name);
                 compose_cmd.down().await
@@ -402,7 +426,7 @@ async fn prepare_and_start(
     run_step_result(
         progress,
         "Building compose services...",
-        compose_cmd.build(None, cfg.build_no_cache),
+        compose_cmd.build(None, cfg.resolution.build_no_cache),
     )
     .await?;
 
@@ -503,7 +527,13 @@ async fn finalize_compose(
     // 19. Launch agent as background process via exec
     hooks.launch_agent(client, &primary.id, agent_arch).await;
 
-    // 20. Run lifecycle phases (primary service only)
+    // 20. Run lifecycle phases (primary service only). Honor the lifecycle
+    // gate: --skip-post-create drops everything, --prebuild and
+    // --skip-non-blocking-commands stop after the waitFor phase, and
+    // --skip-post-attach drops only postAttachCommand. Compose runs phases
+    // sequentially in the foreground (no backgrounding), so the gate's
+    // "does this phase run?" decision is all that applies here.
+    let gate = cfg.lifecycle_gate;
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     for phase in [
@@ -513,6 +543,9 @@ async fn finalize_compose(
         "postStartCommand",
         "postAttachCommand",
     ] {
+        if !gate.runs_phase(phase) {
+            continue;
+        }
         let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
         cella_config::config_map::substitute_lifecycle_entries(&mut entries, &subst_ctx);
         let lc_ctx = build_lifecycle_ctx(
@@ -621,7 +654,11 @@ async fn handle_compose_running(
     // (potentially updated) cella network IP.
     restart_agent_in_container(client, &container.id).await;
 
-    if let Some(cmd) = config.get("postAttachCommand")
+    // postAttachCommand runs on every attach to an already-running compose
+    // project. Honor the gate (--skip-post-create / --skip-post-attach /
+    // stop-after flags all suppress it).
+    if cfg.lifecycle_gate.runs_post_attach()
+        && let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()
     {
         // CLI --remote-env first, config remoteEnv last so config wins.
@@ -1439,14 +1476,14 @@ mod tests {
             container_name: "test-container",
             remote_env: &[],
             cli_remote_env: &[],
-            remove_container: false,
-            build_no_cache: false,
+            resolution: ContainerResolution::default(),
             skip_checksum: false,
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1500,14 +1537,14 @@ mod tests {
             container_name: "test-container",
             remote_env: &[],
             cli_remote_env: &[],
-            remove_container: false,
-            build_no_cache: false,
+            resolution: ContainerResolution::default(),
             skip_checksum: false,
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),

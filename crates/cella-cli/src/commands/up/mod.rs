@@ -550,6 +550,59 @@ struct ResolvedMountConfig {
     mount_git_worktree_common_dir: bool,
 }
 
+/// How to resolve an existing/missing container for an `up` invocation.
+///
+/// Groups the container-resolution flags so they live together and keep
+/// `UpContext` under the struct bool-count lint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContainerResolution {
+    /// Tear down and recreate an existing container (`--rebuild` / `--remove`).
+    pub remove_container: bool,
+    /// Rebuild the image with `--no-cache`.
+    pub build_no_cache: bool,
+    /// `--expect-existing-container`: fail (not create) if none is found.
+    pub expect_existing_container: bool,
+}
+
+/// Parse the CLI `--mount` and `--build-secret` flags, mapping their errors
+/// into the shared boxed error type.
+fn parse_cli_mounts_and_secrets(
+    args: &UpArgs,
+) -> Result<(Vec<MountConfig>, Vec<BuildSecret>), Box<dyn std::error::Error + Send + Sync>> {
+    let additional_cli_mounts = args
+        .mounts
+        .mount
+        .iter()
+        .map(|s| parse_cli_mount(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let build_secrets = args
+        .build
+        .secrets
+        .iter()
+        .map(|s| super::build::parse_build_secret(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    Ok((additional_cli_mounts, build_secrets))
+}
+
+/// Build the lifecycle gate from the parity flags + the resolved `waitFor`
+/// phase. The single place the four lifecycle flags are turned into the gate
+/// consumed by the orchestrator and compose paths.
+fn build_lifecycle_gate(args: &UpArgs, config: &serde_json::Value) -> cella_backend::LifecycleGate {
+    cella_backend::LifecycleGate::new(
+        cella_backend::WaitForPhase::from_config(config),
+        args.lifecycle.skip_post_create,
+        cella_backend::StopAfter {
+            skip_non_blocking: args.lifecycle.skip_non_blocking_commands,
+            prebuild: args.lifecycle.prebuild,
+        },
+        args.config_inputs.skip_post_attach,
+    )
+}
+
 /// Holds resolved state for an `up` invocation, shared across all code paths.
 pub struct UpContext {
     pub(crate) resolved: ResolvedConfig,
@@ -562,8 +615,8 @@ pub struct UpContext {
     default_workspace_folder: String,
     pub(crate) progress: crate::progress::Progress,
     pub(crate) output: OutputFormat,
-    pub(crate) remove_container: bool,
-    pub(crate) build_no_cache: bool,
+    /// Container-resolution flags (rebuild / no-cache / expect-existing).
+    pub(crate) resolution: ContainerResolution,
     pub(crate) skip_checksum: bool,
     /// Image pull policy (e.g. "always").
     pub(crate) pull_policy: Option<String>,
@@ -590,6 +643,8 @@ pub struct UpContext {
     mount_config: ResolvedMountConfig,
     /// Resolved user env probe type (config value or CLI default).
     default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
+    /// Lifecycle phase gate built from the `--skip-*` / `--prebuild` flags.
+    pub(crate) lifecycle_gate: cella_backend::LifecycleGate,
 }
 
 impl UpContext {
@@ -598,8 +653,6 @@ impl UpContext {
         progress: crate::progress::Progress,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cwd = crate::commands::resolve_workspace_folder(args.workspace_folder.as_deref())?;
-
-        let remove_container = args.build.rebuild || args.build.remove_existing_container;
 
         // 1. Resolve config
         let mut resolved = progress
@@ -650,23 +703,11 @@ impl UpContext {
             Vec::new()
         };
 
-        let build_secrets = args
-            .build
-            .secrets
-            .iter()
-            .map(|s| super::build::parse_build_secret(s))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let (additional_cli_mounts, build_secrets) = parse_cli_mounts_and_secrets(args)?;
 
         let cella_cfg = cella_config::CellaConfig::load(&resolved.workspace_root, Some(&resolved))?;
 
-        let additional_cli_mounts = args
-            .mounts
-            .mount
-            .iter()
-            .map(|s| parse_cli_mount(s))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let lifecycle_gate = build_lifecycle_gate(args, &resolved.config);
 
         Ok(Self {
             resolved,
@@ -678,8 +719,11 @@ impl UpContext {
             default_workspace_folder,
             progress,
             output: args.output.clone(),
-            remove_container,
-            build_no_cache: args.build.build_no_cache || cella_cfg.cli.build.no_cache,
+            resolution: ContainerResolution {
+                remove_container: args.build.rebuild || args.build.remove_existing_container,
+                build_no_cache: args.build.build_no_cache || cella_cfg.cli.build.no_cache,
+                expect_existing_container: args.config_inputs.expect_existing_container,
+            },
             skip_checksum: args.skip_checksum || cella_cfg.cli.skip_checksum,
             pull_policy: args
                 .build
@@ -710,6 +754,7 @@ impl UpContext {
                 mount_git_worktree_common_dir: args.mounts.mount_git_worktree_common_dir,
             },
             default_user_env_probe: args.default_user_env_probe,
+            lifecycle_gate,
         })
     }
 
@@ -766,8 +811,7 @@ impl UpContext {
             default_workspace_folder,
             progress,
             output,
-            remove_container: false,
-            build_no_cache: false,
+            resolution: ContainerResolution::default(),
             skip_checksum: false,
             pull_policy: None,
             extra_labels,
@@ -787,6 +831,7 @@ impl UpContext {
                 mount_git_worktree_common_dir: false,
             },
             default_user_env_probe,
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
         })
     }
 
@@ -1171,12 +1216,12 @@ impl UpContext {
             id_labels: &self.id_labels,
             image_strategy: if build_no_cache {
                 cella_orchestrator::ImageStrategy::RebuildNoCache
-            } else if self.remove_container {
+            } else if self.resolution.remove_container {
                 cella_orchestrator::ImageStrategy::Rebuild
             } else {
                 cella_orchestrator::ImageStrategy::Cached
             },
-            remove_existing_container: self.remove_container,
+            remove_existing_container: self.resolution.remove_container,
             skip_checksum: self.skip_checksum,
             host_requirement_policy: if strict
                 .iter()
@@ -1201,6 +1246,8 @@ impl UpContext {
             },
             lifecycle_secrets: &self.lifecycle_secrets,
             user_env_probe: self.probe_type(),
+            lifecycle_gate: self.lifecycle_gate,
+            expect_existing_container: self.resolution.expect_existing_container,
         };
 
         let result =
@@ -1272,8 +1319,9 @@ impl UpArgs {
             "up",
         )
         .await;
-        ctx.remove_container = self.build.rebuild || self.build.remove_existing_container;
-        ctx.build_no_cache = self.build.build_no_cache;
+        ctx.resolution.remove_container =
+            self.build.rebuild || self.build.remove_existing_container;
+        ctx.resolution.build_no_cache = self.build.build_no_cache;
         ctx.skip_checksum = self.skip_checksum;
         ctx.pull_policy = self
             .build

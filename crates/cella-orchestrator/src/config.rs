@@ -66,6 +66,13 @@ pub struct UpConfig<'a> {
     pub lifecycle_secrets: &'a [String],
     /// Resolved `userEnvProbe` type (config value or CLI default).
     pub user_env_probe: cella_env::user_env_probe::UserEnvProbe,
+    /// Gates which lifecycle phases run, and how, for this `up` (built from
+    /// `--skip-post-create` / `--skip-non-blocking-commands` / `--prebuild` /
+    /// `--skip-post-attach`). `Default` reproduces standard cella behavior.
+    pub lifecycle_gate: cella_backend::LifecycleGate,
+    /// `--expect-existing-container`: when `true`, fail (rather than create)
+    /// if no container is found for this workspace. Gates before any build.
+    pub expect_existing_container: bool,
 }
 
 /// How the up pipeline should handle the container image.

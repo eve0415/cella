@@ -14,7 +14,8 @@ pub mod uid_image;
 pub use agent::agent_env_vars;
 pub use error::BackendError;
 pub use lifecycle::{
-    LifecycleContext, OutputCallback, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,
+    EXPECTED_CONTAINER_MISSING, LifecycleContext, LifecycleGate, OutputCallback, ParsedLifecycle,
+    StopAfter, WaitForPhase, parse_lifecycle_command, run_lifecycle_phase,
 };
 pub use mount::{MountKind, MountSpec};
 pub use names::{

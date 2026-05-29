@@ -310,7 +310,7 @@ pub(super) async fn run_compose_branch(
     }
 
     if build_no_cache {
-        ctx.remove_container = true;
+        ctx.resolution.remove_container = true;
     }
     // Local-only images (from build:) must not be pulled. Registry
     // images (from image:) need normal pull behavior.

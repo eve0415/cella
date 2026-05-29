@@ -607,6 +607,219 @@ impl WaitForPhase {
     }
 }
 
+/// Error for `--expect-existing-container` when no container exists.
+///
+/// Matches the official devcontainer CLI exactly (including the trailing
+/// period), so scripted consumers see identical output.
+pub const EXPECTED_CONTAINER_MISSING: &str = "The expected container does not exist.";
+
+/// Which "stop after this phase" flags are active for an `up`.
+///
+/// Both flags suppress cella's background tail: the phases past the stop point
+/// are dropped entirely (not backgrounded). Modelled as a struct rather than
+/// two `LifecycleGate` bools so the gate stays under the bool-count lint and
+/// the stop semantics live in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StopAfter {
+    /// `--skip-non-blocking-commands`: stop after the resolved `waitFor` phase.
+    pub skip_non_blocking: bool,
+    /// `--prebuild`: stop after `onCreate` + `updateContent` (and force-rerun
+    /// `updateContentCommand`).
+    pub prebuild: bool,
+}
+
+impl StopAfter {
+    /// Whether any stop-after flag is active (the background tail is dropped).
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.skip_non_blocking || self.prebuild
+    }
+}
+
+/// Gates which lifecycle phases run, and how, for a single `up` invocation.
+///
+/// Built from the devcontainer-CLI-parity lifecycle flags
+/// (`--skip-post-create`, `--skip-non-blocking-commands`, `--prebuild`,
+/// `--skip-post-attach`).
+///
+/// `Default` reproduces cella's standard behavior (everything runs; phases past
+/// `wait_for` are backgrounded), so callers that pass no flags are unaffected.
+///
+/// Field semantics:
+/// - `enabled == false` (from `--skip-post-create`): run NOTHING — no phases,
+///   no dotfiles, no `userEnvProbe`.
+/// - `wait_for`: the resolved `waitFor` phase (never mutated). Phases up to
+///   (and not including) it run in the foreground; the rest are backgrounded
+///   (default) or dropped (when a stop-after flag is active).
+/// - `stop`: the active stop-after flags (`--skip-non-blocking-commands` /
+///   `--prebuild`).
+/// - `skip_post_attach` (from `--skip-post-attach`): drop only
+///   `postAttachCommand`, regardless of where it would otherwise run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleGate {
+    /// Master switch. `false` skips all phases + dotfiles + `userEnvProbe`.
+    pub enabled: bool,
+    /// Resolved `waitFor` phase — the default foreground/background boundary.
+    pub wait_for: WaitForPhase,
+    /// Active "stop after this phase" flags.
+    pub stop: StopAfter,
+    /// `--skip-post-attach`: drop only `postAttachCommand`.
+    pub skip_post_attach: bool,
+}
+
+impl Default for LifecycleGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_for: WaitForPhase::UpdateContent,
+            stop: StopAfter::default(),
+            skip_post_attach: false,
+        }
+    }
+}
+
+impl LifecycleGate {
+    /// Build a gate from the resolved `waitFor` phase and the lifecycle flags.
+    /// This is the single place flag interactions are resolved, so every
+    /// consumer (create, reuse, restart, compose) honors them uniformly.
+    #[must_use]
+    pub const fn new(
+        wait_for: WaitForPhase,
+        skip_post_create: bool,
+        stop: StopAfter,
+        skip_post_attach: bool,
+    ) -> Self {
+        Self {
+            enabled: !skip_post_create,
+            wait_for,
+            stop,
+            skip_post_attach,
+        }
+    }
+
+    /// Run phases past the foreground boundary in the background (cella
+    /// default) vs. drop them entirely (when a stop-after flag is active).
+    #[must_use]
+    pub const fn background_tail(self) -> bool {
+        !self.stop.any()
+    }
+
+    /// `--prebuild` force-reruns `updateContentCommand` even when the content
+    /// hash is unchanged (official `injectHeadless.ts`: `rerun = !!prebuild`).
+    #[must_use]
+    pub const fn rerun_update_content(self) -> bool {
+        self.stop.prebuild
+    }
+
+    /// Whether the named post-create phase runs at all under this gate
+    /// (foreground or background). Unknown phase names return `false`.
+    ///
+    /// Used by callers that run phases sequentially without cella's
+    /// foreground/background split (e.g. the compose path), where the only
+    /// question is "does this phase run?".
+    #[must_use]
+    pub fn runs_phase(self, phase: &str) -> bool {
+        POST_CREATE_PHASES
+            .iter()
+            .position(|&p| p == phase)
+            .is_some_and(|i| plan_phases(self)[i] != PhaseAction::Skip)
+    }
+
+    /// Whether `postAttachCommand` runs at all under this gate. Used by the
+    /// reuse paths (`handle_running`, restart, compose-already-running) where
+    /// postAttach is the only deferred phase and runs on every attach.
+    #[must_use]
+    pub fn runs_post_attach(self) -> bool {
+        self.runs_phase("postAttachCommand")
+    }
+
+    /// Whether `postStartCommand` runs at all under this gate. Used by the
+    /// restart path which runs postStart + postAttach on a started container.
+    #[must_use]
+    pub fn runs_post_start(self) -> bool {
+        self.runs_phase("postStartCommand")
+    }
+
+    /// The foreground boundary index into the canonical phase array
+    /// `[onCreate, updateContent, postCreate, postStart, postAttach]`.
+    /// Phases at indices `< boundary` run in the foreground.
+    ///
+    /// The boundary is the resolved `waitFor` ordinal, lowered to the prebuild
+    /// stop point (`updateContent`) when `--prebuild` is set. When both
+    /// `--prebuild` and `--skip-non-blocking-commands` are set, the EARLIER
+    /// stop wins (official: `skipNonBlocking` returns before the prebuild check
+    /// when its `waitFor` phase is earlier — `injectHeadless.ts` edge case).
+    #[must_use]
+    pub const fn foreground_boundary(self) -> usize {
+        let wait_boundary = match self.wait_for {
+            WaitForPhase::Initialize => 0,
+            _ => self.wait_for.ordinal(),
+        };
+        if self.stop.prebuild {
+            let prebuild_boundary = PHASE_UPDATE_CONTENT + 1;
+            // skip-non-blocking can stop EARLIER than prebuild; take the min.
+            // prebuild alone IGNORES waitFor, so it pins to its own boundary.
+            return if self.stop.skip_non_blocking {
+                if wait_boundary < prebuild_boundary {
+                    wait_boundary
+                } else {
+                    prebuild_boundary
+                }
+            } else {
+                prebuild_boundary
+            };
+        }
+        wait_boundary
+    }
+}
+
+/// Index of `updateContentCommand` in the canonical post-create phase array.
+const PHASE_UPDATE_CONTENT: usize = 1;
+
+/// The canonical post-create phase array used by the lifecycle runner.
+const POST_CREATE_PHASES: [&str; 5] = [
+    "onCreateCommand",
+    "updateContentCommand",
+    "postCreateCommand",
+    "postStartCommand",
+    "postAttachCommand",
+];
+
+/// Decision for a single phase under a [`LifecycleGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhaseAction {
+    /// Run in the foreground (blocking) before `up` returns.
+    Foreground,
+    /// Defer to a detached background process after `up` returns.
+    Background,
+    /// Do not run at all.
+    Skip,
+}
+
+/// Pure phase-selection logic: given a gate, decide what happens to each phase
+/// in [`POST_CREATE_PHASES`]. This is the single source of truth the runner
+/// routes through, and is unit-tested exhaustively.
+pub(crate) fn plan_phases(gate: LifecycleGate) -> [PhaseAction; 5] {
+    if !gate.enabled {
+        return [PhaseAction::Skip; 5];
+    }
+    let boundary = gate.foreground_boundary();
+    let mut plan = [PhaseAction::Skip; 5];
+    for (i, slot) in plan.iter_mut().enumerate() {
+        let is_post_attach = POST_CREATE_PHASES[i] == "postAttachCommand";
+        if gate.skip_post_attach && is_post_attach {
+            *slot = PhaseAction::Skip;
+        } else if i < boundary {
+            *slot = PhaseAction::Foreground;
+        } else if gate.background_tail() {
+            *slot = PhaseAction::Background;
+        } else {
+            *slot = PhaseAction::Skip;
+        }
+    }
+    plan
+}
+
 /// Run lifecycle phases up to `wait_for`, then spawn remaining phases in background.
 ///
 /// # Errors
@@ -618,38 +831,39 @@ pub async fn run_lifecycle_phases_with_wait_for(
     resolved_features: Option<&cella_features::ResolvedFeatures>,
     image_metadata: Option<&str>,
     progress: &ProgressSender,
-    wait_for: WaitForPhase,
+    gate: LifecycleGate,
     post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let phases: &[&str] = &[
-        "onCreateCommand",
-        "updateContentCommand",
-        "postCreateCommand",
-        "postStartCommand",
-        "postAttachCommand",
-    ];
+    // `enabled == false` (--skip-post-create) skips every phase. Callers also
+    // skip dotfiles and the userEnvProbe, so nothing in the post-create chain
+    // runs.
+    if !gate.enabled {
+        return Ok(());
+    }
 
-    let wait_index = match wait_for {
-        WaitForPhase::Initialize => 0,
-        _ => wait_for.ordinal(),
-    };
-
+    let plan = plan_phases(gate);
     let mut background_cmds: Vec<String> = Vec::new();
 
-    for (i, &phase) in phases.iter().enumerate() {
-        let is_foreground = i < wait_index;
+    for (i, &phase) in POST_CREATE_PHASES.iter().enumerate() {
+        if plan[i] == PhaseAction::Skip {
+            continue;
+        }
         let mut entries =
             resolve_entries_with_metadata(resolved_features, image_metadata, config, phase);
         if let Some(f) = post_resolve {
             f(&mut entries);
         }
 
-        if is_foreground {
-            run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
-        } else {
-            for entry in &entries {
-                background_cmds.push(entry_to_shell_command(entry));
+        match plan[i] {
+            PhaseAction::Foreground => {
+                run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
             }
+            PhaseAction::Background => {
+                for entry in &entries {
+                    background_cmds.push(entry_to_shell_command(entry));
+                }
+            }
+            PhaseAction::Skip => {}
         }
     }
 
@@ -741,8 +955,25 @@ pub async fn check_and_run_content_update(
     metadata: Option<&str>,
     workspace_root: &std::path::Path,
     progress: &ProgressSender,
+    gate: LifecycleGate,
     post_resolve: Option<&PostResolveFn>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // --skip-post-create gates the entire content-update on reuse.
+    if !gate.enabled {
+        return Ok(());
+    }
+
+    // postCreateCommand is index 2 in the canonical phase array. Under
+    // --skip-non-blocking-commands (default waitFor=updateContent) or --prebuild
+    // the boundary stops before postCreate, so on reuse we re-run only
+    // updateContentCommand. plan_phases is the single source of truth.
+    let plan = plan_phases(gate);
+    let run_update_content = plan[1] != PhaseAction::Skip;
+    let run_post_create = plan[2] != PhaseAction::Skip;
+    if !run_update_content && !run_post_create {
+        return Ok(());
+    }
+
     let current_hash = cella_git::content_hash::compute(workspace_root);
 
     let read_result = lc_ctx
@@ -763,13 +994,24 @@ pub async fn check_and_run_content_update(
         .filter(|r| r.exit_code == 0)
         .map(|r| r.stdout.trim().to_string());
 
-    if stored_hash.as_deref() == Some(&current_hash) {
+    // --prebuild force-reruns updateContentCommand even when the hash matches
+    // (official injectHeadless.ts: rerun = !!prebuild). Otherwise honor the
+    // content-hash short-circuit.
+    if stored_hash.as_deref() == Some(&current_hash) && !gate.rerun_update_content() {
         return Ok(());
     }
 
-    progress.println("  Content changed, re-running updateContentCommand + postCreateCommand...");
+    let phases: &[&str] = if run_post_create {
+        progress
+            .println("  Content changed, re-running updateContentCommand + postCreateCommand...");
+        &["updateContentCommand", "postCreateCommand"]
+    } else {
+        // prebuild / skip-non-blocking: updateContent only, no postCreate.
+        progress.println("  Re-running updateContentCommand...");
+        &["updateContentCommand"]
+    };
 
-    for phase in ["updateContentCommand", "postCreateCommand"] {
+    for &phase in phases {
         let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
         if let Some(f) = post_resolve {
             f(&mut entries);
@@ -784,22 +1026,29 @@ pub async fn check_and_run_content_update(
         }
     }
 
-    let _ = lc_ctx
-        .client
-        .exec_command(
-            lc_ctx.container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("mkdir -p /tmp/.cella && printf '%s' '{current_hash}' > /tmp/.cella/content_hash"),
-                ],
-                user: lc_ctx.user.map(String::from),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
+    // Only persist the new content hash when postCreateCommand actually ran.
+    // Under prebuild / skip-non-blocking we re-run updateContentCommand alone;
+    // writing the hash here would make a later un-gated `up` see a matching
+    // hash and permanently skip the deferred postCreateCommand (mirrors the
+    // create-path content-hash gating).
+    if run_post_create {
+        let _ = lc_ctx
+            .client
+            .exec_command(
+                lc_ctx.container_id,
+                &ExecOptions {
+                    cmd: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("mkdir -p /tmp/.cella && printf '%s' '{current_hash}' > /tmp/.cella/content_hash"),
+                    ],
+                    user: lc_ctx.user.map(String::from),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+    }
 
     Ok(())
 }
@@ -1464,6 +1713,192 @@ mod tests {
             WaitForPhase::from_config(&json!({"waitFor": null})),
             WaitForPhase::UpdateContent
         );
+    }
+
+    /// Map a phase plan to the set of phase names per action, for readable
+    /// assertions in the table test.
+    fn plan_sets(plan: [PhaseAction; 5]) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut foreground = Vec::new();
+        let mut background = Vec::new();
+        for (i, action) in plan.iter().enumerate() {
+            match action {
+                PhaseAction::Foreground => foreground.push(POST_CREATE_PHASES[i]),
+                PhaseAction::Background => background.push(POST_CREATE_PHASES[i]),
+                PhaseAction::Skip => {}
+            }
+        }
+        (foreground, background)
+    }
+
+    /// Test helper: gate for `--skip-post-create`.
+    fn gate_skip_post_create() -> LifecycleGate {
+        LifecycleGate::new(
+            WaitForPhase::UpdateContent,
+            true,
+            StopAfter::default(),
+            false,
+        )
+    }
+
+    /// Test helper: gate for `--skip-non-blocking-commands` at a given waitFor.
+    fn gate_skip_non_blocking(wait_for: WaitForPhase) -> LifecycleGate {
+        LifecycleGate::new(
+            wait_for,
+            false,
+            StopAfter {
+                skip_non_blocking: true,
+                prebuild: false,
+            },
+            false,
+        )
+    }
+
+    /// Test helper: gate for `--prebuild` at a given waitFor.
+    fn gate_prebuild(wait_for: WaitForPhase) -> LifecycleGate {
+        LifecycleGate::new(
+            wait_for,
+            false,
+            StopAfter {
+                skip_non_blocking: false,
+                prebuild: true,
+            },
+            false,
+        )
+    }
+
+    /// Test helper: gate for `--skip-post-attach`.
+    fn gate_skip_post_attach() -> LifecycleGate {
+        LifecycleGate::new(
+            WaitForPhase::UpdateContent,
+            false,
+            StopAfter::default(),
+            true,
+        )
+    }
+
+    #[test]
+    fn lifecycle_gate_default_matches_legacy_behavior() {
+        // Default: foreground onCreate+updateContent, background the rest.
+        let gate = LifecycleGate::default();
+        assert!(gate.enabled);
+        assert_eq!(gate.wait_for, WaitForPhase::UpdateContent);
+        assert!(gate.background_tail());
+        assert!(!gate.rerun_update_content());
+        assert!(!gate.skip_post_attach);
+        let (fg, bg) = plan_sets(plan_phases(gate));
+        assert_eq!(fg, vec!["onCreateCommand", "updateContentCommand"]);
+        assert_eq!(
+            bg,
+            vec!["postCreateCommand", "postStartCommand", "postAttachCommand"]
+        );
+    }
+
+    #[test]
+    fn plan_phases_table_driven() {
+        // Each row: (gate, expected_foreground, expected_background).
+        let none: Vec<&str> = vec![];
+        let cases: &[(LifecycleGate, Vec<&str>, Vec<&str>)] = &[
+            // --skip-post-create: nothing runs at all.
+            (gate_skip_post_create(), none.clone(), none.clone()),
+            // default (no flags): foreground to updateContent, background the tail.
+            (
+                LifecycleGate::default(),
+                vec!["onCreateCommand", "updateContentCommand"],
+                vec!["postCreateCommand", "postStartCommand", "postAttachCommand"],
+            ),
+            // --skip-non-blocking-commands (default waitFor): same fg, tail DROPPED.
+            (
+                gate_skip_non_blocking(WaitForPhase::UpdateContent),
+                vec!["onCreateCommand", "updateContentCommand"],
+                none.clone(),
+            ),
+            // --skip-non-blocking-commands with waitFor=onCreateCommand: only onCreate fg.
+            (
+                gate_skip_non_blocking(WaitForPhase::OnCreate),
+                vec!["onCreateCommand"],
+                none.clone(),
+            ),
+            // --prebuild: stop after onCreate+updateContent, tail dropped.
+            (
+                gate_prebuild(WaitForPhase::UpdateContent),
+                vec!["onCreateCommand", "updateContentCommand"],
+                none.clone(),
+            ),
+            // --prebuild overrides config waitFor=postCreateCommand (still stops after updateContent).
+            (
+                gate_prebuild(WaitForPhase::PostCreate),
+                vec!["onCreateCommand", "updateContentCommand"],
+                none.clone(),
+            ),
+            // --skip-post-attach: default set, but postAttach dropped from the tail.
+            (
+                gate_skip_post_attach(),
+                vec!["onCreateCommand", "updateContentCommand"],
+                vec!["postCreateCommand", "postStartCommand"],
+            ),
+        ];
+
+        for (i, (gate, want_fg, want_bg)) in cases.iter().enumerate() {
+            let (fg, bg) = plan_sets(plan_phases(*gate));
+            assert_eq!(&fg, want_fg, "foreground mismatch in case {i}: {gate:?}");
+            assert_eq!(&bg, want_bg, "background mismatch in case {i}: {gate:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_gate_prebuild_overrides_wait_for_and_forces_rerun() {
+        let gate = gate_prebuild(WaitForPhase::PostStart);
+        assert!(gate.stop.prebuild);
+        assert!(gate.rerun_update_content());
+        assert!(!gate.background_tail());
+        // waitFor=postStart is ignored by prebuild: boundary is after updateContent.
+        assert_eq!(gate.foreground_boundary(), PHASE_UPDATE_CONTENT + 1);
+    }
+
+    #[test]
+    fn lifecycle_gate_skip_non_blocking_precedence_over_prebuild() {
+        // Spec (prebuild edge case 4 + verification): `--skip-non-blocking
+        // --prebuild` with waitFor=onCreateCommand stops AFTER onCreate —
+        // updateContent never runs (skipNonBlocking's earlier stop wins).
+        let gate = LifecycleGate::new(
+            WaitForPhase::OnCreate,
+            false,
+            StopAfter {
+                skip_non_blocking: true,
+                prebuild: true,
+            },
+            false,
+        );
+        assert!(!gate.background_tail());
+        let (fg, bg) = plan_sets(plan_phases(gate));
+        assert_eq!(fg, vec!["onCreateCommand"]);
+        assert!(bg.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_gate_both_flags_default_wait_for_run_same_set() {
+        // With default waitFor, both flags stop at the same point — the
+        // executed set is identical (onCreate+updateContent).
+        let gate = LifecycleGate::new(
+            WaitForPhase::UpdateContent,
+            false,
+            StopAfter {
+                skip_non_blocking: true,
+                prebuild: true,
+            },
+            false,
+        );
+        let (fg, bg) = plan_sets(plan_phases(gate));
+        assert_eq!(fg, vec!["onCreateCommand", "updateContentCommand"]);
+        assert!(bg.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_gate_disabled_skips_everything() {
+        let gate = LifecycleGate::new(WaitForPhase::PostStart, true, StopAfter::default(), false);
+        assert!(!gate.enabled);
+        let plan = plan_phases(gate);
+        assert!(plan.iter().all(|a| *a == PhaseAction::Skip));
     }
 
     #[test]
