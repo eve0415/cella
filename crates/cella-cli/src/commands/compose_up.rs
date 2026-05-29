@@ -46,6 +46,11 @@ pub async fn compose_ensure_up(
         gpu_availability: ctx.gpu_availability(),
         update_remote_user_uid_default: ctx.update_remote_user_uid_default(),
         omit_remote_env_from_metadata: ctx.omit_remote_env_from_metadata(),
+        dotfiles: cella_orchestrator::compose_up::DotfilesConfig {
+            repository: ctx.dotfiles.repository.clone(),
+            install_command: ctx.dotfiles.install_command.clone(),
+            target_path: ctx.dotfiles.target_path.clone(),
+        },
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
@@ -168,6 +173,34 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
                 .post_create_setup(container_id, remote_user, &env_fwd, &settings, remote_env)
                 .await;
             lifecycle_env
+        })
+    }
+
+    fn install_dotfiles<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        remote_user: &'a str,
+        dotfiles: &'a cella_orchestrator::compose_up::DotfilesConfig,
+        lifecycle_env: &'a [String],
+    ) -> cella_orchestrator::compose_up::DotfilesInstallFuture<'a> {
+        Box::pin(async move {
+            // The orchestrator owns the install logic; bridge into it here (the
+            // CLI sees both crates, cella-compose does not). Caller already
+            // guards on repository.is_some(); be defensive in case that changes.
+            let Some(repository) = dotfiles.repository.as_deref() else {
+                return Ok(());
+            };
+            cella_orchestrator::dotfiles::install_dotfiles(
+                client,
+                container_id,
+                remote_user,
+                repository,
+                dotfiles.install_command.as_deref(),
+                &dotfiles.target_path,
+                lifecycle_env,
+            )
+            .await
         })
     }
 }

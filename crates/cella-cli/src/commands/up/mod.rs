@@ -428,7 +428,6 @@ impl UpArgs {
         );
 
         let lf = &self.lockfile;
-        let df = &self.dotfiles;
         debug!(
             container_data_folder = ?c.container_data_folder,
             container_system_data_folder = ?c.container_system_data_folder,
@@ -439,10 +438,7 @@ impl UpArgs {
             experimental_lockfile = lf.experimental_lockfile,
             experimental_frozen_lockfile = c.experimental_frozen_lockfile,
             omit_syntax_directive = c.omit_syntax_directive,
-            dotfiles_repository = ?df.repository,
-            dotfiles_install_command = df.install_command.is_some(),
-            dotfiles_target_path = %df.target_path,
-            "up: compatibility no-op / dotfiles flags accepted"
+            "up: compatibility no-op flags accepted"
         );
     }
 }
@@ -684,6 +680,54 @@ pub struct UpContext {
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
     /// `devcontainer.metadata` label.
     omit_remote_env_from_metadata: bool,
+    /// Dotfiles install inputs (`--dotfiles-*`). `repository` is normalized
+    /// (owner/repo shorthand expanded) at construction so both the
+    /// single-container and compose paths receive a clone-ready value.
+    pub(crate) dotfiles: cella_orchestrator::config::DotfilesConfig,
+}
+
+/// Normalize a `--dotfiles-repository` value to a clone-ready form.
+///
+/// Mirrors the official tool (`dotfiles.ts:27-29`): a bare `owner/repo`
+/// shorthand (no `:` and not a `/`, `./`, or `../` path) expands to a full
+/// GitHub HTTPS URL. Full URLs (`https://`, `git@host:`, `ssh://`) and local
+/// paths pass through unchanged. The `:` guard makes this idempotent.
+fn normalize_dotfiles_repository(repo: &str) -> String {
+    let is_path = repo.starts_with('/') || repo.starts_with("./") || repo.starts_with("../");
+    let is_shorthand = !repo.contains(':') && !is_path;
+    if is_shorthand {
+        format!("https://github.com/{repo}.git")
+    } else {
+        repo.to_string()
+    }
+}
+
+/// Build the orchestrator [`cella_orchestrator::config::DotfilesConfig`] from
+/// the CLI dotfiles args, normalizing the repository shorthand once.
+///
+/// An empty `--dotfiles-repository ""` is treated as unset (matching the
+/// official tool's `if (!repository) return`), so it never triggers an install.
+fn build_dotfiles_config(args: &UpDotfilesArgs) -> cella_orchestrator::config::DotfilesConfig {
+    cella_orchestrator::config::DotfilesConfig {
+        repository: args
+            .repository
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(normalize_dotfiles_repository),
+        install_command: args.install_command.clone(),
+        target_path: args.target_path.clone(),
+    }
+}
+
+/// Parse the `--secrets-file` into lifecycle secret `KEY=VALUE` entries, or an
+/// empty list when no secrets file was given.
+fn resolve_lifecycle_secrets(
+    args: &UpArgs,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    args.build
+        .secrets_file
+        .as_ref()
+        .map_or_else(|| Ok(Vec::new()), |path| parse_secrets_file(path))
 }
 
 /// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
@@ -761,11 +805,7 @@ impl UpContext {
         let default_workspace_folder =
             compute_default_workspace_folder(&resolved.workspace_root, &host_mount_folder);
 
-        let lifecycle_secrets = if let Some(ref path) = args.build.secrets_file {
-            parse_secrets_file(path)?
-        } else {
-            Vec::new()
-        };
+        let lifecycle_secrets = resolve_lifecycle_secrets(args)?;
 
         let (additional_cli_mounts, build_secrets) = parse_cli_mounts_and_secrets(args)?;
 
@@ -829,6 +869,7 @@ impl UpContext {
                 args.compat.update_remote_user_uid_default,
             ),
             omit_remote_env_from_metadata: args.result.omit_config_remote_env_from_metadata,
+            dotfiles: build_dotfiles_config(&args.dotfiles),
         })
     }
 
@@ -917,6 +958,8 @@ impl UpContext {
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::On,
             // Branch/auto-up keeps the full metadata label (no flag plumbed).
             omit_remote_env_from_metadata: false,
+            // Branch/auto-up never installs dotfiles (no --dotfiles-* flags).
+            dotfiles: cella_orchestrator::config::DotfilesConfig::default(),
         })
     }
 
@@ -1369,6 +1412,7 @@ impl UpContext {
             metadata_options: cella_orchestrator::MetadataOptions {
                 omit_remote_env: self.omit_remote_env_from_metadata,
             },
+            dotfiles: self.dotfiles.clone(),
         };
 
         let result =

@@ -68,6 +68,23 @@ pub struct MetadataOptions {
     pub omit_remote_env: bool,
 }
 
+/// Dotfiles installation inputs resolved from the `--dotfiles-*` CLI flags.
+///
+/// `repository` being `Some` is what arms the install (a `None` skips it
+/// entirely). The repository value is expected to be already normalized by the
+/// caller (owner/repo shorthand expanded to a full GitHub URL) — the installer
+/// passes it to `git clone` verbatim. Grouped so the dotfiles concern threads
+/// as one unit and can grow additively (e.g. a future `--dotfiles-branch`).
+#[derive(Clone, Default)]
+pub struct DotfilesConfig {
+    /// `--dotfiles-repository`: clone source. `None` disables dotfiles install.
+    pub repository: Option<String>,
+    /// `--dotfiles-install-command`: explicit install script. `None` autodetects.
+    pub install_command: Option<String>,
+    /// `--dotfiles-target-path`: in-container clone target (default `~/dotfiles`).
+    pub target_path: String,
+}
+
 /// Mount-related CLI flags for workspace configuration.
 pub struct MountFlags<'a> {
     /// Additional mount points from CLI `--mount` flags.
@@ -143,6 +160,10 @@ pub struct UpConfig<'a> {
     pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
     /// Options shaping the persisted `devcontainer.metadata` label.
     pub metadata_options: MetadataOptions,
+    /// Dotfiles install inputs (`--dotfiles-repository` / `-install-command` /
+    /// `-target-path`). Installed in the post-create flow when armed and the
+    /// lifecycle gate permits (after `postCreateCommand`, before `postStart`).
+    pub dotfiles: DotfilesConfig,
 }
 
 /// How the up pipeline should handle the container image.

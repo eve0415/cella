@@ -1487,6 +1487,14 @@ impl EnsureUpContext<'_> {
             .await;
         }
 
+        // Dotfiles install runs in the FOREGROUND right after the lifecycle
+        // phases, mirroring official's slot between postCreate and postStart
+        // (injectHeadless.ts:392). Gated identically to write_content_hash so
+        // --skip-post-create / --prebuild / --skip-non-blocking-commands all
+        // suppress it. Non-fatal: a failure warns but never fails `up`.
+        self.install_dotfiles_if_enabled(container_id, remote_user, lifecycle_env, gate)
+            .await;
+
         // Mark onCreateCommand done only when it ran in the FOREGROUND. The
         // phases array is [onCreate, updateContent, postCreate, postStart,
         // postAttach]; onCreate (index 0) runs foreground iff the boundary is
@@ -1500,6 +1508,49 @@ impl EnsureUpContext<'_> {
         write_lifecycle_state(self.client, container_id, remote_user, &state).await;
 
         Ok(())
+    }
+
+    /// Install dotfiles after the create lifecycle, if armed and gate-permitted.
+    ///
+    /// Runs only when a `--dotfiles-repository` was given AND the gate would run
+    /// `postCreateCommand` (so it's skipped under `--skip-post-create`,
+    /// `--prebuild`, and `--skip-non-blocking-commands` with the default
+    /// `waitFor`). A dotfiles failure is logged as a warning and a progress
+    /// message — it never fails `up`, matching the official tool.
+    async fn install_dotfiles_if_enabled(
+        &self,
+        container_id: &str,
+        remote_user: &str,
+        lifecycle_env: &[String],
+        gate: cella_backend::LifecycleGate,
+    ) {
+        let cfg = &self.config.dotfiles;
+        if !should_run_dotfiles(gate, cfg.repository.as_deref()) {
+            return;
+        }
+        let Some(repository) = cfg.repository.as_deref() else {
+            return;
+        };
+        let step = self.progress.step("Installing dotfiles...");
+        match crate::dotfiles::install_dotfiles(
+            self.client,
+            container_id,
+            remote_user,
+            repository,
+            cfg.install_command.as_deref(),
+            &cfg.target_path,
+            lifecycle_env,
+        )
+        .await
+        {
+            Ok(()) => step.finish(),
+            Err(e) => {
+                warn!("Dotfiles install failed (continuing): {e}");
+                step.fail("failed");
+                self.progress
+                    .warn(&format!("Dotfiles install failed (continuing): {e}"));
+            }
+        }
     }
 
     /// Create a container with progress reporting.
@@ -1941,6 +1992,18 @@ fn add_orbstack_hostname_labels(
     labels.insert("dev.orbstack.http-port".to_string(), default_port);
 }
 
+/// Whether dotfiles should be installed for this `up`.
+///
+/// Dotfiles run iff a repository was given AND the gate would run
+/// `postCreateCommand` — they occupy the slot between `postCreate` and
+/// `postStart` in the official tool (`injectHeadless.ts:392`), so any flag that
+/// stops the lifecycle at or before `postCreate` also skips dotfiles:
+/// `--skip-post-create` (`gate.enabled == false`), `--prebuild`, and
+/// `--skip-non-blocking-commands` with the default `waitFor`.
+fn should_run_dotfiles(gate: cella_backend::LifecycleGate, repository: Option<&str>) -> bool {
+    repository.is_some() && gate.enabled && gate.runs_phase("postCreateCommand")
+}
+
 fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
     config
         .get("forwardPorts")
@@ -2192,10 +2255,80 @@ fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
 mod tests {
     use super::*;
 
+    use cella_backend::{LifecycleGate, StopAfter, WaitForPhase};
+
     #[test]
     fn network_rule_policy_enforce_eq() {
         assert_eq!(NetworkRulePolicy::Enforce, NetworkRulePolicy::Enforce);
         assert_ne!(NetworkRulePolicy::Enforce, NetworkRulePolicy::Skip);
+    }
+
+    #[test]
+    fn dotfiles_skipped_when_repository_is_none() {
+        // No repository: nothing to install, even on a fully-enabled gate.
+        assert!(!should_run_dotfiles(LifecycleGate::default(), None));
+    }
+
+    #[test]
+    fn dotfiles_skipped_when_gate_disabled() {
+        // --skip-post-create disables the whole hook chain incl. dotfiles.
+        let gate = LifecycleGate {
+            enabled: false,
+            ..LifecycleGate::default()
+        };
+        assert!(!should_run_dotfiles(gate, Some("owner/repo")));
+    }
+
+    #[test]
+    fn dotfiles_skipped_under_prebuild() {
+        // --prebuild stops after updateContent, before postCreate -> skip.
+        let gate = LifecycleGate {
+            stop: StopAfter {
+                prebuild: true,
+                skip_non_blocking: false,
+            },
+            ..LifecycleGate::default()
+        };
+        assert!(!should_run_dotfiles(gate, Some("owner/repo")));
+    }
+
+    #[test]
+    fn dotfiles_skipped_under_skip_non_blocking_default_wait_for() {
+        // --skip-non-blocking-commands at default waitFor=updateContent stops
+        // before postCreate -> skip dotfiles.
+        let gate = LifecycleGate {
+            wait_for: WaitForPhase::UpdateContent,
+            stop: StopAfter {
+                prebuild: false,
+                skip_non_blocking: true,
+            },
+            ..LifecycleGate::default()
+        };
+        assert!(!should_run_dotfiles(gate, Some("owner/repo")));
+    }
+
+    #[test]
+    fn dotfiles_runs_under_skip_non_blocking_wait_for_post_start() {
+        // --skip-non-blocking-commands with waitFor=postStart runs through
+        // postCreate, so dotfiles install.
+        let gate = LifecycleGate {
+            wait_for: WaitForPhase::PostStart,
+            stop: StopAfter {
+                prebuild: false,
+                skip_non_blocking: true,
+            },
+            ..LifecycleGate::default()
+        };
+        assert!(should_run_dotfiles(gate, Some("owner/repo")));
+    }
+
+    #[test]
+    fn dotfiles_runs_on_default_gate_with_repository() {
+        // Happy path: standard `up` with a repository installs dotfiles.
+        assert!(should_run_dotfiles(
+            LifecycleGate::default(),
+            Some("owner/repo")
+        ));
     }
 
     #[test]

@@ -76,6 +76,30 @@ pub struct ComposeUpConfig<'a> {
     /// generated `devcontainer.metadata` label. Does NOT affect the runtime
     /// `dev.cella.remote_env` label.
     pub omit_remote_env_from_metadata: bool,
+    /// Dotfiles install inputs (`--dotfiles-repository` / `-install-command` /
+    /// `-target-path`). Installed via [`ComposeUpHooks::install_dotfiles`] in
+    /// the post-create flow, between `postCreateCommand` and `postStartCommand`,
+    /// when `repository` is `Some` and the gate runs `postCreateCommand`.
+    pub dotfiles: DotfilesConfig,
+}
+
+/// Dotfiles installation inputs resolved from the `--dotfiles-*` CLI flags.
+///
+/// Mirrors `cella_orchestrator::config::DotfilesConfig` — duplicated here
+/// because cella-orchestrator depends on cella-compose (so cella-compose cannot
+/// import the orchestrator's type). `repository` being `Some` arms the install;
+/// the value is expected to be already normalized (owner/repo shorthand
+/// expanded) by the CLI before it reaches here. The actual clone+install runs
+/// via [`ComposeUpHooks::install_dotfiles`] so cella-compose never needs to
+/// reach the orchestrator's install logic.
+#[derive(Debug, Clone, Default)]
+pub struct DotfilesConfig {
+    /// `--dotfiles-repository`: clone source. `None` disables dotfiles install.
+    pub repository: Option<String>,
+    /// `--dotfiles-install-command`: explicit install script. `None` autodetects.
+    pub install_command: Option<String>,
+    /// `--dotfiles-target-path`: in-container clone target (default `~/dotfiles`).
+    pub target_path: String,
 }
 
 /// Build/backend tuning inputs for the compose `up` path.
@@ -157,6 +181,14 @@ pub enum ComposeUpOutcome {
 // Hooks for CLI-specific operations
 // ---------------------------------------------------------------------------
 
+/// Boxed, fallible future returned by [`ComposeUpHooks::install_dotfiles`].
+///
+/// Aliased so the (necessarily verbose) `Pin<Box<dyn Future<Output = Result<…>>>>`
+/// shape stays under the `clippy::type_complexity` limit at both the trait
+/// definition and the CLI implementation.
+pub type DotfilesInstallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+
 /// Callbacks for operations that live outside the orchestrator's dependency
 /// graph (daemon management, agent launch, etc.).
 pub trait ComposeUpHooks: Send + Sync {
@@ -205,6 +237,25 @@ pub trait ComposeUpHooks: Send + Sync {
         workspace_root: &'a Path,
         remote_env: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
+
+    /// Clone and install dotfiles inside the container, as `remote_user`.
+    ///
+    /// Bridges the orchestrator-owned install logic (which cella-compose cannot
+    /// import without a dependency cycle) into the compose flow. Called between
+    /// `postCreateCommand` and `postStartCommand`. The returned `Err` is treated
+    /// as non-fatal by the caller (logged, never propagated). Defaults to a
+    /// no-op so non-CLI implementors (test doubles) need not override it.
+    fn install_dotfiles<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        remote_user: &'a str,
+        dotfiles: &'a DotfilesConfig,
+        lifecycle_env: &'a [String],
+    ) -> DotfilesInstallFuture<'a> {
+        let _ = (client, container_id, remote_user, dotfiles, lifecycle_env);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +659,15 @@ async fn finalize_compose(
             progress,
         );
         run_lifecycle_entries(&lc_ctx, phase, &entries, progress).await?;
+
+        // Dotfiles install runs immediately after postCreateCommand and before
+        // postStartCommand, matching official's slot (injectHeadless.ts:392).
+        // Reaching this iteration means the gate already permits postCreate, so
+        // only the repository needs to be armed. Non-fatal: a failure warns but
+        // never fails `up`.
+        if phase == "postCreateCommand" && cfg.dotfiles.repository.is_some() {
+            install_dotfiles_step(ctx, &primary.id, remote_user, &lifecycle_env).await;
+        }
     }
 
     Ok(ComposeUpResult {
@@ -618,6 +678,37 @@ async fn finalize_compose(
         outcome: ComposeUpOutcome::Created,
         ssh_agent_proxy: None,
     })
+}
+
+/// Run the dotfiles install hook with progress reporting (non-fatal on error).
+///
+/// A dotfiles failure is logged and surfaced as a progress warning but never
+/// propagated, so `up` still succeeds — matching the official tool.
+async fn install_dotfiles_step(
+    ctx: &Ctx<'_>,
+    container_id: &str,
+    remote_user: &str,
+    lifecycle_env: &[String],
+) {
+    let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
+    let step = progress.step("Installing dotfiles...");
+    match hooks
+        .install_dotfiles(
+            client,
+            container_id,
+            remote_user,
+            &cfg.dotfiles,
+            lifecycle_env,
+        )
+        .await
+    {
+        Ok(()) => step.finish(),
+        Err(e) => {
+            warn!("Dotfiles install failed (continuing): {e}");
+            step.fail("failed");
+            progress.warn(&format!("Dotfiles install failed (continuing): {e}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,6 +1687,7 @@ mod tests {
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
             omit_remote_env_from_metadata: false,
+            dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1661,6 +1753,7 @@ mod tests {
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
             omit_remote_env_from_metadata: false,
+            dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),
