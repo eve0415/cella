@@ -563,6 +563,8 @@ pub struct UpContext {
     pub(crate) pull_policy: Option<String>,
     /// Extra Docker labels to merge into the container (e.g., worktree labels).
     extra_labels: std::collections::HashMap<String, String>,
+    /// CLI `--id-label` values (`key=value`): set on create, AND-matched on find.
+    id_labels: Vec<String>,
     /// Network rule enforcement policy.
     pub(crate) network_rules: NetworkRulePolicy,
     /// Docker host override (forwarded to daemon registration).
@@ -676,6 +678,7 @@ impl UpContext {
                 .map(ImagePullPolicy::as_str)
                 .map(String::from),
             extra_labels: std::collections::HashMap::new(),
+            id_labels: args.config_inputs.id_label.clone(),
             network_rules: if args.no_network_rules || cella_cfg.cli.no_network_rules {
                 NetworkRulePolicy::Skip
             } else {
@@ -758,6 +761,7 @@ impl UpContext {
             skip_checksum: false,
             pull_policy: None,
             extra_labels,
+            id_labels: Vec::new(),
             network_rules: NetworkRulePolicy::Enforce,
             docker_host: effective_docker_host(backend_args),
             compose_profiles: Vec::new(),
@@ -1142,6 +1146,7 @@ impl UpContext {
             workspace_folder_from_config: self.workspace_folder(),
             default_workspace_folder: &self.default_workspace_folder,
             extra_labels: &self.extra_labels,
+            id_labels: &self.id_labels,
             image_strategy: if build_no_cache {
                 cella_orchestrator::ImageStrategy::RebuildNoCache
             } else if self.remove_container {

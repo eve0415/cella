@@ -32,6 +32,24 @@ pub struct BackendCapabilities {
 /// Boxed future type alias for async trait methods (object-safe).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Returns `true` if `container_labels` satisfies every entry in `required`.
+///
+/// Each `required` entry is a `key=value` (exact match) or a bare `key`
+/// (presence). An empty `required` matches anything. Used to AND-match
+/// `--id-label` selectors against a container's labels.
+#[must_use]
+pub fn labels_match_all<S: std::hash::BuildHasher>(
+    container_labels: &std::collections::HashMap<String, String, S>,
+    required: &[String],
+) -> bool {
+    required.iter().all(|l| {
+        l.split_once('=').map_or_else(
+            || container_labels.contains_key(l),
+            |(k, v)| container_labels.get(k).is_some_and(|actual| actual == v),
+        )
+    })
+}
+
 /// Core container lifecycle trait.
 ///
 /// Uses [`BoxFuture`] return types for object safety so callers can work with
@@ -94,6 +112,29 @@ pub trait ContainerBackend: Send + Sync {
         &'a self,
         label: &'a str,
     ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>>;
+
+    /// Find a container matching ALL of the given `key=value` labels (AND).
+    ///
+    /// Used for `--id-label` targeting, where every provided id-label must
+    /// match. The default queries by the first label and post-filters the
+    /// result against the rest; backends with native multi-label filtering
+    /// should override this so the right container is found when multiple
+    /// share the first label. Returns `None` if `labels` is empty or nothing
+    /// matches all of them.
+    fn find_container_by_labels<'a>(
+        &'a self,
+        labels: &'a [String],
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            let Some(first) = labels.first() else {
+                return Ok(None);
+            };
+            let Some(info) = self.find_container_by_label(first).await? else {
+                return Ok(None);
+            };
+            Ok(labels_match_all(&info.labels, labels).then_some(info))
+        })
+    }
 
     fn container_logs<'a>(
         &'a self,
@@ -326,4 +367,49 @@ pub trait ContainerBackend: Send + Sync {
         &'a self,
         current_version: &'a str,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::labels_match_all;
+    use std::collections::HashMap;
+
+    fn labels() -> HashMap<String, String> {
+        HashMap::from([
+            ("foo".to_string(), "bar".to_string()),
+            ("baz".to_string(), "qux".to_string()),
+        ])
+    }
+
+    #[test]
+    fn matches_when_all_present() {
+        assert!(labels_match_all(
+            &labels(),
+            &["foo=bar".to_string(), "baz=qux".to_string()]
+        ));
+    }
+
+    #[test]
+    fn fails_when_any_value_differs() {
+        assert!(!labels_match_all(
+            &labels(),
+            &["foo=bar".to_string(), "baz=WRONG".to_string()]
+        ));
+    }
+
+    #[test]
+    fn fails_when_key_absent() {
+        assert!(!labels_match_all(&labels(), &["missing=x".to_string()]));
+    }
+
+    #[test]
+    fn bare_key_matches_on_presence() {
+        assert!(labels_match_all(&labels(), &["foo".to_string()]));
+        assert!(!labels_match_all(&labels(), &["nope".to_string()]));
+    }
+
+    #[test]
+    fn empty_required_matches() {
+        assert!(labels_match_all(&labels(), &[]));
+    }
 }

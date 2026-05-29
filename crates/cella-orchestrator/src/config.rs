@@ -38,6 +38,10 @@ pub struct UpConfig<'a> {
     pub default_workspace_folder: &'a str,
     /// Extra labels to merge into the container (e.g. worktree metadata).
     pub extra_labels: &'a HashMap<String, String>,
+    /// CLI `--id-label` values (`key=value`). When non-empty these are set on a
+    /// newly created container AND used (AND-matched) to find an existing one,
+    /// replacing the default workspace-path lookup.
+    pub id_labels: &'a [String],
     /// How to handle the container image.
     pub image_strategy: ImageStrategy,
     /// Whether to remove an existing container before starting.

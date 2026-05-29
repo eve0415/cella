@@ -890,6 +890,13 @@ impl EnsureUpContext<'_> {
         }
 
         labels.extend(self.config.extra_labels.clone());
+        // CLI --id-label values are set on the container so a later `up`
+        // --id-label finds it (AND-matched), additive on top of cella labels.
+        for id_label in self.config.id_labels {
+            if let Some((k, v)) = id_label.split_once('=') {
+                labels.insert(k.to_string(), v.to_string());
+            }
+        }
         if runtime == cella_env::DockerRuntime::OrbStack {
             add_orbstack_hostname_labels(
                 &mut labels,
@@ -1704,10 +1711,17 @@ impl EnsureUpContext<'_> {
             );
         }
 
-        let existing = self
-            .client
-            .find_container(&self.config.resolved.workspace_root)
-            .await?;
+        // With --id-label, find by AND-matched labels (matching the official
+        // CLI); otherwise fall back to the workspace-path lookup.
+        let existing = if self.config.id_labels.is_empty() {
+            self.client
+                .find_container(&self.config.resolved.workspace_root)
+                .await?
+        } else {
+            self.client
+                .find_container_by_labels(self.config.id_labels)
+                .await?
+        };
 
         if let Some(container) = existing {
             let remote_user = self.resolve_remote_user_from_container(&container).await;
