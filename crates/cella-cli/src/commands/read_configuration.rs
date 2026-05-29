@@ -78,23 +78,7 @@ impl ReadConfigurationArgs {
         };
 
         if let Some(ref additional) = self.additional_features {
-            let extra: serde_json::Value = serde_json::from_str(additional)
-                .map_err(|e| format!("--additional-features: invalid JSON: {e}"))?;
-            let obj = extra
-                .as_object()
-                .ok_or("--additional-features must be a JSON object")?;
-            let features = resolved
-                .config
-                .as_object_mut()
-                .expect("config is always an object")
-                .entry("features")
-                .or_insert_with(|| json!({}));
-            let features_obj = features
-                .as_object_mut()
-                .ok_or("existing features field is not an object")?;
-            for (k, v) in obj {
-                features_obj.insert(k.clone(), v.clone());
-            }
+            super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
         let device_type = if resolved.config.get("dockerComposeFile").is_some() {

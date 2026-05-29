@@ -594,7 +594,7 @@ impl UpContext {
         let remove_container = args.build.rebuild || args.build.remove_existing_container;
 
         // 1. Resolve config
-        let resolved = progress
+        let mut resolved = progress
             .run_step("Resolving devcontainer configuration...", async {
                 resolve::config(&cwd, args.config.as_deref())
             })
@@ -602,6 +602,14 @@ impl UpContext {
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
+        }
+
+        // Merge CLI --additional-features into the config's features (config
+        // wins on collision). This flows into the image cache digest and
+        // feature resolution, so the feature set and cache key both reflect it.
+        if let Some(ref additional) = args.config_inputs.additional_features {
+            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
         let config = &resolved.config;
