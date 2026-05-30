@@ -95,8 +95,10 @@ pub struct RunUserCommandsInput<'a> {
     /// Resolved devcontainer config (lifecycle is sourced from `metadata` when
     /// present, falling back to this config's phase keys).
     pub config: &'a Value,
-    /// The container's `devcontainer.metadata` label, when present. Source of
-    /// truth for lifecycle commands on an existing container.
+    /// The container's effective lifecycle-metadata array, when present (the
+    /// baked `devcontainer.metadata`, plus the on-disk `--config` appended in
+    /// the `--container-id` case — see `effective_lifecycle_metadata`). Source
+    /// of truth for lifecycle commands; falls back to `config` when absent.
     pub metadata: Option<&'a str>,
     /// Lifecycle-gating inputs.
     pub gating: Gating,
@@ -281,6 +283,23 @@ pub fn metadata_remote_env(metadata: Option<&str>) -> Vec<String> {
     acc.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
+/// Resolve the `userEnvProbe` from a `devcontainer.metadata` label.
+///
+/// Returns the LAST array entry that declares `userEnvProbe`, mirroring official
+/// `mergeConfiguration` (`reversed.find(entry => entry.userEnvProbe)`). The
+/// caller prefers the fresh `--config`'s value first (it sits in the official
+/// `pickUpdateableConfigProperties` whitelist, so it wins in every branch),
+/// then this baked value, then the CLI `--default-user-env-probe`.
+#[must_use]
+pub fn metadata_user_env_probe(metadata: Option<&str>) -> Option<String> {
+    let entries: Vec<Value> = serde_json::from_str(metadata?).ok()?;
+    entries.iter().rev().find_map(|e| {
+        e.get("userEnvProbe")
+            .and_then(Value::as_str)
+            .map(String::from)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +365,28 @@ mod tests {
         assert!(metadata_remote_env(None).is_empty());
         assert!(metadata_remote_env(Some("[]")).is_empty());
         assert!(metadata_remote_env(Some("not json")).is_empty());
+    }
+
+    #[test]
+    fn metadata_user_env_probe_last_entry_wins() {
+        // mergeConfiguration: reversed.find(entry => entry.userEnvProbe).
+        let meta = json!([
+            {"userEnvProbe": "loginInteractiveShell"},
+            {"id": "feature", "userEnvProbe": "interactiveShell"}
+        ])
+        .to_string();
+        assert_eq!(
+            metadata_user_env_probe(Some(&meta)).as_deref(),
+            Some("interactiveShell")
+        );
+    }
+
+    #[test]
+    fn metadata_user_env_probe_absent_or_no_label() {
+        assert!(metadata_user_env_probe(None).is_none());
+        assert!(metadata_user_env_probe(Some("[]")).is_none());
+        assert!(metadata_user_env_probe(Some(r#"[{"id":"f"}]"#)).is_none());
+        assert!(metadata_user_env_probe(Some("not json")).is_none());
     }
 
     #[test]

@@ -251,6 +251,22 @@ impl RunUserCommandsArgs {
         let config = self.read_config(workspace.as_deref())?;
         let metadata = container.labels.get("devcontainer.metadata").cloned();
 
+        // Official `getImageMetadataFromContainer` branches on `hasIdLabels`: a
+        // container matched by `--id-label` / workspace folder (true) is driven
+        // by its baked `devcontainer.metadata` alone, while one matched by raw
+        // `--container-id` (false) gets the on-disk `--config` appended to the
+        // metadata array. `--container-id` is cella's only non-label resolution
+        // path, so this approximates official's `hasIdLabels === false`. (It
+        // misses the rare `--container-id` + matching `--id-label` combo, which
+        // official treats as branch A; matching that exactly would require
+        // porting `findContainerAndIdLabels`.)
+        let appends_config = self.target.container_id.is_some();
+        let effective_metadata = cella_backend::lifecycle::effective_lifecycle_metadata(
+            metadata.as_deref(),
+            &config,
+            appends_config,
+        );
+
         let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
@@ -272,7 +288,7 @@ impl RunUserCommandsArgs {
             )
             .await;
 
-        let gating = self.build_gating(&config);
+        let gating = self.build_gating(&config, effective_metadata.as_deref());
         let (sender, renderer) = crate::progress::bridge(&progress);
         let lc_ctx = cella_backend::LifecycleContext {
             client: &*client,
@@ -285,7 +301,7 @@ impl RunUserCommandsArgs {
         };
         let input = orchestrator::RunUserCommandsInput {
             config: &config,
-            metadata: metadata.as_deref(),
+            metadata: effective_metadata.as_deref(),
             gating,
             dotfiles: orchestrator::DotfilesInputs {
                 repository: self.dotfiles.repository.as_deref(),
@@ -352,9 +368,14 @@ impl RunUserCommandsArgs {
         remote_env.extend(orchestrator::metadata_remote_env(metadata));
         remote_env.extend(map_env_object(config.get("remoteEnv")));
 
+        // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
+        // --config wins (it's in pickUpdateableConfigProperties, appended last in
+        // every branch), then the baked metadata's value, then the CLI default.
         let probe_type = config
             .get("userEnvProbe")
             .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| orchestrator::metadata_user_env_probe(metadata))
             .and_then(|s| s.parse().ok())
             .unwrap_or(self.default_user_env_probe);
         let shell = detect_shell(client, container_id, remote_user).await;
@@ -370,7 +391,15 @@ impl RunUserCommandsArgs {
     }
 
     /// Build the lifecycle gating from the parity flags and resolved `waitFor`.
-    fn build_gating(&self, config: &Value) -> orchestrator::Gating {
+    ///
+    /// `waitFor` is sourced from the effective metadata array (the baked
+    /// metadata, plus the on-disk `--config` in the `--container-id` case),
+    /// matching official `mergeConfiguration` — not from the fresh config alone.
+    fn build_gating(
+        &self,
+        config: &Value,
+        effective_metadata: Option<&str>,
+    ) -> orchestrator::Gating {
         orchestrator::Gating {
             stop: cella_backend::StopAfter {
                 skip_non_blocking: self.gate.skip_non_blocking_commands,
@@ -378,7 +407,10 @@ impl RunUserCommandsArgs {
             },
             stop_for_personalization: self.gate.stop_for_personalization,
             skip_post_attach: self.attach.skip_post_attach,
-            wait_for: cella_backend::WaitForPhase::from_config(config),
+            wait_for: cella_backend::WaitForPhase::from_metadata_or_config(
+                effective_metadata,
+                config,
+            ),
         }
     }
 }

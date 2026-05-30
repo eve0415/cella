@@ -430,6 +430,56 @@ pub fn lifecycle_entries_for_phase(
     )
 }
 
+/// Build the effective lifecycle-metadata array for an existing container,
+/// mirroring official `getImageMetadataFromContainer`.
+///
+/// When the container was matched by id-labels / workspace folder (official
+/// `hasIdLabels === true`), the container's own `devcontainer.metadata` alone
+/// drives the lifecycle, so the metadata is returned unchanged. When it was
+/// matched by raw `--container-id` (`hasIdLabels === false`), the on-disk
+/// `--config`/`--override-config` is appended as the FINAL array entry —
+/// official does this via `getDevcontainerMetadata` (`pick(config,
+/// pickConfigProperties)`), so the config's lifecycle hooks and `waitFor` take
+/// effect after the baked metadata. Only the lifecycle hooks and `waitFor` are
+/// picked here; `remoteEnv` / `remoteUser` / `userEnvProbe` are layered by the
+/// caller and must not be double-counted via this array.
+///
+/// With no metadata label the array is empty regardless of branch (official's
+/// no-label branch returns `getDevcontainerMetadata([], config)`), so `None` is
+/// returned and the caller sources lifecycle from the config directly.
+#[must_use]
+pub fn effective_lifecycle_metadata(
+    metadata: Option<&str>,
+    config: &Value,
+    append_config: bool,
+) -> Option<String> {
+    let raw = metadata?;
+    if !append_config {
+        return Some(raw.to_string());
+    }
+    let Ok(mut entries) = serde_json::from_str::<Vec<Value>>(raw) else {
+        return Some(raw.to_string());
+    };
+    let mut picked = serde_json::Map::new();
+    for key in [
+        "onCreateCommand",
+        "updateContentCommand",
+        "postCreateCommand",
+        "postStartCommand",
+        "postAttachCommand",
+        "waitFor",
+    ] {
+        if let Some(v) = config.get(key).filter(|v| !v.is_null()) {
+            picked.insert(key.to_string(), v.clone());
+        }
+    }
+    if picked.is_empty() {
+        return Some(raw.to_string());
+    }
+    entries.push(Value::Object(picked));
+    serde_json::to_string(&entries).map_or_else(|_| Some(raw.to_string()), Some)
+}
+
 /// Run a sequence of origin-tracked lifecycle entries with progress tracking.
 ///
 /// # Errors
@@ -571,6 +621,29 @@ impl WaitForPhase {
             Some("postStartCommand") => Self::PostStart,
             _ => Self::UpdateContent,
         }
+    }
+
+    /// Resolve `waitFor` for an existing container from its effective
+    /// lifecycle-metadata array (see [`effective_lifecycle_metadata`]).
+    ///
+    /// Mirrors official `mergeConfiguration` (`reversed.find(entry =>
+    /// entry.waitFor)?.waitFor`): the LAST array entry that declares `waitFor`
+    /// wins. Because the effective array already carries the on-disk `--config`
+    /// as its final entry in the `--container-id` case, this yields the config's
+    /// `waitFor` there and the baked metadata's otherwise. With no metadata
+    /// array the value comes from `config` (official's no-label branch); absent
+    /// everywhere it defaults to `updateContentCommand`.
+    #[must_use]
+    pub fn from_metadata_or_config(metadata: Option<&str>, config: &Value) -> Self {
+        let Some(raw) = metadata else {
+            return Self::from_config(config);
+        };
+        let entries: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+        entries
+            .iter()
+            .rev()
+            .find(|e| e.get("waitFor").and_then(Value::as_str).is_some())
+            .map_or(Self::UpdateContent, Self::from_config)
     }
 
     pub(crate) const fn ordinal(self) -> usize {
@@ -1567,6 +1640,90 @@ mod tests {
         assert_eq!(
             WaitForPhase::from_config(&json!({"waitFor": "updateContentCommand"})),
             WaitForPhase::UpdateContent
+        );
+    }
+
+    #[test]
+    fn effective_metadata_unchanged_in_branch_a() {
+        // hasIdLabels == true: baked metadata drives lifecycle alone; the fresh
+        // --config is NOT appended (would double-run hooks).
+        let meta = r#"[{"id":"feat","postCreateCommand":"a"}]"#;
+        let config = json!({"postCreateCommand": "b", "waitFor": "onCreateCommand"});
+        assert_eq!(
+            effective_lifecycle_metadata(Some(meta), &config, false).as_deref(),
+            Some(meta)
+        );
+    }
+
+    #[test]
+    fn effective_metadata_appends_config_in_branch_b() {
+        // hasIdLabels == false (--container-id): on-disk --config appended as
+        // the final array entry, carrying only lifecycle + waitFor (NOT
+        // remoteEnv, which the caller layers separately).
+        let meta = r#"[{"id":"feat","postCreateCommand":"a"}]"#;
+        let config = json!({
+            "postCreateCommand": "b",
+            "waitFor": "onCreateCommand",
+            "remoteEnv": {"X": "1"}
+        });
+        let eff = effective_lifecycle_metadata(Some(meta), &config, true).unwrap();
+        let arr: Vec<Value> = serde_json::from_str(&eff).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1].get("postCreateCommand").unwrap(), "b");
+        assert_eq!(arr[1].get("waitFor").unwrap(), "onCreateCommand");
+        assert!(arr[1].get("remoteEnv").is_none());
+    }
+
+    #[test]
+    fn effective_metadata_none_without_label() {
+        let config = json!({"postCreateCommand": "b"});
+        assert!(effective_lifecycle_metadata(None, &config, true).is_none());
+        assert!(effective_lifecycle_metadata(None, &config, false).is_none());
+    }
+
+    #[test]
+    fn effective_metadata_branch_b_empty_config_is_noop() {
+        let meta = r#"[{"id":"feat","postCreateCommand":"a"}]"#;
+        assert_eq!(
+            effective_lifecycle_metadata(Some(meta), &json!({}), true).as_deref(),
+            Some(meta)
+        );
+    }
+
+    #[test]
+    fn wait_for_metadata_last_entry_wins() {
+        // mergeConfiguration: reversed.find(entry => entry.waitFor). Fresh
+        // config's waitFor is ignored when a metadata array is present (branch A).
+        let meta = r#"[{"waitFor":"onCreateCommand"},{"id":"f","waitFor":"postStartCommand"}]"#;
+        assert_eq!(
+            WaitForPhase::from_metadata_or_config(
+                Some(meta),
+                &json!({"waitFor": "initializeCommand"})
+            ),
+            WaitForPhase::PostStart
+        );
+    }
+
+    #[test]
+    fn wait_for_metadata_absent_defaults_not_config() {
+        // Metadata present but no entry declares waitFor → default
+        // updateContentCommand, NOT the fresh config's waitFor.
+        let meta = r#"[{"id":"f","postCreateCommand":"a"}]"#;
+        assert_eq!(
+            WaitForPhase::from_metadata_or_config(
+                Some(meta),
+                &json!({"waitFor": "initializeCommand"})
+            ),
+            WaitForPhase::UpdateContent
+        );
+    }
+
+    #[test]
+    fn wait_for_falls_back_to_config_without_metadata() {
+        // No metadata array (no-label container) → source from config.
+        assert_eq!(
+            WaitForPhase::from_metadata_or_config(None, &json!({"waitFor": "postCreateCommand"})),
+            WaitForPhase::PostCreate
         );
     }
 
