@@ -1143,6 +1143,20 @@ pub async fn seed_tool_config_files(
             for file in &to_upload {
                 chown_in_container(client, container_id, remote_user, &file.path).await;
             }
+
+            // Also chown parent directories — create_tar_archive includes
+            // directory entries with root ownership that clobber the
+            // UID-remapped home directory.
+            let mut parents: Vec<&str> = to_upload
+                .iter()
+                .filter_map(|f| std::path::Path::new(&f.path).parent()?.to_str())
+                .collect();
+            parents.sort_unstable();
+            parents.dedup();
+            for parent in parents {
+                chown_in_container(client, container_id, remote_user, parent).await;
+            }
+
             debug!(
                 "Seeded {} tool config file(s) into container",
                 to_upload.len()
