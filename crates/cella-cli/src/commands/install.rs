@@ -61,7 +61,7 @@ impl InstallArgs {
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
-            id_label: self.id_label,
+            id_labels: self.id_label.into_iter().collect(),
             workspace_folder: self.workspace_folder,
         };
 

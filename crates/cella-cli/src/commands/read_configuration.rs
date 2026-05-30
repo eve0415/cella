@@ -59,7 +59,7 @@ impl ReadConfigurationArgs {
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
                 container_name: None,
-                id_label: self.id_label.clone(),
+                id_labels: self.id_label.iter().cloned().collect(),
                 workspace_folder: self.workspace_folder.clone(),
             };
             let container = target.resolve(&*client, false).await?;

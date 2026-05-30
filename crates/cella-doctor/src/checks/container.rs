@@ -104,7 +104,7 @@ async fn check_workspace_container(
     let target = ContainerTarget {
         container_id: None,
         container_name: None,
-        id_label: None,
+        id_labels: Vec::new(),
         workspace_folder: Some(workspace.clone()),
     };
 

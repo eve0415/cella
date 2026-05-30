@@ -111,7 +111,7 @@ impl DownArgs {
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder,
         };
 

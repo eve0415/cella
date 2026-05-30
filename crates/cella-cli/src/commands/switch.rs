@@ -45,7 +45,7 @@ impl SwitchArgs {
         let target = ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: Some(workspace_folder),
         };
 

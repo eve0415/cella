@@ -269,7 +269,7 @@ impl RunUserCommandsArgs {
         let target = ContainerTarget {
             container_id: self.target.container_id.clone(),
             container_name: None,
-            id_label: self.target.id_label.first().cloned(),
+            id_labels: self.target.id_label.clone(),
             workspace_folder: self.target.workspace_folder.clone(),
         };
         let container = target.resolve(&*client, false).await?;
@@ -561,6 +561,26 @@ mod tests {
             "EMPTY=",
         ]);
         assert!(r.is_ok(), "--remote-env with empty value must parse");
+    }
+
+    #[test]
+    fn multiple_id_labels_are_all_retained() {
+        use clap::Parser;
+        // Regression: repeatable --id-label must keep EVERY value (official
+        // AND-matches all of them). A prior bug truncated to the first label.
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "run-user-commands",
+            "--id-label",
+            "a=1",
+            "--id-label",
+            "b=2",
+        ])
+        .expect("two --id-label values must parse");
+        let crate::commands::Command::RunUserCommands(args) = &cli.command else {
+            panic!("expected run-user-commands subcommand");
+        };
+        assert_eq!(args.target.id_label, ["a=1", "b=2"]);
     }
 
     #[test]
