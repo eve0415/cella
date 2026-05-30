@@ -1138,17 +1138,40 @@ pub async fn seed_tool_config_files(
 
     match client.upload_files(container_id, &to_upload).await {
         Ok(()) => {
-            // Tar extraction runs as root, so the files land root-owned; chown
-            // each to the remote user or `claude`/tmux can't read its own config.
-            for file in &to_upload {
-                chown_in_container(client, container_id, remote_user, &file.path).await;
-            }
+            chown_uploaded_files_and_parents(client, container_id, remote_user, &to_upload).await;
             debug!(
                 "Seeded {} tool config file(s) into container",
                 to_upload.len()
             );
         }
         Err(e) => warn!("Failed to seed tool config files: {e}"),
+    }
+}
+
+/// Chown each uploaded file and its parent directories back to `remote_user`.
+///
+/// Tar extraction runs as root, so files land root-owned. Additionally,
+/// `create_tar_archive` includes directory entries with root ownership that
+/// clobber the UID-remapped home directory. This chowns both files and their
+/// unique parent directories.
+async fn chown_uploaded_files_and_parents(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    remote_user: &str,
+    files: &[FileToUpload],
+) {
+    for file in files {
+        chown_in_container(client, container_id, remote_user, &file.path).await;
+    }
+
+    let mut parents: Vec<&str> = files
+        .iter()
+        .filter_map(|f| std::path::Path::new(&f.path).parent()?.to_str())
+        .collect();
+    parents.sort_unstable();
+    parents.dedup();
+    for parent in parents {
+        chown_in_container(client, container_id, remote_user, parent).await;
     }
 }
 
@@ -3065,5 +3088,110 @@ mod tests {
             install_cmd.contains("bubblewrap"),
             "should install bubblewrap"
         );
+    }
+
+    // ── chown_uploaded_files_and_parents — parent directory chown regression ──
+
+    #[tokio::test]
+    async fn chown_after_upload_includes_deduped_parent_dirs() {
+        let files = vec![
+            FileToUpload {
+                path: "/home/dev/.claude.json".to_string(),
+                content: b"{}".to_vec(),
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/home/dev/.tmux.conf".to_string(),
+                content: b"set -g mouse on".to_vec(),
+                mode: 0o600,
+            },
+        ];
+
+        // 2 per-file chowns + 1 deduped parent chown = 3 exec calls
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // chown .claude.json
+            Ok(ok_exit(0)), // chown .tmux.conf
+            Ok(ok_exit(0)), // chown /home/dev (parent)
+        ]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 3, "2 file chowns + 1 parent chown");
+
+        assert_eq!(
+            calls[0].cmd,
+            vec!["chown", "-R", "dev:dev", "/home/dev/.claude.json"],
+        );
+        assert_eq!(
+            calls[1].cmd,
+            vec!["chown", "-R", "dev:dev", "/home/dev/.tmux.conf"],
+        );
+        assert_eq!(calls[2].cmd, vec!["chown", "-R", "dev:dev", "/home/dev"],);
+        assert_eq!(calls[2].user.as_deref(), Some("root"));
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_deduplicates_shared_parent() {
+        let files = vec![
+            FileToUpload {
+                path: "/home/dev/.config/tmux/tmux.conf".to_string(),
+                content: vec![],
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/home/dev/.config/tmux/plugins.conf".to_string(),
+                content: vec![],
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/home/dev/.claude.json".to_string(),
+                content: vec![],
+                mode: 0o600,
+            },
+        ];
+
+        // 3 file chowns + 2 unique parents (/home/dev/.config/tmux, /home/dev)
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)),
+            Ok(ok_exit(0)),
+            Ok(ok_exit(0)),
+            Ok(ok_exit(0)),
+            Ok(ok_exit(0)),
+        ]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 5, "3 file chowns + 2 unique parent chowns");
+
+        let parent_chowns: Vec<&str> = calls[3..].iter().map(|c| c.cmd[3].as_str()).collect();
+        assert!(parent_chowns.contains(&"/home/dev"));
+        assert!(parent_chowns.contains(&"/home/dev/.config/tmux"));
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_handles_single_file() {
+        let files = vec![FileToUpload {
+            path: "/home/dev/.claude.json".to_string(),
+            content: b"{}".to_vec(),
+            mode: 0o600,
+        }];
+
+        // 1 file chown + 1 parent chown
+        let backend = MockBackend::new(vec![Ok(ok_exit(0)), Ok(ok_exit(0))]);
+
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &files).await;
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].cmd[3], "/home/dev");
+    }
+
+    #[tokio::test]
+    async fn chown_after_upload_empty_is_noop() {
+        let backend = MockBackend::new(vec![]);
+        chown_uploaded_files_and_parents(&backend, "ctr", "dev", &[]).await;
+        assert!(backend.calls().is_empty());
     }
 }

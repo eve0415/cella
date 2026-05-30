@@ -856,6 +856,13 @@ impl EnsureUpContext<'_> {
                         )
                         .await;
                     let _ = self.client.upload_files(container_id, &files).await;
+                    crate::container_setup::chown_in_container(
+                        self.client,
+                        container_id,
+                        remote_user,
+                        &config_dir,
+                    )
+                    .await;
                     tracing::debug!("Seeded phantom gh credentials into container");
                 }
             } else {
@@ -1253,6 +1260,24 @@ impl EnsureUpContext<'_> {
                 },
             )
             .await;
+
+        // Ensure home directory ownership survives file uploads that include
+        // root-owned tar directory entries (e.g. seed_tool_config_files).
+        if remote_user != "root" {
+            let home = format!("/home/{remote_user}");
+            let _ = self
+                .client
+                .exec_command(
+                    container_id,
+                    &ExecOptions {
+                        cmd: vec!["chown".into(), format!("{remote_user}:{remote_user}"), home],
+                        user: Some("root".to_string()),
+                        env: None,
+                        working_dir: None,
+                    },
+                )
+                .await;
+        }
 
         self.install_tools_and_probe_env(
             container_id,
