@@ -430,29 +430,6 @@ pub fn lifecycle_entries_for_phase(
     )
 }
 
-/// Run a devcontainer.json config phase with progress output.
-///
-/// # Errors
-///
-/// Returns an error if the lifecycle command fails.
-pub async fn run_config_phase_with_output(
-    lc_ctx: &LifecycleContext<'_>,
-    phase: &str,
-    cmd: &Value,
-    progress: &ProgressSender,
-) -> Result<(), BackendError> {
-    let label = format!("Running the {phase} from devcontainer.json...");
-    let start = std::time::Instant::now();
-    progress.println(&format!("  \x1b[36m▸\x1b[0m {label}"));
-    let result = run_lifecycle_phase(lc_ctx, phase, cmd, "devcontainer.json").await;
-    let elapsed = format_elapsed(start.elapsed());
-    match &result {
-        Ok(()) => progress.println(&format!("  \x1b[32m✓\x1b[0m {label}{elapsed}")),
-        Err(e) => progress.println(&format!("  \x1b[31m✗\x1b[0m {label}: {e}")),
-    }
-    result
-}
-
 /// Run a sequence of origin-tracked lifecycle entries with progress tracking.
 ///
 /// # Errors
@@ -1013,17 +990,22 @@ pub async fn check_and_run_content_update(
 
     for &phase in phases {
         let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
+        // When metadata is present but defines no command for this phase, fall
+        // back to the devcontainer.json command — pushed into `entries` so it
+        // goes through `post_resolve` (variable substitution) like every other
+        // entry, instead of being run raw.
+        if entries.is_empty()
+            && let Some(cmd) = config.get(phase).filter(|v| !v.is_null())
+        {
+            entries.push(cella_features::LifecycleEntry {
+                origin: "devcontainer.json".into(),
+                command: cmd.clone(),
+            });
+        }
         if let Some(f) = post_resolve {
             f(&mut entries);
         }
         run_lifecycle_entries(lc_ctx, phase, &entries, progress).await?;
-
-        if entries.is_empty()
-            && let Some(cmd) = config.get(phase)
-            && !cmd.is_null()
-        {
-            run_config_phase_with_output(lc_ctx, phase, cmd, progress).await?;
-        }
     }
 
     // Only persist the new content hash when postCreateCommand actually ran.
