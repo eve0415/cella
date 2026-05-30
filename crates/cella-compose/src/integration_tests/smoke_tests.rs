@@ -23,6 +23,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
+        request_gpu: false,
     }
 }
 

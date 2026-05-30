@@ -140,6 +140,42 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn find_container_by_labels<'a>(
+        &'a self,
+        labels: &'a [String],
+    ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+        Box::pin(async move {
+            use bollard::query_parameters::ListContainersOptions;
+            use std::collections::HashMap;
+
+            if labels.is_empty() {
+                return Ok(None);
+            }
+            // Docker ANDs all label filters in the same `label` key, so every
+            // id-label must match for a container to be returned.
+            let filters: HashMap<String, Vec<String>> =
+                HashMap::from([("label".to_string(), labels.to_vec())]);
+            let options = ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            };
+            let containers = self
+                .inner()
+                .list_containers(Some(options))
+                .await
+                .map_err(|e| BackendError::Runtime(Box::new(e)))?;
+
+            if let Some(summary) = containers.into_iter().next() {
+                let id = summary.id.as_deref().unwrap_or_default();
+                let info = self.inspect_container(id).await?;
+                Ok(Some(info))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     fn container_logs<'a>(
         &'a self,
         id: &'a str,
@@ -282,6 +318,28 @@ impl ContainerBackend for DockerClient {
             crate::volume::detect_container_arch(self.inner())
                 .await
                 .map_err(BackendError::from)
+        })
+    }
+
+    fn detect_gpu_support(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(async move {
+            // API equivalent of `docker info -f '{{.Runtimes.nvidia}}'`: the
+            // daemon exposes an `nvidia` runtime whose binary is the
+            // nvidia-container-runtime. Treat a missing runtimes map (older
+            // API versions) as "no GPU support".
+            let info = self
+                .inner()
+                .info()
+                .await
+                .map_err(|e| BackendError::Runtime(Box::new(e)))?;
+            let has_nvidia = info.runtimes.is_some_and(|runtimes| {
+                runtimes.get("nvidia").is_some_and(|rt| {
+                    rt.path
+                        .as_deref()
+                        .is_some_and(|p| p.contains("nvidia-container-runtime"))
+                })
+            });
+            Ok(has_nvidia)
         })
     }
 

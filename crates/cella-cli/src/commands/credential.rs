@@ -82,7 +82,7 @@ async fn sync_gh(
     let target = ContainerTarget {
         container_id: container_id_override,
         container_name: None,
-        id_label: None,
+        id_labels: Vec::new(),
         workspace_folder: Some(cwd.clone()),
     };
     let container = target.resolve(client.as_ref(), true).await?;
@@ -252,7 +252,7 @@ async fn run_status(
     let target = ContainerTarget {
         container_id: args.container,
         container_name: None,
-        id_label: None,
+        id_labels: Vec::new(),
         workspace_folder: Some(cwd),
     };
 

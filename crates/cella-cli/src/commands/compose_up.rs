@@ -29,14 +29,28 @@ pub async fn compose_ensure_up(
         workspace_root: &ctx.resolved.workspace_root,
         container_name: &ctx.container_nm,
         remote_env: &ctx.remote_env,
-        remove_container: ctx.remove_container,
-        build_no_cache: ctx.build_no_cache,
+        cli_remote_env: &ctx.cli_remote_env,
+        resolution: cella_orchestrator::compose_up::ContainerResolution {
+            remove_container: ctx.resolution.remove_container,
+            build_no_cache: ctx.resolution.build_no_cache,
+            expect_existing_container: ctx.resolution.expect_existing_container,
+        },
         skip_checksum: ctx.skip_checksum,
         profiles: ctx.compose_profiles.clone(),
         env_files: ctx.compose_env_files.clone(),
         pull_policy: ctx.compose_pull_policy.clone(),
         network_rule_policy: ctx.network_rules,
         user_env_probe: ctx.probe_type(),
+        lifecycle_gate: ctx.lifecycle_gate,
+        build_tuning: ctx.compose_build_tuning(),
+        gpu_availability: ctx.gpu_availability(),
+        update_remote_user_uid_default: ctx.update_remote_user_uid_default(),
+        omit_remote_env_from_metadata: ctx.omit_remote_env_from_metadata(),
+        dotfiles: cella_orchestrator::compose_up::DotfilesConfig {
+            repository: ctx.dotfiles.repository.clone(),
+            install_command: ctx.dotfiles.install_command.clone(),
+            target_path: ctx.dotfiles.target_path.clone(),
+        },
     };
 
     let (sender, renderer) = crate::progress::bridge(&ctx.progress);
@@ -56,22 +70,25 @@ pub async fn compose_ensure_up(
             ComposeUpOutcome::Running => "running".to_string(),
         },
         ssh_agent_proxy: result.ssh_agent_proxy,
+        compose_project_name: Some(result.project_name),
+        configuration: None,
+        merged_configuration: None,
     })
 }
 
 /// Run the Docker Compose orchestration flow.
 ///
-/// Called from `UpArgs::execute()` when the resolved config contains `dockerComposeFile`.
-pub async fn compose_up(ctx: UpContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = compose_ensure_up(&ctx).await?;
-    output_result(
-        &ctx.output,
-        &result.outcome,
-        &result.container_id,
-        &result.remote_user,
-        &result.workspace_folder,
-        result.ssh_agent_proxy.as_ref(),
-    );
+/// Called from `UpArgs::execute()` when the resolved config contains
+/// `dockerComposeFile`. `result_flags` carries the `--include-configuration`
+/// / `--include-merged-configuration` toggles so the compose envelope matches
+/// the single-container one.
+pub async fn compose_up(
+    ctx: UpContext,
+    result_flags: &super::up::UpResultArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut result = compose_ensure_up(&ctx).await?;
+    super::up::populate_envelope_extras(result_flags, &ctx, &mut result).await?;
+    output_result(&super::up::result_render_data(&ctx.output, &result));
     Ok(())
 }
 
@@ -156,6 +173,34 @@ impl ComposeUpHooks for CliComposeUpHooks<'_> {
                 .post_create_setup(container_id, remote_user, &env_fwd, &settings, remote_env)
                 .await;
             lifecycle_env
+        })
+    }
+
+    fn install_dotfiles<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        remote_user: &'a str,
+        dotfiles: &'a cella_orchestrator::compose_up::DotfilesConfig,
+        lifecycle_env: &'a [String],
+    ) -> cella_orchestrator::compose_up::DotfilesInstallFuture<'a> {
+        Box::pin(async move {
+            // The orchestrator owns the install logic; bridge into it here (the
+            // CLI sees both crates, cella-compose does not). Caller already
+            // guards on repository.is_some(); be defensive in case that changes.
+            let Some(repository) = dotfiles.repository.as_deref() else {
+                return Ok(());
+            };
+            cella_orchestrator::dotfiles::install_dotfiles(
+                client,
+                container_id,
+                remote_user,
+                repository,
+                dotfiles.install_command.as_deref(),
+                &dotfiles.target_path,
+                lifecycle_env,
+            )
+            .await
         })
     }
 }

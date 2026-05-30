@@ -19,16 +19,55 @@ mod outdated;
 mod ports;
 mod prune;
 mod read_configuration;
+mod run_user_commands;
 mod shell;
 mod status;
 mod switch;
 mod template;
 pub mod up;
 
+use std::io::IsTerminal;
+
 use clap::{Args, Subcommand, ValueEnum};
 use tracing::warn;
 
 use crate::progress::{Progress, Verbosity};
+
+/// Validate an `--id-label` value (`name=value`, both non-empty). Shared by
+/// `up` and `run-user-commands` (the official validation is identical).
+pub fn parse_id_label(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
+        _ => Err("id-label must match <name>=<value>".to_string()),
+    }
+}
+
+/// Validate a `--remote-env` value (`name=value`, value may be empty). Shared
+/// by `up` and `run-user-commands`.
+pub fn parse_remote_env(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
+        _ => Err("remote-env must match <name>=<value>".to_string()),
+    }
+}
+
+/// Dotfiles install flags (`--dotfiles-*`). Shared verbatim by `up` and
+/// `run-user-commands`; flattened into each command's arg struct.
+#[derive(Args)]
+pub struct DotfilesArgs {
+    /// URL of a dotfiles Git repository to clone into the container.
+    #[arg(long = "dotfiles-repository")]
+    pub(crate) repository: Option<String>,
+
+    /// Command to run after cloning the dotfiles repository. Defaults to the
+    /// first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup.
+    #[arg(long = "dotfiles-install-command")]
+    pub(crate) install_command: Option<String>,
+
+    /// Path to clone the dotfiles repository to (default `~/dotfiles`).
+    #[arg(long = "dotfiles-target-path", default_value = "~/dotfiles")]
+    pub(crate) target_path: String,
+}
 
 /// Common flags for commands that support verbose output.
 #[derive(Args, Clone)]
@@ -41,8 +80,34 @@ pub struct VerboseArgs {
 /// Output format for container commands.
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
+    /// Resolve at runtime: `Json` when stdout is not a terminal
+    /// (piped/scripted), `Text` when attached to a terminal.
+    Auto,
     Text,
     Json,
+}
+
+impl OutputFormat {
+    /// Collapse `Auto` to a concrete `Text`/`Json` variant.
+    ///
+    /// `Auto` resolves to `Json` when stdout is not a terminal (the output is
+    /// being piped or captured by a script) and `Text` otherwise. `Text` and
+    /// `Json` pass through unchanged, so callers can `match` on the result
+    /// without ever seeing `Auto`.
+    #[must_use]
+    pub fn resolve(&self) -> Self {
+        match self {
+            Self::Auto => {
+                if std::io::stdout().is_terminal() {
+                    Self::Text
+                } else {
+                    Self::Json
+                }
+            }
+            Self::Text => Self::Text,
+            Self::Json => Self::Json,
+        }
+    }
 }
 
 /// Image pull policy for container builds.
@@ -111,6 +176,52 @@ impl ComposePullPolicy {
     }
 }
 
+/// Availability of GPUs for dev containers that request one.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum GpuAvailability {
+    /// Expect a GPU to be available.
+    All,
+    /// Use a GPU if one is detected and the config requires it (default).
+    Detect,
+    /// Never expose a GPU to the container.
+    None,
+}
+
+/// Default for updating the remote user's UID/GID to the local user's.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum UpdateRemoteUserUidDefault {
+    /// Never update the remote user's UID/GID.
+    Never,
+    /// Update by default unless devcontainer.json opts out (default).
+    On,
+    /// Do not update by default unless devcontainer.json opts in.
+    Off,
+}
+
+/// Log verbosity for lifecycle/terminal logging.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum LogLevel {
+    Info,
+    Debug,
+    Trace,
+}
+
+/// Log output format.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+/// Controls whether `BuildKit` is used when building images.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum BuildKitMode {
+    /// Use `BuildKit` when available (default).
+    Auto,
+    /// Never use `BuildKit`.
+    Never,
+}
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {
@@ -161,6 +272,9 @@ pub enum Command {
     /// Read and output the resolved devcontainer configuration.
     #[command(name = "read-configuration")]
     ReadConfiguration(read_configuration::ReadConfigurationArgs),
+    /// Re-run lifecycle hooks against an existing dev container.
+    #[command(name = "run-user-commands")]
+    RunUserCommands(run_user_commands::RunUserCommandsArgs),
     /// Generate shell completion scripts.
     Completion(completion::CompletionArgs),
     /// Manage the cella daemon.
@@ -176,7 +290,8 @@ impl Command {
             Self::Code(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
-            Self::ReadConfiguration(_) => false,
+            // Both emit a JSON envelope on stdout; spinners would fight it.
+            Self::ReadConfiguration(_) | Self::RunUserCommands(_) => false,
             _ => true,
         }
     }
@@ -204,6 +319,37 @@ impl Command {
         matches!(self, Self::Daemon(_))
     }
 
+    /// The `--log-level` value, if the subcommand carries one.
+    ///
+    /// Only `up` (and `code`, which embeds the `up` arg surface) expose
+    /// `--log-level`; every other variant returns `None`. main.rs reads this
+    /// once, before subcommand dispatch, to seed the global tracing filter —
+    /// the level can't be applied inside `execute()` because the subscriber is
+    /// already installed by then.
+    pub const fn log_level(&self) -> Option<LogLevel> {
+        match self {
+            Self::Up(args) => args.compat.log_level,
+            Self::Code(args) => args.up.compat.log_level,
+            Self::RunUserCommands(args) => args.compat.log_level,
+            _ => None,
+        }
+    }
+
+    /// The `--log-format` value (defaults to `Text`).
+    ///
+    /// Only `up`/`code` expose `--log-format`; every other variant returns
+    /// `Text`. Read once in main.rs to select the tracing formatter and to
+    /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
+    /// machine-readable JSON log lines on stderr).
+    pub const fn log_format(&self) -> LogFormat {
+        match self {
+            Self::Up(args) => args.compat.log_format,
+            Self::Code(args) => args.up.compat.log_format,
+            Self::RunUserCommands(args) => args.compat.log_format,
+            _ => LogFormat::Text,
+        }
+    }
+
     pub async fn execute(
         self,
         progress: Progress,
@@ -223,6 +369,7 @@ impl Command {
             Self::Switch(args) => args.execute().await,
             Self::Prune(args) => args.execute().await,
             Self::ReadConfiguration(args) => args.execute().await,
+            Self::RunUserCommands(args) => args.execute(progress).await,
             Self::Config(args) => args.execute(),
             Self::Template(args) => args.execute(),
             Self::Features(args) => args.execute(progress).await,

@@ -167,8 +167,36 @@ pub struct BuildOptions {
     pub args: HashMap<String, String>,
     pub target: Option<String>,
     pub cache_from: Vec<String>,
+    /// Cache export destination (`BuildKit` `--cache-to`). Emitted only on the
+    /// buildx branch; silently dropped when `BuildKit` is unavailable or
+    /// disabled, matching the official CLI.
+    pub cache_to: Option<String>,
     pub options: Vec<String>,
     pub secrets: Vec<BuildSecret>,
+    /// Whether `BuildKit`/buildx may be used for this build. `false` forces a
+    /// classic `docker build` (the `--buildkit never` decision); `true` lets
+    /// the backend probe for buildx and use it when present.
+    pub use_buildkit: bool,
+    /// Path to the `docker` CLI binary. `None` defaults to `docker` on `PATH`.
+    pub docker_path: Option<String>,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            image_name: String::new(),
+            context_path: PathBuf::new(),
+            dockerfile: String::new(),
+            args: HashMap::new(),
+            target: None,
+            cache_from: Vec::new(),
+            cache_to: None,
+            options: Vec::new(),
+            secrets: Vec::new(),
+            use_buildkit: true,
+            docker_path: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +249,89 @@ pub enum GpuRequest {
     DeviceIds(Vec<String>),
 }
 
+/// Resolved `--gpu-availability` policy, decoupled from the CLI clap enum.
+///
+/// Controls whether a config-requested GPU (`hostRequirements.gpu`) is granted.
+/// Never touches `runArgs` `--gpus`, which pass through verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuAvailability {
+    /// Force-grant the GPU request when the config asks for one.
+    All,
+    /// Grant iff the daemon exposes GPU support (default).
+    #[default]
+    Detect,
+    /// Never grant a config-requested GPU.
+    None,
+}
+
+/// Resolved `--update-remote-user-uid-default` policy, decoupled from the CLI
+/// clap enum. Decides the default when devcontainer.json omits
+/// `updateRemoteUserUID`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdateRemoteUserUidDefault {
+    /// Never remap, regardless of config.
+    Never,
+    /// Default `true`; devcontainer.json may opt out (default).
+    #[default]
+    On,
+    /// Default `false`; devcontainer.json may opt in.
+    Off,
+}
+
+/// Resolve whether the remote user's UID/GID should be remapped.
+///
+/// `config_value` is devcontainer.json's `updateRemoteUserUID` (when a boolean).
+/// `Never` always skips (config ignored); `On` defaults to `true`; `Off`
+/// defaults to `false`. In both `On`/`Off`, an explicit config boolean wins.
+#[must_use]
+pub const fn should_update_uid(
+    config_value: Option<bool>,
+    default: UpdateRemoteUserUidDefault,
+) -> bool {
+    match default {
+        UpdateRemoteUserUidDefault::Never => false,
+        UpdateRemoteUserUidDefault::On => match config_value {
+            Some(v) => v,
+            None => true,
+        },
+        UpdateRemoteUserUidDefault::Off => match config_value {
+            Some(v) => v,
+            None => false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // should_update_uid (--update-remote-user-uid-default)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_update_uid_on_defaults_true() {
+        use UpdateRemoteUserUidDefault::On;
+        assert!(should_update_uid(None, On));
+        assert!(!should_update_uid(Some(false), On)); // config wins
+        assert!(should_update_uid(Some(true), On));
+    }
+
+    #[test]
+    fn should_update_uid_off_defaults_false_but_config_opts_in() {
+        use UpdateRemoteUserUidDefault::Off;
+        assert!(!should_update_uid(None, Off));
+        assert!(should_update_uid(Some(true), Off)); // off != never: config opts in
+        assert!(!should_update_uid(Some(false), Off));
+    }
+
+    #[test]
+    fn should_update_uid_never_always_skips() {
+        use UpdateRemoteUserUidDefault::Never;
+        assert!(!should_update_uid(None, Never));
+        assert!(!should_update_uid(Some(true), Never)); // never overrides explicit true
+        assert!(!should_update_uid(Some(false), Never));
+    }
 
     // -----------------------------------------------------------------------
     // ContainerState::parse

@@ -34,6 +34,7 @@ fn override_file_exists_before_compose_uses_it() {
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
+        request_gpu: false,
     };
 
     let yaml = generate_override_yaml(&override_cfg);
@@ -188,6 +189,7 @@ fn additional_contexts_in_override_for_features() {
         additional_contexts,
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
+        request_gpu: false,
     };
 
     let yaml = generate_override_yaml(&override_cfg);

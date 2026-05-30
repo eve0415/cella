@@ -41,12 +41,14 @@ pub struct ComposeUpConfig<'a> {
     pub workspace_root: &'a Path,
     /// Container name for daemon registration.
     pub container_name: &'a str,
-    /// Extra environment variables to inject (`KEY=VALUE` format).
+    /// Extra environment variables to inject (`KEY=VALUE` format). From config
+    /// `remoteEnv`; used for lifecycle env AND the metadata label / containerEnv.
     pub remote_env: &'a [String],
-    /// Whether to tear down and recreate existing containers.
-    pub remove_container: bool,
-    /// Whether to rebuild with `--no-cache`.
-    pub build_no_cache: bool,
+    /// CLI `--remote-env` entries. Lifecycle command env ONLY (config
+    /// `remote_env` wins on collision); never enters labels or `containerEnv`.
+    pub cli_remote_env: &'a [String],
+    /// How to resolve an existing/missing container before building.
+    pub resolution: ContainerResolution,
     /// Skip agent checksum verification.
     pub skip_checksum: bool,
     /// Docker Compose profiles to activate (`--profile` flags).
@@ -59,6 +61,101 @@ pub struct ComposeUpConfig<'a> {
     pub network_rule_policy: cella_network::NetworkRulePolicy,
     /// Resolved userEnvProbe type (from config or CLI default).
     pub user_env_probe: cella_env::user_env_probe::UserEnvProbe,
+    /// Gates which lifecycle phases run for this compose `up` (built from
+    /// `--skip-post-create` / `--skip-non-blocking-commands` / `--prebuild` /
+    /// `--skip-post-attach`). `Default` runs every phase.
+    pub lifecycle_gate: cella_backend::LifecycleGate,
+    /// Build/backend tuning (`--docker-path`, `--docker-compose-path`,
+    /// `--buildkit`).
+    pub build_tuning: ComposeBuildTuning,
+    /// `--gpu-availability`: whether a config-requested GPU is granted.
+    pub gpu_availability: cella_backend::GpuAvailability,
+    /// `--update-remote-user-uid-default`: default for `updateRemoteUserUID`.
+    pub update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// generated `devcontainer.metadata` label. Does NOT affect the runtime
+    /// `dev.cella.remote_env` label.
+    pub omit_remote_env_from_metadata: bool,
+    /// Dotfiles install inputs (`--dotfiles-repository` / `-install-command` /
+    /// `-target-path`). Installed via [`ComposeUpHooks::install_dotfiles`] in
+    /// the post-create flow, between `postCreateCommand` and `postStartCommand`,
+    /// when `repository` is `Some` and the gate runs `postCreateCommand`.
+    pub dotfiles: DotfilesConfig,
+}
+
+impl ComposeUpConfig<'_> {
+    /// Lifecycle command environment: CLI `--remote-env` first, config
+    /// `remoteEnv` last so config wins on collision (the merge is later-wins).
+    /// Lifecycle-only — never enters labels or `containerEnv`.
+    fn lifecycle_remote_env(&self) -> Vec<String> {
+        self.cli_remote_env
+            .iter()
+            .chain(self.remote_env.iter())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Dotfiles installation inputs resolved from the `--dotfiles-*` CLI flags.
+///
+/// Mirrors `cella_orchestrator::config::DotfilesConfig` — duplicated here
+/// because cella-orchestrator depends on cella-compose (so cella-compose cannot
+/// import the orchestrator's type). `repository` being `Some` arms the install;
+/// the value is expected to be already normalized (owner/repo shorthand
+/// expanded) by the CLI before it reaches here. The actual clone+install runs
+/// via [`ComposeUpHooks::install_dotfiles`] so cella-compose never needs to
+/// reach the orchestrator's install logic.
+#[derive(Debug, Clone, Default)]
+pub struct DotfilesConfig {
+    /// `--dotfiles-repository`: clone source. `None` disables dotfiles install.
+    pub repository: Option<String>,
+    /// `--dotfiles-install-command`: explicit install script. `None` autodetects.
+    pub install_command: Option<String>,
+    /// `--dotfiles-target-path`: in-container clone target (default `~/dotfiles`).
+    pub target_path: String,
+}
+
+/// Build/backend tuning inputs for the compose `up` path.
+///
+/// `docker_path` selects the `docker` binary used for `docker compose`.
+/// `docker_compose_path` is the standalone (V1) `docker-compose` binary — cella
+/// is V2-only today, so it is accepted and stored but currently unused (see
+/// [`ComposeCommand`]). `use_buildkit` propagates the `--buildkit` decision to
+/// build sites cella owns (e.g. the UID-remap layer).
+#[derive(Debug, Clone, Default)]
+pub struct ComposeBuildTuning {
+    /// `docker` CLI binary path (`--docker-path`). `None` = `docker`.
+    pub docker_path: Option<String>,
+    /// Standalone `docker-compose` (V1) binary (`--docker-compose-path`).
+    /// Accepted-and-stored; reserved for a future V1 fallback.
+    pub docker_compose_path: Option<String>,
+    /// Whether `BuildKit`/buildx may be used (`false` = classic builder).
+    pub use_buildkit: bool,
+}
+
+impl ComposeUpConfig<'_> {
+    /// `(docker_path, docker_compose_path)` for [`ComposeCommand::with_docker_binaries`].
+    fn docker_binaries(&self) -> (Option<String>, Option<String>) {
+        (
+            self.build_tuning.docker_path.clone(),
+            self.build_tuning.docker_compose_path.clone(),
+        )
+    }
+}
+
+/// How to resolve an existing (or missing) compose container before building.
+///
+/// Groups the container-resolution flags so they live together and stay under
+/// the struct bool-count lint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContainerResolution {
+    /// Whether to tear down and recreate existing containers.
+    pub remove_container: bool,
+    /// Whether to rebuild with `--no-cache`.
+    pub build_no_cache: bool,
+    /// `--expect-existing-container`: fail (rather than create) if no compose
+    /// container is found. Gates before any build/up.
+    pub expect_existing_container: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +170,9 @@ pub struct ComposeUpResult {
     pub remote_user: String,
     /// Workspace folder path inside the container.
     pub workspace_folder: String,
+    /// Docker Compose project name (the `-p`/`COMPOSE_PROJECT_NAME` value).
+    /// Surfaced as `composeProjectName` in the `up` result envelope.
+    pub project_name: String,
     /// Whether the container was freshly created or already running.
     pub outcome: ComposeUpOutcome,
     /// SSH-agent proxy status, when an SSH-agent forwarding decision
@@ -93,6 +193,14 @@ pub enum ComposeUpOutcome {
 // ---------------------------------------------------------------------------
 // Hooks for CLI-specific operations
 // ---------------------------------------------------------------------------
+
+/// Boxed, fallible future returned by [`ComposeUpHooks::install_dotfiles`].
+///
+/// Aliased so the (necessarily verbose) `Pin<Box<dyn Future<Output = Result<…>>>>`
+/// shape stays under the `clippy::type_complexity` limit at both the trait
+/// definition and the CLI implementation.
+pub type DotfilesInstallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
 
 /// Callbacks for operations that live outside the orchestrator's dependency
 /// graph (daemon management, agent launch, etc.).
@@ -142,6 +250,25 @@ pub trait ComposeUpHooks: Send + Sync {
         workspace_root: &'a Path,
         remote_env: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
+
+    /// Clone and install dotfiles inside the container, as `remote_user`.
+    ///
+    /// Bridges the orchestrator-owned install logic (which cella-compose cannot
+    /// import without a dependency cycle) into the compose flow. Called between
+    /// `postCreateCommand` and `postStartCommand`. The returned `Err` is treated
+    /// as non-fatal by the caller (logged, never propagated). Defaults to a
+    /// no-op so non-CLI implementors (test doubles) need not override it.
+    fn install_dotfiles<'a>(
+        &'a self,
+        client: &'a dyn ContainerBackend,
+        container_id: &'a str,
+        remote_user: &'a str,
+        dotfiles: &'a DotfilesConfig,
+        lifecycle_env: &'a [String],
+    ) -> DotfilesInstallFuture<'a> {
+        let _ = (client, container_id, remote_user, dotfiles, lifecycle_env);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,18 +337,27 @@ pub async fn compose_up(
     let existing =
         find_compose_container(client, &project.project_name, &project.primary_service).await?;
 
+    // --expect-existing-container: fail before any build/up if no container
+    // exists (matches the official compose path, identical error string). A
+    // stopped container counts as existing, so this only fires on a true miss.
+    if existing.is_none() && cfg.resolution.expect_existing_container {
+        return Err(cella_backend::EXPECTED_CONTAINER_MISSING.into());
+    }
+
     if let Some(ref container) = existing {
         if container.state == ContainerState::Running
-            && !cfg.remove_container
-            && !cfg.build_no_cache
+            && !cfg.resolution.remove_container
+            && !cfg.resolution.build_no_cache
         {
             info!("Compose project already running, running postAttachCommand only");
             return handle_compose_running(&ctx, &project, container).await;
         }
 
-        if cfg.remove_container || cfg.build_no_cache {
+        if cfg.resolution.remove_container || cfg.resolution.build_no_cache {
             run_step_result(&progress, "Stopping existing compose project...", async {
-                let compose_cmd = ComposeCommand::from_project_name(&project.project_name);
+                let (dp, dcp) = cfg.docker_binaries();
+                let compose_cmd = ComposeCommand::from_project_name(&project.project_name)
+                    .with_docker_binaries(dp, dcp);
                 compose_cmd.down().await
             })
             .await?;
@@ -302,8 +438,14 @@ async fn resolve_user_and_env(
 ) {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let (image_user, image_meta_user) =
-        resolve_compose_image_info(client, project, features_build, progress).await;
+    let (image_user, image_meta_user) = resolve_compose_image_info(
+        client,
+        project,
+        features_build,
+        cfg.docker_binaries(),
+        progress,
+    )
+    .await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
@@ -352,6 +494,7 @@ async fn prepare_and_start(
         config,
         cfg.config_path,
         project,
+        cfg.omit_remote_env_from_metadata,
         progress,
     )
     .await?;
@@ -387,15 +530,18 @@ async fn prepare_and_start(
         extra_env: Vec::new(),
         labels: BTreeMap::new(),
         extra_volumes: Vec::new(),
+        // GPU reservation is emitted only in the final override, not at build.
+        request_gpu: false,
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
     // 9. Run docker compose build to ensure images exist for inspection.
-    let compose_cmd = ComposeCommand::new(project);
+    let (dp, dcp) = ctx.cfg.docker_binaries();
+    let compose_cmd = ComposeCommand::new(project).with_docker_binaries(dp, dcp);
     run_step_result(
         progress,
         "Building compose services...",
-        compose_cmd.build(None, cfg.build_no_cache),
+        compose_cmd.build(None, cfg.resolution.build_no_cache),
     )
     .await?;
 
@@ -467,7 +613,8 @@ async fn finalize_compose(
         .register_container(client, &primary.id, config, cfg.container_name)
         .await;
 
-    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe)
+    // 17. Post-create setup (UID, env, credentials, tools, userEnvProbe).
+    let lifecycle_remote_env = cfg.lifecycle_remote_env();
     let lifecycle_env = hooks
         .post_create_setup(
             client,
@@ -475,7 +622,7 @@ async fn finalize_compose(
             remote_user,
             config,
             cfg.workspace_root,
-            cfg.remote_env,
+            &lifecycle_remote_env,
         )
         .await;
 
@@ -488,7 +635,13 @@ async fn finalize_compose(
     // 19. Launch agent as background process via exec
     hooks.launch_agent(client, &primary.id, agent_arch).await;
 
-    // 20. Run lifecycle phases (primary service only)
+    // 20. Run lifecycle phases (primary service only). Honor the lifecycle
+    // gate: --skip-post-create drops everything, --prebuild and
+    // --skip-non-blocking-commands stop after the waitFor phase, and
+    // --skip-post-attach drops only postAttachCommand. Compose runs phases
+    // sequentially in the foreground (no backgrounding), so the gate's
+    // "does this phase run?" decision is all that applies here.
+    let gate = cfg.lifecycle_gate;
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
     for phase in [
@@ -498,6 +651,9 @@ async fn finalize_compose(
         "postStartCommand",
         "postAttachCommand",
     ] {
+        if !gate.runs_phase(phase) {
+            continue;
+        }
         let mut entries = lifecycle_entries_for_phase(metadata, config, phase);
         cella_config::config_map::substitute_lifecycle_entries(&mut entries, &subst_ctx);
         let lc_ctx = build_lifecycle_ctx(
@@ -509,15 +665,59 @@ async fn finalize_compose(
             progress,
         );
         run_lifecycle_entries(&lc_ctx, phase, &entries, progress).await?;
+
+        // Dotfiles install runs after postCreateCommand but past the postCreate
+        // skipNonBlocking checkpoint (official injectHeadless.ts:392, after the
+        // :388 return). Gate on postStartCommand (not postCreateCommand) so
+        // `--skip-non-blocking-commands` with `waitFor: postCreateCommand`
+        // correctly skips dotfiles. Non-fatal: a failure warns but never fails `up`.
+        if phase == "postCreateCommand"
+            && cfg.dotfiles.repository.is_some()
+            && gate.runs_phase("postStartCommand")
+        {
+            install_dotfiles_step(ctx, &primary.id, remote_user, &lifecycle_env).await;
+        }
     }
 
     Ok(ComposeUpResult {
         container_id: primary.id,
         remote_user: remote_user.to_string(),
         workspace_folder: project.workspace_folder.clone(),
+        project_name: project.project_name.clone(),
         outcome: ComposeUpOutcome::Created,
         ssh_agent_proxy: None,
     })
+}
+
+/// Run the dotfiles install hook with progress reporting (non-fatal on error).
+///
+/// A dotfiles failure is logged and surfaced as a progress warning but never
+/// propagated, so `up` still succeeds — matching the official tool.
+async fn install_dotfiles_step(
+    ctx: &Ctx<'_>,
+    container_id: &str,
+    remote_user: &str,
+    lifecycle_env: &[String],
+) {
+    let (client, cfg, hooks, progress) = (ctx.client, ctx.cfg, ctx.hooks, ctx.progress);
+    let step = progress.step("Installing dotfiles...");
+    match hooks
+        .install_dotfiles(
+            client,
+            container_id,
+            remote_user,
+            &cfg.dotfiles,
+            lifecycle_env,
+        )
+        .await
+    {
+        Ok(()) => step.finish(),
+        Err(e) => {
+            warn!("Dotfiles install failed (continuing): {e}");
+            step.fail("failed");
+            progress.warn(&format!("Dotfiles install failed (continuing): {e}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,10 +805,14 @@ async fn handle_compose_running(
     // (potentially updated) cella network IP.
     restart_agent_in_container(client, &container.id).await;
 
-    if let Some(cmd) = config.get("postAttachCommand")
+    // postAttachCommand runs on every attach to an already-running compose
+    // project. Honor the gate (--skip-post-create / --skip-post-attach /
+    // stop-after flags all suppress it).
+    if cfg.lifecycle_gate.runs_post_attach()
+        && let Some(cmd) = config.get("postAttachCommand")
         && !cmd.is_null()
     {
-        let lifecycle_env: Vec<String> = cfg.remote_env.to_vec();
+        let lifecycle_env = cfg.lifecycle_remote_env();
         let lc_ctx = build_lifecycle_ctx(
             client,
             &container.id,
@@ -633,6 +837,7 @@ async fn handle_compose_running(
         container_id: container.id.clone(),
         remote_user,
         workspace_folder: project.workspace_folder.clone(),
+        project_name: project.project_name.clone(),
         outcome: ComposeUpOutcome::Running,
         ssh_agent_proxy: None,
     })
@@ -645,6 +850,9 @@ struct OverrideContext {
     extra_env: Vec<String>,
     labels: BTreeMap<String, String>,
     extra_volumes: Vec<MountSpec>,
+    /// Whether to emit the GPU reservation block (config requires a GPU AND
+    /// `--gpu-availability` grants it). Net-new compose GPU support.
+    request_gpu: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +881,9 @@ fn write_build_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
+        // The build-time override never needs the GPU reservation; it is
+        // emitted only in the final override used for `compose up`.
+        request_gpu: false,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -698,6 +909,7 @@ async fn resolve_compose_image_info(
     client: &dyn ContainerBackend,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
+    docker_binaries: (Option<String>, Option<String>),
     progress: &ProgressSender,
 ) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
     // If features resolved an image, its metadata was already extracted.
@@ -710,7 +922,8 @@ async fn resolve_compose_image_info(
     }
 
     // Resolve compose config to find the service's image source.
-    let compose_cmd = ComposeCommand::without_override(project);
+    let (dp, dcp) = docker_binaries;
+    let compose_cmd = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
     let resolved = match compose_cmd.config().await {
         Ok(r) => r,
         Err(e) => {
@@ -766,6 +979,42 @@ async fn resolve_compose_image_info(
 // UID remap
 // ---------------------------------------------------------------------------
 
+/// Whether the compose service should be granted a GPU.
+///
+/// Mirrors the single-container gate: the config must request a GPU
+/// (`hostRequirements.gpu` truthy) AND `--gpu-availability` must grant it
+/// (`all` => always, `none` => never, `detect` => daemon probe). When the
+/// config requires a GPU but support is declined, the official warning is
+/// emitted (unless the requirement was marked `optional`).
+async fn resolve_compose_gpu(ctx: &Ctx<'_>, config: &serde_json::Value) -> bool {
+    let gpu = config.get("hostRequirements").and_then(|h| h.get("gpu"));
+    let requires_gpu = matches!(
+        gpu,
+        Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+    ) || gpu.and_then(serde_json::Value::as_str) == Some("optional");
+    if !requires_gpu {
+        return false;
+    }
+
+    let supported = match ctx.cfg.gpu_availability {
+        cella_backend::GpuAvailability::All => true,
+        cella_backend::GpuAvailability::None => false,
+        cella_backend::GpuAvailability::Detect => {
+            ctx.client.detect_gpu_support().await.unwrap_or(false)
+        }
+    };
+
+    if !supported {
+        let is_optional = gpu.and_then(serde_json::Value::as_str) == Some("optional");
+        if !is_optional {
+            ctx.progress.warn(
+                "No GPU support found yet a GPU was required - consider marking it as \"optional\"",
+            );
+        }
+    }
+    supported
+}
+
 /// Build a UID-remapped image for the compose service.
 ///
 /// Returns the UID-remapped image name, or `None` if remap was skipped.
@@ -776,12 +1025,13 @@ async fn build_uid_remap_image_compose(
     remote_user: &str,
     image_user: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let update_uid = ctx
+    let config_value = ctx
         .cfg
         .config
         .get("updateRemoteUserUID")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .and_then(serde_json::Value::as_bool);
+    let update_uid =
+        cella_backend::should_update_uid(config_value, ctx.cfg.update_remote_user_uid_default);
 
     if !update_uid {
         return Ok(None);
@@ -796,6 +1046,10 @@ async fn build_uid_remap_image_compose(
         &compose_image,
         image_user,
         remote_user,
+        cella_backend::uid_image::BuildToolchain {
+            docker_path: ctx.cfg.build_tuning.docker_path.as_deref(),
+            use_buildkit: ctx.cfg.build_tuning.use_buildkit,
+        },
         ctx.progress,
     )
     .await
@@ -827,6 +1081,7 @@ fn write_final_override(
             .unwrap_or_default(),
         build_secrets: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
+        request_gpu: ov.request_gpu,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -883,8 +1138,11 @@ async fn build_override_and_start(
         subst_ctx: &subst_ctx,
         agent_vol_target: &agent_vol_target,
         agent_vol_name: &agent_vol_name,
+        docker_binaries: cfg.docker_binaries(),
     })
     .await?;
+
+    let request_gpu = resolve_compose_gpu(ctx, config).await;
 
     let mut ov_ctx = OverrideContext {
         agent_vol_name,
@@ -892,6 +1150,7 @@ async fn build_override_and_start(
         extra_env,
         labels,
         extra_volumes: mount_specs,
+        request_gpu,
     };
 
     let uid_image =
@@ -1147,6 +1406,8 @@ struct ComposeMountParams<'a> {
     /// Agent volume name (e.g., `cella-agent`). Volume mounts aliasing this
     /// source name are rejected regardless of their target path.
     agent_vol_name: &'a str,
+    /// `(docker_path, docker_compose_path)` for the compose-config probe.
+    docker_binaries: (Option<String>, Option<String>),
 }
 
 /// Build compose mount specs: tool configs, SSH/GPG forwarding, parent-git,
@@ -1239,7 +1500,8 @@ async fn build_compose_mount_specs(
     //
     // If `docker compose config` fails, emit a warning and skip both
     // validation and dedup — Docker Compose will surface any eventual collision.
-    let validation_cmd = ComposeCommand::without_override(p.project);
+    let (dp, dcp) = p.docker_binaries;
+    let validation_cmd = ComposeCommand::without_override(p.project).with_docker_binaries(dp, dcp);
     match validation_cmd.config().await {
         Ok(resolved) => {
             // Reject the whole `cella up` if the user's base compose file aliases
@@ -1422,14 +1684,20 @@ mod tests {
             workspace_root: &workspace_root,
             container_name: "test-container",
             remote_env: &[],
-            remove_container: false,
-            build_no_cache: false,
+            cli_remote_env: &[],
+            resolution: ContainerResolution::default(),
             skip_checksum: false,
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
+            dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test".to_string(),
@@ -1482,14 +1750,20 @@ mod tests {
             workspace_root: workspace_dir.path(),
             container_name: "test-container",
             remote_env: &[],
-            remove_container: false,
-            build_no_cache: false,
+            cli_remote_env: &[],
+            resolution: ContainerResolution::default(),
             skip_checksum: false,
             profiles: vec![],
             env_files: vec![],
             pull_policy: None,
             network_rule_policy: cella_network::NetworkRulePolicy::Enforce,
             user_env_probe: cella_env::user_env_probe::UserEnvProbe::default(),
+            lifecycle_gate: cella_backend::LifecycleGate::default(),
+            build_tuning: ComposeBuildTuning::default(),
+            gpu_availability: cella_backend::GpuAvailability::default(),
+            update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
+            omit_remote_env_from_metadata: false,
+            dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {
             project_name: "cella-test-project".to_string(),

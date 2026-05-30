@@ -59,7 +59,7 @@ impl ReadConfigurationArgs {
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
                 container_name: None,
-                id_label: self.id_label.clone(),
+                id_labels: self.id_label.iter().cloned().collect(),
                 workspace_folder: self.workspace_folder.clone(),
             };
             let container = target.resolve(&*client, false).await?;
@@ -78,23 +78,7 @@ impl ReadConfigurationArgs {
         };
 
         if let Some(ref additional) = self.additional_features {
-            let extra: serde_json::Value = serde_json::from_str(additional)
-                .map_err(|e| format!("--additional-features: invalid JSON: {e}"))?;
-            let obj = extra
-                .as_object()
-                .ok_or("--additional-features must be a JSON object")?;
-            let features = resolved
-                .config
-                .as_object_mut()
-                .expect("config is always an object")
-                .entry("features")
-                .or_insert_with(|| json!({}));
-            let features_obj = features
-                .as_object_mut()
-                .ok_or("existing features field is not an object")?;
-            for (k, v) in obj {
-                features_obj.insert(k.clone(), v.clone());
-            }
+            super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
         let device_type = if resolved.config.get("dockerComposeFile").is_some() {
@@ -147,7 +131,15 @@ impl ReadConfigurationArgs {
     }
 }
 
-async fn resolve_merged_config(
+/// Build the features-merged configuration for a resolved devcontainer.
+///
+/// Reused by `up --include-merged-configuration`.
+///
+/// KNOWN GAP: this performs an additive overwrite that keeps lifecycle keys
+/// SINGULAR (`onCreateCommand`), whereas the official `mergeConfiguration`
+/// emits PLURAL arrays (`onCreateCommands` etc.), a `customizations` Record,
+/// and boolean-OR/union/last-wins scalar resolution. Tracked for a follow-up.
+pub async fn resolve_merged_config(
     config: &serde_json::Value,
     config_path: &std::path::Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -164,6 +156,9 @@ async fn resolve_merged_config(
         base_image,
         image_user: "root",
         metadata: None,
+        // read-configuration only merges config; no label is persisted, so the
+        // omit-remote-env flag does not apply here.
+        omit_remote_env: false,
     };
     let rf =
         cella_features::resolve_features(config, config_path, &platform, &cache, &base_ctx, false)

@@ -365,7 +365,7 @@ pub async fn resolve_up_workspace(up_args: &mut crate::commands::up::UpArgs) {
 pub const fn has_explicit_target(target: &cella_backend::ContainerTarget) -> bool {
     target.container_id.is_some()
         || target.container_name.is_some()
-        || target.id_label.is_some()
+        || !target.id_labels.is_empty()
         || target.workspace_folder.is_some()
 }
 
@@ -654,7 +654,7 @@ mod tests {
         let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert!(!has_explicit_target(&target));
@@ -665,7 +665,7 @@ mod tests {
         let target = cella_backend::ContainerTarget {
             container_id: Some("abc123".to_string()),
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert!(has_explicit_target(&target));
@@ -676,7 +676,7 @@ mod tests {
         let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: Some("my-container".to_string()),
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert!(has_explicit_target(&target));
@@ -687,7 +687,7 @@ mod tests {
         let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: Some("dev.cella.id=abc".to_string()),
+            id_labels: vec!["dev.cella.id=abc".to_string()],
             workspace_folder: None,
         };
         assert!(has_explicit_target(&target));
@@ -698,7 +698,7 @@ mod tests {
         let target = cella_backend::ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: Some("/workspaces/myapp".into()),
         };
         assert!(has_explicit_target(&target));

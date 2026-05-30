@@ -875,6 +875,8 @@ mod tests {
 
     #[test]
     fn gpu_request_used_when_no_run_args_gpu() {
+        // `--gpu-availability all` resolves to `GpuRequest::All`: a single
+        // device request with count -1 and capabilities [["gpu"]].
         let mut opts = minimal_opts();
         opts.gpu_request = Some(GpuRequest::All);
         let config = to_bollard_config(&opts);
@@ -882,6 +884,18 @@ mod tests {
         let devs = hc.device_requests.unwrap();
         assert_eq!(devs.len(), 1);
         assert_eq!(devs[0].count, Some(-1));
+        assert_eq!(devs[0].capabilities, Some(vec![vec!["gpu".to_string()]]));
+    }
+
+    #[test]
+    fn no_gpu_request_means_no_device_request() {
+        // `--gpu-availability none` strips `gpu_request` in the orchestrator;
+        // with neither a request nor a runArgs GPU, no DeviceRequest is emitted.
+        let opts = minimal_opts();
+        assert!(opts.gpu_request.is_none());
+        let config = to_bollard_config(&opts);
+        let hc = config.host_config.unwrap();
+        assert!(hc.device_requests.is_none());
     }
 
     #[test]

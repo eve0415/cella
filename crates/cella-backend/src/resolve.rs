@@ -15,7 +15,9 @@ use crate::types::{ContainerInfo, ContainerState};
 pub struct ContainerTarget {
     pub container_id: Option<String>,
     pub container_name: Option<String>,
-    pub id_label: Option<String>,
+    /// `key=value` id labels; ALL must match (AND), mirroring the official
+    /// `--id-label` semantics. Empty means "no id-label targeting".
+    pub id_labels: Vec<String>,
     pub workspace_folder: Option<PathBuf>,
 }
 
@@ -25,7 +27,7 @@ impl ContainerTarget {
     /// Resolution priority (first match wins):
     /// 1. `container_id` — direct inspect
     /// 2. `container_name` — backend resolves names via inspect
-    /// 3. `id_label` — search containers by label
+    /// 3. `id_labels` — search containers matching ALL labels (AND)
     /// 4. `workspace_folder` — search by `dev.cella.workspace_path` label
     /// 5. CWD fallback — `std::env::current_dir()` as `workspace_folder`
     ///
@@ -60,8 +62,8 @@ impl ContainerTarget {
         if let Some(ref name) = self.container_name {
             return self.find_by_name(client, name).await;
         }
-        if let Some(ref label) = self.id_label {
-            return self.find_by_label(client, label).await;
+        if !self.id_labels.is_empty() {
+            return self.find_by_labels(client, &self.id_labels).await;
         }
         self.find_by_workspace_or_cwd(client).await
     }
@@ -103,18 +105,20 @@ impl ContainerTarget {
         self.find_by_workspace(client, &folder).await
     }
 
-    async fn find_by_label(
+    async fn find_by_labels(
         &self,
         client: &dyn ContainerBackend,
-        label: &str,
+        labels: &[String],
     ) -> Result<ContainerInfo, BackendError> {
-        debug!("Resolving container by label: {label}");
-        // Search all runtime containers (not just cella-managed ones).
-        client.find_container_by_label(label).await?.ok_or_else(|| {
-            BackendError::ContainerNotFound {
-                identifier: format!("label={label}"),
-            }
-        })
+        debug!("Resolving container by labels: {}", labels.join(", "));
+        // Search all runtime containers (not just cella-managed ones); every
+        // label must match (AND), mirroring the official `--id-label` semantics.
+        client
+            .find_container_by_labels(labels)
+            .await?
+            .ok_or_else(|| BackendError::ContainerNotFound {
+                identifier: labels.join(","),
+            })
     }
 
     async fn find_by_workspace(
@@ -140,12 +144,12 @@ mod tests {
         let target = ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert!(target.container_id.is_none());
         assert!(target.container_name.is_none());
-        assert!(target.id_label.is_none());
+        assert!(target.id_labels.is_empty());
         assert!(target.workspace_folder.is_none());
     }
 
@@ -154,7 +158,7 @@ mod tests {
         let target = ContainerTarget {
             container_id: Some("abc123".to_string()),
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert_eq!(target.container_id.as_deref(), Some("abc123"));
@@ -165,21 +169,21 @@ mod tests {
         let target = ContainerTarget {
             container_id: None,
             container_name: Some("my-container".to_string()),
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: None,
         };
         assert_eq!(target.container_name.as_deref(), Some("my-container"));
     }
 
     #[test]
-    fn container_target_with_label() {
+    fn container_target_with_labels() {
         let target = ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: Some("dev.cella.id=xyz".to_string()),
+            id_labels: vec!["dev.cella.id=xyz".to_string(), "owner=me".to_string()],
             workspace_folder: None,
         };
-        assert_eq!(target.id_label.as_deref(), Some("dev.cella.id=xyz"));
+        assert_eq!(target.id_labels, ["dev.cella.id=xyz", "owner=me"]);
     }
 
     #[test]
@@ -187,7 +191,7 @@ mod tests {
         let target = ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: Some(PathBuf::from("/home/user/project")),
         };
         assert_eq!(
@@ -201,12 +205,12 @@ mod tests {
         let target = ContainerTarget {
             container_id: Some("id-1".to_string()),
             container_name: Some("name-1".to_string()),
-            id_label: Some("label=val".to_string()),
+            id_labels: vec!["label=val".to_string()],
             workspace_folder: Some(PathBuf::from("/ws")),
         };
         assert!(target.container_id.is_some());
         assert!(target.container_name.is_some());
-        assert!(target.id_label.is_some());
+        assert!(!target.id_labels.is_empty());
         assert!(target.workspace_folder.is_some());
     }
 
@@ -215,7 +219,7 @@ mod tests {
         let target = ContainerTarget {
             container_id: None,
             container_name: None,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder: Some(PathBuf::from("/home/user/my project/repo")),
         };
         assert_eq!(

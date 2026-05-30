@@ -139,6 +139,24 @@ mod tests {
     }
 
     #[test]
+    fn merge_env_later_entry_wins_config_over_cli() {
+        // The `up` lifecycle env is built as [CLI --remote-env..., config
+        // remoteEnv...] and fed here, so config must win on key collision
+        // (merge_env applies entries in order, last write wins).
+        let probed = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let entries = vec![
+            "FOO=cli".to_string(),
+            "FOO=cfg".to_string(),
+            "BAR=cli".to_string(),
+        ];
+        let merged = merge_env(&probed, &entries);
+        assert!(merged.contains(&"FOO=cfg".to_string()));
+        assert!(!merged.contains(&"FOO=cli".to_string()));
+        assert!(merged.contains(&"BAR=cli".to_string()));
+        assert!(merged.contains(&"PATH=/usr/bin".to_string()));
+    }
+
+    #[test]
     fn parse_env_output() {
         let output = "HOME=/home/user\0PATH=/usr/bin:/bin\0SHELL=/bin/bash\0";
         let env = parse_probed_env(output);

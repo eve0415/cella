@@ -26,6 +26,10 @@ pub struct FeaturesLayerContext<'a> {
     pub base_image: &'a str,
     pub image_user: &'a str,
     pub no_cache: bool,
+    /// Toolchain inputs only (docker binary + `BuildKit` decision). The
+    /// features layer never inherits CLI cache I/O — its FROM image is a
+    /// cella-internal base no external registry cache would match.
+    pub build_tuning: crate::config::BuildTuning<'a>,
     pub progress: &'a ProgressSender,
 }
 
@@ -63,8 +67,11 @@ pub async fn build_features_layer(
         args,
         target: None,
         cache_from: vec![],
+        cache_to: None,
         options,
         secrets: vec![],
+        use_buildkit: ctx.build_tuning.use_buildkit,
+        docker_path: ctx.build_tuning.docker_path.map(str::to_string),
     };
 
     info!(
@@ -99,6 +106,12 @@ pub struct EnsureImageInput<'a> {
     pub pull_policy: Option<&'a str>,
     /// `BuildKit` secrets forwarded to every `docker build` as `--secret` flags.
     pub secrets: &'a [BuildSecret],
+    /// Build/backend tuning. Toolchain inputs (`docker_path`, `use_buildkit`)
+    /// apply to every build site; cache I/O applies to the base build only.
+    pub build_tuning: crate::config::BuildTuning<'a>,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// generated `devcontainer.metadata` label baked into the built image.
+    pub omit_remote_env_from_metadata: bool,
     pub progress: &'a ProgressSender,
 }
 
@@ -144,6 +157,8 @@ pub async fn ensure_image(
         base_image_tag: &base_image_tag,
         base_image_details: &base_image_details,
         no_cache: input.no_cache,
+        build_tuning: input.build_tuning,
+        omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
         progress: input.progress,
     };
     let (features_image, resolved) = resolve_and_build_features(&features_input).await?;
@@ -230,11 +245,17 @@ async fn resolve_base_image(
             input.workspace_root,
             input.no_cache,
             input.pull_policy,
+            input.build_tuning,
         );
         build_opts.secrets = input.secrets.to_vec();
 
         if !will_build_features {
-            let metadata_label = cella_features::generate_metadata_label(&[], input.config, None);
+            let metadata_label = cella_features::generate_metadata_label(
+                &[],
+                input.config,
+                None,
+                input.omit_remote_env_from_metadata,
+            );
             build_opts
                 .options
                 .push(format!("--label=devcontainer.metadata={metadata_label}"));
@@ -275,6 +296,8 @@ struct FeaturesBuildInput<'a> {
     base_image_tag: &'a str,
     base_image_details: &'a ImageDetails,
     no_cache: bool,
+    build_tuning: crate::config::BuildTuning<'a>,
+    omit_remote_env_from_metadata: bool,
     progress: &'a ProgressSender,
 }
 
@@ -301,6 +324,7 @@ async fn resolve_and_build_features(
             base_image: input.base_image_tag,
             image_user: &input.base_image_details.user,
             metadata: input.base_image_details.metadata.as_deref(),
+            omit_remote_env: input.omit_remote_env_from_metadata,
         },
         false, // non-compose: build context IS the features dir, bare COPY works
     )
@@ -316,6 +340,7 @@ async fn resolve_and_build_features(
         base_image: input.base_image_tag,
         image_user: &input.base_image_details.user,
         no_cache: input.no_cache,
+        build_tuning: input.build_tuning.toolchain(),
         progress: input.progress,
     };
     let features_image = build_features_layer(&ctx).await?;
@@ -351,6 +376,7 @@ pub fn parse_build_options(
     workspace_root: &Path,
     no_cache: bool,
     pull_policy: Option<&str>,
+    build_tuning: crate::config::BuildTuning<'_>,
 ) -> BuildOptions {
     let dockerfile = build
         .get("dockerfile")
@@ -381,7 +407,7 @@ pub fn parse_build_options(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let cache_from: Vec<String> = build
+    let config_cache_from: Vec<String> = build
         .get("cacheFrom")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -390,6 +416,19 @@ pub fn parse_build_options(
                 .collect()
         })
         .unwrap_or_default();
+
+    // CLI `--cache-from` is prepended before config `cacheFrom` (matching the
+    // official ordering); both are dropped entirely under `--no-cache`.
+    let cache_from: Vec<String> = if no_cache {
+        Vec::new()
+    } else {
+        build_tuning
+            .cli_cache_from
+            .iter()
+            .cloned()
+            .chain(config_cache_from)
+            .collect()
+    };
 
     let mut options: Vec<String> = build
         .get("options")
@@ -418,14 +457,19 @@ pub fn parse_build_options(
         args,
         target,
         cache_from,
+        // `--cache-to` applies to the base Dockerfile build only.
+        cache_to: build_tuning.cache_to.map(str::to_string),
         options,
         secrets: vec![],
+        use_buildkit: build_tuning.use_buildkit,
+        docker_path: build_tuning.docker_path.map(str::to_string),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BuildTuning;
     use serde_json::json;
 
     // ── parse_build_options ──────────────────────────────────────────────
@@ -434,7 +478,14 @@ mod tests {
     fn parse_build_options_no_cache_adds_flags() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true, None);
+        let opts = parse_build_options(
+            &build,
+            "test:latest",
+            Path::new("/ws"),
+            true,
+            None,
+            BuildTuning::default(),
+        );
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
     }
@@ -443,7 +494,14 @@ mod tests {
     fn parse_build_options_without_no_cache() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "test:latest",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert!(!opts.options.contains(&"--no-cache".to_string()));
         assert!(!opts.options.contains(&"--pull".to_string()));
     }
@@ -454,7 +512,14 @@ mod tests {
             r#"{"dockerfile": "Dockerfile", "context": ".", "options": ["--squash"]}"#,
         )
         .unwrap();
-        let opts = parse_build_options(&build, "test:latest", Path::new("/ws"), true, None);
+        let opts = parse_build_options(
+            &build,
+            "test:latest",
+            Path::new("/ws"),
+            true,
+            None,
+            BuildTuning::default(),
+        );
         assert!(opts.options.contains(&"--squash".to_string()));
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
@@ -464,7 +529,14 @@ mod tests {
     fn parse_build_options_defaults() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r"{}").unwrap();
-        let opts = parse_build_options(&build, "img:tag", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img:tag",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.image_name, "img:tag");
         assert_eq!(opts.dockerfile, "Dockerfile");
         assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/."));
@@ -478,7 +550,14 @@ mod tests {
     fn parse_build_options_custom_dockerfile() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile.dev"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.dockerfile, "Dockerfile.dev");
     }
 
@@ -486,7 +565,14 @@ mod tests {
     fn parse_build_options_absolute_context() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"context": "/absolute/path"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.context_path, Path::new("/absolute/path"));
     }
 
@@ -494,7 +580,14 @@ mod tests {
     fn parse_build_options_relative_context() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"context": "../"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.context_path, Path::new("/ws/.devcontainer/../"));
     }
 
@@ -502,7 +595,14 @@ mod tests {
     fn parse_build_options_with_args() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"args": {"NODE_VERSION": "18", "DEBUG": "true"}}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.args.get("NODE_VERSION").unwrap(), "18");
         assert_eq!(opts.args.get("DEBUG").unwrap(), "true");
     }
@@ -511,7 +611,14 @@ mod tests {
     fn parse_build_options_with_target() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"target": "development"}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.target.as_deref(), Some("development"));
     }
 
@@ -519,15 +626,72 @@ mod tests {
     fn parse_build_options_with_cache_from() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"cacheFrom": ["img:cache", "img:latest"]}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.cache_from, vec!["img:cache", "img:latest"]);
+    }
+
+    #[test]
+    fn parse_build_options_cli_cache_from_prepended_before_config() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"cacheFrom": ["cfg:1"]}"#).unwrap();
+        let cli = vec!["cli:1".to_string(), "cli:2".to_string()];
+        let tuning = BuildTuning {
+            cli_cache_from: &cli,
+            use_buildkit: true,
+            ..Default::default()
+        };
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
+        assert_eq!(opts.cache_from, vec!["cli:1", "cli:2", "cfg:1"]);
+    }
+
+    #[test]
+    fn parse_build_options_no_cache_drops_all_cache_from() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"cacheFrom": ["cfg:1"]}"#).unwrap();
+        let cli = vec!["cli:1".to_string()];
+        let tuning = BuildTuning {
+            cli_cache_from: &cli,
+            ..Default::default()
+        };
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), true, None, tuning);
+        assert!(opts.cache_from.is_empty());
+    }
+
+    #[test]
+    fn parse_build_options_threads_cache_to_and_toolchain() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let tuning = BuildTuning {
+            docker_path: Some("/usr/local/bin/docker"),
+            use_buildkit: true,
+            cache_to: Some("type=registry,ref=r"),
+            cli_cache_from: &[],
+        };
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
+        assert_eq!(opts.cache_to.as_deref(), Some("type=registry,ref=r"));
+        assert!(opts.use_buildkit);
+        assert_eq!(opts.docker_path.as_deref(), Some("/usr/local/bin/docker"));
     }
 
     #[test]
     fn parse_build_options_args_non_string_value_becomes_empty() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"args": {"NUM": 42}}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None);
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
         assert_eq!(opts.args.get("NUM").unwrap(), "");
     }
 
@@ -535,7 +699,14 @@ mod tests {
     fn parse_build_options_pull_always_adds_pull_flag() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, Some("always"));
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            Some("always"),
+            BuildTuning::default(),
+        );
         assert!(opts.options.contains(&"--pull".to_string()));
         assert!(!opts.options.contains(&"--no-cache".to_string()));
     }
@@ -544,7 +715,14 @@ mod tests {
     fn parse_build_options_pull_missing_does_not_add_pull_flag() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, Some("missing"));
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            Some("missing"),
+            BuildTuning::default(),
+        );
         assert!(!opts.options.contains(&"--pull".to_string()));
     }
 
@@ -552,7 +730,14 @@ mod tests {
     fn parse_build_options_no_cache_takes_priority_over_pull_policy() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "context": "."}"#).unwrap();
-        let opts = parse_build_options(&build, "img", Path::new("/ws"), true, Some("always"));
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            true,
+            Some("always"),
+            BuildTuning::default(),
+        );
         assert!(opts.options.contains(&"--no-cache".to_string()));
         assert!(opts.options.contains(&"--pull".to_string()));
         // --pull should only appear once (from no_cache path, not duplicated)
@@ -603,11 +788,7 @@ mod tests {
             image_name: "test".to_string(),
             context_path: PathBuf::from("."),
             dockerfile: "Dockerfile".to_string(),
-            args: HashMap::new(),
-            target: None,
-            cache_from: vec![],
-            options: vec![],
-            secrets: vec![],
+            ..Default::default()
         };
         inject_proxy_build_args(&mut opts, &proxy);
         // With no proxy env vars set and default config, args should remain empty
@@ -622,10 +803,7 @@ mod tests {
             context_path: PathBuf::from("."),
             dockerfile: "Dockerfile".to_string(),
             args: HashMap::from([("HTTP_PROXY".to_string(), "http://custom:1234".to_string())]),
-            target: None,
-            cache_from: vec![],
-            options: vec![],
-            secrets: vec![],
+            ..Default::default()
         };
         inject_proxy_build_args(&mut opts, &proxy);
         // Existing value must not be overwritten

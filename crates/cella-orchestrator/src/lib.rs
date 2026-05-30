@@ -16,6 +16,7 @@ pub mod credential_protect;
 pub use cella_config::config_map;
 pub mod daemon_registration;
 pub mod docker_helpers;
+pub mod dotfiles;
 pub mod env_cache;
 pub mod error;
 pub mod host_requirements;
@@ -24,6 +25,7 @@ pub use cella_backend::lifecycle;
 pub use cella_backend::progress;
 pub mod prune;
 pub mod result;
+pub mod run_user_commands;
 pub mod shell_detect;
 pub use cella_backend::uid_image;
 pub use cella_daemon_client::ssh_proxy as ssh_proxy_client;
@@ -33,8 +35,8 @@ pub mod up;
 use crate::config_map::subst_ctx;
 
 pub use config::{
-    BranchConfig, HostRequirementPolicy, ImageStrategy, MountFlags, NetworkRulePolicy, PruneConfig,
-    UpConfig,
+    BranchConfig, BuildTuning, HostRequirementPolicy, ImageStrategy, MetadataOptions, MountFlags,
+    NetworkRulePolicy, PruneConfig, UpConfig,
 };
 pub use error::OrchestratorError;
 pub use progress::{PhaseChildHandle, PhaseHandle, ProgressEvent, ProgressSender, StepHandle};

@@ -46,6 +46,26 @@ ARG IMAGE_USER=root
 USER $IMAGE_USER
 "#;
 
+/// Toolchain inputs threaded into the UID-remap build so it honors the same
+/// `--docker-path` / `--buildkit` selection as every other build site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildToolchain<'a> {
+    /// `docker` CLI binary path (`None` = `docker`).
+    pub docker_path: Option<&'a str>,
+    /// Whether `BuildKit`/buildx may be used (`false` = classic builder).
+    pub use_buildkit: bool,
+}
+
+/// Whether UID remap should be skipped based on the resolved remote user.
+///
+/// Mirrors official's post-gate skip (`containerFeatures.ts`): skip when the
+/// remote user is `root` or an all-numeric UID (`/^\d+$/`) — there is nothing
+/// to remap in either case.
+fn skip_remap_for_remote_user(remote_user: &str) -> bool {
+    remote_user == "root"
+        || (!remote_user.is_empty() && remote_user.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Build a UID-remapped image on top of `base_image`.
 ///
 /// Returns `Ok(Some(uid_image_name))` when a new image was built, or
@@ -62,10 +82,11 @@ pub async fn build_uid_remap_image(
     base_image: &str,
     image_user: &str,
     remote_user: &str,
+    toolchain: BuildToolchain<'_>,
     progress: &ProgressSender,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    if remote_user == "root" {
-        debug!("Skipping UID remap: remote user is root");
+    if skip_remap_for_remote_user(remote_user) {
+        debug!("Skipping UID remap: remote user is root or numeric ({remote_user})");
         return Ok(None);
     }
 
@@ -97,8 +118,11 @@ pub async fn build_uid_remap_image(
         args,
         target: None,
         cache_from: vec![],
+        cache_to: None,
         options: vec![],
         secrets: vec![],
+        use_buildkit: toolchain.use_buildkit,
+        docker_path: toolchain.docker_path.map(str::to_string),
     };
 
     info!("Building UID remap image: {uid_image} (UID {host_uid}:{host_gid})");
@@ -154,5 +178,20 @@ mod tests {
         let base = "myimage:latest";
         let uid_name = format!("{base}-uid");
         assert_eq!(uid_name, "myimage:latest-uid");
+    }
+
+    #[test]
+    fn skip_remap_for_root_and_numeric_users() {
+        assert!(skip_remap_for_remote_user("root"));
+        assert!(skip_remap_for_remote_user("1000"));
+        assert!(skip_remap_for_remote_user("0"));
+    }
+
+    #[test]
+    fn no_skip_for_named_user() {
+        assert!(!skip_remap_for_remote_user("vscode"));
+        assert!(!skip_remap_for_remote_user("node"));
+        // Empty string is not numeric per /^\d+$/ (requires >=1 digit).
+        assert!(!skip_remap_for_remote_user(""));
     }
 }

@@ -74,6 +74,9 @@ pub struct BaseImageContext<'a> {
     pub image_user: &'a str,
     /// `devcontainer.metadata` label from the base image, if available.
     pub metadata: Option<&'a str>,
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// user-config entry of the generated `devcontainer.metadata` label.
+    pub omit_remote_env: bool,
 }
 
 /// Intermediate representation of a parsed feature before ordering.
@@ -110,7 +113,12 @@ pub async fn resolve_features(
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
         Some(obj) if !obj.is_empty() => obj,
         _ => {
-            return resolve_empty_features(config, cache, base_image_ctx.metadata);
+            return resolve_empty_features(
+                config,
+                cache,
+                base_image_ctx.metadata,
+                base_image_ctx.omit_remote_env,
+            );
         }
     };
 
@@ -148,7 +156,12 @@ pub async fn resolve_features(
 
     // Step 9: Merge feature metadata and generate label.
     let container_config = merge_all_metadata(&resolved, config, base_image_ctx.metadata);
-    let metadata_label = generate_metadata_label(&resolved, config, base_image_ctx.metadata);
+    let metadata_label = generate_metadata_label(
+        &resolved,
+        config,
+        base_image_ctx.metadata,
+        base_image_ctx.omit_remote_env,
+    );
 
     debug!(
         "resolved {} features, build context at {}",
@@ -176,10 +189,19 @@ pub async fn resolve_features(
 /// - One object per resolved feature (with id, `containerEnv`, entrypoint,
 ///   mounts, customizations, and lifecycle commands).
 /// - The last element is the user's `devcontainer.json` properties.
+///
+/// When `omit_remote_env` is set (the `--omit-config-remote-env-from-metadata`
+/// flag), the `remoteEnv` key is stripped from the user-config entry so that
+/// host-specific or secret remote-env values are not persisted into the image
+/// label. This mirrors the official CLI, which removes `remoteEnv` from the
+/// `pickConfigProperties` whitelist when the flag is set. It affects ONLY the
+/// `devcontainer.metadata` label, never the runtime `dev.cella.remote_env`
+/// label used to re-inject env across restarts.
 pub fn generate_metadata_label(
     features: &[ResolvedFeature],
     user_config: &serde_json::Value,
     base_image_metadata: Option<&str>,
+    omit_remote_env: bool,
 ) -> String {
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
@@ -198,8 +220,17 @@ pub fn generate_metadata_label(
         entries.push(build_feature_metadata_entry(feature));
     }
 
-    // Last element: user config properties.
-    entries.push(user_config.clone());
+    // Last element: user config properties. Optionally strip `remoteEnv`.
+    let user_entry = if omit_remote_env {
+        let mut stripped = user_config.clone();
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.remove("remoteEnv");
+        }
+        stripped
+    } else {
+        user_config.clone()
+    };
+    entries.push(user_entry);
 
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
 }
@@ -213,6 +244,7 @@ fn resolve_empty_features(
     config: &serde_json::Value,
     cache: &FeatureCache,
     base_image_metadata: Option<&str>,
+    omit_remote_env: bool,
 ) -> Result<ResolvedFeatures, FeatureError> {
     debug!("no features declared in devcontainer.json");
     let build_context = cache.build_context_path("empty");
@@ -228,7 +260,7 @@ fn resolve_empty_features(
         dockerfile: String::new(),
         build_context,
         container_config,
-        metadata_label: generate_metadata_label(&[], config, base_image_metadata),
+        metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit_remote_env),
     })
 }
 
@@ -644,7 +676,7 @@ mod tests {
 
     #[test]
     fn metadata_label_empty_features() {
-        let label = generate_metadata_label(&[], &json!({"image": "ubuntu"}), None);
+        let label = generate_metadata_label(&[], &json!({"image": "ubuntu"}), None, false);
         let parsed: serde_json::Value = serde_json::from_str(&label).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -667,7 +699,7 @@ mod tests {
             has_install_script: true,
         }];
 
-        let label = generate_metadata_label(&features, &json!({}), None);
+        let label = generate_metadata_label(&features, &json!({}), None, false);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         assert_eq!(parsed.len(), 2);
@@ -679,7 +711,7 @@ mod tests {
     #[test]
     fn metadata_label_with_base_image_metadata() {
         let base_meta = r#"[{"id":"base","containerEnv":{"LANG":"C.UTF-8"}}]"#;
-        let label = generate_metadata_label(&[], &json!({}), Some(base_meta));
+        let label = generate_metadata_label(&[], &json!({}), Some(base_meta), false);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         // base entry + user config entry
@@ -690,11 +722,44 @@ mod tests {
     #[test]
     fn metadata_label_base_image_non_array() {
         let base_meta = r#"{"id":"single"}"#;
-        let label = generate_metadata_label(&[], &json!({}), Some(base_meta));
+        let label = generate_metadata_label(&[], &json!({}), Some(base_meta), false);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["id"], "single");
+    }
+
+    #[test]
+    fn metadata_label_omits_remote_env_when_requested() {
+        let config = json!({
+            "image": "ubuntu",
+            "remoteEnv": {"SECRET": "value"},
+            "remoteUser": "vscode",
+        });
+
+        // omit=true strips remoteEnv from the user-config entry...
+        let omitted = generate_metadata_label(&[], &config, None, true);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&omitted).unwrap();
+        let entry = parsed.last().unwrap();
+        assert!(entry.get("remoteEnv").is_none());
+        // ...without disturbing the other keys.
+        assert_eq!(entry["remoteUser"], "vscode");
+        assert_eq!(entry["image"], "ubuntu");
+
+        // omit=false retains remoteEnv.
+        let kept = generate_metadata_label(&[], &config, None, false);
+        let parsed_kept: Vec<serde_json::Value> = serde_json::from_str(&kept).unwrap();
+        assert_eq!(parsed_kept.last().unwrap()["remoteEnv"]["SECRET"], "value");
+    }
+
+    #[test]
+    fn metadata_label_omit_remote_env_is_noop_without_key() {
+        // A config that has no remoteEnv must not panic and must be unchanged.
+        let config = json!({"image": "ubuntu"});
+        let label = generate_metadata_label(&[], &config, None, true);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
+        assert_eq!(parsed.last().unwrap()["image"], "ubuntu");
+        assert!(parsed.last().unwrap().get("remoteEnv").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -801,6 +866,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -829,6 +895,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -881,6 +948,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -996,6 +1064,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -1060,6 +1129,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -1103,6 +1173,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -1146,6 +1217,7 @@ mod tests {
                 base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )
@@ -1278,6 +1350,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
+                omit_remote_env: false,
             },
             false,
         )

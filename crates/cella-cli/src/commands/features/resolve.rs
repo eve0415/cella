@@ -76,6 +76,44 @@ pub fn extract_features(config: &serde_json::Value) -> Vec<(String, serde_json::
         .collect()
 }
 
+/// Merge `--additional-features` JSON into the config's `features` map.
+///
+/// Config features win on key collision: an additional feature is added only
+/// when its id is not already present, mirroring the official CLI's
+/// `userFeaturesToArray` (config features first, additional appended only for
+/// new keys). Values are inserted verbatim (no variable substitution), matching
+/// the official `jsonc.parse` of `--additional-features`.
+///
+/// # Errors
+///
+/// Returns an error if `additional_json` is not valid JSON or not a JSON object,
+/// or if the existing `features` field is present but not an object.
+pub fn merge_additional_features(
+    config: &mut serde_json::Value,
+    additional_json: &str,
+) -> Result<(), String> {
+    let extra: serde_json::Value = serde_json::from_str(additional_json)
+        .map_err(|e| format!("--additional-features: invalid JSON: {e}"))?;
+    let obj = extra
+        .as_object()
+        .ok_or("--additional-features must be a JSON object")?;
+    if obj.is_empty() {
+        return Ok(());
+    }
+    let features = config
+        .as_object_mut()
+        .expect("config is always an object")
+        .entry("features")
+        .or_insert_with(|| serde_json::json!({}));
+    let features_obj = features
+        .as_object_mut()
+        .ok_or("existing features field is not an object")?;
+    for (k, v) in obj {
+        features_obj.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    Ok(())
+}
+
 /// Match a short ID like `"node"` to a full OCI reference from a list.
 ///
 /// Tries exact match first, then falls back to matching the last path
@@ -188,6 +226,44 @@ mod tests {
         let config = serde_json::json!({"name": "Test"});
         let features = extract_features(&config);
         assert!(features.is_empty());
+    }
+
+    #[test]
+    fn merge_additional_features_config_wins_on_collision() {
+        let mut config = serde_json::json!({
+            "features": { "ghcr.io/x/foo:1": {"a": 1} }
+        });
+        merge_additional_features(
+            &mut config,
+            r#"{"ghcr.io/x/foo:1": {"a": 2}, "ghcr.io/x/bar:1": {}}"#,
+        )
+        .unwrap();
+        let features = config["features"].as_object().unwrap();
+        // Config feature kept verbatim; additional foo dropped on collision.
+        assert_eq!(features["ghcr.io/x/foo:1"]["a"], serde_json::json!(1));
+        // Non-colliding additional feature appended.
+        assert!(features.contains_key("ghcr.io/x/bar:1"));
+    }
+
+    #[test]
+    fn merge_additional_features_creates_features_when_absent() {
+        let mut config = serde_json::json!({"image": "ubuntu"});
+        merge_additional_features(&mut config, r#"{"ghcr.io/x/node:1": {}}"#).unwrap();
+        assert!(
+            config["features"]
+                .as_object()
+                .unwrap()
+                .contains_key("ghcr.io/x/node:1")
+        );
+    }
+
+    #[test]
+    fn merge_additional_features_rejects_invalid_and_non_object() {
+        let mut config = serde_json::json!({});
+        assert!(merge_additional_features(&mut config, "not json").is_err());
+        assert!(merge_additional_features(&mut config, "[1,2]").is_err());
+        // Empty object is a no-op success.
+        assert!(merge_additional_features(&mut config, "{}").is_ok());
     }
 
     #[test]

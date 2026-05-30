@@ -59,7 +59,7 @@ pub struct BuildArgs {
 
 impl BuildArgs {
     pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Text)
+        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
     }
 
     pub async fn execute(
@@ -136,6 +136,12 @@ impl BuildArgs {
             no_cache: self.no_cache,
             pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
+            // `cella build` has no build-tuning flags yet; use defaults
+            // (BuildKit auto, default docker binary, no CLI cache I/O).
+            build_tuning: cella_orchestrator::BuildTuning::default(),
+            // `--omit-config-remote-env-from-metadata` is wired on `up` only;
+            // `cella build` keeps the full metadata label.
+            omit_remote_env_from_metadata: false,
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;
@@ -161,7 +167,7 @@ impl BuildArgs {
 /// Print the build result in the requested output format.
 fn print_result(output: &OutputFormat, image_name: &str, compose: bool) {
     match output {
-        OutputFormat::Text => {
+        OutputFormat::Auto | OutputFormat::Text => {
             if compose {
                 eprintln!("Compose services built. Primary image: {image_name}");
             } else {

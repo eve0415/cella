@@ -61,6 +61,7 @@ pub async fn resolve_compose_features(
     config: &serde_json::Value,
     config_path: &Path,
     project: &ComposeProject,
+    omit_remote_env_from_metadata: bool,
     progress: &ProgressSender,
 ) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error + Send + Sync>> {
     // 1. Check if features are present
@@ -153,6 +154,7 @@ pub async fn resolve_compose_features(
                 base_image: &stage_name,
                 image_user: &image_user,
                 metadata: base_image_metadata.as_deref(),
+                omit_remote_env: omit_remote_env_from_metadata,
             },
             true, // compose builds use named content source via additional_contexts
         )

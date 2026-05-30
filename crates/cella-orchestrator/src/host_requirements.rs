@@ -12,6 +12,10 @@ pub struct RequirementCheck {
     pub required: String,
     pub actual: String,
     pub met: bool,
+    /// Whether an unmet check should hard-fail under the `Error` policy.
+    /// GPU checks are non-fatal — the official CLI only ever warns about a
+    /// missing GPU, never errors, regardless of strictness.
+    pub fatal: bool,
 }
 
 /// Result of validating all host requirements.
@@ -52,7 +56,9 @@ pub fn validate(config: &Value, workspace_root: &Path) -> ValidationResult {
         check_gpu(&mut checks, gpu);
     }
 
-    let all_met = checks.iter().all(|c| c.met);
+    // GPU checks are non-fatal (warn-only), matching the official CLI which
+    // never errors on a missing GPU. Only fatal checks gate `all_met`.
+    let all_met = checks.iter().all(|c| c.met || !c.fatal);
     ValidationResult { checks, all_met }
 }
 
@@ -65,6 +71,7 @@ fn check_cpus(checks: &mut Vec<RequirementCheck>, cpus: u64) {
         required: cpus.to_string(),
         actual: available.to_string(),
         met: available >= cpus,
+        fatal: true,
     });
 }
 
@@ -76,6 +83,7 @@ fn check_memory(checks: &mut Vec<RequirementCheck>, required_bytes: u64) {
         required: format_bytes(required_bytes),
         actual: actual_bytes.map_or_else(|| "unknown".to_string(), format_bytes),
         met,
+        fatal: true,
     });
 }
 
@@ -87,6 +95,7 @@ fn check_storage(checks: &mut Vec<RequirementCheck>, required_bytes: u64, worksp
         required: format_bytes(required_bytes),
         actual: actual_bytes.map_or_else(|| "unknown".to_string(), format_bytes),
         met,
+        fatal: true,
     });
 }
 
@@ -112,6 +121,10 @@ fn check_gpu(checks: &mut Vec<RequirementCheck>, gpu: &Value) {
                 "not detected".to_string()
             },
             met: gpu_available || optional,
+            // GPU never hard-fails: the official CLI warns but proceeds, and
+            // the actual GPU grant/deny decision is made later by
+            // `--gpu-availability` gating, not here.
+            fatal: false,
         });
     }
 }
@@ -411,6 +424,18 @@ mod tests {
         let config = json!({"hostRequirements": {"gpu": false}});
         let result = validate(&config, Path::new("/tmp"));
         assert!(result.checks.is_empty());
+    }
+
+    #[test]
+    fn validate_gpu_required_is_non_fatal() {
+        // A required-but-undetected GPU produces an unmet check, but never
+        // blocks `all_met` (GPU is warn-only, matching the official CLI).
+        let config = json!({"hostRequirements": {"gpu": true}});
+        let result = validate(&config, Path::new("/tmp"));
+        assert_eq!(result.checks.len(), 1);
+        assert!(!result.checks[0].fatal);
+        // Regardless of whether the test host has a GPU, GPU never gates all_met.
+        assert!(result.all_met);
     }
 
     #[test]

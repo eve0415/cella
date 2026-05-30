@@ -91,7 +91,7 @@ impl OutdatedArgs {
         }
 
         match self.output {
-            OutputFormat::Text => print_table(&entries),
+            OutputFormat::Auto | OutputFormat::Text => print_table(&entries),
             OutputFormat::Json => print_json(&entries)?,
         }
 

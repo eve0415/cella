@@ -55,6 +55,18 @@ pub struct ComposeCommand {
     profiles: Vec<String>,
     env_files: Vec<PathBuf>,
     pull_policy: Option<String>,
+    /// `docker` CLI binary (`--docker-path`); `None` = `docker`. Used as the
+    /// program for the V2 `docker compose` invocation.
+    docker_bin: Option<String>,
+    /// Standalone `docker-compose` (V1) binary (`--docker-compose-path`).
+    ///
+    /// cella is V2-only: it always invokes `<docker_bin> compose`. Official's
+    /// `dockerComposeCLIConfig` only uses `docker-compose` when the V2 probe
+    /// (`docker compose version`) fails, so on any modern host this value has
+    /// no effect. It is accepted and stored here, reserved for a future V1
+    /// probe/fallback; it is intentionally NOT routed into `base_command`
+    /// (doing so would run `docker-compose compose ...` and break).
+    compose_v1_bin: Option<String>,
 }
 
 impl ComposeCommand {
@@ -68,6 +80,8 @@ impl ComposeCommand {
             profiles: project.profiles.clone(),
             env_files: project.env_files.clone(),
             pull_policy: project.pull_policy.clone(),
+            docker_bin: None,
+            compose_v1_bin: None,
         }
     }
 
@@ -84,6 +98,8 @@ impl ComposeCommand {
             profiles: project.profiles.clone(),
             env_files: project.env_files.clone(),
             pull_policy: project.pull_policy.clone(),
+            docker_bin: None,
+            compose_v1_bin: None,
         }
     }
 
@@ -97,12 +113,28 @@ impl ComposeCommand {
             profiles: Vec::new(),
             env_files: Vec::new(),
             pull_policy: None,
+            docker_bin: None,
+            compose_v1_bin: None,
         }
+    }
+
+    /// Override the `docker`/`docker-compose` binaries from the CLI
+    /// `--docker-path` / `--docker-compose-path` flags. `docker_compose_path`
+    /// is stored but currently unused (cella is V2-only).
+    #[must_use]
+    pub fn with_docker_binaries(
+        mut self,
+        docker_path: Option<String>,
+        docker_compose_path: Option<String>,
+    ) -> Self {
+        self.docker_bin = docker_path;
+        self.compose_v1_bin = docker_compose_path;
+        self
     }
 
     /// Build the base `docker compose` command with project name and file flags.
     fn base_command(&self) -> Command {
-        let mut cmd = Command::new("docker");
+        let mut cmd = Command::new(self.docker_bin.as_deref().unwrap_or("docker"));
         cmd.arg("compose");
         cmd.arg("--project-name").arg(&self.project_name);
         for p in &self.profiles {
@@ -553,6 +585,29 @@ mod tests {
         assert_eq!(args[3], "-f");
         assert_eq!(args[4], "/workspace/docker-compose.yml");
         assert_eq!(args.len(), 5); // No override file
+    }
+
+    #[test]
+    fn docker_path_overrides_base_command_program() {
+        let cmd = ComposeCommand::from_project_name("cella-test")
+            .with_docker_binaries(Some("/usr/local/bin/podman".to_string()), None);
+        let base = cmd.base_command();
+        assert_eq!(base.as_std().get_program(), "/usr/local/bin/podman");
+        // Still uses the V2 `compose` subcommand.
+        let args: Vec<_> = base.as_std().get_args().collect();
+        assert_eq!(args[0], "compose");
+    }
+
+    #[test]
+    fn docker_compose_path_does_not_change_base_command() {
+        // docker-compose-path is accepted and stored but NOT routed into
+        // base_command (cella is V2-only); the program stays `docker`.
+        let cmd = ComposeCommand::from_project_name("cella-test")
+            .with_docker_binaries(None, Some("/usr/bin/docker-compose".to_string()));
+        let base = cmd.base_command();
+        assert_eq!(base.as_std().get_program(), "docker");
+        let args: Vec<_> = base.as_std().get_args().collect();
+        assert_eq!(args[0], "compose");
     }
 
     #[test]

@@ -2,7 +2,6 @@
 
 use std::fmt::Write as _;
 use std::process::Stdio;
-use std::sync::OnceLock;
 
 use bollard::query_parameters::CreateImageOptions;
 use futures_util::StreamExt;
@@ -26,39 +25,67 @@ pub(crate) fn normalize_user(raw: &str) -> String {
     }
 }
 
-/// Locate the docker binary, caching the result.
-fn docker_binary() -> Result<&'static str, CellaDockerError> {
-    static BINARY: OnceLock<Result<&'static str, String>> = OnceLock::new();
-    BINARY
-        .get_or_init(|| {
-            let output = std::process::Command::new("docker")
-                .arg("--version")
-                .output();
-            match output {
-                Ok(o) if o.status.success() => Ok("docker"),
-                Ok(o) => Err(format!(
-                    "docker --version failed: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                )),
-                Err(e) => Err(format!("docker not found: {e}")),
-            }
-        })
-        .as_ref()
-        .copied()
-        .map_err(|msg| CellaDockerError::DockerCliNotFound {
-            message: msg.clone(),
-        })
+/// Resolve the docker binary path (defaults to `docker` on `PATH`).
+///
+/// Unlike the previous process-global cache, this re-probes per call so a
+/// per-invocation `--docker-path` override is honored. Builds are infrequent,
+/// so the extra `--version` probe is negligible.
+fn docker_binary(docker_path: Option<&str>) -> Result<String, CellaDockerError> {
+    let bin = docker_path.unwrap_or("docker");
+    let output = std::process::Command::new(bin).arg("--version").output();
+    match output {
+        Ok(o) if o.status.success() => Ok(bin.to_string()),
+        Ok(o) => Err(CellaDockerError::DockerCliNotFound {
+            message: format!(
+                "{bin} --version failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        }),
+        Err(e) => Err(CellaDockerError::DockerCliNotFound {
+            message: format!("{bin} not found: {e}"),
+        }),
+    }
 }
 
-/// Check if `docker buildx` is available, caching the result.
-fn has_buildx() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::process::Command::new("docker")
-            .args(["buildx", "version"])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    })
+/// Check whether `<docker> buildx` is available.
+///
+/// Re-probes per call (no global cache) so the result tracks `docker_path`.
+fn has_buildx(docker_path: Option<&str>) -> bool {
+    let bin = docker_path.unwrap_or("docker");
+    std::process::Command::new(bin)
+        .args(["buildx", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Whether a `--cache-to` value already exports an inline cache.
+///
+/// Matches the official `isBuildxCacheToInline` regex `/type\s*=\s*inline/i`
+/// (case-insensitive, whitespace-tolerant) with a hand-rolled scan to avoid a
+/// new dependency. When true, the separate `BUILDKIT_INLINE_CACHE=1` build-arg
+/// is skipped (the cache-to export already inlines).
+fn is_cache_to_inline(cache_to: &str) -> bool {
+    let lower = cache_to.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("type") {
+        let mut j = i + pos + "type".len();
+        // Skip whitespace, then require '='.
+        while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b'=') {
+            j += 1;
+            while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if lower[j..].starts_with("inline") {
+                return true;
+            }
+        }
+        i += pos + "type".len();
+    }
+    false
 }
 
 /// Build the argument list for a `docker [buildx] build` invocation.
@@ -69,9 +96,11 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push("buildx".to_string());
     }
     args.push("build".to_string());
-    args.push("--progress=plain".to_string());
 
+    // `--progress=plain` and `--load` are buildx-only. The classic builder
+    // rejects `--progress`, and official emits neither on the legacy path.
     if use_buildx {
+        args.push("--progress=plain".to_string());
         args.push("--load".to_string());
     }
 
@@ -95,6 +124,20 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
 
     for cf in &opts.cache_from {
         args.extend(["--cache-from".to_string(), cf.clone()]);
+    }
+
+    // `--cache-to` is buildx-only; silently dropped on the legacy path
+    // (matching the official CLI). When set and not already an inline export,
+    // also request the inline-cache build-arg so the resulting image carries
+    // its layer cache metadata.
+    if use_buildx && let Some(cache_to) = &opts.cache_to {
+        args.extend(["--cache-to".to_string(), cache_to.clone()]);
+        if !is_cache_to_inline(cache_to) {
+            args.extend([
+                "--build-arg".to_string(),
+                "BUILDKIT_INLINE_CACHE=1".to_string(),
+            ]);
+        }
     }
 
     for opt in &opts.options {
@@ -168,8 +211,12 @@ impl DockerClient {
 
     /// Build an image from a Dockerfile using the docker CLI.
     ///
-    /// Prefers `docker buildx build` when available. Falls back to
-    /// `docker build` with `DOCKER_BUILDKIT=1` otherwise.
+    /// Uses `<docker> buildx build` when `BuildKit` is enabled (`use_buildkit`)
+    /// AND buildx is present; otherwise runs the classic `<docker> build`. The
+    /// `docker` binary is taken from `opts.docker_path` when set. No
+    /// `DOCKER_BUILDKIT`/`BUILDKIT_PROGRESS` env is set — the build subcommand
+    /// (`buildx build` vs `build`) is the sole `BuildKit` selector, matching
+    /// the official CLI.
     ///
     /// Build output (stdout/stderr) is captured and forwarded to the
     /// provided callback line by line. Pass `|_| {}` to discard output.
@@ -184,21 +231,28 @@ impl DockerClient {
     ) -> Result<String, CellaDockerError> {
         info!("Building image: {}", opts.image_name);
 
-        let bin = docker_binary()?;
-        let use_buildx = has_buildx();
+        let docker_path = opts.docker_path.as_deref();
+        let bin = docker_binary(docker_path)?;
+        // `auto` probes for buildx; `never` (use_buildkit == false) forces the
+        // classic builder without probing.
+        let use_buildx = opts.use_buildkit && has_buildx(docker_path);
+
+        // `--cache-to` is buildx-only. On the classic builder (BuildKit never,
+        // or auto with no buildx) it is silently dropped from the command, so
+        // warn the user once that it had no effect. cache_to is only ever set
+        // on the base build's BuildOptions, so this fires at most once per up.
+        if !use_buildx && opts.cache_to.is_some() {
+            tracing::warn!("--cache-to is ignored without BuildKit/buildx (classic docker build)");
+        }
+
         let args = build_command_args(opts, use_buildx);
 
         debug!("{bin} {}", args.join(" "));
 
-        let mut cmd = tokio::process::Command::new(bin);
+        let mut cmd = tokio::process::Command::new(&bin);
         cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        if !use_buildx {
-            cmd.env("DOCKER_BUILDKIT", "1");
-            cmd.env("BUILDKIT_PROGRESS", "plain");
-        }
 
         let mut child = cmd
             .spawn()
@@ -335,20 +389,23 @@ mod tests {
             args: HashMap::new(),
             target: None,
             cache_from: Vec::new(),
+            cache_to: None,
             options: Vec::new(),
             secrets: Vec::new(),
+            use_buildkit: true,
+            docker_path: None,
         }
     }
 
     #[test]
     fn build_args_basic() {
+        // Legacy (classic) build: no `buildx`, no `--progress`, no `--load`.
         let opts = basic_opts();
         let args = build_command_args(&opts, false);
         assert_eq!(
             args,
             vec![
                 "build",
-                "--progress=plain",
                 "-t",
                 "myimage:latest",
                 "-f",
@@ -484,11 +541,13 @@ mod tests {
     }
 
     #[test]
-    fn build_args_always_has_progress_plain() {
+    fn build_args_progress_plain_only_with_buildx() {
+        // `--progress=plain` is buildx-only; the classic builder rejects it,
+        // and the official CLI never emits it on the legacy path.
         let opts = basic_opts();
         let args_no_buildx = build_command_args(&opts, false);
         let args_buildx = build_command_args(&opts, true);
-        assert!(args_no_buildx.contains(&"--progress=plain".to_string()));
+        assert!(!args_no_buildx.contains(&"--progress=plain".to_string()));
         assert!(args_buildx.contains(&"--progress=plain".to_string()));
     }
 
@@ -529,8 +588,8 @@ mod tests {
     fn build_args_empty_options() {
         let opts = basic_opts();
         let args = build_command_args(&opts, false);
-        // Should be minimal: ["build", "--progress=plain", "-t", name, "-f", path, context]
-        assert_eq!(args.len(), 7);
+        // Minimal legacy build: ["build", "-t", name, "-f", path, context]
+        assert_eq!(args.len(), 6);
     }
 
     #[test]
@@ -606,5 +665,88 @@ mod tests {
         let secret_count = args.iter().filter(|a| *a == "--secret").count();
         assert_eq!(secret_count, 2);
         assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    // -----------------------------------------------------------------------
+    // --cache-to / BuildKit / inline-cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_args_cache_to_buildx_registry_adds_inline_cache_arg() {
+        let mut opts = basic_opts();
+        opts.cache_to = Some("type=registry,ref=r".to_string());
+        let args = build_command_args(&opts, true);
+        let idx = args.iter().position(|a| a == "--cache-to").unwrap();
+        assert_eq!(args[idx + 1], "type=registry,ref=r");
+        assert!(args.contains(&"BUILDKIT_INLINE_CACHE=1".to_string()));
+    }
+
+    #[test]
+    fn build_args_cache_to_inline_skips_inline_cache_arg() {
+        let mut opts = basic_opts();
+        opts.cache_to = Some("type=inline".to_string());
+        let args = build_command_args(&opts, true);
+        assert!(args.contains(&"type=inline".to_string()));
+        assert!(!args.contains(&"BUILDKIT_INLINE_CACHE=1".to_string()));
+    }
+
+    #[test]
+    fn build_args_cache_to_dropped_without_buildx() {
+        // buildkit=never (use_buildx == false): cache-to is silently dropped.
+        let mut opts = basic_opts();
+        opts.cache_to = Some("type=registry,ref=r".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(!args.contains(&"--cache-to".to_string()));
+        assert!(!args.contains(&"BUILDKIT_INLINE_CACHE=1".to_string()));
+    }
+
+    #[test]
+    fn build_args_buildkit_never_omits_buildx_subcommand() {
+        // The classic-builder argument list never starts with `buildx`.
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert_eq!(args[0], "build");
+        assert!(!args.contains(&"buildx".to_string()));
+    }
+
+    #[test]
+    fn build_args_cache_from_present() {
+        // The orchestrator appends CLI `--cache-from` into `cache_from`; this
+        // verifies every entry is emitted in order on the build command.
+        let mut opts = basic_opts();
+        opts.cache_from = vec!["cli:1".to_string(), "cfg:1".to_string()];
+        let args = build_command_args(&opts, true);
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--cache-from")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(args[positions[0] + 1], "cli:1");
+        assert_eq!(args[positions[1] + 1], "cfg:1");
+    }
+
+    #[test]
+    fn is_cache_to_inline_matches() {
+        assert!(is_cache_to_inline("type=inline"));
+        assert!(is_cache_to_inline("type = inline"));
+        assert!(is_cache_to_inline("TYPE=INLINE"));
+        assert!(is_cache_to_inline("dest=x,type=inline,mode=max"));
+        assert!(!is_cache_to_inline("type=registry,ref=r"));
+        assert!(!is_cache_to_inline(""));
+    }
+
+    #[test]
+    fn docker_binary_uses_override_path() {
+        // A nonexistent docker path surfaces as not-found rather than silently
+        // falling back to the default `docker`.
+        let err = docker_binary(Some("/nonexistent/docker-binary-xyz")).unwrap_err();
+        assert!(matches!(err, CellaDockerError::DockerCliNotFound { .. }));
+    }
+
+    #[test]
+    fn has_buildx_false_for_missing_binary() {
+        assert!(!has_buildx(Some("/nonexistent/docker-binary-xyz")));
     }
 }

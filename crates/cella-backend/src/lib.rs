@@ -14,7 +14,8 @@ pub mod uid_image;
 pub use agent::agent_env_vars;
 pub use error::BackendError;
 pub use lifecycle::{
-    LifecycleContext, OutputCallback, ParsedLifecycle, parse_lifecycle_command, run_lifecycle_phase,
+    EXPECTED_CONTAINER_MISSING, LifecycleContext, LifecycleGate, OutputCallback, ParsedLifecycle,
+    StopAfter, WaitForPhase, parse_lifecycle_command, run_lifecycle_phase,
 };
 pub use mount::{MountKind, MountSpec};
 pub use names::{
@@ -27,7 +28,7 @@ pub use resolve::ContainerTarget;
 pub use traits::{BackendCapabilities, BoxFuture, ContainerBackend, Platform};
 pub use types::{
     BackendKind, BuildOptions, BuildSecret, ContainerInfo, ContainerState, CreateContainerOptions,
-    DeviceSpec, ExecOptions, ExecResult, FileToUpload, GpuRequest, ImageDetails,
+    DeviceSpec, ExecOptions, ExecResult, FileToUpload, GpuAvailability, GpuRequest, ImageDetails,
     InteractiveExecOptions, MountConfig, MountInfo, PortBinding, PortForward, RunArgsOverrides,
-    SshAgentProxyStatus, UlimitSpec,
+    SshAgentProxyStatus, UlimitSpec, UpdateRemoteUserUidDefault, should_update_uid,
 };

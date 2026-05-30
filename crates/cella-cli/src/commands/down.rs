@@ -91,7 +91,7 @@ fn remove_worktree(branch_name: &str) -> Result<(), Box<dyn std::error::Error + 
 
 impl DownArgs {
     pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Text)
+        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
     }
 
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -111,7 +111,7 @@ impl DownArgs {
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
-            id_label: None,
+            id_labels: Vec::new(),
             workspace_folder,
         };
 
@@ -139,7 +139,7 @@ impl DownArgs {
 
             if shutdown_action == "none" && !self.force {
                 match &self.output {
-                    OutputFormat::Text => {
+                    OutputFormat::Auto | OutputFormat::Text => {
                         eprintln!("Container has shutdownAction=\"none\". Use --force to stop it.");
                     }
                     OutputFormat::Json => {
@@ -291,7 +291,7 @@ pub(super) async fn deregister_container(container: &ContainerInfo) {
 /// Print the outcome in the requested output format.
 fn print_outcome(output: &OutputFormat, outcome: &str, container_id: &str) {
     match output {
-        OutputFormat::Text => {
+        OutputFormat::Auto | OutputFormat::Text => {
             if outcome == "removed" {
                 eprintln!("Container stopped and removed.");
             } else {
