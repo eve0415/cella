@@ -1023,6 +1023,16 @@ impl EnsureUpContext<'_> {
             );
         }
 
+        // Opt the container into ~/.claude.json sync (env is immutable after
+        // create, so it must be set here at create time).
+        let tool_env = crate::tool_install::tool_config_env_vars(settings, remote_user);
+        if !tool_env.is_empty() {
+            if create_opts.env.is_empty() {
+                create_opts.env = image_env.to_vec();
+            }
+            create_opts.env.extend(tool_env);
+        }
+
         append_extra_mounts(
             &mut create_opts.mounts,
             &self.config.resolved.workspace_root,
@@ -1208,6 +1218,17 @@ impl EnsureUpContext<'_> {
             crate::tool_install::setup_plugin_manifests(self.client, container_id, remote_user)
                 .await;
         }
+
+        // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
+        // files instead of single-file bind mounts (anti-ghost). No-ops when
+        // nothing is forwarded or the files already exist in the container.
+        crate::tool_install::seed_tool_config_files(
+            self.client,
+            container_id,
+            settings,
+            remote_user,
+        )
+        .await;
 
         let tools_to_install = crate::tool_install::resolve_tool_names(&settings.tools.install);
         let spec = crate::tool_install::InstallSpec {

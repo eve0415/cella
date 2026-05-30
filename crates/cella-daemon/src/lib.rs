@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod browser;
+pub mod claude_config_sync;
 pub mod clipboard;
 pub mod control_server;
 pub mod credential;

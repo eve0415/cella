@@ -63,6 +63,12 @@ pub struct AgentHello {
     pub container_name: String,
     /// Auth token for validating the connection.
     pub auth_token: String,
+    /// Whether this agent participates in `~/.claude.json` bidirectional sync
+    /// (set from `CELLA_SYNC_CLAUDE_CONFIG`). The daemon only broadcasts config
+    /// updates to agents that advertise this. Defaults to false for older
+    /// agents that don't send the field.
+    #[serde(default)]
+    pub claude_config_sync: bool,
 }
 
 /// Sent by the daemon in response to `AgentHello`.
@@ -131,6 +137,9 @@ pub enum AgentMessage {
         uptime_secs: u64,
         ports_detected: usize,
     },
+    /// The container's `~/.claude.json` changed; carries its full content for
+    /// the daemon to deep-merge into the canonical config and propagate.
+    ClaudeConfigChanged { content: String },
 
     // -- Worktree operations (in-container CLI → daemon) --------------------
     /// Request to create a worktree-backed branch and its container.
@@ -446,6 +455,10 @@ pub enum DaemonMessage {
         connection_id: u64,
         target_port: u16,
     },
+    /// Push the canonical `~/.claude.json` content to the agent so it can write
+    /// it into the container. Only sent to agents that advertised
+    /// `claude_config_sync` in their `AgentHello`.
+    SyncClaudeConfig { content: String },
 
     // -- Worktree operation responses (daemon → in-container agent) ---------
     /// Progress update for a long-running operation (branch creation, etc.).
@@ -953,6 +966,7 @@ mod tests {
             agent_version: "0.1.0".to_string(),
             container_name: "test".to_string(),
             auth_token: "token".to_string(),
+            claude_config_sync: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         let result = serde_json::from_str::<TunnelHandshake>(&json);
@@ -1124,12 +1138,62 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_claude_config_changed() {
+        let msg = AgentMessage::ClaudeConfigChanged {
+            content: r#"{"numStartups":3}"#.to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"claude_config_changed\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, AgentMessage::ClaudeConfigChanged { content } if content == r#"{"numStartups":3}"#)
+        );
+    }
+
+    #[test]
+    fn roundtrip_sync_claude_config() {
+        let msg = DaemonMessage::SyncClaudeConfig {
+            content: r#"{"mcpServers":{}}"#.to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"sync_claude_config\""));
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, DaemonMessage::SyncClaudeConfig { content } if content == r#"{"mcpServers":{}}"#)
+        );
+    }
+
+    #[test]
+    fn agent_hello_claude_config_sync_roundtrip() {
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.1.0".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            claude_config_sync: true,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"claude_config_sync\":true"));
+        let decoded: AgentHello = serde_json::from_str(&json).unwrap();
+        assert!(decoded.claude_config_sync);
+    }
+
+    #[test]
+    fn agent_hello_backward_compat_missing_claude_config_sync() {
+        // Old agents won't send the flag; it must default to false.
+        let json = r#"{"protocol_version":1,"agent_version":"0.1.0","container_name":"c","auth_token":"t"}"#;
+        let decoded: AgentHello = serde_json::from_str(json).unwrap();
+        assert!(!decoded.claude_config_sync);
+    }
+
+    #[test]
     fn roundtrip_agent_hello() {
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
             agent_version: "0.1.0".to_string(),
             container_name: "test-container".to_string(),
             auth_token: "token123".to_string(),
+            claude_config_sync: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         let decoded: AgentHello = serde_json::from_str(&json).unwrap();

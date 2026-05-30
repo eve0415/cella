@@ -40,6 +40,11 @@ pub(crate) struct ControlContext {
     pub phantom_registry: Arc<Mutex<crate::phantom_registry::PhantomRegistry>>,
     pub is_orbstack: bool,
     pub hostname_route_table: cella_proxy::server::SharedRouteTable,
+    /// Canonical `~/.claude.json` state for bidirectional sync.
+    pub claude_sync: Arc<Mutex<crate::claude_config_sync::ClaudeSyncState>>,
+    /// Host-side `~/.claude.json` path to watch and write (target path; the
+    /// file need not exist yet). `None` if the host home can't be resolved.
+    pub claude_json_path: Option<std::path::PathBuf>,
 }
 
 /// Tracks whether an agent has actually connected and sent messages.
@@ -76,6 +81,10 @@ pub struct ContainerHandle {
     pub docker_host: Option<String>,
     /// Channel for sending daemon-initiated messages to the connected agent.
     pub agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
+    /// Whether the connected agent opted into `~/.claude.json` sync
+    /// (advertised via `AgentHello.claude_config_sync`). The daemon only
+    /// broadcasts config updates to handles where this is true.
+    pub claude_config_sync: bool,
 }
 
 /// Spawn a handler task for a new TCP connection (agent or tunnel).
@@ -252,6 +261,23 @@ pub(crate) async fn run_control_server(
 ) {
     let ctx = Arc::new(ctx);
 
+    // Watch the host `~/.claude.json` and propagate edits to opted-in agents.
+    if let Some(path) = ctx.claude_json_path.clone() {
+        let state = ctx.claude_sync.clone();
+        let handles = ctx.container_handles.clone();
+        tokio::spawn(async move {
+            match cella_filesync::watch_file(&path, std::time::Duration::from_millis(300)) {
+                Ok(mut handle) => {
+                    debug!("claude sync: watching host {}", path.display());
+                    while handle.changes.recv().await.is_some() {
+                        crate::claude_config_sync::on_host_change(&state, &handles, &path).await;
+                    }
+                }
+                Err(e) => warn!("claude sync: cannot watch host ~/.claude.json: {e}"),
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -293,6 +319,11 @@ struct HandshakeResult {
     workspace_path: Option<String>,
     /// Host-side parent repo root (set for worktree containers).
     parent_repo: Option<String>,
+    /// Whether the agent opted into `~/.claude.json` sync. Gates both the
+    /// canonical push on connect and — crucially — ingest of inbound
+    /// `ClaudeConfigChanged`, so a non-opted-in container cannot write the host
+    /// config or poison peers.
+    claude_config_sync: bool,
 }
 
 /// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
@@ -389,10 +420,95 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         agent_state,
         workspace_path,
         parent_repo,
+        claude_config_sync: agent_hello.claude_config_sync,
     }))
 }
 
 /// Handle an agent TCP connection after the `AgentHello` has been parsed.
+/// Route a single inbound agent message: `~/.claude.json` sync, worktree/task
+/// operations (which need streaming writer access), or the generic handler.
+async fn dispatch_agent_message<W: AsyncWriteExt + Unpin>(
+    msg: AgentMessage,
+    ctx: &ControlContext,
+    hs: &HandshakeResult,
+    writer: &mut W,
+) -> Result<(), CellaDaemonError> {
+    // `~/.claude.json` sync: diff into a merge-patch, apply to the canonical
+    // config, write the host file, re-broadcast to the other agents, and push
+    // back to the sender if it is missing keys.
+    //
+    // Ingest is gated on the sender's opt-in (symmetric with the broadcast
+    // gate): a container that wasn't granted config forwarding must not be able
+    // to write the host `~/.claude.json` or poison peer containers.
+    if let AgentMessage::ClaudeConfigChanged { content } = &msg {
+        if !hs.claude_config_sync {
+            warn!(
+                "Dropping ClaudeConfigChanged from {} (did not opt into config sync)",
+                hs.container_name
+            );
+            return Ok(());
+        }
+        crate::claude_config_sync::on_agent_change(
+            &ctx.claude_sync,
+            &ctx.container_handles,
+            ctx.claude_json_path.as_deref(),
+            content,
+            &hs.container_name,
+        )
+        .await;
+        return Ok(());
+    }
+
+    if matches!(
+        &msg,
+        AgentMessage::BranchRequest { .. }
+            | AgentMessage::ListRequest { .. }
+            | AgentMessage::ExecRequest { .. }
+            | AgentMessage::ExecCaptureRequest { .. }
+            | AgentMessage::DoctorRequest { .. }
+            | AgentMessage::PruneRequest { .. }
+            | AgentMessage::DownRequest { .. }
+            | AgentMessage::UpRequest { .. }
+            | AgentMessage::TaskRunRequest { .. }
+            | AgentMessage::TaskListRequest { .. }
+            | AgentMessage::TaskLogsRequest { .. }
+            | AgentMessage::TaskWaitRequest { .. }
+            | AgentMessage::TaskStopRequest { .. }
+            | AgentMessage::SwitchRequest { .. }
+    ) {
+        handle_worktree_message(
+            msg,
+            WorktreeHandlerCtx {
+                workspace_path: hs.workspace_path.as_deref(),
+                parent_repo: hs.parent_repo.as_deref(),
+                cella_bin: &ctx.cella_bin,
+                task_mgr: &ctx.task_manager,
+                container_handles: &ctx.container_handles,
+                container_name: &hs.container_name,
+            },
+            writer,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let handler_ctx = AgentHandlerContext {
+        port_manager: &ctx.port_manager,
+        browser_handler: &ctx.browser_handler,
+        clipboard_handler: &ctx.clipboard_handler,
+        container_id: Some(&hs.container_id),
+        proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
+        container_ip: hs.container_ip.as_deref(),
+        container_name: Some(&hs.container_name),
+        is_orbstack: ctx.is_orbstack,
+        hostname_route_table: ctx.hostname_route_table.clone(),
+    };
+    if let Some(resp) = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await {
+        send_message(writer, &resp).await?;
+    }
+    Ok(())
+}
+
 async fn handle_agent_connection_after_hello(
     agent_hello: AgentHello,
     mut reader: BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
@@ -411,9 +527,15 @@ async fn handle_agent_connection_after_hello(
     {
         let mut handles = ctx.container_handles.lock().await;
         if let Some(handle) = handles.get_mut(&hs.container_name) {
-            handle.agent_tx = Some(daemon_tx);
+            handle.agent_tx = Some(daemon_tx.clone());
+            handle.claude_config_sync = hs.claude_config_sync;
         }
     }
+
+    // The agent re-announces its current `~/.claude.json` on (re)connect (before
+    // its reader starts), so the daemon merges its state and pushes back whatever
+    // it is missing. No unconditional push here: a daemon-restart canonical would
+    // be stale (missing this container's keys) and would clobber its file.
 
     // --- Message loop ---
     let result: Result<(), CellaDaemonError> = loop {
@@ -439,55 +561,7 @@ async fn handle_agent_connection_after_hello(
                     })?;
                 line.clear();
 
-                if matches!(
-                    &msg,
-                    AgentMessage::BranchRequest { .. }
-                        | AgentMessage::ListRequest { .. }
-                        | AgentMessage::ExecRequest { .. }
-                        | AgentMessage::ExecCaptureRequest { .. }
-                        | AgentMessage::DoctorRequest { .. }
-                        | AgentMessage::PruneRequest { .. }
-                        | AgentMessage::DownRequest { .. }
-                        | AgentMessage::UpRequest { .. }
-                        | AgentMessage::TaskRunRequest { .. }
-                        | AgentMessage::TaskListRequest { .. }
-                        | AgentMessage::TaskLogsRequest { .. }
-                        | AgentMessage::TaskWaitRequest { .. }
-                        | AgentMessage::TaskStopRequest { .. }
-                        | AgentMessage::SwitchRequest { .. }
-                ) {
-                    handle_worktree_message(
-                        msg,
-                        WorktreeHandlerCtx {
-                            workspace_path: hs.workspace_path.as_deref(),
-                            parent_repo: hs.parent_repo.as_deref(),
-                            cella_bin: &ctx.cella_bin,
-                            task_mgr: &ctx.task_manager,
-                            container_handles: &ctx.container_handles,
-                            container_name: &hs.container_name,
-                        },
-                        &mut writer,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                let handler_ctx = AgentHandlerContext {
-                    port_manager: &ctx.port_manager,
-                    browser_handler: &ctx.browser_handler,
-                    clipboard_handler: &ctx.clipboard_handler,
-                    container_id: Some(&hs.container_id),
-                    proxy_cmd_tx: Some(&ctx.proxy_cmd_tx),
-                    container_ip: hs.container_ip.as_deref(),
-                    container_name: Some(&hs.container_name),
-                    is_orbstack: ctx.is_orbstack,
-                    hostname_route_table: ctx.hostname_route_table.clone(),
-                };
-                let response = handle_agent_message(msg, &handler_ctx, &hs.agent_state).await;
-
-                if let Some(resp) = response {
-                    send_message(&mut writer, &resp).await?;
-                }
+                dispatch_agent_message(msg, ctx, &hs, &mut writer).await?;
             }
             Some(msg) = daemon_rx.recv() => {
                 send_message(&mut writer, &msg).await?;
@@ -501,6 +575,7 @@ async fn handle_agent_connection_after_hello(
         let mut handles = ctx.container_handles.lock().await;
         if let Some(handle) = handles.get_mut(&hs.container_name) {
             handle.agent_tx = None;
+            handle.claude_config_sync = false;
         }
     }
     hs.agent_state.connected.store(false, Ordering::Relaxed);
@@ -810,6 +885,10 @@ pub(crate) async fn handle_agent_message(
         AgentMessage::ClipboardPaste { mime_type } => {
             Some(handle_clipboard_paste(mime_type, ctx).await)
         }
+
+        // Handled upstream in the message loop (needs the canonical sync state
+        // and broadcast access); never reaches this catch-all in practice.
+        AgentMessage::ClaudeConfigChanged { .. } => None,
 
         // Worktree/exec/task operations are handled in the message loop via
         // handle_worktree_message() which has writer access for streaming.
@@ -2960,6 +3039,7 @@ mod tests {
             backend_kind: Some("docker".into()),
             docker_host: None,
             agent_tx: None,
+            claude_config_sync: false,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
@@ -2987,6 +3067,10 @@ mod tests {
             hostname_route_table: Arc::new(tokio::sync::RwLock::new(
                 cella_proxy::router::RouteTable::new(),
             )),
+            claude_sync: Arc::new(Mutex::new(
+                crate::claude_config_sync::ClaudeSyncState::load(None),
+            )),
+            claude_json_path: None,
         }
     }
 
@@ -3003,6 +3087,7 @@ mod tests {
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
                     agent_tx: None,
+                    claude_config_sync: false,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3014,6 +3099,7 @@ mod tests {
             agent_version: "0.0.28".to_string(),
             container_name: "test-container".to_string(),
             auth_token: "test-token".to_string(),
+            claude_config_sync: false,
         };
 
         assert!(
@@ -3062,6 +3148,7 @@ mod tests {
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
                     agent_tx: None,
+                    claude_config_sync: false,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3084,6 +3171,7 @@ mod tests {
             agent_version: "0.0.28".to_string(),
             container_name: "int-test-container".to_string(),
             auth_token: "int-test-token".to_string(),
+            claude_config_sync: false,
         };
         let mut json = serde_json::to_string(&hello).unwrap();
         json.push('\n');
@@ -3136,6 +3224,7 @@ mod tests {
             agent_version: "0.0.28".to_string(),
             container_name: "not-registered".to_string(),
             auth_token: "test-token".to_string(),
+            claude_config_sync: false,
         };
 
         let (_daemon_side, agent_side) = tokio::io::duplex(4096);
@@ -3146,6 +3235,135 @@ mod tests {
         assert!(
             matches!(result, Ok(None)),
             "handshake must reject and return Ok(None) for unknown container"
+        );
+    }
+
+    fn handshake_for(name: &str, claude_config_sync: bool) -> HandshakeResult {
+        HandshakeResult {
+            container_name: name.to_string(),
+            container_id: "id".to_string(),
+            container_ip: None,
+            agent_state: Arc::new(AgentConnectionState::new()),
+            workspace_path: None,
+            parent_repo: None,
+            claude_config_sync,
+        }
+    }
+
+    /// Regression: a container that did NOT opt into config sync must not be
+    /// able to write the host `~/.claude.json` via `ClaudeConfigChanged`.
+    #[tokio::test]
+    async fn claude_config_changed_ingest_gated_on_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join(".claude.json");
+        std::fs::write(&host, b"{}").unwrap();
+
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut ctx = test_control_context(handles, "tok");
+        ctx.claude_json_path = Some(host.clone());
+        ctx.claude_sync = Arc::new(Mutex::new(
+            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
+        ));
+
+        let msg = AgentMessage::ClaudeConfigChanged {
+            content: r#"{"projects":{"/evil":{}}}"#.to_string(),
+        };
+        let (_d, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        // Sender did NOT opt in → ingest dropped, host file untouched.
+        dispatch_agent_message(msg, &ctx, &handshake_for("c", false), &mut w)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&host).unwrap(),
+            b"{}",
+            "non-opted-in container must not mutate the host config"
+        );
+    }
+
+    /// Counterpart: an opted-in container's change is applied to the host file.
+    #[tokio::test]
+    async fn claude_config_changed_applied_when_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join(".claude.json");
+        std::fs::write(&host, b"{}").unwrap();
+
+        let handles = Arc::new(Mutex::new(HashMap::new()));
+        let mut ctx = test_control_context(handles, "tok");
+        ctx.claude_json_path = Some(host.clone());
+        ctx.claude_sync = Arc::new(Mutex::new(
+            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
+        ));
+
+        let msg = AgentMessage::ClaudeConfigChanged {
+            content: r#"{"projects":{"/workspaces/p":{}}}"#.to_string(),
+        };
+        let (_d, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+
+        dispatch_agent_message(msg, &ctx, &handshake_for("c", true), &mut w)
+            .await
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&host).unwrap()).unwrap();
+        assert!(
+            written["projects"]["/workspaces/p"].is_object(),
+            "opted-in container's change should land on the host: {written}"
+        );
+    }
+
+    /// Reconnect/catch-up wiring: an opted-in container that re-announces a config
+    /// missing a key the canonical holds must get a push-back carrying it, routed
+    /// `dispatch_agent_message` -> `on_agent_change` -> the handle's `agent_tx`.
+    /// Covers the daemon half of the (re)connect reconcile end to end.
+    #[tokio::test]
+    async fn claude_config_changed_pushes_back_missing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join(".claude.json");
+        // Canonical (seeded from the host) holds a project the agent won't send.
+        std::fs::write(&host, br#"{"projects":{"/Users/h/p":{"k":1}}}"#).unwrap();
+
+        // Register the sender with an agent_tx so the push-back can be delivered.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
+        let mut map = HashMap::new();
+        map.insert(
+            "c".to_string(),
+            ContainerHandle {
+                container_id: "id".to_string(),
+                agent_state: Arc::new(AgentConnectionState::new()),
+                backend_kind: None,
+                docker_host: None,
+                agent_tx: Some(tx),
+                claude_config_sync: true,
+            },
+        );
+        let handles = Arc::new(Mutex::new(map));
+        let mut ctx = test_control_context(handles, "tok");
+        ctx.claude_json_path = Some(host.clone());
+        ctx.claude_sync = Arc::new(Mutex::new(
+            crate::claude_config_sync::ClaudeSyncState::load(Some(&host)),
+        ));
+
+        // Agent re-announces a config lacking the canonical's project key.
+        let msg = AgentMessage::ClaudeConfigChanged {
+            content: r#"{"keep":true}"#.to_string(),
+        };
+        let (_d, agent_side) = tokio::io::duplex(4096);
+        let (_r, mut w) = tokio::io::split(agent_side);
+        dispatch_agent_message(msg, &ctx, &handshake_for("c", true), &mut w)
+            .await
+            .unwrap();
+
+        let DaemonMessage::SyncClaudeConfig { content } =
+            rx.try_recv().expect("agent must receive a push-back")
+        else {
+            panic!("expected SyncClaudeConfig");
+        };
+        let pushed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            pushed["projects"]["/Users/h/p"]["k"], 1,
+            "push-back must carry the key the agent was missing"
         );
     }
 

@@ -101,6 +101,12 @@ pub(crate) async fn run_management_server(
             phantom_registry: ctx.phantom_registry.clone(),
             is_orbstack: ctx.is_orbstack,
             hostname_route_table: ctx.hostname_route_table.clone(),
+            claude_sync: Arc::new(Mutex::new(
+                crate::claude_config_sync::ClaudeSyncState::load(
+                    cella_env::claude_code::host_claude_json_path().as_deref(),
+                ),
+            )),
+            claude_json_path: cella_env::claude_code::host_claude_json_target(),
         };
         tokio::spawn(async move {
             crate::control_server::run_control_server(
@@ -407,6 +413,7 @@ async fn handle_register(
             backend_kind: reg.backend_kind,
             docker_host: reg.docker_host,
             agent_tx: None,
+            claude_config_sync: false,
         },
     );
 
@@ -1089,6 +1096,7 @@ mod tests {
             agent_version: "0.0.28".to_string(),
             container_name: "hs-container".to_string(),
             auth_token: "test-token".to_string(),
+            claude_config_sync: false,
         };
         let mut json = serde_json::to_string(&hello).unwrap();
         json.push('\n');

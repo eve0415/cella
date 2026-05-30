@@ -618,6 +618,17 @@ impl UpContext {
             setup_plugin_manifests(self.client.as_ref(), container_id, remote_user).await;
         }
 
+        // Seed single-file configs (~/.claude.json, ~/.tmux.conf) as regular
+        // files instead of single-file bind mounts (anti-ghost). Shared by the
+        // compose path, which reaches this method via the ComposeUpHooks hook.
+        cella_orchestrator::tool_install::seed_tool_config_files(
+            self.client.as_ref(),
+            container_id,
+            settings,
+            remote_user,
+        )
+        .await;
+
         // Install tools listed in [tools] install = [...]
         let tools_to_install =
             cella_orchestrator::tool_install::resolve_tool_names(&settings.tools.install);

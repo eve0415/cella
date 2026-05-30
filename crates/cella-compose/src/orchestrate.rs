@@ -857,11 +857,18 @@ async fn build_override_and_start(
     let progress = ctx.progress;
 
     let managed = ctx.client.capabilities().managed_agent;
-    let extra_env = build_extra_env(daemon_env, env_fwd, cfg.remote_env, managed);
+    let mut extra_env = build_extra_env(daemon_env, env_fwd, cfg.remote_env, managed);
     let mut labels = build_compose_labels(cfg, project, remote_user);
 
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     cella_tool_install::ensure_tool_config_paths(&settings);
+    // Container env is immutable after create, so the claude.json sync opt-in
+    // must be baked into the compose override here (mirrors the single-container
+    // `apply_env_and_mounts` injection).
+    extra_env.extend(cella_tool_install::tool_config_env_vars(
+        &settings,
+        remote_user,
+    ));
     insert_mount_input_fingerprint_label(&mut labels, &settings, env_fwd, cfg.workspace_root);
 
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);

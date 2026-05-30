@@ -8,7 +8,9 @@ use std::future::Future;
 
 use cella_backend::container_setup::chown_in_container;
 use cella_backend::progress::{PhaseChildHandle, ProgressSender};
-use cella_backend::{BackendError, ContainerBackend, ExecOptions, ExecResult, MountSpec};
+use cella_backend::{
+    BackendError, ContainerBackend, ExecOptions, ExecResult, FileToUpload, MountSpec,
+};
 use tracing::{debug, warn};
 
 /// Probed user environment (e.g. from `userEnvProbe`).
@@ -1125,34 +1127,32 @@ pub fn build_tool_config_mount_specs(
 ) -> Vec<MountSpec> {
     let mut out = Vec::new();
 
-    // Claude Code: ~/.claude.json (single file) and ~/.claude/ (directory)
-    if settings.tools.claude_code.forward_config {
-        if let Some(host_path) = cella_env::claude_code::host_claude_json_path() {
-            let target = format!(
-                "{}/.claude.json",
-                cella_env::claude_code::container_home(remote_user),
-            );
-            out.push(MountSpec::bind(
-                host_path.to_string_lossy().to_string(),
-                target,
-            ));
-        }
-        if let Some(host_path) = cella_env::claude_code::host_claude_dir() {
-            let target = cella_env::claude_code::claude_dir_for_user(remote_user);
-            out.push(MountSpec::bind(
-                host_path.to_string_lossy().to_string(),
-                target.clone(),
-            ));
+    // Claude Code: ~/.claude/ (directory) only.
+    //
+    // `~/.claude.json` is intentionally NOT bind-mounted as a single file: on
+    // VirtioFS (OrbStack) a host atomic-replace (Claude Code rewrites it via
+    // temp+rename on every config change) unlinks the backing inode, leaving a
+    // ghost mountpoint (`-????????? ?` / `//deleted`) that the `claude` CLI
+    // can't read. Instead it is seeded as a regular file at create time (see
+    // `build_tool_config_seed_files`) and kept live via the daemon sync hub.
+    // Directory mounts are immune — the directory inode is stable.
+    if settings.tools.claude_code.forward_config
+        && let Some(host_path) = cella_env::claude_code::host_claude_dir()
+    {
+        let target = cella_env::claude_code::claude_dir_for_user(remote_user);
+        out.push(MountSpec::bind(
+            host_path.to_string_lossy().to_string(),
+            target.clone(),
+        ));
 
-            // Hidden mount for host plugins (backward sync access)
-            if let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() {
-                out.push(MountSpec::bind(
-                    host_plugins.to_string_lossy().to_string(),
-                    "/tmp/.cella/host-plugins".to_string(),
-                ));
-                // tmpfs shadows the parent bind mount's plugins/ subdirectory
-                out.push(MountSpec::tmpfs(format!("{target}/plugins")));
-            }
+        // Hidden mount for host plugins (backward sync access)
+        if let Some(host_plugins) = cella_env::claude_code::host_plugins_dir() {
+            out.push(MountSpec::bind(
+                host_plugins.to_string_lossy().to_string(),
+                "/tmp/.cella/host-plugins".to_string(),
+            ));
+            // tmpfs shadows the parent bind mount's plugins/ subdirectory
+            out.push(MountSpec::tmpfs(format!("{target}/plugins")));
         }
     }
 
@@ -1187,27 +1187,159 @@ pub fn build_tool_config_mount_specs(
         ));
     }
 
-    // Tmux: ~/.tmux.conf (file) and/or ~/.config/tmux/ (directory)
-    if settings.tools.tmux.forward_config {
-        if let Some(host_path) =
-            cella_env::tmux::host_tmux_conf(settings.tools.tmux.config_path.as_deref())
-        {
-            out.push(MountSpec::bind(
-                host_path.to_string_lossy().to_string(),
-                cella_env::tmux::container_tmux_conf(remote_user),
-            ));
-        }
-        if let Some(host_path) =
+    // Tmux: ~/.config/tmux/ (directory) only. `~/.tmux.conf` is seeded as a
+    // regular file at create time rather than bind-mounted as a single file —
+    // same VirtioFS ghost-on-atomic-replace bug as `~/.claude.json` (see
+    // `build_tool_config_seed_files`).
+    if settings.tools.tmux.forward_config
+        && let Some(host_path) =
             cella_env::tmux::host_tmux_config_dir(settings.tools.tmux.config_path.as_deref())
-        {
-            out.push(MountSpec::bind(
-                host_path.to_string_lossy().to_string(),
-                cella_env::tmux::container_tmux_config_dir(remote_user),
-            ));
-        }
+    {
+        out.push(MountSpec::bind(
+            host_path.to_string_lossy().to_string(),
+            cella_env::tmux::container_tmux_config_dir(remote_user),
+        ));
     }
 
     out
+}
+
+// ── Single-file config seeding (anti-ghost) ──────────────────────────────────
+
+/// Build regular-file seed uploads for the single-file tool configs that are no
+/// longer bind-mounted: `~/.claude.json` and `~/.tmux.conf`.
+///
+/// Reads each enabled config from the host and targets its container-side path
+/// at mode `0o600`. A regular file copy cannot ghost when the host atomically
+/// replaces the original (unlike a single-file `VirtioFS` bind mount), which is
+/// the root-cause fix. `~/.claude.json` is additionally kept live by the daemon
+/// sync hub once the container is running.
+#[must_use]
+pub fn build_tool_config_seed_files(
+    settings: &cella_config::CellaConfig,
+    remote_user: &str,
+) -> Vec<FileToUpload> {
+    let mut files = Vec::new();
+
+    if settings.tools.claude_code.forward_config
+        && let Some(host_path) = cella_env::claude_code::host_claude_json_path()
+        && let Ok(content) = std::fs::read(&host_path)
+    {
+        files.push(FileToUpload {
+            path: format!(
+                "{}/.claude.json",
+                cella_env::claude_code::container_home(remote_user)
+            ),
+            content,
+            mode: 0o600,
+        });
+    }
+
+    if settings.tools.tmux.forward_config
+        && let Some(host_path) =
+            cella_env::tmux::host_tmux_conf(settings.tools.tmux.config_path.as_deref())
+        && let Ok(content) = std::fs::read(&host_path)
+    {
+        files.push(FileToUpload {
+            path: cella_env::tmux::container_tmux_conf(remote_user),
+            content,
+            mode: 0o600,
+        });
+    }
+
+    files
+}
+
+/// Container env vars required by forwarded single-file tool configs.
+///
+/// `CELLA_SYNC_CLAUDE_CONFIG=1` opts the in-container agent into bidirectional
+/// `~/.claude.json` sync; `CELLA_CLAUDE_JSON_PATH` pins the exact file the agent
+/// must watch/write so it always matches the seeded path — even when the agent
+/// daemon runs as a different user than `remote_user` (so `$HOME` would differ).
+/// Container env is immutable after create, so this is injected at create time
+/// on both the single-container and compose paths.
+#[must_use]
+pub fn tool_config_env_vars(
+    settings: &cella_config::CellaConfig,
+    remote_user: &str,
+) -> Vec<String> {
+    let mut env = Vec::new();
+    if settings.tools.claude_code.forward_config {
+        env.push("CELLA_SYNC_CLAUDE_CONFIG=1".to_string());
+        env.push(format!(
+            "CELLA_CLAUDE_JSON_PATH={}/.claude.json",
+            cella_env::claude_code::container_home(remote_user)
+        ));
+    }
+    env
+}
+
+/// Seed single-file tool configs into a freshly-created container as regular
+/// files (see [`build_tool_config_seed_files`]).
+///
+/// Any file already present in the container is left untouched, so an
+/// agent-applied `~/.claude.json` update (Layer B) is never clobbered by the
+/// stale host snapshot. Best-effort: failures are logged, never fatal.
+pub async fn seed_tool_config_files(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    settings: &cella_config::CellaConfig,
+    remote_user: &str,
+) {
+    let files = build_tool_config_seed_files(settings, remote_user);
+    if files.is_empty() {
+        return;
+    }
+
+    let mut to_upload = Vec::with_capacity(files.len());
+    for file in files {
+        if container_file_exists(client, container_id, &file.path).await {
+            debug!("seed: {} already present in container, skipping", file.path);
+        } else {
+            to_upload.push(file);
+        }
+    }
+
+    if to_upload.is_empty() {
+        return;
+    }
+
+    match client.upload_files(container_id, &to_upload).await {
+        Ok(()) => {
+            // Tar extraction runs as root, so the files land root-owned; chown
+            // each to the remote user or `claude`/tmux can't read its own config.
+            for file in &to_upload {
+                chown_in_container(client, container_id, remote_user, &file.path).await;
+            }
+            debug!(
+                "Seeded {} tool config file(s) into container",
+                to_upload.len()
+            );
+        }
+        Err(e) => warn!("Failed to seed tool config files: {e}"),
+    }
+}
+
+/// Whether `path` exists as a regular file inside the container.
+async fn container_file_exists(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    path: &str,
+) -> bool {
+    matches!(
+        client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["test".to_string(), "-f".to_string(), path.to_string()],
+                    user: None,
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await,
+        Ok(r) if r.exit_code == 0
+    )
 }
 
 // ── Verify & symlink ─────────────────────────────────────────────────────────
@@ -1662,6 +1794,62 @@ async fn install_fallible_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Single-file config seeding ─────────────────────────────────────────
+
+    #[test]
+    fn tool_config_env_vars_opts_in_when_forwarding() {
+        let settings = cella_config::CellaConfig::default();
+        assert!(settings.tools.claude_code.forward_config, "precondition");
+        assert_eq!(
+            tool_config_env_vars(&settings, "vscode"),
+            vec![
+                "CELLA_SYNC_CLAUDE_CONFIG=1".to_string(),
+                "CELLA_CLAUDE_JSON_PATH=/home/vscode/.claude.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_config_env_vars_pins_path_for_root_user() {
+        // The agent may run as a different user than remote_user; pin the path
+        // to remote_user's home regardless of the agent's $HOME.
+        let settings = cella_config::CellaConfig::default();
+        assert!(
+            tool_config_env_vars(&settings, "root")
+                .contains(&"CELLA_CLAUDE_JSON_PATH=/root/.claude.json".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_config_env_vars_empty_when_forwarding_off() {
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.claude_code.forward_config = false;
+        assert!(tool_config_env_vars(&settings, "vscode").is_empty());
+    }
+
+    #[test]
+    fn seed_files_empty_when_single_file_forwarding_off() {
+        // Both single-file forwards disabled → no host reads, no seeds.
+        let mut settings = cella_config::CellaConfig::default();
+        settings.tools.claude_code.forward_config = false;
+        settings.tools.tmux.forward_config = false;
+        assert!(build_tool_config_seed_files(&settings, "vscode").is_empty());
+    }
+
+    #[test]
+    fn claude_json_no_longer_bind_mounted() {
+        // Regression guard for the ghost-file fix: the single-file claude.json
+        // mount must never reappear in the mount specs.
+        let settings = cella_config::CellaConfig::default();
+        let specs = build_tool_config_mount_specs(&settings, "vscode");
+        assert!(
+            !specs
+                .iter()
+                .any(|s| s.target.ends_with("/.claude.json") || s.target.ends_with("/.tmux.conf")),
+            "single-file claude.json/tmux.conf must be seeded, not bind-mounted: {specs:?}"
+        );
+    }
 
     // ── ToolName ───────────────────────────────────────────────────────────
 

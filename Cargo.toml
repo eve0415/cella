@@ -12,6 +12,7 @@ members = [
     "crates/cella-doctor",
     "crates/cella-docker",
     "crates/cella-env",
+    "crates/cella-filesync",
     "crates/cella-git",
     "crates/cella-port",
     "crates/cella-agent",
@@ -177,6 +178,7 @@ cella-daemon = { path = "crates/cella-daemon" }
 cella-daemon-client = { path = "crates/cella-daemon-client" }
 cella-docker = { path = "crates/cella-docker" }
 cella-env = { path = "crates/cella-env" }
+cella-filesync = { path = "crates/cella-filesync" }
 cella-features = { path = "crates/cella-features" }
 cella-git = { path = "crates/cella-git" }
 cella-network = { path = "crates/cella-network" }
