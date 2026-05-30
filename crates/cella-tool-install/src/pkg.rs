@@ -18,77 +18,54 @@ impl PackageManager {
 
 pub struct PackageSpec {
     pub check_binary: Option<&'static str>,
-    pub apt: &'static [&'static str],
-    pub apk: &'static [&'static str],
-    pub dnf: &'static [&'static str],
-    pub pacman: &'static [&'static str],
-    pub zypper: &'static [&'static str],
+    pub names: &'static [&'static str],
+    pub apk_override: Option<&'static [&'static str]>,
 }
 
 impl PackageSpec {
     pub const fn names_for(&self, manager: PackageManager) -> &[&str] {
-        match manager {
-            PackageManager::Apt => self.apt,
-            PackageManager::Apk => self.apk,
-            PackageManager::Dnf => self.dnf,
-            PackageManager::Pacman => self.pacman,
-            PackageManager::Zypper => self.zypper,
+        if let (PackageManager::Apk, Some(apk)) = (manager, self.apk_override) {
+            apk
+        } else {
+            self.names
         }
     }
 }
 
 pub const TMUX: PackageSpec = PackageSpec {
     check_binary: Some("tmux"),
-    apt: &["tmux"],
-    apk: &["tmux"],
-    dnf: &["tmux"],
-    pacman: &["tmux"],
-    zypper: &["tmux"],
+    names: &["tmux"],
+    apk_override: None,
 };
 
 pub const BUBBLEWRAP: PackageSpec = PackageSpec {
     check_binary: Some("bwrap"),
-    apt: &["bubblewrap"],
-    apk: &["bubblewrap"],
-    dnf: &["bubblewrap"],
-    pacman: &["bubblewrap"],
-    zypper: &["bubblewrap"],
+    names: &["bubblewrap"],
+    apk_override: None,
 };
 
 pub const NODEJS: PackageSpec = PackageSpec {
     check_binary: None,
-    apt: &["nodejs", "npm"],
-    apk: &["nodejs", "npm"],
-    dnf: &["nodejs", "npm"],
-    pacman: &["nodejs", "npm"],
-    zypper: &["nodejs", "npm"],
+    names: &["nodejs", "npm"],
+    apk_override: None,
 };
 
 pub const LIBGCC: PackageSpec = PackageSpec {
     check_binary: None,
-    apt: &[],
-    apk: &["libgcc"],
-    dnf: &[],
-    pacman: &[],
-    zypper: &[],
+    names: &[],
+    apk_override: Some(&["libgcc"]),
 };
 
 pub const LIBSTDCPP: PackageSpec = PackageSpec {
     check_binary: None,
-    apt: &[],
-    apk: &["libstdc++"],
-    dnf: &[],
-    pacman: &[],
-    zypper: &[],
+    names: &[],
+    apk_override: Some(&["libstdc++"]),
 };
 
 pub const RIPGREP: PackageSpec = PackageSpec {
     check_binary: Some("rg"),
-    apt: &["ripgrep"],
-    apk: &["ripgrep"],
-    dnf: &["ripgrep"],
-    pacman: &["ripgrep"],
-    zypper: &["ripgrep"],
+    names: &["ripgrep"],
+    apk_override: None,
 };
 
 pub async fn detect_package_manager(
@@ -123,6 +100,11 @@ pub async fn detect_package_manager(
     None
 }
 
+/// # Returns
+///
+/// Returns `Ok(result)` even when `result.exit_code != 0` — the caller
+/// decides whether a non-zero exit is fatal. Transport errors during exec
+/// are returned as `Err`.
 pub async fn install_packages(
     client: &dyn ContainerBackend,
     container_id: &str,

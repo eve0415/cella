@@ -313,14 +313,14 @@ pub async fn install_nvim(
     Ok(install_result)
 }
 
-// ── Tmux install ────────────────────────────────────────────────────────────
+// ── Tmux ────────────────────────────────────────────────────────────────────
 
 /// Verify tmux is available after the batch package install step.
 ///
 /// # Errors
 ///
 /// Returns an error string if tmux is not reachable.
-pub async fn install_tmux(
+pub async fn verify_tmux(
     client: &dyn ContainerBackend,
     container_id: &str,
 ) -> Result<ExecResult, String> {
@@ -328,7 +328,11 @@ pub async fn install_tmux(
         .exec_command(
             container_id,
             &ExecOptions {
-                cmd: vec!["which".to_string(), "tmux".to_string()],
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "command -v tmux".to_string(),
+                ],
                 user: Some("root".to_string()),
                 env: None,
                 working_dir: None,
@@ -605,7 +609,7 @@ pub async fn npm_install_global(
 // ── Codex ────────────────────────────────────────────────────────────────────
 
 /// Check if bubblewrap is available after the batch package install step.
-pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
+pub async fn check_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
     let available = client
         .exec_command(
             container_id,
@@ -631,7 +635,7 @@ pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Ensures bubblewrap is available for sandbox support, then checks if
+/// Checks bubblewrap availability for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
 ///
@@ -646,7 +650,7 @@ pub async fn install_codex(
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) -> Option<ExecResult> {
-    ensure_codex_sandbox_deps(client, container_id).await;
+    check_codex_sandbox_deps(client, container_id).await;
 
     if is_npm_tool_installed(
         client,
@@ -1517,7 +1521,7 @@ pub async fn install_tools(
         &phase,
         "tmux",
         has(ToolName::Tmux),
-        install_tmux(client, container_id),
+        verify_tmux(client, container_id),
     );
 
     let (c, n, nv, t) = tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
@@ -1560,20 +1564,19 @@ async fn install_system_packages(
             needed.push(&pkg::RIPGREP);
         }
 
-        if !needed.is_empty() {
-            let _ = pkg::install_packages(client, container_id, mgr, &needed).await;
+        if !needed.is_empty()
+            && let Err(e) = pkg::install_packages(client, container_id, mgr, &needed).await
+        {
+            warn!("Batch package install failed: {e}");
         }
     }
 
-    let node_available = if needs_npm {
-        if npm_was_missing {
+    let node_available = needs_npm
+        && if npm_was_missing {
             npm_available_on_path(client, container_id, probed_env).await
         } else {
             true
-        }
-    } else {
-        false
-    };
+        };
 
     (is_alpine, node_available)
 }
@@ -1860,25 +1863,25 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
-    // ── install_tmux ───────────────────────────────────────────────────────
+    // ── verify_tmux ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn install_tmux_available() {
+    async fn verify_tmux_available() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // which tmux
+            Ok(ok_exit(0)), // command -v tmux
         ]);
-        let result = install_tmux(&backend, "test-container")
+        let result = verify_tmux(&backend, "test-container")
             .await
             .expect("should succeed");
         assert_eq!(result.exit_code, 0);
     }
 
     #[tokio::test]
-    async fn install_tmux_not_available() {
+    async fn verify_tmux_not_available() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // which tmux — not found
+            Ok(ok_exit(1)), // command -v tmux — not found
         ]);
-        let Err(err) = install_tmux(&backend, "test-container").await else {
+        let Err(err) = verify_tmux(&backend, "test-container").await else {
             panic!("expected Err when tmux not available");
         };
         assert!(err.contains("not available"), "got: {err}");
@@ -1962,7 +1965,7 @@ mod tests {
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
     }
 
-    // ── MockBackend for ensure_codex_sandbox_deps tests ─────────────────────
+    // ── MockBackend for check_codex_sandbox_deps tests ─────────────────────
 
     use std::collections::VecDeque;
     use std::io::Write;
@@ -2248,18 +2251,18 @@ mod tests {
         }
     }
 
-    // ── ensure_codex_sandbox_deps ─────────────────────────────────────────
+    // ── check_codex_sandbox_deps ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn ensure_codex_sandbox_deps_bwrap_available() {
+    async fn check_codex_sandbox_deps_bwrap_available() {
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
-        assert!(ensure_codex_sandbox_deps(&backend, "test-container").await);
+        assert!(check_codex_sandbox_deps(&backend, "test-container").await);
     }
 
     #[tokio::test]
-    async fn ensure_codex_sandbox_deps_bwrap_missing() {
+    async fn check_codex_sandbox_deps_bwrap_missing() {
         let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
-        assert!(!ensure_codex_sandbox_deps(&backend, "test-container").await);
+        assert!(!check_codex_sandbox_deps(&backend, "test-container").await);
     }
 
     // ── npm_available_on_path ──────────────────────────────────────────────
