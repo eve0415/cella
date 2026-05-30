@@ -856,6 +856,13 @@ impl EnsureUpContext<'_> {
                         )
                         .await;
                     let _ = self.client.upload_files(container_id, &files).await;
+                    crate::container_setup::chown_in_container(
+                        self.client,
+                        container_id,
+                        remote_user,
+                        &config_dir,
+                    )
+                    .await;
                     tracing::debug!("Seeded phantom gh credentials into container");
                 }
             } else {
