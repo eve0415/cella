@@ -88,29 +88,13 @@ pub struct UpMountArgs {
     pub(crate) mount_git_worktree_common_dir: bool,
 }
 
-/// Validate an `--id-label` value (`name=value`, both non-empty).
-fn parse_id_label(s: &str) -> Result<String, String> {
-    match s.split_once('=') {
-        Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
-        _ => Err("id-label must match <name>=<value>".to_string()),
-    }
-}
-
-/// Validate a `--remote-env` value (`name=value`, value may be empty).
-fn parse_remote_env(s: &str) -> Result<String, String> {
-    match s.split_once('=') {
-        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
-        _ => Err("remote-env must match <name>=<value>".to_string()),
-    }
-}
-
 /// Configuration-input flags: container targeting, config overrides, and the
 /// feature/lifecycle inputs that mirror the official `up` surface.
 #[derive(Args)]
 pub struct UpConfigInputArgs {
     /// Id label(s) of the format `name=value`, used to find/tag the container
     /// (repeatable). If omitted, one is inferred from the workspace folder.
-    #[arg(long = "id-label", value_parser = parse_id_label)]
+    #[arg(long = "id-label", value_parser = crate::commands::parse_id_label)]
     pub(crate) id_label: Vec<String>,
 
     /// devcontainer.json path that overrides any discovered config entirely.
@@ -123,7 +107,7 @@ pub struct UpConfigInputArgs {
 
     /// Remote environment variables of the format `name=value`, added when
     /// running the user (lifecycle) commands (repeatable).
-    #[arg(long = "remote-env", value_parser = parse_remote_env)]
+    #[arg(long = "remote-env", value_parser = crate::commands::parse_remote_env)]
     pub(crate) remote_env: Vec<String>,
 
     /// Do not run postAttachCommand.
@@ -191,23 +175,6 @@ pub struct UpLockfileArgs {
     /// Deprecated alias for lockfile writing (compatibility no-op).
     #[arg(long, hide = true)]
     pub(crate) experimental_lockfile: bool,
-}
-
-/// Dotfiles flags for an `up` invocation.
-#[derive(Args)]
-pub struct UpDotfilesArgs {
-    /// URL of a dotfiles Git repository to clone into the container.
-    #[arg(long = "dotfiles-repository")]
-    pub(crate) repository: Option<String>,
-
-    /// Command to run after cloning the dotfiles repository. Defaults to the
-    /// first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup.
-    #[arg(long = "dotfiles-install-command")]
-    pub(crate) install_command: Option<String>,
-
-    /// Path to clone the dotfiles repository to (default `~/dotfiles`).
-    #[arg(long = "dotfiles-target-path", default_value = "~/dotfiles")]
-    pub(crate) target_path: String,
 }
 
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
@@ -361,7 +328,7 @@ pub struct UpArgs {
     pub(crate) lockfile: UpLockfileArgs,
 
     #[command(flatten)]
-    pub(crate) dotfiles: UpDotfilesArgs,
+    pub(crate) dotfiles: crate::commands::DotfilesArgs,
 
     #[command(flatten)]
     pub(crate) compat: UpCompatArgs,
@@ -675,7 +642,9 @@ fn normalize_dotfiles_repository(repo: &str) -> String {
 ///
 /// An empty `--dotfiles-repository ""` is treated as unset (matching the
 /// official tool's `if (!repository) return`), so it never triggers an install.
-fn build_dotfiles_config(args: &UpDotfilesArgs) -> cella_orchestrator::config::DotfilesConfig {
+fn build_dotfiles_config(
+    args: &crate::commands::DotfilesArgs,
+) -> cella_orchestrator::config::DotfilesConfig {
     cella_orchestrator::config::DotfilesConfig {
         repository: args
             .repository

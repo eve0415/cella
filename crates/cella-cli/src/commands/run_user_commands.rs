@@ -33,22 +33,6 @@ use super::up::{map_env_object, parse_secrets_file};
 use super::{LogFormat, LogLevel};
 use crate::backend::BackendArgs;
 
-/// Validate an `--id-label` value (`name=value`, both non-empty).
-fn parse_id_label(s: &str) -> Result<String, String> {
-    match s.split_once('=') {
-        Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
-        _ => Err("id-label must match <name>=<value>".to_string()),
-    }
-}
-
-/// Validate a `--remote-env` value (`name=value`, value may be empty).
-fn parse_remote_env(s: &str) -> Result<String, String> {
-    match s.split_once('=') {
-        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
-        _ => Err("remote-env must match <name>=<value>".to_string()),
-    }
-}
-
 /// Container-targeting flags. Mirrors the official `run-user-commands`
 /// resolution surface: `--container-id` (highest priority), repeatable
 /// `--id-label`, or `--workspace-folder` (defaults to cwd when none given).
@@ -61,7 +45,7 @@ pub struct TargetArgs {
     /// Id label(s) of the format `name=value` used to find the container
     /// (repeatable). If no `--container-id` is given the id labels are used to
     /// look up the container.
-    #[arg(long = "id-label", value_parser = parse_id_label)]
+    #[arg(long = "id-label", value_parser = crate::commands::parse_id_label)]
     id_label: Vec<String>,
 
     /// Workspace folder path. The devcontainer.json is looked up relative to
@@ -114,23 +98,6 @@ pub struct AttachArgs {
     /// Do not run `postAttachCommand`.
     #[arg(long = "skip-post-attach")]
     skip_post_attach: bool,
-}
-
-/// Dotfiles flags. Same surface as `up`.
-#[derive(Args)]
-pub struct DotfilesArgs {
-    /// URL of a dotfiles Git repository to clone into the container.
-    #[arg(long = "dotfiles-repository")]
-    repository: Option<String>,
-
-    /// Command to run after cloning the dotfiles repository. Defaults to the
-    /// first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup.
-    #[arg(long = "dotfiles-install-command")]
-    install_command: Option<String>,
-
-    /// Path to clone the dotfiles repository to (default `~/dotfiles`).
-    #[arg(long = "dotfiles-target-path", default_value = "~/dotfiles")]
-    target_path: String,
 }
 
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
@@ -224,7 +191,7 @@ pub struct RunUserCommandsArgs {
 
     /// Remote environment variables of the format `name=value`, added when
     /// running the user (lifecycle) commands (repeatable).
-    #[arg(long = "remote-env", value_parser = parse_remote_env)]
+    #[arg(long = "remote-env", value_parser = crate::commands::parse_remote_env)]
     remote_env: Vec<String>,
 
     #[command(flatten)]
@@ -234,7 +201,7 @@ pub struct RunUserCommandsArgs {
     attach: AttachArgs,
 
     #[command(flatten)]
-    dotfiles: DotfilesArgs,
+    dotfiles: crate::commands::DotfilesArgs,
 
     #[command(flatten)]
     pub(crate) compat: CompatArgs,

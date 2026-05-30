@@ -33,6 +33,42 @@ use tracing::warn;
 
 use crate::progress::{Progress, Verbosity};
 
+/// Validate an `--id-label` value (`name=value`, both non-empty). Shared by
+/// `up` and `run-user-commands` (the official validation is identical).
+pub fn parse_id_label(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok(s.to_string()),
+        _ => Err("id-label must match <name>=<value>".to_string()),
+    }
+}
+
+/// Validate a `--remote-env` value (`name=value`, value may be empty). Shared
+/// by `up` and `run-user-commands`.
+pub fn parse_remote_env(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
+        _ => Err("remote-env must match <name>=<value>".to_string()),
+    }
+}
+
+/// Dotfiles install flags (`--dotfiles-*`). Shared verbatim by `up` and
+/// `run-user-commands`; flattened into each command's arg struct.
+#[derive(Args)]
+pub struct DotfilesArgs {
+    /// URL of a dotfiles Git repository to clone into the container.
+    #[arg(long = "dotfiles-repository")]
+    pub(crate) repository: Option<String>,
+
+    /// Command to run after cloning the dotfiles repository. Defaults to the
+    /// first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup.
+    #[arg(long = "dotfiles-install-command")]
+    pub(crate) install_command: Option<String>,
+
+    /// Path to clone the dotfiles repository to (default `~/dotfiles`).
+    #[arg(long = "dotfiles-target-path", default_value = "~/dotfiles")]
+    pub(crate) target_path: String,
+}
+
 /// Common flags for commands that support verbose output.
 #[derive(Args, Clone)]
 pub struct VerboseArgs {
