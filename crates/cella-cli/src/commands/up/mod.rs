@@ -484,7 +484,7 @@ fn parse_cli_mount(s: &str) -> Result<MountConfig, String> {
     })
 }
 
-fn parse_secrets_file(
+pub fn parse_secrets_file(
     path: &Path,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let content = std::fs::read_to_string(path)

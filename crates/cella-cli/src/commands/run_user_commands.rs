@@ -11,10 +11,11 @@
 //! `{"outcome":"error","message":...,"description":...}` on failure (exit 1).
 //!
 //! Flag surface is `runUserCommandsOptions` verbatim. The data-folder fields,
-//! `--docker-path`/`--docker-compose-path`, `--mount-*`, `--secrets-file`,
+//! `--docker-path`/`--docker-compose-path`, `--mount-*`,
 //! `--skip-feature-auto-mapping`, and the terminal-size flags are accepted for
 //! drop-in parity but are no-ops in cella (it manages its own data dirs, talks
 //! to the engine API directly, resolves no features here, and has no PTY).
+//! `--secrets-file` IS honored: its entries are injected into the lifecycle env.
 
 use std::path::PathBuf;
 
@@ -28,7 +29,7 @@ use cella_orchestrator::env_cache::probe_and_cache_user_env;
 use cella_orchestrator::run_user_commands as orchestrator;
 use cella_orchestrator::shell_detect::detect_shell;
 
-use super::up::map_env_object;
+use super::up::{map_env_object, parse_secrets_file};
 use super::{LogFormat, LogLevel};
 use crate::backend::BackendArgs;
 
@@ -137,8 +138,8 @@ pub struct DotfilesArgs {
 /// The data-folder fields, `--docker-path`/`--docker-compose-path`, and the
 /// `--mount-*` flags are no-ops in cella (it manages its own data dirs and
 /// talks to the engine API directly, not the `docker` CLI; mount layout is
-/// fixed at create time). `--secrets-file` is accepted but not wired into the
-/// lifecycle env yet. `--terminal-columns`/`--terminal-rows` size lifecycle
+/// fixed at create time). `--secrets-file` IS wired (read and injected into the
+/// lifecycle env). `--terminal-columns`/`--terminal-rows` size lifecycle
 /// subprocess output in the official CLI; cella's capture exec has no PTY, so
 /// they are accepted-and-ignored (clap's `requires` enforces the pair).
 #[derive(Args)]
@@ -180,7 +181,7 @@ pub struct CompatArgs {
     #[arg(long = "skip-feature-auto-mapping", hide = true)]
     skip_feature_auto_mapping: bool,
 
-    /// Path to a JSON file of secret env vars (compatibility no-op).
+    /// Path to a JSON file of secret env vars, injected into the lifecycle env.
     #[arg(long = "secrets-file")]
     secrets_file: Option<PathBuf>,
 
@@ -286,6 +287,13 @@ impl RunUserCommandsArgs {
         let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
+        // Read --secrets-file up front so a bad file fails before any command
+        // runs (mirrors official doRunUserCommands → readSecretsFromFile).
+        let secrets = match self.compat.secrets_file.as_deref() {
+            Some(path) => parse_secrets_file(path)?,
+            None => Vec::new(),
+        };
+
         let lifecycle_env = self
             .build_lifecycle_env(
                 &*client,
@@ -293,6 +301,7 @@ impl RunUserCommandsArgs {
                 &remote_user,
                 &config,
                 metadata.as_deref(),
+                &secrets,
             )
             .await;
 
@@ -356,6 +365,10 @@ impl RunUserCommandsArgs {
     /// `remoteEnv` (later-wins, via `metadata_remote_env`) then (b) the `--config`
     /// `remoteEnv` layered last — the on-disk user config is the final metadata
     /// entry in the official merge, so it wins over earlier feature/base entries.
+    ///
+    /// `--secrets-file` entries are layered last of all, so they win over both
+    /// probed and `remoteEnv` values, mirroring `up` and the official
+    /// `runLifecycleHooks(..., secretsP)`.
     async fn build_lifecycle_env(
         &self,
         client: &dyn cella_backend::ContainerBackend,
@@ -363,6 +376,7 @@ impl RunUserCommandsArgs {
         remote_user: &str,
         config: &Value,
         metadata: Option<&str>,
+        secrets: &[String],
     ) -> Vec<String> {
         // Order the vec for merge_env's later-wins insert: probed first
         // (provided by merge_env), then CLI --remote-env, then the merged
@@ -380,10 +394,12 @@ impl RunUserCommandsArgs {
         let probed =
             probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
 
-        probed.as_ref().map_or_else(
+        let mut lifecycle_env = probed.as_ref().map_or_else(
             || remote_env.clone(),
             |p| cella_env::user_env_probe::merge_env(p, &remote_env),
-        )
+        );
+        lifecycle_env.extend_from_slice(secrets);
+        lifecycle_env
     }
 
     /// Build the lifecycle gating from the parity flags and resolved `waitFor`.
