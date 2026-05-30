@@ -3,6 +3,10 @@
 //! Centralizes install logic for all tools (Claude Code, Codex, Gemini, nvim,
 //! tmux) so both `cella up` and `cella install` share the same code paths.
 
+mod pkg;
+
+pub use pkg::PackageManager;
+
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -309,82 +313,41 @@ pub async fn install_nvim(
     Ok(install_result)
 }
 
-// ── Tmux install ────────────────────────────────────────────────────────────
+// ── Tmux ────────────────────────────────────────────────────────────────────
 
-/// Install tmux via the container's package manager.
-///
-/// Tries apt-get, apk, dnf, pacman, zypper in order.
+/// Verify tmux is available after the batch package install step.
 ///
 /// # Errors
 ///
-/// Returns an error string if no supported package manager is found or
-/// the install command fails.
-pub async fn install_tmux(
+/// Returns an error string if tmux is not reachable.
+pub async fn verify_tmux(
     client: &dyn ContainerBackend,
     container_id: &str,
 ) -> Result<ExecResult, String> {
-    let install_commands: &[(&str, &str)] = &[
-        (
-            "apt-get",
-            "apt-get update -qq && apt-get install -y -qq tmux",
-        ),
-        ("apk", "apk add --no-cache tmux"),
-        ("dnf", "dnf install -y tmux"),
-        ("pacman", "pacman -S --noconfirm tmux"),
-        ("zypper", "zypper install -y tmux"),
-    ];
+    let check = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "command -v tmux".to_string(),
+                ],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to check tmux: {e}"))?;
 
-    for (pkg_mgr, install_cmd) in install_commands {
-        let check = client
-            .exec_command(
-                container_id,
-                &ExecOptions {
-                    cmd: vec!["which".to_string(), (*pkg_mgr).to_string()],
-                    user: Some("root".to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await;
-
-        if !check.is_ok_and(|r| r.exit_code == 0) {
-            continue;
-        }
-
-        debug!("Installing tmux via {pkg_mgr}");
-        let result = client
-            .exec_command(
-                container_id,
-                &ExecOptions {
-                    cmd: vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        (*install_cmd).to_string(),
-                    ],
-                    user: Some("root".to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await
-            .map_err(|e| format!("failed to run {pkg_mgr}: {e}"))?;
-
-        if result.exit_code != 0 {
-            return Err(format!(
-                "Failed to install tmux via {pkg_mgr} (exit {}): {}",
-                result.exit_code,
-                result.stderr.trim()
-            ));
-        }
-
-        return Ok(result);
+    if check.exit_code == 0 {
+        return Ok(check);
     }
 
-    Err(
-        "No supported package manager found (apt-get, apk, dnf, pacman, zypper). \
+    Err("tmux not available after package installation. \
          Install tmux manually in your container image."
-            .to_string(),
-    )
+        .to_string())
 }
 
 // ── Tool exec helpers ────────────────────────────────────────────────────────
@@ -417,43 +380,19 @@ pub fn tool_shell_cmd(probed_env: Option<&ProbedEnv>, inner_cmd: &str) -> Vec<St
     }
 }
 
-// ── Alpine detection ─────────────────────────────────────────────────────────
-
-/// Check if the container is Alpine-based.
-pub async fn is_alpine_container(client: &dyn ContainerBackend, container_id: &str) -> bool {
-    client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec![
-                    "test".to_string(),
-                    "-f".to_string(),
-                    "/etc/alpine-release".to_string(),
-                ],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await
-        .is_ok_and(|r| r.exit_code == 0)
-}
-
 // ── Node.js / npm ────────────────────────────────────────────────────────────
 
-/// Ensure Node.js and npm are available in the container.
+/// Check whether npm is available on the container's PATH.
 ///
 /// Uses the probed user environment PATH (from `userEnvProbe`) to detect
 /// npm installed by devcontainer features (e.g. nvm). Falls back to a login
-/// shell when no probed env is available. If npm is still not found, attempts
-/// to install Node.js via the system package manager (apt-get or apk).
-/// Returns `true` if npm is available after the check.
-pub async fn ensure_node_available(
+/// shell when no probed env is available.
+async fn npm_available_on_path(
     client: &dyn ContainerBackend,
     container_id: &str,
     probed_env: Option<&ProbedEnv>,
 ) -> bool {
-    let npm_check = client
+    client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -463,49 +402,8 @@ pub async fn ensure_node_available(
                 working_dir: None,
             },
         )
-        .await;
-
-    if npm_check.is_ok_and(|r| r.exit_code == 0) {
-        return true;
-    }
-
-    debug!("npm not found, installing Node.js...");
-    let install_cmd = if is_alpine_container(client, container_id).await {
-        "apk add --no-cache nodejs npm"
-    } else {
-        "apt-get update -qq && apt-get install -y -qq nodejs npm"
-    };
-
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    match &result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("Node.js installed successfully");
-            true
-        }
-        Ok(r) => {
-            warn!(
-                "Node.js installation failed (exit {}): {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-            false
-        }
-        Err(e) => {
-            warn!("Node.js installation failed: {e}");
-            false
-        }
-    }
+        .await
+        .is_ok_and(|r| r.exit_code == 0)
 }
 
 // ── Claude Code ──────────────────────────────────────────────────────────────
@@ -548,36 +446,11 @@ pub async fn is_claude_code_installed(
     false
 }
 
-/// Detect Alpine and install Claude Code native dependencies if needed.
-/// Returns `true` if the container is Alpine-based.
-pub async fn ensure_alpine_claude_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
-    let is_alpine = is_alpine_container(client, container_id).await;
-
-    if is_alpine {
-        debug!("Alpine detected, installing Claude Code dependencies...");
-        let _ = client
-            .exec_command(
-                container_id,
-                &ExecOptions {
-                    cmd: vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "apk add --no-cache libgcc libstdc++ ripgrep".to_string(),
-                    ],
-                    user: Some("root".to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await;
-    }
-    is_alpine
-}
-
 /// Install Claude Code inside the container.
 ///
-/// Checks if already installed at the desired version, installs Alpine
-/// dependencies if needed, then runs the native installer.
+/// Checks if already installed at the desired version, then runs the native
+/// installer. Alpine dependencies (libgcc, libstdc++, ripgrep) must be
+/// installed by the caller via the batch package step before this function.
 ///
 /// Returns `Some(ExecResult)` when the native installer was invoked (whether
 /// or not it succeeded), and `None` when the idempotency guard short-circuited
@@ -589,6 +462,7 @@ pub async fn install_claude_code(
     container_id: &str,
     remote_user: &str,
     settings: &cella_config::settings::ClaudeCode,
+    is_alpine: bool,
     probed_env: Option<&ProbedEnv>,
 ) -> Option<ExecResult> {
     if is_claude_code_installed(
@@ -604,7 +478,6 @@ pub async fn install_claude_code(
         return None;
     }
 
-    let is_alpine = ensure_alpine_claude_deps(client, container_id).await;
     Some(
         run_claude_install(
             client,
@@ -735,13 +608,9 @@ pub async fn npm_install_global(
 
 // ── Codex ────────────────────────────────────────────────────────────────────
 
-/// Ensure bubblewrap is available in the container for Codex sandbox support.
-///
-/// Checks if `bwrap` is already on PATH. If not, installs the `bubblewrap`
-/// package via the system package manager (apt-get or apk). Runs as root.
-/// Returns `true` if bwrap is available after the check.
-pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
-    let bwrap_check = client
+/// Check if bubblewrap is available after the batch package install step.
+pub async fn check_codex_sandbox_deps(client: &dyn ContainerBackend, container_id: &str) -> bool {
+    let available = client
         .exec_command(
             container_id,
             &ExecOptions {
@@ -755,55 +624,18 @@ pub async fn ensure_codex_sandbox_deps(client: &dyn ContainerBackend, container_
                 working_dir: None,
             },
         )
-        .await;
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
 
-    if bwrap_check.is_ok_and(|r| r.exit_code == 0) {
-        debug!("bubblewrap already installed");
-        return true;
+    if !available {
+        warn!("bubblewrap not available after package installation");
     }
-
-    debug!("bubblewrap not found, installing...");
-    let install_cmd = if is_alpine_container(client, container_id).await {
-        "apk add --no-cache bubblewrap"
-    } else {
-        "apt-get update -qq && apt-get install -y -qq bubblewrap"
-    };
-
-    let result = client
-        .exec_command(
-            container_id,
-            &ExecOptions {
-                cmd: vec!["sh".to_string(), "-c".to_string(), install_cmd.to_string()],
-                user: Some("root".to_string()),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    match &result {
-        Ok(r) if r.exit_code == 0 => {
-            debug!("bubblewrap installed successfully");
-            true
-        }
-        Ok(r) => {
-            warn!(
-                "bubblewrap installation failed (exit {}): {}",
-                r.exit_code,
-                r.stderr.trim()
-            );
-            false
-        }
-        Err(e) => {
-            warn!("bubblewrap installation failed: {e}");
-            false
-        }
-    }
+    available
 }
 
 /// Install `OpenAI` Codex CLI inside the container via npm.
 ///
-/// Ensures bubblewrap is available for sandbox support, then checks if
+/// Checks bubblewrap availability for sandbox support, then checks if
 /// Codex is already installed before running `npm install -g @openai/codex`.
 /// Caller must ensure Node.js/npm are available before calling this.
 ///
@@ -818,7 +650,7 @@ pub async fn install_codex(
     settings: &cella_config::settings::Codex,
     probed_env: Option<&ProbedEnv>,
 ) -> Option<ExecResult> {
-    ensure_codex_sandbox_deps(client, container_id).await;
+    check_codex_sandbox_deps(client, container_id).await;
 
     if is_npm_tool_installed(
         client,
@@ -1626,9 +1458,11 @@ pub struct InstallSpec<'a> {
 
 /// Install the specified tools inside a container.
 ///
-/// Claude Code (curl-based) runs in parallel with npm-based tools (Codex, Gemini).
-/// Codex and Gemini run sequentially to avoid npm global lock contention.
-/// Nvim and tmux run in parallel with the other branches.
+/// System packages are batch-installed in a single transaction before tool
+/// setup begins, eliminating apt lock races between parallel branches.
+/// Claude Code (curl-based) runs in parallel with npm-based tools (Codex,
+/// Gemini). Codex and Gemini run sequentially to avoid npm global lock
+/// contention. Nvim and tmux run in parallel with the other branches.
 ///
 /// Returns the number of tools that failed to install.
 pub async fn install_tools(
@@ -1645,13 +1479,10 @@ pub async fn install_tools(
     }
 
     let has = |t: ToolName| tools.contains(&t);
-
     let needs_npm = has(ToolName::Codex) || has(ToolName::Gemini);
-    let node_available = if needs_npm {
-        ensure_node_available(client, container_id, probed_env).await
-    } else {
-        false
-    };
+
+    let (is_alpine, node_available) =
+        install_system_packages(client, container_id, probed_env, tools, needs_npm).await;
 
     let ctx = InstallCtx {
         client,
@@ -1663,7 +1494,8 @@ pub async fn install_tools(
 
     let phase = progress.phase("Installing tools...");
 
-    let claude_branch = install_claude_branch(&ctx, &phase, settings, has(ToolName::ClaudeCode));
+    let claude_branch =
+        install_claude_branch(&ctx, &phase, settings, has(ToolName::ClaudeCode), is_alpine);
     let npm_branch = install_npm_branch(
         &ctx,
         &phase,
@@ -1689,7 +1521,7 @@ pub async fn install_tools(
         &phase,
         "tmux",
         has(ToolName::Tmux),
-        install_tmux(client, container_id),
+        verify_tmux(client, container_id),
     );
 
     let (c, n, nv, t) = tokio::join!(claude_branch, npm_branch, nvim_branch, tmux_branch);
@@ -1697,11 +1529,64 @@ pub async fn install_tools(
     c + n + nv + t
 }
 
+/// Detect the container's package manager and batch-install all system
+/// packages needed by the requested tools in a single transaction.
+///
+/// Returns `(is_alpine, node_available)`.
+async fn install_system_packages(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    probed_env: Option<&ProbedEnv>,
+    tools: &[ToolName],
+    needs_npm: bool,
+) -> (bool, bool) {
+    let pkg_mgr = pkg::detect_package_manager(client, container_id).await;
+    let is_alpine = pkg_mgr.is_some_and(PackageManager::is_alpine);
+
+    let npm_was_missing =
+        needs_npm && !npm_available_on_path(client, container_id, probed_env).await;
+
+    if let Some(mgr) = pkg_mgr {
+        let mut needed: Vec<&pkg::PackageSpec> = Vec::new();
+
+        if npm_was_missing {
+            needed.push(&pkg::NODEJS);
+        }
+        if tools.contains(&ToolName::Tmux) {
+            needed.push(&pkg::TMUX);
+        }
+        if tools.contains(&ToolName::Codex) {
+            needed.push(&pkg::BUBBLEWRAP);
+        }
+        if tools.contains(&ToolName::ClaudeCode) && is_alpine {
+            needed.push(&pkg::LIBGCC);
+            needed.push(&pkg::LIBSTDCPP);
+            needed.push(&pkg::RIPGREP);
+        }
+
+        if !needed.is_empty()
+            && let Err(e) = pkg::install_packages(client, container_id, mgr, &needed).await
+        {
+            warn!("Batch package install failed: {e}");
+        }
+    }
+
+    let node_available = needs_npm
+        && if npm_was_missing {
+            npm_available_on_path(client, container_id, probed_env).await
+        } else {
+            true
+        };
+
+    (is_alpine, node_available)
+}
+
 async fn install_claude_branch(
     ctx: &InstallCtx<'_>,
     phase: &cella_backend::progress::PhaseHandle,
     settings: &cella_config::CellaConfig,
     requested: bool,
+    is_alpine: bool,
 ) -> usize {
     if !requested {
         return 0;
@@ -1712,6 +1597,7 @@ async fn install_claude_branch(
         ctx.container_id,
         ctx.remote_user,
         &settings.tools.claude_code,
+        is_alpine,
         ctx.probed_env,
     )
     .await;
@@ -1977,46 +1863,28 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
-    // ── install_tmux ───────────────────────────────────────────────────────
+    // ── verify_tmux ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn install_tmux_apt_success() {
+    async fn verify_tmux_available() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // which apt-get
-            Ok(ok_exit(0)), // apt-get install
+            Ok(ok_exit(0)), // command -v tmux
         ]);
-        let result = install_tmux(&backend, "test-container")
+        let result = verify_tmux(&backend, "test-container")
             .await
             .expect("should succeed");
         assert_eq!(result.exit_code, 0);
     }
 
     #[tokio::test]
-    async fn install_tmux_fallback_to_apk() {
+    async fn verify_tmux_not_available() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // which apt-get — not found
-            Ok(ok_exit(0)), // which apk
-            Ok(ok_exit(0)), // apk add
+            Ok(ok_exit(1)), // command -v tmux — not found
         ]);
-        let result = install_tmux(&backend, "test-container")
-            .await
-            .expect("should succeed via apk");
-        assert_eq!(result.exit_code, 0);
-    }
-
-    #[tokio::test]
-    async fn install_tmux_no_package_manager() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // no apt-get
-            Ok(ok_exit(1)), // no apk
-            Ok(ok_exit(1)), // no dnf
-            Ok(ok_exit(1)), // no pacman
-            Ok(ok_exit(1)), // no zypper
-        ]);
-        let Err(err) = install_tmux(&backend, "test-container").await else {
-            panic!("expected Err with no package manager");
+        let Err(err) = verify_tmux(&backend, "test-container").await else {
+            panic!("expected Err when tmux not available");
         };
-        assert!(err.contains("No supported package manager"), "got: {err}");
+        assert!(err.contains("not available"), "got: {err}");
     }
 
     #[test]
@@ -2097,7 +1965,7 @@ mod tests {
         assert_eq!(cmd, vec!["sh", "-l", "-c", ""]);
     }
 
-    // ── MockBackend for ensure_codex_sandbox_deps tests ─────────────────────
+    // ── MockBackend for check_codex_sandbox_deps tests ─────────────────────
 
     use std::collections::VecDeque;
     use std::io::Write;
@@ -2383,65 +2251,24 @@ mod tests {
         }
     }
 
-    // Call sequence for ensure_codex_sandbox_deps:
-    // 1. exec: "command -v bwrap"          (bwrap check)
-    // 2. exec: "test -f /etc/alpine-release" (alpine check, only if bwrap missing)
-    // 3. exec: install command               (only if bwrap missing)
+    // ── check_codex_sandbox_deps ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn ensure_codex_sandbox_deps_bwrap_already_installed() {
-        // bwrap found on PATH -> return true, no further calls
+    async fn check_codex_sandbox_deps_bwrap_available() {
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
-        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
-        assert!(result);
+        assert!(check_codex_sandbox_deps(&backend, "test-container").await);
     }
 
     #[tokio::test]
-    async fn ensure_codex_sandbox_deps_debian_install_success() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // bwrap not found
-            Ok(ok_exit(1)), // not alpine (test -f /etc/alpine-release fails)
-            Ok(ok_exit(0)), // apt-get install succeeds
-        ]);
-        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
-        assert!(result);
+    async fn check_codex_sandbox_deps_bwrap_missing() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!check_codex_sandbox_deps(&backend, "test-container").await);
     }
 
-    #[tokio::test]
-    async fn ensure_codex_sandbox_deps_alpine_install_success() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // bwrap not found
-            Ok(ok_exit(0)), // is alpine (test -f /etc/alpine-release succeeds)
-            Ok(ok_exit(0)), // apk add succeeds
-        ]);
-        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
-        assert!(result);
-    }
+    // ── npm_available_on_path ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn ensure_codex_sandbox_deps_debian_install_failure() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)),                                               // bwrap not found
-            Ok(ok_exit(1)),                                               // not alpine
-            Ok(fail_exit(100, "E: Unable to locate package bubblewrap")), // apt-get fails
-        ]);
-        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn ensure_codex_sandbox_deps_alpine_install_failure() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)),                                       // bwrap not found
-            Ok(ok_exit(0)),                                       // is alpine
-            Ok(fail_exit(1, "ERROR: unable to select packages")), // apk add fails
-        ]);
-        let result = ensure_codex_sandbox_deps(&backend, "test-container").await;
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn ensure_node_available_uses_existing_npm_on_probed_path() {
+    async fn npm_available_on_path_uses_probed_env() {
         let mut env = ProbedEnv::new();
         env.insert(
             "PATH".to_string(),
@@ -2449,7 +2276,7 @@ mod tests {
         );
         let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
 
-        assert!(ensure_node_available(&backend, "test-container", Some(&env)).await);
+        assert!(npm_available_on_path(&backend, "test-container", Some(&env)).await);
 
         let calls = backend.calls();
         assert_eq!(calls.len(), 1);
@@ -2461,54 +2288,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_node_available_installs_with_apt_on_non_alpine() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // npm not found
-            Ok(ok_exit(1)), // not Alpine
-            Ok(ok_exit(0)), // apt-get install succeeds
-        ]);
-
-        assert!(ensure_node_available(&backend, "test-container", None).await);
-
-        let calls = backend.calls();
-        assert_eq!(calls[0].cmd, vec!["sh", "-l", "-c", "command -v npm"]);
-        assert_eq!(
-            calls[2].cmd,
-            vec![
-                "sh",
-                "-c",
-                "apt-get update -qq && apt-get install -y -qq nodejs npm"
-            ]
-        );
-        assert_eq!(calls[2].user.as_deref(), Some("root"));
-    }
-
-    #[tokio::test]
-    async fn ensure_node_available_installs_with_apk_on_alpine() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // npm not found
-            Ok(ok_exit(0)), // Alpine
-            Ok(ok_exit(0)), // apk install succeeds
-        ]);
-
-        assert!(ensure_node_available(&backend, "test-container", None).await);
-
-        let calls = backend.calls();
-        assert_eq!(
-            calls[2].cmd,
-            vec!["sh", "-c", "apk add --no-cache nodejs npm"]
-        );
-    }
-
-    #[tokio::test]
-    async fn ensure_node_available_returns_false_when_install_fails() {
-        let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)),                        // npm not found
-            Ok(ok_exit(1)),                        // not Alpine
-            Ok(fail_exit(100, "apt unavailable")), // install fails
-        ]);
-
-        assert!(!ensure_node_available(&backend, "test-container", None).await);
+    async fn npm_available_on_path_returns_false_when_missing() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(1))]);
+        assert!(!npm_available_on_path(&backend, "test-container", None).await);
     }
 
     #[tokio::test]
@@ -2543,18 +2325,16 @@ mod tests {
         };
 
         let result =
-            install_claude_code(&backend, "test-container", "vscode", &settings, None).await;
+            install_claude_code(&backend, "test-container", "vscode", &settings, false, None).await;
 
         assert!(result.is_none());
         assert_eq!(backend.calls().len(), 1);
     }
 
     #[tokio::test]
-    async fn install_claude_code_installs_alpine_deps_then_native_installer() {
+    async fn install_claude_code_runs_native_installer_with_alpine_flag() {
         let backend = MockBackend::new(vec![
             Ok(ok_exit(1)), // claude --version not installed
-            Ok(ok_exit(0)), // Alpine detected
-            Ok(ok_exit(0)), // apk deps install
             Ok(ok_exit(0)), // native installer
         ]);
         let settings = cella_config::settings::ClaudeCode {
@@ -2562,18 +2342,15 @@ mod tests {
             forward_config: false,
         };
 
-        let result = install_claude_code(&backend, "test-container", "vscode", &settings, None)
-            .await
-            .expect("installer should run");
+        let result =
+            install_claude_code(&backend, "test-container", "vscode", &settings, true, None)
+                .await
+                .expect("installer should run");
 
         assert_eq!(result.exit_code, 0);
         let calls = backend.calls();
         assert_eq!(
-            calls[2].cmd,
-            vec!["sh", "-c", "apk add --no-cache libgcc libstdc++ ripgrep"]
-        );
-        assert_eq!(
-            calls[3].cmd,
+            calls[1].cmd,
             vec![
                 "sh",
                 "-c",
@@ -2581,7 +2358,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            calls[3].env,
+            calls[1].env,
             Some(vec!["USE_BUILTIN_RIPGREP=0".to_string()])
         );
     }
@@ -2708,11 +2485,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_codex_installs_deps_then_npm_package_when_missing() {
+    async fn install_codex_checks_bwrap_then_installs_npm_package() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(1)), // bwrap not found
-            Ok(ok_exit(1)), // not Alpine
-            Ok(ok_exit(0)), // apt bubblewrap install succeeds
+            Ok(ok_exit(0)), // bwrap available (batch step already installed it)
             Ok(ok_exit(1)), // codex --version missing
             Ok(ok_exit(0)), // npm install succeeds
         ]);
@@ -2729,14 +2504,6 @@ mod tests {
         let calls = backend.calls();
         assert_eq!(
             calls[2].cmd,
-            vec![
-                "sh",
-                "-c",
-                "apt-get update -qq && apt-get install -y -qq bubblewrap"
-            ]
-        );
-        assert_eq!(
-            calls[4].cmd,
             vec!["sh", "-l", "-c", "npm install -g @openai/codex@0.42.0"]
         );
     }
@@ -2744,7 +2511,7 @@ mod tests {
     #[tokio::test]
     async fn install_codex_short_circuits_when_requested_version_exists() {
         let backend = MockBackend::new(vec![
-            Ok(ok_exit(0)), // bwrap already installed
+            Ok(ok_exit(0)), // bwrap available
             Ok(ok_stdout(0, "codex 0.42.0\n")),
         ]);
         let settings = cella_config::settings::Codex {
@@ -3169,6 +2936,134 @@ mod tests {
         assert!(
             tmp.path().join(".gemini").is_dir(),
             ".gemini must satisfy is_dir() for host detection"
+        );
+    }
+
+    // ── pkg module tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn detect_package_manager_apt() {
+        let backend = MockBackend::new(vec![Ok(ok_exit(0))]);
+        let result = pkg::detect_package_manager(&backend, "c").await;
+        assert_eq!(result, Some(PackageManager::Apt));
+    }
+
+    #[tokio::test]
+    async fn detect_package_manager_apk_fallback() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // no apt-get
+            Ok(ok_exit(0)), // apk found
+        ]);
+        let result = pkg::detect_package_manager(&backend, "c").await;
+        assert_eq!(result, Some(PackageManager::Apk));
+    }
+
+    #[tokio::test]
+    async fn detect_package_manager_none() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // no apt-get
+            Ok(ok_exit(1)), // no apk
+            Ok(ok_exit(1)), // no dnf
+            Ok(ok_exit(1)), // no pacman
+            Ok(ok_exit(1)), // no zypper
+        ]);
+        assert!(pkg::detect_package_manager(&backend, "c").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn install_packages_apt_includes_lock_timeout() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // tmux binary not found
+            Ok(ok_exit(0)), // install succeeds
+        ]);
+        let specs: Vec<&pkg::PackageSpec> = vec![&pkg::TMUX];
+        pkg::install_packages(&backend, "c", PackageManager::Apt, &specs)
+            .await
+            .unwrap();
+
+        let calls = backend.calls();
+        let install_cmd = &calls[1].cmd[2];
+        assert!(
+            install_cmd.contains("DPkg::Lock::Timeout=60"),
+            "apt command must include lock timeout: {install_cmd}"
+        );
+        let update_part = install_cmd.split("&&").next().unwrap();
+        assert!(
+            update_part.contains("DPkg::Lock::Timeout=60"),
+            "apt-get update must include lock timeout: {update_part}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_packages_skips_existing_binary() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // tmux binary already exists
+        ]);
+        let specs: Vec<&pkg::PackageSpec> = vec![&pkg::TMUX];
+        let result = pkg::install_packages(&backend, "c", PackageManager::Apt, &specs)
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            backend.calls().len(),
+            1,
+            "only the binary check, no install"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_packages_empty_when_all_present() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(0)), // tmux exists
+            Ok(ok_exit(0)), // bwrap exists
+        ]);
+        let specs: Vec<&pkg::PackageSpec> = vec![&pkg::TMUX, &pkg::BUBBLEWRAP];
+        let result = pkg::install_packages(&backend, "c", PackageManager::Apt, &specs)
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(backend.calls().len(), 2, "only binary checks, no install");
+    }
+
+    #[test]
+    fn package_spec_names_for_returns_correct_packages() {
+        assert_eq!(pkg::TMUX.names_for(PackageManager::Apt), &["tmux"]);
+        assert_eq!(
+            pkg::NODEJS.names_for(PackageManager::Apk),
+            &["nodejs", "npm"]
+        );
+        assert!(pkg::LIBGCC.names_for(PackageManager::Apt).is_empty());
+        assert_eq!(pkg::LIBGCC.names_for(PackageManager::Apk), &["libgcc"]);
+    }
+
+    #[test]
+    fn package_manager_is_alpine() {
+        assert!(PackageManager::Apk.is_alpine());
+        assert!(!PackageManager::Apt.is_alpine());
+        assert!(!PackageManager::Dnf.is_alpine());
+    }
+
+    #[tokio::test]
+    async fn install_packages_batches_multiple_specs() {
+        let backend = MockBackend::new(vec![
+            Ok(ok_exit(1)), // tmux not found
+            Ok(ok_exit(1)), // bwrap not found
+            Ok(ok_exit(0)), // install succeeds
+        ]);
+        let specs: Vec<&pkg::PackageSpec> = vec![&pkg::TMUX, &pkg::BUBBLEWRAP];
+        pkg::install_packages(&backend, "c", PackageManager::Apt, &specs)
+            .await
+            .unwrap();
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 3, "2 binary checks + 1 install");
+        let install_cmd = &calls[2].cmd[2];
+        assert!(install_cmd.contains("tmux"), "should install tmux");
+        assert!(
+            install_cmd.contains("bubblewrap"),
+            "should install bubblewrap"
         );
     }
 }

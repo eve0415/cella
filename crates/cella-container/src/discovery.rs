@@ -93,9 +93,9 @@ fn which_binary(name: &str) -> Option<PathBuf> {
 ///
 /// Returns `Err` if the binary cannot be executed or is not the Apple Container CLI.
 async fn validate_binary(binary: &Path) -> Result<String, String> {
-    // Try the version command first.
-    if let Ok(version) = validate_via_version(binary).await {
-        return Ok(version);
+    match validate_via_version(binary).await {
+        Ok(version) => return Ok(version),
+        Err(e) => debug!(error = %e, "version check failed, trying system status fallback"),
     }
 
     // Fallback: the version plugin may not be installed (e.g. .pkg installs).
@@ -202,13 +202,33 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
 
             let write_script = |name: &str, body: &str| -> PathBuf {
+                use std::io::Write;
                 let path = dir.path().join(name);
-                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                let mut file = std::fs::File::create(&path).unwrap();
+                file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+                    .unwrap();
+                file.sync_all().unwrap();
+                drop(file);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                         .unwrap();
+                }
+                // ETXTBSY guard: the kernel may not have released the inode
+                // write reference yet (deferred __fput). Spin until exec works.
+                for _ in 0..50 {
+                    match std::process::Command::new(&path)
+                        .arg("--etxtbsy-probe")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output()
+                    {
+                        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        _ => break,
+                    }
                 }
                 path
             };

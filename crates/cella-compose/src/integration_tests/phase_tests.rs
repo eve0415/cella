@@ -20,8 +20,12 @@ fn override_file_exists_before_compose_uses_it() {
         .unwrap()
         .with_project_name(ctx.project_name.clone());
 
+    // Write to the test's temp dir instead of $HOME/.cella/ to avoid
+    // permission issues when ~/.cella is owned by a different user.
+    let override_path = ctx.fixture_dir.join("docker-compose.cella.yml");
+
     let override_cfg = OverrideConfig {
-        primary_service: project.primary_service.clone(),
+        primary_service: project.primary_service,
         image_override: None,
         override_command: false,
         agent_volume_name: "cella-agent".to_string(),
@@ -38,16 +42,15 @@ fn override_file_exists_before_compose_uses_it() {
     };
 
     let yaml = generate_override_yaml(&override_cfg);
-    write_override_file(&project.override_file, &yaml).unwrap();
+    write_override_file(&override_path, &yaml).unwrap();
 
     assert!(
-        project.override_file.exists(),
+        override_path.exists(),
         "override file should exist at {}",
-        project.override_file.display()
+        override_path.display()
     );
 
-    // Verify content has the expected service name
-    let written = std::fs::read_to_string(&project.override_file).unwrap();
+    let written = std::fs::read_to_string(&override_path).unwrap();
     assert!(
         written.contains("app:"),
         "override should reference the primary service"
@@ -56,9 +59,6 @@ fn override_file_exists_before_compose_uses_it() {
         written.contains("cella-agent"),
         "override should include agent volume"
     );
-
-    // Cleanup
-    crate::override_file::cleanup_override_file(&project.override_file);
 }
 
 /// A `ComposeCommand::without_override` should not include the override

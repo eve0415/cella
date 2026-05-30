@@ -344,6 +344,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
 
             let write_script = |name: &str, body: &str| -> PathBuf {
+                use std::io::Write;
                 let path = dir.join(name);
                 let content = format!("#!/bin/sh\n{body}\n");
                 // Only write if missing or content changed; avoids ETXTBSY
@@ -351,7 +352,10 @@ mod tests {
                 let needs_write = std::fs::read_to_string(&path)
                     .map_or(true, |existing| existing != content);
                 if needs_write {
-                    std::fs::write(&path, &content).unwrap();
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    file.write_all(content.as_bytes()).unwrap();
+                    file.sync_all().unwrap();
+                    drop(file);
                 }
                 #[cfg(unix)]
                 {
@@ -360,6 +364,25 @@ mod tests {
                         &path,
                         std::fs::Permissions::from_mode(0o755),
                     );
+                }
+                // ETXTBSY guard: the kernel may not have released the inode
+                // write reference yet (deferred __fput). Spin until exec works.
+                if needs_write {
+                    for _ in 0..50 {
+                        match std::process::Command::new(&path)
+                            .arg("--etxtbsy-probe")
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .output()
+                        {
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            _ => break,
+                        }
+                    }
                 }
                 path
             };
