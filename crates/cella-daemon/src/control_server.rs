@@ -785,7 +785,9 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
         let container_id = cid.to_string();
         tokio::spawn(async move {
             wait_for_callback_forwarded(callback_port, &container_id, &pm, 50).await;
-            if let Some(port) = extract_port(&rewritten) {
+            if let Some(port) = extract_port(&rewritten)
+                && port != callback_port
+            {
                 wait_for_proxy_ready(port).await;
             }
             browser.open_url(&rewritten);
@@ -3648,12 +3650,13 @@ mod tests {
 
     #[tokio::test]
     async fn callback_forwarded_returns_when_port_registered() {
-        let pm = pm_with_forwarded_port(54545).await;
-        let listener = TcpListener::bind(("127.0.0.1", 54545))
+        let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind for readiness check");
+        let port = listener.local_addr().unwrap().port();
+        let pm = pm_with_forwarded_port(port).await;
         let start = std::time::Instant::now();
-        wait_for_callback_forwarded(54545, "c1", &pm, 50).await;
+        wait_for_callback_forwarded(port, "c1", &pm, 50).await;
         drop(listener);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }

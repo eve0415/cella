@@ -84,7 +84,7 @@ mod tests {
     #[tokio::test]
     async fn localhost_connects_to_ipv6_only_listener() {
         use tokio::net::TcpListener;
-        let Ok(listener) = TcpListener::bind(("[::1]", 0)).await else {
+        let Ok(listener) = TcpListener::bind(("::1", 0)).await else {
             return;
         };
         let port = listener.local_addr().unwrap().port();
