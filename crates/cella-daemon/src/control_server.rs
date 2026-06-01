@@ -686,6 +686,7 @@ async fn handle_port_open(
             return Some(DaemonMessage::Ack { id: None });
         };
 
+        debug!("Port {port}: forwarding via {target:?} to host:{hp}");
         if !start_port_proxy(hp, target, tx).await {
             ctx.port_manager.lock().await.handle_port_closed(&cid, port);
             return Some(DaemonMessage::Ack { id: None });
