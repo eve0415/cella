@@ -48,15 +48,16 @@ pub async fn handle_tunnel_request(connection_id: u64, target_port: u16, config:
         return;
     }
 
-    let local_result = TcpStream::connect(("127.0.0.1", target_port)).await;
+    let local_result = TcpStream::connect(("localhost", target_port)).await;
     let mut local = match local_result {
         Ok(s) => s,
         Err(e) => {
-            warn!("Tunnel local connect to 127.0.0.1:{target_port} failed: {e}");
+            warn!("Tunnel local connect to localhost:{target_port} failed: {e}");
             return;
         }
     };
 
+    debug!("Tunnel {connection_id}: connected to localhost:{target_port}");
     let _ = copy_bidirectional(&mut tunnel, &mut local).await;
     debug!("Tunnel connection {connection_id} closed");
 }
@@ -78,6 +79,17 @@ mod tests {
         let cloned = clone_config(&config);
         assert_eq!(cloned.daemon_addr, "127.0.0.1:5000");
         assert_eq!(cloned.auth_token, "secret");
+    }
+
+    #[tokio::test]
+    async fn localhost_connects_to_ipv6_only_listener() {
+        use tokio::net::TcpListener;
+        let Ok(listener) = TcpListener::bind(("[::1]", 0)).await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let connect = TcpStream::connect(("localhost", port)).await;
+        assert!(connect.is_ok(), "localhost must resolve to ::1");
     }
 
     #[tokio::test]
