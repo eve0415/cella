@@ -769,6 +769,29 @@ async fn handle_browser_open(url: String, ctx: &AgentHandlerContext<'_>) {
     } else {
         info!("Browser open request: {url} -> {rewritten}");
     }
+
+    // If the URL contains a redirect_uri pointing at a loopback callback port,
+    // wait for that port to be forwarded before opening the browser. The wait
+    // runs in a spawned task because the agent message loop is serial — blocking
+    // here would prevent the PortOpen message (which registers the callback
+    // port) from being processed.
+    if let Some(cid) = ctx.container_id
+        && let Some(callback_port) = extract_redirect_uri_port(&url)
+    {
+        debug!("OAuth callback port detected in redirect_uri: {callback_port}");
+        let pm = Arc::clone(ctx.port_manager);
+        let browser = Arc::clone(ctx.browser_handler);
+        let container_id = cid.to_string();
+        tokio::spawn(async move {
+            wait_for_callback_forwarded(callback_port, &container_id, &pm, 50).await;
+            if let Some(port) = extract_port(&rewritten) {
+                wait_for_proxy_ready(port).await;
+            }
+            browser.open_url(&rewritten);
+        });
+        return;
+    }
+
     if let Some(port) = extract_port(&rewritten) {
         wait_for_proxy_ready(port).await;
     }
@@ -2818,6 +2841,88 @@ async fn resolve_backend_cli_and_host(wt: &WorktreeHandlerCtx<'_>) -> (String, O
     (cmd_name, host)
 }
 
+/// Decode `%XX` sequences in a URL value. Does not decode `+` as space
+/// (URL query values, not `application/x-www-form-urlencoded`).
+fn simple_percent_decode(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+/// Extract the port from a `redirect_uri` query parameter in a URL.
+///
+/// Only returns a port when the redirect target is a loopback address
+/// (`localhost`, `127.0.0.1`, or `[::1]`), which covers OAuth callback servers.
+fn extract_redirect_uri_port(url: &str) -> Option<u16> {
+    let query = url.split_once('?')?.1;
+    let raw_value = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "redirect_uri")?
+        .1;
+    let decoded = simple_percent_decode(raw_value);
+    let rest = decoded.split_once("://")?.1;
+    let host_port = rest.find('/').map_or(rest, |i| &rest[..i]);
+    let (host, port_str) = host_port.rsplit_once(':')?;
+    if host != "localhost" && host != "127.0.0.1" && host != "[::1]" {
+        return None;
+    }
+    port_str.parse().ok()
+}
+
+/// Wait for the OAuth callback port to appear in the forwarding table.
+///
+/// Polls `host_port_for` every 100ms up to `max_attempts` times (~5s at 50).
+/// If the port was remapped to a different host port, emits an actionable
+/// warning since the browser's `redirect_uri` will point at the wrong port.
+async fn wait_for_callback_forwarded(
+    callback_port: u16,
+    container_id: &str,
+    port_manager: &Arc<Mutex<PortManager>>,
+    max_attempts: u32,
+) {
+    for _ in 0..max_attempts {
+        let hp = port_manager
+            .lock()
+            .await
+            .host_port_for(container_id, callback_port);
+        match hp {
+            Some(host_port) if host_port == callback_port => {
+                debug!("OAuth callback port {callback_port} forwarded, checking proxy readiness");
+                wait_for_proxy_ready(callback_port).await;
+                return;
+            }
+            Some(host_port) => {
+                warn!(
+                    "OAuth callback port {callback_port} was remapped to {host_port}; \
+                     the browser redirect will fail because the redirect_uri points to \
+                     port {callback_port}. Free port {callback_port} on the host and retry."
+                );
+                return;
+            }
+            None => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    warn!(
+        "OAuth callback port {callback_port} not forwarded within timeout; opening browser anyway"
+    );
+}
+
 /// Extract the port number from a URL like `http://localhost:3000/path`.
 fn extract_port(url: &str) -> Option<u16> {
     let rest = url.split_once("://")?.1;
@@ -3433,6 +3538,131 @@ mod tests {
     fn extract_port_overflow_port() {
         // 65536 does not fit in u16
         assert_eq!(extract_port("http://localhost:65536/path"), None);
+    }
+
+    // ---------------------------------------------------------------
+    // simple_percent_decode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn percent_decode_hex_sequences() {
+        assert_eq!(simple_percent_decode("%3A"), ":");
+        assert_eq!(simple_percent_decode("%2F"), "/");
+    }
+
+    #[test]
+    fn percent_decode_mixed_content() {
+        assert_eq!(
+            simple_percent_decode("http%3A%2F%2Flocalhost%3A3000"),
+            "http://localhost:3000"
+        );
+    }
+
+    #[test]
+    fn percent_decode_trailing_percent() {
+        assert_eq!(simple_percent_decode("hello%"), "hello%");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        assert_eq!(simple_percent_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn percent_decode_empty() {
+        assert_eq!(simple_percent_decode(""), "");
+    }
+
+    #[test]
+    fn percent_decode_plus_stays_literal() {
+        assert_eq!(simple_percent_decode("a+b"), "a+b");
+    }
+
+    // ---------------------------------------------------------------
+    // extract_redirect_uri_port
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn redirect_uri_encoded_localhost() {
+        let url = "https://accounts.example.com/authorize?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback&state=abc";
+        assert_eq!(extract_redirect_uri_port(url), Some(54545));
+    }
+
+    #[test]
+    fn redirect_uri_encoded_127() {
+        let url =
+            "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb";
+        assert_eq!(extract_redirect_uri_port(url), Some(9999));
+    }
+
+    #[test]
+    fn redirect_uri_encoded_ipv6() {
+        let url = "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A8080%2Fcb";
+        assert_eq!(extract_redirect_uri_port(url), Some(8080));
+    }
+
+    #[test]
+    fn redirect_uri_literal_unencoded() {
+        let url = "https://auth.example.com/authorize?redirect_uri=http://localhost:12345/callback&state=x";
+        assert_eq!(extract_redirect_uri_port(url), Some(12345));
+    }
+
+    #[test]
+    fn redirect_uri_remote_host_rejected() {
+        let url =
+            "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Fevil.com%3A3000%2Fcb";
+        assert_eq!(extract_redirect_uri_port(url), None);
+    }
+
+    #[test]
+    fn redirect_uri_missing() {
+        let url = "https://auth.example.com/authorize?response_type=code&state=abc";
+        assert_eq!(extract_redirect_uri_port(url), None);
+    }
+
+    #[test]
+    fn redirect_uri_no_query_string() {
+        assert_eq!(
+            extract_redirect_uri_port("https://auth.example.com/authorize"),
+            None
+        );
+    }
+
+    #[test]
+    fn redirect_uri_key_prefix_not_matched() {
+        let url = "https://auth.example.com/authorize?xredirect_uri=http%3A%2F%2Flocalhost%3A3000";
+        assert_eq!(extract_redirect_uri_port(url), None);
+    }
+
+    #[test]
+    fn redirect_uri_without_port() {
+        let url =
+            "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%2Fcallback";
+        assert_eq!(extract_redirect_uri_port(url), None);
+    }
+
+    // ---------------------------------------------------------------
+    // wait_for_callback_forwarded
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn callback_forwarded_returns_when_port_registered() {
+        let pm = pm_with_forwarded_port(54545).await;
+        let listener = TcpListener::bind(("127.0.0.1", 54545))
+            .await
+            .expect("bind for readiness check");
+        let start = std::time::Instant::now();
+        wait_for_callback_forwarded(54545, "c1", &pm, 50).await;
+        drop(listener);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn callback_forwarded_times_out_when_not_registered() {
+        let pm = Arc::new(Mutex::new(PortManager::new(false)));
+        let start = std::time::Instant::now();
+        wait_for_callback_forwarded(54546, "nonexistent", &pm, 3).await;
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     // ---------------------------------------------------------------
