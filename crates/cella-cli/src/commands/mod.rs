@@ -350,42 +350,71 @@ impl Command {
         }
     }
 
-    pub async fn execute(
-        self,
-        progress: Progress,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(self, progress: Progress) -> miette::Result<()> {
         match self {
-            Self::Up(args) => args.execute(progress).await,
             Self::Code(args) => args.execute(progress).await,
-            Self::Down(args) => args.execute().await,
-            Self::Shell(args) => args.execute().await,
-            Self::Exec(args) => args.execute().await,
-            Self::Install(args) => args.execute().await,
-            Self::Build(args) => args.execute(progress).await,
-            Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute().await,
-            Self::Doctor(args) => args.execute().await,
-            Self::Branch(args) => args.execute(progress).await,
-            Self::Switch(args) => args.execute().await,
-            Self::Prune(args) => args.execute().await,
-            Self::ReadConfiguration(args) => args.execute().await,
-            Self::RunUserCommands(args) => args.execute(progress).await,
-            Self::Config(args) => args.execute(),
-            Self::Template(args) => args.execute(),
-            Self::Features(args) => args.execute(progress).await,
-            Self::Outdated(args) => args.execute().await,
-            Self::Init(args) => args.execute(progress).await,
+            Self::Up(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Down(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Shell(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Exec(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Install(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Build(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::List(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Logs(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Doctor(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Branch(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Switch(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Prune(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::ReadConfiguration(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::RunUserCommands(args) => {
+                args.execute(progress).await.map_err(boxed_err_to_report)
+            }
+            Self::Config(args) => args.execute().map_err(boxed_err_to_report),
+            Self::Template(args) => args.execute().map_err(boxed_err_to_report),
+            Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Init(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Completion(args) => {
                 args.execute();
                 Ok(())
             }
-            Self::Credential(args) => args.execute().await,
-            Self::Network(args) => args.execute(),
-            Self::Ports(args) => args.execute().await,
-            Self::Status(args) => args.execute().await,
-            Self::Daemon(args) => args.execute().await,
+            Self::Credential(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Network(args) => args.execute().map_err(boxed_err_to_report),
+            Self::Ports(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Status(args) => args.execute().await.map_err(boxed_err_to_report),
+            Self::Daemon(args) => args.execute().await.map_err(boxed_err_to_report),
         }
     }
+}
+
+/// Convert a `Box<dyn Error>` into a `miette::Report`, preserving the error source chain.
+///
+/// Miette's `IntoDiagnostic` requires `E: Error`, which `Box<dyn Error + Send + Sync>`
+/// doesn't satisfy. This adapter bridges the gap until commands return `miette::Result` natively.
+pub fn boxed_err_to_report(err: Box<dyn std::error::Error + Send + Sync>) -> miette::Report {
+    struct Adapter(Box<dyn std::error::Error + Send + Sync>);
+
+    impl std::fmt::Display for Adapter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.0, f)
+        }
+    }
+
+    impl std::fmt::Debug for Adapter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.0, f)
+        }
+    }
+
+    impl std::error::Error for Adapter {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.0.source()
+        }
+    }
+
+    impl miette::Diagnostic for Adapter {}
+
+    miette::Report::new(Adapter(err))
 }
 
 /// Emit a warning if a container lacks the `dev.cella.backend` label.
