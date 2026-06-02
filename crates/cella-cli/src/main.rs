@@ -74,7 +74,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() {
     title::install_signal_handlers();
 
     // Install miette's graphical error handler for pretty diagnostics
@@ -138,7 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The `up` argument surface is large (full devcontainer-CLI flag parity),
     // so box the dispatch future to keep it off the stack.
-    Box::pin(cli.command.execute(progress)).await
+    if let Err(e) = Box::pin(cli.command.execute(progress)).await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
