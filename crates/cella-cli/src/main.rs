@@ -138,8 +138,7 @@ async fn main() {
 
     // The `up` argument surface is large (full devcontainer-CLI flag parity),
     // so box the dispatch future to keep it off the stack.
-    if let Err(e) = Box::pin(cli.command.execute(progress)).await {
-        let report = miette::Report::msg(e.to_string());
+    if let Err(report) = Box::pin(cli.command.execute(progress)).await {
         eprintln!("{report:?}");
         std::process::exit(1);
     }

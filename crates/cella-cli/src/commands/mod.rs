@@ -350,40 +350,38 @@ impl Command {
         }
     }
 
-    pub async fn execute(
-        self,
-        progress: Progress,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(self, progress: Progress) -> miette::Result<()> {
+        let map = |e: Box<dyn std::error::Error + Send + Sync>| miette::Report::msg(e.to_string());
         match self {
-            Self::Up(args) => args.execute(progress).await,
             Self::Code(args) => args.execute(progress).await,
-            Self::Down(args) => args.execute().await,
-            Self::Shell(args) => args.execute().await,
-            Self::Exec(args) => args.execute().await,
-            Self::Install(args) => args.execute().await,
-            Self::Build(args) => args.execute(progress).await,
-            Self::List(args) => args.execute().await,
-            Self::Logs(args) => args.execute().await,
-            Self::Doctor(args) => args.execute().await,
-            Self::Branch(args) => args.execute(progress).await,
-            Self::Switch(args) => args.execute().await,
-            Self::Prune(args) => args.execute().await,
-            Self::ReadConfiguration(args) => args.execute().await,
-            Self::RunUserCommands(args) => args.execute(progress).await,
-            Self::Config(args) => args.execute(),
-            Self::Template(args) => args.execute(),
-            Self::Features(args) => args.execute(progress).await,
-            Self::Outdated(args) => args.execute().await,
-            Self::Init(args) => args.execute(progress).await,
+            Self::Up(args) => args.execute(progress).await.map_err(map),
+            Self::Down(args) => args.execute().await.map_err(map),
+            Self::Shell(args) => args.execute().await.map_err(map),
+            Self::Exec(args) => args.execute().await.map_err(map),
+            Self::Install(args) => args.execute().await.map_err(map),
+            Self::Build(args) => args.execute(progress).await.map_err(map),
+            Self::List(args) => args.execute().await.map_err(map),
+            Self::Logs(args) => args.execute().await.map_err(map),
+            Self::Doctor(args) => args.execute().await.map_err(map),
+            Self::Branch(args) => args.execute(progress).await.map_err(map),
+            Self::Switch(args) => args.execute().await.map_err(map),
+            Self::Prune(args) => args.execute().await.map_err(map),
+            Self::ReadConfiguration(args) => args.execute().await.map_err(map),
+            Self::RunUserCommands(args) => args.execute(progress).await.map_err(map),
+            Self::Config(args) => args.execute().map_err(map),
+            Self::Template(args) => args.execute().map_err(map),
+            Self::Features(args) => args.execute(progress).await.map_err(map),
+            Self::Outdated(args) => args.execute().await.map_err(map),
+            Self::Init(args) => args.execute(progress).await.map_err(map),
             Self::Completion(args) => {
                 args.execute();
                 Ok(())
             }
-            Self::Credential(args) => args.execute().await,
-            Self::Network(args) => args.execute(),
-            Self::Ports(args) => args.execute().await,
-            Self::Status(args) => args.execute().await,
-            Self::Daemon(args) => args.execute().await,
+            Self::Credential(args) => args.execute().await.map_err(map),
+            Self::Network(args) => args.execute().map_err(map),
+            Self::Ports(args) => args.execute().await.map_err(map),
+            Self::Status(args) => args.execute().await.map_err(map),
+            Self::Daemon(args) => args.execute().await.map_err(map),
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
@@ -22,6 +22,40 @@ pub enum EditorChoice {
 }
 
 use crate::picker;
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+pub enum CodeError {
+    #[error("`{name}` not found in PATH")]
+    #[diagnostic(code(cella::code::editor_not_in_path), help("{help_text}"))]
+    EditorNotInPath { name: String, help_text: String },
+
+    #[error("editor binary not found: {path}")]
+    #[diagnostic(code(cella::code::editor_binary_not_found))]
+    EditorBinaryNotFound { path: String },
+
+    #[error("failed to launch `{name}`: {reason}")]
+    #[diagnostic(
+        code(cella::code::editor_launch_failed),
+        help("Ensure `{name}` is properly installed and can be launched from the terminal.")
+    )]
+    EditorLaunchFailed { name: String, reason: String },
+
+    #[error("`cella code` requires a local Docker host")]
+    #[diagnostic(
+        code(cella::code::remote_docker_host),
+        help(
+            "DOCKER_HOST points to a remote {protocol} host. For remote containers:\n\
+             \x20 1. SSH into the remote host\n\
+             \x20 2. Run `cella code` there, or\n\
+             \x20 3. Use VS Code Remote-SSH + forward Docker socket"
+        )
+    )]
+    RemoteDockerHost { protocol: String },
+
+    #[error("`cella code` requires the Docker backend (VS Code attach is Docker-specific)")]
+    #[diagnostic(code(cella::code::non_docker_backend))]
+    NonDockerBackend,
+}
 
 /// Open VS Code connected to the dev container.
 ///
@@ -50,10 +84,7 @@ impl CodeArgs {
         self.up.is_text_output()
     }
 
-    pub async fn execute(
-        self,
-        progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(self, progress: crate::progress::Progress) -> miette::Result<()> {
         // 1. Check for remote Docker (unsupported)
         check_local_docker()?;
 
@@ -67,7 +98,9 @@ impl CodeArgs {
         let output_format = self.up.output.resolve();
         let mut up = self.up;
         picker::resolve_up_workspace(&mut up).await;
-        let ctx = UpContext::new(&up, progress).await?;
+        let ctx = UpContext::new(&up, progress)
+            .await
+            .map_err(|e| miette::Report::msg(e.to_string()))?;
         let _title_guard = crate::title::push_for_workspace(
             ctx.client.as_ref(),
             &ctx.resolved.workspace_root,
@@ -80,25 +113,32 @@ impl CodeArgs {
 
         // Reject non-Docker backends — VS Code attach URI is Docker-specific
         if ctx.client.kind() != cella_backend::BackendKind::Docker {
-            return Err(
-                "cella code requires the Docker backend (VS Code attach is Docker-specific)".into(),
-            );
+            return Err(CodeError::NonDockerBackend.into());
         }
         let result = if ctx.is_compose() {
-            super::compose_up::compose_ensure_up(&ctx).await?
+            super::compose_up::compose_ensure_up(&ctx)
+                .await
+                .map_err(|e| miette::Report::msg(e.to_string()))?
         } else {
-            ctx.ensure_up(build_no_cache, &strict).await?
+            ctx.ensure_up(build_no_cache, &strict)
+                .await
+                .map_err(|e| miette::Report::msg(e.to_string()))?
         };
 
         // 4. Resolve compose service if needed
         let container_id = if self.service.is_some() {
-            let container = ctx.client.inspect_container(&result.container_id).await?;
+            let container = ctx
+                .client
+                .inspect_container(&result.container_id)
+                .await
+                .map_err(|e| miette::Report::msg(e.to_string()))?;
             let resolved = super::resolve_service_container(
                 ctx.client.as_ref(),
                 container,
                 self.service.as_deref(),
             )
-            .await?;
+            .await
+            .map_err(|e| miette::Report::msg(e.to_string()))?;
             resolved.id
         } else {
             result.container_id.clone()
@@ -119,11 +159,15 @@ impl CodeArgs {
             Ok(_child) => step.finish(),
             Err(e) => {
                 step.fail("failed to launch");
-                return Err(format!(
-                    "Failed to launch `{}`: {e}\n\n{}",
-                    editor.display(),
-                    editor_install_hint(&editor)
-                )
+                let name = editor
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("editor")
+                    .to_string();
+                return Err(CodeError::EditorLaunchFailed {
+                    name,
+                    reason: e.to_string(),
+                }
                 .into());
             }
         }
@@ -213,21 +257,19 @@ fn build_vscode_uri(container_id: &str, workspace_folder: &str) -> String {
 }
 
 /// Resolve which editor binary to use.
-///
-/// Returns the path to the editor binary. If the binary is not found, returns
-/// an error with platform-specific installation instructions.
 fn resolve_editor_binary(
     editor: &EditorChoice,
     binary: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PathBuf, CodeError> {
     let name = if let Some(b) = binary {
-        // If it contains a path separator, treat as path
         if b.contains('/') {
             let path = PathBuf::from(b);
             if path.exists() {
                 return Ok(path);
             }
-            return Err(format!("Editor binary not found: {b}").into());
+            return Err(CodeError::EditorBinaryNotFound {
+                path: b.to_string(),
+            });
         }
         b.to_string()
     } else {
@@ -242,7 +284,7 @@ fn resolve_editor_binary(
 }
 
 /// Look up a binary name in PATH.
-fn which_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+fn which_binary(name: &str) -> Result<PathBuf, CodeError> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(name);
@@ -251,62 +293,43 @@ fn which_binary(name: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send 
             }
         }
     }
-    Err(format!(
-        "`{name}` not found in PATH.\n\n{}",
-        editor_not_found_help(name)
-    )
-    .into())
+    Err(CodeError::EditorNotInPath {
+        name: name.to_string(),
+        help_text: editor_not_found_help(name),
+    })
 }
 
-/// Platform-specific help text when an editor binary is not found.
+/// Platform-specific help text for the `EditorNotInPath` diagnostic.
 fn editor_not_found_help(name: &str) -> String {
     match name {
         "code" | "code-insiders" => {
             if cfg!(target_os = "macos") {
                 format!(
-                    "To fix:\n  \
-                     Open VS Code \u{2192} Cmd+Shift+P \u{2192} \
+                    "Open VS Code \u{2192} Cmd+Shift+P \u{2192} \
                      \"Shell Command: Install '{name}' command in PATH\""
                 )
             } else {
-                format!("To fix:\n  Install the `{name}` package or add it to your PATH")
+                format!("Install the `{name}` package or add it to your PATH")
             }
         }
-        "cursor" => {
-            "To fix:\n  Install Cursor from https://cursor.com and add it to your PATH".to_string()
-        }
+        "cursor" => "Install Cursor from https://cursor.com and add it to your PATH".to_string(),
         _ => format!("Ensure `{name}` is installed and available in your PATH"),
     }
 }
 
-/// Help text when editor launch fails (binary exists but spawn fails).
-fn editor_install_hint(editor: &Path) -> String {
-    let name = editor
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("editor");
-    format!("Ensure `{name}` is properly installed and can be launched from the terminal.")
-}
-
 /// Check that Docker is local (not a remote host via SSH or TCP).
-fn check_local_docker() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn check_local_docker() -> Result<(), CodeError> {
     let docker_host = std::env::var("DOCKER_HOST").ok();
     if let Some(ref host) = docker_host {
         if host.starts_with("ssh://") {
-            return Err("`cella code` requires a local Docker host.\n\n\
-                 DOCKER_HOST is set to an SSH remote. For remote containers:\n  \
-                 1. SSH into the remote host\n  \
-                 2. Run `cella code` there, or\n  \
-                 3. Use VS Code Remote-SSH + forward Docker socket"
-                .into());
+            return Err(CodeError::RemoteDockerHost {
+                protocol: "SSH".to_string(),
+            });
         }
         if host.starts_with("tcp://") && !is_localhost_tcp(host) {
-            return Err("`cella code` requires a local Docker host.\n\n\
-                 DOCKER_HOST points to a remote TCP host. For remote containers:\n  \
-                 1. SSH into the remote host\n  \
-                 2. Run `cella code` there, or\n  \
-                 3. Use VS Code Remote-SSH + forward Docker socket"
-                .into());
+            return Err(CodeError::RemoteDockerHost {
+                protocol: "TCP".to_string(),
+            });
         }
     }
     Ok(())
@@ -474,17 +497,37 @@ mod tests {
     }
 
     #[test]
-    fn editor_install_hint_with_name() {
-        let path = PathBuf::from("/usr/local/bin/code");
-        let hint = editor_install_hint(&path);
-        assert!(hint.contains("code"));
+    fn code_error_editor_not_in_path_has_help() {
+        use miette::Diagnostic;
+        let err = CodeError::EditorNotInPath {
+            name: "code".into(),
+            help_text: "Install code".into(),
+        };
+        let help = err.help().expect("should have help text");
+        assert!(help.to_string().contains("Install code"));
     }
 
     #[test]
-    fn editor_install_hint_no_file_name() {
-        let path = PathBuf::from("/");
-        let hint = editor_install_hint(&path);
-        assert!(hint.contains("editor"));
+    fn code_error_editor_launch_failed_has_help() {
+        use miette::Diagnostic;
+        let err = CodeError::EditorLaunchFailed {
+            name: "code".into(),
+            reason: "not found".into(),
+        };
+        let help = err.help().expect("should have help text");
+        assert!(help.to_string().contains("code"));
+        assert!(help.to_string().contains("terminal"));
+    }
+
+    #[test]
+    fn code_error_remote_docker_has_help() {
+        use miette::Diagnostic;
+        let err = CodeError::RemoteDockerHost {
+            protocol: "SSH".into(),
+        };
+        let help = err.help().expect("should have help text");
+        assert!(help.to_string().contains("SSH"));
+        assert!(help.to_string().contains("Remote-SSH"));
     }
 
     #[test]
@@ -558,13 +601,10 @@ mod tests {
         assert!(uri.ends_with("/workspaces/project/sub/dir"));
     }
 
-    // ── editor_install_hint ────────────────────────────────────────
-
     #[test]
-    fn editor_install_hint_with_nested_path() {
-        let path = PathBuf::from("/usr/local/bin/my-editor");
-        let hint = editor_install_hint(&path);
-        assert!(hint.contains("my-editor"));
-        assert!(hint.contains("terminal"));
+    fn code_error_non_docker_has_no_help() {
+        use miette::Diagnostic;
+        let err = CodeError::NonDockerBackend;
+        assert!(err.help().is_none());
     }
 }
