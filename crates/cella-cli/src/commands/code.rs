@@ -40,14 +40,13 @@ pub enum CodeError {
     )]
     EditorLaunchFailed { name: String, reason: String },
 
-    #[error("`cella code` requires a local Docker host")]
+    #[error(
+        "DOCKER_HOST points to a remote {protocol} host, but `cella code` requires a local Docker host"
+    )]
     #[diagnostic(
         code(cella::code::remote_docker_host),
         help(
-            "DOCKER_HOST points to a remote {protocol} host. For remote containers:\n\
-             \x20 1. SSH into the remote host\n\
-             \x20 2. Run `cella code` there, or\n\
-             \x20 3. Use VS Code Remote-SSH + forward Docker socket"
+            "For remote containers:\n  1. SSH into the remote host\n  2. Run `cella code` there, or\n  3. Use VS Code Remote-SSH + forward Docker socket"
         )
     )]
     RemoteDockerHost { protocol: String },
@@ -100,7 +99,7 @@ impl CodeArgs {
         picker::resolve_up_workspace(&mut up).await;
         let ctx = UpContext::new(&up, progress)
             .await
-            .map_err(|e| miette::Report::msg(e.to_string()))?;
+            .map_err(super::boxed_err_to_report)?;
         let _title_guard = crate::title::push_for_workspace(
             ctx.client.as_ref(),
             &ctx.resolved.workspace_root,
@@ -118,27 +117,23 @@ impl CodeArgs {
         let result = if ctx.is_compose() {
             super::compose_up::compose_ensure_up(&ctx)
                 .await
-                .map_err(|e| miette::Report::msg(e.to_string()))?
+                .map_err(super::boxed_err_to_report)?
         } else {
             ctx.ensure_up(build_no_cache, &strict)
                 .await
-                .map_err(|e| miette::Report::msg(e.to_string()))?
+                .map_err(super::boxed_err_to_report)?
         };
 
         // 4. Resolve compose service if needed
         let container_id = if self.service.is_some() {
-            let container = ctx
-                .client
-                .inspect_container(&result.container_id)
-                .await
-                .map_err(|e| miette::Report::msg(e.to_string()))?;
+            let container = ctx.client.inspect_container(&result.container_id).await?;
             let resolved = super::resolve_service_container(
                 ctx.client.as_ref(),
                 container,
                 self.service.as_deref(),
             )
             .await
-            .map_err(|e| miette::Report::msg(e.to_string()))?;
+            .map_err(super::boxed_err_to_report)?;
             resolved.id
         } else {
             result.container_id.clone()
@@ -523,10 +518,13 @@ mod tests {
     fn code_error_remote_docker_has_help() {
         use miette::Diagnostic;
         let err = CodeError::RemoteDockerHost {
-            protocol: "SSH".into(),
+            protocol: "TCP".into(),
         };
+        assert!(
+            err.to_string().contains("TCP"),
+            "protocol should appear in error body"
+        );
         let help = err.help().expect("should have help text");
-        assert!(help.to_string().contains("SSH"));
         assert!(help.to_string().contains("Remote-SSH"));
     }
 
@@ -606,6 +604,21 @@ mod tests {
         use miette::Diagnostic;
         let err = CodeError::NonDockerBackend;
         assert!(err.help().is_none());
+    }
+
+    #[test]
+    fn code_error_remote_docker_renders_multiline_help() {
+        let report: miette::Report = CodeError::RemoteDockerHost {
+            protocol: "SSH".into(),
+        }
+        .into();
+        let mut rendered = String::new();
+        miette::GraphicalReportHandler::new()
+            .render_report(&mut rendered, report.as_ref())
+            .unwrap();
+        assert!(rendered.contains("help:"), "missing help section");
+        assert!(rendered.contains("1."), "missing numbered list");
+        assert!(rendered.contains("Remote-SSH"), "missing VS Code hint");
     }
 
     #[test]
