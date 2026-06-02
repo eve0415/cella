@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -135,7 +135,7 @@ tokio-rustls = "=0.26.4"
 tokio-stream = "=0.1.18"
 
 # HTTP proxy (MITM relay)
-hyper = { version = "=1.9.0", features = ["server", "client", "http1", "http2"] }
+hyper = { version = "=1.10.1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "=0.1.3"
 
