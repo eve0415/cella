@@ -607,4 +607,19 @@ mod tests {
         let err = CodeError::NonDockerBackend;
         assert!(err.help().is_none());
     }
+
+    #[test]
+    fn code_error_renders_help_on_separate_line() {
+        let report: miette::Report = CodeError::EditorNotInPath {
+            name: "code".into(),
+            help_text: "add it to PATH".into(),
+        }
+        .into();
+        let mut rendered = String::new();
+        miette::GraphicalReportHandler::new()
+            .render_report(&mut rendered, report.as_ref())
+            .unwrap();
+        assert!(rendered.contains("help:"), "missing help section");
+        assert!(!rendered.contains("\\n"), "literal \\n in output");
+    }
 }
