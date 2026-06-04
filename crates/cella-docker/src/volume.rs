@@ -236,6 +236,21 @@ exec "{agent_path}" wl-copy "$@"
     .into_bytes()
 }
 
+/// Generate the xdg-open shim script content.
+///
+/// Placed at `/cella/bin/xdg-open` to shadow the real xdg-open binary.
+/// Forwards the URL to the agent's browser handler, fixing tools like
+/// Wrangler that call `xdg-open` directly instead of checking `$BROWSER`.
+pub fn xdg_open_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" browser-open "$1"
+"#
+    )
+    .into_bytes()
+}
+
 /// Version marker file path inside the volume.
 pub const fn version_marker_path() -> &'static str {
     "/cella/.version"
@@ -338,6 +353,7 @@ async fn populate_volume(
         xclip: &xclip_helper_script(),
         wl_paste: &wl_paste_helper_script(),
         wl_copy: &wl_copy_helper_script(),
+        xdg_open: &xdg_open_helper_script(),
     };
 
     upload_to_volume(
@@ -962,6 +978,7 @@ struct VolumeTarScripts<'a> {
     xclip: &'a [u8],
     wl_paste: &'a [u8],
     wl_copy: &'a [u8],
+    xdg_open: &'a [u8],
 }
 
 fn tar_append_file(
@@ -1004,6 +1021,7 @@ fn build_volume_tar(
         tar_append_file(&mut archive, "cella/bin/xclip", scripts.xclip, 0o755)?;
         tar_append_file(&mut archive, "cella/bin/wl-paste", scripts.wl_paste, 0o755)?;
         tar_append_file(&mut archive, "cella/bin/wl-copy", scripts.wl_copy, 0o755)?;
+        tar_append_file(&mut archive, "cella/bin/xdg-open", scripts.xdg_open, 0o755)?;
 
         // Stable agent symlink: /cella/bin/cella-agent -> versioned binary
         // Survives version upgrades so CMD paths and credential helpers keep working.
@@ -1443,6 +1461,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1479,6 +1498,10 @@ mod tests {
             entries.iter().any(|e| e == "cella/bin/wl-copy"),
             "tar must contain wl-copy shim"
         );
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/xdg-open"),
+            "tar must contain xdg-open shim"
+        );
     }
 
     #[test]
@@ -1510,6 +1533,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1557,6 +1581,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1763,6 +1788,20 @@ mod tests {
     }
 
     #[test]
+    fn xdg_open_helper_script_starts_with_shebang() {
+        let bytes = xdg_open_helper_script();
+        assert!(String::from_utf8_lossy(&bytes).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn xdg_open_helper_script_execs_agent_browser_open() {
+        let bytes = xdg_open_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("browser-open"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
     fn version_marker_path_is_under_cella() {
         let path = version_marker_path();
         assert_eq!(path, "/cella/.version");
@@ -1876,6 +1915,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1907,6 +1947,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "m",
         )
@@ -1960,7 +2001,7 @@ abc333  artifact-c
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_volume_tar_contains_exactly_nine_entries() {
+    fn build_volume_tar_contains_exactly_ten_entries() {
         let tar_bytes = build_volume_tar(
             "2.0.0",
             "aarch64",
@@ -1971,6 +2012,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "2.0.0/aarch64\n",
         )
@@ -1986,11 +2028,11 @@ abc333  artifact-c
             })
             .collect();
 
-        // agent binary, browser script, xsel shim, xclip shim, wl-paste shim, wl-copy shim, agent symlink, cella symlink, .version
+        // agent binary, browser script, xsel, xclip, wl-paste, wl-copy, xdg-open, agent symlink, cella symlink, .version
         assert_eq!(
             entries.len(),
-            9,
-            "expected 9 entries in volume tar, got {}: {entries:?}",
+            10,
+            "expected 10 entries in volume tar, got {}: {entries:?}",
             entries.len()
         );
     }
@@ -2008,6 +2050,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2040,6 +2083,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2071,6 +2115,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "1.0.0/x86_64\n",
         )
@@ -2105,6 +2150,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2119,7 +2165,7 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
-        assert_eq!(entries.len(), 9);
+        assert_eq!(entries.len(), 10);
     }
 
     // -----------------------------------------------------------------------
