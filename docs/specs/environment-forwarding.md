@@ -452,6 +452,11 @@ Container processes request host browser access via the agent-daemon control con
 
 The daemon opens the URL in the host's default browser using the platform-appropriate mechanism (`open` on macOS, `xdg-open` on Linux, `start` on Windows).
 
+Two mechanisms expose browser opening to container processes:
+
+1. **`BROWSER` env var** -- Set to `/cella/bin/cella-browser`, a shell script that execs `cella-agent browser-open "$1"`. Tools that respect `$BROWSER` (e.g., Claude Code) use this path.
+2. **`xdg-open` shim** -- An `xdg-open` shim at `/cella/bin/xdg-open` delegates to the same `cella-agent browser-open` command. Since `/cella/bin` is prepended to `PATH`, the shim shadows any real `xdg-open`. This handles tools like Wrangler that call `xdg-open` directly on Linux without checking `$BROWSER`.
+
 This enables OAuth flows, documentation links, and preview URLs from container processes to open in the host browser seamlessly.
 
 See [IPC Protocol](ipc-protocol.md) for the message definition.
