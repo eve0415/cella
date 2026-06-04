@@ -236,6 +236,21 @@ exec "{agent_path}" wl-copy "$@"
     .into_bytes()
 }
 
+/// Generate the xdg-open shim script content.
+///
+/// Placed at `/cella/bin/xdg-open` to shadow the real xdg-open binary.
+/// Forwards the URL to the agent's browser handler, fixing tools like
+/// Wrangler that call `xdg-open` directly instead of checking `$BROWSER`.
+pub fn xdg_open_helper_script() -> Vec<u8> {
+    let agent_path = agent_symlink_path();
+    format!(
+        r#"#!/bin/sh
+exec "{agent_path}" browser-open "$1"
+"#
+    )
+    .into_bytes()
+}
+
 /// Version marker file path inside the volume.
 pub const fn version_marker_path() -> &'static str {
     "/cella/.version"
@@ -338,6 +353,7 @@ async fn populate_volume(
         xclip: &xclip_helper_script(),
         wl_paste: &wl_paste_helper_script(),
         wl_copy: &wl_copy_helper_script(),
+        xdg_open: &xdg_open_helper_script(),
     };
 
     upload_to_volume(
@@ -962,6 +978,7 @@ struct VolumeTarScripts<'a> {
     xclip: &'a [u8],
     wl_paste: &'a [u8],
     wl_copy: &'a [u8],
+    xdg_open: &'a [u8],
 }
 
 fn tar_append_file(
@@ -1004,6 +1021,7 @@ fn build_volume_tar(
         tar_append_file(&mut archive, "cella/bin/xclip", scripts.xclip, 0o755)?;
         tar_append_file(&mut archive, "cella/bin/wl-paste", scripts.wl_paste, 0o755)?;
         tar_append_file(&mut archive, "cella/bin/wl-copy", scripts.wl_copy, 0o755)?;
+        tar_append_file(&mut archive, "cella/bin/xdg-open", scripts.xdg_open, 0o755)?;
 
         // Stable agent symlink: /cella/bin/cella-agent -> versioned binary
         // Survives version upgrades so CMD paths and credential helpers keep working.
