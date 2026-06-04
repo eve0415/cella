@@ -1461,6 +1461,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1497,6 +1498,10 @@ mod tests {
             entries.iter().any(|e| e == "cella/bin/wl-copy"),
             "tar must contain wl-copy shim"
         );
+        assert!(
+            entries.iter().any(|e| e == "cella/bin/xdg-open"),
+            "tar must contain xdg-open shim"
+        );
     }
 
     #[test]
@@ -1528,6 +1533,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1575,6 +1581,7 @@ mod tests {
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1781,6 +1788,20 @@ mod tests {
     }
 
     #[test]
+    fn xdg_open_helper_script_starts_with_shebang() {
+        let bytes = xdg_open_helper_script();
+        assert!(String::from_utf8_lossy(&bytes).starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn xdg_open_helper_script_execs_agent_browser_open() {
+        let bytes = xdg_open_helper_script();
+        let script = String::from_utf8_lossy(&bytes);
+        assert!(script.contains("browser-open"));
+        assert!(script.contains("cella-agent"));
+    }
+
+    #[test]
     fn version_marker_path_is_under_cella() {
         let path = version_marker_path();
         assert_eq!(path, "/cella/.version");
@@ -1894,6 +1915,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             marker,
         )
@@ -1925,6 +1947,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "m",
         )
@@ -1978,7 +2001,7 @@ abc333  artifact-c
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_volume_tar_contains_exactly_nine_entries() {
+    fn build_volume_tar_contains_exactly_ten_entries() {
         let tar_bytes = build_volume_tar(
             "2.0.0",
             "aarch64",
@@ -1989,6 +2012,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "2.0.0/aarch64\n",
         )
@@ -2004,11 +2028,11 @@ abc333  artifact-c
             })
             .collect();
 
-        // agent binary, browser script, xsel shim, xclip shim, wl-paste shim, wl-copy shim, agent symlink, cella symlink, .version
+        // agent binary, browser script, xsel, xclip, wl-paste, wl-copy, xdg-open, agent symlink, cella symlink, .version
         assert_eq!(
             entries.len(),
-            9,
-            "expected 9 entries in volume tar, got {}: {entries:?}",
+            10,
+            "expected 10 entries in volume tar, got {}: {entries:?}",
             entries.len()
         );
     }
@@ -2026,6 +2050,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2058,6 +2083,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2089,6 +2115,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "1.0.0/x86_64\n",
         )
@@ -2123,6 +2150,7 @@ abc333  artifact-c
                 xclip: b"s",
                 wl_paste: b"s",
                 wl_copy: b"s",
+                xdg_open: b"s",
             },
             "marker",
         )
@@ -2137,7 +2165,7 @@ abc333  artifact-c
                     .and_then(|entry| entry.path().ok().map(|p| p.to_string_lossy().to_string()))
             })
             .collect();
-        assert_eq!(entries.len(), 9);
+        assert_eq!(entries.len(), 10);
     }
 
     // -----------------------------------------------------------------------
