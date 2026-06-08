@@ -41,7 +41,7 @@ pub async fn handle_credential(operation: &str) -> Result<(), CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
     let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
-    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token).await?;
+    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token, true).await?;
 
     let msg = AgentMessage::CredentialRequest {
         id: request_id.clone(),

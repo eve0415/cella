@@ -71,6 +71,12 @@ impl Default for AgentConnectionState {
     }
 }
 
+/// Monotonic counter for `agent_tx` ownership. Each persistent connection
+/// bumps this and stores its value; on disconnect it only clears `agent_tx`
+/// if its generation still matches, preventing stale cleanup from clobbering
+/// a newer persistent connection that reconnected during the race window.
+static AGENT_TX_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Handle for a registered container (no per-container server task).
 pub struct ContainerHandle {
     pub container_id: String,
@@ -85,6 +91,7 @@ pub struct ContainerHandle {
     /// (advertised via `AgentHello.claude_config_sync`). The daemon only
     /// broadcasts config updates to handles where this is true.
     pub claude_config_sync: bool,
+    pub(crate) agent_tx_generation: u64,
 }
 
 /// Spawn a handler task for a new TCP connection (agent or tunnel).
@@ -324,6 +331,7 @@ struct HandshakeResult {
     /// `ClaudeConfigChanged`, so a non-opted-in container cannot write the host
     /// config or poison peers.
     claude_config_sync: bool,
+    transient: bool,
 }
 
 /// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
@@ -368,7 +376,9 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         pm.container_ip(&container_id).map(String::from)
     };
 
-    if let Ok(mut v) = agent_state.agent_version.lock() {
+    if !agent_hello.transient
+        && let Ok(mut v) = agent_state.agent_version.lock()
+    {
         *v = Some(agent_hello.agent_version.clone());
     }
 
@@ -405,7 +415,9 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         message: format!("hello flush error: {e}"),
     })?;
 
-    agent_state.connected.store(true, Ordering::Relaxed);
+    if !agent_hello.transient {
+        agent_state.connected.store(true, Ordering::Relaxed);
+    }
     agent_state
         .last_seen_secs
         .store(current_time_secs(), Ordering::Relaxed);
@@ -421,6 +433,7 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         workspace_path,
         parent_repo,
         claude_config_sync: agent_hello.claude_config_sync,
+        transient: agent_hello.transient,
     }))
 }
 
@@ -524,13 +537,19 @@ async fn handle_agent_connection_after_hello(
 
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
-    {
+    let my_generation = if hs.transient {
+        0
+    } else {
+        let generation = AGENT_TX_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         let mut handles = ctx.container_handles.lock().await;
         if let Some(handle) = handles.get_mut(&hs.container_name) {
             handle.agent_tx = Some(daemon_tx.clone());
+            handle.agent_tx_generation = generation;
             handle.claude_config_sync = hs.claude_config_sync;
         }
-    }
+        drop(handles);
+        generation
+    };
 
     // The agent re-announces its current `~/.claude.json` on (re)connect (before
     // its reader starts), so the daemon merges its state and pushes back whatever
@@ -571,16 +590,19 @@ async fn handle_agent_connection_after_hello(
 
     // Connection closed — clear live state so status queries don't report
     // stale version/connectivity info for this container.
-    {
+    if !hs.transient {
         let mut handles = ctx.container_handles.lock().await;
-        if let Some(handle) = handles.get_mut(&hs.container_name) {
+        if let Some(handle) = handles.get_mut(&hs.container_name)
+            && handle.agent_tx_generation == my_generation
+        {
             handle.agent_tx = None;
             handle.claude_config_sync = false;
+            drop(handles);
+            hs.agent_state.connected.store(false, Ordering::Relaxed);
+            if let Ok(mut v) = hs.agent_state.agent_version.lock() {
+                *v = None;
+            }
         }
-    }
-    hs.agent_state.connected.store(false, Ordering::Relaxed);
-    if let Ok(mut v) = hs.agent_state.agent_version.lock() {
-        *v = None;
     }
     info!("Agent disconnected for container {}", hs.container_name);
 
@@ -3151,6 +3173,7 @@ mod tests {
             docker_host: None,
             agent_tx: None,
             claude_config_sync: false,
+            agent_tx_generation: 0,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
@@ -3199,6 +3222,7 @@ mod tests {
                     docker_host: None,
                     agent_tx: None,
                     claude_config_sync: false,
+                    agent_tx_generation: 0,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3211,6 +3235,7 @@ mod tests {
             container_name: "test-container".to_string(),
             auth_token: "test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
 
         assert!(
@@ -3260,6 +3285,7 @@ mod tests {
                     docker_host: None,
                     agent_tx: None,
                     claude_config_sync: false,
+                    agent_tx_generation: 0,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3283,6 +3309,7 @@ mod tests {
             container_name: "int-test-container".to_string(),
             auth_token: "int-test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
         let mut json = serde_json::to_string(&hello).unwrap();
         json.push('\n');
@@ -3336,6 +3363,7 @@ mod tests {
             container_name: "not-registered".to_string(),
             auth_token: "test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
 
         let (_daemon_side, agent_side) = tokio::io::duplex(4096);
@@ -3358,6 +3386,7 @@ mod tests {
             workspace_path: None,
             parent_repo: None,
             claude_config_sync,
+            transient: false,
         }
     }
 
@@ -3447,6 +3476,7 @@ mod tests {
                 docker_host: None,
                 agent_tx: Some(tx),
                 claude_config_sync: true,
+                agent_tx_generation: 0,
             },
         );
         let handles = Arc::new(Mutex::new(map));
@@ -4771,6 +4801,207 @@ branch refs/heads/feat-b
             })
         ));
         proxy_assertion.await.unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // agent_tx ownership / transient connection regression tests
+    // ---------------------------------------------------------------
+
+    struct TestServer {
+        handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+        addr: std::net::SocketAddr,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    }
+
+    async fn start_ownership_test_server(
+        agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
+        initial_generation: u64,
+    ) -> TestServer {
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "test-container".to_string(),
+                ContainerHandle {
+                    container_id: "cid".to_string(),
+                    agent_state: Arc::new(AgentConnectionState::new()),
+                    backend_kind: None,
+                    docker_host: None,
+                    agent_tx,
+                    claude_config_sync: false,
+                    agent_tx_generation: initial_generation,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles.clone(), "test-token");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let la = Arc::new(AtomicU64::new(0));
+        tokio::spawn(async move {
+            run_control_server(listener, ctx, la, shutdown_rx).await;
+        });
+        TestServer {
+            handles,
+            addr,
+            shutdown_tx,
+        }
+    }
+
+    async fn agent_handshake(addr: std::net::SocketAddr, transient: bool) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "test-container".to_string(),
+            auth_token: "test-token".to_string(),
+            claude_config_sync: false,
+            transient,
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut buf)
+            .await
+            .unwrap();
+        stream
+    }
+
+    fn get_handle_state(guard: &HashMap<String, ContainerHandle>) -> (bool, u64) {
+        let h = guard.get("test-container").unwrap();
+        (h.agent_tx.is_some(), h.agent_tx_generation)
+    }
+
+    #[tokio::test]
+    async fn transient_connect_does_not_set_agent_tx() {
+        use tokio::io::AsyncWriteExt;
+        let (existing_tx, _existing_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
+        let srv = start_ownership_test_server(Some(existing_tx), 42).await;
+
+        let mut stream = agent_handshake(srv.addr, true).await;
+        let msg = AgentMessage::BrowserOpen {
+            url: "http://example.com".to_string(),
+        };
+        let mut msg_json = serde_json::to_string(&msg).unwrap();
+        msg_json.push('\n');
+        stream.write_all(msg_json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, generation) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "transient disconnect must not clear agent_tx");
+        assert_eq!(generation, 42, "transient must not change generation");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn persistent_connect_sets_and_clears_agent_tx() {
+        let srv = start_ownership_test_server(None, 0).await;
+        let stream = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (has_tx, generation) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "persistent connect must set agent_tx");
+        assert!(generation > 0, "persistent connect must bump generation");
+
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
+        assert!(!has_tx, "persistent disconnect must clear agent_tx");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn generation_counter_prevents_stale_persistent_cleanup() {
+        let srv = start_ownership_test_server(None, 0).await;
+
+        let stream1 = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let gen1 = get_handle_state(&*srv.handles.lock().await).1;
+
+        let stream2 = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let gen2 = get_handle_state(&*srv.handles.lock().await).1;
+        assert!(gen2 > gen1, "second connect must bump generation");
+
+        // Disconnect #1 — stale cleanup must NOT clear #2's agent_tx.
+        drop(stream1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, g) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "stale disconnect must not clear newer agent_tx");
+        assert_eq!(g, gen2, "generation must still be from connection #2");
+
+        // Disconnect #2 — owning cleanup should clear.
+        drop(stream2);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
+        assert!(!has_tx, "owning disconnect must clear agent_tx");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn transient_lifecycle_preserves_persistent_tunnel_channel() {
+        use tokio::io::AsyncWriteExt;
+        // Regression: the exact sequence that broke OAuth on Colima.
+        let srv = start_ownership_test_server(None, 0).await;
+
+        // Persistent agent connects.
+        let persistent = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            get_handle_state(&*srv.handles.lock().await).0,
+            "persistent must set agent_tx"
+        );
+
+        // Transient browser-open connects, sends, disconnects.
+        let mut transient = agent_handshake(srv.addr, true).await;
+        let msg = AgentMessage::BrowserOpen {
+            url: "http://oauth.example.com/callback".to_string(),
+        };
+        let mut json = serde_json::to_string(&msg).unwrap();
+        json.push('\n');
+        transient.write_all(json.as_bytes()).await.unwrap();
+        transient.flush().await.unwrap();
+        drop(transient);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Persistent agent_tx must survive.
+        assert!(
+            get_handle_state(&*srv.handles.lock().await).0,
+            "REGRESSION: transient disconnect must not clear persistent agent_tx"
+        );
+
+        // agent_tx must still be functional (tunnel would work).
+        let tx = srv
+            .handles
+            .lock()
+            .await
+            .get("test-container")
+            .unwrap()
+            .agent_tx
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            tx.send(DaemonMessage::TunnelRequest {
+                connection_id: 1,
+                target_port: 45973,
+            })
+            .await
+            .is_ok(),
+            "agent_tx must still be functional after transient lifecycle"
+        );
+
+        drop(persistent);
+        let _ = srv.shutdown_tx.send(true);
     }
 
     // ---------------------------------------------------------------

@@ -414,6 +414,7 @@ async fn handle_register(
             docker_host: reg.docker_host,
             agent_tx: None,
             claude_config_sync: false,
+            agent_tx_generation: 0,
         },
     );
 
@@ -1097,6 +1098,7 @@ mod tests {
             container_name: "hs-container".to_string(),
             auth_token: "test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
         let mut json = serde_json::to_string(&hello).unwrap();
         json.push('\n');

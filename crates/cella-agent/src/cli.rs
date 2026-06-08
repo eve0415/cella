@@ -620,7 +620,7 @@ async fn connect_daemon() -> Result<ControlClient, Box<dyn std::error::Error + S
     };
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
 
-    let (client, _hello) = ControlClient::connect(&addr, &container_name, &token)
+    let (client, _hello) = ControlClient::connect(&addr, &container_name, &token, true)
         .await
         .map_err(|e| {
             format!(
@@ -675,7 +675,7 @@ async fn run_doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 3. Daemon connectivity
     let container_name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
-    match ControlClient::connect(&addr, &container_name, &token).await {
+    match ControlClient::connect(&addr, &container_name, &token, true).await {
         Ok((_client, hello)) => {
             eprintln!("  \u{2713} daemon reachable at {addr}");
             eprintln!(

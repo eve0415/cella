@@ -270,6 +270,7 @@ mod tests {
             docker_host: None,
             agent_tx: Some(tx),
             claude_config_sync: true,
+            agent_tx_generation: 0,
         };
         handles
             .try_lock()

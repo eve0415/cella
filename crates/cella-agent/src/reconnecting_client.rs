@@ -95,7 +95,7 @@ impl ReconnectingClient {
             .flatten();
 
         loop {
-            match ControlClient::connect(&addr, container_name, &token).await {
+            match ControlClient::connect(&addr, container_name, &token, false).await {
                 Ok((mut client, hello)) => {
                     info!("Connected to daemon at {addr}");
                     let tunnel_config = Some(crate::tunnel::TunnelConfig {
@@ -247,7 +247,9 @@ impl ReconnectingClient {
     /// updates on every `cella up` and daemon restart).
     async fn try_reconnect(&mut self) -> Result<(), CellaPortError> {
         // 1. Try the current address
-        match ControlClient::connect(&self.addr, &self.container_name, &self.auth_token).await {
+        match ControlClient::connect(&self.addr, &self.container_name, &self.auth_token, false)
+            .await
+        {
             Ok((mut client, hello)) => {
                 info!("Reconnected to daemon at {}", self.addr);
                 let tunnel_config = Some(crate::tunnel::TunnelConfig {
@@ -275,7 +277,8 @@ impl ReconnectingClient {
                 "Daemon address changed ({} -> {}), trying new address",
                 self.addr, info.addr
             );
-            match ControlClient::connect(&info.addr, &self.container_name, &info.token).await {
+            match ControlClient::connect(&info.addr, &self.container_name, &info.token, false).await
+            {
                 Ok((mut client, hello)) => {
                     info!("Reconnected to daemon at {} (from .daemon_addr)", info.addr);
                     let tunnel_config = Some(crate::tunnel::TunnelConfig {
@@ -367,7 +370,7 @@ pub fn spawn_background_reconnect(
                 (initial_addr.clone(), initial_token.clone())
             };
 
-            match ControlClient::connect(&addr, &container_name, &token).await {
+            match ControlClient::connect(&addr, &container_name, &token, false).await {
                 Ok((client, hello)) => {
                     info!("Background reconnection succeeded (addr: {addr})");
                     control
