@@ -69,6 +69,10 @@ pub struct AgentHello {
     /// agents that don't send the field.
     #[serde(default)]
     pub claude_config_sync: bool,
+    /// One-shot connections (browser-open, credential, clipboard) set this so
+    /// the daemon skips `agent_tx` and connection-state management.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 /// Sent by the daemon in response to `AgentHello`.
@@ -967,6 +971,7 @@ mod tests {
             container_name: "test".to_string(),
             auth_token: "token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         let result = serde_json::from_str::<TunnelHandshake>(&json);
@@ -1171,6 +1176,7 @@ mod tests {
             container_name: "test".to_string(),
             auth_token: "token".to_string(),
             claude_config_sync: true,
+            transient: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert!(json.contains("\"claude_config_sync\":true"));
@@ -1194,6 +1200,7 @@ mod tests {
             container_name: "test-container".to_string(),
             auth_token: "token123".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         let decoded: AgentHello = serde_json::from_str(&json).unwrap();
