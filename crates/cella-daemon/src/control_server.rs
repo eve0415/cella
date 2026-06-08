@@ -4800,6 +4800,207 @@ branch refs/heads/feat-b
     }
 
     // ---------------------------------------------------------------
+    // agent_tx ownership / transient connection regression tests
+    // ---------------------------------------------------------------
+
+    struct TestServer {
+        handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
+        addr: std::net::SocketAddr,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    }
+
+    async fn start_ownership_test_server(
+        agent_tx: Option<tokio::sync::mpsc::Sender<DaemonMessage>>,
+        initial_generation: u64,
+    ) -> TestServer {
+        let handles = {
+            let mut map = HashMap::new();
+            map.insert(
+                "test-container".to_string(),
+                ContainerHandle {
+                    container_id: "cid".to_string(),
+                    agent_state: Arc::new(AgentConnectionState::new()),
+                    backend_kind: None,
+                    docker_host: None,
+                    agent_tx,
+                    claude_config_sync: false,
+                    agent_tx_generation: initial_generation,
+                },
+            );
+            Arc::new(Mutex::new(map))
+        };
+        let ctx = test_control_context(handles.clone(), "test-token");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let la = Arc::new(AtomicU64::new(0));
+        tokio::spawn(async move {
+            run_control_server(listener, ctx, la, shutdown_rx).await;
+        });
+        TestServer {
+            handles,
+            addr,
+            shutdown_tx,
+        }
+    }
+
+    async fn agent_handshake(addr: std::net::SocketAddr, transient: bool) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.0.28".to_string(),
+            container_name: "test-container".to_string(),
+            auth_token: "test-token".to_string(),
+            claude_config_sync: false,
+            transient,
+        };
+        let mut json = serde_json::to_string(&hello).unwrap();
+        json.push('\n');
+        stream.write_all(json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut buf)
+            .await
+            .unwrap();
+        stream
+    }
+
+    fn get_handle_state(guard: &HashMap<String, ContainerHandle>) -> (bool, u64) {
+        let h = guard.get("test-container").unwrap();
+        (h.agent_tx.is_some(), h.agent_tx_generation)
+    }
+
+    #[tokio::test]
+    async fn transient_connect_does_not_set_agent_tx() {
+        use tokio::io::AsyncWriteExt;
+        let (existing_tx, _existing_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
+        let srv = start_ownership_test_server(Some(existing_tx), 42).await;
+
+        let mut stream = agent_handshake(srv.addr, true).await;
+        let msg = AgentMessage::BrowserOpen {
+            url: "http://example.com".to_string(),
+        };
+        let mut msg_json = serde_json::to_string(&msg).unwrap();
+        msg_json.push('\n');
+        stream.write_all(msg_json.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, generation) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "transient disconnect must not clear agent_tx");
+        assert_eq!(generation, 42, "transient must not change generation");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn persistent_connect_sets_and_clears_agent_tx() {
+        let srv = start_ownership_test_server(None, 0).await;
+        let stream = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (has_tx, generation) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "persistent connect must set agent_tx");
+        assert!(generation > 0, "persistent connect must bump generation");
+
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
+        assert!(!has_tx, "persistent disconnect must clear agent_tx");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn generation_counter_prevents_stale_persistent_cleanup() {
+        let srv = start_ownership_test_server(None, 0).await;
+
+        let stream1 = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let gen1 = get_handle_state(&*srv.handles.lock().await).1;
+
+        let stream2 = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let gen2 = get_handle_state(&*srv.handles.lock().await).1;
+        assert!(gen2 > gen1, "second connect must bump generation");
+
+        // Disconnect #1 — stale cleanup must NOT clear #2's agent_tx.
+        drop(stream1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, g) = get_handle_state(&*srv.handles.lock().await);
+        assert!(has_tx, "stale disconnect must not clear newer agent_tx");
+        assert_eq!(g, gen2, "generation must still be from connection #2");
+
+        // Disconnect #2 — owning cleanup should clear.
+        drop(stream2);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
+        assert!(!has_tx, "owning disconnect must clear agent_tx");
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn transient_lifecycle_preserves_persistent_tunnel_channel() {
+        use tokio::io::AsyncWriteExt;
+        // Regression: the exact sequence that broke OAuth on Colima.
+        let srv = start_ownership_test_server(None, 0).await;
+
+        // Persistent agent connects.
+        let persistent = agent_handshake(srv.addr, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            get_handle_state(&*srv.handles.lock().await).0,
+            "persistent must set agent_tx"
+        );
+
+        // Transient browser-open connects, sends, disconnects.
+        let mut transient = agent_handshake(srv.addr, true).await;
+        let msg = AgentMessage::BrowserOpen {
+            url: "http://oauth.example.com/callback".to_string(),
+        };
+        let mut json = serde_json::to_string(&msg).unwrap();
+        json.push('\n');
+        transient.write_all(json.as_bytes()).await.unwrap();
+        transient.flush().await.unwrap();
+        drop(transient);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Persistent agent_tx must survive.
+        assert!(
+            get_handle_state(&*srv.handles.lock().await).0,
+            "REGRESSION: transient disconnect must not clear persistent agent_tx"
+        );
+
+        // agent_tx must still be functional (tunnel would work).
+        let tx = srv
+            .handles
+            .lock()
+            .await
+            .get("test-container")
+            .unwrap()
+            .agent_tx
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            tx.send(DaemonMessage::TunnelRequest {
+                connection_id: 1,
+                target_port: 45973,
+            })
+            .await
+            .is_ok(),
+            "agent_tx must still be functional after transient lifecycle"
+        );
+
+        drop(persistent);
+        let _ = srv.shutdown_tx.send(true);
+    }
+
+    // ---------------------------------------------------------------
     // snapshot_binary
     // ---------------------------------------------------------------
 

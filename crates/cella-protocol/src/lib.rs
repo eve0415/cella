@@ -1193,6 +1193,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_hello_transient_flag_roundtrip() {
+        let hello = AgentHello {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.1.0".to_string(),
+            container_name: "test".to_string(),
+            auth_token: "token".to_string(),
+            claude_config_sync: false,
+            transient: true,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"transient\":true"));
+        let decoded: AgentHello = serde_json::from_str(&json).unwrap();
+        assert!(decoded.transient);
+    }
+
+    #[test]
+    fn agent_hello_backward_compat_missing_transient() {
+        // Old agents won't send transient; it must default to false.
+        let json = r#"{"protocol_version":1,"agent_version":"0.1.0","container_name":"c","auth_token":"t"}"#;
+        let decoded: AgentHello = serde_json::from_str(json).unwrap();
+        assert!(!decoded.transient);
+    }
+
+    #[test]
     fn roundtrip_agent_hello() {
         let hello = AgentHello {
             protocol_version: PROTOCOL_VERSION,
