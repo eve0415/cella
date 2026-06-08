@@ -376,7 +376,9 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         pm.container_ip(&container_id).map(String::from)
     };
 
-    if let Ok(mut v) = agent_state.agent_version.lock() {
+    if !agent_hello.transient
+        && let Ok(mut v) = agent_state.agent_version.lock()
+    {
         *v = Some(agent_hello.agent_version.clone());
     }
 
@@ -413,7 +415,9 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         message: format!("hello flush error: {e}"),
     })?;
 
-    agent_state.connected.store(true, Ordering::Relaxed);
+    if !agent_hello.transient {
+        agent_state.connected.store(true, Ordering::Relaxed);
+    }
     agent_state
         .last_seen_secs
         .store(current_time_secs(), Ordering::Relaxed);
@@ -593,11 +597,11 @@ async fn handle_agent_connection_after_hello(
         {
             handle.agent_tx = None;
             handle.claude_config_sync = false;
-        }
-        drop(handles);
-        hs.agent_state.connected.store(false, Ordering::Relaxed);
-        if let Ok(mut v) = hs.agent_state.agent_version.lock() {
-            *v = None;
+            drop(handles);
+            hs.agent_state.connected.store(false, Ordering::Relaxed);
+            if let Ok(mut v) = hs.agent_state.agent_version.lock() {
+                *v = None;
+            }
         }
     }
     info!("Agent disconnected for container {}", hs.container_name);
