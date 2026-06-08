@@ -199,7 +199,7 @@ async fn execute_clipboard_op(op: ClipboardOp, filter: bool) -> Result<(), Cella
 async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
     let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
-    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token).await?;
+    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token, true).await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     let msg = AgentMessage::ClipboardCopy {
         data: encoded,
@@ -211,7 +211,7 @@ async fn send_clipboard_copy(data: &[u8], mime_type: &str) -> Result<(), CellaPo
 async fn request_clipboard_paste(mime_type: &str) -> Result<Vec<u8>, CellaPortError> {
     let (addr, token) = crate::control::resolve_daemon_connection()?;
     let name = std::env::var("CELLA_CONTAINER_NAME").unwrap_or_default();
-    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token).await?;
+    let (mut client, _hello) = ControlClient::connect(&addr, &name, &token, true).await?;
     let msg = AgentMessage::ClipboardPaste {
         mime_type: Some(mime_type.to_string()),
     };

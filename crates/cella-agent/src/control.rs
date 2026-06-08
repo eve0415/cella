@@ -28,6 +28,7 @@ impl ControlClient {
         addr: &str,
         container_name: &str,
         auth_token: &str,
+        transient: bool,
     ) -> Result<(Self, DaemonHello), CellaPortError> {
         let stream = TcpStream::connect(addr)
             .await
@@ -51,6 +52,7 @@ impl ControlClient {
             container_name: container_name.to_string(),
             auth_token: auth_token.to_string(),
             claude_config_sync: crate::claude_config_sync::sync_enabled(),
+            transient,
         };
         let mut json = serde_json::to_string(&hello)?;
         json.push('\n');
@@ -297,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_fails_on_unreachable_address() {
-        let result = ControlClient::connect("127.0.0.1:1", "test-container", "token").await;
+        let result = ControlClient::connect("127.0.0.1:1", "test-container", "token", false).await;
         let Err(err) = result else {
             panic!("expected error on unreachable address");
         };
@@ -315,7 +317,8 @@ mod tests {
             drop(stream);
         });
 
-        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        let result =
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false).await;
         assert!(
             result.is_err(),
             "expected error when server closes connection immediately"
@@ -334,7 +337,8 @@ mod tests {
             stream.write_all(b"not-json\n").await.unwrap();
         });
 
-        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        let result =
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false).await;
         let Err(err) = result else {
             panic!("expected error on invalid JSON");
         };
@@ -364,7 +368,8 @@ mod tests {
             stream.write_all(json.as_bytes()).await.unwrap();
         });
 
-        let result = ControlClient::connect(&addr.to_string(), "test-container", "bad-token").await;
+        let result =
+            ControlClient::connect(&addr.to_string(), "test-container", "bad-token", false).await;
         let Err(err) = result else {
             panic!("expected error when daemon rejects");
         };
@@ -397,7 +402,8 @@ mod tests {
             stream.write_all(json.as_bytes()).await.unwrap();
         });
 
-        let result = ControlClient::connect(&addr.to_string(), "test-container", "token").await;
+        let result =
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false).await;
         assert!(result.is_ok());
         let (_client, hello) = result.unwrap();
         assert_eq!(hello.daemon_version, "0.1.0");
@@ -441,7 +447,7 @@ mod tests {
         });
 
         let (mut client, _hello) =
-            ControlClient::connect(&addr.to_string(), "test-container", "token")
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false)
                 .await
                 .unwrap();
         client.start_reader(None, None);
@@ -485,7 +491,7 @@ mod tests {
         });
 
         let (mut client, _hello) =
-            ControlClient::connect(&addr.to_string(), "test-container", "token")
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false)
                 .await
                 .unwrap();
         client.start_reader(None, None);
@@ -529,7 +535,7 @@ mod tests {
         });
 
         let (mut client, _hello) =
-            ControlClient::connect(&addr.to_string(), "test-container", "token")
+            ControlClient::connect(&addr.to_string(), "test-container", "token", false)
                 .await
                 .unwrap();
 
