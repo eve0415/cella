@@ -71,6 +71,12 @@ impl Default for AgentConnectionState {
     }
 }
 
+/// Monotonic counter for `agent_tx` ownership. Each persistent connection
+/// bumps this and stores its value; on disconnect it only clears `agent_tx`
+/// if its generation still matches, preventing stale cleanup from clobbering
+/// a newer persistent connection that reconnected during the race window.
+static AGENT_TX_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Handle for a registered container (no per-container server task).
 pub struct ContainerHandle {
     pub container_id: String,
@@ -85,6 +91,7 @@ pub struct ContainerHandle {
     /// (advertised via `AgentHello.claude_config_sync`). The daemon only
     /// broadcasts config updates to handles where this is true.
     pub claude_config_sync: bool,
+    pub(crate) agent_tx_generation: u64,
 }
 
 /// Spawn a handler task for a new TCP connection (agent or tunnel).
@@ -324,6 +331,7 @@ struct HandshakeResult {
     /// `ClaudeConfigChanged`, so a non-opted-in container cannot write the host
     /// config or poison peers.
     claude_config_sync: bool,
+    transient: bool,
 }
 
 /// Validate an already-parsed `AgentHello`, look up container, send `DaemonHello`.
@@ -421,6 +429,7 @@ async fn validate_agent_hello<W: AsyncWriteExt + Unpin>(
         workspace_path,
         parent_repo,
         claude_config_sync: agent_hello.claude_config_sync,
+        transient: agent_hello.transient,
     }))
 }
 
@@ -524,13 +533,19 @@ async fn handle_agent_connection_after_hello(
 
     let (daemon_tx, mut daemon_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(32);
 
-    {
+    let my_generation = if hs.transient {
+        0
+    } else {
+        let generation = AGENT_TX_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         let mut handles = ctx.container_handles.lock().await;
         if let Some(handle) = handles.get_mut(&hs.container_name) {
             handle.agent_tx = Some(daemon_tx.clone());
+            handle.agent_tx_generation = generation;
             handle.claude_config_sync = hs.claude_config_sync;
         }
-    }
+        drop(handles);
+        generation
+    };
 
     // The agent re-announces its current `~/.claude.json` on (re)connect (before
     // its reader starts), so the daemon merges its state and pushes back whatever
@@ -571,16 +586,19 @@ async fn handle_agent_connection_after_hello(
 
     // Connection closed — clear live state so status queries don't report
     // stale version/connectivity info for this container.
-    {
+    if !hs.transient {
         let mut handles = ctx.container_handles.lock().await;
-        if let Some(handle) = handles.get_mut(&hs.container_name) {
+        if let Some(handle) = handles.get_mut(&hs.container_name)
+            && handle.agent_tx_generation == my_generation
+        {
             handle.agent_tx = None;
             handle.claude_config_sync = false;
         }
-    }
-    hs.agent_state.connected.store(false, Ordering::Relaxed);
-    if let Ok(mut v) = hs.agent_state.agent_version.lock() {
-        *v = None;
+        drop(handles);
+        hs.agent_state.connected.store(false, Ordering::Relaxed);
+        if let Ok(mut v) = hs.agent_state.agent_version.lock() {
+            *v = None;
+        }
     }
     info!("Agent disconnected for container {}", hs.container_name);
 
@@ -3151,6 +3169,7 @@ mod tests {
             docker_host: None,
             agent_tx: None,
             claude_config_sync: false,
+            agent_tx_generation: 0,
         };
         assert_eq!(handle.container_id, "abc123");
         assert!(!handle.agent_state.connected.load(Ordering::Relaxed));
@@ -3199,6 +3218,7 @@ mod tests {
                     docker_host: None,
                     agent_tx: None,
                     claude_config_sync: false,
+                    agent_tx_generation: 0,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3211,6 +3231,7 @@ mod tests {
             container_name: "test-container".to_string(),
             auth_token: "test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
 
         assert!(
@@ -3260,6 +3281,7 @@ mod tests {
                     docker_host: None,
                     agent_tx: None,
                     claude_config_sync: false,
+                    agent_tx_generation: 0,
                 },
             );
             Arc::new(Mutex::new(map))
@@ -3283,6 +3305,7 @@ mod tests {
             container_name: "int-test-container".to_string(),
             auth_token: "int-test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
         let mut json = serde_json::to_string(&hello).unwrap();
         json.push('\n');
@@ -3336,6 +3359,7 @@ mod tests {
             container_name: "not-registered".to_string(),
             auth_token: "test-token".to_string(),
             claude_config_sync: false,
+            transient: false,
         };
 
         let (_daemon_side, agent_side) = tokio::io::duplex(4096);
@@ -3358,6 +3382,7 @@ mod tests {
             workspace_path: None,
             parent_repo: None,
             claude_config_sync,
+            transient: false,
         }
     }
 
@@ -3447,6 +3472,7 @@ mod tests {
                 docker_host: None,
                 agent_tx: Some(tx),
                 claude_config_sync: true,
+                agent_tx_generation: 0,
             },
         );
         let handles = Arc::new(Mutex::new(map));
