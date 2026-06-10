@@ -12,7 +12,7 @@ use cella_backend::{
 use tracing::{debug, warn};
 
 use crate::sdk::ContainerCli;
-use crate::sdk::types::ContainerListEntry;
+use crate::sdk::types::{ContainerListEntry, FilesystemType};
 
 /// Apple Container backend — drives the `container` CLI binary.
 pub struct AppleContainerBackend {
@@ -21,19 +21,13 @@ pub struct AppleContainerBackend {
 }
 
 impl AppleContainerBackend {
-    /// Resolve the staging directory for a container by looking up its name.
+    /// Resolve the staging directory for a container.
     ///
-    /// The staging directory is mounted at create time using the container name,
-    /// but subsequent operations receive the container ID. This helper bridges
-    /// the gap by inspecting the container to retrieve its name.
-    async fn staging_dir_for(&self, container_id: &str) -> Result<PathBuf, BackendError> {
-        let entry = self.cli.inspect(container_id).await?;
-        let name = entry
-            .configuration
-            .as_ref()
-            .and_then(|c| c.name.as_deref())
-            .unwrap_or(container_id);
-        Ok(self.staging_base.join(name))
+    /// Apple Container has no separate name field — `--name` sets the
+    /// container ID — so the create-time staging directory (keyed by name)
+    /// is directly addressable by ID.
+    fn staging_dir_for(&self, container_id: &str) -> PathBuf {
+        self.staging_base.join(container_id)
     }
 }
 
@@ -90,7 +84,7 @@ impl ContainerBackend for AppleContainerBackend {
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
             let canonical_str = canonical.to_string_lossy();
 
-            let entries = self.cli.list(None).await?;
+            let entries = self.cli.list().await?;
 
             for entry in entries {
                 if let Some(info) = entry_to_container_info(&entry)
@@ -136,10 +130,9 @@ impl ContainerBackend for AppleContainerBackend {
         remove_volumes: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_dir_for(id).await.ok();
             self.cli.rm(id).await?;
             if remove_volumes {
-                let staging_dir = staging_dir.unwrap_or_else(|| self.staging_base.join(id));
+                let staging_dir = self.staging_dir_for(id);
                 if staging_dir.exists() {
                     debug!(path = %staging_dir.display(), "removing staging directory");
                     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -166,7 +159,7 @@ impl ContainerBackend for AppleContainerBackend {
         running_only: bool,
     ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
         Box::pin(async move {
-            let entries = self.cli.list(None).await?;
+            let entries = self.cli.list().await?;
             let mut results = Vec::new();
             for entry in &entries {
                 if let Some(info) = entry_to_container_info(entry) {
@@ -199,7 +192,7 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move {
             let (key, value) = label.split_once('=').unwrap_or((label, ""));
 
-            let entries = self.cli.list(None).await?;
+            let entries = self.cli.list().await?;
             for entry in entries {
                 if let Some(info) = entry_to_container_info(&entry)
                     && info
@@ -442,7 +435,7 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_dir_for(container_id).await?;
+            let staging_dir = self.staging_dir_for(container_id);
             tokio::fs::create_dir_all(&staging_dir).await?;
 
             let staging_mount = "/tmp/.cella-staging";
@@ -511,7 +504,7 @@ impl ContainerBackend for AppleContainerBackend {
     fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
             // Verify the container CLI is reachable by running `container list`.
-            let _ = self.cli.list(None).await?;
+            let _ = self.cli.list().await?;
             Ok(())
         })
     }
@@ -807,8 +800,6 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
             },
         );
 
-    let exit_code = entry.status.as_ref().and_then(|s| s.exit_code);
-
     let labels = config.labels.clone().unwrap_or_default();
     let config_hash = labels.get("dev.cella.config_hash").cloned();
 
@@ -821,7 +812,7 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
                     Some(PortBinding {
                         container_port: p.container_port?,
                         host_port: p.host_port,
-                        protocol: p.protocol.clone().unwrap_or_else(|| "tcp".to_string()),
+                        protocol: p.proto.clone().unwrap_or_else(|| "tcp".to_string()),
                     })
                 })
                 .collect()
@@ -834,8 +825,20 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
         .map(|ms| {
             ms.iter()
                 .map(|m| MountInfo {
-                    mount_type: m.mount_type.clone().unwrap_or_default(),
-                    source: m.source.clone().unwrap_or_default(),
+                    mount_type: m
+                        .fs_type
+                        .as_ref()
+                        .map(|t| t.kind().to_string())
+                        .unwrap_or_default(),
+                    // Volume mounts surface the volume name (Docker parity);
+                    // the raw source is the host-side storage path.
+                    source: m
+                        .fs_type
+                        .as_ref()
+                        .and_then(FilesystemType::volume_name)
+                        .map(String::from)
+                        .or_else(|| m.source.clone())
+                        .unwrap_or_default(),
                     destination: m.destination.clone().unwrap_or_default(),
                 })
                 .collect()
@@ -845,16 +848,17 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     let created_at = labels.get("dev.cella.created_at").cloned();
 
     Some(ContainerInfo {
+        name: id.clone(),
         id,
-        name: config.name.clone().unwrap_or_default(),
         state,
-        exit_code,
+        // 1.0.0 does not report exit codes through ls/inspect.
+        exit_code: None,
         labels,
         config_hash,
         ports,
         created_at,
         container_user: None,
-        image: config.image.clone(),
+        image: config.image.as_ref().and_then(|i| i.reference.clone()),
         mounts,
         backend: BackendKind::AppleContainer,
     })
@@ -1093,68 +1097,69 @@ mod tests {
         assert!(staging_mount.is_some(), "expected staging volume mount");
     }
 
+    /// Test helper: a status with the given state and no network attachments.
+    fn test_status(state: &str) -> crate::sdk::types::ContainerStatus {
+        crate::sdk::types::ContainerStatus {
+            state: Some(state.to_string()),
+            networks: Vec::new(),
+        }
+    }
+
+    /// Test helper: a configuration with the given ID and everything else
+    /// empty.
+    fn test_config(id: Option<&str>) -> crate::sdk::types::ContainerConfiguration {
+        crate::sdk::types::ContainerConfiguration {
+            id: id.map(String::from),
+            image: None,
+            labels: None,
+            published_ports: None,
+            mounts: None,
+            networks: Vec::new(),
+        }
+    }
+
     #[test]
     fn entry_to_container_info_basic() {
+        let mut config = test_config(Some("abc123"));
+        config.image = Some(crate::sdk::types::ImageDescription {
+            reference: Some("ubuntu:latest".to_string()),
+        });
+        config.labels = Some(HashMap::from([(
+            "dev.cella.tool".to_string(),
+            "cella".to_string(),
+        )]));
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: Some(0),
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("abc123".to_string()),
-                name: Some("test".to_string()),
-                image: Some("ubuntu:latest".to_string()),
-                labels: Some(HashMap::from([(
-                    "dev.cella.tool".to_string(),
-                    "cella".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("running")),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
         assert_eq!(info.id, "abc123");
-        assert_eq!(info.name, "test");
+        // Containers have no separate name; the ID doubles as the name.
+        assert_eq!(info.name, "abc123");
         assert_eq!(info.state, ContainerState::Running);
-        assert_eq!(info.exit_code, Some(0));
+        assert_eq!(info.image.as_deref(), Some("ubuntu:latest"));
         assert_eq!(info.backend, BackendKind::AppleContainer);
     }
 
     #[test]
     fn entry_to_container_info_stopped_state() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("stopped".to_string()),
-                exit_code: Some(137),
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("def456".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("stopped")),
+            configuration: Some(test_config(Some("def456"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
         assert_eq!(info.state, ContainerState::Stopped);
-        assert_eq!(info.exit_code, Some(137));
+        // 1.0.0 does not report exit codes through ls/inspect.
+        assert_eq!(info.exit_code, None);
     }
 
     #[test]
     fn entry_to_container_info_no_id_returns_none() {
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: None,
-                name: Some("orphan".to_string()),
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(test_config(None)),
         };
 
         assert!(entry_to_container_info(&entry).is_none());
@@ -1163,10 +1168,7 @@ mod tests {
     #[test]
     fn entry_to_container_info_no_config_returns_none() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: None,
-            }),
+            status: Some(test_status("running")),
             configuration: None,
         };
 
@@ -1414,36 +1416,28 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_ports() {
+        let mut config = test_config(Some("p1"));
+        config.published_ports = Some(vec![
+            crate::sdk::types::PublishedPort {
+                container_port: Some(80),
+                host_port: Some(8080),
+                proto: Some("tcp".to_string()),
+            },
+            crate::sdk::types::PublishedPort {
+                container_port: Some(443),
+                host_port: None,
+                proto: None,
+            },
+            // Port entry missing container_port should be filtered out.
+            crate::sdk::types::PublishedPort {
+                container_port: None,
+                host_port: Some(9999),
+                proto: None,
+            },
+        ]);
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: None,
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("p1".to_string()),
-                name: Some("with-ports".to_string()),
-                image: Some("nginx".to_string()),
-                labels: None,
-                published_ports: Some(vec![
-                    crate::sdk::types::PublishedPort {
-                        container_port: Some(80),
-                        host_port: Some(8080),
-                        protocol: Some("tcp".to_string()),
-                    },
-                    crate::sdk::types::PublishedPort {
-                        container_port: Some(443),
-                        host_port: None,
-                        protocol: None,
-                    },
-                    // Port entry missing container_port should be filtered out.
-                    crate::sdk::types::PublishedPort {
-                        container_port: None,
-                        host_port: Some(9999),
-                        protocol: None,
-                    },
-                ]),
-                mounts: None,
-            }),
+            status: Some(test_status("running")),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1458,44 +1452,48 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_mounts() {
+        let mut config = test_config(Some("m1"));
+        config.mounts = Some(vec![
+            crate::sdk::types::MountEntry {
+                source: Some("/host".to_string()),
+                destination: Some("/container".to_string()),
+                fs_type: Some(FilesystemType::Virtiofs(serde_json::Value::Null)),
+                options: Vec::new(),
+            },
+            crate::sdk::types::MountEntry {
+                source: Some("/var/lib/volumes/data".to_string()),
+                destination: Some("/data".to_string()),
+                fs_type: Some(FilesystemType::Volume {
+                    name: Some("data".to_string()),
+                }),
+                options: Vec::new(),
+            },
+        ]);
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("m1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: Some(vec![crate::sdk::types::MountEntry {
-                    source: Some("/host".to_string()),
-                    destination: Some("/container".to_string()),
-                    mount_type: Some("bind".to_string()),
-                }]),
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
-        assert_eq!(info.mounts.len(), 1);
+        assert_eq!(info.mounts.len(), 2);
         assert_eq!(info.mounts[0].source, "/host");
         assert_eq!(info.mounts[0].destination, "/container");
         assert_eq!(info.mounts[0].mount_type, "bind");
+        // Volume mounts surface the volume name, not the storage path.
+        assert_eq!(info.mounts[1].source, "data");
+        assert_eq!(info.mounts[1].mount_type, "volume");
     }
 
     #[test]
     fn entry_to_container_info_with_config_hash_label() {
+        let mut config = test_config(Some("h1"));
+        config.labels = Some(HashMap::from([(
+            "dev.cella.config_hash".to_string(),
+            "abc123hash".to_string(),
+        )]));
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("h1".to_string()),
-                name: None,
-                image: None,
-                labels: Some(HashMap::from([(
-                    "dev.cella.config_hash".to_string(),
-                    "abc123hash".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1504,19 +1502,14 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_created_at_label() {
+        let mut config = test_config(Some("ca1"));
+        config.labels = Some(HashMap::from([(
+            "dev.cella.created_at".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )]));
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("ca1".to_string()),
-                name: None,
-                image: None,
-                labels: Some(HashMap::from([(
-                    "dev.cella.created_at".to_string(),
-                    "2026-01-01T00:00:00Z".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1526,36 +1519,19 @@ mod tests {
     #[test]
     fn entry_to_container_info_unknown_state() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("paused".to_string()),
-                exit_code: None,
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("u1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("stopping")),
+            configuration: Some(test_config(Some("u1"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
-        assert_eq!(info.state, ContainerState::Other("paused".to_string()));
+        assert_eq!(info.state, ContainerState::Other("stopping".to_string()));
     }
 
     #[test]
     fn entry_to_container_info_no_status_defaults_to_unknown() {
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("ns1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(test_config(Some("ns1"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1564,20 +1540,16 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_empty_mount_fields() {
+        let mut config = test_config(Some("em1"));
+        config.mounts = Some(vec![crate::sdk::types::MountEntry {
+            source: None,
+            destination: None,
+            fs_type: None,
+            options: Vec::new(),
+        }]);
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("em1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: Some(vec![crate::sdk::types::MountEntry {
-                    source: None,
-                    destination: None,
-                    mount_type: None,
-                }]),
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();

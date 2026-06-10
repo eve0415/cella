@@ -100,29 +100,34 @@ impl ContainerCli {
 
     /// Inspect a container and return its full metadata.
     ///
+    /// `container inspect` always emits a JSON array; the first entry is
+    /// returned.
+    ///
     /// # Errors
     ///
     /// Returns an error if the container does not exist, the CLI exits
     /// non-zero, or the JSON output cannot be parsed.
     pub async fn inspect(&self, id: &str) -> Result<types::ContainerInspect, BackendError> {
-        run_cli_json(&self.binary_path, &["inspect", id, "--format", "json"]).await
+        let entries: Vec<types::ContainerInspect> =
+            run_cli_json(&self.binary_path, &["inspect", id]).await?;
+        entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::ContainerNotFound {
+                identifier: id.to_string(),
+            })
     }
 
-    /// List containers, optionally filtering by a label.
+    /// List all containers (running and stopped).
+    ///
+    /// The CLI has no server-side filtering; callers filter on labels from
+    /// the returned entries.
     ///
     /// # Errors
     ///
     /// Returns an error if the CLI exits non-zero or JSON parsing fails.
-    pub async fn list(
-        &self,
-        label_filter: Option<&str>,
-    ) -> Result<Vec<types::ContainerListEntry>, BackendError> {
-        let mut args = vec!["ls", "--format", "json", "--all"];
-        if let Some(label) = label_filter {
-            args.push("--filter");
-            args.push(label);
-        }
-        run_cli_json(&self.binary_path, &args).await
+    pub async fn list(&self) -> Result<Vec<types::ContainerListEntry>, BackendError> {
+        run_cli_json(&self.binary_path, &["ls", "--format", "json", "--all"]).await
     }
 
     /// Fetch the last `tail` lines of container logs.
@@ -132,7 +137,7 @@ impl ContainerCli {
     /// Returns an error if the CLI cannot be spawned.
     pub async fn logs(&self, id: &str, tail: u32) -> Result<String, BackendError> {
         let tail_str = tail.to_string();
-        let output = run_cli(&self.binary_path, &["logs", id, "--tail", &tail_str]).await?;
+        let output = run_cli(&self.binary_path, &["logs", id, "-n", &tail_str]).await?;
         // Logs may come on stderr for some runtimes; combine both.
         let mut combined = output.stdout;
         if !output.stderr.is_empty() {
@@ -268,17 +273,14 @@ impl ContainerCli {
         Ok(output.exit_code == 0)
     }
 
-    /// Inspect an image and return raw JSON output.
+    /// Inspect an image and return raw JSON output (an array of image
+    /// resources).
     ///
     /// # Errors
     ///
     /// Returns `BackendError::ImageNotFound` if the image does not exist.
     pub async fn image_inspect(&self, image: &str) -> Result<String, BackendError> {
-        let output = run_cli(
-            &self.binary_path,
-            &["image", "inspect", image, "--format", "json"],
-        )
-        .await?;
+        let output = run_cli(&self.binary_path, &["image", "inspect", image]).await?;
         if output.exit_code != 0 {
             return Err(BackendError::ImageNotFound {
                 image: image.to_string(),
@@ -349,8 +351,8 @@ mod tests {
                 let content = format!("#!/bin/sh\n{body}\n");
                 // Only write if missing or content changed; avoids ETXTBSY
                 // when another thread is executing the same file.
-                let needs_write = std::fs::read_to_string(&path)
-                    .map_or(true, |existing| existing != content);
+                let needs_write =
+                    std::fs::read_to_string(&path).map_or(true, |existing| existing != content);
                 if needs_write {
                     let mut file = std::fs::File::create(&path).unwrap();
                     file.write_all(content.as_bytes()).unwrap();
@@ -360,10 +362,7 @@ mod tests {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
                 }
                 // ETXTBSY guard: the kernel may not have released the inode
                 // write reference yet (deferred __fput). Spin until exec works.
@@ -375,9 +374,7 @@ mod tests {
                             .stderr(std::process::Stdio::null())
                             .output()
                         {
-                            Err(e)
-                                if e.kind() == std::io::ErrorKind::ExecutableFileBusy =>
-                            {
+                            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                             _ => break,
@@ -396,7 +393,7 @@ mod tests {
                 build_fail: write_script("build_fail.sh", "echo 'build failed' >&2; exit 1"),
                 inspect_json: write_script(
                     "inspect_json.sh",
-                    r#"echo '{"status":{"state":"running"},"configuration":{"id":"x","name":"n"}}'"#,
+                    r#"echo '[{"status":{"state":"running"},"configuration":{"id":"x"}}]'"#,
                 ),
                 list_json: write_script(
                     "list_json.sh",
@@ -524,20 +521,30 @@ mod tests {
         assert!(result.is_err(), "expected JSON parse error");
     }
 
+    #[tokio::test]
+    async fn inspect_empty_array_is_not_found() {
+        let cli = cli_from(&mock_scripts().empty_list);
+        let result = cli.inspect("ghost").await;
+        assert!(
+            matches!(result, Err(BackendError::ContainerNotFound { .. })),
+            "expected ContainerNotFound for empty inspect output"
+        );
+    }
+
     // -- list -----------------------------------------------------------------
 
     #[tokio::test]
     async fn list_parses_valid_json_array() {
         let cli = cli_from(&mock_scripts().list_json);
-        let result = cli.list(None).await;
+        let result = cli.list().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn list_with_label_filter() {
+    async fn list_empty_array() {
         let cli = cli_from(&mock_scripts().empty_list);
-        let result = cli.list(Some("dev.cella.tool=cella")).await;
+        let result = cli.list().await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -545,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn list_error_on_invalid_json() {
         let cli = echo_cli();
-        let result = cli.list(None).await;
+        let result = cli.list().await;
         assert!(result.is_err(), "expected JSON parse error");
     }
 
