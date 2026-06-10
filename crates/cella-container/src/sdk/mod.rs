@@ -328,6 +328,60 @@ impl ContainerCli {
         }
         Ok(())
     }
+
+    // -- Network operations (macOS 26+) --
+
+    /// Create a network with the given labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero (including on macOS 15,
+    /// where the network commands do not exist) or cannot be spawned.
+    pub async fn network_create(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<(), BackendError> {
+        let mut args = vec!["network".to_string(), "create".to_string()];
+        for (key, value) in labels {
+            args.push("--label".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push(name.to_string());
+
+        let output = run_cli_owned(&self.binary_path, &args).await?;
+        if output.exit_code != 0 {
+            return Err(BackendError::Runtime(
+                format!("network create {name} failed: {}", output.stderr).into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// List networks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero (including on macOS 15,
+    /// where the network commands do not exist) or JSON parsing fails.
+    pub async fn network_list(&self) -> Result<Vec<types::NetworkListEntry>, BackendError> {
+        run_cli_json(&self.binary_path, &["network", "ls", "--format", "json"]).await
+    }
+
+    /// Delete a network by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero or cannot be spawned.
+    pub async fn network_delete(&self, name: &str) -> Result<(), BackendError> {
+        let output = run_cli(&self.binary_path, &["network", "delete", name]).await?;
+        if output.exit_code != 0 {
+            return Err(BackendError::Runtime(
+                format!("network delete {name} failed: {}", output.stderr).into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

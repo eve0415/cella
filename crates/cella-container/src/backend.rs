@@ -4,19 +4,31 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 
+use cella_backend::network::{
+    CELLA_NETWORK_NAME, MANAGED_LABEL, MANAGED_VALUE, REPO_LABEL, repo_network_name,
+    workspace_network_name,
+};
 use cella_backend::{
     BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
-    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding, RunArgsOverrides,
+    ImageDetails, InteractiveExecOptions, ManagedNetwork, MountInfo, Platform, PortBinding,
+    RemovalOutcome, RunArgsOverrides,
 };
 use tracing::{debug, warn};
 
 use crate::sdk::ContainerCli;
 use crate::sdk::types::{ContainerListEntry, FilesystemType};
 
+/// Labels applied to every cella-managed network.
+const NETWORK_BASE_LABELS: [(&str, &str); 2] =
+    [("dev.cella.tool", "cella"), (MANAGED_LABEL, MANAGED_VALUE)];
+
 /// Apple Container backend — drives the `container` CLI binary.
 pub struct AppleContainerBackend {
     cli: ContainerCli,
+    /// Whether `container network` commands work on this host (macOS 26+).
+    /// Probed lazily, once per backend instance.
+    networks_available: tokio::sync::OnceCell<bool>,
 }
 
 impl AppleContainerBackend {
@@ -26,8 +38,131 @@ impl AppleContainerBackend {
             "Apple Container backend is EXPERIMENTAL — \
              expect rough edges and missing features"
         );
-        Self { cli }
+        Self {
+            cli,
+            networks_available: tokio::sync::OnceCell::new(),
+        }
     }
+
+    /// Whether the network subcommands are usable (they only exist on
+    /// macOS 26+; on macOS 15 every invocation fails).
+    async fn networks_available(&self) -> bool {
+        *self
+            .networks_available
+            .get_or_init(|| async {
+                match self.cli.network_list().await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "network commands unavailable (requires macOS 26+); \
+                             continuing without network integration"
+                        );
+                        false
+                    }
+                }
+            })
+            .await
+    }
+
+    /// Check whether a network with the given name exists.
+    async fn named_network_exists(&self, name: &str) -> Result<bool, BackendError> {
+        let networks = self.cli.network_list().await?;
+        Ok(networks.iter().any(|n| n.name() == Some(name)))
+    }
+
+    /// Create `name` with `labels` unless it already exists.
+    async fn ensure_named_network(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<(), BackendError> {
+        if self.named_network_exists(name).await? {
+            return Ok(());
+        }
+        match self.cli.network_create(name, labels).await {
+            Ok(()) => Ok(()),
+            // Lost a creation race? An existing network is still success.
+            Err(e) => {
+                if self.named_network_exists(name).await.unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Ensure the shared and per-workspace networks exist and return the
+    /// attachment names for `container create`.
+    ///
+    /// Apple Container fixes network attachments at creation, so this runs
+    /// before every create. Network trouble degrades to fewer (or no)
+    /// attachments rather than failing container creation.
+    async fn prepare_create_networks(&self, opts: &CreateContainerOptions) -> Vec<String> {
+        if !self.networks_available().await {
+            return Vec::new();
+        }
+
+        let mut networks = Vec::new();
+
+        match self
+            .ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS)
+            .await
+        {
+            Ok(()) => networks.push(CELLA_NETWORK_NAME.to_string()),
+            Err(e) => warn!(
+                error = %e,
+                "could not ensure '{CELLA_NETWORK_NAME}' network; creating container without it"
+            ),
+        }
+
+        // The workspace label is canonicalized when labels are built, so the
+        // derived name matches what down/prune compute later.
+        if let Some(workspace) = opts.labels.get("dev.cella.workspace_path") {
+            let name = repo_network_name(Path::new(workspace));
+            let labels = [
+                NETWORK_BASE_LABELS[0],
+                NETWORK_BASE_LABELS[1],
+                (REPO_LABEL, workspace.as_str()),
+            ];
+            match self.ensure_named_network(&name, &labels).await {
+                Ok(()) => networks.push(name),
+                Err(e) => warn!(
+                    error = %e,
+                    network = %name,
+                    "could not ensure workspace network; creating container without it"
+                ),
+            }
+        }
+
+        networks
+    }
+}
+
+/// Build a `NotSupported` error for a network operation, mentioning the
+/// macOS 26 requirement.
+fn network_unavailable(operation: &str) -> BackendError {
+    BackendError::NotSupported {
+        backend: "apple-container".to_string(),
+        operation: format!("{operation} (network commands require macOS 26+)"),
+    }
+}
+
+/// Whether a list entry is attached to `name`, either by configuration
+/// (create-time) or live status.
+fn entry_attached_to_network(entry: &ContainerListEntry, name: &str) -> bool {
+    let configured = entry.configuration.as_ref().is_some_and(|c| {
+        c.networks
+            .iter()
+            .any(|n| n.network.as_deref() == Some(name))
+    });
+    let live = entry.status.as_ref().is_some_and(|s| {
+        s.networks
+            .iter()
+            .any(|n| n.network.as_deref() == Some(name))
+    });
+    configured || live
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +214,10 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
-            let args = build_create_args(opts);
+            // Network attachments are fixed at creation, so the shared and
+            // per-workspace networks must exist (and be requested) up front.
+            let networks = self.prepare_create_networks(opts).await;
+            let args = build_create_args(opts, &networks);
             debug!(?args, "container create arguments");
             self.cli.create(&args).await
         })
@@ -526,31 +664,186 @@ impl ContainerBackend for AppleContainerBackend {
 
     fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
-            Err(BackendError::NotSupported {
-                backend: "apple-container".to_string(),
-                operation: "ensure_network".to_string(),
-            })
+            if !self.networks_available().await {
+                return Err(network_unavailable("ensure_network"));
+            }
+            self.ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS)
+                .await
         })
     }
 
     fn ensure_container_network<'a>(
         &'a self,
-        _container_id: &'a str,
-        _repo_path: &'a Path,
+        container_id: &'a str,
+        repo_path: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            Err(BackendError::NotSupported {
-                backend: "apple-container".to_string(),
-                operation: "ensure_container_network".to_string(),
-            })
+            if !self.networks_available().await {
+                return Err(network_unavailable("ensure_container_network"));
+            }
+
+            // Attachments are fixed at creation; verify the create-time
+            // attachments cover what the orchestrator expects.
+            let entry = self.cli.inspect(container_id).await?;
+            let expected = [
+                CELLA_NETWORK_NAME.to_string(),
+                workspace_network_name(repo_path),
+            ];
+            let missing: Vec<&str> = expected
+                .iter()
+                .filter(|name| !entry_attached_to_network(&entry, name))
+                .map(String::as_str)
+                .collect();
+
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(BackendError::NotSupported {
+                    backend: "apple-container".to_string(),
+                    operation: format!(
+                        "attaching networks to an existing container ({}); \
+                         attachments are fixed at creation — recreate the \
+                         container to join them",
+                        missing.join(", ")
+                    ),
+                })
+            }
         })
     }
 
     fn get_container_ip<'a>(
         &'a self,
-        _container_id: &'a str,
+        container_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move {
+            let entry = self.cli.inspect(container_id).await?;
+            let Some(status) = entry.status else {
+                return Ok(None);
+            };
+
+            // Prefer the shared cella network, mirroring the Docker backend.
+            if let Some(ip) = status
+                .networks
+                .iter()
+                .find(|n| n.network.as_deref() == Some(CELLA_NETWORK_NAME))
+                .and_then(|n| n.ipv4())
+            {
+                return Ok(Some(ip.to_string()));
+            }
+            Ok(status
+                .networks
+                .iter()
+                .find_map(|n| n.ipv4().map(String::from)))
+        })
+    }
+
+    fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
+        Box::pin(async move {
+            if !self.networks_available().await {
+                return Err(network_unavailable("list_managed_networks"));
+            }
+
+            let networks = self.cli.network_list().await?;
+            let containers = self.cli.list().await?;
+
+            let mut out = Vec::new();
+            for net in &networks {
+                let Some(name) = net.name() else { continue };
+                let labels = net
+                    .configuration
+                    .as_ref()
+                    .and_then(|c| c.labels.clone())
+                    .unwrap_or_default();
+                if labels.get(MANAGED_LABEL).map(String::as_str) != Some(MANAGED_VALUE) {
+                    continue;
+                }
+
+                let container_count = containers
+                    .iter()
+                    .filter(|c| entry_attached_to_network(c, name))
+                    .count();
+                let created_at = net
+                    .configuration
+                    .as_ref()
+                    .and_then(|c| c.creation_date.as_ref())
+                    .and_then(|v| v.as_str().map(String::from));
+
+                out.push(ManagedNetwork {
+                    name: name.to_string(),
+                    repo_path: labels.get(REPO_LABEL).cloned(),
+                    container_count,
+                    created_at,
+                    labels,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn remove_network_if_orphan<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            if !self.networks_available().await {
+                return Err(network_unavailable("remove_network_if_orphan"));
+            }
+
+            let networks = self.cli.network_list().await?;
+            let Some(net) = networks.iter().find(|n| n.name() == Some(name)) else {
+                return Ok(RemovalOutcome::NotFound);
+            };
+
+            let labels = net
+                .configuration
+                .as_ref()
+                .and_then(|c| c.labels.clone())
+                .unwrap_or_default();
+            let managed = labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_VALUE);
+
+            let containers = self.cli.list().await?;
+            let container_count = containers
+                .iter()
+                .filter(|c| entry_attached_to_network(c, name))
+                .count();
+
+            if !managed || container_count > 0 {
+                debug!(
+                    network = name,
+                    managed, container_count, "network not an orphan, leaving in place"
+                );
+                return Ok(RemovalOutcome::SkippedInUse);
+            }
+
+            match self.cli.network_delete(name).await {
+                Ok(()) => Ok(RemovalOutcome::Removed),
+                // Removed by a concurrent caller between list and delete.
+                Err(e) if e.to_string().contains("not found") => Ok(RemovalOutcome::NotFound),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn remove_workspace_network<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            let name = workspace_network_name(workspace_root);
+            self.remove_network_if_orphan(&name).await
+        })
+    }
+
+    fn network_exists<'a>(
+        &'a self,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BackendError>> {
+        Box::pin(async move {
+            if !self.networks_available().await {
+                return Err(network_unavailable("network_exists"));
+            }
+            self.named_network_exists(network_name).await
+        })
     }
 
     // -- Agent provisioning --
@@ -602,8 +895,17 @@ impl ContainerBackend for AppleContainerBackend {
 // ---------------------------------------------------------------------------
 
 /// Build CLI arguments for `container create` from `CreateContainerOptions`.
-fn build_create_args(opts: &CreateContainerOptions) -> Vec<String> {
+///
+/// `networks` lists pre-created networks to attach; attachments cannot be
+/// added after creation.
+fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<String> {
     let mut args = Vec::new();
+
+    // Network attachments.
+    for network in networks {
+        args.push("--network".to_string());
+        args.push(network.clone());
+    }
 
     // Name
     args.push("--name".to_string());
@@ -1025,7 +1327,7 @@ mod tests {
     #[test]
     fn build_create_args_minimal() {
         let opts = minimal_create_opts();
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"test-container".to_string()));
@@ -1040,7 +1342,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.labels
             .insert("dev.cella.tool".to_string(), "cella".to_string());
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let label_idx = args.iter().position(|a| a == "--label").unwrap();
         assert_eq!(args[label_idx + 1], "dev.cella.tool=cella");
@@ -1051,7 +1353,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.env = vec!["FOO=bar".to_string()];
         opts.remote_env = vec!["BAZ=qux".to_string()];
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let env_positions: Vec<usize> = args
             .iter()
@@ -1067,7 +1369,7 @@ mod tests {
     fn build_create_args_with_user() {
         let mut opts = minimal_create_opts();
         opts.user = Some("vscode".to_string());
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let user_idx = args.iter().position(|a| a == "-u").unwrap();
         assert_eq!(args[user_idx + 1], "vscode");
@@ -1084,7 +1386,7 @@ mod tests {
             read_only: false,
             external: false,
         });
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(args[vol_idx + 1], "/host/project:/workspace");
@@ -1101,7 +1403,7 @@ mod tests {
             read_only: true,
             external: false,
         });
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(
@@ -1121,7 +1423,7 @@ mod tests {
                 host_port: Some("3000".to_string()),
             }],
         );
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "3000:8080/tcp");
@@ -1131,7 +1433,7 @@ mod tests {
     fn build_create_args_with_entrypoint() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(vec!["/bin/sh".to_string(), "-c".to_string()]);
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let ep_idx = args.iter().position(|a| a == "--entrypoint").unwrap();
         assert_eq!(args[ep_idx + 1], "/bin/sh -c");
@@ -1141,7 +1443,7 @@ mod tests {
     fn build_create_args_with_cmd() {
         let mut opts = minimal_create_opts();
         opts.cmd = Some(vec!["sleep".to_string(), "infinity".to_string()]);
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         // Image should be followed by cmd.
         let img_idx = args.iter().position(|a| a == "ubuntu:latest").unwrap();
@@ -1152,12 +1454,74 @@ mod tests {
     #[test]
     fn build_create_args_has_no_staging_mount() {
         let opts = minimal_create_opts();
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         assert!(
             !args.iter().any(|a| a.contains(".cella-staging")),
             "file uploads use `container cp`; no staging mount expected"
         );
+    }
+
+    #[test]
+    fn build_create_args_attaches_networks() {
+        let opts = minimal_create_opts();
+        let networks = vec!["cella".to_string(), "cella-net-abcdef123456".to_string()];
+        let args = build_create_args(&opts, &networks);
+
+        let attached: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--network")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(attached, vec!["cella", "cella-net-abcdef123456"]);
+    }
+
+    #[test]
+    fn build_create_args_no_networks_no_flag() {
+        let opts = minimal_create_opts();
+        let args = build_create_args(&opts, &[]);
+        assert!(!args.contains(&"--network".to_string()));
+    }
+
+    #[test]
+    fn entry_attached_to_network_checks_configuration() {
+        let mut config = test_config(Some("c1"));
+        config.networks = vec![crate::sdk::types::AttachmentConfiguration {
+            network: Some("cella".to_string()),
+        }];
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(config),
+        };
+
+        assert!(entry_attached_to_network(&entry, "cella"));
+        assert!(!entry_attached_to_network(&entry, "other"));
+    }
+
+    #[test]
+    fn entry_attached_to_network_checks_live_status() {
+        let mut status = test_status("running");
+        status.networks = vec![crate::sdk::types::NetworkAttachment {
+            network: Some("cella-net-abc".to_string()),
+            hostname: None,
+            ipv4_address: Some("192.168.65.2/24".to_string()),
+            ipv4_gateway: None,
+        }];
+        let entry = ContainerListEntry {
+            status: Some(status),
+            configuration: Some(test_config(Some("c2"))),
+        };
+
+        assert!(entry_attached_to_network(&entry, "cella-net-abc"));
+        assert!(!entry_attached_to_network(&entry, "cella"));
+    }
+
+    #[test]
+    fn network_unavailable_mentions_macos_requirement() {
+        let err = network_unavailable("ensure_network");
+        let msg = err.to_string();
+        assert!(msg.contains("apple-container"), "msg: {msg}");
+        assert!(msg.contains("macOS 26"), "msg: {msg}");
     }
 
     /// Test helper: a status with the given state and no network attachments.
@@ -1276,7 +1640,7 @@ mod tests {
     fn build_create_args_passes_capabilities() {
         let mut opts = minimal_create_opts();
         opts.cap_add = vec!["SYS_PTRACE".to_string(), "NET_RAW".to_string()];
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let cap_values: Vec<&str> = args
             .windows(2)
@@ -1377,7 +1741,7 @@ mod tests {
             read_only: false,
             external: false,
         }];
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let mut pairs = args.windows(2).map(|w| (w[0].as_str(), w[1].as_str()));
         assert!(pairs.any(|p| p == ("--tmpfs", "/run/scratch")));
@@ -1449,7 +1813,7 @@ mod tests {
                 external: false,
             },
         ];
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1482,7 +1846,7 @@ mod tests {
             read_only: true,
             external: false,
         }];
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1510,7 +1874,7 @@ mod tests {
                 host_port: Some("8443".to_string()),
             }],
         );
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "127.0.0.1:8443:443/tcp");
@@ -1526,7 +1890,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "0.0.0.0::80/tcp");
@@ -1542,7 +1906,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         // When both host_ip and host_port are None, just the container port.
@@ -1565,7 +1929,7 @@ mod tests {
                 },
             ],
         );
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         let port_count = args.iter().filter(|a| *a == "-p").count();
         assert_eq!(port_count, 2);
@@ -1575,7 +1939,7 @@ mod tests {
     fn build_create_args_empty_entrypoint_is_skipped() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(Vec::new());
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),
@@ -1586,7 +1950,7 @@ mod tests {
     #[test]
     fn build_create_args_none_entrypoint_is_skipped() {
         let opts = minimal_create_opts();
-        let args = build_create_args(&opts);
+        let args = build_create_args(&opts, &[]);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),
