@@ -1,7 +1,7 @@
 //! `ContainerBackend` implementation for the Apple Container runtime.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
 use cella_backend::{
@@ -17,18 +17,6 @@ use crate::sdk::types::{ContainerListEntry, FilesystemType};
 /// Apple Container backend — drives the `container` CLI binary.
 pub struct AppleContainerBackend {
     cli: ContainerCli,
-    staging_base: PathBuf,
-}
-
-impl AppleContainerBackend {
-    /// Resolve the staging directory for a container.
-    ///
-    /// Apple Container has no separate name field — `--name` sets the
-    /// container ID — so the create-time staging directory (keyed by name)
-    /// is directly addressable by ID.
-    fn staging_dir_for(&self, container_id: &str) -> PathBuf {
-        self.staging_base.join(container_id)
-    }
 }
 
 impl AppleContainerBackend {
@@ -38,22 +26,8 @@ impl AppleContainerBackend {
             "Apple Container backend is EXPERIMENTAL — \
              expect rough edges and missing features"
         );
-        let staging_base = default_staging_base();
-        Self { cli, staging_base }
+        Self { cli }
     }
-}
-
-/// Default host-side staging directory for file uploads.
-fn default_staging_base() -> PathBuf {
-    std::env::var("HOME").map_or_else(
-        |_| PathBuf::from("/tmp/cella/containers"),
-        |h| {
-            PathBuf::from(h)
-                .join(".cache")
-                .join("cella")
-                .join("containers")
-        },
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -105,12 +79,7 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
-            // Ensure the staging directory exists before creating the container,
-            // since it is mounted as a volume.
-            let staging_dir = self.staging_base.join(&opts.name);
-            tokio::fs::create_dir_all(&staging_dir).await?;
-
-            let args = build_create_args(opts, &self.staging_base);
+            let args = build_create_args(opts);
             debug!(?args, "container create arguments");
             self.cli.create(&args).await
         })
@@ -132,11 +101,10 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move {
             self.cli.rm(id).await?;
             if remove_volumes {
-                let staging_dir = self.staging_dir_for(id);
-                if staging_dir.exists() {
-                    debug!(path = %staging_dir.display(), "removing staging directory");
-                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-                }
+                // Apple Container's delete never removes volumes, and this
+                // backend creates no per-container anonymous volumes — named
+                // volumes from user config are intentionally left in place.
+                debug!("remove_volumes requested; no backend-managed volumes to remove");
             }
             Ok(())
         })
@@ -435,25 +403,8 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_dir_for(container_id);
-            tokio::fs::create_dir_all(&staging_dir).await?;
-
-            let staging_mount = "/tmp/.cella-staging";
-
             for file in files {
-                // Write to host staging directory.
-                let host_path =
-                    staging_dir.join(file.path.trim_start_matches('/').replace('/', "_"));
-                tokio::fs::write(&host_path, &file.content).await?;
-
-                let staging_name = host_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let staging_src = format!("{staging_mount}/{staging_name}");
-
-                // Ensure parent directory exists inside the container.
+                // Ensure the parent directory exists inside the container.
                 if let Some(parent) = Path::new(&file.path).parent() {
                     let mkdir_cmd = vec![
                         "mkdir".to_string(),
@@ -466,19 +417,28 @@ impl ContainerBackend for AppleContainerBackend {
                         .await;
                 }
 
-                // Copy from staging mount to final path.
-                let cp_cmd = vec!["cp".to_string(), staging_src, file.path.clone()];
+                // Stage the content in a host temp file and copy it in.
+                // The temp file is removed when `tmp` drops.
+                let tmp = tempfile::NamedTempFile::new()?;
+                tokio::fs::write(tmp.path(), &file.content).await?;
+                self.cli
+                    .cp_into(tmp.path(), container_id, &file.path)
+                    .await?;
+
+                // `container cp` preserves host-side metadata; normalize to
+                // the root ownership and explicit mode the old exec-based
+                // copy produced.
+                let chown_cmd = vec!["chown".to_string(), "0:0".to_string(), file.path.clone()];
                 let (exit_code, _, stderr) = self
                     .cli
-                    .exec_capture(container_id, &cp_cmd, Some("root"), None, None)
+                    .exec_capture(container_id, &chown_cmd, Some("root"), None, None)
                     .await?;
                 if exit_code != 0 {
                     return Err(BackendError::Runtime(
-                        format!("cp failed for {}: {stderr}", file.path).into(),
+                        format!("chown failed for {}: {stderr}", file.path).into(),
                     ));
                 }
 
-                // Set permissions.
                 let chmod_cmd = vec![
                     "chmod".to_string(),
                     format!("{:o}", file.mode),
@@ -642,7 +602,7 @@ impl ContainerBackend for AppleContainerBackend {
 // ---------------------------------------------------------------------------
 
 /// Build CLI arguments for `container create` from `CreateContainerOptions`.
-fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<String> {
+fn build_create_args(opts: &CreateContainerOptions) -> Vec<String> {
     let mut args = Vec::new();
 
     // Name
@@ -688,11 +648,6 @@ fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<
         let ro_suffix = if mount.read_only { ":ro" } else { "" };
         args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
     }
-
-    // Staging directory mount for file uploads.
-    let staging_dir = staging_base.join(&opts.name);
-    args.push("--volume".to_string());
-    args.push(format!("{}:/tmp/.cella-staging", staging_dir.display()));
 
     // Port bindings
     for (container_port, forwards) in &opts.port_bindings {
@@ -943,8 +898,7 @@ mod tests {
     #[test]
     fn build_create_args_minimal() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"test-container".to_string()));
@@ -959,8 +913,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.labels
             .insert("dev.cella.tool".to_string(), "cella".to_string());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let label_idx = args.iter().position(|a| a == "--label").unwrap();
         assert_eq!(args[label_idx + 1], "dev.cella.tool=cella");
@@ -971,8 +924,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.env = vec!["FOO=bar".to_string()];
         opts.remote_env = vec!["BAZ=qux".to_string()];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let env_positions: Vec<usize> = args
             .iter()
@@ -988,8 +940,7 @@ mod tests {
     fn build_create_args_with_user() {
         let mut opts = minimal_create_opts();
         opts.user = Some("vscode".to_string());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let user_idx = args.iter().position(|a| a == "-u").unwrap();
         assert_eq!(args[user_idx + 1], "vscode");
@@ -1006,8 +957,7 @@ mod tests {
             read_only: false,
             external: false,
         });
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(args[vol_idx + 1], "/host/project:/workspace");
@@ -1024,8 +974,7 @@ mod tests {
             read_only: true,
             external: false,
         });
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(
@@ -1045,8 +994,7 @@ mod tests {
                 host_port: Some("3000".to_string()),
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "3000:8080/tcp");
@@ -1056,8 +1004,7 @@ mod tests {
     fn build_create_args_with_entrypoint() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(vec!["/bin/sh".to_string(), "-c".to_string()]);
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let ep_idx = args.iter().position(|a| a == "--entrypoint").unwrap();
         assert_eq!(args[ep_idx + 1], "/bin/sh -c");
@@ -1067,8 +1014,7 @@ mod tests {
     fn build_create_args_with_cmd() {
         let mut opts = minimal_create_opts();
         opts.cmd = Some(vec!["sleep".to_string(), "infinity".to_string()]);
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         // Image should be followed by cmd.
         let img_idx = args.iter().position(|a| a == "ubuntu:latest").unwrap();
@@ -1077,24 +1023,14 @@ mod tests {
     }
 
     #[test]
-    fn build_create_args_staging_mount() {
+    fn build_create_args_has_no_staging_mount() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
-        // Should contain a volume mount for the staging directory.
-        let vol_args: Vec<&str> = args
-            .windows(2)
-            .filter_map(|w| {
-                if w[0] == "--volume" {
-                    Some(w[1].as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let staging_mount = vol_args.iter().find(|v| v.contains(".cella-staging"));
-        assert!(staging_mount.is_some(), "expected staging volume mount");
+        assert!(
+            !args.iter().any(|a| a.contains(".cella-staging")),
+            "file uploads use `container cp`; no staging mount expected"
+        );
     }
 
     /// Test helper: a status with the given state and no network attachments.
@@ -1210,16 +1146,6 @@ mod tests {
     }
 
     #[test]
-    fn default_staging_base_contains_cella() {
-        let base = default_staging_base();
-        let base_str = base.to_string_lossy();
-        assert!(
-            base_str.contains("cella"),
-            "staging base should contain 'cella': {base_str}"
-        );
-    }
-
-    #[test]
     fn unsupported_warnings_do_not_panic() {
         let mut opts = minimal_create_opts();
         opts.privileged = true;
@@ -1259,8 +1185,7 @@ mod tests {
                 external: false,
             },
         ];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1293,8 +1218,7 @@ mod tests {
             read_only: true,
             external: false,
         }];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1322,8 +1246,7 @@ mod tests {
                 host_port: Some("8443".to_string()),
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "127.0.0.1:8443:443/tcp");
@@ -1339,8 +1262,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "0.0.0.0::80/tcp");
@@ -1356,8 +1278,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         // When both host_ip and host_port are None, just the container port.
@@ -1380,8 +1301,7 @@ mod tests {
                 },
             ],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         let port_count = args.iter().filter(|a| *a == "-p").count();
         assert_eq!(port_count, 2);
@@ -1391,8 +1311,7 @@ mod tests {
     fn build_create_args_empty_entrypoint_is_skipped() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(Vec::new());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),
@@ -1403,8 +1322,7 @@ mod tests {
     #[test]
     fn build_create_args_none_entrypoint_is_skipped() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),

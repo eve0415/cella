@@ -289,6 +289,33 @@ impl ContainerCli {
         Ok(output.stdout)
     }
 
+    /// Copy a file from the host into a running container.
+    ///
+    /// Wraps `container cp <host_path> <id>:<container_path>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero or cannot be spawned.
+    pub async fn cp_into(
+        &self,
+        host_path: &Path,
+        id: &str,
+        container_path: &str,
+    ) -> Result<(), BackendError> {
+        let args = vec![
+            "cp".to_string(),
+            host_path.to_string_lossy().into_owned(),
+            format!("{id}:{container_path}"),
+        ];
+        let output = run_cli_owned(&self.binary_path, &args).await?;
+        if output.exit_code != 0 {
+            return Err(BackendError::Runtime(
+                format!("container cp to {container_path} failed: {}", output.stderr).into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a named volume.
     ///
     /// # Errors
