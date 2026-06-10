@@ -259,21 +259,8 @@ impl ContainerBackend for AppleContainerBackend {
             let canonical = workspace_root
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
-            let canonical_str = canonical.to_string_lossy();
-
-            let entries = self.cli.list().await?;
-
-            for entry in entries {
-                if let Some(info) = entry_to_container_info(&entry)
-                    && info
-                        .labels
-                        .get("dev.cella.workspace_path")
-                        .is_some_and(|wp| wp == canonical_str.as_ref())
-                {
-                    return Ok(Some(info));
-                }
-            }
-            Ok(None)
+            let label = format!("dev.cella.workspace_path={}", canonical.to_string_lossy());
+            self.find_container_by_label(&label).await
         })
     }
 
@@ -679,11 +666,7 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move {
             Ok(Platform {
                 os: "linux".to_string(),
-                arch: if cfg!(target_arch = "aarch64") {
-                    "arm64".to_string()
-                } else {
-                    "amd64".to_string()
-                },
+                arch: host_oci_arch().to_string(),
             })
         })
     }
@@ -1220,20 +1203,13 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     let config = entry.configuration.as_ref()?;
     let id = config.id.clone()?;
 
-    let state = entry
-        .status
-        .as_ref()
-        .and_then(|s| s.state.as_deref())
-        .map_or_else(
-            || ContainerState::Other("unknown".to_string()),
-            |s| {
-                // Apple Container uses "stopped" rather than Docker's "exited".
-                match s {
-                    "stopped" => ContainerState::Stopped,
-                    other => ContainerState::parse(other),
-                }
-            },
-        );
+    let state = ContainerState::parse(
+        entry
+            .status
+            .as_ref()
+            .and_then(|s| s.state.as_deref())
+            .unwrap_or("unknown"),
+    );
 
     let labels = config.labels.clone().unwrap_or_default();
     let config_hash = labels.get("dev.cella.config_hash").cloned();

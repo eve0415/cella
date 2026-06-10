@@ -63,7 +63,8 @@ impl ContainerState {
     pub fn parse(s: &str) -> Self {
         match s {
             "running" => Self::Running,
-            "exited" | "dead" => Self::Stopped,
+            // Docker reports exited/dead; Apple Container reports stopped.
+            "exited" | "dead" | "stopped" => Self::Stopped,
             "created" => Self::Created,
             "removing" => Self::Removing,
             other => Self::Other(other.to_string()),
@@ -350,6 +351,11 @@ mod tests {
     #[test]
     fn parse_dead() {
         assert_eq!(ContainerState::parse("dead"), ContainerState::Stopped);
+    }
+
+    #[test]
+    fn parse_stopped() {
+        assert_eq!(ContainerState::parse("stopped"), ContainerState::Stopped);
     }
 
     #[test]
