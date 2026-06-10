@@ -162,12 +162,6 @@ fn connect_docker_backend(
 fn connect_apple_container_backend()
 -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
     let cli = cella_container::discovery::discover()?;
-
-    eprintln!(
-        "warning: Apple Container backend is experimental. \
-         Report issues at https://github.com/eve0415/cella/issues"
-    );
-
     Ok(Box::new(cella_container::AppleContainerBackend::new(cli)))
 }
 

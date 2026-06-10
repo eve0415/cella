@@ -34,10 +34,6 @@ pub struct AppleContainerBackend {
 impl AppleContainerBackend {
     /// Create a new backend wrapping the given CLI handle.
     pub fn new(cli: ContainerCli) -> Self {
-        warn!(
-            "Apple Container backend is EXPERIMENTAL — \
-             expect rough edges and missing features"
-        );
         Self {
             cli,
             networks_available: tokio::sync::OnceCell::new(),
