@@ -7,7 +7,7 @@ use std::process::Stdio;
 use cella_backend::{
     BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
-    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding,
+    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding, RunArgsOverrides,
 };
 use tracing::{debug, warn};
 
@@ -642,11 +642,17 @@ fn build_create_args(opts: &CreateContainerOptions) -> Vec<String> {
         args.push(format!("{}:{}{ro_suffix}", wm.source, wm.target));
     }
 
-    // Additional mounts
+    // Additional mounts. Named volumes work through `-v name:target`
+    // natively; tmpfs entries use the dedicated flag.
     for mount in &opts.mounts {
-        args.push("--volume".to_string());
-        let ro_suffix = if mount.read_only { ":ro" } else { "" };
-        args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
+        if mount.mount_type == "tmpfs" {
+            args.push("--tmpfs".to_string());
+            args.push(mount.target.clone());
+        } else {
+            args.push("--volume".to_string());
+            let ro_suffix = if mount.read_only { ":ro" } else { "" };
+            args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
+        }
     }
 
     // Port bindings
@@ -675,6 +681,17 @@ fn build_create_args(opts: &CreateContainerOptions) -> Vec<String> {
         args.push(ep.join(" "));
     }
 
+    // Linux capabilities (supported since Apple Container 0.12.0).
+    for cap in &opts.cap_add {
+        args.push("--cap-add".to_string());
+        args.push(cap.clone());
+    }
+
+    // runArgs overrides with native CLI equivalents.
+    if let Some(ref overrides) = opts.run_args_overrides {
+        push_override_args(&mut args, overrides);
+    }
+
     // SSH agent forwarding
     if std::env::var("SSH_AUTH_SOCK").is_ok() {
         args.push("--ssh".to_string());
@@ -696,16 +713,119 @@ fn build_create_args(opts: &CreateContainerOptions) -> Vec<String> {
     args
 }
 
+/// Append runArgs overrides that have native Apple Container equivalents.
+fn push_override_args(args: &mut Vec<String>, overrides: &RunArgsOverrides) {
+    if let Some(memory) = overrides.memory
+        && memory > 0
+    {
+        args.push("--memory".to_string());
+        args.push(memory.to_string());
+    }
+
+    // Docker counts in nano-CPUs; Apple Container allocates whole vCPUs.
+    if let Some(nano_cpus) = overrides.nano_cpus
+        && let Ok(nano) = u64::try_from(nano_cpus)
+        && nano > 0
+    {
+        args.push("--cpus".to_string());
+        args.push(nano.div_ceil(1_000_000_000).to_string());
+    }
+
+    if let Some(shm_size) = overrides.shm_size
+        && shm_size > 0
+    {
+        args.push("--shm-size".to_string());
+        args.push(shm_size.to_string());
+    }
+
+    if overrides.init == Some(true) {
+        args.push("--init".to_string());
+    }
+
+    for ip in &overrides.dns {
+        args.push("--dns".to_string());
+        args.push(ip.clone());
+    }
+    for domain in &overrides.dns_search {
+        args.push("--dns-search".to_string());
+        args.push(domain.clone());
+    }
+
+    for ulimit in &overrides.ulimits {
+        args.push("--ulimit".to_string());
+        args.push(format!("{}={}:{}", ulimit.name, ulimit.soft, ulimit.hard));
+    }
+
+    for (path, options) in &overrides.tmpfs {
+        if !options.is_empty() {
+            warn!(
+                path,
+                options, "tmpfs mount options are not supported by Apple Container; mounting plain"
+            );
+        }
+        args.push("--tmpfs".to_string());
+        args.push(path.clone());
+    }
+
+    for (key, value) in &overrides.labels {
+        args.push("--label".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    if let Some(ref runtime) = overrides.runtime {
+        args.push("--runtime".to_string());
+        args.push(runtime.clone());
+    }
+}
+
+/// Collect runArgs override flags that Apple Container has no equivalent for.
+fn collect_unsupported_overrides(overrides: &RunArgsOverrides) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+
+    let flags: [(bool, &'static str); 22] = [
+        (overrides.network_mode.is_some(), "--network"),
+        (overrides.hostname.is_some(), "--hostname"),
+        (!overrides.extra_hosts.is_empty(), "--add-host"),
+        (overrides.mac_address.is_some(), "--mac-address"),
+        (overrides.memory_swap.is_some(), "--memory-swap"),
+        (
+            overrides.memory_reservation.is_some(),
+            "--memory-reservation",
+        ),
+        (overrides.cpu_shares.is_some(), "--cpu-shares"),
+        (overrides.cpu_period.is_some(), "--cpu-period"),
+        (overrides.cpu_quota.is_some(), "--cpu-quota"),
+        (overrides.cpuset_cpus.is_some(), "--cpuset-cpus"),
+        (overrides.cpuset_mems.is_some(), "--cpuset-mems"),
+        (overrides.pids_limit.is_some(), "--pids-limit"),
+        (overrides.userns_mode.is_some(), "--userns"),
+        (overrides.cgroup_parent.is_some(), "--cgroup-parent"),
+        (overrides.cgroupns_mode.is_some(), "--cgroupns"),
+        (!overrides.sysctls.is_empty(), "--sysctl"),
+        (overrides.pid_mode.is_some(), "--pid"),
+        (overrides.ipc_mode.is_some(), "--ipc"),
+        (overrides.uts_mode.is_some(), "--uts"),
+        (!overrides.storage_opt.is_empty(), "--storage-opt"),
+        (
+            overrides.log_driver.is_some() || !overrides.log_opt.is_empty(),
+            "--log-driver/--log-opt",
+        ),
+        (overrides.restart_policy.is_some(), "--restart"),
+    ];
+
+    for (present, flag) in flags {
+        if present {
+            ignored.push(flag);
+        }
+    }
+
+    ignored
+}
+
 /// Emit warnings for Docker-specific options that Apple Container does not support.
 fn emit_unsupported_warnings(opts: &CreateContainerOptions) {
     if opts.privileged {
         warn!("--privileged is not supported by Apple Container; ignoring");
-    }
-    if !opts.cap_add.is_empty() {
-        warn!(
-            caps = ?opts.cap_add,
-            "--cap-add is not supported by Apple Container; ignoring"
-        );
     }
     if !opts.security_opt.is_empty() {
         warn!(
@@ -723,6 +843,13 @@ fn emit_unsupported_warnings(opts: &CreateContainerOptions) {
         }
         if overrides.gpus.is_some() {
             warn!("--gpus is not supported by Apple Container; ignoring");
+        }
+        let ignored = collect_unsupported_overrides(overrides);
+        if !ignored.is_empty() {
+            warn!(
+                flags = ?ignored,
+                "runArgs not supported by Apple Container; ignoring"
+            );
         }
         if !overrides.unrecognized.is_empty() {
             warn!(
@@ -1143,6 +1270,143 @@ mod tests {
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn build_create_args_passes_capabilities() {
+        let mut opts = minimal_create_opts();
+        opts.cap_add = vec!["SYS_PTRACE".to_string(), "NET_RAW".to_string()];
+        let args = build_create_args(&opts);
+
+        let cap_values: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--cap-add")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(cap_values, vec!["SYS_PTRACE", "NET_RAW"]);
+    }
+
+    #[test]
+    fn push_override_args_maps_resources() {
+        let overrides = RunArgsOverrides {
+            memory: Some(2_147_483_648),
+            nano_cpus: Some(1_500_000_000),
+            shm_size: Some(67_108_864),
+            init: Some(true),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--memory", "2147483648")));
+        // 1.5 CPUs rounds up to 2 whole vCPUs.
+        assert!(pairs.contains(&("--cpus", "2")));
+        assert!(pairs.contains(&("--shm-size", "67108864")));
+        assert!(args.contains(&"--init".to_string()));
+    }
+
+    #[test]
+    fn push_override_args_maps_dns_and_ulimits() {
+        let overrides = RunArgsOverrides {
+            dns: vec!["1.1.1.1".to_string()],
+            dns_search: vec!["internal.example".to_string()],
+            ulimits: vec![cella_backend::UlimitSpec {
+                name: "nofile".to_string(),
+                soft: 1024,
+                hard: 4096,
+            }],
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--dns", "1.1.1.1")));
+        assert!(pairs.contains(&("--dns-search", "internal.example")));
+        assert!(pairs.contains(&("--ulimit", "nofile=1024:4096")));
+    }
+
+    #[test]
+    fn push_override_args_maps_tmpfs_labels_runtime() {
+        let overrides = RunArgsOverrides {
+            tmpfs: HashMap::from([("/scratch".to_string(), String::new())]),
+            labels: HashMap::from([("from.runargs".to_string(), "yes".to_string())]),
+            runtime: Some("container-runtime-linux".to_string()),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--tmpfs", "/scratch")));
+        assert!(pairs.contains(&("--label", "from.runargs=yes")));
+        assert!(pairs.contains(&("--runtime", "container-runtime-linux")));
+    }
+
+    #[test]
+    fn push_override_args_skips_non_positive_resources() {
+        let overrides = RunArgsOverrides {
+            memory: Some(0),
+            nano_cpus: Some(-1),
+            shm_size: Some(0),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+        assert!(args.is_empty(), "non-positive resources must be skipped");
+    }
+
+    #[test]
+    fn build_create_args_tmpfs_mount_config() {
+        let mut opts = minimal_create_opts();
+        opts.mounts = vec![MountConfig {
+            mount_type: "tmpfs".to_string(),
+            source: String::new(),
+            target: "/run/scratch".to_string(),
+            consistency: None,
+            read_only: false,
+            external: false,
+        }];
+        let args = build_create_args(&opts);
+
+        let mut pairs = args.windows(2).map(|w| (w[0].as_str(), w[1].as_str()));
+        assert!(pairs.any(|p| p == ("--tmpfs", "/run/scratch")));
+        assert!(
+            !args.iter().any(|a| a.starts_with(":/run/scratch")),
+            "tmpfs must not be emitted as an empty-source volume"
+        );
+    }
+
+    #[test]
+    fn collect_unsupported_overrides_lists_flags() {
+        let overrides = RunArgsOverrides {
+            network_mode: Some("host".to_string()),
+            hostname: Some("custom".to_string()),
+            sysctls: HashMap::from([("net.core.somaxconn".to_string(), "1024".to_string())]),
+            restart_policy: Some("always".to_string()),
+            ..RunArgsOverrides::default()
+        };
+        let ignored = collect_unsupported_overrides(&overrides);
+        assert!(ignored.contains(&"--network"));
+        assert!(ignored.contains(&"--hostname"));
+        assert!(ignored.contains(&"--sysctl"));
+        assert!(ignored.contains(&"--restart"));
+        assert_eq!(ignored.len(), 4);
+    }
+
+    #[test]
+    fn collect_unsupported_overrides_empty_for_default() {
+        assert!(collect_unsupported_overrides(&RunArgsOverrides::default()).is_empty());
     }
 
     #[test]
