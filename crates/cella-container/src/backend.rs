@@ -269,6 +269,17 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
+            // The image is the only argv token not anchored to a flag, so a
+            // leading dash would be parsed as an option. A `--` separator is
+            // no defense: the CLI's passthrough arguments capture it as a
+            // literal (swift-argument-parser captureForPassthrough). Valid
+            // OCI references never start with `-`, so reject instead.
+            if opts.image.starts_with('-') {
+                return Err(BackendError::Runtime(
+                    format!("invalid image reference '{}'", opts.image).into(),
+                ));
+            }
+
             // Network attachments are fixed at creation, so the shared and
             // per-workspace networks must exist (and be requested) up front.
             let networks = self.prepare_create_networks(opts).await;
@@ -1702,6 +1713,22 @@ mod tests {
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_container_rejects_dash_prefixed_image() {
+        let backend = AppleContainerBackend::new(ContainerCli::new(
+            std::path::PathBuf::from("/nonexistent/container"),
+            "1.0.0".to_string(),
+        ));
+        let mut opts = minimal_create_opts();
+        opts.image = "--volume=/:/host".to_string();
+
+        let err = backend.create_container(&opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid image reference"),
+            "got: {err}"
+        );
     }
 
     #[test]
