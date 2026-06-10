@@ -35,21 +35,18 @@ pub struct ContainerStatus {
 }
 
 /// A live network attachment on a running container.
+///
+/// The CLI also reports `hostname`, `ipv4Gateway`, `macAddress`, and `mtu`;
+/// add fields when a consumer appears.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkAttachment {
     /// Name of the attached network (e.g. `"default"`).
     #[serde(default)]
     pub network: Option<String>,
-    /// Hostname assigned to the container on this network.
-    #[serde(default)]
-    pub hostname: Option<String>,
     /// Interface address in CIDR form (e.g. `"192.168.64.2/24"`).
     #[serde(default)]
     pub ipv4_address: Option<String>,
-    /// Gateway address (e.g. `"192.168.64.1"`).
-    #[serde(default)]
-    pub ipv4_gateway: Option<String>,
 }
 
 impl NetworkAttachment {
@@ -114,6 +111,9 @@ pub struct PublishedPort {
 }
 
 /// A mount/volume attached to the container.
+///
+/// The CLI also reports mount `options` (e.g. `["ro"]`); surface them when
+/// `MountInfo` grows a read-only field.
 #[derive(Debug, Deserialize)]
 pub struct MountEntry {
     #[serde(default)]
@@ -124,9 +124,6 @@ pub struct MountEntry {
     /// externally-tagged object (e.g. `{"virtiofs": {}}`).
     #[serde(default, rename = "type")]
     pub fs_type: Option<FilesystemType>,
-    /// Mount options (e.g. `["ro"]`).
-    #[serde(default)]
-    pub options: Vec<String>,
 }
 
 /// Filesystem attachment type for a mount.
@@ -187,6 +184,9 @@ pub struct NetworkListEntry {
 }
 
 /// Persistent configuration of a network.
+///
+/// The CLI also reports `creationDate` as a numeric Swift reference-date
+/// value; parse it when a consumer needs RFC 3339 timestamps.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkConfiguration {
@@ -194,9 +194,6 @@ pub struct NetworkConfiguration {
     pub name: Option<String>,
     #[serde(default)]
     pub labels: Option<HashMap<String, String>>,
-    /// Creation timestamp as emitted by the CLI.
-    #[serde(default)]
-    pub creation_date: Option<serde_json::Value>,
 }
 
 impl NetworkListEntry {
@@ -286,10 +283,6 @@ mod tests {
         assert_eq!(status.state.as_deref(), Some("running"));
         assert_eq!(status.networks.len(), 1);
         assert_eq!(status.networks[0].ipv4(), Some("192.168.64.2"));
-        assert_eq!(
-            status.networks[0].ipv4_gateway.as_deref(),
-            Some("192.168.64.1")
-        );
 
         let config = entry.configuration.unwrap();
         assert_eq!(config.id.as_deref(), Some("abc123"));
@@ -356,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_mount_with_ro_option() {
+    fn deserialize_mount_ignores_unmapped_keys() {
         let json = r#"{
             "type": { "virtiofs": {} },
             "source": "/h",
@@ -364,7 +357,7 @@ mod tests {
             "options": ["ro"]
         }"#;
         let mount: MountEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(mount.options, vec!["ro"]);
+        assert_eq!(mount.source.as_deref(), Some("/h"));
     }
 
     #[test]

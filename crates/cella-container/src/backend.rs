@@ -1597,9 +1597,7 @@ mod tests {
         let mut status = test_status("running");
         status.networks = vec![crate::sdk::types::NetworkAttachment {
             network: Some("cella-net-abc".to_string()),
-            hostname: None,
             ipv4_address: Some("192.168.65.2/24".to_string()),
-            ipv4_gateway: None,
         }];
         let entry = ContainerListEntry {
             status: Some(status),
@@ -2147,7 +2145,6 @@ mod tests {
                 source: Some("/host".to_string()),
                 destination: Some("/container".to_string()),
                 fs_type: Some(FilesystemType::Virtiofs(serde_json::Value::Null)),
-                options: Vec::new(),
             },
             crate::sdk::types::MountEntry {
                 source: Some("/var/lib/volumes/data".to_string()),
@@ -2155,7 +2152,6 @@ mod tests {
                 fs_type: Some(FilesystemType::Volume {
                     name: Some("data".to_string()),
                 }),
-                options: Vec::new(),
             },
         ]);
         let entry = ContainerListEntry {
@@ -2234,7 +2230,6 @@ mod tests {
             source: None,
             destination: None,
             fs_type: None,
-            options: Vec::new(),
         }]);
         let entry = ContainerListEntry {
             status: None,

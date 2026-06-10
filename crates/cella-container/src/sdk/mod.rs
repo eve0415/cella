@@ -316,19 +316,6 @@ impl ContainerCli {
         Ok(())
     }
 
-    /// Create a named volume.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the CLI exits non-zero or cannot be spawned.
-    pub async fn volume_create(&self, name: &str) -> Result<(), BackendError> {
-        let output = run_cli(&self.binary_path, &["volume", "create", name]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
-        Ok(())
-    }
-
     // -- Network operations (macOS 26+) --
 
     /// Create a network with the given labels.
@@ -770,22 +757,6 @@ mod tests {
             matches!(err, BackendError::ImageNotFound { .. }),
             "expected ImageNotFound, got: {err:?}"
         );
-    }
-
-    // -- volume_create --------------------------------------------------------
-
-    #[tokio::test]
-    async fn volume_create_succeeds_with_echo() {
-        let cli = echo_cli();
-        let result = cli.volume_create("my-volume").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn volume_create_error_on_nonzero_exit() {
-        let cli = cli_from(&mock_scripts().fail);
-        let result = cli.volume_create("my-volume").await;
-        assert!(result.is_err());
     }
 
     // -- nonexistent binary ---------------------------------------------------
