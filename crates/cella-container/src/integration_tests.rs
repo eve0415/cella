@@ -549,20 +549,29 @@ async fn test_remove_nonexistent_container() {
 }
 
 #[cella_testing::runtime_test(apple_container, flavor = "multi_thread")]
-async fn test_workspace_folder_label_set() {
+async fn test_labels_roundtrip_through_inspect() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("wslabel");
     let mut guard = ContainerGuard::new(cli_path);
 
+    // The backend emits exactly the labels it is given (the orchestrator is
+    // what adds dev.cella.workspace_folder and friends).
     let mut opts = minimal_create_opts(&name);
     opts.labels
         .insert("dev.cella.tool".to_string(), "cella".to_string());
+    opts.labels.insert(
+        "dev.cella.workspace_folder".to_string(),
+        "/workspace".to_string(),
+    );
 
     let id = backend.create_container(&opts).await.unwrap();
     guard.set_id(id.clone());
 
     let info = backend.inspect_container(&id).await.unwrap();
-    // workspace_folder from create opts should be reflected
+    assert_eq!(
+        info.labels.get("dev.cella.tool").map(String::as_str),
+        Some("cella"),
+    );
     assert_eq!(
         info.labels
             .get("dev.cella.workspace_folder")
