@@ -5,8 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use cella_backend::network::{
-    CELLA_NETWORK_NAME, MANAGED_LABEL, MANAGED_VALUE, REPO_LABEL, repo_network_name,
-    workspace_network_name,
+    CELLA_NETWORK_NAME, MANAGED_LABEL, MANAGED_VALUE, REPO_LABEL, workspace_network_name,
 };
 use cella_backend::{
     BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
@@ -40,25 +39,45 @@ impl AppleContainerBackend {
         }
     }
 
-    /// Whether the network subcommands are usable (they only exist on
-    /// macOS 26+; on macOS 15 every invocation fails).
-    async fn networks_available(&self) -> bool {
-        *self
-            .networks_available
-            .get_or_init(|| async {
-                match self.cli.network_list().await {
-                    Ok(_) => true,
-                    Err(e) => {
-                        debug!(
-                            error = %e,
-                            "network commands unavailable (requires macOS 26+); \
-                             continuing without network integration"
-                        );
-                        false
-                    }
-                }
-            })
-            .await
+    /// Fetch the network list, lazily resolving whether the network
+    /// subcommands exist on this host (they require macOS 26+; on macOS 15
+    /// every invocation fails).
+    ///
+    /// `Ok(None)` means the commands are unavailable — that verdict is
+    /// cached for the process lifetime. Once availability has been
+    /// established, later failures propagate as `Err` instead of silently
+    /// flipping the backend into no-network mode.
+    async fn network_list_if_available(
+        &self,
+    ) -> Result<Option<Vec<crate::sdk::types::NetworkListEntry>>, BackendError> {
+        if self.networks_available.get() == Some(&false) {
+            return Ok(None);
+        }
+        match self.cli.network_list().await {
+            Ok(list) => {
+                let _ = self.networks_available.set(true);
+                Ok(Some(list))
+            }
+            Err(e) if self.networks_available.get() == Some(&true) => Err(e),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Apple Container network commands unavailable (requires macOS 26+); \
+                     continuing without network integration"
+                );
+                let _ = self.networks_available.set(false);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Whether the network subcommands are usable, without consuming the
+    /// fetched list.
+    async fn networks_available(&self) -> Result<bool, BackendError> {
+        if let Some(available) = self.networks_available.get() {
+            return Ok(*available);
+        }
+        Ok(self.network_list_if_available().await?.is_some())
     }
 
     /// Exec a command as root inside the container, mapping a non-zero exit
@@ -81,19 +100,20 @@ impl AppleContainerBackend {
         Ok(())
     }
 
-    /// Check whether a network with the given name exists.
+    /// Check whether a network with the given name exists (fresh fetch).
     async fn named_network_exists(&self, name: &str) -> Result<bool, BackendError> {
         let networks = self.cli.network_list().await?;
         Ok(networks.iter().any(|n| n.name() == Some(name)))
     }
 
-    /// Create `name` with `labels` unless it already exists.
+    /// Create `name` with `labels` unless it appears in `existing`.
     async fn ensure_named_network(
         &self,
         name: &str,
         labels: &[(&str, &str)],
+        existing: &[crate::sdk::types::NetworkListEntry],
     ) -> Result<(), BackendError> {
-        if self.named_network_exists(name).await? {
+        if existing.iter().any(|n| n.name() == Some(name)) {
             return Ok(());
         }
         match self.cli.network_create(name, labels).await {
@@ -113,17 +133,23 @@ impl AppleContainerBackend {
     /// attachment names for `container create`.
     ///
     /// Apple Container fixes network attachments at creation, so this runs
-    /// before every create. Network trouble degrades to fewer (or no)
+    /// before every create. One `network ls` answers availability and both
+    /// existence checks. Network trouble degrades to fewer (or no)
     /// attachments rather than failing container creation.
     async fn prepare_create_networks(&self, opts: &CreateContainerOptions) -> Vec<String> {
-        if !self.networks_available().await {
-            return Vec::new();
-        }
+        let existing = match self.network_list_if_available().await {
+            Ok(Some(list)) => list,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                warn!(error = %e, "could not list networks; creating container without them");
+                return Vec::new();
+            }
+        };
 
         let mut networks = Vec::new();
 
         match self
-            .ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS)
+            .ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS, &existing)
             .await
         {
             Ok(()) => networks.push(CELLA_NETWORK_NAME.to_string()),
@@ -133,16 +159,14 @@ impl AppleContainerBackend {
             ),
         }
 
-        // The workspace label is canonicalized when labels are built, so the
-        // derived name matches what down/prune compute later.
+        // The workspace label is canonicalized when labels are built;
+        // workspace_network_name re-canonicalizes (idempotently) so the
+        // derived name always matches what down/prune compute later.
         if let Some(workspace) = opts.labels.get("dev.cella.workspace_path") {
-            let name = repo_network_name(Path::new(workspace));
-            let labels = [
-                NETWORK_BASE_LABELS[0],
-                NETWORK_BASE_LABELS[1],
-                (REPO_LABEL, workspace.as_str()),
-            ];
-            match self.ensure_named_network(&name, &labels).await {
+            let name = workspace_network_name(Path::new(workspace));
+            let mut labels = NETWORK_BASE_LABELS.to_vec();
+            labels.push((REPO_LABEL, workspace.as_str()));
+            match self.ensure_named_network(&name, &labels, &existing).await {
                 Ok(()) => networks.push(name),
                 Err(e) => warn!(
                     error = %e,
@@ -700,10 +724,10 @@ impl ContainerBackend for AppleContainerBackend {
 
     fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
-            if !self.networks_available().await {
+            let Some(existing) = self.network_list_if_available().await? else {
                 return Err(network_unavailable("ensure_network"));
-            }
-            self.ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS)
+            };
+            self.ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS, &existing)
                 .await
         })
     }
@@ -714,7 +738,7 @@ impl ContainerBackend for AppleContainerBackend {
         repo_path: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            if !self.networks_available().await {
+            if !self.networks_available().await? {
                 return Err(network_unavailable("ensure_container_network"));
             }
 
@@ -775,21 +799,15 @@ impl ContainerBackend for AppleContainerBackend {
 
     fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
         Box::pin(async move {
-            if !self.networks_available().await {
+            let Some(networks) = self.network_list_if_available().await? else {
                 return Err(network_unavailable("list_managed_networks"));
-            }
-
-            let networks = self.cli.network_list().await?;
+            };
             let containers = self.cli.list().await?;
 
             let mut out = Vec::new();
             for net in &networks {
                 let Some(name) = net.name() else { continue };
-                let labels = net
-                    .configuration
-                    .as_ref()
-                    .and_then(|c| c.labels.clone())
-                    .unwrap_or_default();
+                let labels = net.labels();
                 if labels.get(MANAGED_LABEL).map(String::as_str) != Some(MANAGED_VALUE) {
                     continue;
                 }
@@ -798,17 +816,14 @@ impl ContainerBackend for AppleContainerBackend {
                     .iter()
                     .filter(|c| entry_attached_to_network(c, name))
                     .count();
-                let created_at = net
-                    .configuration
-                    .as_ref()
-                    .and_then(|c| c.creation_date.as_ref())
-                    .and_then(|v| v.as_str().map(String::from));
 
                 out.push(ManagedNetwork {
                     name: name.to_string(),
                     repo_path: labels.get(REPO_LABEL).cloned(),
+                    // The CLI emits creation dates as numeric Swift
+                    // reference-date values; not surfaced as RFC 3339.
+                    created_at: None,
                     container_count,
-                    created_at,
                     labels,
                 });
             }
@@ -821,22 +836,20 @@ impl ContainerBackend for AppleContainerBackend {
         name: &'a str,
     ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
         Box::pin(async move {
-            if !self.networks_available().await {
+            let Some(networks) = self.network_list_if_available().await? else {
                 return Err(network_unavailable("remove_network_if_orphan"));
-            }
-
-            let networks = self.cli.network_list().await?;
+            };
             let Some(net) = networks.iter().find(|n| n.name() == Some(name)) else {
                 return Ok(RemovalOutcome::NotFound);
             };
 
-            let labels = net
-                .configuration
-                .as_ref()
-                .and_then(|c| c.labels.clone())
-                .unwrap_or_default();
+            let labels = net.labels();
             let managed = labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_VALUE);
 
+            // Counting configured attachments includes stopped containers
+            // deliberately: attachments are fixed at creation, so deleting a
+            // network out from under a stopped container would break its
+            // next start (unlike Docker, which can reconnect).
             let containers = self.cli.list().await?;
             let container_count = containers
                 .iter()
@@ -854,7 +867,9 @@ impl ContainerBackend for AppleContainerBackend {
             match self.cli.network_delete(name).await {
                 Ok(()) => Ok(RemovalOutcome::Removed),
                 // Removed by a concurrent caller between list and delete.
-                Err(e) if e.to_string().contains("not found") => Ok(RemovalOutcome::NotFound),
+                Err(e) if e.to_string().to_lowercase().contains("not found") => {
+                    Ok(RemovalOutcome::NotFound)
+                }
                 Err(e) => Err(e),
             }
         })
@@ -875,10 +890,10 @@ impl ContainerBackend for AppleContainerBackend {
         network_name: &'a str,
     ) -> BoxFuture<'a, Result<bool, BackendError>> {
         Box::pin(async move {
-            if !self.networks_available().await {
+            let Some(networks) = self.network_list_if_available().await? else {
                 return Err(network_unavailable("network_exists"));
-            }
-            self.named_network_exists(network_name).await
+            };
+            Ok(networks.iter().any(|n| n.name() == Some(network_name)))
         })
     }
 

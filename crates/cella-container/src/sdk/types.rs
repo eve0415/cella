@@ -209,6 +209,15 @@ impl NetworkListEntry {
             .and_then(|c| c.name.as_deref())
             .or(self.id.as_deref())
     }
+
+    /// The network's labels (empty when absent).
+    #[must_use]
+    pub fn labels(&self) -> HashMap<String, String> {
+        self.configuration
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// A single entry from `container system version --format json` (returns an
