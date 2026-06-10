@@ -45,7 +45,7 @@ pub async fn ensure_network(docker: &Docker) -> Result<(), CellaDockerError> {
         labels: Some(
             [
                 ("dev.cella.tool".to_string(), "cella".to_string()),
-                ("dev.cella.managed".to_string(), "true".to_string()),
+                (MANAGED_LABEL.to_string(), MANAGED_VALUE.to_string()),
             ]
             .into_iter()
             .collect(),

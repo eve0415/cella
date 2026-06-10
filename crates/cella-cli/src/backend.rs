@@ -128,16 +128,13 @@ async fn auto_detect(
     match connect_apple_container_backend() {
         Ok(client) => return Ok(client),
         Err(e) => {
+            use cella_container::discovery::DiscoveryError;
             // An installed-but-outdated CLI deserves a visible hint even in
             // auto-detect, where other fallback failures stay silent.
-            if e.downcast_ref::<cella_container::discovery::DiscoveryError>()
-                .is_some_and(|d| {
-                    matches!(
-                        d,
-                        cella_container::discovery::DiscoveryError::UnsupportedVersion { .. }
-                    )
-                })
-            {
+            if matches!(
+                e.downcast_ref::<DiscoveryError>(),
+                Some(DiscoveryError::UnsupportedVersion { .. })
+            ) {
                 eprintln!("warning: {e}");
             }
         }

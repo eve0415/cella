@@ -580,16 +580,22 @@ async fn test_labels_roundtrip_through_inspect() {
     );
 }
 
+/// Ensure the shared cella network, returning `false` to skip the test on
+/// hosts without network commands (macOS 15 reports `NotSupported`).
+async fn ensure_network_or_skip(backend: &AppleContainerBackend) -> bool {
+    match backend.ensure_network().await {
+        Ok(()) => true,
+        Err(cella_backend::BackendError::NotSupported { .. }) => false,
+        Err(e) => panic!("ensure_network failed: {e}"),
+    }
+}
+
 #[cella_testing::runtime_test(apple_container, flavor = "multi_thread")]
 async fn test_network_ensure_and_exists() {
     let (backend, _cli_path) = setup_backend();
 
-    // Network commands need macOS 26+; skip quietly on older hosts where
-    // the backend reports NotSupported.
-    match backend.ensure_network().await {
-        Ok(()) => {}
-        Err(cella_backend::BackendError::NotSupported { .. }) => return,
-        Err(e) => panic!("ensure_network failed: {e}"),
+    if !ensure_network_or_skip(&backend).await {
+        return;
     }
 
     assert!(
@@ -608,10 +614,8 @@ async fn test_network_ensure_and_exists() {
 async fn test_container_attaches_to_networks_and_reports_ip() {
     let (backend, cli_path) = setup_backend();
 
-    match backend.ensure_network().await {
-        Ok(()) => {}
-        Err(cella_backend::BackendError::NotSupported { .. }) => return,
-        Err(e) => panic!("ensure_network failed: {e}"),
+    if !ensure_network_or_skip(&backend).await {
+        return;
     }
 
     let name = test_container_name("netattach");
