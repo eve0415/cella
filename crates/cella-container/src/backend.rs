@@ -476,9 +476,13 @@ impl ContainerBackend for AppleContainerBackend {
                 extra_args.push("--target".to_string());
                 extra_args.push(target.clone());
             }
-            for cache in &opts.cache_from {
-                extra_args.push("--cache-from".to_string());
-                extra_args.push(cache.clone());
+            // `container build` has no --cache-from; passing it would abort
+            // the build with an unknown-option error.
+            if !opts.cache_from.is_empty() {
+                warn!(
+                    images = ?opts.cache_from,
+                    "cacheFrom is not supported by Apple Container builds; ignoring"
+                );
             }
             for opt in &opts.options {
                 extra_args.push(opt.clone());
