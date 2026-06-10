@@ -125,8 +125,19 @@ async fn auto_detect(
 
     // Apple Container is lowest priority fallback (macOS only)
     #[cfg(target_os = "macos")]
-    if let Ok(client) = connect_apple_container_backend() {
-        return Ok(client);
+    match connect_apple_container_backend() {
+        Ok(client) => return Ok(client),
+        Err(e) => {
+            use cella_container::discovery::DiscoveryError;
+            // An installed-but-outdated CLI deserves a visible hint even in
+            // auto-detect, where other fallback failures stay silent.
+            if matches!(
+                e.downcast_ref::<DiscoveryError>(),
+                Some(DiscoveryError::UnsupportedVersion { .. })
+            ) {
+                eprintln!("warning: {e}");
+            }
+        }
     }
 
     Err(
@@ -147,14 +158,7 @@ fn connect_docker_backend(
 #[cfg(target_os = "macos")]
 fn connect_apple_container_backend()
 -> Result<Box<dyn ContainerBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    let cli = cella_container::discovery::discover()
-        .ok_or("Apple Container CLI not found. Install from https://github.com/apple/container")?;
-
-    eprintln!(
-        "warning: Apple Container backend is experimental. \
-         Report issues at https://github.com/eve0415/cella/issues"
-    );
-
+    let cli = cella_container::discovery::discover()?;
     Ok(Box::new(cella_container::AppleContainerBackend::new(cli)))
 }
 

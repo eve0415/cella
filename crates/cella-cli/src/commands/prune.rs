@@ -239,7 +239,20 @@ impl PruneArgs {
 
     async fn execute_networks_sweep(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.backend.resolve_client().await?;
-        let all = client.list_managed_networks().await?;
+        let all = match client.list_managed_networks().await {
+            Ok(networks) => networks,
+            // e.g. Apple Container on macOS 15, where the network commands
+            // don't exist — nothing to sweep rather than a hard failure.
+            Err(cella_backend::BackendError::NotSupported { .. }) => {
+                if self.is_json() {
+                    print_networks_json_result(&[], &[], &[]);
+                } else {
+                    eprintln!("Network management is not supported by this backend.");
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let orphans: Vec<ManagedNetwork> =
             all.into_iter().filter(|n| n.container_count == 0).collect();
 

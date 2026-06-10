@@ -45,7 +45,7 @@ pub struct ResolvedSshProxy {
 ///
 /// `host_gateway` is the hostname the container uses to reach the daemon
 /// — typically `host.docker.internal` (Docker Desktop, `OrbStack`, recent
-/// colima) or `host.local` (Apple Container).
+/// colima) or `host.container.internal` (Apple Container).
 pub async fn register_proxy(
     daemon_socket: &Path,
     workspace: &Path,

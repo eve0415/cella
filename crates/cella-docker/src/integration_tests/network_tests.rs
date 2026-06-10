@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use bollard::Docker;
 use cella_backend::RemovalOutcome;
 
-use crate::network::{
-    list_managed_networks, remove_network_if_orphan, repo_network_name, workspace_network_name,
-};
+use crate::network::{list_managed_networks, remove_network_if_orphan};
 
 /// Create a bridge network with the given labels. Returns the network name.
 async fn create_test_network(
@@ -162,22 +160,6 @@ async fn list_managed_networks_filters_by_label() {
     force_remove(&docker, &unlabeled).await;
 }
 
-/// `workspace_network_name` matches `repo_network_name` for the same
-/// canonicalized path — the contract `cella down --rm` relies on to
-/// find the network it's trying to remove.
-#[tokio::test]
-async fn workspace_network_name_matches_repo_network_name_for_real_path() {
-    let tmpdir =
-        std::env::temp_dir().join(format!("cella-integration-wsroot-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmpdir);
-    let canonical = tmpdir.canonicalize().expect("canonicalize tmpdir");
-
-    let via_workspace = workspace_network_name(&tmpdir);
-    let via_repo = repo_network_name(&canonical);
-    assert_eq!(
-        via_workspace, via_repo,
-        "workspace_network_name should canonicalize then hash"
-    );
-
-    let _ = std::fs::remove_dir_all(&tmpdir);
-}
+// The canonicalize-then-hash naming contract is covered by
+// `workspace_network_name_canonicalizes_then_hashes` in
+// cella-backend::network, next to the implementation.

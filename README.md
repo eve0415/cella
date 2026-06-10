@@ -89,7 +89,7 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 | `waitFor` | Return after specified lifecycle phase | No |
 | Config validation | Source-positioned diagnostics | Basic |
 | Docker Compose | Yes | Yes |
-| Container backends | Docker, Apple Container (experimental), Colima (experimental) | Docker, Podman |
+| Container backends | Docker, Apple Container, Colima (experimental) | Docker, Podman |
 | Podman | Not yet | Yes |
 | Editor requirement | None (any terminal) | VS Code for full feature set |
 
@@ -165,12 +165,9 @@ The [Dev Container specification](https://containers.dev/) ([spec repo](https://
 
 - [x] Docker Engine
 - [x] OrbStack
+- [x] Apple Container (1.0.0+, Apple Silicon — no Compose, no managed agent; networks need macOS 26)
 - [x] Colima / Lima (experimental — reverse tunnel port forwarding)
 - [ ] Podman
-
-### Experimental Backends
-
-- [x] Apple Container (macOS 26+, Apple Silicon only — pre-1.0 CLI, no Compose support)
 
 ### Planned
 

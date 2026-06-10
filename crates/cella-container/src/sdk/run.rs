@@ -63,6 +63,33 @@ pub async fn run_cli_owned(binary: &Path, args: &[String]) -> Result<CommandOutp
     run_cli(binary, &refs).await
 }
 
+/// Run the CLI, mapping a non-zero exit to `BackendError::Runtime` carrying
+/// the stderr output.
+///
+/// # Errors
+///
+/// Returns an error if the CLI exits non-zero or cannot be spawned.
+pub async fn run_cli_checked(binary: &Path, args: &[&str]) -> Result<CommandOutput, BackendError> {
+    let output = run_cli(binary, args).await?;
+    if output.exit_code != 0 {
+        return Err(BackendError::Runtime(output.stderr.into()));
+    }
+    Ok(output)
+}
+
+/// Owned-args version of [`run_cli_checked`].
+///
+/// # Errors
+///
+/// Returns an error if the CLI exits non-zero or cannot be spawned.
+pub async fn run_cli_checked_owned(
+    binary: &Path,
+    args: &[String],
+) -> Result<CommandOutput, BackendError> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cli_checked(binary, &refs).await
+}
+
 /// Run the CLI and parse the JSON stdout into `T`.
 ///
 /// # Errors
@@ -73,10 +100,7 @@ pub async fn run_cli_json<T: serde::de::DeserializeOwned>(
     binary: &Path,
     args: &[&str],
 ) -> Result<T, BackendError> {
-    let output = run_cli(binary, args).await?;
-    if output.exit_code != 0 {
-        return Err(BackendError::Runtime(output.stderr.into()));
-    }
+    let output = run_cli_checked(binary, args).await?;
     serde_json::from_str(&output.stdout).map_err(|e| BackendError::Runtime(Box::new(e)))
 }
 

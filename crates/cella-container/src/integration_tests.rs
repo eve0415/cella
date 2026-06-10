@@ -549,24 +549,115 @@ async fn test_remove_nonexistent_container() {
 }
 
 #[cella_testing::runtime_test(apple_container, flavor = "multi_thread")]
-async fn test_workspace_folder_label_set() {
+async fn test_labels_roundtrip_through_inspect() {
     let (backend, cli_path) = setup_backend();
     let name = test_container_name("wslabel");
     let mut guard = ContainerGuard::new(cli_path);
 
+    // The backend emits exactly the labels it is given (the orchestrator is
+    // what adds dev.cella.workspace_folder and friends).
     let mut opts = minimal_create_opts(&name);
     opts.labels
         .insert("dev.cella.tool".to_string(), "cella".to_string());
+    opts.labels.insert(
+        "dev.cella.workspace_folder".to_string(),
+        "/workspace".to_string(),
+    );
 
     let id = backend.create_container(&opts).await.unwrap();
     guard.set_id(id.clone());
 
     let info = backend.inspect_container(&id).await.unwrap();
-    // workspace_folder from create opts should be reflected
+    assert_eq!(
+        info.labels.get("dev.cella.tool").map(String::as_str),
+        Some("cella"),
+    );
     assert_eq!(
         info.labels
             .get("dev.cella.workspace_folder")
             .map(String::as_str),
         Some("/workspace"),
     );
+}
+
+/// Ensure the shared cella network, returning `false` to skip the test on
+/// hosts without network commands (macOS 15 reports `NotSupported`).
+async fn ensure_network_or_skip(backend: &AppleContainerBackend) -> bool {
+    match backend.ensure_network().await {
+        Ok(()) => true,
+        Err(cella_backend::BackendError::NotSupported { .. }) => false,
+        Err(e) => panic!("ensure_network failed: {e}"),
+    }
+}
+
+#[cella_testing::runtime_test(apple_container, flavor = "multi_thread")]
+async fn test_network_ensure_and_exists() {
+    let (backend, _cli_path) = setup_backend();
+
+    if !ensure_network_or_skip(&backend).await {
+        return;
+    }
+
+    assert!(
+        backend.network_exists("cella").await.unwrap(),
+        "cella network should exist after ensure_network"
+    );
+
+    let managed = backend.list_managed_networks().await.unwrap();
+    assert!(
+        managed.iter().any(|n| n.name == "cella"),
+        "cella network should be listed as managed: {managed:?}"
+    );
+}
+
+#[cella_testing::runtime_test(apple_container, flavor = "multi_thread")]
+async fn test_container_attaches_to_networks_and_reports_ip() {
+    let (backend, cli_path) = setup_backend();
+
+    if !ensure_network_or_skip(&backend).await {
+        return;
+    }
+
+    let name = test_container_name("netattach");
+    let mut guard = ContainerGuard::new(cli_path);
+    let workspace = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let canonical = workspace.canonicalize().unwrap();
+
+    backend.pull_image(TEST_IMAGE).await.unwrap();
+
+    let mut opts = minimal_create_opts(&name);
+    opts.labels
+        .insert("dev.cella.tool".to_string(), "cella".to_string());
+    opts.labels.insert(
+        "dev.cella.workspace_path".to_string(),
+        canonical.to_string_lossy().to_string(),
+    );
+
+    let id = backend.create_container(&opts).await.unwrap();
+    guard.set_id(id.clone());
+    backend.start_container(&id).await.unwrap();
+
+    // The create-time attachments must satisfy ensure_container_network.
+    backend
+        .ensure_container_network(&id, &canonical)
+        .await
+        .unwrap();
+
+    let ip = backend.get_container_ip(&id).await.unwrap();
+    assert!(ip.is_some(), "running container should report an IPv4");
+
+    // Workspace network must not be removable while the container uses it.
+    let outcome = backend.remove_workspace_network(&canonical).await.unwrap();
+    assert_eq!(outcome, cella_backend::RemovalOutcome::SkippedInUse);
+
+    backend.stop_container(&id).await.unwrap();
+    backend.remove_container(&id, false).await.unwrap();
+    guard.container_id = None;
+
+    // After removal the workspace network is an orphan and gets cleaned up.
+    let outcome = backend.remove_workspace_network(&canonical).await.unwrap();
+    assert_eq!(outcome, cella_backend::RemovalOutcome::Removed);
+
+    std::fs::remove_dir_all(&workspace).ok();
 }

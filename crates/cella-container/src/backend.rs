@@ -1,65 +1,236 @@
 //! `ContainerBackend` implementation for the Apple Container runtime.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
+use cella_backend::network::{
+    CELLA_NETWORK_NAME, MANAGED_LABEL, MANAGED_VALUE, REPO_LABEL, workspace_network_name,
+};
 use cella_backend::{
     BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
     ContainerInfo, ContainerState, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
-    ImageDetails, InteractiveExecOptions, MountInfo, Platform, PortBinding,
+    ImageDetails, InteractiveExecOptions, ManagedNetwork, MountInfo, Platform, PortBinding,
+    RemovalOutcome, RunArgsOverrides,
 };
 use tracing::{debug, warn};
 
 use crate::sdk::ContainerCli;
-use crate::sdk::types::ContainerListEntry;
+use crate::sdk::types::{ContainerListEntry, FilesystemType};
+
+/// Labels applied to every cella-managed network.
+const NETWORK_BASE_LABELS: [(&str, &str); 2] =
+    [("dev.cella.tool", "cella"), (MANAGED_LABEL, MANAGED_VALUE)];
 
 /// Apple Container backend — drives the `container` CLI binary.
 pub struct AppleContainerBackend {
     cli: ContainerCli,
-    staging_base: PathBuf,
-}
-
-impl AppleContainerBackend {
-    /// Resolve the staging directory for a container by looking up its name.
-    ///
-    /// The staging directory is mounted at create time using the container name,
-    /// but subsequent operations receive the container ID. This helper bridges
-    /// the gap by inspecting the container to retrieve its name.
-    async fn staging_dir_for(&self, container_id: &str) -> Result<PathBuf, BackendError> {
-        let entry = self.cli.inspect(container_id).await?;
-        let name = entry
-            .configuration
-            .as_ref()
-            .and_then(|c| c.name.as_deref())
-            .unwrap_or(container_id);
-        Ok(self.staging_base.join(name))
-    }
+    /// Whether `container network` commands work on this host (macOS 26+).
+    /// Probed lazily, once per backend instance.
+    networks_available: tokio::sync::OnceCell<bool>,
 }
 
 impl AppleContainerBackend {
     /// Create a new backend wrapping the given CLI handle.
     pub fn new(cli: ContainerCli) -> Self {
-        warn!(
-            "Apple Container backend is EXPERIMENTAL — \
-             expect rough edges and missing features"
-        );
-        let staging_base = default_staging_base();
-        Self { cli, staging_base }
+        Self {
+            cli,
+            networks_available: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Fetch the network list, lazily resolving whether the network
+    /// subcommands exist on this host (they require macOS 26+; on macOS 15
+    /// every invocation fails).
+    ///
+    /// `Ok(None)` means the commands are unavailable — that verdict is
+    /// cached for the process lifetime. Once availability has been
+    /// established, later failures propagate as `Err` instead of silently
+    /// flipping the backend into no-network mode.
+    async fn network_list_if_available(
+        &self,
+    ) -> Result<Option<Vec<crate::sdk::types::NetworkListEntry>>, BackendError> {
+        if self.networks_available.get() == Some(&false) {
+            return Ok(None);
+        }
+        match self.cli.network_list().await {
+            Ok(list) => {
+                let _ = self.networks_available.set(true);
+                Ok(Some(list))
+            }
+            Err(e) if self.networks_available.get() == Some(&true) => Err(e),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Apple Container network commands unavailable (requires macOS 26+); \
+                     continuing without network integration"
+                );
+                let _ = self.networks_available.set(false);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Whether the network subcommands are usable, without consuming the
+    /// fetched list.
+    async fn networks_available(&self) -> Result<bool, BackendError> {
+        if let Some(available) = self.networks_available.get() {
+            return Ok(*available);
+        }
+        Ok(self.network_list_if_available().await?.is_some())
+    }
+
+    /// Exec a command as root inside the container, mapping a non-zero exit
+    /// to a runtime error labeled with `action`.
+    async fn exec_root_checked(
+        &self,
+        container_id: &str,
+        cmd: &[String],
+        action: &str,
+    ) -> Result<(), BackendError> {
+        let (exit_code, _, stderr) = self
+            .cli
+            .exec_capture(container_id, cmd, Some("root"), None, None)
+            .await?;
+        if exit_code != 0 {
+            return Err(BackendError::Runtime(
+                format!("{action} failed: {stderr}").into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check whether a network with the given name exists (fresh fetch).
+    async fn named_network_exists(&self, name: &str) -> Result<bool, BackendError> {
+        let networks = self.cli.network_list().await?;
+        Ok(networks.iter().any(|n| n.name() == Some(name)))
+    }
+
+    /// Create `name` with `labels` unless it appears in `existing`.
+    async fn ensure_named_network(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+        existing: &[crate::sdk::types::NetworkListEntry],
+    ) -> Result<(), BackendError> {
+        if existing.iter().any(|n| n.name() == Some(name)) {
+            return Ok(());
+        }
+        match self.cli.network_create(name, labels).await {
+            Ok(()) => Ok(()),
+            // Lost a creation race? An existing network is still success.
+            Err(e) => {
+                if self.named_network_exists(name).await.unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Ensure the shared and per-workspace networks exist and return the
+    /// attachment names for `container create`.
+    ///
+    /// Apple Container fixes network attachments at creation, so this runs
+    /// before every create. One `network ls` answers availability and both
+    /// existence checks. Network trouble degrades to fewer (or no)
+    /// attachments rather than failing container creation.
+    async fn prepare_create_networks(&self, opts: &CreateContainerOptions) -> Vec<String> {
+        let existing = match self.network_list_if_available().await {
+            Ok(Some(list)) => list,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                warn!(error = %e, "could not list networks; creating container without them");
+                return Vec::new();
+            }
+        };
+
+        let mut networks = Vec::new();
+
+        match self
+            .ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS, &existing)
+            .await
+        {
+            Ok(()) => networks.push(CELLA_NETWORK_NAME.to_string()),
+            Err(e) => warn!(
+                error = %e,
+                "could not ensure '{CELLA_NETWORK_NAME}' network; creating container without it"
+            ),
+        }
+
+        // The workspace label is canonicalized when labels are built;
+        // workspace_network_name re-canonicalizes (idempotently) so the
+        // derived name always matches what down/prune compute later.
+        if let Some(workspace) = opts.labels.get("dev.cella.workspace_path") {
+            let name = workspace_network_name(Path::new(workspace));
+            let mut labels = NETWORK_BASE_LABELS.to_vec();
+            labels.push((REPO_LABEL, workspace.as_str()));
+            match self.ensure_named_network(&name, &labels, &existing).await {
+                Ok(()) => networks.push(name),
+                Err(e) => warn!(
+                    error = %e,
+                    network = %name,
+                    "could not ensure workspace network; creating container without it"
+                ),
+            }
+        }
+
+        networks
     }
 }
 
-/// Default host-side staging directory for file uploads.
-fn default_staging_base() -> PathBuf {
-    std::env::var("HOME").map_or_else(
-        |_| PathBuf::from("/tmp/cella/containers"),
-        |h| {
-            PathBuf::from(h)
-                .join(".cache")
-                .join("cella")
-                .join("containers")
-        },
-    )
+/// Deduplicated parent directories for an upload batch, in first-seen order.
+fn upload_parent_dirs(files: &[FileToUpload]) -> Vec<String> {
+    let mut parents: Vec<String> = Vec::new();
+    for file in files {
+        let Some(parent) = Path::new(&file.path).parent() else {
+            continue;
+        };
+        let parent = parent.to_string_lossy().into_owned();
+        if !parent.is_empty() && !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+    parents
+}
+
+/// Group uploaded file paths by requested mode (sorted for determinism).
+fn files_by_mode(files: &[FileToUpload]) -> std::collections::BTreeMap<u32, Vec<String>> {
+    let mut by_mode: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for file in files {
+        by_mode
+            .entry(file.mode)
+            .or_default()
+            .push(file.path.clone());
+    }
+    by_mode
+}
+
+/// Build a `NotSupported` error for a network operation, mentioning the
+/// macOS 26 requirement.
+fn network_unavailable(operation: &str) -> BackendError {
+    BackendError::NotSupported {
+        backend: "apple-container".to_string(),
+        operation: format!("{operation} (network commands require macOS 26+)"),
+    }
+}
+
+/// Whether a list entry is attached to `name`, either by configuration
+/// (create-time) or live status.
+fn entry_attached_to_network(entry: &ContainerListEntry, name: &str) -> bool {
+    let configured = entry.configuration.as_ref().is_some_and(|c| {
+        c.networks
+            .iter()
+            .any(|n| n.network.as_deref() == Some(name))
+    });
+    let live = entry.status.as_ref().is_some_and(|s| {
+        s.networks
+            .iter()
+            .any(|n| n.network.as_deref() == Some(name))
+    });
+    configured || live
 }
 
 // ---------------------------------------------------------------------------
@@ -88,21 +259,8 @@ impl ContainerBackend for AppleContainerBackend {
             let canonical = workspace_root
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
-            let canonical_str = canonical.to_string_lossy();
-
-            let entries = self.cli.list(None).await?;
-
-            for entry in entries {
-                if let Some(info) = entry_to_container_info(&entry)
-                    && info
-                        .labels
-                        .get("dev.cella.workspace_path")
-                        .is_some_and(|wp| wp == canonical_str.as_ref())
-                {
-                    return Ok(Some(info));
-                }
-            }
-            Ok(None)
+            let label = format!("dev.cella.workspace_path={}", canonical.to_string_lossy());
+            self.find_container_by_label(&label).await
         })
     }
 
@@ -111,12 +269,21 @@ impl ContainerBackend for AppleContainerBackend {
         opts: &'a CreateContainerOptions,
     ) -> BoxFuture<'a, Result<String, BackendError>> {
         Box::pin(async move {
-            // Ensure the staging directory exists before creating the container,
-            // since it is mounted as a volume.
-            let staging_dir = self.staging_base.join(&opts.name);
-            tokio::fs::create_dir_all(&staging_dir).await?;
+            // The image is the only argv token not anchored to a flag, so a
+            // leading dash would be parsed as an option. A `--` separator is
+            // no defense: the CLI's passthrough arguments capture it as a
+            // literal (swift-argument-parser captureForPassthrough). Valid
+            // OCI references never start with `-`, so reject instead.
+            if opts.image.starts_with('-') {
+                return Err(BackendError::Runtime(
+                    format!("invalid image reference '{}'", opts.image).into(),
+                ));
+            }
 
-            let args = build_create_args(opts, &self.staging_base);
+            // Network attachments are fixed at creation, so the shared and
+            // per-workspace networks must exist (and be requested) up front.
+            let networks = self.prepare_create_networks(opts).await;
+            let args = build_create_args(opts, &networks);
             debug!(?args, "container create arguments");
             self.cli.create(&args).await
         })
@@ -136,14 +303,12 @@ impl ContainerBackend for AppleContainerBackend {
         remove_volumes: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_dir_for(id).await.ok();
             self.cli.rm(id).await?;
             if remove_volumes {
-                let staging_dir = staging_dir.unwrap_or_else(|| self.staging_base.join(id));
-                if staging_dir.exists() {
-                    debug!(path = %staging_dir.display(), "removing staging directory");
-                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-                }
+                // Apple Container's delete never removes volumes, and this
+                // backend creates no per-container anonymous volumes — named
+                // volumes from user config are intentionally left in place.
+                debug!("remove_volumes requested; no backend-managed volumes to remove");
             }
             Ok(())
         })
@@ -166,7 +331,7 @@ impl ContainerBackend for AppleContainerBackend {
         running_only: bool,
     ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
         Box::pin(async move {
-            let entries = self.cli.list(None).await?;
+            let entries = self.cli.list().await?;
             let mut results = Vec::new();
             for entry in &entries {
                 if let Some(info) = entry_to_container_info(entry) {
@@ -199,7 +364,7 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move {
             let (key, value) = label.split_once('=').unwrap_or((label, ""));
 
-            let entries = self.cli.list(None).await?;
+            let entries = self.cli.list().await?;
             for entry in entries {
                 if let Some(info) = entry_to_container_info(&entry)
                     && info
@@ -381,9 +546,13 @@ impl ContainerBackend for AppleContainerBackend {
                 extra_args.push("--target".to_string());
                 extra_args.push(target.clone());
             }
-            for cache in &opts.cache_from {
-                extra_args.push("--cache-from".to_string());
-                extra_args.push(cache.clone());
+            // `container build` has no --cache-from; passing it would abort
+            // the build with an unknown-option error.
+            if !opts.cache_from.is_empty() {
+                warn!(
+                    images = ?opts.cache_from,
+                    "cacheFrom is not supported by Apple Container builds; ignoring"
+                );
             }
             for opt in &opts.options {
                 extra_args.push(opt.clone());
@@ -415,16 +584,8 @@ impl ContainerBackend for AppleContainerBackend {
         image: &'a str,
     ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
         Box::pin(async move {
-            // The Apple Container CLI's image inspect format is not fully
-            // documented. For now we return sensible defaults and parse what
-            // we can from the raw JSON output.
-            // TODO: parse OCI image config for user, env, labels once the
-            // CLI output format stabilizes.
             let raw = self.cli.image_inspect(image).await?;
-
-            // Attempt to extract user and env from a JSON blob that might
-            // contain Docker-style config fields.
-            let (user, env, metadata) = parse_image_details_best_effort(&raw);
+            let (user, env, metadata) = parse_image_details(&raw, host_oci_arch());
 
             Ok(ImageDetails {
                 user,
@@ -442,64 +603,49 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            let staging_dir = self.staging_dir_for(container_id).await?;
-            tokio::fs::create_dir_all(&staging_dir).await?;
+            if files.is_empty() {
+                return Ok(());
+            }
 
-            let staging_mount = "/tmp/.cella-staging";
+            // Every CLI call is a subprocess, so metadata operations are
+            // batched: one mkdir for all parents, one cp per file (the CLI
+            // accepts a single source/destination pair), one chown for all
+            // files, and one chmod per distinct mode.
+            let parents = upload_parent_dirs(files);
+            if !parents.is_empty() {
+                let mut mkdir_cmd = vec!["mkdir".to_string(), "-p".to_string()];
+                mkdir_cmd.extend(parents);
+                // Best-effort, matching the old per-file behavior: existing
+                // directories are fine and cp reports real failures.
+                let _ = self
+                    .cli
+                    .exec_capture(container_id, &mkdir_cmd, Some("root"), None, None)
+                    .await;
+            }
 
             for file in files {
-                // Write to host staging directory.
-                let host_path =
-                    staging_dir.join(file.path.trim_start_matches('/').replace('/', "_"));
-                tokio::fs::write(&host_path, &file.content).await?;
-
-                let staging_name = host_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let staging_src = format!("{staging_mount}/{staging_name}");
-
-                // Ensure parent directory exists inside the container.
-                if let Some(parent) = Path::new(&file.path).parent() {
-                    let mkdir_cmd = vec![
-                        "mkdir".to_string(),
-                        "-p".to_string(),
-                        parent.to_string_lossy().to_string(),
-                    ];
-                    let _ = self
-                        .cli
-                        .exec_capture(container_id, &mkdir_cmd, Some("root"), None, None)
-                        .await;
-                }
-
-                // Copy from staging mount to final path.
-                let cp_cmd = vec!["cp".to_string(), staging_src, file.path.clone()];
-                let (exit_code, _, stderr) = self
-                    .cli
-                    .exec_capture(container_id, &cp_cmd, Some("root"), None, None)
+                // Stage the content in a host temp file and copy it in.
+                // The temp file is removed when `tmp` drops.
+                let tmp = tempfile::NamedTempFile::new()?;
+                tokio::fs::write(tmp.path(), &file.content).await?;
+                self.cli
+                    .cp_into(tmp.path(), container_id, &file.path)
                     .await?;
-                if exit_code != 0 {
-                    return Err(BackendError::Runtime(
-                        format!("cp failed for {}: {stderr}", file.path).into(),
-                    ));
-                }
+            }
 
-                // Set permissions.
-                let chmod_cmd = vec![
-                    "chmod".to_string(),
-                    format!("{:o}", file.mode),
-                    file.path.clone(),
-                ];
-                let (exit_code, _, stderr) = self
-                    .cli
-                    .exec_capture(container_id, &chmod_cmd, Some("root"), None, None)
+            // `container cp` preserves host-side metadata; normalize to the
+            // root ownership and explicit modes the old exec-based copy
+            // produced.
+            let mut chown_cmd = vec!["chown".to_string(), "0:0".to_string()];
+            chown_cmd.extend(files.iter().map(|f| f.path.clone()));
+            self.exec_root_checked(container_id, &chown_cmd, "chown")
+                .await?;
+
+            for (mode, paths) in files_by_mode(files) {
+                let mut chmod_cmd = vec!["chmod".to_string(), format!("{mode:o}")];
+                chmod_cmd.extend(paths);
+                self.exec_root_checked(container_id, &chmod_cmd, "chmod")
                     .await?;
-                if exit_code != 0 {
-                    return Err(BackendError::Runtime(
-                        format!("chmod failed for {}: {stderr}", file.path).into(),
-                    ));
-                }
             }
 
             Ok(())
@@ -511,15 +657,18 @@ impl ContainerBackend for AppleContainerBackend {
     fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
             // Verify the container CLI is reachable by running `container list`.
-            let _ = self.cli.list(None).await?;
+            let _ = self.cli.list().await?;
             Ok(())
         })
     }
 
     fn host_gateway(&self) -> &'static str {
-        // Apple Container uses the standard macOS localhost; containers
-        // can reach the host via this address when networking is enabled.
-        "host.local"
+        // Apple Container ships no automatic host alias. Apple's documented
+        // convention is a user-created localhost domain:
+        //   sudo container system dns create host.container.internal --localhost <ip>
+        // Returning that name makes cella's injected URLs work as soon as
+        // the user runs the one-time setup.
+        "host.container.internal"
     }
 
     // -- Platform detection --
@@ -528,11 +677,7 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move {
             Ok(Platform {
                 os: "linux".to_string(),
-                arch: if cfg!(target_arch = "aarch64") {
-                    "arm64".to_string()
-                } else {
-                    "amd64".to_string()
-                },
+                arch: host_oci_arch().to_string(),
             })
         })
     }
@@ -573,31 +718,177 @@ impl ContainerBackend for AppleContainerBackend {
 
     fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
-            Err(BackendError::NotSupported {
-                backend: "apple-container".to_string(),
-                operation: "ensure_network".to_string(),
-            })
+            let Some(existing) = self.network_list_if_available().await? else {
+                return Err(network_unavailable("ensure_network"));
+            };
+            self.ensure_named_network(CELLA_NETWORK_NAME, &NETWORK_BASE_LABELS, &existing)
+                .await
         })
     }
 
     fn ensure_container_network<'a>(
         &'a self,
-        _container_id: &'a str,
-        _repo_path: &'a Path,
+        container_id: &'a str,
+        repo_path: &'a Path,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            Err(BackendError::NotSupported {
-                backend: "apple-container".to_string(),
-                operation: "ensure_container_network".to_string(),
-            })
+            if !self.networks_available().await? {
+                return Err(network_unavailable("ensure_container_network"));
+            }
+
+            // Attachments are fixed at creation; verify the create-time
+            // attachments cover what the orchestrator expects.
+            let entry = self.cli.inspect(container_id).await?;
+            let expected = [
+                CELLA_NETWORK_NAME.to_string(),
+                workspace_network_name(repo_path),
+            ];
+            let missing: Vec<&str> = expected
+                .iter()
+                .filter(|name| !entry_attached_to_network(&entry, name))
+                .map(String::as_str)
+                .collect();
+
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(BackendError::NotSupported {
+                    backend: "apple-container".to_string(),
+                    operation: format!(
+                        "attaching networks to an existing container ({}); \
+                         attachments are fixed at creation — recreate the \
+                         container to join them",
+                        missing.join(", ")
+                    ),
+                })
+            }
         })
     }
 
     fn get_container_ip<'a>(
         &'a self,
-        _container_id: &'a str,
+        container_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move {
+            let entry = self.cli.inspect(container_id).await?;
+            let Some(status) = entry.status else {
+                return Ok(None);
+            };
+
+            // Prefer the shared cella network, mirroring the Docker backend.
+            if let Some(ip) = status
+                .networks
+                .iter()
+                .find(|n| n.network.as_deref() == Some(CELLA_NETWORK_NAME))
+                .and_then(|n| n.ipv4())
+            {
+                return Ok(Some(ip.to_string()));
+            }
+            Ok(status
+                .networks
+                .iter()
+                .find_map(|n| n.ipv4().map(String::from)))
+        })
+    }
+
+    fn list_managed_networks(&self) -> BoxFuture<'_, Result<Vec<ManagedNetwork>, BackendError>> {
+        Box::pin(async move {
+            let Some(networks) = self.network_list_if_available().await? else {
+                return Err(network_unavailable("list_managed_networks"));
+            };
+            let containers = self.cli.list().await?;
+
+            let mut out = Vec::new();
+            for net in &networks {
+                let Some(name) = net.name() else { continue };
+                let labels = net.labels();
+                if labels.get(MANAGED_LABEL).map(String::as_str) != Some(MANAGED_VALUE) {
+                    continue;
+                }
+
+                let container_count = containers
+                    .iter()
+                    .filter(|c| entry_attached_to_network(c, name))
+                    .count();
+
+                out.push(ManagedNetwork {
+                    name: name.to_string(),
+                    repo_path: labels.get(REPO_LABEL).cloned(),
+                    // The CLI emits creation dates as numeric Swift
+                    // reference-date values; not surfaced as RFC 3339.
+                    created_at: None,
+                    container_count,
+                    labels,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn remove_network_if_orphan<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            let Some(networks) = self.network_list_if_available().await? else {
+                return Err(network_unavailable("remove_network_if_orphan"));
+            };
+            let Some(net) = networks.iter().find(|n| n.name() == Some(name)) else {
+                return Ok(RemovalOutcome::NotFound);
+            };
+
+            let labels = net.labels();
+            let managed = labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_VALUE);
+
+            // Counting configured attachments includes stopped containers
+            // deliberately: attachments are fixed at creation, so deleting a
+            // network out from under a stopped container would break its
+            // next start (unlike Docker, which can reconnect).
+            let containers = self.cli.list().await?;
+            let container_count = containers
+                .iter()
+                .filter(|c| entry_attached_to_network(c, name))
+                .count();
+
+            if !managed || container_count > 0 {
+                debug!(
+                    network = name,
+                    managed, container_count, "network not an orphan, leaving in place"
+                );
+                return Ok(RemovalOutcome::SkippedInUse);
+            }
+
+            match self.cli.network_delete(name).await {
+                Ok(()) => Ok(RemovalOutcome::Removed),
+                // Removed by a concurrent caller between list and delete.
+                Err(e) if e.to_string().to_lowercase().contains("not found") => {
+                    Ok(RemovalOutcome::NotFound)
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn remove_workspace_network<'a>(
+        &'a self,
+        workspace_root: &'a Path,
+    ) -> BoxFuture<'a, Result<RemovalOutcome, BackendError>> {
+        Box::pin(async move {
+            let name = workspace_network_name(workspace_root);
+            self.remove_network_if_orphan(&name).await
+        })
+    }
+
+    fn network_exists<'a>(
+        &'a self,
+        network_name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, BackendError>> {
+        Box::pin(async move {
+            let Some(networks) = self.network_list_if_available().await? else {
+                return Err(network_unavailable("network_exists"));
+            };
+            Ok(networks.iter().any(|n| n.name() == Some(network_name)))
+        })
     }
 
     // -- Agent provisioning --
@@ -649,8 +940,17 @@ impl ContainerBackend for AppleContainerBackend {
 // ---------------------------------------------------------------------------
 
 /// Build CLI arguments for `container create` from `CreateContainerOptions`.
-fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<String> {
+///
+/// `networks` lists pre-created networks to attach; attachments cannot be
+/// added after creation.
+fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<String> {
     let mut args = Vec::new();
+
+    // Network attachments.
+    for network in networks {
+        args.push("--network".to_string());
+        args.push(network.clone());
+    }
 
     // Name
     args.push("--name".to_string());
@@ -689,17 +989,18 @@ fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<
         args.push(format!("{}:{}{ro_suffix}", wm.source, wm.target));
     }
 
-    // Additional mounts
+    // Additional mounts. Named volumes work through `-v name:target`
+    // natively; tmpfs entries use the dedicated flag.
     for mount in &opts.mounts {
-        args.push("--volume".to_string());
-        let ro_suffix = if mount.read_only { ":ro" } else { "" };
-        args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
+        if mount.mount_type == "tmpfs" {
+            args.push("--tmpfs".to_string());
+            args.push(mount.target.clone());
+        } else {
+            args.push("--volume".to_string());
+            let ro_suffix = if mount.read_only { ":ro" } else { "" };
+            args.push(format!("{}:{}{ro_suffix}", mount.source, mount.target));
+        }
     }
-
-    // Staging directory mount for file uploads.
-    let staging_dir = staging_base.join(&opts.name);
-    args.push("--volume".to_string());
-    args.push(format!("{}:/tmp/.cella-staging", staging_dir.display()));
 
     // Port bindings
     for (container_port, forwards) in &opts.port_bindings {
@@ -727,6 +1028,17 @@ fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<
         args.push(ep.join(" "));
     }
 
+    // Linux capabilities (supported since Apple Container 0.12.0).
+    for cap in &opts.cap_add {
+        args.push("--cap-add".to_string());
+        args.push(cap.clone());
+    }
+
+    // runArgs overrides with native CLI equivalents.
+    if let Some(ref overrides) = opts.run_args_overrides {
+        push_override_args(&mut args, overrides);
+    }
+
     // SSH agent forwarding
     if std::env::var("SSH_AUTH_SOCK").is_ok() {
         args.push("--ssh".to_string());
@@ -748,16 +1060,119 @@ fn build_create_args(opts: &CreateContainerOptions, staging_base: &Path) -> Vec<
     args
 }
 
+/// Append runArgs overrides that have native Apple Container equivalents.
+fn push_override_args(args: &mut Vec<String>, overrides: &RunArgsOverrides) {
+    if let Some(memory) = overrides.memory
+        && memory > 0
+    {
+        args.push("--memory".to_string());
+        args.push(memory.to_string());
+    }
+
+    // Docker counts in nano-CPUs; Apple Container allocates whole vCPUs.
+    if let Some(nano_cpus) = overrides.nano_cpus
+        && let Ok(nano) = u64::try_from(nano_cpus)
+        && nano > 0
+    {
+        args.push("--cpus".to_string());
+        args.push(nano.div_ceil(1_000_000_000).to_string());
+    }
+
+    if let Some(shm_size) = overrides.shm_size
+        && shm_size > 0
+    {
+        args.push("--shm-size".to_string());
+        args.push(shm_size.to_string());
+    }
+
+    if overrides.init == Some(true) {
+        args.push("--init".to_string());
+    }
+
+    for ip in &overrides.dns {
+        args.push("--dns".to_string());
+        args.push(ip.clone());
+    }
+    for domain in &overrides.dns_search {
+        args.push("--dns-search".to_string());
+        args.push(domain.clone());
+    }
+
+    for ulimit in &overrides.ulimits {
+        args.push("--ulimit".to_string());
+        args.push(format!("{}={}:{}", ulimit.name, ulimit.soft, ulimit.hard));
+    }
+
+    for (path, options) in &overrides.tmpfs {
+        if !options.is_empty() {
+            warn!(
+                path,
+                options, "tmpfs mount options are not supported by Apple Container; mounting plain"
+            );
+        }
+        args.push("--tmpfs".to_string());
+        args.push(path.clone());
+    }
+
+    for (key, value) in &overrides.labels {
+        args.push("--label".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    if let Some(ref runtime) = overrides.runtime {
+        args.push("--runtime".to_string());
+        args.push(runtime.clone());
+    }
+}
+
+/// Collect runArgs override flags that Apple Container has no equivalent for.
+fn collect_unsupported_overrides(overrides: &RunArgsOverrides) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+
+    let flags: [(bool, &'static str); 22] = [
+        (overrides.network_mode.is_some(), "--network"),
+        (overrides.hostname.is_some(), "--hostname"),
+        (!overrides.extra_hosts.is_empty(), "--add-host"),
+        (overrides.mac_address.is_some(), "--mac-address"),
+        (overrides.memory_swap.is_some(), "--memory-swap"),
+        (
+            overrides.memory_reservation.is_some(),
+            "--memory-reservation",
+        ),
+        (overrides.cpu_shares.is_some(), "--cpu-shares"),
+        (overrides.cpu_period.is_some(), "--cpu-period"),
+        (overrides.cpu_quota.is_some(), "--cpu-quota"),
+        (overrides.cpuset_cpus.is_some(), "--cpuset-cpus"),
+        (overrides.cpuset_mems.is_some(), "--cpuset-mems"),
+        (overrides.pids_limit.is_some(), "--pids-limit"),
+        (overrides.userns_mode.is_some(), "--userns"),
+        (overrides.cgroup_parent.is_some(), "--cgroup-parent"),
+        (overrides.cgroupns_mode.is_some(), "--cgroupns"),
+        (!overrides.sysctls.is_empty(), "--sysctl"),
+        (overrides.pid_mode.is_some(), "--pid"),
+        (overrides.ipc_mode.is_some(), "--ipc"),
+        (overrides.uts_mode.is_some(), "--uts"),
+        (!overrides.storage_opt.is_empty(), "--storage-opt"),
+        (
+            overrides.log_driver.is_some() || !overrides.log_opt.is_empty(),
+            "--log-driver/--log-opt",
+        ),
+        (overrides.restart_policy.is_some(), "--restart"),
+    ];
+
+    for (present, flag) in flags {
+        if present {
+            ignored.push(flag);
+        }
+    }
+
+    ignored
+}
+
 /// Emit warnings for Docker-specific options that Apple Container does not support.
 fn emit_unsupported_warnings(opts: &CreateContainerOptions) {
     if opts.privileged {
         warn!("--privileged is not supported by Apple Container; ignoring");
-    }
-    if !opts.cap_add.is_empty() {
-        warn!(
-            caps = ?opts.cap_add,
-            "--cap-add is not supported by Apple Container; ignoring"
-        );
     }
     if !opts.security_opt.is_empty() {
         warn!(
@@ -776,6 +1191,13 @@ fn emit_unsupported_warnings(opts: &CreateContainerOptions) {
         if overrides.gpus.is_some() {
             warn!("--gpus is not supported by Apple Container; ignoring");
         }
+        let ignored = collect_unsupported_overrides(overrides);
+        if !ignored.is_empty() {
+            warn!(
+                flags = ?ignored,
+                "runArgs not supported by Apple Container; ignoring"
+            );
+        }
         if !overrides.unrecognized.is_empty() {
             warn!(
                 args = ?overrides.unrecognized,
@@ -792,22 +1214,13 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     let config = entry.configuration.as_ref()?;
     let id = config.id.clone()?;
 
-    let state = entry
-        .status
-        .as_ref()
-        .and_then(|s| s.state.as_deref())
-        .map_or_else(
-            || ContainerState::Other("unknown".to_string()),
-            |s| {
-                // Apple Container uses "stopped" rather than Docker's "exited".
-                match s {
-                    "stopped" => ContainerState::Stopped,
-                    other => ContainerState::parse(other),
-                }
-            },
-        );
-
-    let exit_code = entry.status.as_ref().and_then(|s| s.exit_code);
+    let state = ContainerState::parse(
+        entry
+            .status
+            .as_ref()
+            .and_then(|s| s.state.as_deref())
+            .unwrap_or("unknown"),
+    );
 
     let labels = config.labels.clone().unwrap_or_default();
     let config_hash = labels.get("dev.cella.config_hash").cloned();
@@ -821,7 +1234,7 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
                     Some(PortBinding {
                         container_port: p.container_port?,
                         host_port: p.host_port,
-                        protocol: p.protocol.clone().unwrap_or_else(|| "tcp".to_string()),
+                        protocol: p.proto.clone().unwrap_or_else(|| "tcp".to_string()),
                     })
                 })
                 .collect()
@@ -834,8 +1247,20 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
         .map(|ms| {
             ms.iter()
                 .map(|m| MountInfo {
-                    mount_type: m.mount_type.clone().unwrap_or_default(),
-                    source: m.source.clone().unwrap_or_default(),
+                    mount_type: m
+                        .fs_type
+                        .as_ref()
+                        .map(|t| t.kind().to_string())
+                        .unwrap_or_default(),
+                    // Volume mounts surface the volume name (Docker parity);
+                    // the raw source is the host-side storage path.
+                    source: m
+                        .fs_type
+                        .as_ref()
+                        .and_then(FilesystemType::volume_name)
+                        .map(String::from)
+                        .or_else(|| m.source.clone())
+                        .unwrap_or_default(),
                     destination: m.destination.clone().unwrap_or_default(),
                 })
                 .collect()
@@ -845,59 +1270,103 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     let created_at = labels.get("dev.cella.created_at").cloned();
 
     Some(ContainerInfo {
+        name: id.clone(),
         id,
-        name: config.name.clone().unwrap_or_default(),
         state,
-        exit_code,
+        // 1.0.0 does not report exit codes through ls/inspect.
+        exit_code: None,
         labels,
         config_hash,
         ports,
         created_at,
         container_user: None,
-        image: config.image.clone(),
+        image: config.image.as_ref().and_then(|i| i.reference.clone()),
         mounts,
         backend: BackendKind::AppleContainer,
     })
 }
 
-/// Best-effort extraction of user, env, and metadata from raw image inspect JSON.
-fn parse_image_details_best_effort(raw: &str) -> (String, Vec<String>, Option<String>) {
+/// The OCI architecture string for the host (`arm64`/`amd64`).
+const fn host_oci_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+/// Extract user, env, and devcontainer metadata from `container image
+/// inspect` output.
+///
+/// The CLI emits an array of image resources whose `variants[].config`
+/// carry full OCI image configs; the variant matching `prefer_arch` wins,
+/// falling back to the first variant. Docker-style top-level `Config`
+/// objects are also recognized for robustness.
+fn parse_image_details(raw: &str, prefer_arch: &str) -> (String, Vec<String>, Option<String>) {
     let mut user = "root".to_string();
     let mut env = Vec::new();
     let mut metadata = None;
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        // Try Docker-style config paths.
-        let config = value
-            .get("Config")
-            .or_else(|| value.get("config"))
-            .or_else(|| value.get("container_config"));
-
-        if let Some(cfg) = config {
-            if let Some(u) = cfg.get("User").or_else(|| cfg.get("user"))
-                && let Some(u_str) = u.as_str()
-                && !u_str.is_empty()
-            {
-                // Take only the user part (before any colon).
-                user = u_str.split(':').next().unwrap_or(u_str).to_string();
-            }
-            if let Some(e) = cfg.get("Env").or_else(|| cfg.get("env"))
-                && let Some(arr) = e.as_array()
-            {
-                env = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
-            if let Some(labels) = cfg.get("Labels").or_else(|| cfg.get("labels"))
-                && let Some(md) = labels.get("devcontainer.metadata").and_then(|v| v.as_str())
-            {
-                metadata = Some(md.to_string());
-            }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(cfg) = find_oci_config(&value, prefer_arch)
+    {
+        if let Some(u) = cfg.get("User").or_else(|| cfg.get("user"))
+            && let Some(u_str) = u.as_str()
+            && !u_str.is_empty()
+        {
+            // Take only the user part (before any colon).
+            user = u_str.split(':').next().unwrap_or(u_str).to_string();
+        }
+        if let Some(e) = cfg.get("Env").or_else(|| cfg.get("env"))
+            && let Some(arr) = e.as_array()
+        {
+            env = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+        if let Some(labels) = cfg.get("Labels").or_else(|| cfg.get("labels"))
+            && let Some(md) = labels.get("devcontainer.metadata").and_then(|v| v.as_str())
+        {
+            metadata = Some(md.to_string());
         }
     }
 
     (user, env, metadata)
+}
+
+/// Locate the OCI runtime `config` object inside image inspect JSON,
+/// preferring the variant built for `prefer_arch`.
+fn find_oci_config<'v>(
+    value: &'v serde_json::Value,
+    prefer_arch: &str,
+) -> Option<&'v serde_json::Value> {
+    // The CLI wraps results in an array; tolerate a bare object too.
+    let resource = if let Some(arr) = value.as_array() {
+        arr.first()?
+    } else {
+        value
+    };
+
+    // 1.0.0 shape: image resource with per-platform variants.
+    if let Some(variants) = resource.get("variants").and_then(|v| v.as_array()) {
+        let preferred = variants.iter().find(|var| {
+            var.get("platform")
+                .and_then(|p| p.get("architecture"))
+                .and_then(|a| a.as_str())
+                == Some(prefer_arch)
+        });
+        let variant = preferred.or_else(|| variants.first())?;
+        return variant
+            .get("config")
+            .and_then(|img| img.get("config").or_else(|| img.get("Config")));
+    }
+
+    // Docker-style fallback.
+    resource
+        .get("Config")
+        .or_else(|| resource.get("config"))
+        .or_else(|| resource.get("container_config"))
 }
 
 // ---------------------------------------------------------------------------
@@ -939,8 +1408,7 @@ mod tests {
     #[test]
     fn build_create_args_minimal() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"test-container".to_string()));
@@ -955,8 +1423,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.labels
             .insert("dev.cella.tool".to_string(), "cella".to_string());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let label_idx = args.iter().position(|a| a == "--label").unwrap();
         assert_eq!(args[label_idx + 1], "dev.cella.tool=cella");
@@ -967,8 +1434,7 @@ mod tests {
         let mut opts = minimal_create_opts();
         opts.env = vec!["FOO=bar".to_string()];
         opts.remote_env = vec!["BAZ=qux".to_string()];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let env_positions: Vec<usize> = args
             .iter()
@@ -984,8 +1450,7 @@ mod tests {
     fn build_create_args_with_user() {
         let mut opts = minimal_create_opts();
         opts.user = Some("vscode".to_string());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let user_idx = args.iter().position(|a| a == "-u").unwrap();
         assert_eq!(args[user_idx + 1], "vscode");
@@ -1002,8 +1467,7 @@ mod tests {
             read_only: false,
             external: false,
         });
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(args[vol_idx + 1], "/host/project:/workspace");
@@ -1020,8 +1484,7 @@ mod tests {
             read_only: true,
             external: false,
         });
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let vol_idx = args.iter().position(|a| a == "--volume").unwrap();
         assert_eq!(
@@ -1041,8 +1504,7 @@ mod tests {
                 host_port: Some("3000".to_string()),
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "3000:8080/tcp");
@@ -1052,8 +1514,7 @@ mod tests {
     fn build_create_args_with_entrypoint() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(vec!["/bin/sh".to_string(), "-c".to_string()]);
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let ep_idx = args.iter().position(|a| a == "--entrypoint").unwrap();
         assert_eq!(args[ep_idx + 1], "/bin/sh -c");
@@ -1063,8 +1524,7 @@ mod tests {
     fn build_create_args_with_cmd() {
         let mut opts = minimal_create_opts();
         opts.cmd = Some(vec!["sleep".to_string(), "infinity".to_string()]);
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         // Image should be followed by cmd.
         let img_idx = args.iter().position(|a| a == "ubuntu:latest").unwrap();
@@ -1073,88 +1533,139 @@ mod tests {
     }
 
     #[test]
-    fn build_create_args_staging_mount() {
+    fn build_create_args_has_no_staging_mount() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
-        // Should contain a volume mount for the staging directory.
-        let vol_args: Vec<&str> = args
+        assert!(
+            !args.iter().any(|a| a.contains(".cella-staging")),
+            "file uploads use `container cp`; no staging mount expected"
+        );
+    }
+
+    #[test]
+    fn build_create_args_attaches_networks() {
+        let opts = minimal_create_opts();
+        let networks = vec!["cella".to_string(), "cella-net-abcdef123456".to_string()];
+        let args = build_create_args(&opts, &networks);
+
+        let attached: Vec<&str> = args
             .windows(2)
-            .filter_map(|w| {
-                if w[0] == "--volume" {
-                    Some(w[1].as_str())
-                } else {
-                    None
-                }
-            })
+            .filter(|w| w[0] == "--network")
+            .map(|w| w[1].as_str())
             .collect();
-        let staging_mount = vol_args.iter().find(|v| v.contains(".cella-staging"));
-        assert!(staging_mount.is_some(), "expected staging volume mount");
+        assert_eq!(attached, vec!["cella", "cella-net-abcdef123456"]);
+    }
+
+    #[test]
+    fn build_create_args_no_networks_no_flag() {
+        let opts = minimal_create_opts();
+        let args = build_create_args(&opts, &[]);
+        assert!(!args.contains(&"--network".to_string()));
+    }
+
+    #[test]
+    fn entry_attached_to_network_checks_configuration() {
+        let mut config = test_config(Some("c1"));
+        config.networks = vec![crate::sdk::types::AttachmentConfiguration {
+            network: Some("cella".to_string()),
+        }];
+        let entry = ContainerListEntry {
+            status: None,
+            configuration: Some(config),
+        };
+
+        assert!(entry_attached_to_network(&entry, "cella"));
+        assert!(!entry_attached_to_network(&entry, "other"));
+    }
+
+    #[test]
+    fn entry_attached_to_network_checks_live_status() {
+        let mut status = test_status("running");
+        status.networks = vec![crate::sdk::types::NetworkAttachment {
+            network: Some("cella-net-abc".to_string()),
+            ipv4_address: Some("192.168.65.2/24".to_string()),
+        }];
+        let entry = ContainerListEntry {
+            status: Some(status),
+            configuration: Some(test_config(Some("c2"))),
+        };
+
+        assert!(entry_attached_to_network(&entry, "cella-net-abc"));
+        assert!(!entry_attached_to_network(&entry, "cella"));
+    }
+
+    #[test]
+    fn network_unavailable_mentions_macos_requirement() {
+        let err = network_unavailable("ensure_network");
+        let msg = err.to_string();
+        assert!(msg.contains("apple-container"), "msg: {msg}");
+        assert!(msg.contains("macOS 26"), "msg: {msg}");
+    }
+
+    /// Test helper: a status with the given state and no network attachments.
+    fn test_status(state: &str) -> crate::sdk::types::ContainerStatus {
+        crate::sdk::types::ContainerStatus {
+            state: Some(state.to_string()),
+            networks: Vec::new(),
+        }
+    }
+
+    /// Test helper: a configuration with the given ID and everything else
+    /// empty.
+    fn test_config(id: Option<&str>) -> crate::sdk::types::ContainerConfiguration {
+        crate::sdk::types::ContainerConfiguration {
+            id: id.map(String::from),
+            image: None,
+            labels: None,
+            published_ports: None,
+            mounts: None,
+            networks: Vec::new(),
+        }
     }
 
     #[test]
     fn entry_to_container_info_basic() {
+        let mut config = test_config(Some("abc123"));
+        config.image = Some(crate::sdk::types::ImageDescription {
+            reference: Some("ubuntu:latest".to_string()),
+        });
+        config.labels = Some(HashMap::from([(
+            "dev.cella.tool".to_string(),
+            "cella".to_string(),
+        )]));
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: Some(0),
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("abc123".to_string()),
-                name: Some("test".to_string()),
-                image: Some("ubuntu:latest".to_string()),
-                labels: Some(HashMap::from([(
-                    "dev.cella.tool".to_string(),
-                    "cella".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("running")),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
         assert_eq!(info.id, "abc123");
-        assert_eq!(info.name, "test");
+        // Containers have no separate name; the ID doubles as the name.
+        assert_eq!(info.name, "abc123");
         assert_eq!(info.state, ContainerState::Running);
-        assert_eq!(info.exit_code, Some(0));
+        assert_eq!(info.image.as_deref(), Some("ubuntu:latest"));
         assert_eq!(info.backend, BackendKind::AppleContainer);
     }
 
     #[test]
     fn entry_to_container_info_stopped_state() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("stopped".to_string()),
-                exit_code: Some(137),
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("def456".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("stopped")),
+            configuration: Some(test_config(Some("def456"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
         assert_eq!(info.state, ContainerState::Stopped);
-        assert_eq!(info.exit_code, Some(137));
+        // 1.0.0 does not report exit codes through ls/inspect.
+        assert_eq!(info.exit_code, None);
     }
 
     #[test]
     fn entry_to_container_info_no_id_returns_none() {
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: None,
-                name: Some("orphan".to_string()),
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(test_config(None)),
         };
 
         assert!(entry_to_container_info(&entry).is_none());
@@ -1163,10 +1674,7 @@ mod tests {
     #[test]
     fn entry_to_container_info_no_config_returns_none() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: None,
-            }),
+            status: Some(test_status("running")),
             configuration: None,
         };
 
@@ -1185,7 +1693,7 @@ mod tests {
             }
         }"#;
 
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "vscode");
         assert_eq!(env.len(), 2);
         assert!(metadata.is_some());
@@ -1193,7 +1701,7 @@ mod tests {
 
     #[test]
     fn parse_image_details_empty_json() {
-        let (user, env, metadata) = parse_image_details_best_effort("{}");
+        let (user, env, metadata) = parse_image_details("{}", "arm64");
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -1201,20 +1709,212 @@ mod tests {
 
     #[test]
     fn parse_image_details_invalid_json() {
-        let (user, env, metadata) = parse_image_details_best_effort("not json");
+        let (user, env, metadata) = parse_image_details("not json", "arm64");
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
     }
 
-    #[test]
-    fn default_staging_base_contains_cella() {
-        let base = default_staging_base();
-        let base_str = base.to_string_lossy();
+    #[tokio::test]
+    async fn create_container_rejects_dash_prefixed_image() {
+        let backend = AppleContainerBackend::new(ContainerCli::new(
+            std::path::PathBuf::from("/nonexistent/container"),
+            "1.0.0".to_string(),
+        ));
+        let mut opts = minimal_create_opts();
+        opts.image = "--volume=/:/host".to_string();
+
+        let err = backend.create_container(&opts).await.unwrap_err();
         assert!(
-            base_str.contains("cella"),
-            "staging base should contain 'cella': {base_str}"
+            err.to_string().contains("invalid image reference"),
+            "got: {err}"
         );
+    }
+
+    #[test]
+    fn upload_parent_dirs_dedupes_in_order() {
+        let files = vec![
+            FileToUpload {
+                path: "/etc/app/one.conf".to_string(),
+                content: Vec::new(),
+                mode: 0o644,
+            },
+            FileToUpload {
+                path: "/etc/app/two.conf".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/home/user/.ssh/config".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+        ];
+        assert_eq!(
+            upload_parent_dirs(&files),
+            vec!["/etc/app", "/home/user/.ssh"]
+        );
+    }
+
+    #[test]
+    fn files_by_mode_groups_paths() {
+        let files = vec![
+            FileToUpload {
+                path: "/a".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/b".to_string(),
+                content: Vec::new(),
+                mode: 0o755,
+            },
+            FileToUpload {
+                path: "/c".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+        ];
+        let groups = files_by_mode(&files);
+        assert_eq!(groups[&0o600], vec!["/a", "/c"]);
+        assert_eq!(groups[&0o755], vec!["/b"]);
+    }
+
+    #[test]
+    fn build_create_args_passes_capabilities() {
+        let mut opts = minimal_create_opts();
+        opts.cap_add = vec!["SYS_PTRACE".to_string(), "NET_RAW".to_string()];
+        let args = build_create_args(&opts, &[]);
+
+        let cap_values: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--cap-add")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(cap_values, vec!["SYS_PTRACE", "NET_RAW"]);
+    }
+
+    #[test]
+    fn push_override_args_maps_resources() {
+        let overrides = RunArgsOverrides {
+            memory: Some(2_147_483_648),
+            nano_cpus: Some(1_500_000_000),
+            shm_size: Some(67_108_864),
+            init: Some(true),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--memory", "2147483648")));
+        // 1.5 CPUs rounds up to 2 whole vCPUs.
+        assert!(pairs.contains(&("--cpus", "2")));
+        assert!(pairs.contains(&("--shm-size", "67108864")));
+        assert!(args.contains(&"--init".to_string()));
+    }
+
+    #[test]
+    fn push_override_args_maps_dns_and_ulimits() {
+        let overrides = RunArgsOverrides {
+            dns: vec!["1.1.1.1".to_string()],
+            dns_search: vec!["internal.example".to_string()],
+            ulimits: vec![cella_backend::UlimitSpec {
+                name: "nofile".to_string(),
+                soft: 1024,
+                hard: 4096,
+            }],
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--dns", "1.1.1.1")));
+        assert!(pairs.contains(&("--dns-search", "internal.example")));
+        assert!(pairs.contains(&("--ulimit", "nofile=1024:4096")));
+    }
+
+    #[test]
+    fn push_override_args_maps_tmpfs_labels_runtime() {
+        let overrides = RunArgsOverrides {
+            tmpfs: HashMap::from([("/scratch".to_string(), String::new())]),
+            labels: HashMap::from([("from.runargs".to_string(), "yes".to_string())]),
+            runtime: Some("container-runtime-linux".to_string()),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--tmpfs", "/scratch")));
+        assert!(pairs.contains(&("--label", "from.runargs=yes")));
+        assert!(pairs.contains(&("--runtime", "container-runtime-linux")));
+    }
+
+    #[test]
+    fn push_override_args_skips_non_positive_resources() {
+        let overrides = RunArgsOverrides {
+            memory: Some(0),
+            nano_cpus: Some(-1),
+            shm_size: Some(0),
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+        assert!(args.is_empty(), "non-positive resources must be skipped");
+    }
+
+    #[test]
+    fn build_create_args_tmpfs_mount_config() {
+        let mut opts = minimal_create_opts();
+        opts.mounts = vec![MountConfig {
+            mount_type: "tmpfs".to_string(),
+            source: String::new(),
+            target: "/run/scratch".to_string(),
+            consistency: None,
+            read_only: false,
+            external: false,
+        }];
+        let args = build_create_args(&opts, &[]);
+
+        let mut pairs = args.windows(2).map(|w| (w[0].as_str(), w[1].as_str()));
+        assert!(pairs.any(|p| p == ("--tmpfs", "/run/scratch")));
+        assert!(
+            !args.iter().any(|a| a.starts_with(":/run/scratch")),
+            "tmpfs must not be emitted as an empty-source volume"
+        );
+    }
+
+    #[test]
+    fn collect_unsupported_overrides_lists_flags() {
+        let overrides = RunArgsOverrides {
+            network_mode: Some("host".to_string()),
+            hostname: Some("custom".to_string()),
+            sysctls: HashMap::from([("net.core.somaxconn".to_string(), "1024".to_string())]),
+            restart_policy: Some("always".to_string()),
+            ..RunArgsOverrides::default()
+        };
+        let ignored = collect_unsupported_overrides(&overrides);
+        assert!(ignored.contains(&"--network"));
+        assert!(ignored.contains(&"--hostname"));
+        assert!(ignored.contains(&"--sysctl"));
+        assert!(ignored.contains(&"--restart"));
+        assert_eq!(ignored.len(), 4);
+    }
+
+    #[test]
+    fn collect_unsupported_overrides_empty_for_default() {
+        assert!(collect_unsupported_overrides(&RunArgsOverrides::default()).is_empty());
     }
 
     #[test]
@@ -1257,8 +1957,7 @@ mod tests {
                 external: false,
             },
         ];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1291,8 +1990,7 @@ mod tests {
             read_only: true,
             external: false,
         }];
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let vol_args: Vec<&str> = args
             .windows(2)
@@ -1320,8 +2018,7 @@ mod tests {
                 host_port: Some("8443".to_string()),
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "127.0.0.1:8443:443/tcp");
@@ -1337,8 +2034,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "0.0.0.0::80/tcp");
@@ -1354,8 +2050,7 @@ mod tests {
                 host_port: None,
             }],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         // When both host_ip and host_port are None, just the container port.
@@ -1378,8 +2073,7 @@ mod tests {
                 },
             ],
         );
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         let port_count = args.iter().filter(|a| *a == "-p").count();
         assert_eq!(port_count, 2);
@@ -1389,8 +2083,7 @@ mod tests {
     fn build_create_args_empty_entrypoint_is_skipped() {
         let mut opts = minimal_create_opts();
         opts.entrypoint = Some(Vec::new());
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),
@@ -1401,8 +2094,7 @@ mod tests {
     #[test]
     fn build_create_args_none_entrypoint_is_skipped() {
         let opts = minimal_create_opts();
-        let staging = PathBuf::from("/tmp/staging");
-        let args = build_create_args(&opts, &staging);
+        let args = build_create_args(&opts, &[]);
 
         assert!(
             !args.contains(&"--entrypoint".to_string()),
@@ -1414,36 +2106,28 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_ports() {
+        let mut config = test_config(Some("p1"));
+        config.published_ports = Some(vec![
+            crate::sdk::types::PublishedPort {
+                container_port: Some(80),
+                host_port: Some(8080),
+                proto: Some("tcp".to_string()),
+            },
+            crate::sdk::types::PublishedPort {
+                container_port: Some(443),
+                host_port: None,
+                proto: None,
+            },
+            // Port entry missing container_port should be filtered out.
+            crate::sdk::types::PublishedPort {
+                container_port: None,
+                host_port: Some(9999),
+                proto: None,
+            },
+        ]);
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("running".to_string()),
-                exit_code: None,
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("p1".to_string()),
-                name: Some("with-ports".to_string()),
-                image: Some("nginx".to_string()),
-                labels: None,
-                published_ports: Some(vec![
-                    crate::sdk::types::PublishedPort {
-                        container_port: Some(80),
-                        host_port: Some(8080),
-                        protocol: Some("tcp".to_string()),
-                    },
-                    crate::sdk::types::PublishedPort {
-                        container_port: Some(443),
-                        host_port: None,
-                        protocol: None,
-                    },
-                    // Port entry missing container_port should be filtered out.
-                    crate::sdk::types::PublishedPort {
-                        container_port: None,
-                        host_port: Some(9999),
-                        protocol: None,
-                    },
-                ]),
-                mounts: None,
-            }),
+            status: Some(test_status("running")),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1458,44 +2142,46 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_mounts() {
+        let mut config = test_config(Some("m1"));
+        config.mounts = Some(vec![
+            crate::sdk::types::MountEntry {
+                source: Some("/host".to_string()),
+                destination: Some("/container".to_string()),
+                fs_type: Some(FilesystemType::Virtiofs(serde_json::Value::Null)),
+            },
+            crate::sdk::types::MountEntry {
+                source: Some("/var/lib/volumes/data".to_string()),
+                destination: Some("/data".to_string()),
+                fs_type: Some(FilesystemType::Volume {
+                    name: Some("data".to_string()),
+                }),
+            },
+        ]);
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("m1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: Some(vec![crate::sdk::types::MountEntry {
-                    source: Some("/host".to_string()),
-                    destination: Some("/container".to_string()),
-                    mount_type: Some("bind".to_string()),
-                }]),
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
-        assert_eq!(info.mounts.len(), 1);
+        assert_eq!(info.mounts.len(), 2);
         assert_eq!(info.mounts[0].source, "/host");
         assert_eq!(info.mounts[0].destination, "/container");
         assert_eq!(info.mounts[0].mount_type, "bind");
+        // Volume mounts surface the volume name, not the storage path.
+        assert_eq!(info.mounts[1].source, "data");
+        assert_eq!(info.mounts[1].mount_type, "volume");
     }
 
     #[test]
     fn entry_to_container_info_with_config_hash_label() {
+        let mut config = test_config(Some("h1"));
+        config.labels = Some(HashMap::from([(
+            "dev.cella.config_hash".to_string(),
+            "abc123hash".to_string(),
+        )]));
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("h1".to_string()),
-                name: None,
-                image: None,
-                labels: Some(HashMap::from([(
-                    "dev.cella.config_hash".to_string(),
-                    "abc123hash".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1504,19 +2190,14 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_with_created_at_label() {
+        let mut config = test_config(Some("ca1"));
+        config.labels = Some(HashMap::from([(
+            "dev.cella.created_at".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )]));
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("ca1".to_string()),
-                name: None,
-                image: None,
-                labels: Some(HashMap::from([(
-                    "dev.cella.created_at".to_string(),
-                    "2026-01-01T00:00:00Z".to_string(),
-                )])),
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1526,36 +2207,19 @@ mod tests {
     #[test]
     fn entry_to_container_info_unknown_state() {
         let entry = ContainerListEntry {
-            status: Some(crate::sdk::types::ContainerStatus {
-                state: Some("paused".to_string()),
-                exit_code: None,
-            }),
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("u1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            status: Some(test_status("stopping")),
+            configuration: Some(test_config(Some("u1"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
-        assert_eq!(info.state, ContainerState::Other("paused".to_string()));
+        assert_eq!(info.state, ContainerState::Other("stopping".to_string()));
     }
 
     #[test]
     fn entry_to_container_info_no_status_defaults_to_unknown() {
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("ns1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: None,
-            }),
+            configuration: Some(test_config(Some("ns1"))),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1564,20 +2228,15 @@ mod tests {
 
     #[test]
     fn entry_to_container_info_empty_mount_fields() {
+        let mut config = test_config(Some("em1"));
+        config.mounts = Some(vec![crate::sdk::types::MountEntry {
+            source: None,
+            destination: None,
+            fs_type: None,
+        }]);
         let entry = ContainerListEntry {
             status: None,
-            configuration: Some(crate::sdk::types::ContainerConfiguration {
-                id: Some("em1".to_string()),
-                name: None,
-                image: None,
-                labels: None,
-                published_ports: None,
-                mounts: Some(vec![crate::sdk::types::MountEntry {
-                    source: None,
-                    destination: None,
-                    mount_type: None,
-                }]),
-            }),
+            configuration: Some(config),
         };
 
         let info = entry_to_container_info(&entry).unwrap();
@@ -1587,7 +2246,87 @@ mod tests {
         assert_eq!(info.mounts[0].mount_type, "");
     }
 
-    // -- Additional parse_image_details_best_effort edge cases ----------------
+    #[test]
+    fn parse_image_details_one_zero_variants() {
+        let raw = r#"[{
+            "id": "abc",
+            "configuration": {
+                "name": "ghcr.io/foo/devimage:latest",
+                "creationDate": 771234567.0,
+                "descriptor": { "digest": "sha256:abc", "size": 1 }
+            },
+            "variants": [
+                {
+                    "platform": { "architecture": "amd64", "os": "linux" },
+                    "digest": "sha256:d1",
+                    "size": 100,
+                    "config": {
+                        "architecture": "amd64",
+                        "os": "linux",
+                        "config": { "User": "intel-user", "Env": ["A=1"] }
+                    }
+                },
+                {
+                    "platform": { "architecture": "arm64", "os": "linux" },
+                    "digest": "sha256:d2",
+                    "size": 100,
+                    "config": {
+                        "architecture": "arm64",
+                        "os": "linux",
+                        "config": {
+                            "User": "vscode",
+                            "Env": ["PATH=/usr/bin", "HOME=/home/vscode"],
+                            "Labels": {
+                                "devcontainer.metadata": "[{\"remoteUser\":\"vscode\"}]"
+                            }
+                        }
+                    }
+                }
+            ]
+        }]"#;
+
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
+        assert_eq!(user, "vscode", "must pick the arm64 variant");
+        assert_eq!(env, vec!["PATH=/usr/bin", "HOME=/home/vscode"]);
+        assert!(metadata.is_some());
+
+        let (user, _, _) = parse_image_details(raw, "amd64");
+        assert_eq!(user, "intel-user", "must pick the amd64 variant");
+    }
+
+    #[test]
+    fn parse_image_details_falls_back_to_first_variant() {
+        let raw = r#"[{
+            "variants": [
+                {
+                    "platform": { "architecture": "amd64", "os": "linux" },
+                    "config": { "config": { "User": "only-user" } }
+                }
+            ]
+        }]"#;
+
+        let (user, _, _) = parse_image_details(raw, "arm64");
+        assert_eq!(
+            user, "only-user",
+            "no arch match should fall back to the first variant"
+        );
+    }
+
+    #[test]
+    fn parse_image_details_empty_variants() {
+        let raw = r#"[{ "variants": [] }]"#;
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
+        assert_eq!(user, "root");
+        assert!(env.is_empty());
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn host_oci_arch_is_known_value() {
+        assert!(matches!(host_oci_arch(), "arm64" | "amd64"));
+    }
+
+    // -- Additional parse_image_details edge cases -----------------------------
 
     #[test]
     fn parse_image_details_lowercase_keys() {
@@ -1600,7 +2339,7 @@ mod tests {
                 }
             }
         }"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "app");
         assert_eq!(env, vec!["PATH=/usr/bin"]);
         assert!(metadata.is_some());
@@ -1614,7 +2353,7 @@ mod tests {
                 "Env": ["LANG=C"]
             }
         }"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "deploy");
         assert_eq!(env, vec!["LANG=C"]);
         assert!(metadata.is_none());
@@ -1623,7 +2362,7 @@ mod tests {
     #[test]
     fn parse_image_details_user_with_colon() {
         let raw = r#"{"Config": {"User": "1000:1000"}}"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "1000");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -1632,14 +2371,14 @@ mod tests {
     #[test]
     fn parse_image_details_empty_user_stays_root() {
         let raw = r#"{"Config": {"User": ""}}"#;
-        let (user, _, _) = parse_image_details_best_effort(raw);
+        let (user, _, _) = parse_image_details(raw, "arm64");
         assert_eq!(user, "root");
     }
 
     #[test]
     fn parse_image_details_no_labels() {
         let raw = r#"{"Config": {"User": "web", "Env": []}}"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "web");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -1648,7 +2387,7 @@ mod tests {
     #[test]
     fn parse_image_details_env_with_non_string_values() {
         let raw = r#"{"Config": {"Env": ["GOOD=val", 42, null]}}"#;
-        let (_, env, _) = parse_image_details_best_effort(raw);
+        let (_, env, _) = parse_image_details(raw, "arm64");
         // Only string values should be collected.
         assert_eq!(env, vec!["GOOD=val"]);
     }

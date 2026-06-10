@@ -48,7 +48,7 @@ graph TD
 |---|---|---|
 | `cella-backend` | Foundation | Trait definitions, shared types, error types, naming/label utilities, mount abstractions, container target resolution |
 | `cella-docker` | Domain | Docker Engine implementation via bollard, socket discovery, config mapping to Docker API, network/volume management |
-| `cella-container` | Domain | Apple Container implementation via CLI subprocess, staging directory file injection, best-effort OCI image parsing |
+| `cella-container` | Domain | Apple Container implementation via CLI subprocess (1.0.0+), `container cp` file injection, OCI variant image parsing |
 | `cella-doctor` | Domain | Runtime availability checks, engine version validation, security advisory detection |
 
 ## Backend Trait
@@ -369,49 +369,70 @@ Compose-managed containers additionally carry `dev.cella.compose_project` and `d
 
 The Apple Container backend drives the macOS-native container runtime through the `container` CLI binary. The runtime uses Apple's Virtualization.framework (vz) to run Linux containers as lightweight VMs on Apple Silicon, providing near-native performance without a third-party hypervisor. The backend implements `ContainerBackend` by translating trait method calls into CLI subprocess invocations via `ContainerCli`.
 
+Discovery requires Apple Container **1.0.0 or newer**: the probe runs `container system version --format json`, and older releases are rejected with `DiscoveryError::UnsupportedVersion` (their structured-output shapes are incompatible and they lack `container cp`). A binary that fails the version probe but answers `container system status` is classified as a pre-1.0 Apple CLI; anything else is rejected as a foreign binary.
+
 Key differences from the Docker backend:
 
 | Aspect | Docker | Apple Container |
 |---|---|---|
 | API client | bollard (async Rust, Docker Engine API) | CLI subprocess (`container` binary) |
-| Compose | Supported | Not supported |
-| Agent provisioning | Shared Docker volume | Not supported |
-| Network management | Docker bridge networks | Not supported (returns `NotSupported`) |
-| Host gateway | `host.docker.internal` | `host.local` |
-| Mount types | bind, volume, tmpfs, npipe | bind (via `--volume` flag) |
+| Compose | Supported | Not supported (no compose equivalent exists) |
+| Agent provisioning | Shared Docker volume | Not supported (see below) |
+| Network management | Docker bridge networks; connect any time | vmnet networks; attachments fixed at creation (macOS 26+) |
+| Host gateway | `host.docker.internal` | `host.container.internal` (requires one-time `sudo container system dns create`) |
+| Mount types | bind, volume, tmpfs, npipe | bind (`-v src:dst[:ro]`), named volume (`-v name:dst`), tmpfs (`--tmpfs`) |
 | State mapping | Docker's `exited`/`dead` -> `Stopped` | Apple's `stopped` -> `Stopped` |
+| Exit codes | Reported via inspect | Not reported (`ContainerInfo::exit_code` is `None`) |
+
+### Networks
+
+On macOS 26+ the backend manages the same network topology as Docker: the shared `cella` network plus per-workspace `cella-net-{hash}` networks, all labeled `dev.cella.managed=true` (workspace networks additionally carry `dev.cella.repo`). Naming and labels come from `cella_backend::network`, so `cella list`, `cella prune`, and `cella down --rm` behave identically across backends.
+
+vmnet fixes attachments at creation: `create_container` ensures the networks exist and passes `--network` flags, and `ensure_container_network` verifies the create-time attachments instead of connecting afterwards (a container created before network support reports `NotSupported` until recreated). `get_container_ip` reads the live attachment address, preferring the `cella` network.
+
+The network subcommands do not exist on macOS 15. A one-shot probe (`container network ls`) detects this and the backend degrades gracefully: containers attach to the default vmnet network and the network trait methods report `NotSupported`.
+
+### Managed Agent (not supported)
+
+`capabilities().managed_agent` is `false`. The blocker is connectivity, not volume mechanics: the in-container cella-agent must dial the host daemon (`CELLA_DAEMON_ADDR={host_gateway}:{control_port}`), and the daemon's control listener binds `127.0.0.1` only. Docker Desktop, OrbStack, and Colima forward `host.docker.internal` into the host loopback; Apple Container has no automatic equivalent:
+
+- The vmnet gateway IP (e.g. `192.168.64.1`) reaches the host's bridge interface but **not** loopback-bound services. Using it would require the daemon to bind `0.0.0.0` or the bridge interface — a security-posture change (token-authenticated, but exposed beyond loopback) and a lifecycle problem (the bridge interface only exists while a container runs).
+- Apple's `container system dns create <domain> --localhost <ip>` does reach loopback via a pf redirect, but requires sudo, disables iCloud Private Relay, and the pf rule is lost on reboot — too fragile to depend on silently.
+
+Everything else needed for agent support exists in 1.0.0 (named volumes, `container cp` for populating them). If a daemon bind-address policy for non-loopback listeners is decided, agent provisioning can mirror the Docker volume flow. `host_gateway()` returns `host.container.internal` so injected URLs work for users who have run the one-time DNS setup.
 
 ### File Injection
 
-Without Docker's tar-upload API, the Apple Container backend uses a staging directory pattern for file injection:
+File injection uses the native `container cp` command (added in 1.0.0):
 
-1. Create a host-side staging directory at `~/.cache/cella/containers/{container-name}/`.
-2. Mount the staging directory into the container at `/tmp/.cella-staging`.
-3. Write files to the host staging directory.
-4. Execute `cp` inside the container to move files from the staging mount to their final paths.
-5. Execute `chmod` to set correct permissions.
-
-The staging directory is cleaned up when the container is removed with `remove_volumes: true`.
+1. Execute `mkdir -p` inside the container for the destination's parent directory.
+2. Write the content to a host temp file and run `container cp <tmp> <id>:<path>`.
+3. Execute `chown 0:0` and `chmod` to normalize ownership and permissions.
 
 ### Image Inspection
 
-Image metadata parsing uses best-effort extraction from the raw `container image inspect` JSON output. The parser checks multiple key paths for Docker/OCI compatibility:
+`container image inspect` emits an array of image resources whose `variants[]` carry full OCI image configs. The parser selects the variant matching the host architecture (falling back to the first variant) and reads the OCI `config` object:
 
-- `Config.User` / `config.user` / `container_config.User` -- user field (colon-delimited, only the user portion is extracted; defaults to `"root"` if empty)
-- `Config.Env` / `config.env` -- environment variable array
-- `Config.Labels` / `config.labels` -> `devcontainer.metadata` -- raw metadata JSON string
+- `config.User` -- user field (colon-delimited, only the user portion is extracted; defaults to `"root"` if empty)
+- `config.Env` -- environment variable array
+- `config.Labels` -> `devcontainer.metadata` -- raw metadata JSON string
 
-### Unsupported Docker Options
+Docker-style top-level `Config` objects are still recognized as a fallback.
 
-When Docker-specific creation flags are present, the Apple Container backend MUST emit warnings and proceed:
+### runArgs Mapping
+
+runArgs with native equivalents are passed through; the rest MUST emit warnings and proceed:
 
 | Flag | Behavior |
 |---|---|
+| `--cap-add` | Passed through (`container create --cap-add`) |
+| `--memory`, `--cpus`, `--shm-size` | Passed through; nano-CPUs round up to whole vCPUs |
+| `--init`, `--dns`, `--dns-search`, `--ulimit`, `--tmpfs`, `--label`, `--runtime` | Passed through |
 | `--privileged` | Warning emitted, ignored |
-| `--cap-add` | Warning emitted, ignored |
 | `--security-opt` | Warning emitted, ignored |
 | `--gpus` / `gpu_request` | Warning emitted, ignored |
 | `--device` | Warning emitted, ignored |
+| Namespace/cgroup/restart flags (`--pid`, `--ipc`, `--uts`, `--userns`, `--cgroupns`, `--restart`, ...) | One consolidated warning listing the ignored flags |
 | Unrecognized `runArgs` | Warning emitted, ignored |
 
 ## Docker Compose Configuration
@@ -495,9 +516,9 @@ The Apple Container CLI is discovered through a separate process:
 
 1. **`CELLA_CONTAINER_PATH` env var** -- explicit override pointing to the `container` binary.
 2. **PATH search** -- locate `container` in the system `PATH`.
-3. **Validation** -- confirm the binary is Apple's Container CLI (not a coincidental name collision):
-   - Primary: `container version --format json` -- parse JSON output for version info. An entry with `appName` containing "container" (case-insensitive) or any entry with a version field is accepted.
-   - Fallback: `container system status` -- confirms the binary is a working Apple Container CLI when the version plugin is not installed (common with `.pkg` installs).
+3. **Validation** -- confirm the binary is Apple's Container CLI (not a coincidental name collision) and enforce the minimum version:
+   - Primary: `container system version --format json` -- parse JSON output for version info. An entry with `appName` containing "container" (case-insensitive) or any entry with a version field is accepted. Versions below 1.0.0 are rejected as `DiscoveryError::UnsupportedVersion`; an unparseable version string fails open (the gate exists to reject known-old releases).
+   - Classifier: when the version probe fails, `container system status` distinguishes a pre-1.0 Apple CLI (rejected as outdated) from a foreign binary (rejected as not Apple's tool).
 
 ### Runtime Health Checks
 
@@ -755,7 +776,7 @@ The Docker backend's `connect_with_host` method accepts TCP URLs, enabling conne
 
 ## Limitations
 
-- **Apple Container CLI stability.** The `container` CLI output format is pre-1.0 and may change between macOS releases. The backend uses best-effort JSON parsing with multiple key-path fallbacks to tolerate format changes.
+- **Apple Container host connectivity.** Containers cannot reach loopback-bound host services without the one-time `sudo container system dns create` setup, which blocks managed-agent support (see the Apple Container Backend section). Serde parsing stays tolerant (`#[serde(default)]`, unknown keys ignored) so additive CLI output changes don't break the backend.
 - **Container label immutability.** Docker container labels and environment variables are immutable after creation. Configuration changes that affect labels require container recreation.
 - **macOS container-IP routing.** Colima and Docker Desktop for Mac run containers inside a VM. Container IPs are not routable from the host. Port access requires explicit forwarding through the daemon's tunnel infrastructure. OrbStack is the exception -- its native `.local` domain routing provides direct container access.
 
