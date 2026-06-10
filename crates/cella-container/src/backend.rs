@@ -61,6 +61,26 @@ impl AppleContainerBackend {
             .await
     }
 
+    /// Exec a command as root inside the container, mapping a non-zero exit
+    /// to a runtime error labeled with `action`.
+    async fn exec_root_checked(
+        &self,
+        container_id: &str,
+        cmd: &[String],
+        action: &str,
+    ) -> Result<(), BackendError> {
+        let (exit_code, _, stderr) = self
+            .cli
+            .exec_capture(container_id, cmd, Some("root"), None, None)
+            .await?;
+        if exit_code != 0 {
+            return Err(BackendError::Runtime(
+                format!("{action} failed: {stderr}").into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Check whether a network with the given name exists.
     async fn named_network_exists(&self, name: &str) -> Result<bool, BackendError> {
         let networks = self.cli.network_list().await?;
@@ -134,6 +154,34 @@ impl AppleContainerBackend {
 
         networks
     }
+}
+
+/// Deduplicated parent directories for an upload batch, in first-seen order.
+fn upload_parent_dirs(files: &[FileToUpload]) -> Vec<String> {
+    let mut parents: Vec<String> = Vec::new();
+    for file in files {
+        let Some(parent) = Path::new(&file.path).parent() else {
+            continue;
+        };
+        let parent = parent.to_string_lossy().into_owned();
+        if !parent.is_empty() && !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+    parents
+}
+
+/// Group uploaded file paths by requested mode (sorted for determinism).
+fn files_by_mode(files: &[FileToUpload]) -> std::collections::BTreeMap<u32, Vec<String>> {
+    let mut by_mode: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for file in files {
+        by_mode
+            .entry(file.mode)
+            .or_default()
+            .push(file.path.clone());
+    }
+    by_mode
 }
 
 /// Build a `NotSupported` error for a network operation, mentioning the
@@ -533,20 +581,27 @@ impl ContainerBackend for AppleContainerBackend {
         files: &'a [FileToUpload],
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
-            for file in files {
-                // Ensure the parent directory exists inside the container.
-                if let Some(parent) = Path::new(&file.path).parent() {
-                    let mkdir_cmd = vec![
-                        "mkdir".to_string(),
-                        "-p".to_string(),
-                        parent.to_string_lossy().to_string(),
-                    ];
-                    let _ = self
-                        .cli
-                        .exec_capture(container_id, &mkdir_cmd, Some("root"), None, None)
-                        .await;
-                }
+            if files.is_empty() {
+                return Ok(());
+            }
 
+            // Every CLI call is a subprocess, so metadata operations are
+            // batched: one mkdir for all parents, one cp per file (the CLI
+            // accepts a single source/destination pair), one chown for all
+            // files, and one chmod per distinct mode.
+            let parents = upload_parent_dirs(files);
+            if !parents.is_empty() {
+                let mut mkdir_cmd = vec!["mkdir".to_string(), "-p".to_string()];
+                mkdir_cmd.extend(parents);
+                // Best-effort, matching the old per-file behavior: existing
+                // directories are fine and cp reports real failures.
+                let _ = self
+                    .cli
+                    .exec_capture(container_id, &mkdir_cmd, Some("root"), None, None)
+                    .await;
+            }
+
+            for file in files {
                 // Stage the content in a host temp file and copy it in.
                 // The temp file is removed when `tmp` drops.
                 let tmp = tempfile::NamedTempFile::new()?;
@@ -554,35 +609,21 @@ impl ContainerBackend for AppleContainerBackend {
                 self.cli
                     .cp_into(tmp.path(), container_id, &file.path)
                     .await?;
+            }
 
-                // `container cp` preserves host-side metadata; normalize to
-                // the root ownership and explicit mode the old exec-based
-                // copy produced.
-                let chown_cmd = vec!["chown".to_string(), "0:0".to_string(), file.path.clone()];
-                let (exit_code, _, stderr) = self
-                    .cli
-                    .exec_capture(container_id, &chown_cmd, Some("root"), None, None)
-                    .await?;
-                if exit_code != 0 {
-                    return Err(BackendError::Runtime(
-                        format!("chown failed for {}: {stderr}", file.path).into(),
-                    ));
-                }
+            // `container cp` preserves host-side metadata; normalize to the
+            // root ownership and explicit modes the old exec-based copy
+            // produced.
+            let mut chown_cmd = vec!["chown".to_string(), "0:0".to_string()];
+            chown_cmd.extend(files.iter().map(|f| f.path.clone()));
+            self.exec_root_checked(container_id, &chown_cmd, "chown")
+                .await?;
 
-                let chmod_cmd = vec![
-                    "chmod".to_string(),
-                    format!("{:o}", file.mode),
-                    file.path.clone(),
-                ];
-                let (exit_code, _, stderr) = self
-                    .cli
-                    .exec_capture(container_id, &chmod_cmd, Some("root"), None, None)
+            for (mode, paths) in files_by_mode(files) {
+                let mut chmod_cmd = vec!["chmod".to_string(), format!("{mode:o}")];
+                chmod_cmd.extend(paths);
+                self.exec_root_checked(container_id, &chmod_cmd, "chmod")
                     .await?;
-                if exit_code != 0 {
-                    return Err(BackendError::Runtime(
-                        format!("chmod failed for {}: {stderr}", file.path).into(),
-                    ));
-                }
             }
 
             Ok(())
@@ -1672,6 +1713,55 @@ mod tests {
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn upload_parent_dirs_dedupes_in_order() {
+        let files = vec![
+            FileToUpload {
+                path: "/etc/app/one.conf".to_string(),
+                content: Vec::new(),
+                mode: 0o644,
+            },
+            FileToUpload {
+                path: "/etc/app/two.conf".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/home/user/.ssh/config".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+        ];
+        assert_eq!(
+            upload_parent_dirs(&files),
+            vec!["/etc/app", "/home/user/.ssh"]
+        );
+    }
+
+    #[test]
+    fn files_by_mode_groups_paths() {
+        let files = vec![
+            FileToUpload {
+                path: "/a".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+            FileToUpload {
+                path: "/b".to_string(),
+                content: Vec::new(),
+                mode: 0o755,
+            },
+            FileToUpload {
+                path: "/c".to_string(),
+                content: Vec::new(),
+                mode: 0o600,
+            },
+        ];
+        let groups = files_by_mode(&files);
+        assert_eq!(groups[&0o600], vec!["/a", "/c"]);
+        assert_eq!(groups[&0o755], vec!["/b"]);
     }
 
     #[test]
