@@ -212,10 +212,8 @@ async fn query_version(binary: &Path) -> Result<String, String> {
 
     // If we got valid JSON with at least one entry, accept it even if the
     // app_name doesn't exactly match — the CLI format may evolve.
-    if let Some(first) = entries.first()
-        && first.version.is_some()
-    {
-        return Ok(first.version.clone().unwrap_or_default());
+    if let Some(version) = entries.first().and_then(|e| e.version.clone()) {
+        return Ok(version);
     }
 
     Err("no recognizable Apple Container version entry found".to_string())

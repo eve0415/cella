@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use cella_backend::BackendError;
 use tracing::debug;
 
-use self::run::{run_cli, run_cli_json, run_cli_owned};
+use self::run::{run_cli, run_cli_checked, run_cli_checked_owned, run_cli_json, run_cli_owned};
 
 /// Handle to a discovered Apple Container CLI binary.
 pub struct ContainerCli {
@@ -52,10 +52,7 @@ impl ContainerCli {
     pub async fn create(&self, args: &[String]) -> Result<String, BackendError> {
         let mut cli_args = vec!["create".to_string()];
         cli_args.extend_from_slice(args);
-        let output = run_cli_owned(&self.binary_path, &cli_args).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
+        let output = run_cli_checked_owned(&self.binary_path, &cli_args).await?;
         Ok(output.stdout.trim().to_string())
     }
 
@@ -65,11 +62,9 @@ impl ContainerCli {
     ///
     /// Returns an error if the CLI exits non-zero or cannot be spawned.
     pub async fn start(&self, id: &str) -> Result<(), BackendError> {
-        let output = run_cli(&self.binary_path, &["start", id]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
-        Ok(())
+        run_cli_checked(&self.binary_path, &["start", id])
+            .await
+            .map(drop)
     }
 
     /// Stop a running container.
@@ -78,11 +73,9 @@ impl ContainerCli {
     ///
     /// Returns an error if the CLI exits non-zero or cannot be spawned.
     pub async fn stop(&self, id: &str) -> Result<(), BackendError> {
-        let output = run_cli(&self.binary_path, &["stop", id]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
-        Ok(())
+        run_cli_checked(&self.binary_path, &["stop", id])
+            .await
+            .map(drop)
     }
 
     /// Remove a container.
@@ -91,11 +84,9 @@ impl ContainerCli {
     ///
     /// Returns an error if the CLI exits non-zero or cannot be spawned.
     pub async fn rm(&self, id: &str) -> Result<(), BackendError> {
-        let output = run_cli(&self.binary_path, &["rm", id]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
-        Ok(())
+        run_cli_checked(&self.binary_path, &["rm", id])
+            .await
+            .map(drop)
     }
 
     /// Inspect a container and return its full metadata.
@@ -202,11 +193,9 @@ impl ContainerCli {
     /// Returns an error if the CLI exits non-zero or cannot be spawned.
     pub async fn pull(&self, image: &str) -> Result<(), BackendError> {
         debug!(image, "pulling image");
-        let output = run_cli(&self.binary_path, &["image", "pull", image]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(output.stderr.into()));
-        }
-        Ok(())
+        run_cli_checked(&self.binary_path, &["image", "pull", image])
+            .await
+            .map(drop)
     }
 
     /// Build an image from a Dockerfile.
@@ -307,13 +296,14 @@ impl ContainerCli {
             host_path.to_string_lossy().into_owned(),
             format!("{id}:{container_path}"),
         ];
-        let output = run_cli_owned(&self.binary_path, &args).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(
-                format!("container cp to {container_path} failed: {}", output.stderr).into(),
-            ));
-        }
-        Ok(())
+        run_cli_checked_owned(&self.binary_path, &args)
+            .await
+            .map(drop)
+            .map_err(|e| {
+                BackendError::Runtime(
+                    format!("container cp to {container_path} failed: {e}").into(),
+                )
+            })
     }
 
     // -- Network operations (macOS 26+) --
@@ -336,13 +326,10 @@ impl ContainerCli {
         }
         args.push(name.to_string());
 
-        let output = run_cli_owned(&self.binary_path, &args).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(
-                format!("network create {name} failed: {}", output.stderr).into(),
-            ));
-        }
-        Ok(())
+        run_cli_checked_owned(&self.binary_path, &args)
+            .await
+            .map(drop)
+            .map_err(|e| BackendError::Runtime(format!("network create {name} failed: {e}").into()))
     }
 
     /// List networks.
@@ -361,13 +348,10 @@ impl ContainerCli {
     ///
     /// Returns an error if the CLI exits non-zero or cannot be spawned.
     pub async fn network_delete(&self, name: &str) -> Result<(), BackendError> {
-        let output = run_cli(&self.binary_path, &["network", "delete", name]).await?;
-        if output.exit_code != 0 {
-            return Err(BackendError::Runtime(
-                format!("network delete {name} failed: {}", output.stderr).into(),
-            ));
-        }
-        Ok(())
+        run_cli_checked(&self.binary_path, &["network", "delete", name])
+            .await
+            .map(drop)
+            .map_err(|e| BackendError::Runtime(format!("network delete {name} failed: {e}").into()))
     }
 }
 
