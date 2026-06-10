@@ -376,7 +376,7 @@ pub enum ManagementResponse {
     /// SSH-agent bridge registered (or refcount bumped). `bridge_port` is
     /// the localhost TCP port the in-container `cella-agent` should
     /// connect to (reachable from the container as `host.docker.internal`,
-    /// `host.local`, or the equivalent host-gateway hostname). `refcount`
+    /// `host.container.internal`, or the equivalent host-gateway hostname). `refcount`
     /// is the post-register count; `1` means a fresh bridge was created,
     /// `>1` means an existing one was reused.
     SshAgentProxyRegistered { bridge_port: u16, refcount: usize },

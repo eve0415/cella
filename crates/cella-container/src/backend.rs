@@ -514,16 +514,8 @@ impl ContainerBackend for AppleContainerBackend {
         image: &'a str,
     ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
         Box::pin(async move {
-            // The Apple Container CLI's image inspect format is not fully
-            // documented. For now we return sensible defaults and parse what
-            // we can from the raw JSON output.
-            // TODO: parse OCI image config for user, env, labels once the
-            // CLI output format stabilizes.
             let raw = self.cli.image_inspect(image).await?;
-
-            // Attempt to extract user and env from a JSON blob that might
-            // contain Docker-style config fields.
-            let (user, env, metadata) = parse_image_details_best_effort(&raw);
+            let (user, env, metadata) = parse_image_details(&raw, host_oci_arch());
 
             Ok(ImageDetails {
                 user,
@@ -608,9 +600,12 @@ impl ContainerBackend for AppleContainerBackend {
     }
 
     fn host_gateway(&self) -> &'static str {
-        // Apple Container uses the standard macOS localhost; containers
-        // can reach the host via this address when networking is enabled.
-        "host.local"
+        // Apple Container ships no automatic host alias. Apple's documented
+        // convention is a user-created localhost domain:
+        //   sudo container system dns create host.container.internal --localhost <ip>
+        // Returning that name makes cella's injected URLs work as soon as
+        // the user runs the one-time setup.
+        "host.container.internal"
     }
 
     // -- Platform detection --
@@ -1248,44 +1243,87 @@ fn entry_to_container_info(entry: &ContainerListEntry) -> Option<ContainerInfo> 
     })
 }
 
-/// Best-effort extraction of user, env, and metadata from raw image inspect JSON.
-fn parse_image_details_best_effort(raw: &str) -> (String, Vec<String>, Option<String>) {
+/// The OCI architecture string for the host (`arm64`/`amd64`).
+const fn host_oci_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+/// Extract user, env, and devcontainer metadata from `container image
+/// inspect` output.
+///
+/// The CLI emits an array of image resources whose `variants[].config`
+/// carry full OCI image configs; the variant matching `prefer_arch` wins,
+/// falling back to the first variant. Docker-style top-level `Config`
+/// objects are also recognized for robustness.
+fn parse_image_details(raw: &str, prefer_arch: &str) -> (String, Vec<String>, Option<String>) {
     let mut user = "root".to_string();
     let mut env = Vec::new();
     let mut metadata = None;
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        // Try Docker-style config paths.
-        let config = value
-            .get("Config")
-            .or_else(|| value.get("config"))
-            .or_else(|| value.get("container_config"));
-
-        if let Some(cfg) = config {
-            if let Some(u) = cfg.get("User").or_else(|| cfg.get("user"))
-                && let Some(u_str) = u.as_str()
-                && !u_str.is_empty()
-            {
-                // Take only the user part (before any colon).
-                user = u_str.split(':').next().unwrap_or(u_str).to_string();
-            }
-            if let Some(e) = cfg.get("Env").or_else(|| cfg.get("env"))
-                && let Some(arr) = e.as_array()
-            {
-                env = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
-            if let Some(labels) = cfg.get("Labels").or_else(|| cfg.get("labels"))
-                && let Some(md) = labels.get("devcontainer.metadata").and_then(|v| v.as_str())
-            {
-                metadata = Some(md.to_string());
-            }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(cfg) = find_oci_config(&value, prefer_arch)
+    {
+        if let Some(u) = cfg.get("User").or_else(|| cfg.get("user"))
+            && let Some(u_str) = u.as_str()
+            && !u_str.is_empty()
+        {
+            // Take only the user part (before any colon).
+            user = u_str.split(':').next().unwrap_or(u_str).to_string();
+        }
+        if let Some(e) = cfg.get("Env").or_else(|| cfg.get("env"))
+            && let Some(arr) = e.as_array()
+        {
+            env = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+        if let Some(labels) = cfg.get("Labels").or_else(|| cfg.get("labels"))
+            && let Some(md) = labels.get("devcontainer.metadata").and_then(|v| v.as_str())
+        {
+            metadata = Some(md.to_string());
         }
     }
 
     (user, env, metadata)
+}
+
+/// Locate the OCI runtime `config` object inside image inspect JSON,
+/// preferring the variant built for `prefer_arch`.
+fn find_oci_config<'v>(
+    value: &'v serde_json::Value,
+    prefer_arch: &str,
+) -> Option<&'v serde_json::Value> {
+    // The CLI wraps results in an array; tolerate a bare object too.
+    let resource = if let Some(arr) = value.as_array() {
+        arr.first()?
+    } else {
+        value
+    };
+
+    // 1.0.0 shape: image resource with per-platform variants.
+    if let Some(variants) = resource.get("variants").and_then(|v| v.as_array()) {
+        let preferred = variants.iter().find(|var| {
+            var.get("platform")
+                .and_then(|p| p.get("architecture"))
+                .and_then(|a| a.as_str())
+                == Some(prefer_arch)
+        });
+        let variant = preferred.or_else(|| variants.first())?;
+        return variant
+            .get("config")
+            .and_then(|img| img.get("config").or_else(|| img.get("Config")));
+    }
+
+    // Docker-style fallback.
+    resource
+        .get("Config")
+        .or_else(|| resource.get("config"))
+        .or_else(|| resource.get("container_config"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1614,7 +1652,7 @@ mod tests {
             }
         }"#;
 
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "vscode");
         assert_eq!(env.len(), 2);
         assert!(metadata.is_some());
@@ -1622,7 +1660,7 @@ mod tests {
 
     #[test]
     fn parse_image_details_empty_json() {
-        let (user, env, metadata) = parse_image_details_best_effort("{}");
+        let (user, env, metadata) = parse_image_details("{}", "arm64");
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -1630,7 +1668,7 @@ mod tests {
 
     #[test]
     fn parse_image_details_invalid_json() {
-        let (user, env, metadata) = parse_image_details_best_effort("not json");
+        let (user, env, metadata) = parse_image_details("not json", "arm64");
         assert_eq!(user, "root");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -2105,7 +2143,87 @@ mod tests {
         assert_eq!(info.mounts[0].mount_type, "");
     }
 
-    // -- Additional parse_image_details_best_effort edge cases ----------------
+    #[test]
+    fn parse_image_details_one_zero_variants() {
+        let raw = r#"[{
+            "id": "abc",
+            "configuration": {
+                "name": "ghcr.io/foo/devimage:latest",
+                "creationDate": 771234567.0,
+                "descriptor": { "digest": "sha256:abc", "size": 1 }
+            },
+            "variants": [
+                {
+                    "platform": { "architecture": "amd64", "os": "linux" },
+                    "digest": "sha256:d1",
+                    "size": 100,
+                    "config": {
+                        "architecture": "amd64",
+                        "os": "linux",
+                        "config": { "User": "intel-user", "Env": ["A=1"] }
+                    }
+                },
+                {
+                    "platform": { "architecture": "arm64", "os": "linux" },
+                    "digest": "sha256:d2",
+                    "size": 100,
+                    "config": {
+                        "architecture": "arm64",
+                        "os": "linux",
+                        "config": {
+                            "User": "vscode",
+                            "Env": ["PATH=/usr/bin", "HOME=/home/vscode"],
+                            "Labels": {
+                                "devcontainer.metadata": "[{\"remoteUser\":\"vscode\"}]"
+                            }
+                        }
+                    }
+                }
+            ]
+        }]"#;
+
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
+        assert_eq!(user, "vscode", "must pick the arm64 variant");
+        assert_eq!(env, vec!["PATH=/usr/bin", "HOME=/home/vscode"]);
+        assert!(metadata.is_some());
+
+        let (user, _, _) = parse_image_details(raw, "amd64");
+        assert_eq!(user, "intel-user", "must pick the amd64 variant");
+    }
+
+    #[test]
+    fn parse_image_details_falls_back_to_first_variant() {
+        let raw = r#"[{
+            "variants": [
+                {
+                    "platform": { "architecture": "amd64", "os": "linux" },
+                    "config": { "config": { "User": "only-user" } }
+                }
+            ]
+        }]"#;
+
+        let (user, _, _) = parse_image_details(raw, "arm64");
+        assert_eq!(
+            user, "only-user",
+            "no arch match should fall back to the first variant"
+        );
+    }
+
+    #[test]
+    fn parse_image_details_empty_variants() {
+        let raw = r#"[{ "variants": [] }]"#;
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
+        assert_eq!(user, "root");
+        assert!(env.is_empty());
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn host_oci_arch_is_known_value() {
+        assert!(matches!(host_oci_arch(), "arm64" | "amd64"));
+    }
+
+    // -- Additional parse_image_details edge cases -----------------------------
 
     #[test]
     fn parse_image_details_lowercase_keys() {
@@ -2118,7 +2236,7 @@ mod tests {
                 }
             }
         }"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "app");
         assert_eq!(env, vec!["PATH=/usr/bin"]);
         assert!(metadata.is_some());
@@ -2132,7 +2250,7 @@ mod tests {
                 "Env": ["LANG=C"]
             }
         }"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "deploy");
         assert_eq!(env, vec!["LANG=C"]);
         assert!(metadata.is_none());
@@ -2141,7 +2259,7 @@ mod tests {
     #[test]
     fn parse_image_details_user_with_colon() {
         let raw = r#"{"Config": {"User": "1000:1000"}}"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "1000");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -2150,14 +2268,14 @@ mod tests {
     #[test]
     fn parse_image_details_empty_user_stays_root() {
         let raw = r#"{"Config": {"User": ""}}"#;
-        let (user, _, _) = parse_image_details_best_effort(raw);
+        let (user, _, _) = parse_image_details(raw, "arm64");
         assert_eq!(user, "root");
     }
 
     #[test]
     fn parse_image_details_no_labels() {
         let raw = r#"{"Config": {"User": "web", "Env": []}}"#;
-        let (user, env, metadata) = parse_image_details_best_effort(raw);
+        let (user, env, metadata) = parse_image_details(raw, "arm64");
         assert_eq!(user, "web");
         assert!(env.is_empty());
         assert!(metadata.is_none());
@@ -2166,7 +2284,7 @@ mod tests {
     #[test]
     fn parse_image_details_env_with_non_string_values() {
         let raw = r#"{"Config": {"Env": ["GOOD=val", 42, null]}}"#;
-        let (_, env, _) = parse_image_details_best_effort(raw);
+        let (_, env, _) = parse_image_details(raw, "arm64");
         // Only string values should be collected.
         assert_eq!(env, vec!["GOOD=val"]);
     }
