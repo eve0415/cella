@@ -1,6 +1,6 @@
 {
   "name": "cella",
-  "image": "mcr.microsoft.com/devcontainers/rust:2.0.8-trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:2.0.11-trixie",
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {},
     "ghcr.io/devcontainers/features/node:1": {
@@ -10,7 +10,6 @@
     }
   },
   "postCreateCommand": "cargo install cargo-insta",
-  "postStartCommand": "npm install -g @openai/codex @google/gemini-cli",
   "customizations": {
     "vscode": {
       "extensions": [

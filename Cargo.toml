@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/eve0415/cella"
@@ -39,7 +39,7 @@ description = "A terminal-native devcontainer CLI built for the AI agent era"
 readme = "README.md"
 keywords = ["devcontainers", "containers", "cli", "docker", "vscode"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 
 [workspace.dependencies]
 # Async runtime
@@ -101,7 +101,7 @@ terminal_size = "=0.4.4"
 indicatif = "=0.18.4"
 
 # Timestamps
-chrono = { version = "=0.4.44", default-features = false, features = ["clock"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 
 # Tar archives
 tar = "=0.4.46"
@@ -120,7 +120,7 @@ flate2 = "=1.1.9"
 oci-distribution = { version = "=0.11.0", default-features = false, features = ["rustls-tls"] }
 
 # Pattern matching
-regex = "=1.12.3"
+regex = "=1.12.4"
 glob = "=0.3.3"
 
 # JSONC editing
@@ -129,7 +129,7 @@ jsonc-parser = { version = "=0.32.4", features = ["cst"] }
 # Certificate management
 rcgen = "=0.14.8"
 rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std"] }
-rustls-native-certs = "=0.8.3"
+rustls-native-certs = "=0.8.4"
 rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.4"
 tokio-stream = "=0.1.18"
@@ -154,7 +154,7 @@ quote = "=1.0.45"
 proc-macro2 = "=1.0.106"
 
 # UUID generation (phantom tokens)
-uuid = { version = "=1.23.2", features = ["v4"] }
+uuid = { version = "=1.23.3", features = ["v4"] }
 
 # Credential cache memory safety
 zeroize = "=1.8.2"
