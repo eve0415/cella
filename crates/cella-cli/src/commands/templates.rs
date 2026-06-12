@@ -6,6 +6,8 @@ use serde_json::Value;
 
 use cella_templates::{SelectedFeature, TemplateError, apply, fetcher, options};
 
+use super::LogLevel;
+
 /// Manage dev container templates.
 #[derive(Args)]
 pub struct TemplatesArgs {
@@ -63,18 +65,23 @@ pub struct TemplatesApplyArgs {
 
     /// Log verbosity level.
     #[arg(long = "log-level", value_enum, default_value = "info")]
-    pub log_level: TemplatesLogLevel,
-}
-
-/// Log level for the `templates apply` subcommand.
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum TemplatesLogLevel {
-    Info,
-    Debug,
-    Trace,
+    pub log_level: LogLevel,
 }
 
 impl TemplatesArgs {
+    /// Return the `--log-level` from the `apply` subcommand, if active.
+    ///
+    /// Called by [`super::Command::log_level`] so the global tracing filter is
+    /// seeded before dispatch — the same pattern used by `up` and
+    /// `run-user-commands`.
+    pub const fn apply_log_level(&self) -> Option<LogLevel> {
+        if let TemplatesCommand::Apply(args) = &self.command {
+            Some(args.log_level)
+        } else {
+            None
+        }
+    }
+
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             TemplatesCommand::Apply(args) => args.execute().await,

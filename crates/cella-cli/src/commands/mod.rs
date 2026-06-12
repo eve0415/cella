@@ -331,6 +331,7 @@ impl Command {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
+            Self::Templates(args) => args.apply_log_level(),
             _ => None,
         }
     }

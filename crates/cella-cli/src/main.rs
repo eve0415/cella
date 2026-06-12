@@ -974,6 +974,36 @@ mod tests {
     }
 
     #[test]
+    fn templates_apply_log_level_wired() {
+        use super::commands::LogLevel;
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn templates_apply_default_log_level_is_info() {
+        use super::commands::LogLevel;
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Info)));
+    }
+
+    #[test]
     fn up_log_format_json_accessor() {
         use super::commands::LogFormat;
         let cli = parse(&["cella", "up", "--log-format", "json"]).unwrap();
