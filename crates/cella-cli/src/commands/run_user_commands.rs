@@ -55,6 +55,20 @@ pub struct TargetArgs {
     workspace_folder: Option<PathBuf>,
 }
 
+impl TargetArgs {
+    pub(super) const fn container_id(&self) -> Option<&String> {
+        self.container_id.as_ref()
+    }
+
+    pub(super) fn id_labels(&self) -> &[String] {
+        &self.id_label
+    }
+
+    pub(super) const fn workspace_folder(&self) -> Option<&PathBuf> {
+        self.workspace_folder.as_ref()
+    }
+}
+
 /// Config-sourcing flags. `--config` layers an on-disk devcontainer.json on
 /// top of the container's metadata; `--override-config` replaces it.
 #[derive(Args)]
@@ -68,6 +82,16 @@ pub struct ConfigArgs {
     /// workspace folder (or built-in configuration).
     #[arg(long = "override-config")]
     override_config: Option<PathBuf>,
+}
+
+impl ConfigArgs {
+    pub(super) const fn config(&self) -> Option<&PathBuf> {
+        self.config.as_ref()
+    }
+
+    pub(super) const fn override_config(&self) -> Option<&PathBuf> {
+        self.override_config.as_ref()
+    }
 }
 
 /// Stop-after lifecycle-gating flags. Mirrors `runUserCommandsOptions`: there
@@ -91,6 +115,20 @@ pub struct GateArgs {
     stop_for_personalization: bool,
 }
 
+impl GateArgs {
+    pub(super) const fn skip_non_blocking_commands(&self) -> bool {
+        self.skip_non_blocking_commands
+    }
+
+    pub(super) const fn prebuild(&self) -> bool {
+        self.prebuild
+    }
+
+    pub(super) const fn stop_for_personalization(&self) -> bool {
+        self.stop_for_personalization
+    }
+}
+
 /// `postAttach`-related gating. Split from [`GateArgs`] purely to satisfy the
 /// bool-count lint; flattened it merges back into the same CLI surface.
 #[derive(Args)]
@@ -98,6 +136,12 @@ pub struct AttachArgs {
     /// Do not run `postAttachCommand`.
     #[arg(long = "skip-post-attach")]
     skip_post_attach: bool,
+}
+
+impl AttachArgs {
+    pub(super) const fn skip_post_attach(&self) -> bool {
+        self.skip_post_attach
+    }
 }
 
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
@@ -167,6 +211,12 @@ pub struct CompatArgs {
     /// Number of rows to render subprocess output for (compatibility no-op).
     #[arg(long = "terminal-rows", requires = "terminal_columns")]
     terminal_rows: Option<u16>,
+}
+
+impl CompatArgs {
+    pub(super) const fn secrets_file(&self) -> Option<&PathBuf> {
+        self.secrets_file.as_ref()
+    }
 }
 
 /// Re-run the user (lifecycle) commands against an existing dev container.
