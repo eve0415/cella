@@ -8,6 +8,7 @@ pub mod list;
 pub mod package;
 pub mod prompts;
 pub mod resolve;
+pub mod resolve_dependencies;
 pub mod update;
 
 use clap::{Args, Subcommand};
@@ -33,6 +34,8 @@ pub enum FeaturesCommand {
     List(list::ListArgs),
     /// Package local feature sources into distributable tarballs.
     Package(package::PackageArgs),
+    /// Resolve feature dependencies and print the installation order.
+    ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
@@ -59,6 +62,7 @@ impl FeaturesArgs {
             FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
             FeaturesCommand::Package(args) => args.execute(),
+            FeaturesCommand::ResolveDependencies(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
