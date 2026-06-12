@@ -1668,7 +1668,7 @@ impl UpArgs {
 
         // Docker Compose branch: if dockerComposeFile is present, delegate to compose flow
         if ctx.config().get("dockerComposeFile").is_some() {
-            return super::compose_up::compose_up(ctx, &self.result).await;
+            return Box::pin(super::compose_up::compose_up(ctx, &self.result)).await;
         }
 
         let mut result = ctx

@@ -369,7 +369,7 @@ impl Command {
 
     pub async fn execute(self, progress: Progress) -> miette::Result<()> {
         match self {
-            Self::Code(args) => args.execute(progress).await,
+            Self::Code(args) => Box::pin(args.execute(progress)).await,
             Self::Up(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Down(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Shell(args) => args.execute().await.map_err(boxed_err_to_report),
