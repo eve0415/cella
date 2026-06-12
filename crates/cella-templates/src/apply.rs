@@ -4,7 +4,7 @@
 //! `.devcontainer/` directory with JSONC or JSON output.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::TemplateError;
 use crate::types::{OutputFormat, SelectedFeature};
@@ -25,25 +25,58 @@ fn strip_jsonc(content: &str, file_name: &str) -> Result<String, TemplateError> 
 // Template option substitution
 // ---------------------------------------------------------------------------
 
-/// Substitute `${templateOption:key}` placeholders in content.
+/// Result of substituting `${templateOption:KEY}` placeholders into content.
+#[derive(Debug, Default)]
+pub struct SubstitutionReport {
+    /// Substituted content with all known tokens replaced (unknown tokens
+    /// become `""`).
+    pub content: String,
+    /// Tokens that appeared in the content but had no matching option key.
+    /// Callers should emit a warning per entry so users can diagnose typos.
+    pub unknown_tokens: Vec<String>,
+}
+
+/// Substitute `${templateOption:KEY}` placeholders in content.
 ///
-/// Replaces all occurrences of `${templateOption:<key>}` with the
-/// corresponding value from the options map.
+/// - **Known tokens**: replaced with the option value (stringified). Falsy
+///   values (`"false"`, `"0"`, `""`) are preserved as-is — only absent keys
+///   fall back to `""`.
+/// - **Unknown tokens**: substituted with `""` and recorded in
+///   [`SubstitutionReport::unknown_tokens`] so callers can warn the user.
+/// - **Whitespace tolerance**: `${templateOption: key }` (spaces around the
+///   key name) is matched and treated identically to `${templateOption:key}`.
+///
+/// This differs from the upstream `apply.ts` implementation which uses
+/// `options[token] || ''`, collapsing falsy values to empty string (a bug).
 pub fn substitute_template_options<S: std::hash::BuildHasher>(
     content: &str,
     options: &HashMap<String, serde_json::Value, S>,
-) -> String {
-    let mut result = content.to_owned();
-    for (key, value) in options {
-        let placeholder = format!("${{templateOption:{key}}}");
-        let replacement = match value {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            other => other.to_string(),
-        };
-        result = result.replace(&placeholder, &replacement);
+) -> SubstitutionReport {
+    // Regex: ${templateOption: key } — key is captured, whitespace trimmed.
+    // SAFETY: literal pattern, always valid.
+    let re = regex::Regex::new(r"\$\{templateOption:\s*(\w+?)\s*\}").expect("valid regex");
+
+    let mut unknown_tokens: Vec<String> = Vec::new();
+    let content_out = re.replace_all(content, |caps: &regex::Captures<'_>| {
+        let key = caps.get(1).map_or("", |m| m.as_str());
+        match options.get(key) {
+            Some(value) => match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            },
+            None => {
+                unknown_tokens.push(key.to_owned());
+                String::new()
+            }
+        }
+    });
+
+    SubstitutionReport {
+        content: content_out.into_owned(),
+        unknown_tokens,
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +239,7 @@ pub fn format_config(config: &serde_json::Value, format: OutputFormat) -> String
 }
 
 // ---------------------------------------------------------------------------
-// Template application
+// Template application (init path: copies into .devcontainer/)
 // ---------------------------------------------------------------------------
 
 /// Apply a template: extract files to the output directory, substitute
@@ -226,7 +259,7 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     features: &[SelectedFeature],
     format: OutputFormat,
     overrides: &ConfigOverrides,
-) -> Result<std::path::PathBuf, TemplateError> {
+) -> Result<PathBuf, TemplateError> {
     let devcontainer_dir = output_dir.join(".devcontainer");
     std::fs::create_dir_all(&devcontainer_dir)?;
 
@@ -262,7 +295,14 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     if source_config.exists() {
         let raw = std::fs::read_to_string(&source_config)?;
         let stripped = strip_jsonc(&raw, template_id)?;
-        let substituted = substitute_template_options(&stripped, options);
+        let report = substitute_template_options(&stripped, options);
+        // Unknown tokens in devcontainer.json: warn but continue (output compat).
+        for token in &report.unknown_tokens {
+            tracing::warn!(
+                "template {template_id}: unknown templateOption token '{token}' in devcontainer.json — substituting empty string"
+            );
+        }
+        let substituted = report.content;
         let mut config: serde_json::Value = serde_json::from_str(&substituted).map_err(|e| {
             let snippet: String = substituted.chars().take(80).collect();
             TemplateError::InvalidArtifact {
@@ -279,6 +319,157 @@ pub fn apply_template<S: std::hash::BuildHasher>(
     }
 
     Ok(config_path)
+}
+
+// ---------------------------------------------------------------------------
+// apply_to_workspace (official `templates apply` path: extracts to workspace root)
+// ---------------------------------------------------------------------------
+
+/// Always-excluded filenames in `templates apply` extraction.
+const ALWAYS_EXCLUDED: &[&str] = &["devcontainer-template.json", "README.md", "NOTES.md"];
+
+/// Apply a template to a workspace root directory, following the official
+/// `devcontainer templates apply` contract.
+///
+/// Unlike [`apply_template`] (which writes into `.devcontainer/`), this
+/// function extracts the full tarball contents to `workspace_folder`, mirroring
+/// the official CLI's extraction semantics.
+///
+/// Files excluded:
+/// - `devcontainer-template.json`, `README.md`, `NOTES.md` (always)
+/// - Any path matched by an entry in `omit_paths` (supports trailing `/*` globs)
+///
+/// Template option placeholders (`${templateOption:KEY}`) are substituted in
+/// text files; binary files (not valid UTF-8) are copied verbatim.
+///
+/// Returns a list of written paths relative to `workspace_folder`.
+///
+/// # Errors
+///
+/// Returns [`TemplateError`] on I/O errors or invalid template structure.
+pub fn apply_to_workspace<S: std::hash::BuildHasher>(
+    template_id: &str,
+    template_dir: &Path,
+    workspace_folder: &Path,
+    options: &HashMap<String, serde_json::Value, S>,
+    omit_paths: &[String],
+) -> Result<Vec<PathBuf>, TemplateError> {
+    std::fs::create_dir_all(workspace_folder)?;
+
+    // Compile omit-path patterns.
+    let omit_patterns: Vec<glob::Pattern> = omit_paths
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+
+    let mut written_files: Vec<PathBuf> = Vec::new();
+    extract_to_workspace(
+        template_dir,
+        workspace_folder,
+        template_id,
+        options,
+        template_dir,
+        &omit_patterns,
+        &mut written_files,
+    )?;
+
+    written_files.sort();
+    Ok(written_files)
+}
+
+/// Recursively walk `src`, apply substitution, write to `dest`, and collect
+/// relative paths of written files.
+fn extract_to_workspace<S: std::hash::BuildHasher>(
+    src: &Path,
+    dest: &Path,
+    template_id: &str,
+    options: &HashMap<String, serde_json::Value, S>,
+    template_root: &Path,
+    omit_patterns: &[glob::Pattern],
+    written_files: &mut Vec<PathBuf>,
+) -> Result<(), TemplateError> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        let src_path = entry.path();
+        let dest_path = dest.join(&file_name);
+
+        // Compute path relative to template root for exclusion matching.
+        let relative = src_path.strip_prefix(template_root).unwrap_or(&src_path);
+        let relative_str = relative.to_string_lossy();
+
+        // Always-excluded filenames (only at root level by name).
+        if ALWAYS_EXCLUDED
+            .iter()
+            .any(|ex| file_name.to_string_lossy() == *ex)
+        {
+            continue;
+        }
+
+        // Omit-path glob matching — check the entry itself.
+        if omit_patterns.iter().any(|pat| pat.matches(&relative_str)) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            // Also skip a directory if any omit pattern covers its children
+            // (e.g. `.github/*` → skip `.github` dir entirely).
+            let dir_prefix = format!("{relative_str}/");
+            if omit_patterns
+                .iter()
+                .any(|pat| pat.as_str().starts_with(&dir_prefix))
+            {
+                continue;
+            }
+
+            std::fs::create_dir_all(&dest_path)?;
+            extract_to_workspace(
+                &src_path,
+                &dest_path,
+                template_id,
+                options,
+                template_root,
+                omit_patterns,
+                written_files,
+            )?;
+        } else if file_type.is_file() {
+            write_substituted_file(template_id, &src_path, &dest_path, options)?;
+            // Record path relative to workspace folder (= relative to template root,
+            // since both share the same directory layout).
+            written_files.push(relative.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Write a single file to `dest`, substituting template options.
+///
+/// Text files: substituted and written as UTF-8.
+/// Binary files (invalid UTF-8): copied verbatim.
+fn write_substituted_file<S: std::hash::BuildHasher>(
+    template_id: &str,
+    src: &Path,
+    dest: &Path,
+    options: &HashMap<String, serde_json::Value, S>,
+) -> Result<(), TemplateError> {
+    match std::fs::read_to_string(src) {
+        Ok(content) => {
+            let report = substitute_template_options(&content, options);
+            for token in &report.unknown_tokens {
+                tracing::warn!(
+                    "template {template_id}: unknown templateOption token '{token}' in {} — substituting empty string",
+                    src.display()
+                );
+            }
+            std::fs::write(dest, report.content)?;
+        }
+        Err(_) => {
+            // Not valid UTF-8 — copy binary verbatim.
+            std::fs::copy(src, dest)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy files from `src` to `dest`, applying template option
@@ -334,8 +525,8 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
                     } else {
                         content
                     };
-                    let substituted = substitute_template_options(&stripped, options);
-                    std::fs::write(&dest_path, substituted)?;
+                    let report = substitute_template_options(&stripped, options);
+                    std::fs::write(&dest_path, report.content)?;
                 }
                 Err(_) => {
                     std::fs::copy(&src_path, &dest_path)?;
@@ -366,11 +557,12 @@ mod tests {
 
         let input =
             r#"{"image": "mcr.microsoft.com/devcontainers/rust:1-${templateOption:variant}"}"#;
-        let result = substitute_template_options(input, &opts);
+        let report = substitute_template_options(input, &opts);
         assert_eq!(
-            result,
+            report.content,
             r#"{"image": "mcr.microsoft.com/devcontainers/rust:1-bookworm"}"#
         );
+        assert!(report.unknown_tokens.is_empty());
     }
 
     #[test]
@@ -379,16 +571,63 @@ mod tests {
         opts.insert("installMaven".to_owned(), serde_json::json!(true));
 
         let input = "INSTALL_MAVEN=${templateOption:installMaven}";
-        let result = substitute_template_options(input, &opts);
-        assert_eq!(result, "INSTALL_MAVEN=true");
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "INSTALL_MAVEN=true");
+        assert!(report.unknown_tokens.is_empty());
     }
 
     #[test]
-    fn substitute_preserves_unmatched_placeholders() {
-        let opts = HashMap::new();
-        let input = "${templateOption:unknown}";
-        let result = substitute_template_options(input, &opts);
-        assert_eq!(result, "${templateOption:unknown}");
+    fn substitute_falsy_false_preserved() {
+        // Upstream bug: `options[token] || ''` collapses "false" to "". cella must preserve it.
+        let mut opts = HashMap::new();
+        opts.insert("enabled".to_owned(), serde_json::json!("false"));
+
+        let input = "ENABLED=${templateOption:enabled}";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "ENABLED=false");
+        assert!(report.unknown_tokens.is_empty());
+    }
+
+    #[test]
+    fn substitute_falsy_zero_preserved() {
+        let mut opts = HashMap::new();
+        opts.insert("count".to_owned(), serde_json::json!("0"));
+
+        let input = "COUNT=${templateOption:count}";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "COUNT=0");
+        assert!(report.unknown_tokens.is_empty());
+    }
+
+    #[test]
+    fn substitute_falsy_empty_string_preserved() {
+        let mut opts = HashMap::new();
+        opts.insert("prefix".to_owned(), serde_json::json!(""));
+
+        let input = "PREFIX=${templateOption:prefix}END";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "PREFIX=END");
+        assert!(report.unknown_tokens.is_empty());
+    }
+
+    #[test]
+    fn substitute_unknown_token_reports_and_empties() {
+        let opts: HashMap<String, serde_json::Value> = HashMap::new();
+        let input = "x=${templateOption:missing}";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "x=");
+        assert_eq!(report.unknown_tokens, vec!["missing"]);
+    }
+
+    #[test]
+    fn substitute_whitespace_in_token() {
+        let mut opts = HashMap::new();
+        opts.insert("key".to_owned(), serde_json::json!("val"));
+
+        let input = "${templateOption: key }";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "val");
+        assert!(report.unknown_tokens.is_empty());
     }
 
     #[test]
@@ -397,8 +636,9 @@ mod tests {
         opts.insert("ver".to_owned(), serde_json::json!("3.14"));
 
         let input = "a=${templateOption:ver} b=${templateOption:ver}";
-        let result = substitute_template_options(input, &opts);
-        assert_eq!(result, "a=3.14 b=3.14");
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "a=3.14 b=3.14");
+        assert!(report.unknown_tokens.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -942,5 +1182,157 @@ mod tests {
         };
         apply_overrides(&mut config, &overrides);
         assert_eq!(config["name"], "Added Name");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_to_workspace
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_to_workspace_basic_extraction() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        // Template with .devcontainer/devcontainer.json and README.md
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(
+            dc_dir.join("devcontainer.json"),
+            r#"{"name":"Test","image":"ubuntu"}"#,
+        )
+        .unwrap();
+        std::fs::write(template_dir.path().join("README.md"), "# readme").unwrap();
+        std::fs::write(
+            template_dir.path().join("devcontainer-template.json"),
+            r#"{"id":"test","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let files = apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        // README.md and devcontainer-template.json must NOT be extracted
+        assert!(!workspace.path().join("README.md").exists());
+        assert!(!workspace.path().join("devcontainer-template.json").exists());
+
+        // devcontainer.json should exist
+        assert!(
+            workspace
+                .path()
+                .join(".devcontainer/devcontainer.json")
+                .exists()
+        );
+
+        // The returned list should contain the relative path
+        assert!(
+            files
+                .iter()
+                .any(|p| p == Path::new(".devcontainer/devcontainer.json"))
+        );
+    }
+
+    #[test]
+    fn apply_to_workspace_always_excluded_notes() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        std::fs::write(template_dir.path().join("NOTES.md"), "notes").unwrap();
+        std::fs::write(template_dir.path().join("README.md"), "readme").unwrap();
+        std::fs::write(
+            template_dir.path().join("devcontainer-template.json"),
+            r#"{"id":"t","version":"1"}"#,
+        )
+        .unwrap();
+        // A real file that should be extracted
+        std::fs::write(template_dir.path().join("setup.sh"), "#!/bin/sh").unwrap();
+
+        let files = apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!workspace.path().join("NOTES.md").exists());
+        assert!(!workspace.path().join("README.md").exists());
+        assert!(!workspace.path().join("devcontainer-template.json").exists());
+        assert!(workspace.path().join("setup.sh").exists());
+        assert_eq!(files, vec![PathBuf::from("setup.sh")]);
+    }
+
+    #[test]
+    fn apply_to_workspace_omit_paths_glob() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let github_dir = template_dir.path().join(".github");
+        let workflows_dir = github_dir.join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(workflows_dir.join("ci.yaml"), "name: CI").unwrap();
+        std::fs::write(template_dir.path().join("setup.sh"), "#!/bin/sh").unwrap();
+
+        let files = apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[".github/*".to_owned()],
+        )
+        .unwrap();
+
+        // .github/* should exclude the directory entry
+        assert!(!workspace.path().join(".github").exists());
+        assert!(workspace.path().join("setup.sh").exists());
+        assert_eq!(files, vec![PathBuf::from("setup.sh")]);
+    }
+
+    #[test]
+    fn apply_to_workspace_substitution_falsy() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            template_dir.path().join("config.txt"),
+            "FLAG=${templateOption:flag}",
+        )
+        .unwrap();
+
+        let mut opts = HashMap::new();
+        opts.insert("flag".to_owned(), serde_json::json!("false"));
+
+        apply_to_workspace("test", template_dir.path(), workspace.path(), &opts, &[]).unwrap();
+
+        let content = std::fs::read_to_string(workspace.path().join("config.txt")).unwrap();
+        assert_eq!(content, "FLAG=false");
+    }
+
+    #[test]
+    fn apply_to_workspace_binary_copied_verbatim() {
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        // Write raw bytes that are not valid UTF-8
+        let binary_data: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0x90];
+        std::fs::write(template_dir.path().join("data.bin"), &binary_data).unwrap();
+
+        apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        let result = std::fs::read(workspace.path().join("data.bin")).unwrap();
+        assert_eq!(result, binary_data);
     }
 }
