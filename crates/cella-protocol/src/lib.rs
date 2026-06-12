@@ -401,6 +401,18 @@ pub enum ManagementResponse {
         bridge_port: u16,
         refcount: usize,
         action: SshProxyRefreshAction,
+        /// Whether the upstream socket accepted a probe connection.
+        /// `Some(false)` means the host agent itself is down — bridged
+        /// traffic will EOF even though the bridge is healthy. `None`
+        /// from daemons that don't probe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_reachable: Option<bool>,
+        /// `true` when a rebridge could not reclaim the previous port —
+        /// containers carry the old port baked into their env and need a
+        /// rebuild to reach the bridge again. Defaults to `false` from
+        /// daemons that predate the field.
+        #[serde(default)]
+        port_changed: bool,
     },
     /// Error response.
     Error { message: String },
@@ -1420,6 +1432,8 @@ mod tests {
                 bridge_port: 54321,
                 refcount: 2,
                 action,
+                upstream_reachable: Some(true),
+                port_changed: false,
             };
             let json = serde_json::to_string(&resp).unwrap();
             assert!(json.contains("\"type\":\"ssh_agent_proxy_refreshed\""));
@@ -1427,10 +1441,31 @@ mod tests {
             let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
             assert!(matches!(
                 decoded,
-                ManagementResponse::SshAgentProxyRefreshed { bridge_port: 54321, refcount: 2, action: a }
-                    if a == action
+                ManagementResponse::SshAgentProxyRefreshed {
+                    bridge_port: 54321,
+                    refcount: 2,
+                    action: a,
+                    upstream_reachable: Some(true),
+                    port_changed: false,
+                } if a == action
             ));
         }
+    }
+
+    #[test]
+    fn ssh_agent_proxy_refreshed_tolerates_missing_optional_fields() {
+        // Older daemons don't send the probe or port-change fields — they
+        // must decode as None / false.
+        let json = r#"{"type":"ssh_agent_proxy_refreshed","bridge_port":1,"refcount":1,"action":"unchanged"}"#;
+        let decoded: ManagementResponse = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementResponse::SshAgentProxyRefreshed {
+                upstream_reachable: None,
+                port_changed: false,
+                ..
+            }
+        ));
     }
 
     #[test]

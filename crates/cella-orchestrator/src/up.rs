@@ -1059,9 +1059,20 @@ impl EnsureUpContext<'_> {
         )
         .await?;
 
-        if refreshed.action == cella_protocol::SshProxyRefreshAction::Rebridged {
+        if refreshed.port_changed {
+            self.progress.warn(
+                "The SSH agent bridge had to move to a new port, but this container's \
+                 baked endpoint can't be updated — run `cella up --rebuild` to reconnect.",
+            );
+        } else if refreshed.action == cella_protocol::SshProxyRefreshAction::Rebridged {
             self.progress
                 .hint("Re-bridged the SSH agent to the current host agent socket (it had moved).");
+        }
+        if refreshed.upstream_reachable == Some(false) {
+            self.progress.warn(&format!(
+                "Host SSH agent at {} is not accepting connections — SSH inside the container will fail until it's back (is your agent running?).",
+                upstream.display()
+            ));
         }
         Some(crate::result::SshAgentProxyStatus::Bridged {
             host_endpoint: format!("{}:{}", self.client.host_gateway(), refreshed.bridge_port),

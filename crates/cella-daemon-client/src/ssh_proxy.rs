@@ -343,6 +343,8 @@ mod tests {
                 bridge_port: 54321,
                 refcount: 2,
                 action: SshProxyRefreshAction::Rebridged,
+                upstream_reachable: Some(false),
+                port_changed: true,
             },
         );
 
@@ -357,6 +359,8 @@ mod tests {
         assert_eq!(refreshed.bridge_port, 54321);
         assert_eq!(refreshed.refcount, 2);
         assert_eq!(refreshed.action, SshProxyRefreshAction::Rebridged);
+        assert_eq!(refreshed.upstream_reachable, Some(false));
+        assert!(refreshed.port_changed);
 
         let raw = received
             .lock()
@@ -371,17 +375,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_proxy_returns_none_on_error_or_old_daemon() {
-        // Daemons that predate the refresh RPC reply with Error — the
-        // caller must degrade gracefully rather than fail the up flow.
+    async fn refresh_proxy_returns_none_on_daemon_error() {
         let dir = tempfile::tempdir().unwrap();
         let daemon_sock = dir.path().join("daemon.sock");
         let (_received, task) = spawn_mock_daemon(
             &daemon_sock,
             ManagementResponse::Error {
-                message: "unknown request type".to_string(),
+                message: "bind failed".to_string(),
             },
         );
+
+        let refreshed = refresh_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            &PathBuf::from("/agent.sock"),
+        )
+        .await;
+        assert!(refreshed.is_none());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_proxy_returns_none_when_old_daemon_drops_connection() {
+        // A daemon that predates the refresh RPC can't parse the request:
+        // it logs a protocol error and DROPS the connection (it does not
+        // reply with ManagementResponse::Error). The client sees an I/O
+        // error reading the response — that must degrade to None, not
+        // fail the up flow.
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_sock = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&daemon_sock).unwrap();
+        let task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Read the request line, then hang up without replying.
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+            }
+        });
 
         let refreshed = refresh_proxy(
             &daemon_sock,

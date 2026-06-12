@@ -245,10 +245,14 @@ impl DaemonClient {
                 bridge_port,
                 refcount,
                 action,
+                upstream_reachable,
+                port_changed,
             } => Ok(SshAgentProxyRefresh {
                 bridge_port,
                 refcount,
                 action,
+                upstream_reachable,
+                port_changed,
             }),
             ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
             response => Err(DaemonClientError::unexpected(
@@ -300,6 +304,13 @@ pub struct SshAgentProxyRefresh {
     pub bridge_port: u16,
     pub refcount: usize,
     pub action: cella_protocol::SshProxyRefreshAction,
+    /// `Some(false)` when the daemon probed the upstream socket and it
+    /// refused connections — the host agent is down. `None` from daemons
+    /// that don't probe.
+    pub upstream_reachable: Option<bool>,
+    /// `true` when a rebridge lost the previous port — the container's
+    /// baked bridge endpoint is dead and a rebuild is required.
+    pub port_changed: bool,
 }
 
 /// Error returned by daemon management client operations.

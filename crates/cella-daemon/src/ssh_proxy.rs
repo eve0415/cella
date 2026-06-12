@@ -60,7 +60,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{Mutex, watch};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::CellaDaemonError;
@@ -80,7 +80,7 @@ struct BridgeEntry {
     upstream_socket: PathBuf,
     bridge_port: u16,
     refcount: usize,
-    accept_task: AbortHandle,
+    accept_task: JoinHandle<()>,
     /// Broadcast channel that signals teardown to the accept loop and to
     /// every spawned per-connection bridge. Sending `true` causes the
     /// accept loop and any in-flight bridges to drop their streams,
@@ -98,6 +98,11 @@ pub struct RefreshResult {
     pub refcount: usize,
     /// What the refresh actually did.
     pub action: RefreshAction,
+    /// `true` when a rebridge could not reclaim the previous port and had
+    /// to fall back to a random one. Containers carry the old port baked
+    /// into `CELLA_SSH_AGENT_BRIDGE`, so a changed port means they can no
+    /// longer reach the bridge until recreated — callers must surface this.
+    pub port_changed: bool,
 }
 
 /// What a refresh did to the workspace's bridge.
@@ -191,8 +196,7 @@ impl SshProxyManager {
                     new_upstream = %upstream_socket.display(),
                     "ssh-agent bridge: upstream changed, recreating bridge"
                 );
-                let _ = removed.shutdown_tx.send(true);
-                removed.accept_task.abort();
+                teardown_entry(removed).await;
                 Some(preferred)
             }
             None => None,
@@ -247,6 +251,7 @@ impl SshProxyManager {
                     bridge_port: entry.bridge_port,
                     refcount: entry.refcount,
                     action: RefreshAction::Unchanged,
+                    port_changed: false,
                 });
             }
             Some(_) => {
@@ -258,13 +263,10 @@ impl SshProxyManager {
                     new_upstream = %upstream_socket.display(),
                     "ssh-agent bridge: refresh found stale upstream, rebridging"
                 );
-                let _ = removed.shutdown_tx.send(true);
-                removed.accept_task.abort();
-                (
-                    Some(removed.bridge_port),
-                    removed.refcount,
-                    RefreshAction::Rebridged,
-                )
+                let preferred = removed.bridge_port;
+                let refcount = removed.refcount;
+                teardown_entry(removed).await;
+                (Some(preferred), refcount, RefreshAction::Rebridged)
             }
             None => (None, 1, RefreshAction::Created),
         };
@@ -276,6 +278,7 @@ impl SshProxyManager {
             bridge_port: entry.bridge_port,
             refcount,
             action,
+            port_changed: preferred_port.is_some_and(|p| p != entry.bridge_port),
         };
         self.bridges.insert(workspace, entry);
         self.persist_state();
@@ -310,7 +313,7 @@ impl SshProxyManager {
             upstream_socket,
             bridge_port,
             refcount,
-            accept_task: task.abort_handle(),
+            accept_task: task,
             shutdown_tx,
         })
     }
@@ -440,6 +443,37 @@ pub fn workspace_hash(workspace: &Path) -> String {
     hasher.update(workspace.as_os_str().as_encoded_bytes());
     let digest = hex::encode(hasher.finalize());
     digest[..16].to_string()
+}
+
+/// Tear down a removed bridge entry deterministically: signal shutdown,
+/// abort the accept loop, and WAIT for the task to finish so its
+/// `TcpListener` is actually dropped. Without the wait, an immediate
+/// rebind of the same port races the abort and usually loses — silently
+/// moving the bridge to a new port that running containers can't reach.
+async fn teardown_entry(entry: BridgeEntry) {
+    let _ = entry.shutdown_tx.send(true);
+    entry.accept_task.abort();
+    let _ = entry.accept_task.await;
+}
+
+/// Probe whether `upstream` currently accepts connections.
+///
+/// Connect-only — deliberately no agent-protocol exchange, because a
+/// locked agent (1Password waiting for an unlock prompt) may stall a
+/// request without being broken. A refused/ENOENT/timed-out connect is
+/// the staleness signal that matters: every bridged byte would EOF.
+///
+/// Takes up to 500ms — callers must NOT hold the manager mutex while
+/// awaiting this, or they stall every other proxy operation.
+pub async fn probe_upstream(upstream: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            UnixStream::connect(upstream),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Try binding `127.0.0.1:<preferred>` first; if that fails (e.g. the
@@ -691,7 +725,7 @@ impl SshProxyManager {
                 upstream_socket: upstream,
                 bridge_port: port,
                 refcount: 1,
-                accept_task: task.abort_handle(),
+                accept_task: task,
                 shutdown_tx,
             },
         );
@@ -760,7 +794,7 @@ mod tests {
     }
 
     /// Echo server on a Unix socket — stands in for the host's ssh-agent.
-    fn spawn_echo_upstream(path: &Path) -> tokio::task::JoinHandle<()> {
+    fn spawn_echo_upstream(path: &Path) -> JoinHandle<()> {
         let listener = UnixListener::bind(path).expect("bind upstream");
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -1018,6 +1052,34 @@ mod tests {
             "refresh must not bump the refcount — releases would no longer match registers"
         );
         assert_eq!(m.refcount_for(&workspace), 2);
+        assert!(!result.port_changed, "no-op refresh never changes ports");
+    }
+
+    #[tokio::test]
+    async fn probe_upstream_distinguishes_live_from_dead_sockets() {
+        // The dead-agent case rebinding can't heal: same upstream path,
+        // nothing listening behind it. The probe is what tells `cella up`
+        // to warn the user that traffic will EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+
+        assert!(
+            !probe_upstream(&upstream).await,
+            "missing socket file must probe as unreachable"
+        );
+
+        let listener_task = spawn_echo_upstream(&upstream);
+        assert!(
+            probe_upstream(&upstream).await,
+            "live echo upstream must probe as reachable"
+        );
+
+        listener_task.abort();
+        std::fs::remove_file(&upstream).unwrap();
+        assert!(
+            !probe_upstream(&upstream).await,
+            "dead upstream must probe as unreachable"
+        );
     }
 
     #[tokio::test]

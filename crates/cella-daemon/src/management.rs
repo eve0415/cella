@@ -358,6 +358,9 @@ async fn handle_refresh_ssh_agent_proxy(
 ) -> ManagementResponse {
     let workspace_path = std::path::PathBuf::from(workspace);
     let upstream_path = std::path::PathBuf::from(upstream_socket);
+    // Probe BEFORE taking the manager lock — the probe can take up to
+    // 500ms and would otherwise stall every other proxy operation.
+    let upstream_reachable = crate::ssh_proxy::probe_upstream(&upstream_path).await;
     let result = manager
         .lock()
         .await
@@ -380,6 +383,8 @@ async fn handle_refresh_ssh_agent_proxy(
                 bridge_port: refreshed.bridge_port,
                 refcount: refreshed.refcount,
                 action,
+                upstream_reachable: Some(upstream_reachable),
+                port_changed: refreshed.port_changed,
             }
         }
         Err(e) => {
@@ -1089,9 +1094,20 @@ mod tests {
                 bridge_port,
                 refcount,
                 action,
+                upstream_reachable,
+                port_changed,
             } => {
                 assert_eq!(action, SshProxyRefreshAction::Rebridged);
                 assert_eq!(refcount, 1);
+                assert_eq!(
+                    upstream_reachable,
+                    Some(true),
+                    "live upstream must probe reachable over RPC"
+                );
+                assert!(
+                    !port_changed,
+                    "loopback rebind should reclaim the same port"
+                );
                 let _client = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port))
                     .await
                     .expect("rebridged port must accept connections");
