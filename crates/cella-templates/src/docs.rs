@@ -4,6 +4,7 @@
 //! matching the official `devcontainer templates generate-docs` output format.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -145,12 +146,19 @@ fn process_template_dir(
         }
     };
 
-    let readme_content = render_readme(&metadata, dir, github_owner, github_repo);
+    let readme_content = match render_readme(&metadata, dir, github_owner, github_repo) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Failed to read NOTES.md for {dir_name}: {e}");
+            report.errors.push(format!("{dir_name} (notes error: {e})"));
+            return;
+        }
+    };
     let readme_path = dir.join("README.md");
 
+    eprintln!("Generating {}...", readme_path.display());
     match std::fs::write(&readme_path, readme_content) {
         Ok(()) => {
-            eprintln!("Generating {}...", readme_path.display());
             report.written.push(metadata.id);
         }
         Err(e) => {
@@ -165,21 +173,41 @@ fn process_template_dir(
 // ---------------------------------------------------------------------------
 
 /// Build the full README.md content for a single template.
+///
+/// # Errors
+///
+/// Returns an error when an existing `NOTES.md` cannot be read.
 fn render_readme(
     metadata: &TemplateMetadata,
     template_dir: &Path,
     github_owner: Option<&str>,
     github_repo: Option<&str>,
-) -> String {
+) -> Result<String, std::io::Error> {
     let name_line = build_name_line(metadata);
     let description = metadata.description.as_deref().unwrap_or_default();
     let options_section = build_options_section(&metadata.options);
-    let notes = read_notes(template_dir);
+    let notes = read_notes(template_dir)?;
     let repo_url = build_repo_url(template_dir, github_owner, github_repo);
 
-    format!(
-        "\n# {name_line}\n\n{description}\n\n{options_section}\n\n{notes}\n\n---\n\n_Note: This file was auto-generated from the [devcontainer-template.json]({repo_url}).  Add additional notes to a `NOTES.md`._\n"
+    // Build body sections conditionally to avoid consecutive blank lines when
+    // options_section or notes are empty.
+    let mut body = format!("# {name_line}\n\n{description}");
+    if !options_section.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(&options_section);
+    }
+    if !notes.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(&notes);
+    }
+    body.push_str("\n\n---\n\n");
+    // `writeln!` avoids the extra allocation that `format!` + `push_str` would cause.
+    let () = writeln!(
+        body,
+        "_Note: This file was auto-generated from the [devcontainer-template.json]({repo_url}).  Add additional notes to a `NOTES.md`._"
     )
+    .expect("writing to a String is infallible");
+    Ok(body)
 }
 
 /// `Name (id)` when a name field exists, otherwise just `id`.
@@ -233,12 +261,16 @@ fn default_display(value: &serde_json::Value) -> String {
 }
 
 /// Read `NOTES.md` from the template directory, or return an empty string.
-fn read_notes(template_dir: &Path) -> String {
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read.
+fn read_notes(template_dir: &Path) -> Result<String, std::io::Error> {
     let notes_path = template_dir.join("NOTES.md");
     if notes_path.exists() {
-        std::fs::read_to_string(&notes_path).unwrap_or_default()
+        std::fs::read_to_string(&notes_path)
     } else {
-        String::new()
+        Ok(String::new())
     }
 }
 
@@ -498,5 +530,57 @@ mod tests {
         let aaa_pos = section.find("| aaa |").unwrap();
         let zzz_pos = section.find("| zzz |").unwrap();
         assert!(aaa_pos < zzz_pos, "options must be sorted by key");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: README must start directly with "# Title" (no leading newline)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn readme_starts_with_title_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let tpl_dir = src.join("minimal");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+
+        write_manifest(
+            &tpl_dir,
+            r#"{"id": "minimal", "version": "1.0.0", "name": "Minimal", "description": "A minimal template."}"#,
+        );
+
+        generate_docs(tmp.path(), None, None).unwrap();
+
+        let readme = read_readme(&tpl_dir);
+        assert!(
+            readme.starts_with("# "),
+            "README must start directly with '# ', got: {:?}",
+            &readme[..readme.len().min(30)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: no-options + no-notes → no triple newline anywhere
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_options_no_notes_no_triple_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let tpl_dir = src.join("bare");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+
+        write_manifest(
+            &tpl_dir,
+            r#"{"id": "bare", "version": "1.0.0", "description": "No options or notes."}"#,
+        );
+        // No NOTES.md, no options in manifest.
+
+        generate_docs(tmp.path(), None, None).unwrap();
+
+        let readme = read_readme(&tpl_dir);
+        assert!(
+            !readme.contains("\n\n\n"),
+            "README must not contain three consecutive newlines, got:\n{readme}"
+        );
     }
 }
