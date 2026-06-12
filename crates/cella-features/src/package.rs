@@ -308,16 +308,20 @@ fn write_tgz(
     append_dir_recursive(&mut tar, source_dir, Path::new("."))?;
 
     // Override devcontainer-feature.json inside the archive with the (possibly
-    // mutated) metadata map.
+    // mutated) metadata map. Always use ./- prefix for consistency.
     let updated_json =
         serde_json::to_string_pretty(&meta).map_err(|e| PackageError::Serialize(e.to_string()))?;
     let bytes = updated_json.as_bytes();
     let mut header = tar::Header::new_gnu();
-    header.set_size(bytes.len() as u64);
+    header.set_size(
+        u64::try_from(bytes.len()).map_err(|_| {
+            PackageError::Serialize("metadata JSON exceeds u64 size limit".to_owned())
+        })?,
+    );
     header.set_mode(0o644);
+    set_header_path_raw(&mut header, Path::new("./devcontainer-feature.json"))?;
     header.set_cksum();
-    tar.append_data(&mut header, "./devcontainer-feature.json", bytes)
-        .map_err(PackageError::Io)?;
+    tar.append(&header, bytes).map_err(PackageError::Io)?;
 
     tar.into_inner()
         .map_err(PackageError::Io)?
@@ -327,7 +331,11 @@ fn write_tgz(
     Ok(())
 }
 
-/// Recursively append all files in `src` to the tar builder under `base`.
+/// Recursively append all regular files in `src` to the tar builder under `base`.
+///
+/// - All entry paths are `./`-prefixed for consistency.
+/// - File modes are preserved from the source filesystem.
+/// - Symlinks are skipped with a warning (not followed, to prevent traversal).
 fn append_dir_recursive<W: std::io::Write>(
     tar: &mut tar::Builder<W>,
     src: &Path,
@@ -335,22 +343,76 @@ fn append_dir_recursive<W: std::io::Write>(
 ) -> Result<(), PackageError> {
     for entry in fs::read_dir(src).map_err(PackageError::Io)? {
         let entry = entry.map_err(PackageError::Io)?;
-        let path = entry.path();
         let file_name = entry.file_name();
         let rel = base.join(&file_name);
+        // Use non-following file_type() to detect symlinks without resolving them.
+        let file_type = entry.file_type().map_err(PackageError::Io)?;
 
         // Skip the manifest — we re-append it separately (with mutations).
         if base == Path::new(".") && file_name == "devcontainer-feature.json" {
             continue;
         }
 
-        if path.is_dir() {
-            append_dir_recursive(tar, &path, &rel)?;
+        if file_type.is_symlink() {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping symlink during feature packaging"
+            );
+            continue;
+        }
+
+        if file_type.is_dir() {
+            append_dir_recursive(tar, &entry.path(), &rel)?;
         } else {
-            let mut f = fs::File::open(&path).map_err(PackageError::Io)?;
-            tar.append_file(&rel, &mut f).map_err(PackageError::Io)?;
+            append_file_with_mode(tar, &entry.path(), &rel)?;
         }
     }
+    Ok(())
+}
+
+/// Append a single file to the tar archive, preserving its Unix mode.
+///
+/// The `tar_path` is written raw into the header name field so the `./` prefix
+/// is preserved. The tar crate's `set_path` strips leading `CurDir` components,
+/// so we bypass it and copy the bytes directly.
+fn append_file_with_mode<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    src: &Path,
+    tar_path: &Path,
+) -> Result<(), PackageError> {
+    let metadata = fs::metadata(src).map_err(PackageError::Io)?;
+    let mut file = fs::File::open(src).map_err(PackageError::Io)?;
+
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    // Write the ./- prefixed path directly into the header name field.
+    // `set_path` strips leading CurDir components, so we write raw bytes.
+    set_header_path_raw(&mut header, tar_path)?;
+    header.set_cksum();
+
+    tar.append(&header, &mut file).map_err(PackageError::Io)?;
+    Ok(())
+}
+
+/// Write `path` as raw bytes into the GNU header name field, preserving a
+/// leading `./` that `Header::set_path` would otherwise strip.
+fn set_header_path_raw(header: &mut tar::Header, path: &Path) -> Result<(), PackageError> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| PackageError::Serialize(format!("non-UTF-8 path: {}", path.display())))?;
+    let bytes = path_str.as_bytes();
+    let gnu = header
+        .as_gnu_mut()
+        .ok_or_else(|| PackageError::Serialize("expected GNU tar header".to_owned()))?;
+    if bytes.len() >= gnu.name.len() {
+        return Err(PackageError::Serialize(format!(
+            "path too long for tar header: {}",
+            path.display()
+        )));
+    }
+    gnu.name[..bytes.len()].copy_from_slice(bytes);
+    // Zero-terminate (the rest of the array is already zeroed).
+    gnu.name[bytes.len()] = 0;
     Ok(())
 }
 
@@ -479,6 +541,21 @@ mod tests {
             .collect()
     }
 
+    fn tgz_entry_modes(path: &Path) -> std::collections::HashMap<String, u32> {
+        let file = fs::File::open(path).unwrap();
+        let gz = GzDecoder::new(file);
+        let mut ar = Archive::new(gz);
+        ar.entries()
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| {
+                let mode = e.header().mode().unwrap_or(0);
+                let name = e.path().unwrap().to_string_lossy().to_string();
+                (name, mode)
+            })
+            .collect()
+    }
+
     fn read_collection(output: &Path) -> Value {
         let raw = fs::read_to_string(output.join("devcontainer-collection.json")).unwrap();
         serde_json::from_str(&raw).unwrap()
@@ -510,14 +587,20 @@ mod tests {
 
         let entries = tgz_entries(&tgz);
         assert!(
-            entries.contains("./install.sh") || entries.contains("install.sh"),
-            "install.sh missing from tgz: {entries:?}"
+            entries.contains("./install.sh"),
+            "install.sh missing or not ./- prefixed: {entries:?}"
         );
         assert!(
-            entries.contains("./devcontainer-feature.json")
-                || entries.contains("devcontainer-feature.json"),
-            "manifest missing from tgz: {entries:?}"
+            entries.contains("./devcontainer-feature.json"),
+            "manifest missing or not ./- prefixed: {entries:?}"
         );
+        // Every entry must start with ./
+        for entry in &entries {
+            assert!(
+                entry.starts_with("./"),
+                "tar entry does not start with ./: {entry:?}"
+            );
+        }
 
         let col = read_collection(&out);
         assert_eq!(col["sourceInformation"]["source"], "devcontainer-cli");
@@ -525,6 +608,117 @@ mod tests {
         assert_eq!(features.len(), 1);
         assert_eq!(features[0]["id"], "my-feature");
         assert_eq!(features[0]["version"], "1.0.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: all tgz entries are ./- prefixed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_tgz_entries_have_dot_slash_prefix() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("feature");
+        make_feature(&src, "feature", "1.0.0");
+        // Add a subdirectory with a file to also test recursive entries.
+        fs::create_dir_all(src.join("scripts")).unwrap();
+        fs::write(src.join("scripts").join("helper.sh"), "#!/bin/sh").unwrap();
+
+        let out = tmp.path().join("output");
+        package(&PackageOptions {
+            target: src,
+            output_folder: out.clone(),
+            force_clean_output_folder: false,
+        })
+        .unwrap();
+
+        let tgz = out.join("devcontainer-feature-feature.tgz");
+        let entries = tgz_entries(&tgz);
+        assert!(!entries.is_empty(), "no entries in tgz");
+        for entry in &entries {
+            assert!(
+                entry.starts_with("./"),
+                "tar entry does not start with ./: {entry:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: file modes are preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn executable_install_sh_mode_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("feature");
+        make_feature(&src, "feature", "1.0.0");
+
+        // Make install.sh executable.
+        let install_sh = src.join("install.sh");
+        fs::set_permissions(&install_sh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = tmp.path().join("output");
+        package(&PackageOptions {
+            target: src,
+            output_folder: out.clone(),
+            force_clean_output_folder: false,
+        })
+        .unwrap();
+
+        let tgz = out.join("devcontainer-feature-feature.tgz");
+        let modes = tgz_entry_modes(&tgz);
+        let install_mode = modes
+            .get("./install.sh")
+            .copied()
+            .expect("./install.sh not found in archive");
+        assert_ne!(
+            install_mode & 0o111,
+            0,
+            "install.sh should be executable, got mode {install_mode:#o}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 3: symlinks are not followed during packaging
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn symlinks_are_skipped_not_followed() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("feature");
+        make_feature(&src, "feature", "1.0.0");
+
+        // Create an outside directory with a sentinel file.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "should not appear").unwrap();
+
+        // Symlink from inside feature dir to outside.
+        std::os::unix::fs::symlink(&outside, src.join("linked")).unwrap();
+
+        let out = tmp.path().join("output");
+        package(&PackageOptions {
+            target: src,
+            output_folder: out.clone(),
+            force_clean_output_folder: false,
+        })
+        .unwrap();
+
+        let tgz = out.join("devcontainer-feature-feature.tgz");
+        let entries = tgz_entries(&tgz);
+
+        // No entry should reference the outside dir's files.
+        for entry in &entries {
+            assert!(
+                !entry.contains("secret.txt"),
+                "symlink traversal: found outside file {entry:?} in archive"
+            );
+            assert!(
+                !entry.contains("linked"),
+                "symlink itself should not appear in archive: {entry:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
