@@ -3,6 +3,7 @@ pub mod cache;
 pub mod dockerfile;
 mod error;
 pub mod fetch;
+pub mod graph;
 pub mod merge;
 pub mod metadata;
 pub mod oci;
