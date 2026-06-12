@@ -161,7 +161,7 @@ fn render_readme(
     let deprecation = generate_deprecation_header(parsed);
 
     format!(
-        "{deprecation}\n# {name}\n\n{description}\n\n## Example Usage\n\n```json\n\"features\": {{\n    \"{registry}/{namespace}/{feature_id}:{version}\": {{}}\n}}\n```\n\n{options_table}{customizations}{notes}\n---\n\n_Note: This file was auto-generated from the [devcontainer-feature.json]({repo_url}).  Add additional notes to a `NOTES.md`._\n",
+        "{deprecation}# {name}\n\n{description}\n\n## Example Usage\n\n```json\n\"features\": {{\n    \"{registry}/{namespace}/{feature_id}:{version}\": {{}}\n}}\n```\n\n{options_table}{customizations}{notes}\n---\n\n_Note: This file was auto-generated from the [devcontainer-feature.json]({repo_url}).  Add additional notes to a `NOTES.md`._\n",
         registry = input.registry,
         namespace = input.namespace,
     )
@@ -315,6 +315,8 @@ fn generate_deprecation_header(parsed: &serde_json::Value) -> String {
             "- **Ids used to publish this Feature in the past - {ids}**"
         );
     }
+    // Trailing newline separates the deprecation block from the title that follows.
+    header.push('\n');
     header
 }
 
@@ -347,6 +349,42 @@ mod tests {
             github_owner: "",
             github_repo: "",
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // First-line assertions — no leading blank line
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn readme_starts_with_title_no_leading_blank() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = json!({ "id": "plain", "version": "1.0.0", "name": "Plain" });
+        make_feature_dir(&tmp, "plain", &manifest);
+        let input = default_input(&tmp, "o/r");
+
+        let results = generate_docs(&input).unwrap();
+        let readme = std::fs::read_to_string(&results[0].readme_path).unwrap();
+        let first_line = readme.lines().next().unwrap_or("");
+        assert_eq!(
+            first_line, "# Plain (plain)",
+            "first line must be the title, got:\n{readme}"
+        );
+    }
+
+    #[test]
+    fn deprecated_readme_starts_with_important_note() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = json!({ "id": "old", "version": "1.0.0", "deprecated": true });
+        make_feature_dir(&tmp, "old", &manifest);
+        let input = default_input(&tmp, "o/r");
+
+        let results = generate_docs(&input).unwrap();
+        let readme = std::fs::read_to_string(&results[0].readme_path).unwrap();
+        let first_line = readme.lines().next().unwrap_or("");
+        assert_eq!(
+            first_line, "### **IMPORTANT NOTE**",
+            "deprecated feature first line must be the deprecation header, got:\n{readme}"
+        );
     }
 
     // -------------------------------------------------------------------------
