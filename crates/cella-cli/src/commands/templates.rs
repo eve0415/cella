@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
-use cella_templates::{SelectedFeature, TemplateError, apply, fetcher, options};
+use cella_templates::{SelectedFeature, TemplateError, apply, fetcher, metadata, options};
 
 use super::LogLevel;
 
@@ -19,6 +19,8 @@ pub struct TemplatesArgs {
 pub enum TemplatesCommand {
     /// Apply a template to a workspace folder.
     Apply(TemplatesApplyArgs),
+    /// Fetch a published template's metadata from its OCI manifest.
+    Metadata(TemplatesMetadataArgs),
     /// Create a new template.
     New {
         /// Name for the template.
@@ -31,6 +33,15 @@ pub enum TemplatesCommand {
         /// Name of the template to edit.
         name: String,
     },
+}
+
+/// Arguments for `cella templates metadata`.
+///
+/// Flag surface matches `devcontainer templates metadata` exactly.
+#[derive(Args)]
+pub struct TemplatesMetadataArgs {
+    /// Template OCI reference (e.g. ghcr.io/devcontainers/templates/alpine).
+    pub template_id: String,
 }
 
 /// Arguments for `cella templates apply`.
@@ -88,6 +99,7 @@ impl TemplatesArgs {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             TemplatesCommand::Apply(args) => args.execute().await,
+            TemplatesCommand::Metadata(args) => args.execute().await,
             TemplatesCommand::New { .. }
             | TemplatesCommand::List
             | TemplatesCommand::Edit { .. } => {
@@ -164,6 +176,37 @@ impl TemplatesApplyArgs {
         println!("{}", serde_json::to_string(&output).expect("serializable"));
 
         Ok(())
+    }
+}
+
+impl TemplatesMetadataArgs {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match metadata::fetch_manifest_metadata(&self.template_id).await {
+            Ok(Some(raw)) => {
+                // Re-parse and re-serialize so the output is valid JSON (not
+                // the annotation's raw escaped string).
+                let parsed: Value = serde_json::from_str(&raw)
+                    .map_err(|e| format!("metadata annotation is not valid JSON: {e}"))?;
+                println!("{}", serde_json::to_string(&parsed).expect("serializable"));
+                Ok(())
+            }
+            Ok(None) => {
+                eprintln!(
+                    "Template resolved to '{}' but does not contain metadata on its manifest.",
+                    self.template_id
+                );
+                eprintln!(
+                    "Ask the Template owner to republish this Template to populate the manifest."
+                );
+                println!("{{}}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                println!("{{}}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -453,5 +496,17 @@ mod tests {
         };
         let result = args.execute(dummy_progress()).await;
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // TemplatesMetadataArgs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_args_captures_template_id() {
+        let args = TemplatesMetadataArgs {
+            template_id: "ghcr.io/devcontainers/templates/alpine".to_owned(),
+        };
+        assert_eq!(args.template_id, "ghcr.io/devcontainers/templates/alpine");
     }
 }
