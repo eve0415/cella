@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cella_protocol::{
     ContainerSummary, ForwardedPortDetail, ManagementRequest, ManagementResponse, PortAttributes,
+    SshProxyRefreshAction,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -214,19 +215,7 @@ async fn handle_management_request(
 ) -> ManagementResponse {
     match req {
         ManagementRequest::RegisterContainer(data) => {
-            let reg = ContainerRegistration {
-                container_id: data.container_id,
-                container_name: data.container_name,
-                container_ip: data.container_ip,
-                ports_attributes: data.ports_attributes,
-                other_ports_attributes: data.other_ports_attributes,
-                forward_ports: data.forward_ports,
-                backend_kind: data.backend_kind,
-                docker_host: data.docker_host,
-                project_name: data.project_name,
-                branch: data.branch,
-            };
-            handle_register(reg, ctx, container_handles).await
+            handle_register(ContainerRegistration::from(*data), ctx, container_handles).await
         }
         ManagementRequest::DeregisterContainer { container_name } => {
             ctx.phantom_registry
@@ -274,6 +263,13 @@ async fn handle_management_request(
         }
         ManagementRequest::ReleaseSshAgentProxy { workspace } => {
             handle_release_ssh_agent_proxy(&workspace, &ctx.ssh_proxy_manager).await
+        }
+        ManagementRequest::RefreshSshAgentProxy {
+            workspace,
+            upstream_socket,
+        } => {
+            handle_refresh_ssh_agent_proxy(&workspace, &upstream_socket, &ctx.ssh_proxy_manager)
+                .await
         }
         ManagementRequest::RegisterPhantomTokens {
             container_name,
@@ -355,6 +351,46 @@ async fn handle_release_ssh_agent_proxy(
     ManagementResponse::SshAgentProxyReleased { torn_down }
 }
 
+async fn handle_refresh_ssh_agent_proxy(
+    workspace: &str,
+    upstream_socket: &str,
+    manager: &crate::ssh_proxy::SharedSshProxyManager,
+) -> ManagementResponse {
+    let workspace_path = std::path::PathBuf::from(workspace);
+    let upstream_path = std::path::PathBuf::from(upstream_socket);
+    let result = manager
+        .lock()
+        .await
+        .refresh(workspace_path, upstream_path)
+        .await;
+    match result {
+        Ok(refreshed) => {
+            let action = match refreshed.action {
+                crate::ssh_proxy::RefreshAction::Unchanged => SshProxyRefreshAction::Unchanged,
+                crate::ssh_proxy::RefreshAction::Rebridged => SshProxyRefreshAction::Rebridged,
+                crate::ssh_proxy::RefreshAction::Created => SshProxyRefreshAction::Created,
+            };
+            if action != SshProxyRefreshAction::Unchanged {
+                info!(
+                    "Refreshed ssh-agent bridge for {workspace} ({action:?}, port={})",
+                    refreshed.bridge_port
+                );
+            }
+            ManagementResponse::SshAgentProxyRefreshed {
+                bridge_port: refreshed.bridge_port,
+                refcount: refreshed.refcount,
+                action,
+            }
+        }
+        Err(e) => {
+            warn!("ssh-agent bridge refresh failed for {workspace}: {e}");
+            ManagementResponse::Error {
+                message: format!("ssh-agent bridge refresh failed: {e}"),
+            }
+        }
+    }
+}
+
 /// Data for a container registration request.
 struct ContainerRegistration {
     container_id: String,
@@ -367,6 +403,23 @@ struct ContainerRegistration {
     docker_host: Option<String>,
     project_name: Option<String>,
     branch: Option<String>,
+}
+
+impl From<cella_protocol::ContainerRegistrationData> for ContainerRegistration {
+    fn from(data: cella_protocol::ContainerRegistrationData) -> Self {
+        Self {
+            container_id: data.container_id,
+            container_name: data.container_name,
+            container_ip: data.container_ip,
+            ports_attributes: data.ports_attributes,
+            other_ports_attributes: data.other_ports_attributes,
+            forward_ports: data.forward_ports,
+            backend_kind: data.backend_kind,
+            docker_host: data.docker_host,
+            project_name: data.project_name,
+            branch: data.branch,
+        }
+    }
 }
 
 /// Handle container registration.
@@ -974,6 +1027,77 @@ mod tests {
         let mut buf = [0u8; 2];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hi");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_agent_proxy_refresh_rebridges_stale_upstream_over_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mgmt.sock");
+        let upstream_old = dir.path().join("upstream-old.sock");
+        let upstream_new = dir.path().join("upstream-new.sock");
+        let _up_old = spawn_echo_upstream(&upstream_old);
+        let _up_new = spawn_echo_upstream(&upstream_new);
+        let server = spawn_management_server(&socket_path).await;
+
+        let workspace = "/Users/me/proj".to_string();
+        send_management_request(
+            &socket_path,
+            &ManagementRequest::RegisterSshAgentProxy {
+                workspace: workspace.clone(),
+                upstream_socket: upstream_old.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Same upstream → unchanged, refcount untouched.
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::RefreshSshAgentProxy {
+                workspace: workspace.clone(),
+                upstream_socket: upstream_old.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                resp,
+                ManagementResponse::SshAgentProxyRefreshed {
+                    refcount: 1,
+                    action: SshProxyRefreshAction::Unchanged,
+                    ..
+                }
+            ),
+            "expected unchanged refresh, got {resp:?}"
+        );
+
+        // Stale upstream → rebridged, refcount still untouched.
+        let resp = send_management_request(
+            &socket_path,
+            &ManagementRequest::RefreshSshAgentProxy {
+                workspace,
+                upstream_socket: upstream_new.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        match resp {
+            ManagementResponse::SshAgentProxyRefreshed {
+                bridge_port,
+                refcount,
+                action,
+            } => {
+                assert_eq!(action, SshProxyRefreshAction::Rebridged);
+                assert_eq!(refcount, 1);
+                let _client = tokio::net::TcpStream::connect(("127.0.0.1", bridge_port))
+                    .await
+                    .expect("rebridged port must accept connections");
+            }
+            other => panic!("expected SshAgentProxyRefreshed, got {other:?}"),
+        }
 
         server.abort();
     }

@@ -310,6 +310,16 @@ pub enum ManagementRequest {
     /// the listener and unlinks the socket file when the count reaches
     /// zero. No-op for an unknown workspace.
     ReleaseSshAgentProxy { workspace: String },
+    /// Re-validate the SSH-agent bridge for `workspace` against the
+    /// caller's current `upstream_socket` without changing the refcount.
+    /// Heals bridges whose registered upstream went stale (host agent
+    /// moved after sleep/re-login/agent restart): same upstream is a
+    /// no-op, a different one rebinds on the same port when possible,
+    /// and a missing entry creates a fresh bridge.
+    RefreshSshAgentProxy {
+        workspace: String,
+        upstream_socket: String,
+    },
     /// Register phantom tokens for a credential-protected container.
     RegisterPhantomTokens {
         container_name: String,
@@ -385,8 +395,27 @@ pub enum ManagementResponse {
     /// when the proxy is still in use by another container in the same
     /// workspace, or when the workspace was never registered.
     SshAgentProxyReleased { torn_down: bool },
+    /// SSH-agent bridge re-validated. `bridge_port` is the (possibly
+    /// rebound) localhost TCP port; `refcount` is unchanged by refresh.
+    SshAgentProxyRefreshed {
+        bridge_port: u16,
+        refcount: usize,
+        action: SshProxyRefreshAction,
+    },
     /// Error response.
     Error { message: String },
+}
+
+/// What a `RefreshSshAgentProxy` request actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshProxyRefreshAction {
+    /// Bridge already pointed at the requested upstream.
+    Unchanged,
+    /// Stale upstream — bridge was torn down and rebound.
+    Rebridged,
+    /// No bridge existed — a fresh one was created.
+    Created,
 }
 
 /// Detail about a single forwarded port.
@@ -1359,6 +1388,47 @@ mod tests {
             assert!(matches!(
                 decoded,
                 ManagementResponse::SshAgentProxyReleased { torn_down: t } if t == torn_down
+            ));
+        }
+    }
+
+    #[test]
+    fn roundtrip_refresh_ssh_agent_proxy_request() {
+        let req = ManagementRequest::RefreshSshAgentProxy {
+            workspace: "/Users/me/proj".to_string(),
+            upstream_socket: "/private/tmp/com.apple.launchd.abc/Listeners".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"refresh_ssh_agent_proxy\""));
+        let decoded: ManagementRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ManagementRequest::RefreshSshAgentProxy { ref workspace, ref upstream_socket }
+                if workspace == "/Users/me/proj"
+                    && upstream_socket == "/private/tmp/com.apple.launchd.abc/Listeners"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_ssh_agent_proxy_refreshed_response() {
+        for (action, wire) in [
+            (SshProxyRefreshAction::Unchanged, "\"action\":\"unchanged\""),
+            (SshProxyRefreshAction::Rebridged, "\"action\":\"rebridged\""),
+            (SshProxyRefreshAction::Created, "\"action\":\"created\""),
+        ] {
+            let resp = ManagementResponse::SshAgentProxyRefreshed {
+                bridge_port: 54321,
+                refcount: 2,
+                action,
+            };
+            let json = serde_json::to_string(&resp).unwrap();
+            assert!(json.contains("\"type\":\"ssh_agent_proxy_refreshed\""));
+            assert!(json.contains(wire));
+            let decoded: ManagementResponse = serde_json::from_str(&json).unwrap();
+            assert!(matches!(
+                decoded,
+                ManagementResponse::SshAgentProxyRefreshed { bridge_port: 54321, refcount: 2, action: a }
+                    if a == action
             ));
         }
     }
