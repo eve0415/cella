@@ -7,6 +7,7 @@ pub mod jsonc_edit;
 pub mod list;
 pub mod prompts;
 pub mod resolve;
+pub mod resolve_dependencies;
 pub mod update;
 
 use clap::{Args, Subcommand};
@@ -29,6 +30,8 @@ pub enum FeaturesCommand {
     Info(info::InfoArgs),
     /// List configured or available features.
     List(list::ListArgs),
+    /// Resolve feature dependencies and print the installation order.
+    ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
@@ -42,6 +45,7 @@ impl FeaturesArgs {
             FeaturesCommand::Edit(args) => args.execute().await,
             FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
+            FeaturesCommand::ResolveDependencies(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
