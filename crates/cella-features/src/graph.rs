@@ -33,20 +33,30 @@ pub enum EdgeKind {
 /// `(from_ref, to_ref, kind)` means `from_ref` depends on (or installs after) `to_ref`.
 pub type DepEdge = (String, String, EdgeKind);
 
-/// Recursively build the dependency graph starting from `root_ref`.
+/// The result of building a dependency graph from a set of root feature references.
+pub struct DependencyGraph {
+    /// All edges discovered by recursive OCI fetch.
+    pub edges: Vec<DepEdge>,
+    /// Fetched metadata for every feature visited (roots + all transitives).
+    ///
+    /// Keys are the feature reference strings as declared (roots) or as
+    /// referenced in `dependsOn` (transitives).
+    pub metadata: HashMap<String, crate::FeatureMetadata>,
+}
+
+/// Recursively build the dependency graph starting from one or more root refs.
 ///
-/// Discovers edges from both `dependsOn` (hard, solid arrow) and `installsAfter`
-/// (soft, dashed arrow) metadata fields. Each unique reference is visited at
-/// most once (cycle protection via a `HashSet`). Only `dependsOn` targets are
-/// recursed into; `installsAfter` targets are recorded as edges but not walked.
+/// Each root is visited once; transitive `dependsOn` targets are recursed into
+/// and their metadata is collected. `installsAfter` edges are recorded but not
+/// walked (matching official CLI behaviour).
 ///
-/// Progress message "Building dependency graph..." is printed to stderr.
+/// Emits "Building dependency graph..." to stderr before starting.
 ///
 /// # Errors
 ///
 /// Returns an error when a feature reference cannot be parsed, normalised, or
-/// fetched. Errors on transitive dependencies are propagated.
-pub async fn build_dependency_graph(root_ref: &str) -> Result<Vec<DepEdge>, FeatureError> {
+/// fetched. Transitive errors are propagated.
+pub async fn build_dependency_graph(root_refs: &[&str]) -> Result<DependencyGraph, FeatureError> {
     eprintln!("Building dependency graph...");
 
     let cache = FeatureCache::new();
@@ -55,33 +65,42 @@ pub async fn build_dependency_graph(root_ref: &str) -> Result<Vec<DepEdge>, Feat
 
     let mut edges: Vec<DepEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
+    let mut metadata: HashMap<String, crate::FeatureMetadata> = HashMap::new();
 
-    visit(
-        root_ref,
-        &fetcher,
-        &platform,
-        &cache,
-        &mut edges,
-        &mut visited,
-    )
-    .await?;
+    for root_ref in root_refs {
+        visit(
+            root_ref,
+            &fetcher,
+            &platform,
+            &cache,
+            &mut edges,
+            &mut visited,
+            &mut metadata,
+        )
+        .await?;
+    }
 
-    Ok(edges)
+    Ok(DependencyGraph { edges, metadata })
 }
 
 /// Render a dependency graph as a Mermaid `flowchart TD` diagram.
 ///
-/// Node labels use the short form `name:tag` (last path segment + tag).
-/// When `edges` is empty the diagram still renders with just the root node.
+/// Matches the official devcontainer CLI's `generateMermaidDiagram`: each
+/// user-provided root gets its own entry at the top of the diagram, with edges
+/// from all roots rendered beneath it. Node labels use the short form
+/// `name:tag` (last path segment + tag).
 ///
-/// Edge rendering matches the official devcontainer CLI:
+/// When `edges` is empty for a given root, that root is rendered as an isolated
+/// node. The official CLI uses `flowchart` (no `TD`); we match that.
+///
+/// Edge rendering:
 /// - `dependsOn` → solid arrow `A --> B`
 /// - `installsAfter` → dashed arrow `A -.-> B`
-pub fn render_mermaid(root: &str, edges: &[DepEdge]) -> String {
+pub fn render_mermaid(roots: &[&str], edges: &[DepEdge]) -> String {
     let mut node_ids: HashMap<String, String> = HashMap::new();
     let mut next_id = 0usize;
 
-    // Assign stable single-letter / short node IDs.
+    // Assign stable short node IDs; first call for a ref reserves the next slot.
     let mut get_id = |ref_str: &str| -> String {
         node_ids
             .entry(ref_str.to_owned())
@@ -93,29 +112,38 @@ pub fn render_mermaid(root: &str, edges: &[DepEdge]) -> String {
             .clone()
     };
 
-    // Ensure root always gets node A.
-    get_id(root);
+    // Reserve IDs for all roots first so they get the lowest-numbered slots.
+    for root in roots {
+        get_id(root);
+    }
 
+    // Official CLI uses `flowchart` (no direction keyword).
     let mut lines: Vec<String> = vec!["flowchart TD".to_owned()];
 
-    if edges.is_empty() {
-        let id = get_id(root);
-        let label = short_label(root);
-        lines.push(format!("    {id}[\"{label}\"]"));
-    } else {
-        for (from, to, kind) in edges {
-            let from_id = get_id(from);
-            let to_id = get_id(to);
-            let from_label = short_label(from);
-            let to_label = short_label(to);
-            let arrow = match kind {
-                EdgeKind::DependsOn => "-->",
-                EdgeKind::InstallsAfter => "-.->",
-            };
-            lines.push(format!(
-                "    {from_id}[\"{from_label}\"] {arrow} {to_id}[\"{to_label}\"]"
-            ));
+    // Track which roots have at least one outgoing edge so we can emit isolated
+    // nodes for those that don't.
+    let roots_with_edges: HashSet<&str> = edges.iter().map(|(from, _, _)| from.as_str()).collect();
+
+    for root in roots {
+        if !roots_with_edges.contains(*root) {
+            let id = get_id(root);
+            let label = short_label(root);
+            lines.push(format!("    {id}[\"{label}\"]"));
         }
+    }
+
+    for (from, to, kind) in edges {
+        let from_id = get_id(from);
+        let to_id = get_id(to);
+        let from_label = short_label(from);
+        let to_label = short_label(to);
+        let arrow = match kind {
+            EdgeKind::DependsOn => "-->",
+            EdgeKind::InstallsAfter => "-.->",
+        };
+        lines.push(format!(
+            "    {from_id}[\"{from_label}\"] {arrow} {to_id}[\"{to_label}\"]"
+        ));
     }
 
     lines.join("\n")
@@ -168,7 +196,7 @@ fn host_platform() -> Platform {
     }
 }
 
-/// Recursively visit a feature reference, collecting edges into `edges`.
+/// Recursively visit a feature reference, collecting edges and metadata.
 async fn visit(
     reference: &str,
     fetcher: &OciFetcher,
@@ -176,6 +204,7 @@ async fn visit(
     cache: &FeatureCache,
     edges: &mut Vec<DepEdge>,
     visited: &mut HashSet<String>,
+    metadata_map: &mut HashMap<String, crate::FeatureMetadata>,
 ) -> Result<(), FeatureError> {
     if !visited.insert(reference.to_owned()) {
         debug!("graph: already visited {reference}, skipping");
@@ -196,14 +225,23 @@ async fn visit(
     let metadata = parse_feature_metadata(&json)?;
 
     // Hard dependencies: recurse into each and emit a solid edge.
-    for dep_ref in metadata.depends_on.keys() {
+    let dep_refs: Vec<String> = metadata.depends_on.keys().cloned().collect();
+    for dep_ref in &dep_refs {
         edges.push((reference.to_owned(), dep_ref.clone(), EdgeKind::DependsOn));
         // Box the recursive future to avoid infinitely-sized stack frames.
-        Box::pin(visit(dep_ref, fetcher, platform, cache, edges, visited)).await?;
+        Box::pin(visit(
+            dep_ref,
+            fetcher,
+            platform,
+            cache,
+            edges,
+            visited,
+            metadata_map,
+        ))
+        .await?;
     }
 
-    // Soft ordering hints: record the edge but do not recurse (the target may
-    // not be in the resolved feature set at all).
+    // Soft ordering hints: record the edge but do not recurse.
     for dep_ref in &metadata.installs_after {
         edges.push((
             reference.to_owned(),
@@ -211,6 +249,8 @@ async fn visit(
             EdgeKind::InstallsAfter,
         ));
     }
+
+    metadata_map.insert(reference.to_owned(), metadata);
 
     Ok(())
 }
@@ -298,7 +338,8 @@ mod tests {
 
     #[test]
     fn render_mermaid_no_edges() {
-        let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &[]);
+        let root = "ghcr.io/devcontainers/features/node:1";
+        let output = render_mermaid(&[root], &[]);
         assert!(output.starts_with("flowchart TD"));
         assert!(output.contains("A[\"node:1\"]"));
         // No arrow present
@@ -307,12 +348,13 @@ mod tests {
 
     #[test]
     fn render_mermaid_depends_on_edge() {
+        let root = "ghcr.io/devcontainers/features/node:1";
         let edges = vec![(
-            "ghcr.io/devcontainers/features/node:1".to_owned(),
+            root.to_owned(),
             "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
             EdgeKind::DependsOn,
         )];
-        let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
+        let output = render_mermaid(&[root], &edges);
         assert!(output.starts_with("flowchart TD"));
         // Hard dep → solid arrow
         assert!(output.contains("-->"), "expected solid arrow");
@@ -323,12 +365,13 @@ mod tests {
 
     #[test]
     fn render_mermaid_installs_after_edge() {
+        let root = "ghcr.io/devcontainers/features/node:1";
         let edges = vec![(
-            "ghcr.io/devcontainers/features/node:1".to_owned(),
+            root.to_owned(),
             "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
             EdgeKind::InstallsAfter,
         )];
-        let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
+        let output = render_mermaid(&[root], &edges);
         assert!(output.starts_with("flowchart TD"));
         // Soft dep → dashed arrow
         assert!(output.contains("-.-"), "expected dashed arrow");
@@ -338,19 +381,20 @@ mod tests {
 
     #[test]
     fn render_mermaid_mixed_edges() {
+        let root = "ghcr.io/devcontainers/features/node:1";
         let edges = vec![
             (
-                "ghcr.io/devcontainers/features/node:1".to_owned(),
+                root.to_owned(),
                 "ghcr.io/devcontainers/features/git:1".to_owned(),
                 EdgeKind::DependsOn,
             ),
             (
-                "ghcr.io/devcontainers/features/node:1".to_owned(),
+                root.to_owned(),
                 "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
                 EdgeKind::InstallsAfter,
             ),
         ];
-        let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
+        let output = render_mermaid(&[root], &edges);
         // Header + 2 edge lines
         assert_eq!(output.lines().count(), 3);
         assert!(output.contains("-->"), "expected solid arrow for dependsOn");
@@ -361,6 +405,38 @@ mod tests {
         assert!(output.contains("node:1"));
         assert!(output.contains("git:1"));
         assert!(output.contains("common-utils:2"));
+    }
+
+    #[test]
+    fn render_mermaid_multiple_roots_no_edges() {
+        let roots = [
+            "ghcr.io/devcontainers/features/node:1",
+            "ghcr.io/devcontainers/features/python:1",
+        ];
+        let output = render_mermaid(&roots, &[]);
+        assert!(output.starts_with("flowchart TD"));
+        // Both roots appear as isolated nodes
+        assert!(output.contains("node:1"), "node root missing");
+        assert!(output.contains("python:1"), "python root missing");
+        assert!(!output.contains("-->"));
+    }
+
+    #[test]
+    fn render_mermaid_multiple_roots_with_shared_dep() {
+        let node = "ghcr.io/devcontainers/features/node:1";
+        let python = "ghcr.io/devcontainers/features/python:1";
+        let common = "ghcr.io/devcontainers/features/common-utils:2";
+        let edges = vec![
+            (node.to_owned(), common.to_owned(), EdgeKind::DependsOn),
+            (python.to_owned(), common.to_owned(), EdgeKind::DependsOn),
+        ];
+        let output = render_mermaid(&[node, python], &edges);
+        assert!(output.starts_with("flowchart TD"));
+        assert!(output.contains("node:1"));
+        assert!(output.contains("python:1"));
+        assert!(output.contains("common-utils:2"));
+        // Both roots should have solid arrows to common-utils
+        assert_eq!(output.matches("-->").count(), 2);
     }
 
     // -----------------------------------------------------------------------
