@@ -179,14 +179,17 @@ impl TemplatesApplyArgs {
 impl TemplatesMetadataArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match metadata::fetch_manifest_metadata(&self.template_id).await {
-            Ok(Some(raw)) => {
-                // Re-parse and re-serialize so the output is valid JSON (not
-                // the annotation's raw escaped string).
-                let parsed: Value = serde_json::from_str(&raw)
-                    .map_err(|e| format!("metadata annotation is not valid JSON: {e}"))?;
-                println!("{}", serde_json::to_string(&parsed).expect("serializable"));
-                Ok(())
-            }
+            Ok(Some(raw)) => match render_metadata_annotation(&raw) {
+                Ok(json) => {
+                    println!("{json}");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("warning: metadata annotation is not valid JSON: {e}");
+                    println!("{{}}");
+                    std::process::exit(1);
+                }
+            },
             Ok(None) => {
                 eprintln!(
                     "Template resolved to '{}' but does not contain metadata on its manifest.",
@@ -205,6 +208,19 @@ impl TemplatesMetadataArgs {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering helpers
+// ---------------------------------------------------------------------------
+
+/// Re-parse and re-serialize the raw metadata annotation string so the output
+/// is compact valid JSON rather than the annotation's escaped string value.
+///
+/// Returns `Err` when the annotation is not valid JSON.
+fn render_metadata_annotation(raw: &str) -> Result<String, serde_json::Error> {
+    let parsed: Value = serde_json::from_str(raw)?;
+    Ok(serde_json::to_string(&parsed).expect("re-serializing a Value is infallible"))
 }
 
 // ---------------------------------------------------------------------------
@@ -502,5 +518,36 @@ mod tests {
             template_id: "ghcr.io/devcontainers/templates/alpine".to_owned(),
         };
         assert_eq!(args.template_id, "ghcr.io/devcontainers/templates/alpine");
+    }
+
+    // -----------------------------------------------------------------------
+    // render_metadata_annotation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_valid_annotation_produces_compact_json() {
+        let raw = r#"{"id":"alpine","version":"1.0.0"}"#;
+        let result = render_metadata_annotation(raw).unwrap();
+        // Re-serialization should produce valid compact JSON.
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["id"], Value::String("alpine".to_owned()));
+        assert_eq!(v["version"], Value::String("1.0.0".to_owned()));
+    }
+
+    #[test]
+    fn render_invalid_annotation_returns_err() {
+        let result = render_metadata_annotation("{not valid json}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_annotation_with_whitespace_produces_compact_output() {
+        // Annotation may have extra whitespace or pretty-printing; output must be compact.
+        let raw = "{\n  \"id\": \"alpine\"\n}";
+        let result = render_metadata_annotation(raw).unwrap();
+        assert!(
+            !result.contains('\n'),
+            "output should be compact (no newlines)"
+        );
     }
 }
