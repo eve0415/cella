@@ -82,7 +82,10 @@ impl TemplatesArgs {
         }
     }
 
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(
+        self,
+        _progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             TemplatesCommand::Apply(args) => args.execute().await,
             TemplatesCommand::New { .. }
@@ -427,6 +430,10 @@ mod tests {
     // TemplatesCommand stubs still return not-implemented
     // -----------------------------------------------------------------------
 
+    fn dummy_progress() -> crate::progress::Progress {
+        crate::progress::Progress::new(false, crate::progress::Verbosity::Normal)
+    }
+
     #[tokio::test]
     async fn new_returns_not_implemented() {
         let args = TemplatesArgs {
@@ -434,7 +441,7 @@ mod tests {
                 name: "rust".to_owned(),
             },
         };
-        let result = args.execute().await;
+        let result = args.execute(dummy_progress()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "not yet implemented");
     }
@@ -444,7 +451,7 @@ mod tests {
         let args = TemplatesArgs {
             command: TemplatesCommand::List,
         };
-        let result = args.execute().await;
+        let result = args.execute(dummy_progress()).await;
         assert!(result.is_err());
     }
 }
