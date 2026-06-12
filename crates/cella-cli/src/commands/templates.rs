@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use cella_templates::{
     SelectedFeature, TemplateError, apply, fetcher, generate_docs, metadata, options,
+    publish::{PublishOptions, publish_templates},
 };
 
 use super::LogLevel;
@@ -25,6 +26,8 @@ pub enum TemplatesCommand {
     Metadata(TemplatesMetadataArgs),
     /// Generate documentation (README.md) for all templates in a collection.
     GenerateDocs(TemplatesGenerateDocsArgs),
+    /// Publish templates (single or collection) to an OCI registry.
+    Publish(TemplatesPublishArgs),
     /// Create a new template.
     New {
         /// Name for the template.
@@ -37,6 +40,29 @@ pub enum TemplatesCommand {
         /// Name of the template to edit.
         name: String,
     },
+}
+
+/// Arguments for `cella templates publish`.
+///
+/// Flag surface matches `devcontainer templates publish` exactly.
+#[derive(Args)]
+pub struct TemplatesPublishArgs {
+    /// Path to a single template directory or a collection directory.
+    /// Defaults to the current directory.
+    #[arg(default_value = ".")]
+    pub target: PathBuf,
+
+    /// OCI registry to publish to.
+    #[arg(short = 'r', long = "registry", default_value = "ghcr.io")]
+    pub registry: String,
+
+    /// OCI namespace (owner/org) under which templates are published.
+    #[arg(short = 'n', long = "namespace", required = true)]
+    pub namespace: String,
+
+    /// Log verbosity level.
+    #[arg(long = "log-level", value_enum, default_value = "info")]
+    pub log_level: LogLevel,
 }
 
 /// Arguments for `cella templates generate-docs`.
@@ -133,6 +159,7 @@ impl TemplatesArgs {
             TemplatesCommand::Apply(args) => args.execute().await,
             TemplatesCommand::Metadata(args) => args.execute().await,
             TemplatesCommand::GenerateDocs(args) => args.execute(),
+            TemplatesCommand::Publish(args) => args.execute().await,
             TemplatesCommand::New { .. }
             | TemplatesCommand::List
             | TemplatesCommand::Edit { .. } => {
@@ -140,6 +167,23 @@ impl TemplatesArgs {
                 Err("not yet implemented".into())
             }
         }
+    }
+}
+
+impl TemplatesPublishArgs {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let opts = PublishOptions {
+            target: self.target,
+            registry: self.registry,
+            namespace: self.namespace,
+        };
+
+        let output = publish_templates(opts).await?;
+        println!(
+            "{}",
+            serde_json::to_string(&output).expect("output is serializable")
+        );
+        Ok(())
     }
 }
 
