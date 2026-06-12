@@ -5,21 +5,14 @@
 
 use std::path::PathBuf;
 
-use flate2::read::GzDecoder;
 use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol};
-use oci_distribution::manifest::{
-    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::TemplateMetadata;
 use crate::cache::TemplateCache;
 use crate::error::TemplateError;
-
-/// Media type for devcontainer template/feature layers (plain tar).
-const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 
 /// Fetch a template artifact from an OCI registry and return the local
 /// path where it was extracted.
@@ -49,7 +42,7 @@ pub async fn fetch_template(
     };
     let client = oci_distribution::Client::new(config);
     let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
-    let auth = build_registry_auth(&registry);
+    let auth = cella_oci::build_registry_auth(&registry);
 
     debug!("fetching template {registry}/{repository}:{tag}");
 
@@ -97,7 +90,7 @@ pub async fn fetch_template(
         message: format!("failed to create staging directory: {e}"),
     })?;
 
-    extract_layer(&blob, &layer.media_type, &staging).map_err(|e| {
+    cella_oci::extract_layer(&blob, &layer.media_type, &staging).map_err(|e| {
         let _ = std::fs::remove_dir_all(&staging);
         TemplateError::InvalidArtifact {
             template_id: template_ref.to_owned(),
@@ -156,8 +149,6 @@ fn parse_template_ref(template_ref: &str) -> Result<(String, String, String), Te
     Ok((registry.to_owned(), repository.to_owned(), tag))
 }
 
-use cella_oci::build_registry_auth;
-
 fn find_extractable_layer<'a>(
     manifest: &'a oci_distribution::manifest::OciImageManifest,
     template_ref: &str,
@@ -165,7 +156,7 @@ fn find_extractable_layer<'a>(
     manifest
         .layers
         .iter()
-        .find(|l| is_extractable_layer(&l.media_type))
+        .find(|l| cella_oci::is_extractable_layer(&l.media_type))
         .ok_or_else(|| TemplateError::InvalidArtifact {
             template_id: template_ref.to_owned(),
             reason: format!(
@@ -178,42 +169,6 @@ fn find_extractable_layer<'a>(
                     .join(", ")
             ),
         })
-}
-
-fn is_extractable_layer(media_type: &str) -> bool {
-    matches!(
-        media_type,
-        IMAGE_LAYER_GZIP_MEDIA_TYPE
-            | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
-            | IMAGE_LAYER_MEDIA_TYPE
-            | DEVCONTAINERS_LAYER_MEDIA_TYPE
-    ) || media_type.contains("tar+gzip")
-        || media_type.contains("tar.gzip")
-}
-
-fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::io::Result<()> {
-    let is_gzip = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
-
-    if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
-        if is_gzip {
-            let gz = GzDecoder::new(blob);
-            let mut archive = tar::Archive::new(gz);
-            archive.unpack(dest)?;
-        } else {
-            tracing::warn!("layer declared as gzip but no gzip magic; trying raw tar");
-            let mut archive = tar::Archive::new(blob);
-            archive.unpack(dest)?;
-        }
-    } else if is_gzip {
-        tracing::warn!("layer declared as plain tar but has gzip magic; decompressing");
-        let gz = GzDecoder::new(blob);
-        let mut archive = tar::Archive::new(gz);
-        archive.unpack(dest)?;
-    } else {
-        let mut archive = tar::Archive::new(blob);
-        archive.unpack(dest)?;
-    }
-    Ok(())
 }
 
 // ===========================================================================
@@ -248,17 +203,26 @@ mod tests {
 
     #[test]
     fn extractable_layer_detection() {
-        assert!(is_extractable_layer(IMAGE_LAYER_GZIP_MEDIA_TYPE));
-        assert!(is_extractable_layer(IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE));
-        assert!(is_extractable_layer(IMAGE_LAYER_MEDIA_TYPE));
-        assert!(is_extractable_layer(DEVCONTAINERS_LAYER_MEDIA_TYPE));
-        assert!(!is_extractable_layer(
+        use oci_distribution::manifest::{
+            IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+        };
+        assert!(cella_oci::is_extractable_layer(IMAGE_LAYER_GZIP_MEDIA_TYPE));
+        assert!(cella_oci::is_extractable_layer(
+            IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
+        ));
+        assert!(cella_oci::is_extractable_layer(IMAGE_LAYER_MEDIA_TYPE));
+        assert!(cella_oci::is_extractable_layer(
+            cella_oci::extract::DEVCONTAINERS_LAYER_MEDIA_TYPE
+        ));
+        assert!(!cella_oci::is_extractable_layer(
             "application/vnd.oci.image.config.v1+json"
         ));
     }
 
     #[test]
     fn extract_gzip_tarball() {
+        use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
+
         let dir = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();
 
@@ -274,7 +238,7 @@ mod tests {
         let encoder = tar_builder.into_inner().unwrap();
         let compressed = encoder.finish().unwrap();
 
-        extract_layer(&compressed, IMAGE_LAYER_GZIP_MEDIA_TYPE, staging.path()).unwrap();
+        cella_oci::extract_layer(&compressed, IMAGE_LAYER_GZIP_MEDIA_TYPE, staging.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(staging.path().join("hello.txt")).unwrap(),
             "world"
