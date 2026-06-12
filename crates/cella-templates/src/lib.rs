@@ -11,6 +11,7 @@
 pub mod apply;
 pub mod cache;
 pub mod collection;
+pub mod docs;
 pub mod error;
 pub mod fetcher;
 pub mod index;
@@ -23,6 +24,7 @@ pub mod types;
 pub use apply::{SubstitutionReport, apply_to_workspace};
 pub use cache::TemplateCache;
 pub use collection::{DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMPLATE_COLLECTION};
+pub use docs::{GenerateDocsError, GenerateDocsReport, generate_docs};
 pub use error::TemplateError;
 pub use types::{
     DevcontainerIndex, FeatureCollectionIndex, FeatureSummary, IndexCollection,
