@@ -219,10 +219,17 @@ impl InfoArgs {
                         eprintln!("Failed to fetch tags: {e}");
                     }
                 }
-                // Dependencies section
-                let edges = build_dependency_graph(&self.feature).await?;
-                println!("=== Dependency Graph ===");
-                println!("{}", render_mermaid(&self.feature, &edges));
+                // Dependencies section — failure is non-fatal, symmetric with
+                // the manifest and tags sections above.
+                match build_dependency_graph(&self.feature).await {
+                    Ok(edges) => {
+                        println!("=== Dependency Graph ===");
+                        println!("{}", render_mermaid(&self.feature, &edges));
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to build dependency graph: {e}");
+                    }
+                }
             }
         }
         Ok(())
@@ -234,12 +241,29 @@ impl InfoArgs {
 // ---------------------------------------------------------------------------
 
 /// Build the canonical OCI identifier: `registry/repository@sha256:hex`.
+///
+/// Handles three reference forms correctly:
+/// - `registry/repo/name:tag`  → strips `:tag`, appends digest
+/// - `registry/repo/name@sha256:<hex>` → strips `@…` suffix, appends digest
+/// - `localhost:5000/ns/name`  → no tag after last `/`, appends digest as-is
+///
+/// The `:` in a registry host (`localhost:5000`) is distinguished from a tag
+/// separator by requiring the `:` to appear *after* the last `/`.
 pub fn build_canonical_id(reference: &str, hex_digest: &str) -> String {
-    // Strip the tag to get `registry/repository`, then append the digest.
-    let without_tag = reference
-        .rsplit_once(':')
-        .map_or(reference, |(base, _)| base);
-    format!("{without_tag}@sha256:{hex_digest}")
+    // Strip an existing digest reference (@sha256:...) first.
+    let base = if let Some(pos) = reference.find('@') {
+        &reference[..pos]
+    } else {
+        // Look for a tag-separating `:` — it must appear after the last `/`.
+        let last_slash = reference.rfind('/').map_or(0, |p| p + 1);
+        let colon_after_last_slash = reference[last_slash..].find(':');
+        if let Some(rel) = colon_after_last_slash {
+            &reference[..last_slash + rel]
+        } else {
+            reference
+        }
+    };
+    format!("{base}@sha256:{hex_digest}")
 }
 
 /// Construct the boxed error returned on manifest fetch failure.
@@ -365,14 +389,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn canonical_id_plain_ref_no_tag() {
+        // No tag, no digest — just append.
+        let id = build_canonical_id("ghcr.io/devcontainers/features/node", "abc123");
+        assert_eq!(id, "ghcr.io/devcontainers/features/node@sha256:abc123");
+    }
+
+    #[test]
     fn canonical_id_strips_tag_appends_digest() {
         let id = build_canonical_id("ghcr.io/devcontainers/features/node:1", "abc123");
         assert_eq!(id, "ghcr.io/devcontainers/features/node@sha256:abc123");
     }
 
     #[test]
-    fn canonical_id_no_tag_still_works() {
-        let id = build_canonical_id("ghcr.io/devcontainers/features/node", "abc123");
+    fn canonical_id_digest_ref_does_not_double_append() {
+        // Input already has @sha256:... — strip it and use our digest.
+        let id = build_canonical_id(
+            "ghcr.io/devcontainers/features/node@sha256:deadbeef",
+            "abc123",
+        );
         assert_eq!(id, "ghcr.io/devcontainers/features/node@sha256:abc123");
+    }
+
+    #[test]
+    fn canonical_id_registry_with_port_no_tag() {
+        // The `:5000` is part of the registry host, not a tag separator.
+        let id = build_canonical_id("localhost:5000/ns/myfeature", "abc123");
+        assert_eq!(id, "localhost:5000/ns/myfeature@sha256:abc123");
+    }
+
+    #[test]
+    fn canonical_id_registry_with_port_and_tag() {
+        let id = build_canonical_id("localhost:5000/ns/myfeature:latest", "abc123");
+        assert_eq!(id, "localhost:5000/ns/myfeature@sha256:abc123");
     }
 }
