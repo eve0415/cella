@@ -1,13 +1,42 @@
 //! Docker daemon connection management.
 
 use bollard::Docker;
+use cella_backend::BackendEndpoint;
 use tracing::debug;
 
 use crate::CellaDockerError;
 
+/// Normalize a `--docker-host` value to a full URI string.
+///
+/// Bare socket paths (starting with `/`) are prefixed with `unix://`.
+/// Values that already carry a scheme (`unix://`, `tcp://`, etc.) pass through unchanged.
+fn normalize_host_endpoint(host: &str) -> String {
+    if host.starts_with('/') {
+        format!("unix://{host}")
+    } else {
+        host.to_string()
+    }
+}
+
+/// The endpoint bollard's local-defaults path actually connects to.
+///
+/// Mirrors `Docker::connect_with_unix_defaults`: `DOCKER_HOST` is honored only
+/// when it starts with `unix://`; any other value is ignored and the default
+/// socket is used. Recording anything else would advertise an endpoint the
+/// connection never used.
+fn local_defaults_endpoint(docker_host: Option<String>) -> BackendEndpoint {
+    BackendEndpoint::DockerHost(
+        docker_host
+            .filter(|v| v.starts_with("unix://"))
+            .unwrap_or_else(|| "unix:///var/run/docker.sock".to_string()),
+    )
+}
+
 /// Wrapper around the bollard Docker client.
 pub struct DockerClient {
     inner: Docker,
+    /// Resolved daemon endpoint recorded at connect time.
+    pub(crate) endpoint: BackendEndpoint,
 }
 
 impl DockerClient {
@@ -26,7 +55,11 @@ impl DockerClient {
         match Docker::connect_with_local_defaults() {
             Ok(docker) => {
                 debug!("Connected to Docker via default socket");
-                return Ok(Self { inner: docker });
+                let endpoint = local_defaults_endpoint(std::env::var("DOCKER_HOST").ok());
+                return Ok(Self {
+                    inner: docker,
+                    endpoint,
+                });
             }
             Err(e) => {
                 debug!("Default Docker connection failed: {e}, trying alternative sockets");
@@ -44,7 +77,12 @@ impl DockerClient {
                     ),
                 })?;
             tracing::info!("Connected to Docker via discovered socket: {path_str}");
-            return Ok(Self { inner: docker });
+            let endpoint =
+                BackendEndpoint::DockerHost(format!("unix://{}", discovered.path.display()));
+            return Ok(Self {
+                inner: docker,
+                endpoint,
+            });
         }
 
         // All methods failed
@@ -68,7 +106,11 @@ impl DockerClient {
         .map_err(|e| CellaDockerError::RuntimeNotFound {
             message: format!("failed to connect to Docker at {host}: {e}"),
         })?;
-        Ok(Self { inner: docker })
+        let endpoint = BackendEndpoint::DockerHost(normalize_host_endpoint(host));
+        Ok(Self {
+            inner: docker,
+            endpoint,
+        })
     }
 
     /// Ping the daemon to verify connection.
@@ -85,6 +127,61 @@ impl DockerClient {
     /// Access the inner bollard client.
     pub const fn inner(&self) -> &Docker {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendEndpoint, local_defaults_endpoint, normalize_host_endpoint};
+
+    #[test]
+    fn bare_path_gets_unix_prefix() {
+        assert_eq!(
+            normalize_host_endpoint("/var/run/docker.sock"),
+            "unix:///var/run/docker.sock"
+        );
+    }
+
+    #[test]
+    fn unix_scheme_passes_through() {
+        assert_eq!(
+            normalize_host_endpoint("unix:///var/run/docker.sock"),
+            "unix:///var/run/docker.sock"
+        );
+    }
+
+    #[test]
+    fn tcp_scheme_passes_through() {
+        assert_eq!(
+            normalize_host_endpoint("tcp://localhost:2375"),
+            "tcp://localhost:2375"
+        );
+    }
+
+    #[test]
+    fn local_defaults_without_docker_host_uses_default_socket() {
+        assert_eq!(
+            local_defaults_endpoint(None),
+            BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn local_defaults_honors_unix_docker_host() {
+        assert_eq!(
+            local_defaults_endpoint(Some("unix:///tmp/custom.sock".to_string())),
+            BackendEndpoint::DockerHost("unix:///tmp/custom.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn local_defaults_ignores_non_unix_docker_host() {
+        // Mirrors bollard: a tcp:// DOCKER_HOST is ignored by
+        // connect_with_unix_defaults, so it must not be advertised.
+        assert_eq!(
+            local_defaults_endpoint(Some("tcp://localhost:2375".to_string())),
+            BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string())
+        );
     }
 }
 

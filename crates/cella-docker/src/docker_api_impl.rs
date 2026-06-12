@@ -4,9 +4,9 @@ use std::io::Write;
 use std::path::Path;
 
 use cella_backend::{
-    BackendCapabilities, BackendError, BackendKind, BoxFuture, BuildOptions, ContainerBackend,
-    ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload, ImageDetails,
-    InteractiveExecOptions, ManagedNetwork, Platform, RemovalOutcome,
+    BackendCapabilities, BackendEndpoint, BackendError, BackendKind, BoxFuture, BuildOptions,
+    ContainerBackend, ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult, FileToUpload,
+    ImageDetails, InteractiveExecOptions, ManagedNetwork, Platform, RemovalOutcome,
 };
 
 use crate::client::DockerClient;
@@ -296,6 +296,10 @@ impl ContainerBackend for DockerClient {
 
     fn host_gateway(&self) -> &'static str {
         "host.docker.internal"
+    }
+
+    fn endpoint(&self) -> Option<BackendEndpoint> {
+        Some(self.endpoint.clone())
     }
 
     // -- Platform detection --
