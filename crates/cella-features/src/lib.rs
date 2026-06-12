@@ -7,6 +7,7 @@ pub mod merge;
 pub mod metadata;
 pub mod oci;
 pub mod ordering;
+pub mod package;
 pub mod reference;
 pub mod types;
 
