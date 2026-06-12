@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
-use cella_templates::{SelectedFeature, TemplateError, apply, fetcher, metadata, options};
+use cella_templates::{
+    SelectedFeature, TemplateError, apply, fetcher, generate_docs, metadata, options,
+};
 
 use super::LogLevel;
 
@@ -21,6 +23,8 @@ pub enum TemplatesCommand {
     Apply(TemplatesApplyArgs),
     /// Fetch a published template's metadata from its OCI manifest.
     Metadata(TemplatesMetadataArgs),
+    /// Generate documentation (README.md) for all templates in a collection.
+    GenerateDocs(TemplatesGenerateDocsArgs),
     /// Create a new template.
     New {
         /// Name for the template.
@@ -33,6 +37,25 @@ pub enum TemplatesCommand {
         /// Name of the template to edit.
         name: String,
     },
+}
+
+/// Arguments for `cella templates generate-docs`.
+///
+/// Flag surface matches `devcontainer templates generate-docs` exactly.
+#[derive(Args)]
+pub struct TemplatesGenerateDocsArgs {
+    /// Path to the folder containing a `src/` sub-folder with template directories.
+    /// Defaults to the current directory.
+    #[arg(short = 'p', long = "project-folder", default_value = ".")]
+    pub project_folder: PathBuf,
+
+    /// GitHub owner name used to build the README footer URL.
+    #[arg(long = "github-owner", default_value = "")]
+    pub github_owner: String,
+
+    /// GitHub repository name used to build the README footer URL.
+    #[arg(long = "github-repo", default_value = "")]
+    pub github_repo: String,
 }
 
 /// Arguments for `cella templates metadata`.
@@ -108,6 +131,7 @@ impl TemplatesArgs {
         match self.command {
             TemplatesCommand::Apply(args) => args.execute().await,
             TemplatesCommand::Metadata(args) => args.execute().await,
+            TemplatesCommand::GenerateDocs(args) => args.execute(),
             TemplatesCommand::New { .. }
             | TemplatesCommand::List
             | TemplatesCommand::Edit { .. } => {
@@ -224,6 +248,37 @@ impl TemplatesMetadataArgs {
                 println!("{{}}");
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+impl TemplatesGenerateDocsArgs {
+    pub fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let project_folder = if self.project_folder == std::path::Path::new(".") {
+            std::env::current_dir()?
+        } else {
+            self.project_folder.clone()
+        };
+
+        let owner = (!self.github_owner.is_empty()).then_some(self.github_owner.as_str());
+        let repo = (!self.github_repo.is_empty()).then_some(self.github_repo.as_str());
+
+        let report = generate_docs(&project_folder, owner, repo)?;
+
+        for id in &report.written {
+            eprintln!("  wrote: src/{id}/README.md");
+        }
+        for dir in &report.skipped {
+            eprintln!("  skipped: {dir} (no devcontainer-template.json)");
+        }
+        for dir in &report.errors {
+            eprintln!("  error: {dir}");
+        }
+
+        if report.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{} template(s) failed", report.errors.len()).into())
         }
     }
 }
