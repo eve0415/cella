@@ -583,18 +583,28 @@ async fn expand_depends_on(
     let http_fetcher = HttpFetcher;
     let local_fetcher = LocalFetcher;
 
-    // Visited set: (normalised_ref_string, options_json) to implement spec
-    // identity semantics.  Pre-populate with user-declared entries.
+    // Normalize a raw ref string for identity keying, ignoring parse errors
+    // (invalid refs are caught later during fetch).
+    let normalize_key = |raw: &str| -> String {
+        FeatureRef::parse(raw)
+            .and_then(|r| r.normalize(workspace_root))
+            .map_or_else(|_| raw.to_owned(), |(n, _)| n.to_string())
+    };
+
+    // Visited set: (normalised_ref_string, options_json) — spec identity
+    // semantics.  Pre-populate with user-declared entries using their
+    // NORMALISED ref so that spelling variants of the same OCI ref
+    // (e.g. shorthand vs. fully-qualified) deduplicate correctly.
     let mut visited: std::collections::HashSet<(String, String)> = feature_entries
         .iter()
         .map(|e| {
-            // Reconstruct the canonical key from the original_ref.
+            let norm_key = normalize_key(&e.original_ref);
             let opts = serde_json::to_string(&e.user_options).unwrap_or_default();
-            (e.original_ref.clone(), opts)
+            (norm_key, opts)
         })
         .collect();
 
-    // Worklist: (feature_ref_string, options_value) pairs to process.
+    // Worklist: (raw_ref_string, options_value) pairs to process.
     // Pre-populate from the dependsOn of already-fetched entries.
     let mut worklist: Vec<(String, serde_json::Value)> = feature_entries
         .iter()
@@ -607,21 +617,22 @@ async fn expand_depends_on(
         .collect();
 
     while let Some((dep_ref, dep_opts)) = worklist.pop() {
-        let opts_json = serde_json::to_string(&dep_opts).unwrap_or_default();
-        let visit_key = (dep_ref.clone(), opts_json);
-
-        if visited.contains(&visit_key) {
-            continue;
-        }
-        visited.insert(visit_key);
-
-        // Parse and normalise the reference.
+        // Parse and normalise the reference first so we can deduplicate on
+        // the canonical identity, not the raw string the author wrote.
         let feature_ref = FeatureRef::parse(&dep_ref)?;
         let (normalized, warning) = feature_ref.normalize(workspace_root)?;
         if let Some(w) = warning {
             warn!("{dep_ref}: deprecated feature reference in dependsOn ({w:?})");
             let _ = w;
         }
+
+        let opts_json = serde_json::to_string(&dep_opts).unwrap_or_default();
+        let visit_key = (normalized.to_string(), opts_json);
+
+        if visited.contains(&visit_key) {
+            continue;
+        }
+        visited.insert(visit_key);
 
         // Fetch the artifact.
         let artifact_dir = fetch_one(
@@ -651,10 +662,12 @@ async fn expand_depends_on(
             log_option_warning(&dep_ref, w);
         }
 
-        // Enqueue this entry's own dependsOn for further expansion.
+        // Enqueue this entry's own dependsOn for further expansion,
+        // pre-filtering with the normalised key to avoid redundant fetches.
         for (transitive_ref, transitive_opts) in &metadata.depends_on {
+            let t_norm = normalize_key(transitive_ref);
             let t_opts_json = serde_json::to_string(transitive_opts).unwrap_or_default();
-            let t_key = (transitive_ref.clone(), t_opts_json);
+            let t_key = (t_norm, t_opts_json);
             if !visited.contains(&t_key) {
                 worklist.push((transitive_ref.clone(), transitive_opts.clone()));
             }
@@ -1780,6 +1793,69 @@ mod tests {
         assert!(
             matches!(err, FeatureError::CyclicDependsOn { .. }),
             "expected CyclicDependsOn error, got: {err:?}"
+        );
+    }
+
+    /// Regression: transitive cycle discovered during dependsOn expansion where
+    /// only the root feature is user-declared.
+    ///
+    /// User declares only A.  A dependsOn B (not declared).  B dependsOn A
+    /// (back-edge, completing the cycle).  `resolve_features` must return
+    /// `CyclicDependsOn`, not loop or silently mis-order.
+    #[tokio::test]
+    async fn depends_on_transitive_cycle_not_user_declared_returns_error() {
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        let a_ref = "./feat-a".to_string();
+        let b_ref = "./feat-b".to_string();
+
+        // A depends on B (B is not in the user's features list).
+        make_local_feature(
+            feature_dir.path(),
+            "feat-a",
+            &[(&b_ref, serde_json::json!({}))],
+            true,
+        );
+        // B depends back on A — completes the cycle.
+        make_local_feature(
+            feature_dir.path(),
+            "feat-b",
+            &[(&a_ref, serde_json::json!({}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        // Only feat-a is declared — B is auto-injected via dependsOn expansion.
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": { "./feat-a": {} }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let err = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, FeatureError::CyclicDependsOn { .. }),
+            "expected CyclicDependsOn error for transitive cycle, got: {err:?}"
         );
     }
 }
