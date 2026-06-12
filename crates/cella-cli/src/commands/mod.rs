@@ -333,6 +333,7 @@ impl Command {
             Self::RunUserCommands(args) => args.compat.log_level,
             Self::Features(args) => match &args.command {
                 features::FeaturesCommand::Package(package) => Some(package.log_level),
+                features::FeaturesCommand::Publish(publish) => Some(publish.log_level),
                 _ => None,
             },
             _ => None,
