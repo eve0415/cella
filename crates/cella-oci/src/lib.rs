@@ -1,10 +1,12 @@
 pub mod auth;
 pub mod cache;
 pub mod extract;
+pub mod push;
 
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
 pub use extract::{extract_layer, is_extractable_layer};
+pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
 
 use oci_distribution::secrets::RegistryAuth;
 use tracing::debug;
