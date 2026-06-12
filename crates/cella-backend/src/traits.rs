@@ -11,8 +11,8 @@ use std::pin::Pin;
 use crate::error::BackendError;
 use crate::network::{ManagedNetwork, RemovalOutcome};
 use crate::types::{
-    BackendKind, BuildOptions, ContainerInfo, CreateContainerOptions, ExecOptions, ExecResult,
-    FileToUpload, ImageDetails, InteractiveExecOptions,
+    BackendEndpoint, BackendKind, BuildOptions, ContainerInfo, CreateContainerOptions, ExecOptions,
+    ExecResult, FileToUpload, ImageDetails, InteractiveExecOptions,
 };
 
 /// Container platform information (OS and architecture).
@@ -203,6 +203,14 @@ pub trait ContainerBackend: Send + Sync {
     ///
     /// Docker: `"host.docker.internal"`, Podman: `"host.containers.internal"`.
     fn host_gateway(&self) -> &'static str;
+
+    /// How an external tool can reach the daemon this backend is connected to.
+    ///
+    /// Returns `None` when the backend has no externally usable endpoint
+    /// (e.g. mock or non-Docker backends).
+    fn endpoint(&self) -> Option<BackendEndpoint> {
+        None
+    }
 
     // -- Platform detection --
 
