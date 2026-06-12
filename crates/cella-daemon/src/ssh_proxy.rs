@@ -88,6 +88,30 @@ struct BridgeEntry {
     shutdown_tx: watch::Sender<bool>,
 }
 
+/// Outcome of a [`SshProxyManager::refresh`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshResult {
+    /// TCP port the bridge listens on after the refresh.
+    pub bridge_port: u16,
+    /// Refcount after the refresh — refresh never changes it (a created
+    /// bridge starts at 1).
+    pub refcount: usize,
+    /// What the refresh actually did.
+    pub action: RefreshAction,
+}
+
+/// What a refresh did to the workspace's bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshAction {
+    /// Entry existed with the same upstream — nothing to do.
+    Unchanged,
+    /// Upstream differed — the stale bridge was torn down and rebound
+    /// (preferring the same port so baked-in container env keeps working).
+    Rebridged,
+    /// No entry existed — a fresh bridge was created.
+    Created,
+}
+
 impl SshProxyManager {
     /// Create a new manager that writes its state file under `state_dir`.
     /// The `daemon_pid` and `auth_token` are recorded in the persisted
@@ -174,6 +198,98 @@ impl SshProxyManager {
             None => None,
         };
 
+        let entry = self.spawn_entry(upstream_socket, preferred_port, 1).await?;
+        let bridge_port = entry.bridge_port;
+        debug!(
+            workspace = %workspace.display(),
+            port = bridge_port,
+            "ssh-agent bridge: bound TCP listener"
+        );
+        self.bridges.insert(workspace, entry);
+        self.persist_state();
+        Ok(bridge_port)
+    }
+
+    /// Re-validate the bridge for `workspace` against the caller's current
+    /// `upstream_socket` without touching the refcount.
+    ///
+    /// This is the heal path for `cella up` on an existing container: the
+    /// registered upstream is a snapshot of the host's `$SSH_AUTH_SOCK`
+    /// taken at register time, and it goes stale whenever the host agent
+    /// moves (sleep/wake, re-login rotating the launchd socket path, agent
+    /// restart, or a daemon-restart reclaim restoring a pre-reboot path).
+    /// Unlike [`Self::register`], refresh leaves the refcount alone so
+    /// `cella down` accounting still matches the number of registers.
+    ///
+    /// - Same upstream: no-op, returns the existing port.
+    /// - Different upstream: tear down and rebind, preferring the same port
+    ///   so the container's baked `CELLA_SSH_AGENT_BRIDGE` keeps resolving;
+    ///   the refcount is carried forward.
+    /// - No entry (state lost and reclaim failed): create a fresh bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDaemonError::Socket` if no TCP listener can be bound.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in normal operation. `expect("just indexed")` on the
+    /// stale-upstream branch is proven unreachable by the preceding
+    /// `HashMap::get` returning `Some`.
+    pub async fn refresh(
+        &mut self,
+        workspace: PathBuf,
+        upstream_socket: PathBuf,
+    ) -> Result<RefreshResult, CellaDaemonError> {
+        let (preferred_port, refcount, action) = match self.bridges.get(&workspace) {
+            Some(entry) if entry.upstream_socket == upstream_socket => {
+                return Ok(RefreshResult {
+                    bridge_port: entry.bridge_port,
+                    refcount: entry.refcount,
+                    action: RefreshAction::Unchanged,
+                });
+            }
+            Some(_) => {
+                let removed = self.bridges.remove(&workspace).expect("just indexed");
+                warn!(
+                    workspace = %workspace.display(),
+                    port = removed.bridge_port,
+                    old_upstream = %removed.upstream_socket.display(),
+                    new_upstream = %upstream_socket.display(),
+                    "ssh-agent bridge: refresh found stale upstream, rebridging"
+                );
+                let _ = removed.shutdown_tx.send(true);
+                removed.accept_task.abort();
+                (
+                    Some(removed.bridge_port),
+                    removed.refcount,
+                    RefreshAction::Rebridged,
+                )
+            }
+            None => (None, 1, RefreshAction::Created),
+        };
+
+        let entry = self
+            .spawn_entry(upstream_socket, preferred_port, refcount)
+            .await?;
+        let result = RefreshResult {
+            bridge_port: entry.bridge_port,
+            refcount,
+            action,
+        };
+        self.bridges.insert(workspace, entry);
+        self.persist_state();
+        Ok(result)
+    }
+
+    /// Bind a TCP listener (preferring `preferred_port`) and spawn its
+    /// accept loop, returning the entry to insert into the registry.
+    async fn spawn_entry(
+        &self,
+        upstream_socket: PathBuf,
+        preferred_port: Option<u16>,
+        refcount: usize,
+    ) -> Result<BridgeEntry, CellaDaemonError> {
         let listener = bind_preferred_or_random(preferred_port).await?;
         let bridge_port =
             listener
@@ -183,13 +299,6 @@ impl SshProxyManager {
                     message: format!("ssh-agent bridge: local_addr failed: {e}"),
                 })?;
 
-        debug!(
-            workspace = %workspace.display(),
-            port = bridge_port,
-            upstream = %upstream_socket.display(),
-            "ssh-agent bridge: bound TCP listener"
-        );
-
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let upstream_for_task = upstream_socket.clone();
         let auth_for_task = self.auth_token.clone();
@@ -197,16 +306,13 @@ impl SshProxyManager {
             run_accept_loop(listener, upstream_for_task, auth_for_task, shutdown_rx).await;
         });
 
-        let entry = BridgeEntry {
+        Ok(BridgeEntry {
             upstream_socket,
             bridge_port,
-            refcount: 1,
+            refcount,
             accept_task: task.abort_handle(),
             shutdown_tx,
-        };
-        self.bridges.insert(workspace, entry);
-        self.persist_state();
-        Ok(bridge_port)
+        })
     }
 
     /// Decrement the refcount for `workspace`. When the refcount reaches
@@ -882,6 +988,120 @@ mod tests {
     // undone by the stale-reclaim fix; see
     // `register_with_new_upstream_replaces_stale_bridge` above for
     // the current semantic: different upstream → rebuild bridge.)
+
+    // ---------------------------------------------------------------
+    // refresh: heal-without-refcount semantics for the up reuse path.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refresh_same_upstream_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+        let port = m
+            .register(workspace.clone(), upstream.clone())
+            .await
+            .unwrap();
+        m.register(workspace.clone(), upstream.clone())
+            .await
+            .unwrap();
+
+        let result = m.refresh(workspace.clone(), upstream).await.unwrap();
+
+        assert_eq!(result.action, RefreshAction::Unchanged);
+        assert_eq!(result.bridge_port, port);
+        assert_eq!(
+            result.refcount, 2,
+            "refresh must not bump the refcount — releases would no longer match registers"
+        );
+        assert_eq!(m.refcount_for(&workspace), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_rebridges_stale_upstream_preserving_refcount() {
+        // The recurring colima failure: the bridge's upstream is a
+        // snapshot of $SSH_AUTH_SOCK that went stale (sleep, re-login,
+        // agent restart). refresh must rebind to the CURRENT upstream
+        // while keeping the refcount intact, so `cella down` accounting
+        // still matches the number of ups.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream_old = dir.path().join("upstream-old.sock");
+        let upstream_new = dir.path().join("upstream-new.sock");
+        let _up_old = spawn_echo_upstream(&upstream_old);
+        let _up_new = spawn_echo_upstream(&upstream_new);
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+        m.register(workspace.clone(), upstream_old.clone())
+            .await
+            .unwrap();
+        m.register(workspace.clone(), upstream_old).await.unwrap();
+
+        let result = m
+            .refresh(workspace.clone(), upstream_new.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(result.action, RefreshAction::Rebridged);
+        assert_eq!(
+            result.refcount, 2,
+            "rebridge must carry the existing refcount forward"
+        );
+        assert_eq!(m.refcount_for(&workspace), 2);
+        assert_eq!(m.upstream_for(&workspace), Some(upstream_new.as_path()));
+
+        // The healed bridge must actually forward bytes.
+        let mut client = connect_and_authenticate(result.bridge_port, "test-token").await;
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn refresh_creates_bridge_when_none_exists() {
+        // Reuse path with a daemon that lost its state (state file gone,
+        // reclaim failed): refresh creates a fresh bridge so at least
+        // new connections have somewhere to go.
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let _up = spawn_echo_upstream(&upstream);
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+
+        let result = m.refresh(workspace.clone(), upstream).await.unwrap();
+
+        assert_eq!(result.action, RefreshAction::Created);
+        assert_eq!(result.refcount, 1);
+        assert_eq!(m.refcount_for(&workspace), 1);
+        let _client = TcpStream::connect(("127.0.0.1", result.bridge_port))
+            .await
+            .expect("created bridge must be listening");
+    }
+
+    #[tokio::test]
+    async fn refresh_rebridge_persists_new_upstream_to_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream_old = dir.path().join("upstream-old.sock");
+        let upstream_new = dir.path().join("upstream-new.sock");
+        let _up_old = spawn_echo_upstream(&upstream_old);
+        let _up_new = spawn_echo_upstream(&upstream_new);
+
+        let mut m = manager(dir.path());
+        let workspace = PathBuf::from("/Users/me/proj");
+        m.register(workspace.clone(), upstream_old).await.unwrap();
+        m.refresh(workspace, upstream_new.clone()).await.unwrap();
+
+        let state = std::fs::read_to_string(m.state_file_path()).unwrap();
+        assert!(
+            state.contains(&upstream_new.to_string_lossy().into_owned()),
+            "state file must record the healed upstream for daemon-restart reclaim"
+        );
+    }
 
     // ---------------------------------------------------------------
     // End-to-end byte-fidelity tests through the bridge.
