@@ -11,6 +11,7 @@ use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
 use oci_distribution::errors::{OciDistributionError, OciErrorCode};
 use oci_distribution::manifest::{OciImageManifest, OciManifest};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::build_registry_auth;
@@ -53,6 +54,9 @@ pub enum PushError {
         reference: String,
         source: OciDistributionError,
     },
+
+    #[error("failed to serialize manifest for digest computation: {0}")]
+    ManifestSerialize(serde_json::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,13 +120,13 @@ pub async fn list_published_tags(
 /// `manifest_annotations` are written into the OCI manifest's `annotations`
 /// map (e.g. `dev.containers.metadata`, `com.github.package.type`).
 ///
-/// Returns the manifest digest and the list of tags that were pushed.
-/// Returns an empty `PushResult` immediately when `tags` is empty.
+/// Returns `Some(PushResult)` with the manifest digest and pushed tags, or
+/// `None` when `tags` is empty (nothing to push).
 ///
 /// # Errors
 ///
-/// Returns [`PushError::Push`] if the registry rejects the blob or manifest
-/// upload for any tag.
+/// Returns [`PushError`] if manifest serialization fails or if the registry
+/// rejects the blob or manifest upload for any tag.
 pub async fn push_artifact<S: std::hash::BuildHasher>(
     registry: &str,
     repository: &str,
@@ -130,12 +134,9 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
     layers: Vec<LayerSpec>,
     config_media_type: &str,
     manifest_annotations: Option<HashMap<String, String, S>>,
-) -> Result<PushResult, PushError> {
+) -> Result<Option<PushResult>, PushError> {
     if tags.is_empty() {
-        return Ok(PushResult {
-            digest: String::new(),
-            pushed_tags: Vec::new(),
-        });
+        return Ok(None);
     }
 
     let client = new_client();
@@ -154,6 +155,14 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
         manifest_annotations.map(|m| m.into_iter().collect());
     let manifest = OciImageManifest::build(&image_layers, &config, annotations_default);
 
+    // Compute the manifest digest from the canonical JSON bytes that
+    // oci-distribution will PUT to the registry.  The crate uses
+    // `olpc_cjson::CanonicalFormatter` (OCI canonical JSON — sorted keys, no
+    // extra whitespace), so we must use the same serializer here; a plain
+    // `serde_json::to_vec` would produce a different byte sequence and a wrong
+    // digest.
+    let digest = canonical_manifest_digest(&manifest)?;
+
     // Push under the first tag — this uploads all blobs and the manifest.
     let first_tag = &tags[0];
     let first_ref = Reference::with_tag(
@@ -164,7 +173,7 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
 
     debug!("pushing {registry}/{repository}:{first_tag}");
 
-    let push_response = client
+    client
         .push(
             &first_ref,
             &image_layers,
@@ -179,7 +188,6 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
             source,
         })?;
 
-    let digest = extract_digest_from_url(&push_response.manifest_url);
     debug!("pushed {registry}/{repository}:{first_tag} (digest={digest})");
 
     let mut pushed_tags = vec![first_tag.clone()];
@@ -201,10 +209,10 @@ pub async fn push_artifact<S: std::hash::BuildHasher>(
         pushed_tags.push(tag.clone());
     }
 
-    Ok(PushResult {
+    Ok(Some(PushResult {
         digest,
         pushed_tags,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -218,10 +226,21 @@ fn new_client() -> oci_distribution::Client {
     })
 }
 
-/// Extract `sha256:<hex>` from a pullable URL like `registry/repo@sha256:abc`.
-fn extract_digest_from_url(url: &str) -> String {
-    url.find("sha256:")
-        .map_or_else(|| url.to_owned(), |pos| url[pos..].to_owned())
+/// Serialize `manifest` using OCI canonical JSON (the same formatter that
+/// `oci-distribution` uses before the registry PUT) and return the digest as
+/// `sha256:<hex>`.
+///
+/// # Errors
+///
+/// Returns [`PushError::ManifestSerialize`] if `serde_json` cannot serialise
+/// the manifest struct (should never happen in practice).
+fn canonical_manifest_digest(manifest: &OciImageManifest) -> Result<String, PushError> {
+    let mut body = Vec::new();
+    let mut ser =
+        serde_json::Serializer::with_formatter(&mut body, olpc_cjson::CanonicalFormatter::new());
+    serde::Serialize::serialize(manifest, &mut ser).map_err(PushError::ManifestSerialize)?;
+    let hash = Sha256::digest(&body);
+    Ok(format!("sha256:{}", hex::encode(hash)))
 }
 
 // ===========================================================================
@@ -233,19 +252,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_digest_from_well_formed_url() {
-        let url = "ghcr.io/owner/repo@sha256:abc123def456";
-        assert_eq!(extract_digest_from_url(url), "sha256:abc123def456");
+    fn canonical_manifest_digest_is_stable() {
+        // Build a minimal manifest and verify the digest is deterministic and
+        // has the right format.
+        let layers = vec![ImageLayer::new(
+            b"hello".to_vec(),
+            "application/vnd.devcontainers.layer.v1+tar".to_owned(),
+            None,
+        )];
+        let config = Config::new(
+            b"{}".to_vec(),
+            "application/vnd.devcontainers".to_owned(),
+            None,
+        );
+        let manifest = OciImageManifest::build(&layers, &config, None);
+
+        let d1 = canonical_manifest_digest(&manifest).unwrap();
+        let d2 = canonical_manifest_digest(&manifest).unwrap();
+        assert_eq!(d1, d2, "digest must be deterministic");
+        assert!(d1.starts_with("sha256:"), "digest must start with sha256:");
+        assert_eq!(d1.len(), "sha256:".len() + 64, "sha256 hex is 64 chars");
     }
 
     #[test]
-    fn extract_digest_from_url_without_digest_is_identity() {
-        let url = "ghcr.io/owner/repo:latest";
-        assert_eq!(extract_digest_from_url(url), url);
-    }
-
-    #[test]
-    fn push_artifact_returns_empty_result_for_empty_tags() {
+    fn push_artifact_returns_none_for_empty_tags() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt
             .block_on(push_artifact(
@@ -257,7 +287,6 @@ mod tests {
                 None::<HashMap<String, String>>,
             ))
             .unwrap();
-        assert!(result.pushed_tags.is_empty());
-        assert!(result.digest.is_empty());
+        assert!(result.is_none(), "empty tags must yield None");
     }
 }
