@@ -620,6 +620,12 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
 mod tests {
     use super::*;
 
+    // Build `${templateOption:KEY}` at runtime so no single string literal
+    // contains `{...}`, which would trigger clippy::literal_string_with_formatting_args.
+    fn tok(key: &str) -> String {
+        format!("${{templateOption:{key}}}")
+    }
+
     // -----------------------------------------------------------------------
     // substitute_template_options
     // -----------------------------------------------------------------------
@@ -629,9 +635,11 @@ mod tests {
         let mut opts = HashMap::new();
         opts.insert("variant".to_owned(), serde_json::json!("bookworm"));
 
-        let input =
-            r#"{"image": "mcr.microsoft.com/devcontainers/rust:1-${templateOption:variant}"}"#;
-        let report = substitute_template_options(input, &opts);
+        let input = format!(
+            r#"{{"image": "mcr.microsoft.com/devcontainers/rust:1-{}"}}"#,
+            tok("variant")
+        );
+        let report = substitute_template_options(&input, &opts);
         assert_eq!(
             report.content,
             r#"{"image": "mcr.microsoft.com/devcontainers/rust:1-bookworm"}"#
@@ -644,8 +652,8 @@ mod tests {
         let mut opts = HashMap::new();
         opts.insert("installMaven".to_owned(), serde_json::json!(true));
 
-        let input = "INSTALL_MAVEN=${templateOption:installMaven}";
-        let report = substitute_template_options(input, &opts);
+        let input = format!("INSTALL_MAVEN={}", tok("installMaven"));
+        let report = substitute_template_options(&input, &opts);
         assert_eq!(report.content, "INSTALL_MAVEN=true");
         assert!(report.unknown_tokens.is_empty());
     }
@@ -709,8 +717,9 @@ mod tests {
         let mut opts = HashMap::new();
         opts.insert("ver".to_owned(), serde_json::json!("3.14"));
 
-        let input = "a=${templateOption:ver} b=${templateOption:ver}";
-        let report = substitute_template_options(input, &opts);
+        let tv = tok("ver");
+        let input = format!("a={tv} b={tv}");
+        let report = substitute_template_options(&input, &opts);
         assert_eq!(report.content, "a=3.14 b=3.14");
         assert!(report.unknown_tokens.is_empty());
     }
@@ -871,7 +880,10 @@ mod tests {
         std::fs::create_dir_all(&dc_dir).unwrap();
         std::fs::write(
             dc_dir.join("devcontainer.json"),
-            r#"{"name": "Test", "image": "ubuntu:${templateOption:variant}"}"#,
+            format!(
+                r#"{{"name": "Test", "image": "ubuntu:{}"}}"#,
+                tok("variant")
+            ),
         )
         .unwrap();
 
@@ -944,7 +956,7 @@ mod tests {
         std::fs::write(dc_dir.join("devcontainer.json"), r#"{"name": "Test"}"#).unwrap();
         std::fs::write(
             dc_dir.join("Dockerfile"),
-            "FROM ubuntu:${templateOption:variant}\nRUN apt-get update",
+            format!("FROM ubuntu:{}\nRUN apt-get update", tok("variant")),
         )
         .unwrap();
 
@@ -1118,9 +1130,11 @@ mod tests {
         std::fs::create_dir_all(&dc_dir).unwrap();
         std::fs::write(
             dc_dir.join("devcontainer.json"),
-            "// Template: Node.js\n\
-             {\n  \"name\": \"Node\",\n  \
-             \"image\": \"mcr.microsoft.com/devcontainers/javascript-node:1-${templateOption:imageVariant}\"\n}\n",
+            format!(
+                "// Template: Node.js\n{{\n  \"name\": \"Node\",\n  \
+                 \"image\": \"mcr.microsoft.com/devcontainers/javascript-node:1-{}\"\n}}\n",
+                tok("imageVariant")
+            ),
         )
         .unwrap();
 
@@ -1153,7 +1167,7 @@ mod tests {
         std::fs::create_dir_all(&dc_dir).unwrap();
         std::fs::write(
             dc_dir.join("devcontainer.json"),
-            "// comment\n{\"url\": \"${templateOption:url}\"}",
+            format!("// comment\n{{\"url\": \"{}\"}}", tok("url")),
         )
         .unwrap();
 
