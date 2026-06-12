@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cache;
 pub mod dockerfile;
+pub mod docs;
 mod error;
 pub mod fetch;
 pub mod graph;
