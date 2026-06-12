@@ -337,8 +337,14 @@ const ALWAYS_EXCLUDED: &[&str] = &["devcontainer-template.json", "README.md", "N
 /// the official CLI's extraction semantics.
 ///
 /// Files excluded:
-/// - `devcontainer-template.json`, `README.md`, `NOTES.md` (always)
-/// - Any path matched by an entry in `omit_paths` (supports trailing `/*` globs)
+/// - `devcontainer-template.json`, `README.md`, `NOTES.md` at the root only
+///   (exact full-relative-path matches; a nested `.devcontainer/README.md` is
+///   **not** excluded)
+/// - Any path matched by an `omit_paths` entry. Patterns ending in `/*` become
+///   directory-prefix filters: the bare `*` is stripped and the entry's relative
+///   path is tested with `starts_with(prefix)`. All other patterns are treated as
+///   exact full-relative-path matches.  This mirrors the official CLI's
+///   `getBlob` filtering in `containerCollectionsOCI.ts`.
 ///
 /// Template option placeholders (`${templateOption:KEY}`) are substituted in
 /// text files; binary files (not valid UTF-8) are copied verbatim.
@@ -357,10 +363,18 @@ pub fn apply_to_workspace<S: std::hash::BuildHasher>(
 ) -> Result<Vec<PathBuf>, TemplateError> {
     std::fs::create_dir_all(workspace_folder)?;
 
-    // Compile omit-path patterns.
-    let omit_patterns: Vec<glob::Pattern> = omit_paths
+    // Compile omit-path rules per official semantics:
+    // - Patterns ending in `/*`: strip the `*`, keep the trailing `/` as a
+    //   directory prefix tested with `starts_with`.
+    // - All other patterns: exact full-relative-path match.
+    let omit_rules: Vec<OmitRule> = omit_paths
         .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
+        .map(|p| {
+            p.strip_suffix('*').map_or_else(
+                || OmitRule::Exact(p.clone()),
+                |prefix| OmitRule::DirPrefix(prefix.to_owned()),
+            )
+        })
         .collect();
 
     let mut written_files: Vec<PathBuf> = Vec::new();
@@ -370,12 +384,30 @@ pub fn apply_to_workspace<S: std::hash::BuildHasher>(
         template_id,
         options,
         template_dir,
-        &omit_patterns,
+        &omit_rules,
         &mut written_files,
     )?;
 
     written_files.sort();
     Ok(written_files)
+}
+
+/// An omit-path rule derived from a single `--omit-paths` entry.
+enum OmitRule {
+    /// Pattern `<prefix>/*`: omit any entry whose relative path starts with `<prefix>/`.
+    DirPrefix(String),
+    /// Exact full-relative-path match.
+    Exact(String),
+}
+
+impl OmitRule {
+    /// Returns `true` if `relative` should be omitted under this rule.
+    fn matches(&self, relative: &str) -> bool {
+        match self {
+            Self::DirPrefix(prefix) => relative.starts_with(prefix.as_str()),
+            Self::Exact(exact) => relative == exact.as_str(),
+        }
+    }
 }
 
 /// Recursively walk `src`, apply substitution, write to `dest`, and collect
@@ -386,7 +418,7 @@ fn extract_to_workspace<S: std::hash::BuildHasher>(
     template_id: &str,
     options: &HashMap<String, serde_json::Value, S>,
     template_root: &Path,
-    omit_patterns: &[glob::Pattern],
+    omit_rules: &[OmitRule],
     written_files: &mut Vec<PathBuf>,
 ) -> Result<(), TemplateError> {
     for entry in std::fs::read_dir(src)? {
@@ -400,27 +432,30 @@ fn extract_to_workspace<S: std::hash::BuildHasher>(
         let relative = src_path.strip_prefix(template_root).unwrap_or(&src_path);
         let relative_str = relative.to_string_lossy();
 
-        // Always-excluded filenames (only at root level by name).
-        if ALWAYS_EXCLUDED
-            .iter()
-            .any(|ex| file_name.to_string_lossy() == *ex)
-        {
+        // Always-excluded names — exact root-level relative paths only.
+        // A nested path like `.devcontainer/README.md` must NOT match.
+        if ALWAYS_EXCLUDED.iter().any(|ex| relative_str == *ex) {
             continue;
         }
 
-        // Omit-path glob matching — check the entry itself.
-        if omit_patterns.iter().any(|pat| pat.matches(&relative_str)) {
+        // Omit-path rule matching — check the entry's full relative path.
+        if omit_rules.iter().any(|rule| rule.matches(&relative_str)) {
             continue;
         }
 
         if file_type.is_dir() {
-            // Also skip a directory if any omit pattern covers its children
-            // (e.g. `.github/*` → skip `.github` dir entirely).
-            let dir_prefix = format!("{relative_str}/");
-            if omit_patterns
-                .iter()
-                .any(|pat| pat.as_str().starts_with(&dir_prefix))
-            {
+            // For directories we additionally check whether any DirPrefix rule
+            // covers this whole subtree (e.g. `.github/workflows/*` → skip
+            // `.github/workflows/` directory wholesale).  We test by appending
+            // a trailing slash to simulate a child path prefix.
+            let dir_child_prefix = format!("{relative_str}/");
+            if omit_rules.iter().any(|rule| {
+                if let OmitRule::DirPrefix(prefix) = rule {
+                    dir_child_prefix.starts_with(prefix.as_str())
+                } else {
+                    false
+                }
+            }) {
                 continue;
             }
 
@@ -431,7 +466,7 @@ fn extract_to_workspace<S: std::hash::BuildHasher>(
                 template_id,
                 options,
                 template_root,
-                omit_patterns,
+                omit_rules,
                 written_files,
             )?;
         } else if file_type.is_file() {
@@ -1293,6 +1328,60 @@ mod tests {
         assert!(!workspace.path().join(".github").exists());
         assert!(workspace.path().join("setup.sh").exists());
         assert_eq!(files, vec![PathBuf::from("setup.sh")]);
+    }
+
+    #[test]
+    fn omit_paths_workflows_star_excludes_subtree_only() {
+        // `.github/workflows/*` must omit only the workflows subtree, not all of `.github`.
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let github_dir = template_dir.path().join(".github");
+        let workflows_dir = github_dir.join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(workflows_dir.join("ci.yaml"), "name: CI").unwrap();
+        std::fs::write(github_dir.join("CODEOWNERS"), "* @owner").unwrap();
+
+        apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[".github/workflows/*".to_owned()],
+        )
+        .unwrap();
+
+        // ci.yaml inside workflows/ must be excluded.
+        assert!(!workspace.path().join(".github/workflows/ci.yaml").exists());
+        // CODEOWNERS in .github root must be kept.
+        assert!(workspace.path().join(".github/CODEOWNERS").exists());
+    }
+
+    #[test]
+    fn always_excluded_root_only_nested_readme_kept() {
+        // `.devcontainer/README.md` must NOT be excluded — only root `README.md` is always excluded.
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let dc_dir = template_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_dir).unwrap();
+        std::fs::write(dc_dir.join("devcontainer.json"), r#"{"name":"t"}"#).unwrap();
+        std::fs::write(dc_dir.join("README.md"), "# inner readme").unwrap();
+        std::fs::write(template_dir.path().join("README.md"), "# root readme").unwrap();
+
+        apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        // Root README.md must be excluded.
+        assert!(!workspace.path().join("README.md").exists());
+        // Nested .devcontainer/README.md must be kept.
+        assert!(workspace.path().join(".devcontainer/README.md").exists());
     }
 
     #[test]
