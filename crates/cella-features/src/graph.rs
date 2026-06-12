@@ -284,9 +284,8 @@ mod tests {
             ),
         ];
         let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
-        let lines: Vec<&str> = output.lines().collect();
         // Header + 2 edge lines
-        assert_eq!(lines.len(), 3);
+        assert_eq!(output.lines().count(), 3);
         assert!(output.contains("node:1"));
         assert!(output.contains("common-utils:2"));
         assert!(output.contains("git:1"));
