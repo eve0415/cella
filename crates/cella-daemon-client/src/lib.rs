@@ -222,6 +222,42 @@ impl DaemonClient {
         }
     }
 
+    /// Re-validate the SSH-agent bridge for `workspace` against the
+    /// caller's current upstream socket, without changing the refcount.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on socket/protocol failure or daemon-side error
+    /// (including daemons that predate the refresh RPC).
+    pub async fn refresh_ssh_agent_proxy(
+        &self,
+        workspace: impl Into<String>,
+        upstream_socket: impl Into<String>,
+    ) -> Result<SshAgentProxyRefresh, DaemonClientError> {
+        match self
+            .request(&ManagementRequest::RefreshSshAgentProxy {
+                workspace: workspace.into(),
+                upstream_socket: upstream_socket.into(),
+            })
+            .await?
+        {
+            ManagementResponse::SshAgentProxyRefreshed {
+                bridge_port,
+                refcount,
+                action,
+            } => Ok(SshAgentProxyRefresh {
+                bridge_port,
+                refcount,
+                action,
+            }),
+            ManagementResponse::Error { message } => Err(DaemonClientError::Daemon { message }),
+            response => Err(DaemonClientError::unexpected(
+                "ssh_agent_proxy_refreshed",
+                &response,
+            )),
+        }
+    }
+
     /// Ask the daemon to shut down.
     ///
     /// # Errors
@@ -256,6 +292,14 @@ pub struct DaemonStatus {
 pub struct SshAgentProxyRegistration {
     pub bridge_port: u16,
     pub refcount: usize,
+}
+
+/// Successful SSH-agent proxy refresh details.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SshAgentProxyRefresh {
+    pub bridge_port: u16,
+    pub refcount: usize,
+    pub action: cella_protocol::SshProxyRefreshAction,
 }
 
 /// Error returned by daemon management client operations.

@@ -88,6 +88,36 @@ pub async fn register_proxy(
     }
 }
 
+/// Re-validate the bridge for `workspace` without changing the refcount.
+///
+/// Heals bridges whose registered upstream went stale (host agent moved
+/// after sleep, re-login, or agent restart). Returns `None` when the
+/// daemon is unreachable, errors, or predates the refresh RPC — callers
+/// should treat that as "nothing healed" and move on.
+pub async fn refresh_proxy(
+    daemon_socket: &Path,
+    workspace: &Path,
+    upstream_socket: &Path,
+) -> Option<crate::SshAgentProxyRefresh> {
+    let client = DaemonClient::new(daemon_socket);
+    match client
+        .refresh_ssh_agent_proxy(
+            workspace.to_string_lossy().into_owned(),
+            upstream_socket.to_string_lossy().into_owned(),
+        )
+        .await
+    {
+        Ok(refresh) => Some(refresh),
+        Err(e) => {
+            warn!(
+                "ssh-agent bridge: daemon RefreshSshAgentProxy failed for {}: {e}",
+                workspace.display()
+            );
+            None
+        }
+    }
+}
+
 /// Decrement the refcount for `workspace`. Best-effort: never fails the
 /// caller's down flow even if the daemon is unreachable.
 pub async fn release_proxy(daemon_socket: &Path, workspace: &Path) {
@@ -299,5 +329,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let daemon_sock = dir.path().join("nonexistent.sock");
         release_proxy(&daemon_sock, &PathBuf::from("/x")).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_proxy_translates_response_and_request_shape() {
+        use cella_protocol::SshProxyRefreshAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_sock = dir.path().join("daemon.sock");
+        let (received, task) = spawn_mock_daemon(
+            &daemon_sock,
+            ManagementResponse::SshAgentProxyRefreshed {
+                bridge_port: 54321,
+                refcount: 2,
+                action: SshProxyRefreshAction::Rebridged,
+            },
+        );
+
+        let refreshed = refresh_proxy(
+            &daemon_sock,
+            &PathBuf::from("/Users/me/proj"),
+            &PathBuf::from("/Users/me/.1password/agent.sock"),
+        )
+        .await
+        .expect("happy-path refresh must return Some");
+
+        assert_eq!(refreshed.bridge_port, 54321);
+        assert_eq!(refreshed.refcount, 2);
+        assert_eq!(refreshed.action, SshProxyRefreshAction::Rebridged);
+
+        let raw = received
+            .lock()
+            .await
+            .clone()
+            .expect("daemon must have received a request");
+        assert!(raw.contains("\"type\":\"refresh_ssh_agent_proxy\""));
+        assert!(raw.contains("\"workspace\":\"/Users/me/proj\""));
+        assert!(raw.contains("\"upstream_socket\":\"/Users/me/.1password/agent.sock\""));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_proxy_returns_none_on_error_or_old_daemon() {
+        // Daemons that predate the refresh RPC reply with Error — the
+        // caller must degrade gracefully rather than fail the up flow.
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_sock = dir.path().join("daemon.sock");
+        let (_received, task) = spawn_mock_daemon(
+            &daemon_sock,
+            ManagementResponse::Error {
+                message: "unknown request type".to_string(),
+            },
+        );
+
+        let refreshed = refresh_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            &PathBuf::from("/agent.sock"),
+        )
+        .await;
+        assert!(refreshed.is_none());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_proxy_returns_none_when_daemon_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_sock = dir.path().join("nonexistent.sock");
+        let refreshed = refresh_proxy(
+            &daemon_sock,
+            &PathBuf::from("/x"),
+            &PathBuf::from("/agent.sock"),
+        )
+        .await;
+        assert!(refreshed.is_none());
     }
 }
