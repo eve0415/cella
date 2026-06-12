@@ -77,8 +77,12 @@ impl DockerClient {
                     ),
                 })?;
             tracing::info!("Connected to Docker via discovered socket: {path_str}");
-            let endpoint =
-                BackendEndpoint::HostUri(format!("unix://{}", discovered.path.display()));
+            // Prefer the context name: the editor-side docker CLI resolves it to
+            // the same daemon while inheriting the context's TLS/auth config.
+            let endpoint = discovered.context_name.map_or_else(
+                || BackendEndpoint::HostUri(format!("unix://{}", discovered.path.display())),
+                BackendEndpoint::NamedContext,
+            );
             return Ok(Self {
                 inner: docker,
                 endpoint,

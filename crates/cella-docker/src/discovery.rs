@@ -15,6 +15,10 @@ pub struct DiscoveredSocket {
     pub path: PathBuf,
     /// How the socket was found (for diagnostics).
     pub method: DiscoveryMethod,
+    /// Name of the docker context the socket came from, when discovered via
+    /// `docker context inspect`. Lets consumers reference the daemon by
+    /// context name (inheriting its TLS/auth config) instead of a raw path.
+    pub context_name: Option<String>,
 }
 
 /// How a socket was discovered.
@@ -57,7 +61,7 @@ fn discover_from_docker_context() -> Option<DiscoveredSocket> {
             "context",
             "inspect",
             "--format",
-            "{{.Endpoints.docker.Host}}",
+            "{{.Name}}\t{{.Endpoints.docker.Host}}",
         ])
         .output()
         .ok()?;
@@ -67,16 +71,8 @@ fn discover_from_docker_context() -> Option<DiscoveredSocket> {
         return None;
     }
 
-    let endpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    let path = if let Some(stripped) = endpoint.strip_prefix("unix://") {
-        PathBuf::from(stripped)
-    } else if endpoint.starts_with('/') {
-        PathBuf::from(&endpoint)
-    } else {
-        debug!("docker context endpoint is not a unix socket: {endpoint}");
-        return None;
-    };
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let (context_name, path) = parse_context_inspect_line(&line)?;
 
     if path.exists() {
         info!(
@@ -86,11 +82,32 @@ fn discover_from_docker_context() -> Option<DiscoveredSocket> {
         Some(DiscoveredSocket {
             path,
             method: DiscoveryMethod::DockerContext,
+            context_name,
         })
     } else {
         debug!("docker context socket does not exist: {}", path.display());
         None
     }
+}
+
+/// Parse one line of `docker context inspect --format '{{.Name}}\t{{.Endpoints.docker.Host}}'`.
+///
+/// Returns the context name (`None` when empty) and the endpoint's socket
+/// path, or `None` when the endpoint is not a unix socket.
+fn parse_context_inspect_line(line: &str) -> Option<(Option<String>, PathBuf)> {
+    let (name, endpoint) = line.split_once('\t')?;
+
+    let path = if let Some(stripped) = endpoint.strip_prefix("unix://") {
+        PathBuf::from(stripped)
+    } else if endpoint.starts_with('/') {
+        PathBuf::from(endpoint)
+    } else {
+        debug!("docker context endpoint is not a unix socket: {endpoint}");
+        return None;
+    };
+
+    let name = (!name.is_empty()).then(|| name.to_string());
+    Some((name, path))
 }
 
 /// Probe known filesystem paths for runtime sockets.
@@ -106,6 +123,7 @@ fn discover_from_known_paths() -> Option<DiscoveredSocket> {
             return Some(DiscoveredSocket {
                 path: path.clone(),
                 method: DiscoveryMethod::FilesystemProbe,
+                context_name: None,
             });
         }
         debug!("Socket not found: {}", path.display());
@@ -195,6 +213,53 @@ mod tests {
         assert!(msg.contains("Colima"));
         assert!(msg.contains("Podman"));
         assert!(msg.contains("Rancher Desktop"));
+    }
+
+    #[test]
+    fn parse_context_line_unix_endpoint() {
+        let parsed =
+            parse_context_inspect_line("orbstack\tunix:///Users/x/.orbstack/run/docker.sock");
+        assert_eq!(
+            parsed,
+            Some((
+                Some("orbstack".to_string()),
+                PathBuf::from("/Users/x/.orbstack/run/docker.sock")
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_context_line_bare_path_endpoint() {
+        let parsed = parse_context_inspect_line("default\t/var/run/docker.sock");
+        assert_eq!(
+            parsed,
+            Some((
+                Some("default".to_string()),
+                PathBuf::from("/var/run/docker.sock")
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_context_line_empty_name_becomes_none() {
+        let parsed = parse_context_inspect_line("\tunix:///var/run/docker.sock");
+        assert_eq!(parsed, Some((None, PathBuf::from("/var/run/docker.sock"))));
+    }
+
+    #[test]
+    fn parse_context_line_rejects_tcp_endpoint() {
+        assert_eq!(
+            parse_context_inspect_line("remote\ttcp://example.com:2376"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_context_line_rejects_missing_tab() {
+        assert_eq!(
+            parse_context_inspect_line("unix:///var/run/docker.sock"),
+            None
+        );
     }
 
     #[test]
@@ -300,6 +365,7 @@ mod tests {
         let socket = DiscoveredSocket {
             path: PathBuf::from("/var/run/docker.sock"),
             method: DiscoveryMethod::FilesystemProbe,
+            context_name: None,
         };
         let debug_str = format!("{socket:?}");
         assert!(debug_str.contains("docker.sock"));
@@ -311,9 +377,11 @@ mod tests {
         let socket = DiscoveredSocket {
             path: PathBuf::from("/tmp/test.sock"),
             method: DiscoveryMethod::DockerContext,
+            context_name: Some("orbstack".to_string()),
         };
         let cloned = socket.clone();
         assert_eq!(cloned.path, socket.path);
+        assert_eq!(cloned.context_name, socket.context_name);
         assert!(matches!(cloned.method, DiscoveryMethod::DockerContext));
     }
 
