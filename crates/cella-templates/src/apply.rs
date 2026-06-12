@@ -53,24 +53,25 @@ pub fn substitute_template_options<S: std::hash::BuildHasher>(
     options: &HashMap<String, serde_json::Value, S>,
 ) -> SubstitutionReport {
     // Regex: ${templateOption: key } — key is captured, whitespace trimmed.
-    // SAFETY: literal pattern, always valid.
-    let re = regex::Regex::new(r"\$\{templateOption:\s*(\w+?)\s*\}").expect("valid regex");
+    static TOKEN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\$\{templateOption:\s*(\w+?)\s*\}").expect("valid regex")
+    });
 
     let mut unknown_tokens: Vec<String> = Vec::new();
-    let content_out = re.replace_all(content, |caps: &regex::Captures<'_>| {
+    let content_out = TOKEN_RE.replace_all(content, |caps: &regex::Captures<'_>| {
         let key = caps.get(1).map_or("", |m| m.as_str());
-        match options.get(key) {
-            Some(value) => match value {
+        options.get(key).map_or_else(
+            || {
+                unknown_tokens.push(key.to_owned());
+                String::new()
+            },
+            |value| match value {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Bool(b) => b.to_string(),
                 serde_json::Value::Null => String::new(),
                 other => other.to_string(),
             },
-            None => {
-                unknown_tokens.push(key.to_owned());
-                String::new()
-            }
-        }
+        )
     });
 
     SubstitutionReport {
