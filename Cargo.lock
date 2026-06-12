@@ -590,6 +590,7 @@ dependencies = [
  "miette",
  "oci-distribution",
  "reqwest 0.13.4",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -662,6 +663,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
