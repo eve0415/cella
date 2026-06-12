@@ -4,14 +4,11 @@
 //! `dev.containers.metadata` annotation, which contains the template's JSON
 //! metadata as a string-escaped JSON value.
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
 use oci_distribution::manifest::OciManifest;
 use tracing::debug;
 
-use cella_oci::build_registry_auth;
-
 use crate::error::TemplateError;
+use crate::oci_ref::{build_oci_client, parse_template_ref};
 
 /// Annotation key used by the devcontainer CLI to embed template metadata.
 const METADATA_ANNOTATION: &str = "dev.containers.metadata";
@@ -33,13 +30,7 @@ const METADATA_ANNOTATION: &str = "dev.containers.metadata";
 pub async fn fetch_manifest_metadata(template_ref: &str) -> Result<Option<String>, TemplateError> {
     let (registry, repository, tag) = parse_template_ref(template_ref)?;
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_distribution::Client::new(config);
-    let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
-    let auth = build_registry_auth(&registry);
+    let (client, oci_ref, auth) = build_oci_client(&registry, &repository, &tag);
 
     debug!("fetching manifest for template {registry}/{repository}:{tag}");
 
@@ -85,30 +76,6 @@ fn extract_metadata_annotation(manifest: &OciManifest) -> Option<String> {
                 .cloned()
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a template reference into `(registry, repository, tag)`.
-///
-/// Defaults to `latest` when no tag is present.
-fn parse_template_ref(template_ref: &str) -> Result<(String, String, String), TemplateError> {
-    let (base, tag) = match template_ref.rsplit_once(':') {
-        Some((b, t)) if !t.contains('/') && !t.is_empty() => (b, t.to_owned()),
-        _ => (template_ref, "latest".to_owned()),
-    };
-
-    let (registry, repository) =
-        base.split_once('/')
-            .ok_or_else(|| TemplateError::RegistryError {
-                registry: template_ref.to_owned(),
-                message: "invalid template reference: expected registry/repository[:tag]"
-                    .to_owned(),
-            })?;
-
-    Ok((registry.to_owned(), repository.to_owned(), tag))
 }
 
 // ===========================================================================
@@ -223,32 +190,5 @@ mod tests {
     fn image_index_no_annotation_returns_none() {
         let manifest = image_index(None, None);
         assert!(extract_metadata_annotation(&manifest).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_template_ref
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_ref_with_tag() {
-        let (reg, repo, tag) =
-            parse_template_ref("ghcr.io/devcontainers/templates/alpine:1.2.3").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/alpine");
-        assert_eq!(tag, "1.2.3");
-    }
-
-    #[test]
-    fn parse_ref_without_tag_defaults_to_latest() {
-        let (reg, repo, tag) =
-            parse_template_ref("ghcr.io/devcontainers/templates/alpine").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/alpine");
-        assert_eq!(tag, "latest");
-    }
-
-    #[test]
-    fn parse_ref_no_slash_returns_error() {
-        assert!(parse_template_ref("noslash").is_err());
     }
 }

@@ -6,8 +6,6 @@
 use std::path::PathBuf;
 
 use flate2::read::GzDecoder;
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
@@ -17,6 +15,8 @@ use tracing::debug;
 use crate::TemplateMetadata;
 use crate::cache::TemplateCache;
 use crate::error::TemplateError;
+use crate::oci_ref::build_oci_client;
+use crate::oci_ref::parse_template_ref;
 
 /// Media type for devcontainer template/feature layers (plain tar).
 const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
@@ -43,13 +43,7 @@ pub async fn fetch_template(
         return Ok(cached);
     }
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_distribution::Client::new(config);
-    let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
-    let auth = build_registry_auth(&registry);
+    let (client, oci_ref, auth) = build_oci_client(&registry, &repository, &tag);
 
     debug!("fetching template {registry}/{repository}:{tag}");
 
@@ -138,26 +132,6 @@ pub fn read_template_metadata(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a template reference into `(registry, repository, tag)`.
-fn parse_template_ref(template_ref: &str) -> Result<(String, String, String), TemplateError> {
-    let (base, tag) = match template_ref.rsplit_once(':') {
-        Some((b, t)) if !t.contains('/') && !t.is_empty() => (b, t.to_owned()),
-        _ => (template_ref, "latest".to_owned()),
-    };
-
-    let (registry, repository) =
-        base.split_once('/')
-            .ok_or_else(|| TemplateError::RegistryError {
-                registry: template_ref.to_owned(),
-                message: "invalid template reference: expected registry/repository[:tag]"
-                    .to_owned(),
-            })?;
-
-    Ok((registry.to_owned(), repository.to_owned(), tag))
-}
-
-use cella_oci::build_registry_auth;
-
 fn find_extractable_layer<'a>(
     manifest: &'a oci_distribution::manifest::OciImageManifest,
     template_ref: &str,
@@ -223,28 +197,6 @@ fn extract_layer(blob: &[u8], media_type: &str, dest: &std::path::Path) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_full_ref() {
-        let (reg, repo, tag) =
-            parse_template_ref("ghcr.io/devcontainers/templates/rust:5.0.0").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/rust");
-        assert_eq!(tag, "5.0.0");
-    }
-
-    #[test]
-    fn parse_ref_no_tag() {
-        let (reg, repo, tag) = parse_template_ref("ghcr.io/devcontainers/templates/rust").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/rust");
-        assert_eq!(tag, "latest");
-    }
-
-    #[test]
-    fn parse_ref_invalid() {
-        assert!(parse_template_ref("noslash").is_err());
-    }
 
     #[test]
     fn extractable_layer_detection() {
