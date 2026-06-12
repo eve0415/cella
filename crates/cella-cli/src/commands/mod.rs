@@ -23,7 +23,7 @@ mod run_user_commands;
 mod shell;
 mod status;
 mod switch;
-mod template;
+pub mod templates;
 pub mod up;
 
 use std::io::IsTerminal;
@@ -252,7 +252,7 @@ pub enum Command {
     /// View and manage cella configuration.
     Config(config::ConfigArgs),
     /// Manage dev container templates.
-    Template(template::TemplateArgs),
+    Templates(templates::TemplatesArgs),
     /// Manage devcontainer features.
     Features(features::FeaturesArgs),
     /// Show current and available versions.
@@ -290,8 +290,8 @@ impl Command {
             Self::Code(args) => args.is_text_output(),
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
-            // Both emit a JSON envelope on stdout; spinners would fight it.
-            Self::ReadConfiguration(_) | Self::RunUserCommands(_) => false,
+            // These emit a JSON envelope on stdout; spinners would fight it.
+            Self::ReadConfiguration(_) | Self::RunUserCommands(_) | Self::Templates(_) => false,
             _ => true,
         }
     }
@@ -370,7 +370,7 @@ impl Command {
                 args.execute(progress).await.map_err(boxed_err_to_report)
             }
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
-            Self::Template(args) => args.execute().map_err(boxed_err_to_report),
+            Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Init(args) => args.execute(progress).await.map_err(boxed_err_to_report),
