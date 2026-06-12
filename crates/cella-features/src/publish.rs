@@ -5,7 +5,9 @@
 //! - For each feature: compute the semver tag fan-out against already-published
 //!   tags, skip if the exact version already exists, push the tgz layer + config
 //!   + manifest, then publish the collection index.
-//! - Emit a JSON summary to stdout: `{ "<id>": { publishedTags, digest, version } }`.
+//! - Emit a JSON summary to stdout matching the official CLI format:
+//!   `{ "<id>": { publishedTags, digest, version } }` for published features,
+//!   `{ "<id>": {} }` for features whose exact version was already present.
 
 use std::collections::HashMap;
 use std::fs;
@@ -43,24 +45,40 @@ pub struct PublishOptions {
     pub namespace: String,
 }
 
-/// Per-feature result in the JSON output.
+/// Per-feature result in the JSON output — matches the official CLI contract.
+///
+/// When a feature was actually pushed the fields are populated; when the exact
+/// version already existed the variant is `Skipped` and the JSON value is `{}`.
 #[derive(Debug, Clone)]
-pub struct FeaturePublishResult {
-    /// Manifest digest (`sha256:…`), empty if skipped.
-    pub digest: String,
-    /// Tags that were actually pushed (empty if exact version already existed).
-    pub published_tags: Vec<String>,
-    /// Feature version string.
-    pub version: String,
+pub enum FeaturePublishResult {
+    /// Feature was pushed successfully.
+    Published {
+        /// Manifest digest (`sha256:…`).
+        digest: String,
+        /// Tags that were actually pushed.
+        published_tags: Vec<String>,
+        /// Feature version string.
+        version: String,
+    },
+    /// Exact version already existed in the registry — nothing was pushed.
+    Skipped,
 }
 
 impl FeaturePublishResult {
     fn to_json(&self) -> Value {
-        json!({
-            "publishedTags": self.published_tags,
-            "digest": self.digest,
-            "version": self.version,
-        })
+        match self {
+            Self::Published {
+                digest,
+                published_tags,
+                version,
+            } => json!({
+                "publishedTags": published_tags,
+                "digest": digest,
+                "version": version,
+            }),
+            // Official CLI emits `{}` for skipped features, not `null` and not omitting the key.
+            Self::Skipped => Value::Object(serde_json::Map::new()),
+        }
     }
 }
 
@@ -82,6 +100,9 @@ pub enum PublishError {
 
     #[error("I/O error reading packaged artifact: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("collection JSON is not valid UTF-8: {0}")]
+    CollectionEncoding(#[from] std::string::FromUtf8Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,11 +186,7 @@ async fn publish_one_feature(
             "(!) Version '{version_str}' of feature '{}' already exists in the registry, skipping...",
             feature.id
         );
-        return Ok(FeaturePublishResult {
-            digest: String::new(),
-            published_tags: Vec::new(),
-            version: version_str.clone(),
-        });
+        return Ok(FeaturePublishResult::Skipped);
     };
 
     debug!(
@@ -197,6 +214,8 @@ async fn publish_one_feature(
 
     let manifest_annotations = build_feature_annotations(feature, registry);
 
+    // push_artifact returns None only when tags is empty; we already checked
+    // above that tags is non-empty (Some(tags) from compute_semver_tags).
     let push_result = push_artifact(
         registry,
         &repository,
@@ -205,9 +224,10 @@ async fn publish_one_feature(
         MEDIA_TYPE_CONFIG,
         Some(manifest_annotations),
     )
-    .await?;
+    .await?
+    .expect("tags were non-empty but push_artifact returned None");
 
-    Ok(FeaturePublishResult {
+    Ok(FeaturePublishResult::Published {
         digest: push_result.digest,
         published_tags: push_result.pushed_tags,
         version: version_str.clone(),
@@ -233,12 +253,20 @@ async fn publish_collection_index(
     );
 
     let layer = LayerSpec {
-        data: collection_bytes,
+        data: collection_bytes.clone(),
         media_type: MEDIA_TYPE_COLLECTION_LAYER.to_owned(),
         annotations: Some(layer_annotations),
     };
 
     let mut manifest_annotations = HashMap::new();
+
+    // The `dev.containers.metadata` annotation carries the full collection JSON
+    // string so consumers (VS Code, other tooling) can read it from the manifest
+    // without fetching the layer blob.
+    let collection_json =
+        String::from_utf8(collection_bytes).map_err(PublishError::CollectionEncoding)?;
+    manifest_annotations.insert("dev.containers.metadata".to_owned(), collection_json);
+
     if registry == GHCR_IO {
         manifest_annotations.insert(
             "com.github.package.type".to_owned(),
@@ -367,6 +395,29 @@ mod tests {
 
     fn ver(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // FeaturePublishResult JSON serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn skipped_result_serializes_to_empty_object() {
+        let v = FeaturePublishResult::Skipped.to_json();
+        assert_eq!(v, Value::Object(serde_json::Map::new()));
+    }
+
+    #[test]
+    fn published_result_contains_required_fields() {
+        let v = FeaturePublishResult::Published {
+            digest: "sha256:abc".to_owned(),
+            published_tags: vec!["1.0.0".to_owned(), "latest".to_owned()],
+            version: "1.0.0".to_owned(),
+        }
+        .to_json();
+        assert_eq!(v["digest"], "sha256:abc");
+        assert_eq!(v["version"], "1.0.0");
+        assert!(v["publishedTags"].is_array());
     }
 
     // -----------------------------------------------------------------------
