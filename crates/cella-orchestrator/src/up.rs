@@ -531,13 +531,19 @@ impl EnsureUpContext<'_> {
             run_lifecycle_entries(&lc_ctx, "postAttachCommand", &entries, &self.progress).await?;
         }
 
+        // Heal the bridge against the current host $SSH_AUTH_SOCK — see
+        // refresh_ssh_agent_bridge. The running path is where staleness
+        // bites hardest: the container kept running across a host
+        // sleep/re-login, so the registered upstream is the old one.
+        let ssh_agent_proxy = self.refresh_ssh_agent_bridge().await;
+
         Ok(UpResult {
             container_id: container.id.clone(),
             container_name: self.config.container_name.to_string(),
             remote_user: remote_user.to_string(),
             workspace_folder: self.workspace_folder_str().to_string(),
             outcome: UpOutcome::Running,
-            ssh_agent_proxy: None,
+            ssh_agent_proxy,
         })
     }
 
@@ -687,16 +693,14 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        // Don't re-register here. The container's CELLA_SSH_AGENT_BRIDGE
-        // env var was baked at create time and can't be updated, so a
-        // fresh register on a new port wouldn't help. The daemon reclaims
-        // bridge ports from its state file on startup instead (see
-        // SshProxyManager::reclaim_from_state_file), which typically
-        // lets the stopped-container restart path work transparently.
-        // If the daemon's reclaim fails (port taken by something else,
-        // stale state file, etc.), recovery requires `cella down &&
-        // cella up`.
-        let ssh_agent_proxy: Option<crate::result::SshAgentProxyStatus> = None;
+        // Heal the bridge against the CURRENT host $SSH_AUTH_SOCK. The
+        // registered upstream is a snapshot from the last register and
+        // goes stale when the host agent moves (sleep/wake, re-login,
+        // agent restart) — without this, every bridged connection EOFs
+        // until the user rebuilds the container. The daemon rebinds on
+        // the same port, so the baked CELLA_SSH_AGENT_BRIDGE env var
+        // keeps resolving.
+        let ssh_agent_proxy = self.refresh_ssh_agent_bridge().await;
 
         let step = self.progress.step("Starting container...");
         let start_result = self.client.start_container(&container.id).await;
@@ -1019,6 +1023,50 @@ impl EnsureUpContext<'_> {
                 reason: "daemon RegisterSshAgentProxy failed (see daemon log)".to_string(),
             }),
         }
+    }
+
+    /// Heal the workspace's SSH-agent bridge on the container-reuse paths.
+    ///
+    /// The bridge upstream registered with the daemon is a snapshot of the
+    /// host's `$SSH_AUTH_SOCK` taken at the last register; it goes stale
+    /// whenever the host agent moves (sleep/wake, re-login rotating the
+    /// launchd socket path, agent restart, or a daemon-restart reclaim
+    /// restoring a pre-reboot path). Re-resolves the current strategy from
+    /// the environment and, when this runtime bridges via the daemon
+    /// (colima), asks it to refresh. The daemon rebinds on the same port,
+    /// so the container's baked `CELLA_SSH_AGENT_BRIDGE` keeps working —
+    /// no recreate needed.
+    ///
+    /// Returns `None` for runtimes that don't use the bridge (direct
+    /// socket mounts on Docker Desktop / `OrbStack` / Linux) and when the
+    /// daemon is unreachable or predates the refresh RPC.
+    async fn refresh_ssh_agent_bridge(&self) -> Option<crate::result::SshAgentProxyStatus> {
+        let runtime = cella_env::platform::detect_runtime();
+        let upstream = cella_env::ssh_agent::ssh_agent_request(&runtime, self.config_json())
+            .into_iter()
+            .find_map(|strategy| match strategy {
+                cella_env::ssh_agent::SshAgentRequest::ProxyOnColima {
+                    upstream_socket, ..
+                } => Some(upstream_socket),
+                cella_env::ssh_agent::SshAgentRequest::Direct(_) => None,
+            })?;
+        let daemon_sock = cella_env::paths::daemon_socket_path()?;
+
+        let refreshed = crate::ssh_proxy_client::refresh_proxy(
+            &daemon_sock,
+            &self.config.resolved.workspace_root,
+            &upstream,
+        )
+        .await?;
+
+        if refreshed.action == cella_protocol::SshProxyRefreshAction::Rebridged {
+            self.progress
+                .hint("Re-bridged the SSH agent to the current host agent socket (it had moved).");
+        }
+        Some(crate::result::SshAgentProxyStatus::Bridged {
+            host_endpoint: format!("{}:{}", self.client.host_gateway(), refreshed.bridge_port),
+            refcount: refreshed.refcount,
+        })
     }
 
     async fn apply_env_and_mounts(
