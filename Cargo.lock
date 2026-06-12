@@ -376,6 +376,7 @@ dependencies = [
  "cella-git",
  "cella-jsonc",
  "cella-network",
+ "cella-oci",
  "cella-orchestrator",
  "cella-protocol",
  "cella-templates",

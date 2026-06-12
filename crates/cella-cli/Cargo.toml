@@ -13,6 +13,7 @@ cella-backend.workspace = true
 cella-compose.workspace = true
 cella-config.workspace = true
 cella-features.workspace = true
+cella-oci.workspace = true
 cella-jsonc.workspace = true
 cella-daemon.workspace = true
 cella-daemon-client.workspace = true

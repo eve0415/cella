@@ -2,6 +2,7 @@
 //! devcontainer configurations.
 
 pub mod edit;
+pub mod info;
 pub mod jsonc_edit;
 pub mod list;
 pub mod prompts;
@@ -24,6 +25,8 @@ pub struct FeaturesArgs {
 pub enum FeaturesCommand {
     /// Edit features in an existing devcontainer configuration.
     Edit(edit::EditArgs),
+    /// Show information about a feature (manifest, tags, dependencies).
+    Info(info::InfoArgs),
     /// List configured or available features.
     List(list::ListArgs),
     /// Check for and apply feature version updates.
@@ -37,6 +40,7 @@ impl FeaturesArgs {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             FeaturesCommand::Edit(args) => args.execute().await,
+            FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
