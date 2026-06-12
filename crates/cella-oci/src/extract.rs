@@ -544,6 +544,46 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `./`-prefixed entries (ubiquitous in real OCI tarballs) are accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dotslash_prefixed_entries_accepted() {
+        let tar = build_raw_tar(&[("./.devcontainer/devcontainer.json", b'0', "", b"{}")]);
+        let dest = dest_dir();
+        extract_layer(&tar, IMAGE_LAYER_MEDIA_TYPE, dest.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join(".devcontainer/devcontainer.json")).unwrap(),
+            "{}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Writing through an accepted intra-dest symlink cannot escape dest
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_through_intra_dest_symlink_stays_inside_dest() {
+        // Entry 1: dir "subdir/"; entry 2: symlink "subdir/link" -> ".."
+        // (resolves to dest — contained); entry 3: file "subdir/link/evil.txt"
+        // whose components are all Normal. If extraction follows the symlink,
+        // the file must land inside dest, never outside it.
+        let tar = build_raw_tar(&[
+            ("subdir/", b'5', "", b""),
+            ("subdir/link", b'2', "..", b""),
+            ("subdir/link/evil.txt", b'0', "", b"pwned"),
+        ]);
+        let dest = dest_dir();
+        let result = extract_layer(&tar, IMAGE_LAYER_MEDIA_TYPE, dest.path());
+        // Accepted or rejected are both fine — escaping dest is not.
+        drop(result);
+        assert!(
+            !dest.path().parent().unwrap().join("evil.txt").exists(),
+            "evil.txt must not be written outside dest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // is_extractable_layer
     // -----------------------------------------------------------------------
 
