@@ -53,7 +53,12 @@ pub enum CodeError {
     RemoteDockerHost { protocol: String },
 
     #[error("`cella code` requires the Docker backend (VS Code attach is Docker-specific)")]
-    #[diagnostic(code(cella::code::non_docker_backend))]
+    #[diagnostic(
+        code(cella::code::non_docker_backend),
+        help(
+            "VS Code's Dev Containers extension attaches through the Docker API and cannot see containers managed by the apple/container backend.\nWorkaround: enable VS Code's experimental `dev.containers.experimentalAppleContainerSupport` setting and let the extension manage the container itself."
+        )
+    )]
     NonDockerBackend,
 }
 
@@ -761,10 +766,14 @@ mod tests {
     }
 
     #[test]
-    fn code_error_non_docker_has_no_help() {
+    fn code_error_non_docker_has_help() {
         use miette::Diagnostic;
         let err = CodeError::NonDockerBackend;
-        assert!(err.help().is_none());
+        let help = err.help().expect("should have help text");
+        assert!(
+            help.to_string()
+                .contains("dev.containers.experimentalAppleContainerSupport")
+        );
     }
 
     #[test]
