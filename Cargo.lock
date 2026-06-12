@@ -653,6 +653,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "flate2",
+ "miette",
  "oci-distribution",
  "serde",
  "serde_json",
