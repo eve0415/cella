@@ -23,6 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 cella-oci.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 cella-testing.workspace = true
