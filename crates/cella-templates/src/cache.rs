@@ -276,12 +276,17 @@ impl TemplateCache {
     }
 
     /// Compute the cache path for a template artifact.
+    ///
+    /// Each ref component is hashed before being used as a path segment so
+    /// that crafted values containing `..`, absolute paths, or embedded
+    /// separators cannot escape the cache root.  This changes the on-disk
+    /// layout; any existing unhashed entries are treated as misses.
     pub fn template_path(&self, registry: &str, repository: &str, digest: &str) -> PathBuf {
         self.root
             .join("oci")
-            .join(registry)
-            .join(repository)
-            .join(digest)
+            .join(hash_ref_component(registry))
+            .join(hash_ref_component(repository))
+            .join(hash_ref_component(digest))
     }
 
     /// Return a staging path for atomic writes.
@@ -319,6 +324,17 @@ impl Default for TemplateCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Hash an untrusted OCI ref component (registry, repository, or digest) to a
+/// fixed-length hex string safe for use as a single filesystem path segment.
+///
+/// SHA-256 over the raw bytes produces a 64-character hex string that contains
+/// no path separators, no `..` sequences, and no leading dots, regardless of
+/// the input.  This is the same approach used by the collection-index and
+/// image-tag path helpers.
+fn hash_ref_component(component: &str) -> String {
+    hex::encode(Sha256::digest(component.as_bytes()))
 }
 
 // ===========================================================================
@@ -387,6 +403,77 @@ mod tests {
     // -----------------------------------------------------------------------
     // Template artifact cache
     // -----------------------------------------------------------------------
+
+    fn assert_under_root(root: &Path, path: &Path) {
+        assert!(
+            path.starts_with(root),
+            "path {path:?} escapes cache root {root:?}",
+        );
+    }
+
+    #[test]
+    fn template_path_dotdot_registry_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let path = cache.template_path("../../escape", "repo", "sha256:abc");
+        assert_under_root(dir.path(), &path);
+    }
+
+    #[test]
+    fn template_path_dotdot_repository_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let path = cache.template_path("ghcr.io", "../../escape", "sha256:abc");
+        assert_under_root(dir.path(), &path);
+    }
+
+    #[test]
+    fn template_path_dotdot_digest_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let path = cache.template_path("ghcr.io", "repo", "../../escape");
+        assert_under_root(dir.path(), &path);
+    }
+
+    #[test]
+    fn template_path_absolute_registry_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let path = cache.template_path("/etc/passwd", "repo", "sha256:abc");
+        assert_under_root(dir.path(), &path);
+    }
+
+    #[test]
+    fn template_path_embedded_separator_in_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        // OCI repos legitimately contain slashes (e.g. org/image/name).
+        // After hashing the whole component, the path stays flat.
+        let path = cache.template_path("ghcr.io", "devcontainers/templates/rust", "sha256:abc");
+        assert_under_root(dir.path(), &path);
+        // Result is exactly 4 components deep: root / "oci" / hash / hash / hash
+        let depth = path.components().count();
+        let root_depth = dir.path().components().count();
+        assert_eq!(depth - root_depth, 4, "expected oci/<reg>/<repo>/<dig>");
+    }
+
+    #[test]
+    fn template_path_distinct_repos_produce_distinct_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let a = cache.template_path("ghcr.io", "devcontainers/templates/rust", "sha256:abc");
+        let b = cache.template_path("ghcr.io", "devcontainers/templates/python", "sha256:abc");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn template_path_same_inputs_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TemplateCache::with_root(dir.path());
+        let a = cache.template_path("ghcr.io", "devcontainers/templates/rust", "sha256:abc");
+        let b = cache.template_path("ghcr.io", "devcontainers/templates/rust", "sha256:abc");
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn template_cache_miss() {
