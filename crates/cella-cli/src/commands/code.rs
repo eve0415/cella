@@ -275,11 +275,11 @@ impl AttachSettings {
     /// matching extension key.
     fn from_endpoint(endpoint: &BackendEndpoint) -> Self {
         match endpoint {
-            BackendEndpoint::DockerHost(host) => Self {
+            BackendEndpoint::HostUri(host) => Self {
                 host: Some(host.clone()),
                 context: None,
             },
-            BackendEndpoint::DockerContext(context) => Self {
+            BackendEndpoint::NamedContext(context) => Self {
                 host: None,
                 context: Some(context.clone()),
             },
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn build_uri_with_endpoint_pins_exact_payload() {
-        let endpoint = BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string());
+        let endpoint = BackendEndpoint::HostUri("unix:///var/run/docker.sock".to_string());
         let uri = build_vscode_uri("deadbeef", Some(&endpoint), "/workspaces/test");
         let payload = decode_uri_payload(&uri, "/workspaces/test");
         assert_eq!(
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn build_uri_roundtrip_docker_host() {
         let endpoint =
-            BackendEndpoint::DockerHost("unix:///Users/x/.colima/default/docker.sock".to_string());
+            BackendEndpoint::HostUri("unix:///Users/x/.colima/default/docker.sock".to_string());
         let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
         let payload = decode_uri_payload(&uri, "/workspaces/app");
         let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn build_uri_roundtrip_docker_context() {
-        let endpoint = BackendEndpoint::DockerContext("orbstack".to_string());
+        let endpoint = BackendEndpoint::NamedContext("orbstack".to_string());
         let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
         let payload = decode_uri_payload(&uri, "/workspaces/app");
         let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn build_uri_shape_decodes_to_json_object() {
-        let endpoint = BackendEndpoint::DockerHost("tcp://localhost:2375".to_string());
+        let endpoint = BackendEndpoint::HostUri("tcp://localhost:2375".to_string());
         let uri = build_vscode_uri("c", Some(&endpoint), "/workspaces/x");
         assert!(uri.starts_with("vscode-remote://attached-container+"));
         assert!(uri.ends_with("/workspaces/x"));

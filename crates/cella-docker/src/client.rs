@@ -25,7 +25,7 @@ fn normalize_host_endpoint(host: &str) -> String {
 /// socket is used. Recording anything else would advertise an endpoint the
 /// connection never used.
 fn local_defaults_endpoint(docker_host: Option<String>) -> BackendEndpoint {
-    BackendEndpoint::DockerHost(
+    BackendEndpoint::HostUri(
         docker_host
             .filter(|v| v.starts_with("unix://"))
             .unwrap_or_else(|| "unix:///var/run/docker.sock".to_string()),
@@ -78,7 +78,7 @@ impl DockerClient {
                 })?;
             tracing::info!("Connected to Docker via discovered socket: {path_str}");
             let endpoint =
-                BackendEndpoint::DockerHost(format!("unix://{}", discovered.path.display()));
+                BackendEndpoint::HostUri(format!("unix://{}", discovered.path.display()));
             return Ok(Self {
                 inner: docker,
                 endpoint,
@@ -106,7 +106,7 @@ impl DockerClient {
         .map_err(|e| CellaDockerError::RuntimeNotFound {
             message: format!("failed to connect to Docker at {host}: {e}"),
         })?;
-        let endpoint = BackendEndpoint::DockerHost(normalize_host_endpoint(host));
+        let endpoint = BackendEndpoint::HostUri(normalize_host_endpoint(host));
         Ok(Self {
             inner: docker,
             endpoint,
@@ -162,7 +162,7 @@ mod tests {
     fn local_defaults_without_docker_host_uses_default_socket() {
         assert_eq!(
             local_defaults_endpoint(None),
-            BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string())
+            BackendEndpoint::HostUri("unix:///var/run/docker.sock".to_string())
         );
     }
 
@@ -170,7 +170,7 @@ mod tests {
     fn local_defaults_honors_unix_docker_host() {
         assert_eq!(
             local_defaults_endpoint(Some("unix:///tmp/custom.sock".to_string())),
-            BackendEndpoint::DockerHost("unix:///tmp/custom.sock".to_string())
+            BackendEndpoint::HostUri("unix:///tmp/custom.sock".to_string())
         );
     }
 
@@ -180,7 +180,7 @@ mod tests {
         // connect_with_unix_defaults, so it must not be advertised.
         assert_eq!(
             local_defaults_endpoint(Some("tcp://localhost:2375".to_string())),
-            BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string())
+            BackendEndpoint::HostUri("unix:///var/run/docker.sock".to_string())
         );
     }
 }
