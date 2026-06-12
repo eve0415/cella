@@ -62,7 +62,20 @@ pub async fn fetch_template(
 
     let layer = find_extractable_layer(&manifest, template_ref)?;
 
-    let capacity = usize::try_from(layer.size.max(0)).unwrap_or(0);
+    // Reject oversized blobs before downloading.
+    let declared_size = u64::try_from(layer.size.max(0)).unwrap_or(0);
+    if declared_size > cella_oci::MAX_BLOB_COMPRESSED_BYTES {
+        return Err(TemplateError::RegistryError {
+            registry: registry.clone(),
+            message: format!(
+                "blob download exceeds size limit: {declared_size} bytes > {} bytes for {}",
+                cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                layer.digest,
+            ),
+        });
+    }
+
+    let capacity = usize::try_from(declared_size).unwrap_or(0);
     let mut blob = Vec::with_capacity(capacity);
     client
         .pull_blob(&oci_ref, layer, &mut blob)
@@ -71,6 +84,19 @@ pub async fn fetch_template(
             registry: registry.clone(),
             message: format!("failed to pull layer blob: {e}"),
         })?;
+
+    // Enforce the cap on actual received size too (manifests can lie).
+    let actual_size = blob.len() as u64;
+    if actual_size > cella_oci::MAX_BLOB_COMPRESSED_BYTES {
+        return Err(TemplateError::RegistryError {
+            registry: registry.clone(),
+            message: format!(
+                "blob download exceeds size limit: {actual_size} bytes > {} bytes for {}",
+                cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                layer.digest,
+            ),
+        });
+    }
 
     // Verify digest
     let actual_digest = format!("sha256:{}", hex::encode(Sha256::digest(&blob)));
