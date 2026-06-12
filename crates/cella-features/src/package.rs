@@ -34,18 +34,17 @@ pub struct PackageOptions {
 }
 
 /// A packaged feature entry — the data that lands in `devcontainer-collection.json`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Typed accessors are provided for the well-known fields; the full metadata map
+/// (`raw`) is used when serializing to collection JSON to avoid duplicate keys.
+#[derive(Debug, Clone)]
 pub struct PackagedFeature {
     pub id: String,
     pub version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Full raw metadata from `devcontainer-feature.json` (for collection JSON).
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
+    /// Full raw metadata from `devcontainer-feature.json` (including `id`, `version`, etc.).
+    pub raw: serde_json::Map<String, Value>,
 }
 
 /// Written to `<output>/devcontainer-collection.json`.
@@ -150,7 +149,7 @@ fn package_single(target: &Path, output: &Path) -> Result<PackageResult, Package
         version,
         name,
         description,
-        extra: meta,
+        raw: meta,
     };
 
     write_collection_json(output, std::slice::from_ref(&packaged))?;
@@ -230,7 +229,7 @@ fn package_collection(target: &Path, output: &Path) -> Result<PackageResult, Pac
             version,
             name,
             description,
-            extra: meta,
+            raw: meta,
         });
     }
 
@@ -362,7 +361,8 @@ fn write_collection_json(output: &Path, features: &[PackagedFeature]) -> Result<
         .map(|f| {
             // Start from the full metadata map (which already has id, version, etc.)
             // and ensure top-level `id`/`version`/`name`/`description` are present.
-            let mut map = f.extra.clone();
+            // Using `raw` directly avoids any risk of duplicate keys.
+            let mut map = f.raw.clone();
             map.insert("id".to_owned(), Value::String(f.id.clone()));
             map.insert("version".to_owned(), Value::String(f.version.clone()));
             if let Some(n) = &f.name {
@@ -743,5 +743,36 @@ mod tests {
         assert_eq!(result.features.len(), 1);
         assert_eq!(result.features[0].id, "real-feature");
         assert!(!out.join("devcontainer-feature-hidden.tgz").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4: collection JSON shape stays correct (no duplicate keys)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collection_json_shape_is_correct() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("feature");
+        make_feature(&src, "my-feat", "3.0.0");
+
+        let out = tmp.path().join("output");
+        package(&PackageOptions {
+            target: src,
+            output_folder: out.clone(),
+            force_clean_output_folder: false,
+        })
+        .unwrap();
+
+        let col = read_collection(&out);
+        // Top-level keys must exist.
+        assert!(col["sourceInformation"].is_object());
+        assert_eq!(col["sourceInformation"]["source"], "devcontainer-cli");
+        assert!(col["features"].is_array());
+        let features = col["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1);
+        // Each feature entry must carry full metadata.
+        assert_eq!(features[0]["id"], "my-feat");
+        assert_eq!(features[0]["version"], "3.0.0");
+        assert!(features[0]["name"].is_string());
     }
 }
