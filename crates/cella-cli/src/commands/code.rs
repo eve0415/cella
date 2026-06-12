@@ -2,10 +2,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
+use serde::Serialize;
 use serde_json::json;
 use tracing::debug;
 
-use cella_backend::ExecOptions;
+use cella_backend::{BackendEndpoint, ExecOptions};
 
 use super::OutputFormat;
 use super::up::{UpArgs, UpContext, UpRenderData, UpResult, output_result};
@@ -124,23 +125,13 @@ impl CodeArgs {
                 .map_err(super::boxed_err_to_report)?
         };
 
-        // 4. Resolve compose service if needed
-        let container_id = if self.service.is_some() {
-            let container = ctx.client.inspect_container(&result.container_id).await?;
-            let resolved = super::resolve_service_container(
-                ctx.client.as_ref(),
-                container,
-                self.service.as_deref(),
-            )
-            .await
-            .map_err(super::boxed_err_to_report)?;
-            resolved.id
-        } else {
-            result.container_id.clone()
-        };
+        // 4. Resolve the attach target (id + `/`-trimmed name)
+        let (container_id, container_name) =
+            resolve_attach_target(&ctx, &result.container_id, self.service.as_deref()).await?;
 
         // 5. Build the attached-container URI
-        let uri = build_vscode_uri(&container_id, &result.workspace_folder);
+        let endpoint = ctx.client.endpoint();
+        let uri = build_vscode_uri(&container_name, endpoint.as_ref(), &result.workspace_folder);
         debug!("VS Code URI: {uri}");
 
         // 6. Launch editor
@@ -188,6 +179,23 @@ impl CodeArgs {
     }
 }
 
+/// Resolve the container the editor should attach to, returning its `(id, name)`.
+///
+/// The returned name is `/`-trimmed (as carried by [`cella_backend::ContainerInfo`]).
+/// Inspects `container_id` — revalidating it right before the editor launches —
+/// and, for `--service`, resolves the requested compose service container from it.
+async fn resolve_attach_target(
+    ctx: &UpContext,
+    container_id: &str,
+    service: Option<&str>,
+) -> miette::Result<(String, String)> {
+    let container = ctx.client.inspect_container(container_id).await?;
+    let resolved = super::resolve_service_container(ctx.client.as_ref(), container, service)
+        .await
+        .map_err(super::boxed_err_to_report)?;
+    Ok((resolved.id, resolved.name))
+}
+
 /// Emit the `cella code` result.
 ///
 /// `code` has no official devcontainer-CLI analogue, so its JSON shape keeps
@@ -230,14 +238,58 @@ fn emit_code_result(
     }
 }
 
-/// Hex-encode a container ID for the attached-container URI scheme.
+/// JSON payload encoded into the attached-container URI authority.
 ///
-/// Each ASCII byte of the container ID is converted to its two-character hex
+/// The Dev Containers extension hex-decodes the authority; when the decoded
+/// bytes start with `{` it parses them as this JSON object. `containerName`
+/// carries the `/`-prefixed Docker container name (matching `docker inspect`
+/// `.Name`) and `settings` tells the extension which Docker endpoint to use.
+#[derive(Serialize)]
+struct AttachPayload {
+    #[serde(rename = "containerName")]
+    container_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<AttachSettings>,
+}
+
+/// Docker endpoint hints the extension reads to reach the same daemon cella used.
+///
+/// `host` maps to `DOCKER_HOST`, `context` maps to `DOCKER_CONTEXT`. Each is
+/// omitted when absent; the whole object is omitted when the backend exposes
+/// no endpoint, in which case the extension falls back to its own defaults.
+#[derive(Serialize)]
+struct AttachSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+}
+
+impl AttachSettings {
+    /// Build settings from a backend endpoint, mapping the variant to the
+    /// matching extension key.
+    fn from_endpoint(endpoint: &BackendEndpoint) -> Self {
+        match endpoint {
+            BackendEndpoint::DockerHost(host) => Self {
+                host: Some(host.clone()),
+                context: None,
+            },
+            BackendEndpoint::DockerContext(context) => Self {
+                host: None,
+                context: Some(context.clone()),
+            },
+        }
+    }
+}
+
+/// Hex-encode a string for the attached-container URI authority.
+///
+/// Each UTF-8 byte is converted to its two-character lowercase hex
 /// representation. For example, `"a"` (0x61) becomes `"61"`.
-fn hex_encode_container_id(id: &str) -> String {
+fn hex_encode(value: &str) -> String {
     use std::fmt::Write;
-    let mut encoded = String::with_capacity(id.len() * 2);
-    for byte in id.bytes() {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.bytes() {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
@@ -245,10 +297,26 @@ fn hex_encode_container_id(id: &str) -> String {
 
 /// Build the VS Code attached-container remote URI.
 ///
-/// Format: `vscode-remote://attached-container+{hex_encoded_id}{workspace_path}`
-fn build_vscode_uri(container_id: &str, workspace_folder: &str) -> String {
-    let hex_id = hex_encode_container_id(container_id);
-    format!("vscode-remote://attached-container+{hex_id}{workspace_folder}")
+/// Format: `vscode-remote://attached-container+{hex}{workspace_folder}`, where
+/// `hex` is the byte-hex of a JSON [`AttachPayload`]. The Dev Containers
+/// extension hex-decodes the authority, parses the JSON, and reads
+/// `settings.host`/`settings.context` to pick its Docker endpoint.
+///
+/// `container_name` is the `/`-trimmed name from [`cella_backend::ContainerInfo`];
+/// the leading `/` (as in `docker inspect` `.Name`) is re-prepended here.
+fn build_vscode_uri(
+    container_name: &str,
+    endpoint: Option<&BackendEndpoint>,
+    workspace_folder: &str,
+) -> String {
+    let payload = AttachPayload {
+        container_name: format!("/{container_name}"),
+        settings: endpoint.map(AttachSettings::from_endpoint),
+    };
+    let json = serde_json::to_string(&payload)
+        .expect("AttachPayload contains only strings and is always serializable");
+    let hex = hex_encode(&json);
+    format!("vscode-remote://attached-container+{hex}{workspace_folder}")
 }
 
 /// Resolve which editor binary to use.
@@ -403,22 +471,44 @@ async fn poll_vscode_server(
 mod tests {
     use super::*;
 
+    /// Decode the hex authority of an attached-container URI back to its JSON.
+    ///
+    /// Strips the scheme prefix and the trailing workspace folder, then
+    /// hex-decodes the remaining authority payload to a UTF-8 string.
+    fn decode_uri_payload(uri: &str, workspace_folder: &str) -> String {
+        let authority = uri
+            .strip_prefix("vscode-remote://attached-container+")
+            .expect("URI should carry the attached-container prefix");
+        let hex = authority
+            .strip_suffix(workspace_folder)
+            .expect("URI should end with the workspace folder");
+        assert!(
+            hex.len().is_multiple_of(2),
+            "hex payload must be byte-aligned"
+        );
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        String::from_utf8(bytes).expect("payload should be valid UTF-8")
+    }
+
     #[test]
     fn hex_encode_empty_string() {
-        assert_eq!(hex_encode_container_id(""), "");
+        assert_eq!(hex_encode(""), "");
     }
 
     #[test]
     fn hex_encode_single_char() {
         // 'a' = 0x61
-        assert_eq!(hex_encode_container_id("a"), "61");
+        assert_eq!(hex_encode("a"), "61");
     }
 
     #[test]
-    fn hex_encode_known_container_id() {
+    fn hex_encode_known_string() {
         // A short example: "abc123" -> each char's hex
         // a=61, b=62, c=63, 1=31, 2=32, 3=33
-        assert_eq!(hex_encode_container_id("abc123"), "616263313233");
+        assert_eq!(hex_encode("abc123"), "616263313233");
     }
 
     #[test]
@@ -426,35 +516,94 @@ mod tests {
         // All hex digits: 0-9 a-f
         let input = "0123456789abcdef";
         let expected = "30313233343536373839616263646566";
-        assert_eq!(hex_encode_container_id(input), expected);
+        assert_eq!(hex_encode(input), expected);
     }
 
     #[test]
     fn hex_encode_full_docker_id() {
-        // 64-char container ID should produce 128-char encoded string
+        // 64-char string should produce 128-char encoded string
         let id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let encoded = hex_encode_container_id(id);
+        let encoded = hex_encode(id);
         assert_eq!(encoded.len(), 128);
     }
 
     #[test]
     fn build_uri_basic() {
-        let uri = build_vscode_uri("abc123", "/workspaces/myapp");
+        let uri = build_vscode_uri("my-container", None, "/workspaces/myapp");
+        assert!(uri.starts_with("vscode-remote://attached-container+"));
+        assert!(uri.ends_with("/workspaces/myapp"));
+        let payload = decode_uri_payload(&uri, "/workspaces/myapp");
+        assert_eq!(payload, r#"{"containerName":"/my-container"}"#);
+    }
+
+    #[test]
+    fn build_uri_with_endpoint_pins_exact_payload() {
+        let endpoint = BackendEndpoint::DockerHost("unix:///var/run/docker.sock".to_string());
+        let uri = build_vscode_uri("deadbeef", Some(&endpoint), "/workspaces/test");
+        let payload = decode_uri_payload(&uri, "/workspaces/test");
         assert_eq!(
-            uri,
-            "vscode-remote://attached-container+616263313233/workspaces/myapp"
+            payload,
+            r#"{"containerName":"/deadbeef","settings":{"host":"unix:///var/run/docker.sock"}}"#
         );
     }
 
     #[test]
-    fn build_uri_with_full_id() {
-        let id = "deadbeef";
-        let uri = build_vscode_uri(id, "/workspaces/test");
-        // d=64, e=65, a=61, d=64, b=62, e=65, e=65, f=66
+    fn build_uri_roundtrip_docker_host() {
+        let endpoint =
+            BackendEndpoint::DockerHost("unix:///Users/x/.colima/default/docker.sock".to_string());
+        let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
+        let payload = decode_uri_payload(&uri, "/workspaces/app");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(value["containerName"], "/my-container");
         assert_eq!(
-            uri,
-            "vscode-remote://attached-container+6465616462656566/workspaces/test"
+            value["settings"]["host"],
+            "unix:///Users/x/.colima/default/docker.sock"
         );
+        assert!(value["settings"].get("context").is_none());
+    }
+
+    #[test]
+    fn build_uri_roundtrip_docker_context() {
+        let endpoint = BackendEndpoint::DockerContext("orbstack".to_string());
+        let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
+        let payload = decode_uri_payload(&uri, "/workspaces/app");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(value["containerName"], "/my-container");
+        assert_eq!(value["settings"]["context"], "orbstack");
+        assert!(value["settings"].get("host").is_none());
+    }
+
+    #[test]
+    fn build_uri_no_endpoint_omits_settings() {
+        let uri = build_vscode_uri("my-container", None, "/workspaces/app");
+        let payload = decode_uri_payload(&uri, "/workspaces/app");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(value["containerName"], "/my-container");
+        assert!(
+            value.get("settings").is_none(),
+            "settings key must be absent without an endpoint"
+        );
+    }
+
+    #[test]
+    fn build_uri_shape_decodes_to_json_object() {
+        let endpoint = BackendEndpoint::DockerHost("tcp://localhost:2375".to_string());
+        let uri = build_vscode_uri("c", Some(&endpoint), "/workspaces/x");
+        assert!(uri.starts_with("vscode-remote://attached-container+"));
+        assert!(uri.ends_with("/workspaces/x"));
+        let payload = decode_uri_payload(&uri, "/workspaces/x");
+        assert!(payload.starts_with('{'), "payload must be a JSON object");
+    }
+
+    #[test]
+    fn build_uri_prepends_leading_slash_exactly_once() {
+        // Name input never carries a leading slash; output always begins `"/`.
+        let uri = build_vscode_uri("my-container", None, "");
+        let payload = decode_uri_payload(&uri, "");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        let name = value["containerName"].as_str().expect("string name");
+        assert_eq!(name, "/my-container");
+        assert!(!name.starts_with("//"), "no double-slash prefix");
     }
 
     #[test]
@@ -530,8 +679,9 @@ mod tests {
 
     #[test]
     fn build_uri_empty_workspace() {
-        let uri = build_vscode_uri("abc", "");
-        assert_eq!(uri, "vscode-remote://attached-container+616263");
+        let uri = build_vscode_uri("abc", None, "");
+        let payload = decode_uri_payload(&uri, "");
+        assert_eq!(payload, r#"{"containerName":"/abc"}"#);
     }
 
     #[test]
@@ -581,12 +731,12 @@ mod tests {
         assert!(!is_localhost_tcp("tcp://"));
     }
 
-    // ── hex_encode_container_id ────────────────────────────────────
+    // ── hex_encode ─────────────────────────────────────────────────
 
     #[test]
     fn hex_encode_uppercase_chars() {
         // Uppercase A-F should encode correctly
-        let encoded = hex_encode_container_id("ABCDEF");
+        let encoded = hex_encode("ABCDEF");
         assert_eq!(encoded, "414243444546");
     }
 
@@ -594,7 +744,7 @@ mod tests {
 
     #[test]
     fn build_uri_with_nested_workspace() {
-        let uri = build_vscode_uri("abc", "/workspaces/project/sub/dir");
+        let uri = build_vscode_uri("abc", None, "/workspaces/project/sub/dir");
         assert!(uri.starts_with("vscode-remote://attached-container+"));
         assert!(uri.ends_with("/workspaces/project/sub/dir"));
     }
