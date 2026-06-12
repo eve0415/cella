@@ -331,6 +331,10 @@ impl Command {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
+            Self::Features(args) => match &args.command {
+                features::FeaturesCommand::Package(package) => Some(package.log_level),
+                _ => None,
+            },
             _ => None,
         }
     }
