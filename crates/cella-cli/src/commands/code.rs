@@ -414,10 +414,25 @@ fn is_localhost_tcp(url: &str) -> bool {
         || authority == "::1"
 }
 
+/// Build the shell probe command that detects any VS Code-family server.
+///
+/// Returns a three-element `["sh", "-c", <script>]` command that expands
+/// `$HOME` for the exec user and succeeds (exit 0) as soon as any of
+/// `.vscode-server`, `.vscode-server-insiders`, or `.cursor-server` has a
+/// `bin/` subdirectory. This covers stable VS Code, VS Code Insiders, and
+/// Cursor, and works for any home directory (root, custom, etc.).
+fn vscode_server_probe_cmd() -> Vec<String> {
+    let script = "for d in .vscode-server .vscode-server-insiders .cursor-server; \
+         do [ -d \"$HOME/$d/bin\" ] && exit 0; done; exit 1";
+    vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+}
+
 /// Poll for VS Code Server installation inside the container.
 ///
-/// Checks for `~/.vscode-server/bin` directory every 2 seconds, up to 60 seconds.
-/// Returns `true` if server was detected, `false` on timeout.
+/// Checks `$HOME/{.vscode-server,.vscode-server-insiders,.cursor-server}/bin`
+/// for the exec user every 2 seconds, up to 60 seconds. Covers stable VS Code,
+/// VS Code Insiders, and Cursor, and any home directory (including root).
+/// Returns `true` if a server was detected, `false` on timeout.
 async fn poll_vscode_server(
     client: &dyn cella_backend::ContainerBackend,
     container_id: &str,
@@ -434,11 +449,7 @@ async fn poll_vscode_server(
             .exec_command(
                 container_id,
                 &ExecOptions {
-                    cmd: vec![
-                        "test".to_string(),
-                        "-d".to_string(),
-                        format!("/home/{remote_user}/.vscode-server/bin"),
-                    ],
+                    cmd: vscode_server_probe_cmd(),
                     user: Some(remote_user.to_string()),
                     env: None,
                     working_dir: None,
@@ -784,5 +795,45 @@ mod tests {
             .unwrap();
         assert!(rendered.contains("help:"), "missing help section");
         assert!(!rendered.contains("\\n"), "literal \\n in output");
+    }
+
+    // ── vscode_server_probe_cmd ────────────────────────────────────
+
+    #[test]
+    fn probe_cmd_has_three_elements() {
+        let cmd = vscode_server_probe_cmd();
+        assert_eq!(cmd.len(), 3, "must be [sh, -c, <script>]");
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+    }
+
+    #[test]
+    fn probe_cmd_script_covers_all_server_dirs() {
+        let script = &vscode_server_probe_cmd()[2];
+        assert!(
+            script.contains(".vscode-server"),
+            "must include .vscode-server"
+        );
+        assert!(
+            script.contains(".vscode-server-insiders"),
+            "must include .vscode-server-insiders"
+        );
+        assert!(
+            script.contains(".cursor-server"),
+            "must include .cursor-server"
+        );
+    }
+
+    #[test]
+    fn probe_cmd_script_uses_home_variable_not_hardcoded_path() {
+        let script = &vscode_server_probe_cmd()[2];
+        assert!(
+            script.contains("$HOME"),
+            "must use $HOME, not a hardcoded path"
+        );
+        assert!(
+            !script.contains("/home/"),
+            "must not hardcode /home/ — use $HOME instead"
+        );
     }
 }
