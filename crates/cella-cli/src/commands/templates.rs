@@ -245,6 +245,18 @@ fn parse_string_array(
 }
 
 /// Inject features into the extracted devcontainer.json.
+///
+/// # Comment-loss divergence
+///
+/// The official CLI uses `jsonc.modify` to patch individual `features.<id>`
+/// keys in-place, which preserves comments and existing formatting. The
+/// `cella-jsonc` crate only exposes a comment-stripping function (`strip`), so
+/// this path strips JSONC before parsing and rewrites as plain JSON. Comments
+/// that existed in the extracted devcontainer.json are therefore lost when
+/// `--features` is supplied.
+///
+/// This is a known divergence. A comment-preserving path would require a
+/// JSONC AST-edit capability not yet available in `cella-jsonc`.
 fn inject_features(
     workspace: &std::path::Path,
     features: &[SelectedFeature],

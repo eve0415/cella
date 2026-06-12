@@ -85,33 +85,42 @@ pub fn substitute_template_options<S: std::hash::BuildHasher>(
 // ---------------------------------------------------------------------------
 
 /// Merge selected features into a devcontainer config JSON value.
+///
+/// New feature entries are inserted into the existing `"features"` object
+/// (or a new one is created when absent). On key collision the incoming
+/// entry wins, but existing non-colliding entries are preserved. This
+/// mirrors the official CLI's `jsonc.modify` per-feature approach that
+/// merges into the existing map rather than replacing it.
 pub fn merge_features(config: &mut serde_json::Value, features: &[SelectedFeature]) {
     if features.is_empty() {
         return;
     }
 
-    let features_map: serde_json::Map<String, serde_json::Value> = features
-        .iter()
-        .map(|f| {
-            let options_value = if f.options.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::Value::Object(
-                    f.options
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            };
-            (f.reference.clone(), options_value)
-        })
-        .collect();
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
 
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert(
-            "features".to_owned(),
-            serde_json::Value::Object(features_map),
-        );
+    // Get or create the features map.
+    let features_entry = obj
+        .entry("features".to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(features_map) = features_entry.as_object_mut() else {
+        return;
+    };
+
+    // Insert new entries; existing non-colliding entries are preserved.
+    for f in features {
+        let options_value = if f.options.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::Value::Object(
+                f.options
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
+        };
+        features_map.insert(f.reference.clone(), options_value);
     }
 }
 
@@ -719,6 +728,53 @@ mod tests {
             .get("ghcr.io/devcontainers/features/node:1")
             .unwrap();
         assert_eq!(node.get("version").unwrap(), "lts");
+    }
+
+    #[test]
+    fn merge_features_preserves_existing_entries() {
+        // Template devcontainer.json already has one feature; injecting another
+        // must keep the original entry.
+        let mut config = serde_json::json!({
+            "name": "test",
+            "features": {
+                "ghcr.io/devcontainers/features/git:1": {}
+            }
+        });
+        let features = vec![SelectedFeature {
+            reference: "ghcr.io/devcontainers/features/node:1".to_owned(),
+            options: HashMap::new(),
+        }];
+        merge_features(&mut config, &features);
+
+        let feats = config.get("features").unwrap();
+        // Existing entry must still be present.
+        assert!(feats.get("ghcr.io/devcontainers/features/git:1").is_some());
+        // New entry must have been added.
+        assert!(feats.get("ghcr.io/devcontainers/features/node:1").is_some());
+    }
+
+    #[test]
+    fn merge_features_incoming_wins_on_collision() {
+        // When the same feature id is present in both the existing map and the
+        // incoming list, the incoming options value replaces the existing one.
+        let mut opts_old = serde_json::Map::new();
+        opts_old.insert("version".to_owned(), serde_json::json!("18"));
+        let mut config = serde_json::json!({
+            "features": {
+                "ghcr.io/devcontainers/features/node:1": { "version": "18" }
+            }
+        });
+
+        let mut opts_new = HashMap::new();
+        opts_new.insert("version".to_owned(), serde_json::json!("lts"));
+        let features = vec![SelectedFeature {
+            reference: "ghcr.io/devcontainers/features/node:1".to_owned(),
+            options: opts_new,
+        }];
+        merge_features(&mut config, &features);
+
+        let node = config["features"]["ghcr.io/devcontainers/features/node:1"].clone();
+        assert_eq!(node["version"], serde_json::json!("lts"));
     }
 
     // -----------------------------------------------------------------------
