@@ -287,19 +287,6 @@ impl AttachSettings {
     }
 }
 
-/// Hex-encode a string for the attached-container URI authority.
-///
-/// Each UTF-8 byte is converted to its two-character lowercase hex
-/// representation. For example, `"a"` (0x61) becomes `"61"`.
-fn hex_encode(value: &str) -> String {
-    use std::fmt::Write;
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.bytes() {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
 /// Build the VS Code attached-container remote URI.
 ///
 /// Format: `vscode-remote://attached-container+{hex}{workspace_folder}`, where
@@ -320,7 +307,7 @@ fn build_vscode_uri(
     };
     let json = serde_json::to_string(&payload)
         .expect("AttachPayload contains only strings and is always serializable");
-    let hex = hex_encode(&json);
+    let hex = hex::encode(json);
     format!("vscode-remote://attached-container+{hex}{workspace_folder}")
 }
 
@@ -498,49 +485,8 @@ mod tests {
         let hex = authority
             .strip_suffix(workspace_folder)
             .expect("URI should end with the workspace folder");
-        assert!(
-            hex.len().is_multiple_of(2),
-            "hex payload must be byte-aligned"
-        );
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
-            .collect();
+        let bytes = hex::decode(hex).expect("valid hex payload");
         String::from_utf8(bytes).expect("payload should be valid UTF-8")
-    }
-
-    #[test]
-    fn hex_encode_empty_string() {
-        assert_eq!(hex_encode(""), "");
-    }
-
-    #[test]
-    fn hex_encode_single_char() {
-        // 'a' = 0x61
-        assert_eq!(hex_encode("a"), "61");
-    }
-
-    #[test]
-    fn hex_encode_known_string() {
-        // A short example: "abc123" -> each char's hex
-        // a=61, b=62, c=63, 1=31, 2=32, 3=33
-        assert_eq!(hex_encode("abc123"), "616263313233");
-    }
-
-    #[test]
-    fn hex_encode_hex_chars() {
-        // All hex digits: 0-9 a-f
-        let input = "0123456789abcdef";
-        let expected = "30313233343536373839616263646566";
-        assert_eq!(hex_encode(input), expected);
-    }
-
-    #[test]
-    fn hex_encode_full_docker_id() {
-        // 64-char string should produce 128-char encoded string
-        let id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let encoded = hex_encode(id);
-        assert_eq!(encoded.len(), 128);
     }
 
     #[test]
@@ -745,15 +691,6 @@ mod tests {
     #[test]
     fn is_localhost_tcp_empty_authority() {
         assert!(!is_localhost_tcp("tcp://"));
-    }
-
-    // ── hex_encode ─────────────────────────────────────────────────
-
-    #[test]
-    fn hex_encode_uppercase_chars() {
-        // Uppercase A-F should encode correctly
-        let encoded = hex_encode("ABCDEF");
-        assert_eq!(encoded, "414243444546");
     }
 
     // ── build_vscode_uri ───────────────────────────────────────────

@@ -27,6 +27,7 @@ cella-protocol.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+hex.workspace = true
 inquire.workspace = true
 miette.workspace = true
 nix.workspace = true
