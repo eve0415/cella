@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
-use serde::Serialize;
 use serde_json::json;
 use tracing::debug;
 
@@ -243,71 +242,32 @@ fn emit_code_result(
     }
 }
 
-/// JSON payload encoded into the attached-container URI authority.
-///
-/// The Dev Containers extension hex-decodes the authority; when the decoded
-/// bytes start with `{` it parses them as this JSON object. `containerName`
-/// carries the `/`-prefixed Docker container name (matching `docker inspect`
-/// `.Name`) and `settings` tells the extension which Docker endpoint to use.
-#[derive(Serialize)]
-struct AttachPayload {
-    #[serde(rename = "containerName")]
-    container_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    settings: Option<AttachSettings>,
-}
-
-/// Docker endpoint hints the extension reads to reach the same daemon cella used.
-///
-/// `host` maps to `DOCKER_HOST`, `context` maps to `DOCKER_CONTEXT`. Each is
-/// omitted when absent; the whole object is omitted when the backend exposes
-/// no endpoint, in which case the extension falls back to its own defaults.
-#[derive(Serialize)]
-struct AttachSettings {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
-}
-
-impl AttachSettings {
-    /// Build settings from a backend endpoint, mapping the variant to the
-    /// matching extension key.
-    fn from_endpoint(endpoint: &BackendEndpoint) -> Self {
-        match endpoint {
-            BackendEndpoint::HostUri(host) => Self {
-                host: Some(host.clone()),
-                context: None,
-            },
-            BackendEndpoint::NamedContext(context) => Self {
-                host: None,
-                context: Some(context.clone()),
-            },
-        }
-    }
-}
-
 /// Build the VS Code attached-container remote URI.
 ///
 /// Format: `vscode-remote://attached-container+{hex}{workspace_folder}`, where
-/// `hex` is the byte-hex of a JSON [`AttachPayload`]. The Dev Containers
-/// extension hex-decodes the authority, parses the JSON, and reads
-/// `settings.host`/`settings.context` to pick its Docker endpoint.
+/// `hex` is the byte-hex of a JSON payload. The Dev Containers extension
+/// hex-decodes the authority; when the decoded bytes start with `{` it parses
+/// them as JSON and reads `containerName` (the `/`-prefixed name matching
+/// `docker inspect` `.Name`) plus `settings.host`/`settings.context` to pick
+/// its Docker endpoint (`DOCKER_HOST`/`DOCKER_CONTEXT`, context wins). The
+/// `settings` key is omitted when the backend exposes no endpoint, leaving
+/// the extension on its own defaults.
 ///
 /// `container_name` is the `/`-trimmed name from [`cella_backend::ContainerInfo`];
-/// the leading `/` (as in `docker inspect` `.Name`) is re-prepended here.
+/// the leading `/` is re-prepended here.
 fn build_vscode_uri(
     container_name: &str,
     endpoint: Option<&BackendEndpoint>,
     workspace_folder: &str,
 ) -> String {
-    let payload = AttachPayload {
-        container_name: format!("/{container_name}"),
-        settings: endpoint.map(AttachSettings::from_endpoint),
-    };
-    let json = serde_json::to_string(&payload)
-        .expect("AttachPayload contains only strings and is always serializable");
-    let hex = hex::encode(json);
+    let mut payload = json!({ "containerName": format!("/{container_name}") });
+    if let Some(endpoint) = endpoint {
+        payload["settings"] = match endpoint {
+            BackendEndpoint::HostUri(host) => json!({ "host": host }),
+            BackendEndpoint::NamedContext(context) => json!({ "context": context }),
+        };
+    }
+    let hex = hex::encode(payload.to_string());
     format!("vscode-remote://attached-container+{hex}{workspace_folder}")
 }
 

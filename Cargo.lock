@@ -390,7 +390,6 @@ dependencies = [
  "miette",
  "nix 0.31.3",
  "owo-colors",
- "serde",
  "serde_json",
  "tempfile",
  "terminal_size",
