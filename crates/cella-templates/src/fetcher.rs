@@ -5,14 +5,14 @@
 
 use std::path::PathBuf;
 
-use oci_distribution::Reference;
-use oci_distribution::client::{ClientConfig, ClientProtocol};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::TemplateMetadata;
 use crate::cache::TemplateCache;
 use crate::error::TemplateError;
+use crate::oci_ref::build_oci_client;
+use crate::oci_ref::parse_template_ref;
 
 /// Fetch a template artifact from an OCI registry and return the local
 /// path where it was extracted.
@@ -36,13 +36,7 @@ pub async fn fetch_template(
         return Ok(cached);
     }
 
-    let config = ClientConfig {
-        protocol: ClientProtocol::Https,
-        ..ClientConfig::default()
-    };
-    let client = oci_distribution::Client::new(config);
-    let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
-    let auth = cella_oci::build_registry_auth(&registry);
+    let (client, oci_ref, auth) = build_oci_client(&registry, &repository, &tag);
 
     debug!("fetching template {registry}/{repository}:{tag}");
 
@@ -131,24 +125,6 @@ pub fn read_template_metadata(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a template reference into `(registry, repository, tag)`.
-fn parse_template_ref(template_ref: &str) -> Result<(String, String, String), TemplateError> {
-    let (base, tag) = match template_ref.rsplit_once(':') {
-        Some((b, t)) if !t.contains('/') && !t.is_empty() => (b, t.to_owned()),
-        _ => (template_ref, "latest".to_owned()),
-    };
-
-    let (registry, repository) =
-        base.split_once('/')
-            .ok_or_else(|| TemplateError::RegistryError {
-                registry: template_ref.to_owned(),
-                message: "invalid template reference: expected registry/repository[:tag]"
-                    .to_owned(),
-            })?;
-
-    Ok((registry.to_owned(), repository.to_owned(), tag))
-}
-
 fn find_extractable_layer<'a>(
     manifest: &'a oci_distribution::manifest::OciImageManifest,
     template_ref: &str,
@@ -178,28 +154,6 @@ fn find_extractable_layer<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_full_ref() {
-        let (reg, repo, tag) =
-            parse_template_ref("ghcr.io/devcontainers/templates/rust:5.0.0").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/rust");
-        assert_eq!(tag, "5.0.0");
-    }
-
-    #[test]
-    fn parse_ref_no_tag() {
-        let (reg, repo, tag) = parse_template_ref("ghcr.io/devcontainers/templates/rust").unwrap();
-        assert_eq!(reg, "ghcr.io");
-        assert_eq!(repo, "devcontainers/templates/rust");
-        assert_eq!(tag, "latest");
-    }
-
-    #[test]
-    fn parse_ref_invalid() {
-        assert!(parse_template_ref("noslash").is_err());
-    }
 
     #[test]
     fn extractable_layer_detection() {

@@ -14,6 +14,8 @@ pub mod collection;
 pub mod error;
 pub mod fetcher;
 pub mod index;
+pub mod metadata;
+mod oci_ref;
 pub mod options;
 pub mod tags;
 pub mod types;
