@@ -587,7 +587,6 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
 // ===========================================================================
 
 #[cfg(test)]
-#[expect(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
 
