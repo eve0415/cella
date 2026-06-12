@@ -20,6 +20,10 @@ pub struct PackageArgs {
     /// Delete the output folder before packaging if it already exists.
     #[arg(short = 'f', long)]
     pub force_clean_output_folder: bool,
+
+    /// Log verbosity level.
+    #[arg(long, value_enum, default_value_t = crate::commands::LogLevel::Info)]
+    pub log_level: crate::commands::LogLevel,
 }
 
 impl PackageArgs {
