@@ -1466,7 +1466,9 @@ mod tests {
         std::fs::create_dir_all(&dc_dir).unwrap();
         std::fs::write(dc_dir.join("devcontainer.json"), r#"{"name":"t"}"#).unwrap();
         std::fs::write(dc_dir.join("README.md"), "# inner readme").unwrap();
+        std::fs::write(dc_dir.join("NOTES.md"), "inner notes").unwrap();
         std::fs::write(template_dir.path().join("README.md"), "# root readme").unwrap();
+        std::fs::write(template_dir.path().join("NOTES.md"), "root notes").unwrap();
 
         apply_to_workspace(
             "test",
@@ -1477,10 +1479,12 @@ mod tests {
         )
         .unwrap();
 
-        // Root README.md must be excluded.
+        // Root README.md / NOTES.md must be excluded.
         assert!(!workspace.path().join("README.md").exists());
-        // Nested .devcontainer/README.md must be kept.
+        assert!(!workspace.path().join("NOTES.md").exists());
+        // Nested .devcontainer/README.md and NOTES.md must be kept.
         assert!(workspace.path().join(".devcontainer/README.md").exists());
+        assert!(workspace.path().join(".devcontainer/NOTES.md").exists());
     }
 
     #[test]
