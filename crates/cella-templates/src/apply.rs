@@ -291,6 +291,7 @@ pub fn apply_template<S: std::hash::BuildHasher>(
 
     // Copy and substitute all files from the template
     copy_and_substitute(
+        template_id,
         &source_dir,
         &devcontainer_dir,
         options,
@@ -488,19 +489,38 @@ fn extract_to_workspace<S: std::hash::BuildHasher>(
     Ok(())
 }
 
-/// Write a single file to `dest`, substituting template options.
+/// Write a single leaf file to `dest`, applying template option substitution.
 ///
-/// Text files: substituted and written as UTF-8.
-/// Binary files (invalid UTF-8): copied verbatim.
-fn write_substituted_file<S: std::hash::BuildHasher>(
+/// - **Text files**: content is optionally JSONC-stripped (when
+///   `strip_json_comments` is `true` and the file has a `.json` extension),
+///   then template option placeholders are substituted, and the result is
+///   written as UTF-8. Unknown tokens are logged as warnings.
+/// - **Binary files** (not valid UTF-8): copied verbatim; no substitution.
+///
+/// `strip_json_comments` should be `true` on the init path
+/// (`copy_and_substitute`) so that user-provided option values containing
+/// `//` are not accidentally treated as JSONC comments. It must be `false`
+/// on the apply path (`extract_to_workspace`) to preserve comments in the
+/// extracted files.
+fn write_leaf_file<S: std::hash::BuildHasher>(
     template_id: &str,
     src: &Path,
     dest: &Path,
     options: &HashMap<String, serde_json::Value, S>,
+    strip_json_comments: bool,
 ) -> Result<(), TemplateError> {
     match std::fs::read_to_string(src) {
         Ok(content) => {
-            let report = substitute_template_options(&content, options);
+            let processed = if strip_json_comments
+                && src
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                strip_jsonc(&content, &src.to_string_lossy())?
+            } else {
+                content
+            };
+            let report = substitute_template_options(&processed, options);
             for token in &report.unknown_tokens {
                 tracing::warn!(
                     "template {template_id}: unknown templateOption token '{token}' in {} — substituting empty string",
@@ -517,9 +537,23 @@ fn write_substituted_file<S: std::hash::BuildHasher>(
     Ok(())
 }
 
+/// Write a single file to `dest`, substituting template options.
+///
+/// Apply path: never strips JSONC so that comments in extracted files are
+/// preserved. Delegates to [`write_leaf_file`] with `strip_json_comments: false`.
+fn write_substituted_file<S: std::hash::BuildHasher>(
+    template_id: &str,
+    src: &Path,
+    dest: &Path,
+    options: &HashMap<String, serde_json::Value, S>,
+) -> Result<(), TemplateError> {
+    write_leaf_file(template_id, src, dest, options, false)
+}
+
 /// Recursively copy files from `src` to `dest`, applying template option
 /// substitution to text files and skipping excluded paths.
 fn copy_and_substitute<S: std::hash::BuildHasher>(
+    template_id: &str,
     src: &Path,
     dest: &Path,
     options: &HashMap<String, serde_json::Value, S>,
@@ -550,6 +584,7 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
             copy_and_substitute(
+                template_id,
                 &src_path,
                 &dest_path,
                 options,
@@ -557,26 +592,21 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
                 excluded_paths,
             )?;
         } else if file_type.is_file() {
-            // Try to read as text and substitute; if it fails, copy as binary
-            match std::fs::read_to_string(&src_path) {
-                Ok(content) => {
-                    // Strip JSONC from .json files before substitution so that
-                    // user-provided option values containing '//' are not eaten.
-                    let is_json = src_path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-                    let stripped = if is_json {
-                        strip_jsonc(&content, &file_name.to_string_lossy())?
-                    } else {
-                        content
-                    };
-                    let report = substitute_template_options(&stripped, options);
-                    std::fs::write(&dest_path, report.content)?;
-                }
-                Err(_) => {
-                    std::fs::copy(&src_path, &dest_path)?;
-                }
-            }
+            // init path: strip JSONC comments from .json files before
+            // substitution so user-provided values containing '//' are not eaten.
+            let template_name = file_name.to_string_lossy();
+            write_leaf_file(template_id, &src_path, &dest_path, options, true).map_err(
+                |e| match e {
+                    // Re-wrap InvalidArtifact with the file name for context.
+                    TemplateError::InvalidArtifact { reason, .. } => {
+                        TemplateError::InvalidArtifact {
+                            template_id: template_name.into_owned(),
+                            reason,
+                        }
+                    }
+                    other => other,
+                },
+            )?;
         }
     }
     Ok(())
@@ -1201,7 +1231,7 @@ mod tests {
         options.insert("name".to_owned(), serde_json::json!("Test"));
         options.insert("image".to_owned(), serde_json::json!("ubuntu"));
 
-        copy_and_substitute(&dc_dir, &dest_dc, &options, &dc_dir, &[]).unwrap();
+        copy_and_substitute("test", &dc_dir, &dest_dc, &options, &dc_dir, &[]).unwrap();
 
         // Dockerfile should be copied and substituted
         let dockerfile = std::fs::read_to_string(dest_dc.join("Dockerfile")).unwrap();
