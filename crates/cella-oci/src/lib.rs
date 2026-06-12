@@ -1,10 +1,12 @@
 pub mod auth;
 pub mod cache;
 pub mod extract;
+pub mod limits;
 
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
 pub use extract::{ExtractionError, extract_layer, is_extractable_layer};
+pub use limits::{LimitedReader, MAX_BLOB_COMPRESSED_BYTES, MAX_BLOB_DECOMPRESSED_BYTES};
 
 use oci_distribution::secrets::RegistryAuth;
 use tracing::debug;
