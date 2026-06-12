@@ -115,9 +115,20 @@ impl TemplatesApplyArgs {
 
         // Read metadata and resolve options.
         let metadata = fetcher::read_template_metadata(&template_dir)?;
-        let resolved_opts =
+        let mut resolved_opts =
             options::resolve_options(&metadata.id, &metadata.options, &template_args)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Pass undeclared user keys through to substitution unchanged.
+        // Official behavior: the user-supplied map is the base; resolve_options
+        // only fills *declared* options that are absent from it. Extra keys the
+        // user supplies for custom tokens must still reach substitution so that
+        // `${templateOption:custom}` is replaced rather than left empty.
+        for (key, value) in &template_args {
+            resolved_opts
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
 
         // Apply template to workspace root.
         let written = apply::apply_to_workspace(
