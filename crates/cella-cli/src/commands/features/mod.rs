@@ -1,5 +1,6 @@
 //! `cella features` subcommands: edit, generate-docs, info, list, package,
-//! resolve-dependencies, and update features in devcontainer configurations.
+//! publish, resolve-dependencies, and update features in devcontainer
+//! configurations.
 
 pub mod edit;
 pub mod generate_docs;
@@ -8,6 +9,7 @@ pub mod jsonc_edit;
 pub mod list;
 pub mod package;
 pub mod prompts;
+pub mod publish;
 pub mod resolve;
 pub mod resolve_dependencies;
 pub mod update;
@@ -37,6 +39,8 @@ pub enum FeaturesCommand {
     List(list::ListArgs),
     /// Package local feature sources into distributable tarballs.
     Package(package::PackageArgs),
+    /// Publish packaged features to an OCI registry.
+    Publish(publish::PublishArgs),
     /// Resolve feature dependencies and print the installation order.
     ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
     /// Check for and apply feature version updates.
@@ -70,6 +74,7 @@ impl FeaturesArgs {
             FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
             FeaturesCommand::Package(args) => args.execute(),
+            FeaturesCommand::Publish(args) => args.execute().await,
             FeaturesCommand::ResolveDependencies(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
