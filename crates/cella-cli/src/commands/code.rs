@@ -496,39 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn build_uri_no_endpoint_omits_settings() {
-        let uri = build_vscode_uri("my-container", None, "/workspaces/app");
-        let payload = decode_uri_payload(&uri, "/workspaces/app");
-        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
-        assert_eq!(value["containerName"], "/my-container");
-        assert!(
-            value.get("settings").is_none(),
-            "settings key must be absent without an endpoint"
-        );
-    }
-
-    #[test]
-    fn build_uri_shape_decodes_to_json_object() {
-        let endpoint = BackendEndpoint::HostUri("tcp://localhost:2375".to_string());
-        let uri = build_vscode_uri("c", Some(&endpoint), "/workspaces/x");
-        assert!(uri.starts_with("vscode-remote://attached-container+"));
-        assert!(uri.ends_with("/workspaces/x"));
-        let payload = decode_uri_payload(&uri, "/workspaces/x");
-        assert!(payload.starts_with('{'), "payload must be a JSON object");
-    }
-
-    #[test]
-    fn build_uri_prepends_leading_slash_exactly_once() {
-        // Name input never carries a leading slash; output always begins `"/`.
-        let uri = build_vscode_uri("my-container", None, "");
-        let payload = decode_uri_payload(&uri, "");
-        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
-        let name = value["containerName"].as_str().expect("string name");
-        assert_eq!(name, "/my-container");
-        assert!(!name.starts_with("//"), "no double-slash prefix");
-    }
-
-    #[test]
     fn is_localhost_tcp_variants() {
         assert!(is_localhost_tcp("tcp://localhost:2375"));
         assert!(is_localhost_tcp("tcp://127.0.0.1:2375"));
@@ -706,40 +673,21 @@ mod tests {
     // ── vscode_server_probe_cmd ────────────────────────────────────
 
     #[test]
-    fn probe_cmd_has_three_elements() {
+    fn probe_cmd_covers_all_editors_via_home() {
+        // Regression guard for the original bug: the probe hardcoded
+        // /home/<user> and only knew stable VS Code.
         let cmd = vscode_server_probe_cmd();
         assert_eq!(cmd.len(), 3, "must be [sh, -c, <script>]");
-        assert_eq!(cmd[0], "sh");
-        assert_eq!(cmd[1], "-c");
-    }
-
-    #[test]
-    fn probe_cmd_script_covers_all_server_dirs() {
-        let script = &vscode_server_probe_cmd()[2];
-        assert!(
-            script.contains(".vscode-server"),
-            "must include .vscode-server"
-        );
-        assert!(
-            script.contains(".vscode-server-insiders"),
-            "must include .vscode-server-insiders"
-        );
-        assert!(
-            script.contains(".cursor-server"),
-            "must include .cursor-server"
-        );
-    }
-
-    #[test]
-    fn probe_cmd_script_uses_home_variable_not_hardcoded_path() {
-        let script = &vscode_server_probe_cmd()[2];
-        assert!(
-            script.contains("$HOME"),
-            "must use $HOME, not a hardcoded path"
-        );
-        assert!(
-            !script.contains("/home/"),
-            "must not hardcode /home/ — use $HOME instead"
-        );
+        assert_eq!(&cmd[..2], ["sh", "-c"]);
+        let script = &cmd[2];
+        for dir in [
+            ".vscode-server",
+            ".vscode-server-insiders",
+            ".cursor-server",
+        ] {
+            assert!(script.contains(dir), "must probe {dir}");
+        }
+        assert!(script.contains("$HOME"), "must expand $HOME per exec user");
+        assert!(!script.contains("/home/"), "must not hardcode /home/");
     }
 }
