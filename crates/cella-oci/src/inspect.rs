@@ -9,6 +9,9 @@ use tracing::debug;
 
 use crate::build_registry_auth;
 
+/// Number of tags to request per registry page when listing tags.
+const TAG_PAGE_SIZE: usize = 100;
+
 /// Fetch the OCI manifest for a feature reference and return the manifest JSON
 /// together with its sha256 digest hex string (without the `sha256:` prefix).
 ///
@@ -56,15 +59,29 @@ pub async fn fetch_manifest_with_digest(
     Ok((json_value, hex_digest))
 }
 
-/// Fetch all published tags for an OCI reference.
+/// Fetch **all** published tags for an OCI reference, paginating as needed.
 ///
 /// The reference must include at least `registry/repository` — the tag
 /// component is ignored (a synthetic `"latest"` tag is used internally to
 /// target the repository namespace).
 ///
+/// ## Pagination contract
+///
+/// `oci_distribution`'s `list_tags(ref, auth, n, last)` maps to the OCI
+/// Distribution Spec's `GET /v2/<name>/tags/list?n=<n>&last=<last>` endpoint.
+/// `TagResponse` has no cursor field — pagination is driven by passing the
+/// last tag name from the previous page as the `last` parameter on the next
+/// call.
+///
+/// Some registries (e.g. GHCR) return `{"tags": null}` on the final page
+/// instead of an empty array, which causes `oci_distribution`'s
+/// `TagResponse { tags: Vec<String> }` to produce a deserialization error.
+/// We avoid triggering that path by stopping as soon as a page returns fewer
+/// tags than [`TAG_PAGE_SIZE`] — a partial page always means end-of-list.
+///
 /// # Errors
 ///
-/// Returns an error when the reference cannot be parsed or the registry
+/// Returns an error when the reference cannot be parsed or any registry
 /// request fails.
 pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>> {
     let (registry, repository, _tag) = parse_reference(reference)?;
@@ -80,12 +97,28 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
 
     debug!("listing tags for {registry}/{repository}");
 
-    let response = client
-        .list_tags(&oci_ref, &auth, None, None)
-        .await
-        .map_err(|e| miette::miette!("failed to list tags for {reference}: {e}"))?;
+    let mut all_tags: Vec<String> = Vec::new();
+    let mut last: Option<String> = None;
 
-    Ok(response.tags)
+    loop {
+        let response = client
+            .list_tags(&oci_ref, &auth, Some(TAG_PAGE_SIZE), last.as_deref())
+            .await
+            .map_err(|e| miette::miette!("failed to list tags for {reference}: {e}"))?;
+
+        let page_len = response.tags.len();
+        last = response.tags.last().cloned();
+        all_tags.extend(response.tags);
+
+        // A partial page means we've reached the end. Avoid making a
+        // follow-up request that would trigger the null-tags deserialization
+        // bug in some registries (including GHCR).
+        if page_len < TAG_PAGE_SIZE {
+            break;
+        }
+    }
+
+    Ok(all_tags)
 }
 
 /// Parse a feature OCI reference into `(registry, repository, tag)`.

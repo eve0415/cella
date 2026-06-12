@@ -251,18 +251,16 @@ impl InfoArgs {
 /// separator by requiring the `:` to appear *after* the last `/`.
 pub fn build_canonical_id(reference: &str, hex_digest: &str) -> String {
     // Strip an existing digest reference (@sha256:...) first.
-    let base = if let Some(pos) = reference.find('@') {
-        &reference[..pos]
-    } else {
-        // Look for a tag-separating `:` — it must appear after the last `/`.
-        let last_slash = reference.rfind('/').map_or(0, |p| p + 1);
-        let colon_after_last_slash = reference[last_slash..].find(':');
-        if let Some(rel) = colon_after_last_slash {
-            &reference[..last_slash + rel]
-        } else {
-            reference
-        }
-    };
+    let base = reference.find('@').map_or_else(
+        || {
+            // Look for a tag-separating `:` — it must appear after the last `/`.
+            let last_slash = reference.rfind('/').map_or(0, |p| p + 1);
+            reference[last_slash..]
+                .find(':')
+                .map_or(reference, |rel| &reference[..last_slash + rel])
+        },
+        |pos| &reference[..pos],
+    );
     format!("{base}@sha256:{hex_digest}")
 }
 
