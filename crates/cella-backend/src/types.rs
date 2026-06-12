@@ -6,6 +6,19 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
+// Backend endpoint
+// ---------------------------------------------------------------------------
+
+/// How an external tool (e.g. VS Code) can reach the same daemon this backend uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendEndpoint {
+    /// Explicit daemon URI (`unix://…` or `tcp://…`). Docker maps this to `DOCKER_HOST`.
+    HostUri(String),
+    /// Named connection profile. Docker maps this to `DOCKER_CONTEXT`.
+    NamedContext(String),
+}
+
+// ---------------------------------------------------------------------------
 // Backend kind
 // ---------------------------------------------------------------------------
 

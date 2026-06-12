@@ -27,8 +27,9 @@ pub use network::{ManagedNetwork, RemovalOutcome};
 pub use resolve::ContainerTarget;
 pub use traits::{BackendCapabilities, BoxFuture, ContainerBackend, Platform};
 pub use types::{
-    BackendKind, BuildOptions, BuildSecret, ContainerInfo, ContainerState, CreateContainerOptions,
-    DeviceSpec, ExecOptions, ExecResult, FileToUpload, GpuAvailability, GpuRequest, ImageDetails,
-    InteractiveExecOptions, MountConfig, MountInfo, PortBinding, PortForward, RunArgsOverrides,
-    SshAgentProxyStatus, UlimitSpec, UpdateRemoteUserUidDefault, should_update_uid,
+    BackendEndpoint, BackendKind, BuildOptions, BuildSecret, ContainerInfo, ContainerState,
+    CreateContainerOptions, DeviceSpec, ExecOptions, ExecResult, FileToUpload, GpuAvailability,
+    GpuRequest, ImageDetails, InteractiveExecOptions, MountConfig, MountInfo, PortBinding,
+    PortForward, RunArgsOverrides, SshAgentProxyStatus, UlimitSpec, UpdateRemoteUserUidDefault,
+    should_update_uid,
 };

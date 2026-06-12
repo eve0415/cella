@@ -382,6 +382,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "hex",
  "indicatif",
  "inquire",
  "insta",

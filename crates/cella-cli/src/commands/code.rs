@@ -5,7 +5,7 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use tracing::debug;
 
-use cella_backend::ExecOptions;
+use cella_backend::{BackendEndpoint, ExecOptions};
 
 use super::OutputFormat;
 use super::up::{UpArgs, UpContext, UpRenderData, UpResult, output_result};
@@ -52,7 +52,12 @@ pub enum CodeError {
     RemoteDockerHost { protocol: String },
 
     #[error("`cella code` requires the Docker backend (VS Code attach is Docker-specific)")]
-    #[diagnostic(code(cella::code::non_docker_backend))]
+    #[diagnostic(
+        code(cella::code::non_docker_backend),
+        help(
+            "VS Code's Dev Containers extension attaches through the Docker API and cannot see containers managed by the apple/container backend.\nWorkaround: enable VS Code's experimental `dev.containers.experimentalAppleContainerSupport` setting and let the extension manage the container itself."
+        )
+    )]
     NonDockerBackend,
 }
 
@@ -124,23 +129,13 @@ impl CodeArgs {
                 .map_err(super::boxed_err_to_report)?
         };
 
-        // 4. Resolve compose service if needed
-        let container_id = if self.service.is_some() {
-            let container = ctx.client.inspect_container(&result.container_id).await?;
-            let resolved = super::resolve_service_container(
-                ctx.client.as_ref(),
-                container,
-                self.service.as_deref(),
-            )
-            .await
-            .map_err(super::boxed_err_to_report)?;
-            resolved.id
-        } else {
-            result.container_id.clone()
-        };
+        // 4. Resolve the attach target (id + `/`-trimmed name)
+        let (container_id, container_name) =
+            resolve_attach_target(&ctx, &result.container_id, self.service.as_deref()).await?;
 
         // 5. Build the attached-container URI
-        let uri = build_vscode_uri(&container_id, &result.workspace_folder);
+        let endpoint = ctx.client.endpoint();
+        let uri = build_vscode_uri(&container_name, endpoint.as_ref(), &result.workspace_folder);
         debug!("VS Code URI: {uri}");
 
         // 6. Launch editor
@@ -188,6 +183,23 @@ impl CodeArgs {
     }
 }
 
+/// Resolve the container the editor should attach to, returning its `(id, name)`.
+///
+/// The returned name is `/`-trimmed (as carried by [`cella_backend::ContainerInfo`]).
+/// Inspects `container_id` — revalidating it right before the editor launches —
+/// and, for `--service`, resolves the requested compose service container from it.
+async fn resolve_attach_target(
+    ctx: &UpContext,
+    container_id: &str,
+    service: Option<&str>,
+) -> miette::Result<(String, String)> {
+    let container = ctx.client.inspect_container(container_id).await?;
+    let resolved = super::resolve_service_container(ctx.client.as_ref(), container, service)
+        .await
+        .map_err(super::boxed_err_to_report)?;
+    Ok((resolved.id, resolved.name))
+}
+
 /// Emit the `cella code` result.
 ///
 /// `code` has no official devcontainer-CLI analogue, so its JSON shape keeps
@@ -230,25 +242,33 @@ fn emit_code_result(
     }
 }
 
-/// Hex-encode a container ID for the attached-container URI scheme.
-///
-/// Each ASCII byte of the container ID is converted to its two-character hex
-/// representation. For example, `"a"` (0x61) becomes `"61"`.
-fn hex_encode_container_id(id: &str) -> String {
-    use std::fmt::Write;
-    let mut encoded = String::with_capacity(id.len() * 2);
-    for byte in id.bytes() {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
 /// Build the VS Code attached-container remote URI.
 ///
-/// Format: `vscode-remote://attached-container+{hex_encoded_id}{workspace_path}`
-fn build_vscode_uri(container_id: &str, workspace_folder: &str) -> String {
-    let hex_id = hex_encode_container_id(container_id);
-    format!("vscode-remote://attached-container+{hex_id}{workspace_folder}")
+/// Format: `vscode-remote://attached-container+{hex}{workspace_folder}`, where
+/// `hex` is the byte-hex of a JSON payload. The Dev Containers extension
+/// hex-decodes the authority; when the decoded bytes start with `{` it parses
+/// them as JSON and reads `containerName` (the `/`-prefixed name matching
+/// `docker inspect` `.Name`) plus `settings.host`/`settings.context` to pick
+/// its Docker endpoint (`DOCKER_HOST`/`DOCKER_CONTEXT`, context wins). The
+/// `settings` key is omitted when the backend exposes no endpoint, leaving
+/// the extension on its own defaults.
+///
+/// `container_name` is the `/`-trimmed name from [`cella_backend::ContainerInfo`];
+/// the leading `/` is re-prepended here.
+fn build_vscode_uri(
+    container_name: &str,
+    endpoint: Option<&BackendEndpoint>,
+    workspace_folder: &str,
+) -> String {
+    let mut payload = json!({ "containerName": format!("/{container_name}") });
+    if let Some(endpoint) = endpoint {
+        payload["settings"] = match endpoint {
+            BackendEndpoint::HostUri(host) => json!({ "host": host }),
+            BackendEndpoint::NamedContext(context) => json!({ "context": context }),
+        };
+    }
+    let hex = hex::encode(payload.to_string());
+    format!("vscode-remote://attached-container+{hex}{workspace_folder}")
 }
 
 /// Resolve which editor binary to use.
@@ -346,10 +366,25 @@ fn is_localhost_tcp(url: &str) -> bool {
         || authority == "::1"
 }
 
+/// Build the shell probe command that detects any VS Code-family server.
+///
+/// Returns a three-element `["sh", "-c", <script>]` command that expands
+/// `$HOME` for the exec user and succeeds (exit 0) as soon as any of
+/// `.vscode-server`, `.vscode-server-insiders`, or `.cursor-server` has a
+/// `bin/` subdirectory. This covers stable VS Code, VS Code Insiders, and
+/// Cursor, and works for any home directory (root, custom, etc.).
+fn vscode_server_probe_cmd() -> Vec<String> {
+    let script = "for d in .vscode-server .vscode-server-insiders .cursor-server; \
+         do [ -d \"$HOME/$d/bin\" ] && exit 0; done; exit 1";
+    vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+}
+
 /// Poll for VS Code Server installation inside the container.
 ///
-/// Checks for `~/.vscode-server/bin` directory every 2 seconds, up to 60 seconds.
-/// Returns `true` if server was detected, `false` on timeout.
+/// Checks `$HOME/{.vscode-server,.vscode-server-insiders,.cursor-server}/bin`
+/// for the exec user every 2 seconds, up to 60 seconds. Covers stable VS Code,
+/// VS Code Insiders, and Cursor, and any home directory (including root).
+/// Returns `true` if a server was detected, `false` on timeout.
 async fn poll_vscode_server(
     client: &dyn cella_backend::ContainerBackend,
     container_id: &str,
@@ -366,11 +401,7 @@ async fn poll_vscode_server(
             .exec_command(
                 container_id,
                 &ExecOptions {
-                    cmd: vec![
-                        "test".to_string(),
-                        "-d".to_string(),
-                        format!("/home/{remote_user}/.vscode-server/bin"),
-                    ],
+                    cmd: vscode_server_probe_cmd(),
                     user: Some(remote_user.to_string()),
                     env: None,
                     working_dir: None,
@@ -403,58 +434,65 @@ async fn poll_vscode_server(
 mod tests {
     use super::*;
 
-    #[test]
-    fn hex_encode_empty_string() {
-        assert_eq!(hex_encode_container_id(""), "");
-    }
-
-    #[test]
-    fn hex_encode_single_char() {
-        // 'a' = 0x61
-        assert_eq!(hex_encode_container_id("a"), "61");
-    }
-
-    #[test]
-    fn hex_encode_known_container_id() {
-        // A short example: "abc123" -> each char's hex
-        // a=61, b=62, c=63, 1=31, 2=32, 3=33
-        assert_eq!(hex_encode_container_id("abc123"), "616263313233");
-    }
-
-    #[test]
-    fn hex_encode_hex_chars() {
-        // All hex digits: 0-9 a-f
-        let input = "0123456789abcdef";
-        let expected = "30313233343536373839616263646566";
-        assert_eq!(hex_encode_container_id(input), expected);
-    }
-
-    #[test]
-    fn hex_encode_full_docker_id() {
-        // 64-char container ID should produce 128-char encoded string
-        let id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        let encoded = hex_encode_container_id(id);
-        assert_eq!(encoded.len(), 128);
+    /// Decode the hex authority of an attached-container URI back to its JSON.
+    ///
+    /// Strips the scheme prefix and the trailing workspace folder, then
+    /// hex-decodes the remaining authority payload to a UTF-8 string.
+    fn decode_uri_payload(uri: &str, workspace_folder: &str) -> String {
+        let authority = uri
+            .strip_prefix("vscode-remote://attached-container+")
+            .expect("URI should carry the attached-container prefix");
+        let hex = authority
+            .strip_suffix(workspace_folder)
+            .expect("URI should end with the workspace folder");
+        let bytes = hex::decode(hex).expect("valid hex payload");
+        String::from_utf8(bytes).expect("payload should be valid UTF-8")
     }
 
     #[test]
     fn build_uri_basic() {
-        let uri = build_vscode_uri("abc123", "/workspaces/myapp");
+        let uri = build_vscode_uri("my-container", None, "/workspaces/myapp");
+        assert!(uri.starts_with("vscode-remote://attached-container+"));
+        assert!(uri.ends_with("/workspaces/myapp"));
+        let payload = decode_uri_payload(&uri, "/workspaces/myapp");
+        assert_eq!(payload, r#"{"containerName":"/my-container"}"#);
+    }
+
+    #[test]
+    fn build_uri_with_endpoint_pins_exact_payload() {
+        let endpoint = BackendEndpoint::HostUri("unix:///var/run/docker.sock".to_string());
+        let uri = build_vscode_uri("deadbeef", Some(&endpoint), "/workspaces/test");
+        let payload = decode_uri_payload(&uri, "/workspaces/test");
         assert_eq!(
-            uri,
-            "vscode-remote://attached-container+616263313233/workspaces/myapp"
+            payload,
+            r#"{"containerName":"/deadbeef","settings":{"host":"unix:///var/run/docker.sock"}}"#
         );
     }
 
     #[test]
-    fn build_uri_with_full_id() {
-        let id = "deadbeef";
-        let uri = build_vscode_uri(id, "/workspaces/test");
-        // d=64, e=65, a=61, d=64, b=62, e=65, e=65, f=66
+    fn build_uri_roundtrip_docker_host() {
+        let endpoint =
+            BackendEndpoint::HostUri("unix:///Users/x/.colima/default/docker.sock".to_string());
+        let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
+        let payload = decode_uri_payload(&uri, "/workspaces/app");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(value["containerName"], "/my-container");
         assert_eq!(
-            uri,
-            "vscode-remote://attached-container+6465616462656566/workspaces/test"
+            value["settings"]["host"],
+            "unix:///Users/x/.colima/default/docker.sock"
         );
+        assert!(value["settings"].get("context").is_none());
+    }
+
+    #[test]
+    fn build_uri_roundtrip_docker_context() {
+        let endpoint = BackendEndpoint::NamedContext("orbstack".to_string());
+        let uri = build_vscode_uri("my-container", Some(&endpoint), "/workspaces/app");
+        let payload = decode_uri_payload(&uri, "/workspaces/app");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(value["containerName"], "/my-container");
+        assert_eq!(value["settings"]["context"], "orbstack");
+        assert!(value["settings"].get("host").is_none());
     }
 
     #[test]
@@ -530,8 +568,9 @@ mod tests {
 
     #[test]
     fn build_uri_empty_workspace() {
-        let uri = build_vscode_uri("abc", "");
-        assert_eq!(uri, "vscode-remote://attached-container+616263");
+        let uri = build_vscode_uri("abc", None, "");
+        let payload = decode_uri_payload(&uri, "");
+        assert_eq!(payload, r#"{"containerName":"/abc"}"#);
     }
 
     #[test]
@@ -581,29 +620,24 @@ mod tests {
         assert!(!is_localhost_tcp("tcp://"));
     }
 
-    // ── hex_encode_container_id ────────────────────────────────────
-
-    #[test]
-    fn hex_encode_uppercase_chars() {
-        // Uppercase A-F should encode correctly
-        let encoded = hex_encode_container_id("ABCDEF");
-        assert_eq!(encoded, "414243444546");
-    }
-
     // ── build_vscode_uri ───────────────────────────────────────────
 
     #[test]
     fn build_uri_with_nested_workspace() {
-        let uri = build_vscode_uri("abc", "/workspaces/project/sub/dir");
+        let uri = build_vscode_uri("abc", None, "/workspaces/project/sub/dir");
         assert!(uri.starts_with("vscode-remote://attached-container+"));
         assert!(uri.ends_with("/workspaces/project/sub/dir"));
     }
 
     #[test]
-    fn code_error_non_docker_has_no_help() {
+    fn code_error_non_docker_has_help() {
         use miette::Diagnostic;
         let err = CodeError::NonDockerBackend;
-        assert!(err.help().is_none());
+        let help = err.help().expect("should have help text");
+        assert!(
+            help.to_string()
+                .contains("dev.containers.experimentalAppleContainerSupport")
+        );
     }
 
     #[test]
@@ -634,5 +668,26 @@ mod tests {
             .unwrap();
         assert!(rendered.contains("help:"), "missing help section");
         assert!(!rendered.contains("\\n"), "literal \\n in output");
+    }
+
+    // ── vscode_server_probe_cmd ────────────────────────────────────
+
+    #[test]
+    fn probe_cmd_covers_all_editors_via_home() {
+        // Regression guard for the original bug: the probe hardcoded
+        // /home/<user> and only knew stable VS Code.
+        let cmd = vscode_server_probe_cmd();
+        assert_eq!(cmd.len(), 3, "must be [sh, -c, <script>]");
+        assert_eq!(&cmd[..2], ["sh", "-c"]);
+        let script = &cmd[2];
+        for dir in [
+            ".vscode-server",
+            ".vscode-server-insiders",
+            ".cursor-server",
+        ] {
+            assert!(script.contains(dir), "must probe {dir}");
+        }
+        assert!(script.contains("$HOME"), "must expand $HOME per exec user");
+        assert!(!script.contains("/home/"), "must not hardcode /home/");
     }
 }
