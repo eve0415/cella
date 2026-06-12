@@ -94,9 +94,12 @@ pub fn package(opts: &PackageOptions) -> Result<PackageResult, PackageError> {
     let target = &opts.target;
     let output = &opts.output_folder;
 
+    tracing::debug!(target = %target.display(), output = %output.display(), "starting feature packaging");
+
     // Guard: output folder must not already exist (or force-clean it).
     if output.exists() {
         if opts.force_clean_output_folder {
+            tracing::debug!(output = %output.display(), "force-cleaning existing output folder");
             fs::remove_dir_all(output).map_err(PackageError::Io)?;
         } else {
             return Err(PackageError::OutputFolderExists {
@@ -109,8 +112,10 @@ pub fn package(opts: &PackageOptions) -> Result<PackageResult, PackageError> {
 
     let single_manifest = target.join("devcontainer-feature.json");
     if single_manifest.is_file() {
+        tracing::debug!("detected single-feature mode");
         package_single(target, output)
     } else {
+        tracing::debug!("detected collection mode");
         package_collection(target, output)
     }
 }
@@ -140,9 +145,13 @@ fn package_single(target: &Path, output: &Path) -> Result<PackageResult, Package
 
     inject_current_id_if_needed(&mut meta, &id);
 
+    tracing::debug!(id, version, "packaging single feature");
+
     let archive_name = archive_name(&id);
     let archive_path = output.join(&archive_name);
     write_tgz(target, &archive_path, &meta)?;
+
+    tracing::debug!(archive = %archive_path.display(), "wrote feature archive");
 
     let packaged = PackagedFeature {
         id,
@@ -183,12 +192,17 @@ fn package_collection(target: &Path, output: &Path) -> Result<PackageResult, Pac
 
         // Skip hidden directories.
         if dir_name.starts_with('.') {
+            tracing::trace!(dir = dir_name, "skipping hidden directory");
             continue;
         }
 
         let manifest_path = dir.join("devcontainer-feature.json");
         if !manifest_path.is_file() {
             // Per spec: warn and skip (does not abort).
+            tracing::warn!(
+                feature = dir_name,
+                "missing devcontainer-feature.json, skipping"
+            );
             eprintln!(
                 "(!) WARNING: feature '{dir_name}' is missing a devcontainer-feature.json. Skipping... "
             );
@@ -221,8 +235,12 @@ fn package_collection(target: &Path, output: &Path) -> Result<PackageResult, Pac
 
         inject_current_id_if_needed(&mut meta, &id);
 
+        tracing::debug!(id, version, dir = dir_name, "packaging collection feature");
+
         let archive_path = output.join(archive_name(&id));
         write_tgz(dir, &archive_path, &meta)?;
+
+        tracing::debug!(id, archive = %archive_path.display(), "wrote feature archive");
 
         packaged_features.push(PackagedFeature {
             id,
@@ -260,6 +278,7 @@ fn inject_current_id_if_needed(meta: &mut serde_json::Map<String, Value>, id: &s
         .and_then(|v| v.as_array())
         .is_some_and(|arr| !arr.is_empty());
     if has_legacy {
+        tracing::trace!(id, "injecting currentId for legacyIds");
         meta.insert("currentId".to_owned(), Value::String(id.to_owned()));
     }
 }
@@ -390,6 +409,8 @@ fn append_file_with_mode<W: std::io::Write>(
     set_header_path_raw(&mut header, tar_path)?;
     header.set_cksum();
 
+    tracing::trace!(path = %tar_path.display(), "appending file to archive");
+
     tar.append(&header, &mut file).map_err(PackageError::Io)?;
     Ok(())
 }
@@ -448,6 +469,12 @@ fn write_collection_json(output: &Path, features: &[PackagedFeature]) -> Result<
         },
         features: feature_values,
     };
+
+    tracing::debug!(
+        output = %output.display(),
+        n = features.len(),
+        "writing devcontainer-collection.json"
+    );
 
     let json = serde_json::to_string_pretty(&collection)
         .map_err(|e| PackageError::Serialize(e.to_string()))?;
