@@ -1,8 +1,12 @@
 //! Dependency graph builder and Mermaid renderer for devcontainer features.
 //!
-//! Builds the `dependsOn` (i.e. `installsAfter`) graph by recursively fetching
-//! and parsing `devcontainer-feature.json` from OCI registries, then renders
-//! the result as a Mermaid `flowchart TD` diagram.
+//! Builds the dependency graph by recursively fetching and parsing
+//! `devcontainer-feature.json` from OCI registries, then renders the result as
+//! a Mermaid `flowchart TD` diagram.
+//!
+//! Two edge kinds are modelled to match the official devcontainer CLI renderer:
+//! - **`dependsOn`** (hard dependency) → solid arrow `A --> B`
+//! - **`installsAfter`** (soft ordering hint) → dashed arrow `A -.-> B`
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,14 +19,26 @@ use crate::oci::{FeatureFetcher, OciFetcher};
 use crate::reference::NormalizedRef;
 use crate::types::Platform;
 
-/// An edge in the feature dependency graph: `(from_ref, to_ref)` means
-/// `from_ref` depends on `to_ref` (installs after it).
-pub type DepEdge = (String, String);
+/// The kind of dependency relationship represented by a graph edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// Hard dependency declared via `dependsOn` — rendered as a solid arrow `-->`.
+    DependsOn,
+    /// Soft ordering hint declared via `installsAfter` — rendered as a dashed arrow `-.->`.
+    InstallsAfter,
+}
+
+/// An edge in the feature dependency graph.
+///
+/// `(from_ref, to_ref, kind)` means `from_ref` depends on (or installs after) `to_ref`.
+pub type DepEdge = (String, String, EdgeKind);
 
 /// Recursively build the dependency graph starting from `root_ref`.
 ///
-/// Uses `installsAfter` metadata to discover edges. Visits each unique
-/// reference at most once (cycle protection via a `HashSet` of visited refs).
+/// Discovers edges from both `dependsOn` (hard, solid arrow) and `installsAfter`
+/// (soft, dashed arrow) metadata fields. Each unique reference is visited at
+/// most once (cycle protection via a `HashSet`). Only `dependsOn` targets are
+/// recursed into; `installsAfter` targets are recorded as edges but not walked.
 ///
 /// Progress message "Building dependency graph..." is printed to stderr.
 ///
@@ -57,6 +73,10 @@ pub async fn build_dependency_graph(root_ref: &str) -> Result<Vec<DepEdge>, Feat
 ///
 /// Node labels use the short form `name:tag` (last path segment + tag).
 /// When `edges` is empty the diagram still renders with just the root node.
+///
+/// Edge rendering matches the official devcontainer CLI:
+/// - `dependsOn` → solid arrow `A --> B`
+/// - `installsAfter` → dashed arrow `A -.-> B`
 pub fn render_mermaid(root: &str, edges: &[DepEdge]) -> String {
     let mut node_ids: HashMap<String, String> = HashMap::new();
     let mut next_id = 0usize;
@@ -83,13 +103,17 @@ pub fn render_mermaid(root: &str, edges: &[DepEdge]) -> String {
         let label = short_label(root);
         lines.push(format!("    {id}[\"{label}\"]"));
     } else {
-        for (from, to) in edges {
+        for (from, to, kind) in edges {
             let from_id = get_id(from);
             let to_id = get_id(to);
             let from_label = short_label(from);
             let to_label = short_label(to);
+            let arrow = match kind {
+                EdgeKind::DependsOn => "-->",
+                EdgeKind::InstallsAfter => "-.->",
+            };
             lines.push(format!(
-                "    {from_id}[\"{from_label}\"] --> {to_id}[\"{to_label}\"]"
+                "    {from_id}[\"{from_label}\"] {arrow} {to_id}[\"{to_label}\"]"
             ));
         }
     }
@@ -171,10 +195,21 @@ async fn visit(
 
     let metadata = parse_feature_metadata(&json)?;
 
-    for dep in &metadata.installs_after {
-        edges.push((reference.to_owned(), dep.clone()));
+    // Hard dependencies: recurse into each and emit a solid edge.
+    for dep_ref in metadata.depends_on.keys() {
+        edges.push((reference.to_owned(), dep_ref.clone(), EdgeKind::DependsOn));
         // Box the recursive future to avoid infinitely-sized stack frames.
-        Box::pin(visit(dep, fetcher, platform, cache, edges, visited)).await?;
+        Box::pin(visit(dep_ref, fetcher, platform, cache, edges, visited)).await?;
+    }
+
+    // Soft ordering hints: record the edge but do not recurse (the target may
+    // not be in the resolved feature set at all).
+    for dep_ref in &metadata.installs_after {
+        edges.push((
+            reference.to_owned(),
+            dep_ref.clone(),
+            EdgeKind::InstallsAfter,
+        ));
     }
 
     Ok(())
@@ -259,36 +294,61 @@ mod tests {
     }
 
     #[test]
-    fn render_mermaid_single_edge() {
+    fn render_mermaid_depends_on_edge() {
         let edges = vec![(
             "ghcr.io/devcontainers/features/node:1".to_owned(),
             "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
+            EdgeKind::DependsOn,
         )];
         let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
         assert!(output.starts_with("flowchart TD"));
-        assert!(output.contains("-->"));
+        // Hard dep → solid arrow
+        assert!(output.contains("-->"), "expected solid arrow");
+        assert!(!output.contains("-.-"), "unexpected dashed arrow");
         assert!(output.contains("node:1"));
         assert!(output.contains("common-utils:2"));
     }
 
     #[test]
-    fn render_mermaid_multiple_edges() {
+    fn render_mermaid_installs_after_edge() {
+        let edges = vec![(
+            "ghcr.io/devcontainers/features/node:1".to_owned(),
+            "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
+            EdgeKind::InstallsAfter,
+        )];
+        let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
+        assert!(output.starts_with("flowchart TD"));
+        // Soft dep → dashed arrow
+        assert!(output.contains("-.-"), "expected dashed arrow");
+        assert!(output.contains("node:1"));
+        assert!(output.contains("common-utils:2"));
+    }
+
+    #[test]
+    fn render_mermaid_mixed_edges() {
         let edges = vec![
             (
                 "ghcr.io/devcontainers/features/node:1".to_owned(),
-                "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
+                "ghcr.io/devcontainers/features/git:1".to_owned(),
+                EdgeKind::DependsOn,
             ),
             (
                 "ghcr.io/devcontainers/features/node:1".to_owned(),
-                "ghcr.io/devcontainers/features/git:1".to_owned(),
+                "ghcr.io/devcontainers/features/common-utils:2".to_owned(),
+                EdgeKind::InstallsAfter,
             ),
         ];
         let output = render_mermaid("ghcr.io/devcontainers/features/node:1", &edges);
         // Header + 2 edge lines
         assert_eq!(output.lines().count(), 3);
+        assert!(output.contains("-->"), "expected solid arrow for dependsOn");
+        assert!(
+            output.contains("-.-"),
+            "expected dashed arrow for installsAfter"
+        );
         assert!(output.contains("node:1"));
-        assert!(output.contains("common-utils:2"));
         assert!(output.contains("git:1"));
+        assert!(output.contains("common-utils:2"));
     }
 
     // -----------------------------------------------------------------------

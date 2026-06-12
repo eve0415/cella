@@ -29,6 +29,12 @@ pub struct FeatureMetadata {
     pub name: Option<String>,
     pub description: Option<String>,
     pub options: HashMap<String, FeatureOption>,
+    /// Hard dependencies declared via `dependsOn` in `devcontainer-feature.json`.
+    ///
+    /// Keys are feature reference strings; values are the options map to pass to
+    /// that feature (arbitrary JSON — `string | boolean | object` per spec).
+    pub depends_on: HashMap<String, serde_json::Value>,
+    /// Soft ordering hints declared via `installsAfter`.
     pub installs_after: Vec<String>,
     pub container_user: Option<String>,
     pub entrypoint: Option<String>,
