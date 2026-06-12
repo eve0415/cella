@@ -14,6 +14,8 @@ use oci_distribution::manifest::{
 use thiserror::Error;
 use tracing::warn;
 
+use crate::limits::{LimitedReader, MAX_BLOB_DECOMPRESSED_BYTES};
+
 /// Media type for devcontainer feature layers (plain tar).
 pub const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 
@@ -38,6 +40,18 @@ pub enum ExtractionError {
     /// crate also considers it unsafe.  We surface it as a hard error.
     #[error("tar entry '{path}' was rejected by the tar crate (would escape destination)")]
     EntrySkipped { path: String },
+
+    /// A blob's compressed download size exceeds the configured limit.
+    #[error("blob download exceeds size limit: {size} bytes > {limit} bytes for {digest}")]
+    BlobTooLarge {
+        size: u64,
+        limit: u64,
+        digest: String,
+    },
+
+    /// Decompressed output exceeded the configured cap — possible zip-bomb.
+    #[error("decompressed output exceeds limit of {limit} bytes for blob {digest}")]
+    DecompressedTooLarge { limit: u64, digest: String },
 
     /// Underlying I/O or tar error.
     #[error(transparent)]
@@ -64,25 +78,47 @@ pub fn is_extractable_layer(media_type: &str) -> bool {
 ///
 /// Sniffs the magic bytes to determine encoding regardless of `media_type`
 /// (the registry sometimes lies).  All entries are validated by
-/// [`unpack_archive`] before any file is written.
+/// [`unpack_archive`] before any file is written.  Decompressed output is
+/// capped at [`MAX_BLOB_DECOMPRESSED_BYTES`]; exceeding it returns
+/// [`ExtractionError::DecompressedTooLarge`].
 ///
 /// # Errors
 ///
 /// Returns [`ExtractionError`] if the archive contains a path-traversal or
-/// unsafe link entry, or if an I/O error occurs.
+/// unsafe link entry, if an I/O error occurs, or if the decompressed size
+/// exceeds the cap.
 pub fn extract_layer(blob: &[u8], media_type: &str, dest: &Path) -> Result<(), ExtractionError> {
+    extract_layer_with_limit(blob, media_type, dest, MAX_BLOB_DECOMPRESSED_BYTES)
+}
+
+/// Like [`extract_layer`] but with a caller-supplied decompression cap.
+///
+/// Intended for tests that need a small cap to exercise the limit path without
+/// allocating gigabytes.
+///
+/// # Errors
+///
+/// Same as [`extract_layer`].
+pub fn extract_layer_with_limit(
+    blob: &[u8],
+    media_type: &str,
+    dest: &Path,
+    decompress_limit: u64,
+) -> Result<(), ExtractionError> {
     let is_gzip = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
 
     if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
         if is_gzip {
-            unpack_archive(tar::Archive::new(GzDecoder::new(blob)), dest)
+            let limited = LimitedReader::new(GzDecoder::new(blob), decompress_limit);
+            unpack_archive(tar::Archive::new(limited), dest)
         } else {
             warn!("layer declared as gzip but does not have gzip magic; trying raw tar");
             unpack_archive(tar::Archive::new(blob), dest)
         }
     } else if is_gzip {
         warn!("layer declared as plain tar but has gzip magic; decompressing");
-        unpack_archive(tar::Archive::new(GzDecoder::new(blob)), dest)
+        let limited = LimitedReader::new(GzDecoder::new(blob), decompress_limit);
+        unpack_archive(tar::Archive::new(limited), dest)
     } else {
         unpack_archive(tar::Archive::new(blob), dest)
     }
@@ -619,5 +655,44 @@ mod tests {
         assert!(!is_extractable_layer(
             "application/vnd.oci.image.config.v1+json"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Decompression size caps
+    // -----------------------------------------------------------------------
+
+    /// Build a gzip-compressed tar whose decompressed size exceeds a small cap.
+    ///
+    /// The content is highly compressible (repeated zeros) to simulate a
+    /// zip-bomb: tiny compressed, large decompressed.
+    fn build_gz_tar_with_large_content(decompressed_content_size: usize) -> Vec<u8> {
+        let content = vec![0u8; decompressed_content_size];
+        gz_compress(&build_safe_tar(&[("big.bin", None, &content)]))
+    }
+
+    #[test]
+    fn decompression_cap_blocks_zip_bomb() {
+        // 2048 bytes decompressed content; cap is 1024 bytes → must error.
+        let gz_tar = build_gz_tar_with_large_content(2048);
+        let dest = dest_dir();
+        let result =
+            extract_layer_with_limit(&gz_tar, IMAGE_LAYER_GZIP_MEDIA_TYPE, dest.path(), 1024);
+        assert!(
+            result.is_err(),
+            "expected error for oversized decompressed output, got Ok"
+        );
+    }
+
+    #[test]
+    fn decompression_cap_allows_normal_archive() {
+        // Small archive well under any reasonable cap.
+        let gz_tar = build_gz_tar_with_large_content(512);
+        let dest = dest_dir();
+        extract_layer_with_limit(&gz_tar, IMAGE_LAYER_GZIP_MEDIA_TYPE, dest.path(), 64 * 1024)
+            .expect("small archive should succeed");
+        assert!(
+            dest.path().join("big.bin").exists(),
+            "big.bin should have been extracted"
+        );
     }
 }
