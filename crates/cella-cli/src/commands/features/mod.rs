@@ -1,9 +1,10 @@
-//! `cella features` subcommands: edit, list, and update features in
+//! `cella features` subcommands: edit, list, package, and update features in
 //! devcontainer configurations.
 
 pub mod edit;
 pub mod jsonc_edit;
 pub mod list;
+pub mod package;
 pub mod prompts;
 pub mod resolve;
 pub mod update;
@@ -26,6 +27,8 @@ pub enum FeaturesCommand {
     Edit(edit::EditArgs),
     /// List configured or available features.
     List(list::ListArgs),
+    /// Package local feature sources into distributable tarballs.
+    Package(package::PackageArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
@@ -38,6 +41,7 @@ impl FeaturesArgs {
         match self.command {
             FeaturesCommand::Edit(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
+            FeaturesCommand::Package(args) => args.execute(),
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
