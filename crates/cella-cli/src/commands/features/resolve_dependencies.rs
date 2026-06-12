@@ -259,7 +259,13 @@ fn compute_order_with_metadata(
     let order_input: Vec<(String, &FeatureMetadata)> =
         metas.iter().map(|(id, m)| (id.clone(), m)).collect();
 
-    let (ordered_ids, warnings) = compute_install_order(&order_input, override_order);
+    let mut depends_on_cycle: Option<Vec<String>> = None;
+    let (ordered_ids, warnings) =
+        compute_install_order(&order_input, override_order, &mut depends_on_cycle);
+
+    if let Some(cycle) = depends_on_cycle {
+        return Err(format!("cyclic dependsOn detected: {}", cycle.join(" -> ")));
+    }
 
     for w in &warnings {
         if let FeatureWarning::CyclicDependency { features } = w {
@@ -299,7 +305,13 @@ fn compute_order_declared_only(
     let order_input: Vec<(String, &FeatureMetadata)> =
         metas.iter().map(|(id, m)| (id.clone(), m)).collect();
 
-    let (ordered_ids, warnings) = compute_install_order(&order_input, override_order);
+    let mut depends_on_cycle: Option<Vec<String>> = None;
+    let (ordered_ids, warnings) =
+        compute_install_order(&order_input, override_order, &mut depends_on_cycle);
+
+    if let Some(cycle) = depends_on_cycle {
+        return Err(format!("cyclic dependsOn detected: {}", cycle.join(" -> ")).into());
+    }
 
     for w in &warnings {
         if let FeatureWarning::CyclicDependency { features } = w {
