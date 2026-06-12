@@ -191,42 +191,44 @@ fn parse_template_args(
     Ok(map.into_iter().collect())
 }
 
-/// Parse `--features` JSON array: each entry must have an `"id"` string field.
+/// Wire format for a single entry in the `--features` JSON array.
+///
+/// Official input shape: `[{"id": "...", "options": {...}}]`.
+/// `options` is optional — an absent key is treated as an empty map.
+#[derive(serde::Deserialize)]
+struct FeatureEntry {
+    /// Full OCI reference for the feature (required).
+    id: String,
+    /// Option key-value pairs for this feature (optional).
+    #[serde(default)]
+    options: HashMap<String, Value>,
+}
+
+/// Parse `--features` JSON array using serde.
+///
+/// Each entry must be an object with a required `"id"` string field.
+/// Returns a clear miette-compatible error message on missing id or bad shape.
 fn parse_features_json(
     raw: &str,
 ) -> Result<Vec<SelectedFeature>, Box<dyn std::error::Error + Send + Sync>> {
-    let parsed: Value =
+    // First check the top level is an array so the error message names `--features`.
+    let top: Value =
         serde_json::from_str(raw).map_err(|e| format!("--features: invalid JSON: {e}"))?;
-
-    let Value::Array(arr) = parsed else {
+    if !top.is_array() {
         return Err("--features: must be a JSON array".into());
-    };
-
-    let mut result = Vec::with_capacity(arr.len());
-    for (idx, item) in arr.into_iter().enumerate() {
-        let Value::Object(obj) = item else {
-            return Err(format!("--features[{idx}]: must be a JSON object").into());
-        };
-
-        let id = obj
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("--features[{idx}]: missing required string field \"id\""))?
-            .to_owned();
-
-        let feature_options: HashMap<String, Value> = obj
-            .get("options")
-            .and_then(Value::as_object)
-            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-
-        result.push(SelectedFeature {
-            reference: id,
-            options: feature_options,
-        });
     }
 
-    Ok(result)
+    // Deserialize into the wire type; serde gives us the missing-id error automatically.
+    let entries: Vec<FeatureEntry> =
+        serde_json::from_value(top).map_err(|e| format!("--features: invalid entry: {e}"))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|e| SelectedFeature {
+            reference: e.id,
+            options: e.options,
+        })
+        .collect())
 }
 
 /// Parse a `--flag` JSON array of strings.
@@ -374,16 +376,23 @@ mod tests {
     #[test]
     fn features_rejects_missing_id() {
         let err = parse_features_json(r#"[{"options": {}}]"#).unwrap_err();
+        // serde produces "missing field `id`" for a missing required field.
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("missing required string field \"id\"")
+            msg.contains("id"),
+            "expected error mentioning missing 'id' field, got: {msg}"
         );
     }
 
     #[test]
     fn features_rejects_non_object_entry() {
         let err = parse_features_json(r#"["not-an-object"]"#).unwrap_err();
-        assert!(err.to_string().contains("must be a JSON object"));
+        // serde produces "invalid type: string …, expected struct FeatureEntry"
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid"),
+            "expected invalid-type error, got: {msg}"
+        );
     }
 
     #[test]
