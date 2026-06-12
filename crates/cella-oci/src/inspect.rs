@@ -27,7 +27,7 @@ const TAG_PAGE_SIZE: usize = 100;
 pub async fn fetch_manifest_with_digest(
     reference: &str,
 ) -> miette::Result<(serde_json::Value, String)> {
-    let (registry, repository, tag) = parse_reference(reference)?;
+    let (registry, repository, version) = parse_reference(reference)?;
 
     let config = ClientConfig {
         protocol: ClientProtocol::Https,
@@ -35,10 +35,17 @@ pub async fn fetch_manifest_with_digest(
     };
     let client = oci_distribution::Client::new(config);
 
-    let oci_ref = Reference::with_tag(registry.clone(), repository.clone(), tag.clone());
+    let oci_ref = match &version {
+        ReferenceVersion::Tag(tag) => {
+            Reference::with_tag(registry.clone(), repository.clone(), tag.clone())
+        }
+        ReferenceVersion::Digest(digest) => {
+            Reference::with_digest(registry.clone(), repository.clone(), digest.clone())
+        }
+    };
     let auth = build_registry_auth(&registry);
 
-    debug!("fetching manifest for {registry}/{repository}:{tag}");
+    debug!("fetching manifest for {registry}/{repository} ({version:?})");
 
     let (manifest, digest) = client
         .pull_image_manifest(&oci_ref, &auth)
@@ -54,7 +61,7 @@ pub async fn fetch_manifest_with_digest(
     let json_value = serde_json::to_value(&manifest)
         .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
 
-    debug!("fetched manifest for {registry}/{repository}:{tag} (digest={hex_digest})");
+    debug!("fetched manifest for {registry}/{repository} ({version:?}, digest={hex_digest})");
 
     Ok((json_value, hex_digest))
 }
@@ -84,7 +91,7 @@ pub async fn fetch_manifest_with_digest(
 /// Returns an error when the reference cannot be parsed or any registry
 /// request fails.
 pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>> {
-    let (registry, repository, _tag) = parse_reference(reference)?;
+    let (registry, repository, _version) = parse_reference(reference)?;
 
     let config = ClientConfig {
         protocol: ClientProtocol::Https,
@@ -101,10 +108,23 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
     let mut last: Option<String> = None;
 
     loop {
-        let response = client
+        let response = match client
             .list_tags(&oci_ref, &auth, Some(TAG_PAGE_SIZE), last.as_deref())
             .await
-            .map_err(|e| miette::miette!("failed to list tags for {reference}: {e}"))?;
+        {
+            Ok(response) => response,
+            // A follow-up page can fail on registries that answer the final
+            // page with `{"tags": null}` (e.g. GHCR when the previous page
+            // was exactly full): treat it as end-of-list instead of failing
+            // the whole listing.
+            Err(e) if !all_tags.is_empty() => {
+                debug!("treating tag pagination error as end-of-list: {e}");
+                break;
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to list tags for {reference}: {e}"));
+            }
+        };
 
         let page_len = response.tags.len();
         last = response.tags.last().cloned();
@@ -121,28 +141,44 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
     Ok(all_tags)
 }
 
-/// Parse a feature OCI reference into `(registry, repository, tag)`.
+/// The version component of an OCI reference: a tag or a digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceVersion {
+    /// A named tag, e.g. `1` or `latest`.
+    Tag(String),
+    /// A content digest, e.g. `sha256:<hex>`.
+    Digest(String),
+}
+
+/// Parse a feature OCI reference into `(registry, repository, version)`.
 ///
-/// Accepts `registry/[namespace/]name:tag` or `registry/[namespace/]name`
-/// (defaulting the tag to `"latest"`).
+/// Accepts `registry/[namespace/]name:tag`, `registry/[namespace/]name@digest`,
+/// or `registry/[namespace/]name` (defaulting the tag to `"latest"`).
 ///
 /// # Errors
 ///
 /// Returns an error when the reference has no `/` separator (i.e., it is
 /// not a registry-qualified reference).
-pub fn parse_reference(reference: &str) -> miette::Result<(String, String, String)> {
+pub fn parse_reference(reference: &str) -> miette::Result<(String, String, ReferenceVersion)> {
     // Split registry from the rest on the first `/`.
     let (registry, rest) = reference.split_once('/').ok_or_else(|| {
         miette::miette!("invalid OCI reference (expected registry/repo): {reference}")
     })?;
 
-    // Split repository and tag on the last `:` in `rest`.
-    let (repository, tag) = rest.rsplit_once(':').map_or_else(
-        || (rest.to_owned(), "latest".to_owned()),
-        |(repo, t)| (repo.to_owned(), t.to_owned()),
+    // A digest reference uses `@` (e.g. `name@sha256:<hex>`); check it first
+    // because the digest itself contains a `:`.
+    let (repository, version) = rest.rsplit_once('@').map_or_else(
+        || {
+            // Split repository and tag on the last `:` in `rest`.
+            rest.rsplit_once(':').map_or_else(
+                || (rest.to_owned(), ReferenceVersion::Tag("latest".to_owned())),
+                |(repo, t)| (repo.to_owned(), ReferenceVersion::Tag(t.to_owned())),
+            )
+        },
+        |(repo, digest)| (repo.to_owned(), ReferenceVersion::Digest(digest.to_owned())),
     );
 
-    Ok((registry.to_owned(), repository, tag))
+    Ok((registry.to_owned(), repository, version))
 }
 
 // ===========================================================================
@@ -155,18 +191,31 @@ mod tests {
 
     #[test]
     fn parse_reference_with_tag() {
-        let (reg, repo, tag) = parse_reference("ghcr.io/devcontainers/features/node:1").unwrap();
+        let (reg, repo, version) =
+            parse_reference("ghcr.io/devcontainers/features/node:1").unwrap();
         assert_eq!(reg, "ghcr.io");
         assert_eq!(repo, "devcontainers/features/node");
-        assert_eq!(tag, "1");
+        assert_eq!(version, ReferenceVersion::Tag("1".to_owned()));
     }
 
     #[test]
     fn parse_reference_without_tag_defaults_latest() {
-        let (reg, repo, tag) = parse_reference("ghcr.io/devcontainers/features/node").unwrap();
+        let (reg, repo, version) = parse_reference("ghcr.io/devcontainers/features/node").unwrap();
         assert_eq!(reg, "ghcr.io");
         assert_eq!(repo, "devcontainers/features/node");
-        assert_eq!(tag, "latest");
+        assert_eq!(version, ReferenceVersion::Tag("latest".to_owned()));
+    }
+
+    #[test]
+    fn parse_reference_with_digest() {
+        let (reg, repo, version) =
+            parse_reference("ghcr.io/devcontainers/features/node@sha256:abc123").unwrap();
+        assert_eq!(reg, "ghcr.io");
+        assert_eq!(repo, "devcontainers/features/node");
+        assert_eq!(
+            version,
+            ReferenceVersion::Digest("sha256:abc123".to_owned())
+        );
     }
 
     #[test]
@@ -176,10 +225,10 @@ mod tests {
 
     #[test]
     fn parse_reference_deep_path() {
-        let (reg, repo, tag) =
+        let (reg, repo, version) =
             parse_reference("mcr.microsoft.com/devcontainers/base:ubuntu").unwrap();
         assert_eq!(reg, "mcr.microsoft.com");
         assert_eq!(repo, "devcontainers/base");
-        assert_eq!(tag, "ubuntu");
+        assert_eq!(version, ReferenceVersion::Tag("ubuntu".to_owned()));
     }
 }
