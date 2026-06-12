@@ -12,6 +12,7 @@ pub mod prompts;
 pub mod publish;
 pub mod resolve;
 pub mod resolve_dependencies;
+pub mod test;
 pub mod update;
 
 use clap::{Args, Subcommand};
@@ -43,6 +44,8 @@ pub enum FeaturesCommand {
     Publish(publish::PublishArgs),
     /// Resolve feature dependencies and print the installation order.
     ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
+    /// Run devcontainer feature tests.
+    Test(test::TestArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
@@ -77,6 +80,7 @@ impl FeaturesArgs {
             FeaturesCommand::Package(args) => args.execute(),
             FeaturesCommand::Publish(args) => args.execute().await,
             FeaturesCommand::ResolveDependencies(args) => args.execute().await,
+            FeaturesCommand::Test(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
