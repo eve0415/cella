@@ -672,6 +672,13 @@ impl EnsureUpContext<'_> {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // Spec: initializeCommand runs on the host during every `up`, including
+        // restarting a stopped container — the create and reconnect paths
+        // already do this (official runs it before any container-state branch).
+        if let Some(init_cmd) = self.config_json().get("initializeCommand") {
+            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
+        }
+
         let capabilities = self.client.capabilities();
 
         self.warn_config_drift(container);
