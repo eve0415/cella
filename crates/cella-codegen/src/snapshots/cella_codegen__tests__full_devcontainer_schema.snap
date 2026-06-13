@@ -35,6 +35,10 @@ pub enum MountType {
 }
 #[derive(Debug, Clone)]
 pub struct Mount {
+    ///Whether the volume is externally managed (pre-existing). When true, the tooling will not create or remove the volume.
+    pub external: Option<bool>,
+    ///Whether the mount is read-only.
+    pub read_only: Option<bool>,
     ///Mount source.
     pub source: Option<String>,
     ///Mount target.
@@ -471,6 +475,48 @@ impl Mount {
                     kind: ValidationErrorKind::MissingRequired,
                 });
         }
+        let external = if let Some(v) = obj.get("external") {
+            let field_path = format!("{path}/{}", "external");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let read_only = if let Some(v) = obj.get("readOnly") {
+            let field_path = format!("{path}/{}", "readOnly");
+            match v
+                .as_bool()
+                .ok_or_else(|| {
+                    vec![
+                        ValidationError { path : field_path.to_string(), message :
+                        "expected boolean".to_string(), kind :
+                        ValidationErrorKind::TypeError, }
+                    ]
+                })
+            {
+                Ok(val) => Some(val),
+                Err(mut e) => {
+                    errors.append(&mut e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let source = if let Some(v) = obj.get("source") {
             let field_path = format!("{path}/{}", "source");
             match v
@@ -528,7 +574,9 @@ impl Mount {
             None
         };
         for key in obj.keys() {
-            if !["source", "target", "type"].contains(&key.as_str()) {
+            if !["external", "readOnly", "source", "target", "type"]
+                .contains(&key.as_str())
+            {
                 errors
                     .push(ValidationError {
                         path: format!("{path}/{key}"),
@@ -539,6 +587,8 @@ impl Mount {
         }
         if errors.is_empty() {
             Ok(Self {
+                external,
+                read_only,
                 source,
                 target: target.unwrap(),
                 r#type: r#type.unwrap(),
