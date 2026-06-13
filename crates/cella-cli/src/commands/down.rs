@@ -242,7 +242,7 @@ async fn stop_compose_project(
 /// to the caller, because the container is already gone and the
 /// enclosing `cella down --rm` has succeeded.
 ///
-/// The `dev.cella.workspace_path` label is set from the canonicalized
+/// The `dev.cella.workspace_path` label is set from the lexical absolute
 /// workspace path at container creation, matching the input
 /// `ensure_repo_network` hashes — so the derived network name lines up.
 async fn cleanup_workspace_network(

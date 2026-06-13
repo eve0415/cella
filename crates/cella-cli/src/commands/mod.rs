@@ -30,6 +30,7 @@ mod upgrade;
 
 use std::io::IsTerminal;
 
+use cella_backend::names::lexical_absolute;
 use clap::{Args, Subcommand, ValueEnum};
 use tracing::warn;
 
@@ -457,6 +458,13 @@ pub fn warn_if_missing_backend_label(container: &cella_backend::ContainerInfo) {
 
 /// Resolve the workspace folder from an optional argument or the current directory.
 ///
+/// Returns a lexical absolute path (no symlink resolution) so that downstream
+/// consumers — `container_labels`, `devcontainer_id`, and VS Code / the
+/// official CLI — all work from the same un-resolved path form. Using
+/// `canonicalize` here would silently resolve symlinks (e.g. macOS
+/// `/tmp` → `/private/tmp`), causing mismatches with any tool that looks up
+/// a container by the label value it originally stamped.
+///
 /// # Errors
 ///
 /// Returns error if the current directory cannot be determined.
@@ -464,9 +472,9 @@ pub fn resolve_workspace_folder(
     opt: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(wf) = opt {
-        Ok(wf.canonicalize().unwrap_or_else(|_| wf.to_path_buf()))
+        Ok(lexical_absolute(wf))
     } else {
-        Ok(std::env::current_dir()?)
+        Ok(lexical_absolute(&std::env::current_dir()?))
     }
 }
 
@@ -906,8 +914,8 @@ mod tests {
     fn resolve_workspace_folder_with_existing_path() {
         let tmp = std::env::temp_dir();
         let result = resolve_workspace_folder(Some(&tmp)).unwrap();
-        // canonicalize should succeed for an existing directory
-        assert_eq!(result, tmp.canonicalize().unwrap());
+        // lexical_absolute: no symlink resolution, dot/dotdot collapsed textually.
+        assert_eq!(result, lexical_absolute(&tmp));
     }
 
     #[test]
@@ -915,8 +923,19 @@ mod tests {
         let fake = PathBuf::from("/nonexistent/path/to/workspace");
         let result =
             resolve_workspace_folder(Some(Path::new("/nonexistent/path/to/workspace"))).unwrap();
-        // canonicalize fails, so it returns the path as-is
+        // Path doesn't need to exist — lexical_absolute works without hitting the FS.
         assert_eq!(result, fake);
+    }
+
+    #[test]
+    fn resolve_workspace_folder_does_not_follow_symlinks() {
+        // lexical_absolute preserves the caller-supplied path form, so a symlink
+        // path is stamped as-is rather than resolved to its target. This matters
+        // for container-label / devcontainerId consistency with VS Code and the
+        // official CLI, both of which use the symlink path for lookups.
+        let fake_symlink = PathBuf::from("/fake/link/workspace");
+        let result = resolve_workspace_folder(Some(&fake_symlink)).unwrap();
+        assert_eq!(result, fake_symlink);
     }
 
     // ── is_binary_newer_than ────────────────────────────────────────
