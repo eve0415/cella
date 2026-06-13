@@ -701,6 +701,7 @@ async fn handle_port_open(
             ProxyStartTarget::AgentTunnel {
                 container_name: name.to_string(),
                 port: target_port,
+                target_host: None,
             }
         } else {
             warn!("No container name for tunnel proxy, skipping port {port}");
@@ -4994,6 +4995,7 @@ branch refs/heads/feat-b
             tx.send(DaemonMessage::TunnelRequest {
                 connection_id: 1,
                 target_port: 45973,
+                target_host: None,
             })
             .await
             .is_ok(),

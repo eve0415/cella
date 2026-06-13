@@ -32,7 +32,15 @@ pub enum ProxyStartTarget {
     /// Connect directly to an `IP:port` (`OrbStack`, Linux native).
     DirectIp { ip: String, port: u16 },
     /// Tunnel through the agent via a reverse TCP connection.
-    AgentTunnel { container_name: String, port: u16 },
+    ///
+    /// `target_host` overrides the hostname the agent connects to inside the
+    /// container. `None` means `localhost` (the existing numeric-port path).
+    /// Set to a Compose service name (e.g. `"db"`) for cross-service forwarding.
+    AgentTunnel {
+        container_name: String,
+        port: u16,
+        target_host: Option<String>,
+    },
 }
 
 /// Handle to a running TCP proxy task.
@@ -97,12 +105,14 @@ async fn start_tunnel_proxy(
     host_port: u16,
     container_name: String,
     target_port: u16,
+    target_host: Option<String>,
     broker: Arc<TunnelBroker>,
     container_handles: Arc<Mutex<HashMap<String, ContainerHandle>>>,
 ) -> Result<ProxyHandle, io::Error> {
     let listener = TcpListener::bind(("127.0.0.1", host_port)).await?;
+    let host_label = target_host.as_deref().unwrap_or("localhost");
     debug!(
-        "Tunnel proxy listening on 127.0.0.1:{host_port} -> agent:{container_name}:{target_port}"
+        "Tunnel proxy listening on 127.0.0.1:{host_port} -> agent:{container_name}:{host_label}:{target_port}"
     );
 
     let handle = tokio::spawn(async move {
@@ -118,6 +128,7 @@ async fn start_tunnel_proxy(
             let broker = broker.clone();
             let handles = container_handles.clone();
             let name = container_name.clone();
+            let host = target_host.clone();
             debug!("Tunnel proxy connection from {peer} on port {host_port}");
 
             tokio::spawn(async move {
@@ -125,6 +136,7 @@ async fn start_tunnel_proxy(
                     &mut inbound,
                     &name,
                     target_port,
+                    host,
                     &broker,
                     &handles,
                 )
@@ -144,6 +156,7 @@ async fn handle_tunnel_proxy_connection(
     inbound: &mut TcpStream,
     container_name: &str,
     target_port: u16,
+    target_host: Option<String>,
     broker: &TunnelBroker,
     container_handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>,
 ) -> Result<(), io::Error> {
@@ -166,6 +179,7 @@ async fn handle_tunnel_proxy_connection(
         .send(DaemonMessage::TunnelRequest {
             connection_id,
             target_port,
+            target_host,
         })
         .await
         .is_err()
@@ -224,12 +238,14 @@ pub async fn run_proxy_coordinator(
                     ProxyStartTarget::AgentTunnel {
                         container_name,
                         port,
+                        target_host,
                     } => {
                         if let Some(ref ctx) = ctx {
                             start_tunnel_proxy(
                                 host_port,
                                 container_name,
                                 port,
+                                target_host,
                                 ctx.tunnel_broker.clone(),
                                 ctx.container_handles.clone(),
                             )
@@ -315,10 +331,33 @@ mod tests {
         let target = ProxyStartTarget::AgentTunnel {
             container_name: "cella-test".into(),
             port: 3000,
+            target_host: None,
         };
         let dbg = format!("{target:?}");
         assert!(dbg.contains("cella-test"));
         assert!(dbg.contains("3000"));
+    }
+
+    #[test]
+    fn proxy_start_target_agent_tunnel_with_host() {
+        let target = ProxyStartTarget::AgentTunnel {
+            container_name: "cella-test".into(),
+            port: 5432,
+            target_host: Some("db".to_string()),
+        };
+        let dbg = format!("{target:?}");
+        assert!(dbg.contains("cella-test"));
+        assert!(dbg.contains("5432"));
+        assert!(dbg.contains("db"));
+        // target_host is carried through clone correctly.
+        assert!(matches!(
+            target,
+            ProxyStartTarget::AgentTunnel {
+                ref target_host,
+                port: 5432,
+                ..
+            } if target_host.as_deref() == Some("db")
+        ));
     }
 
     // -- ProxyCommand construction --

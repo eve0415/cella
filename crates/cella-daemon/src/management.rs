@@ -404,6 +404,7 @@ struct ContainerRegistration {
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
     forward_ports: Vec<u16>,
+    forward_host_ports: Vec<cella_protocol::HostForwardPort>,
     backend_kind: Option<String>,
     docker_host: Option<String>,
     project_name: Option<String>,
@@ -419,6 +420,7 @@ impl From<cella_protocol::ContainerRegistrationData> for ContainerRegistration {
             ports_attributes: data.ports_attributes,
             other_ports_attributes: data.other_ports_attributes,
             forward_ports: data.forward_ports,
+            forward_host_ports: data.forward_host_ports,
             backend_kind: data.backend_kind,
             docker_host: data.docker_host,
             project_name: data.project_name,
@@ -482,6 +484,7 @@ async fn handle_register(
         &container_name,
         container_ip_clone.as_deref(),
         &reg.forward_ports,
+        &reg.forward_host_ports,
     )
     .await;
 
@@ -496,6 +499,7 @@ async fn preload_forward_ports(
     container_name: &str,
     container_ip: Option<&str>,
     forward_ports: &[u16],
+    forward_host_ports: &[cella_protocol::HostForwardPort],
 ) {
     ctx.hostname_route_table
         .write()
@@ -528,6 +532,7 @@ async fn preload_forward_ports(
             crate::proxy::ProxyStartTarget::AgentTunnel {
                 container_name: container_name.to_string(),
                 port,
+                target_host: None,
             }
         };
 
@@ -560,6 +565,34 @@ async fn preload_forward_ports(
                 },
             );
             rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
+        }
+    }
+
+    // host:port entries always use AgentTunnel — DNS names like "db" are only
+    // resolvable inside the workspace container, so DirectIp cannot work here.
+    for hfp in forward_host_ports {
+        let host_port = {
+            let mut pm = ctx.port_manager.lock().await;
+            pm.handle_port_open(
+                container_id,
+                hfp.port,
+                cella_protocol::PortProtocol::Tcp,
+                None,
+            )
+        };
+        let Some(host_port) = host_port else { continue };
+
+        let target = crate::proxy::ProxyStartTarget::AgentTunnel {
+            container_name: container_name.to_string(),
+            port: hfp.port,
+            target_host: Some(hfp.host.clone()),
+        };
+
+        if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+            ctx.port_manager
+                .lock()
+                .await
+                .handle_port_closed(container_id, hfp.port);
         }
     }
 }
@@ -788,6 +821,7 @@ mod tests {
                     ports_attributes: vec![],
                     other_ports_attributes: None,
                     forward_ports: vec![],
+                    forward_host_ports: vec![],
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
@@ -1220,6 +1254,7 @@ mod tests {
                     ports_attributes: vec![],
                     other_ports_attributes: None,
                     forward_ports: vec![],
+                    forward_host_ports: vec![],
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
