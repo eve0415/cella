@@ -333,15 +333,11 @@ impl RunUserCommandsArgs {
         status
     }
 
-    /// Read the devcontainer config. With `--config`/`--override-config`,
-    /// resolve it against the container's workspace; otherwise return an empty
-    /// object so lifecycle is sourced entirely from the container's metadata
-    /// label.
     /// Resolve the on-disk devcontainer.json when `--config`/`--override-config`
     /// is given. Returns the full [`ResolvedConfig`] (not just `.config`) so the
     /// raw `remoteEnv` snapshot survives for live `${containerEnv:VAR}`
-    /// resolution. `None` when no config path is provided (lifecycle is sourced
-    /// from the container's metadata label alone).
+    /// resolution. Returns `None` when no config path is provided — lifecycle is
+    /// sourced from the container's baked metadata label alone.
     fn read_config(
         &self,
         workspace: Option<&std::path::Path>,
