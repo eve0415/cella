@@ -112,6 +112,8 @@ pub struct EnsureImageInput<'a> {
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
     /// generated `devcontainer.metadata` label baked into the built image.
     pub omit_remote_env_from_metadata: bool,
+    /// Lockfile policy for feature resolution.
+    pub lockfile_policy: cella_features::LockfilePolicy,
     pub progress: &'a ProgressSender,
 }
 
@@ -159,6 +161,7 @@ pub async fn ensure_image(
         no_cache: input.no_cache,
         build_tuning: input.build_tuning,
         omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
+        lockfile_policy: input.lockfile_policy,
         progress: input.progress,
     };
     let (features_image, resolved) = resolve_and_build_features(&features_input).await?;
@@ -298,6 +301,7 @@ struct FeaturesBuildInput<'a> {
     no_cache: bool,
     build_tuning: crate::config::BuildTuning<'a>,
     omit_remote_env_from_metadata: bool,
+    lockfile_policy: cella_features::LockfilePolicy,
     progress: &'a ProgressSender,
 }
 
@@ -327,7 +331,7 @@ async fn resolve_and_build_features(
             omit_remote_env: input.omit_remote_env_from_metadata,
         },
         false, // non-compose: build context IS the features dir, bare COPY works
-        cella_features::LockfilePolicy::Update,
+        input.lockfile_policy,
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;

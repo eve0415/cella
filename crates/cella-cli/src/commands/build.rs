@@ -142,6 +142,8 @@ impl BuildArgs {
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
             // `cella build` keeps the full metadata label.
             omit_remote_env_from_metadata: false,
+            // `cella build` updates the lockfile when features are present.
+            lockfile_policy: cella_features::LockfilePolicy::Update,
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;

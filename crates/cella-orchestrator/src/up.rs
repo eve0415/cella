@@ -1882,6 +1882,7 @@ impl EnsureUpContext<'_> {
                 secrets: &self.config.build_secrets,
                 build_tuning: self.config.build_tuning,
                 omit_remote_env_from_metadata: self.config.metadata_options.omit_remote_env,
+                lockfile_policy: self.config.lockfile_policy,
                 progress: &self.progress,
             })
             .await?;

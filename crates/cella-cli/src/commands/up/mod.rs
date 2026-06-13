@@ -157,22 +157,21 @@ pub struct UpResultArgs {
     pub(crate) omit_config_remote_env_from_metadata: bool,
 }
 
-/// Feature-lockfile flags. cella does not use feature lockfiles; these are
-/// accepted for devcontainer-CLI compatibility and are no-ops.
+/// Feature-lockfile flags for controlling lockfile read/write behavior.
 #[derive(Args)]
 pub struct UpLockfileArgs {
-    /// Disable lockfile generation and verification (compatibility no-op).
+    /// Disable lockfile generation and pinning.
     #[arg(
         long,
         conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
     )]
     pub(crate) no_lockfile: bool,
 
-    /// Ensure the lockfile remains unchanged (compatibility no-op).
+    /// Require the lockfile to exist and match resolved digests; fail if missing or different.
     #[arg(long)]
     pub(crate) frozen_lockfile: bool,
 
-    /// Deprecated alias for lockfile writing (compatibility no-op).
+    /// Deprecated: lockfile is now written by default.
     #[arg(long, hide = true)]
     pub(crate) experimental_lockfile: bool,
 }
@@ -239,7 +238,7 @@ pub struct UpCompatArgs {
     #[arg(long = "terminal-rows", requires = "terminal_columns")]
     pub(crate) terminal_rows: Option<u16>,
 
-    /// Ensure the lockfile exists and remains unchanged (compatibility no-op).
+    /// Deprecated alias for --frozen-lockfile.
     #[arg(long, hide = true)]
     pub(crate) experimental_frozen_lockfile: bool,
 
@@ -359,7 +358,6 @@ impl UpArgs {
     fn acknowledge_compat_flags(&self) {
         let ci = &self.config_inputs;
         let c = &self.compat;
-        let lf = &self.lockfile;
         debug!(
             skip_feature_auto_mapping = ci.skip_feature_auto_mapping,
             terminal_columns = ?c.terminal_columns,
@@ -368,13 +366,35 @@ impl UpArgs {
             container_system_data_folder = ?c.container_system_data_folder,
             container_session_data_folder = ?c.container_session_data_folder,
             user_data_folder = ?c.user_data_folder,
-            no_lockfile = lf.no_lockfile,
-            frozen_lockfile = lf.frozen_lockfile,
-            experimental_lockfile = lf.experimental_lockfile,
-            experimental_frozen_lockfile = c.experimental_frozen_lockfile,
             omit_syntax_directive = c.omit_syntax_directive,
             "up: accepted devcontainer-CLI compatibility no-op flags"
         );
+    }
+}
+
+/// Derive the lockfile policy from the CLI lockfile flags.
+///
+/// Deprecated aliases emit a warning to stderr before delegating.
+fn derive_lockfile_policy(
+    lf: &UpLockfileArgs,
+    compat: &UpCompatArgs,
+) -> cella_features::LockfilePolicy {
+    if lf.experimental_lockfile {
+        eprintln!(
+            "warning: --experimental-lockfile is deprecated; lockfile is now written by default"
+        );
+    }
+    if compat.experimental_frozen_lockfile {
+        eprintln!(
+            "warning: --experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead"
+        );
+    }
+    if lf.no_lockfile {
+        cella_features::LockfilePolicy::NoLockfile
+    } else if lf.frozen_lockfile || compat.experimental_frozen_lockfile {
+        cella_features::LockfilePolicy::Frozen
+    } else {
+        cella_features::LockfilePolicy::Update
     }
 }
 
@@ -619,6 +639,9 @@ pub struct UpContext {
     /// (owner/repo shorthand expanded) at construction so both the
     /// single-container and compose paths receive a clone-ready value.
     pub(crate) dotfiles: cella_orchestrator::config::DotfilesConfig,
+    /// Lockfile policy derived from the `--no-lockfile` / `--frozen-lockfile`
+    /// flags.
+    pub(crate) lockfile_policy: cella_features::LockfilePolicy,
 }
 
 /// Normalize a `--dotfiles-repository` value to a clone-ready form.
@@ -895,6 +918,7 @@ impl UpContext {
             ),
             omit_remote_env_from_metadata: args.result.omit_config_remote_env_from_metadata,
             dotfiles: build_dotfiles_config(&args.dotfiles),
+            lockfile_policy: derive_lockfile_policy(&args.lockfile, &args.compat),
         })
     }
 
@@ -1045,6 +1069,8 @@ impl UpContext {
             omit_remote_env_from_metadata: false,
             // Branch/auto-up never installs dotfiles (no --dotfiles-* flags).
             dotfiles: cella_orchestrator::config::DotfilesConfig::default(),
+            // Branch/auto-up uses default lockfile policy (Update).
+            lockfile_policy: cella_features::LockfilePolicy::default(),
         })
     }
 
@@ -1509,6 +1535,7 @@ impl UpContext {
                 omit_remote_env: self.omit_remote_env_from_metadata,
             },
             dotfiles: self.dotfiles.clone(),
+            lockfile_policy: self.lockfile_policy,
         };
 
         let result =

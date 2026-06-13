@@ -51,9 +51,10 @@ pub enum LockfileError {
 }
 
 /// Controls how the lockfile is read and written during feature resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LockfilePolicy {
     /// Write/update the lockfile after resolution (default).
+    #[default]
     Update,
     /// Skip reading and writing the lockfile entirely.
     NoLockfile,
