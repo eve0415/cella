@@ -106,7 +106,8 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
 
     // `--platform` is a BuildKit/buildx flag; the classic `docker build`
     // rejects it with "unknown flag: --platform". Emit it only on the buildx
-    // path. On the classic builder it is dropped (build_image warns once).
+    // path. On the classic builder it is dropped (build_image warns on each
+    // invocation with a non-None platform).
     if use_buildx && let Some(platform) = &opts.platform {
         args.extend(["--platform".to_string(), platform.clone()]);
     }

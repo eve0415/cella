@@ -306,18 +306,42 @@ struct FeaturesBuildInput<'a> {
     progress: &'a ProgressSender,
 }
 
+/// Parse a `--platform` string (e.g. `linux/amd64`) into `(os, arch)`.
+///
+/// Returns `None` when the string is malformed (no `/` separator or empty
+/// component). The arch component is passed through as-is; normalisation to
+/// Go/OCI conventions (`amd64`, `arm64`) is done by
+/// [`cella_features::oci::detect_platform`].
+fn parse_platform_str(platform: &str) -> Option<(&str, &str)> {
+    let (os, arch) = platform.split_once('/')?;
+    if os.is_empty() || arch.is_empty() {
+        return None;
+    }
+    Some((os, arch))
+}
+
 /// Resolve features and build the features layer image.
 async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error + Send + Sync>> {
     info!("Resolving devcontainer features...");
-    let backend_platform = input
-        .client
-        .detect_platform()
-        .await
-        .map_err(|e| format!("platform detection failed: {e}"))?;
-    let platform =
-        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
+
+    // When `--platform` is set (cross-arch build), resolve feature artifacts
+    // for the *requested* platform rather than the Docker engine's host arch.
+    // Without this, host-arch feature payloads would be baked into a foreign-
+    // arch image, breaking or silently mis-installing platform-specific scripts.
+    let platform = if let Some(plat_str) = input.build_tuning.platform
+        && let Some((os, arch)) = parse_platform_str(plat_str)
+    {
+        cella_features::oci::detect_platform(os, arch)
+    } else {
+        let backend_platform = input
+            .client
+            .detect_platform()
+            .await
+            .map_err(|e| format!("platform detection failed: {e}"))?;
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch)
+    };
     let cache = cella_features::FeatureCache::new();
 
     let resolved = cella_features::resolve_features(
@@ -995,5 +1019,25 @@ mod tests {
         assert_eq!(build.get("dockerfile").unwrap(), "Legacy.Dockerfile");
         // build-only fields are preserved.
         assert_eq!(build.get("target").unwrap(), "dev");
+    }
+
+    // ── parse_platform_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_platform_str_standard_forms() {
+        assert_eq!(parse_platform_str("linux/amd64"), Some(("linux", "amd64")));
+        assert_eq!(parse_platform_str("linux/arm64"), Some(("linux", "arm64")));
+        assert_eq!(
+            parse_platform_str("linux/arm/v7"),
+            Some(("linux", "arm/v7"))
+        );
+    }
+
+    #[test]
+    fn parse_platform_str_rejects_malformed() {
+        assert!(parse_platform_str("linuxamd64").is_none());
+        assert!(parse_platform_str("/amd64").is_none());
+        assert!(parse_platform_str("linux/").is_none());
+        assert!(parse_platform_str("").is_none());
     }
 }
