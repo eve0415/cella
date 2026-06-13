@@ -252,6 +252,7 @@ pub enum Command {
     /// View and manage cella configuration.
     Config(config::ConfigArgs),
     /// Manage dev container templates.
+    #[command(alias = "template")]
     Templates(templates::TemplatesArgs),
     /// Manage devcontainer features.
     Features(features::FeaturesArgs),

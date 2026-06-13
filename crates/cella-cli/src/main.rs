@@ -846,6 +846,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_template_singular_alias_list() {
+        // `cella template list` (singular) must route to the same Templates variant.
+        let cli = parse(&["cella", "template", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::commands::Command::Templates(_)
+        ));
+    }
+
+    #[test]
     fn parse_templates_apply_requires_template_id() {
         let result = parse(&["cella", "templates", "apply"]);
         assert!(result.is_err());
