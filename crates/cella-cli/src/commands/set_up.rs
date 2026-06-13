@@ -20,7 +20,7 @@
 //! "...","description":"An error occurred running user commands in the
 //! container."}` then exit 1.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde_json::{Value, json};
@@ -135,13 +135,29 @@ impl SetUpArgs {
             id_labels: Vec::new(),
             workspace_folder: None,
         };
-        let container = target
-            .resolve(&*client, false)
-            .await
-            .map_err(|_| "Dev container not found.")?;
+        let container = target.resolve(&*client, true).await?;
 
-        let config = self.read_config()?;
+        // Derive the host-side workspace root from the container label so that
+        // `${localWorkspaceFolder}` and `.devcontainer.local.jsonc` resolve
+        // correctly.  This mirrors how `run-user-commands` derives `workspace`.
+        let workspace_root = container
+            .labels
+            .get("dev.cella.workspace_path")
+            .map(PathBuf::from);
+
+        let config = self.read_config(workspace_root.as_deref())?;
         let metadata = container.labels.get("devcontainer.metadata").cloned();
+
+        // Warn early if the label is present but not valid JSON, regardless of
+        // which result flags are passed — don't silently drop it.
+        if let Some(raw) = metadata.as_deref()
+            && serde_json::from_str::<Vec<Value>>(raw).is_err()
+        {
+            tracing::warn!(
+                "devcontainer.metadata label is not valid JSON, treating as empty: {}",
+                raw
+            );
+        }
 
         // --container-id is the only resolution path for set-up, which matches
         // official's `hasIdLabels === false` branch: the on-disk --config is
@@ -155,23 +171,23 @@ impl SetUpArgs {
         let remote_user = orchestrator::resolve_remote_user(&*client, &container, &config).await;
         let workspace_folder = workspace_folder_in_container(&config, &container);
 
-        let secrets = match self.compat.secrets_file() {
-            Some(path) => parse_secrets_file(path)?,
-            None => Vec::new(),
-        };
-
-        let lifecycle_env = self
-            .build_lifecycle_env(
-                &*client,
-                &container.id,
-                &remote_user,
-                &config,
-                metadata.as_deref(),
-                &secrets,
-            )
-            .await;
-
         if !self.gate.skip_post_create {
+            let secrets = match self.compat.secrets_file() {
+                Some(path) => parse_secrets_file(path)?,
+                None => Vec::new(),
+            };
+
+            let lifecycle_env = self
+                .build_lifecycle_env(
+                    &*client,
+                    &container.id,
+                    &remote_user,
+                    &config,
+                    metadata.as_deref(),
+                    &secrets,
+                )
+                .await;
+
             let gating = orchestrator::Gating {
                 stop: cella_backend::StopAfter {
                     skip_non_blocking: self.gate.skip_non_blocking_commands,
@@ -229,7 +245,15 @@ impl SetUpArgs {
     /// if the path does not exist, error per official "Dev container config
     /// (<path>) not found." When omitted, return an empty object so lifecycle
     /// is sourced entirely from the container's `devcontainer.metadata` label.
-    fn read_config(&self) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// `workspace_root` is the host-side repo root (from the container's
+    /// `dev.cella.workspace_path` label) used as the resolution base for
+    /// `${localWorkspaceFolder}` and `.devcontainer.local.jsonc`. When absent
+    /// (the label is missing), falls back to the config file's parent directory.
+    fn read_config(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let Some(config_path) = self.config.as_deref() else {
             return Ok(json!({}));
         };
@@ -240,9 +264,9 @@ impl SetUpArgs {
             )
             .into());
         }
-        let ws = config_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
+        let ws = workspace_root
+            .map(Path::to_path_buf)
+            .or_else(|| config_path.parent().map(Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
         Ok(cella_config::devcontainer::resolve::config(&ws, Some(config_path))?.config)
     }
@@ -297,8 +321,8 @@ fn workspace_folder_in_container(
     if let Some(basename) = container
         .labels
         .get("dev.cella.workspace_path")
-        .map(std::path::Path::new)
-        .and_then(std::path::Path::file_name)
+        .map(Path::new)
+        .and_then(Path::file_name)
     {
         return format!("/workspaces/{}", basename.to_string_lossy());
     }
