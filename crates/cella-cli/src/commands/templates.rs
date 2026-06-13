@@ -121,7 +121,8 @@ impl TemplatesArgs {
         match &self.command {
             TemplatesCommand::Apply(args) => Some(args.log_level),
             TemplatesCommand::Metadata(args) => Some(args.log_level),
-            TemplatesCommand::New { .. }
+            TemplatesCommand::GenerateDocs(_)
+            | TemplatesCommand::New { .. }
             | TemplatesCommand::List
             | TemplatesCommand::Edit { .. } => None,
         }
@@ -272,14 +273,11 @@ impl TemplatesGenerateDocsArgs {
             eprintln!("  skipped: {dir} (no devcontainer-template.json)");
         }
         for dir in &report.errors {
+            // Official behavior: log per-template failures and continue — exit 0.
             eprintln!("  error: {dir}");
         }
 
-        if report.errors.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("{} template(s) failed", report.errors.len()).into())
-        }
+        Ok(())
     }
 }
 
