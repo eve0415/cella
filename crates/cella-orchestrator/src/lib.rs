@@ -6,6 +6,7 @@
 
 pub mod approved_providers;
 pub mod branch;
+mod forward_ports;
 pub use cella_compose::build_features as compose_build;
 pub use cella_compose::combined_dockerfile_build as compose_features;
 pub use cella_compose::mount_parity as compose_mounts;

@@ -13,6 +13,7 @@ use cella_backend::{
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
 use crate::error::OrchestratorError;
+use crate::forward_ports::forward_port_number;
 use cella_backend::EXPECTED_CONTAINER_MISSING;
 
 use crate::lifecycle::{
@@ -2120,21 +2121,6 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
         .unwrap_or_default()
 }
 
-/// Extract a `u16` port from a `forwardPorts` entry.
-///
-/// Accepts a JSON number or a pure-numeric string (`"9000"` is valid per the
-/// spec). A `"host:port"` string (e.g. `"db:5432"`) is intentionally NOT
-/// reduced to its port number here: that port lives on another container
-/// reached via the workspace container's network, so registering the bare
-/// number would forward the wrong target. Such entries are left for full
-/// `host:port` support and ignored by this number-only path.
-fn forward_port_number(value: &serde_json::Value) -> Option<u16> {
-    let n = value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))?;
-    u16::try_from(n).ok()
-}
-
 /// Run the full non-compose container-up pipeline.
 ///
 /// # Errors
@@ -2661,5 +2647,33 @@ mod tests {
         assert!(result.is_some(), "should resolve relative gitdir");
         let wt = result.unwrap();
         assert_eq!(wt.mount.mount_type, "bind");
+    }
+
+    // ── forward_ports ─────────────────────────────────────────────────
+
+    #[test]
+    fn forward_port_number_accepts_numbers_and_numeric_strings() {
+        use serde_json::json;
+        assert_eq!(forward_port_number(&json!(3000)), Some(3000));
+        assert_eq!(forward_port_number(&json!("9000")), Some(9000));
+        // Out of u16 range.
+        assert_eq!(forward_port_number(&json!(70000)), None);
+        // host:port forms are not reduced to a bare port.
+        assert_eq!(forward_port_number(&json!("db:5432")), None);
+        assert_eq!(forward_port_number(&json!("localhost:3000")), None);
+        // Non-numeric junk.
+        assert_eq!(forward_port_number(&json!("abc")), None);
+    }
+
+    #[test]
+    fn parse_forward_ports_accepts_mixed_entries() {
+        use serde_json::json;
+        let config = json!({
+            "forwardPorts": [3000, 8080, 70000, "9000", "db:5432"]
+        });
+        let ports = parse_forward_ports(&config);
+        // Numeric strings ("9000") are accepted; out-of-range (70000) and
+        // "host:port" forms ("db:5432") are dropped by the number-only path.
+        assert_eq!(ports, vec![3000, 8080, 9000]);
     }
 }

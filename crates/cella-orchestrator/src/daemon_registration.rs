@@ -6,6 +6,8 @@ use std::path::Path;
 use cella_backend::{BACKEND_LABEL, ContainerInfo};
 use cella_protocol::ContainerRegistrationData;
 
+use crate::forward_ports::forward_port_number;
+
 /// Build daemon registration data from a devcontainer config.
 pub fn from_devcontainer_config(
     config: &serde_json::Value,
@@ -98,21 +100,6 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(forward_port_number).collect())
         .unwrap_or_default()
-}
-
-/// Extract a `u16` port from a `forwardPorts` entry.
-///
-/// Accepts a JSON number or a pure-numeric string (`"9000"` is valid per the
-/// spec). A `"host:port"` string (e.g. `"db:5432"`) is intentionally NOT
-/// reduced to its port number here: that port lives on another container
-/// reached via the workspace container's network, so registering the bare
-/// number would forward the wrong target. Such entries are left for full
-/// `host:port` support and ignored by this number-only path.
-fn forward_port_number(value: &serde_json::Value) -> Option<u16> {
-    let n = value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))?;
-    u16::try_from(n).ok()
 }
 
 #[cfg(test)]
