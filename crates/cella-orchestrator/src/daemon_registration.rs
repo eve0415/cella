@@ -96,12 +96,23 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
     config
         .get("forwardPorts")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(forward_port_number).collect())
         .unwrap_or_default()
+}
+
+/// Extract a `u16` port from a `forwardPorts` entry.
+///
+/// Accepts a JSON number or a pure-numeric string (`"9000"` is valid per the
+/// spec). A `"host:port"` string (e.g. `"db:5432"`) is intentionally NOT
+/// reduced to its port number here: that port lives on another container
+/// reached via the workspace container's network, so registering the bare
+/// number would forward the wrong target. Such entries are left for full
+/// `host:port` support and ignored by this number-only path.
+fn forward_port_number(value: &serde_json::Value) -> Option<u16> {
+    let n = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))?;
+    u16::try_from(n).ok()
 }
 
 #[cfg(test)]
@@ -114,9 +125,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forward_port_number_accepts_numbers_and_numeric_strings() {
+        assert_eq!(forward_port_number(&json!(3000)), Some(3000));
+        assert_eq!(forward_port_number(&json!("9000")), Some(9000));
+        // Out of u16 range.
+        assert_eq!(forward_port_number(&json!(70000)), None);
+        // host:port forms are not reduced to a bare port.
+        assert_eq!(forward_port_number(&json!("db:5432")), None);
+        assert_eq!(forward_port_number(&json!("localhost:3000")), None);
+        // Non-numeric junk.
+        assert_eq!(forward_port_number(&json!("abc")), None);
+    }
+
+    #[test]
     fn devcontainer_config_registration_extracts_daemon_fields() {
         let config = json!({
-            "forwardPorts": [3000, 8080, 70000, "9000"],
+            "forwardPorts": [3000, 8080, 70000, "9000", "db:5432"],
             "portsAttributes": {
                 "3000": {"label": "web"}
             },
@@ -138,7 +162,9 @@ mod tests {
         assert_eq!(data.container_id, "abc123");
         assert_eq!(data.container_name, "cella-test");
         assert_eq!(data.container_ip.as_deref(), Some("172.20.0.5"));
-        assert_eq!(data.forward_ports, vec![3000, 8080]);
+        // Numeric strings ("9000") are accepted; out-of-range (70000) and
+        // "host:port" forms ("db:5432") are dropped by the number-only path.
+        assert_eq!(data.forward_ports, vec![3000, 8080, 9000]);
         assert_eq!(data.shutdown_action.as_deref(), Some("none"));
         assert_eq!(data.backend_kind.as_deref(), Some("docker"));
         assert_eq!(
