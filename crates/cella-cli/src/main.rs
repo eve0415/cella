@@ -1094,6 +1094,29 @@ mod tests {
         let cli = parse(&["cella", "up", "--omit-config-remote-env-from-metadata"]).unwrap();
         assert!(matches!(cli.command, super::commands::Command::Up(_)));
     }
+
+    // ── features info --log-level wiring ────────────────────────────
+
+    #[test]
+    fn features_info_log_level_feeds_global_filter() {
+        let cli = parse(&[
+            "cella",
+            "features",
+            "info",
+            "dependencies",
+            "ghcr.io/devcontainers/features/node:1",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        assert!(
+            matches!(
+                cli.command.log_level(),
+                Some(super::commands::LogLevel::Debug)
+            ),
+            "features info --log-level must reach Command::log_level()"
+        );
+    }
 }
 
 // ── log directive / spinner predicate helpers ───────────────────────

@@ -225,6 +225,18 @@ fn parse_norm_ref(reference: &str) -> Result<NormalizedRef, FeatureError> {
                 reason: "expected registry/repository format".to_owned(),
             })?;
 
+    // Digest-pinned references (`repo@sha256:<hex>`) carry a `:` inside the
+    // digest. Splitting on it would treat the hex as a tag and `@sha256` as
+    // part of the repository, fetching the wrong artifact. Reject them
+    // explicitly rather than silently resolving the wrong target — dependency
+    // graphs don't yet resolve digest pins.
+    if rest.contains('@') {
+        return Err(FeatureError::InvalidReference {
+            reference: reference.to_owned(),
+            reason: "digest-pinned dependency references are not supported".to_owned(),
+        });
+    }
+
     let (repository, tag) = rest.rsplit_once(':').map_or_else(
         || (rest.to_owned(), "latest".to_owned()),
         |(r, t)| (r.to_owned(), t.to_owned()),
@@ -375,5 +387,17 @@ mod tests {
     #[test]
     fn parse_norm_ref_no_slash_errors() {
         assert!(parse_norm_ref("not-valid").is_err());
+    }
+
+    #[test]
+    fn parse_norm_ref_rejects_digest() {
+        // A digest pin must not be silently mis-parsed (repo `node@sha256`,
+        // tag `<hex>`); it should be rejected explicitly.
+        let err = parse_norm_ref(
+            "ghcr.io/devcontainers/features/node@sha256:\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap_err();
+        assert!(matches!(err, FeatureError::InvalidReference { .. }));
     }
 }

@@ -5,6 +5,7 @@
 
 use oci_distribution::Reference;
 use oci_distribution::client::{ClientConfig, ClientProtocol};
+use oci_distribution::errors::OciDistributionError;
 use tracing::debug;
 
 use crate::build_registry_auth;
@@ -114,11 +115,13 @@ pub async fn fetch_published_tags(reference: &str) -> miette::Result<Vec<String>
         {
             Ok(response) => response,
             // A follow-up page can fail on registries that answer the final
-            // page with `{"tags": null}` (e.g. GHCR when the previous page
-            // was exactly full): treat it as end-of-list instead of failing
-            // the whole listing.
-            Err(e) if !all_tags.is_empty() => {
-                debug!("treating tag pagination error as end-of-list: {e}");
+            // page with `{"tags": null}` (e.g. GHCR when the previous page was
+            // exactly full): the null body fails JSON deserialization. Treat
+            // *only* that case as end-of-list. Network/auth/registry errors
+            // must propagate — otherwise a transient failure on page 2+ would
+            // silently truncate the listing and look like a complete result.
+            Err(OciDistributionError::JsonError(_)) if !all_tags.is_empty() => {
+                debug!("treating null-tags deserialization on follow-up page as end-of-list");
                 break;
             }
             Err(e) => {

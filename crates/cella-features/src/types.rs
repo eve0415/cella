@@ -1,6 +1,6 @@
 //! Core types shared across the cella-features crate.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Target platform for multi-arch feature resolution.
@@ -33,7 +33,10 @@ pub struct FeatureMetadata {
     ///
     /// Keys are feature reference strings; values are the options map to pass to
     /// that feature (arbitrary JSON — `string | boolean | object` per spec).
-    pub depends_on: HashMap<String, serde_json::Value>,
+    ///
+    /// A `BTreeMap` keeps iteration order stable so dependency-graph rendering
+    /// (e.g. the Mermaid diagram) is deterministic across runs.
+    pub depends_on: BTreeMap<String, serde_json::Value>,
     /// Soft ordering hints declared via `installsAfter`.
     pub installs_after: Vec<String>,
     pub container_user: Option<String>,

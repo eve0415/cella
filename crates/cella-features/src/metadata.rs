@@ -1,6 +1,6 @@
 //! Parser for `devcontainer-feature.json` metadata files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -53,8 +53,10 @@ struct FeatureMetadataDto {
     options: HashMap<String, FeatureOptionDto>,
     /// Hard dependencies: `Record<featureId, options>` where options is
     /// `string | boolean | Record<string, string | boolean>`.
+    ///
+    /// `BTreeMap` for deterministic iteration (stable dependency-graph output).
     #[serde(default)]
-    depends_on: HashMap<String, serde_json::Value>,
+    depends_on: BTreeMap<String, serde_json::Value>,
     /// Soft ordering hints: array of feature reference strings.
     #[serde(default)]
     installs_after: Vec<String>,

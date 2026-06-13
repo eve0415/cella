@@ -9,6 +9,7 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
+use crate::commands::LogLevel;
 use cella_features::graph::{build_dependency_graph, render_mermaid};
 use cella_oci::{fetch_manifest_with_digest, fetch_published_tags};
 
@@ -27,7 +28,7 @@ pub struct InfoArgs {
 
     /// Log verbosity.
     #[arg(long, default_value = "info")]
-    pub log_level: InfoLogLevel,
+    pub log_level: LogLevel,
 
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
@@ -45,14 +46,6 @@ pub enum InfoMode {
     Dependencies,
     /// Show manifest + tags + dependency graph.
     Verbose,
-}
-
-/// Log level for the info command (mirrors the official CLI's `--log-level`).
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum InfoLogLevel {
-    Info,
-    Debug,
-    Trace,
 }
 
 /// Output format.
@@ -183,7 +176,8 @@ impl InfoArgs {
                     Ok((m, d)) => (m, build_canonical_id(&self.feature, &d)),
                     Err(e) => return Err(manifest_fetch_error(e, self.output_format)),
                 };
-                let published_tags = tags_result.unwrap_or_default();
+                let published_tags =
+                    tags_result.map_err(|e| tags_fetch_error(e, self.output_format))?;
                 let out = VerboseOutput {
                     manifest,
                     canonical_id,
