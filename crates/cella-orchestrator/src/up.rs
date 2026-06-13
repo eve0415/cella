@@ -9,6 +9,7 @@ use cella_backend::agent::restart_agent_in_container;
 use cella_backend::{
     BackendError, ContainerBackend, ContainerInfo, ContainerState, ExecOptions, FileToUpload,
     ImageDetails, LifecycleContext, MountConfig, agent_env_vars, container_labels,
+    lexical_absolute,
 };
 
 use crate::config::{HostRequirementPolicy, ImageStrategy, NetworkRulePolicy, UpConfig};
@@ -2045,11 +2046,24 @@ impl EnsureUpContext<'_> {
         }
 
         // With --id-label, find by AND-matched labels (matching the official
-        // CLI); otherwise fall back to the workspace-path lookup.
+        // CLI). Without --id-label, try the spec identity (local_folder +
+        // config_file) first so we reuse exactly the right container in a
+        // multi-config workspace and can find containers VS Code / the official
+        // CLI created. Fall back to cella's own workspace-path lookup for
+        // older containers that were created without the spec-identity labels.
         let existing = if self.config.id_labels.is_empty() {
-            self.client
-                .find_container(&self.config.resolved.workspace_root)
-                .await?
+            let spec_labels = spec_identity_labels(
+                &self.config.resolved.workspace_root,
+                &self.config.resolved.config_path,
+            );
+            match self.client.find_container_by_labels(&spec_labels).await? {
+                Some(c) => Some(c),
+                None => {
+                    self.client
+                        .find_container(&self.config.resolved.workspace_root)
+                        .await?
+                }
+            }
         } else {
             self.client
                 .find_container_by_labels(self.config.id_labels)
@@ -2103,6 +2117,25 @@ impl EnsureUpContext<'_> {
                 (_, false) => {
                     self.client.remove_container(&container.id, false).await?;
                 }
+            }
+
+            // If we're about to create a fresh container and the one we just
+            // removed had a different name (e.g. a VS Code / official-CLI
+            // container matched by spec-identity), a legacy cella container for
+            // the same workspace may still hold our target name. Remove it now
+            // to avoid a Docker name-conflict on create.
+            if remove_container
+                && container.name != self.config.container_name
+                && let Some(legacy) = self
+                    .client
+                    .find_container(&self.config.resolved.workspace_root)
+                    .await?
+                && legacy.name == self.config.container_name
+            {
+                if legacy.state == ContainerState::Running {
+                    let _ = self.client.stop_container(&legacy.id).await;
+                }
+                let _ = self.client.remove_container(&legacy.id, false).await;
             }
         }
 
@@ -2405,6 +2438,29 @@ fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
         .file_uploads
         .iter()
         .any(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH)
+}
+
+/// Build the two spec-standard identity labels used to uniquely identify a
+/// devcontainer in a multi-config workspace and to match containers created
+/// by VS Code / the official CLI.
+///
+/// Both values are LEXICAL absolute paths — identical to what `container_labels`
+/// stamps via the same `lexical_absolute` function, so the lookup and the stamp
+/// are guaranteed to produce byte-identical strings.
+fn spec_identity_labels(
+    workspace_root: &std::path::Path,
+    config_path: &std::path::Path,
+) -> [String; 2] {
+    [
+        format!(
+            "devcontainer.local_folder={}",
+            lexical_absolute(workspace_root).to_string_lossy()
+        ),
+        format!(
+            "devcontainer.config_file={}",
+            lexical_absolute(config_path).to_string_lossy()
+        ),
+    ]
 }
 
 /// Resolve `remoteEnv` to a `KEY=value` vec for lifecycle command injection.
@@ -2752,5 +2808,41 @@ mod tests {
         // Numeric strings ("9000") are accepted; out-of-range (70000) and
         // "host:port" forms ("db:5432") are dropped by the number-only path.
         assert_eq!(ports, vec![3000, 8080, 9000]);
+    }
+
+    // ── spec_identity_labels ──────────────────────────────────────
+
+    /// `spec_identity_labels` produces the exact label strings that
+    /// `container_labels` stamps — format must stay `key=value` with no
+    /// leading/trailing whitespace, matching the bollard filter wire format.
+    #[test]
+    fn spec_identity_labels_produces_correct_format() {
+        let workspace = std::path::Path::new("/tmp/my-project");
+        let config = std::path::Path::new("/tmp/my-project/.devcontainer/devcontainer.json");
+
+        let [lf, cf] = spec_identity_labels(workspace, config);
+
+        // Literal expected strings — if the format changes, the test breaks.
+        assert_eq!(lf, "devcontainer.local_folder=/tmp/my-project");
+        assert_eq!(
+            cf,
+            "devcontainer.config_file=/tmp/my-project/.devcontainer/devcontainer.json"
+        );
+    }
+
+    /// Paths with `..` segments are normalised lexically, not via the
+    /// filesystem, matching the official CLI's `path.resolve` semantics.
+    #[test]
+    fn spec_identity_labels_normalise_dot_dot() {
+        let workspace = std::path::Path::new("/tmp/a/../b");
+        let config = std::path::Path::new("/tmp/a/../b/.devcontainer/devcontainer.json");
+
+        let [lf, cf] = spec_identity_labels(workspace, config);
+
+        assert_eq!(lf, "devcontainer.local_folder=/tmp/b");
+        assert_eq!(
+            cf,
+            "devcontainer.config_file=/tmp/b/.devcontainer/devcontainer.json"
+        );
     }
 }
