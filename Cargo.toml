@@ -88,6 +88,7 @@ bollard = "=0.21.0"
 # Hashing
 sha2 = "=0.11.0"
 hex = "=0.4.3"
+olpc-cjson = "=0.1.4"
 
 # Stream processing
 futures-util = "=0.3.32"
@@ -121,6 +122,9 @@ oci-distribution = { version = "=0.11.0", default-features = false, features = [
 
 # Pattern matching
 regex = "=1.12.4"
+
+# Semantic versioning
+semver = "=1.0.28"
 glob = "=0.3.3"
 
 # JSONC editing
