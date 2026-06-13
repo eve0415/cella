@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use flate2::read::GzDecoder;
+use futures_util::StreamExt as _;
 use tracing::debug;
 
 use crate::Platform;
@@ -50,7 +51,7 @@ impl FeatureFetcher for HttpFetcher {
         }
 
         // Step 2: download the tarball.
-        let bytes = reqwest::get(url)
+        let response = reqwest::get(url)
             .await
             .map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
@@ -60,13 +61,40 @@ impl FeatureFetcher for HttpFetcher {
             .map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
                 message: format!("HTTP error status: {e}"),
-            })?
-            .bytes()
-            .await
-            .map_err(|e| FeatureError::FetchFailed {
+            })?;
+
+        // Pre-check declared Content-Length before streaming.
+        if let Some(content_length) = response.content_length()
+            && content_length > cella_oci::MAX_BLOB_COMPRESSED_BYTES
+        {
+            return Err(FeatureError::FetchFailed {
+                url: url.clone(),
+                message: format!(
+                    "tarball download exceeds size limit: {content_length} bytes > {} bytes",
+                    cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                ),
+            });
+        }
+
+        // Stream body with a running byte counter to enforce the cap.
+        let mut stream = response.bytes_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
                 message: format!("failed to read response body: {e}"),
             })?;
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > cella_oci::MAX_BLOB_COMPRESSED_BYTES {
+                return Err(FeatureError::FetchFailed {
+                    url: url.clone(),
+                    message: format!(
+                        "tarball download exceeds size limit of {} bytes",
+                        cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                    ),
+                });
+            }
+        }
 
         debug!("downloaded {} bytes from {url}", bytes.len());
 
@@ -89,7 +117,8 @@ impl FeatureFetcher for HttpFetcher {
         })?;
 
         let gz = GzDecoder::new(&bytes[..]);
-        let mut archive = tar::Archive::new(gz);
+        let limited_gz = cella_oci::LimitedReader::new(gz, cella_oci::MAX_BLOB_DECOMPRESSED_BYTES);
+        let mut archive = tar::Archive::new(limited_gz);
         archive.unpack(&staging).map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
             FeatureError::FetchFailed {
