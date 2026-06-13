@@ -122,7 +122,10 @@ pub async fn publish(
     opts: &PublishOptions,
 ) -> Result<HashMap<String, FeaturePublishResult>, PublishError> {
     let tmp = tempfile::tempdir().map_err(PublishError::Io)?;
-    let output_folder = tmp.path().to_owned();
+    // Use a fresh, not-yet-existing child dir: `package` rejects a
+    // pre-existing output folder when `force_clean_output_folder` is false,
+    // and `tempdir()` already created `tmp.path()`.
+    let output_folder = tmp.path().join("packaged");
 
     let package_result = package(&PackageOptions {
         target: opts.target.clone(),
