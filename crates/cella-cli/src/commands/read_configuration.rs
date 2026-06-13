@@ -212,7 +212,7 @@ fn build_merged_output(
     let fc = rf.map(|r| &r.container_config);
 
     // --- Lifecycle plural arrays (ALWAYS emitted, even empty) ---
-    // Order: base config's command first, then features in install order.
+    // Order: features in install order, then the devcontainer.json command last.
     merged["onCreateCommands"] = lifecycle_commands_array(config, "onCreateCommand", fc);
     merged["updateContentCommands"] = lifecycle_commands_array(config, "updateContentCommand", fc);
     merged["postCreateCommands"] = lifecycle_commands_array(config, "postCreateCommand", fc);
@@ -260,6 +260,21 @@ fn build_merged_output(
         fc.map(|c| c.security_opt.as_slice()),
     );
 
+    // --- containerEnv: feature contributions merged over the base (last wins) ---
+    if let Some(fc) = fc
+        && !fc.container_env.is_empty()
+    {
+        let mut env_map = config
+            .get("containerEnv")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in &fc.container_env {
+            env_map.insert(k.clone(), json!(v));
+        }
+        merged["containerEnv"] = serde_json::Value::Object(env_map);
+    }
+
     // --- customizations: Record<tool, contributions[]> ---
     apply_merged_customizations(&mut merged, config, rf);
 
@@ -268,10 +283,12 @@ fn build_merged_output(
 
 /// Build a lifecycle plural-array value from base config + feature entries.
 ///
-/// The official spec collects raw command values verbatim from the image metadata
-/// array (which has base config first, then features in install order for the
-/// merged-config output). We replicate that order: base config command first,
-/// then each feature's command from `FeatureContainerConfig.lifecycle`.
+/// The official `mergeConfiguration` collects raw command values verbatim from
+/// the image-metadata array `[base-image…, features in install order,
+/// devcontainer.json]` — so the devcontainer.json command is collected LAST.
+/// `merge_with_devcontainer` already builds `fc.lifecycle.*` in exactly that
+/// order (devcontainer.json appended last), so we emit those entries verbatim.
+/// With no features, the devcontainer.json command is the sole element.
 fn lifecycle_commands_array(
     config: &serde_json::Value,
     singular_key: &str,
@@ -279,12 +296,6 @@ fn lifecycle_commands_array(
 ) -> serde_json::Value {
     let mut commands: Vec<serde_json::Value> = Vec::new();
 
-    // Base config's command first.
-    if let Some(cmd) = config.get(singular_key).filter(|v| !v.is_null()) {
-        commands.push(cmd.clone());
-    }
-
-    // Then each feature's commands in install order.
     if let Some(fc) = fc {
         let feature_entries = match singular_key {
             "onCreateCommand" => &fc.lifecycle.on_create,
@@ -294,13 +305,13 @@ fn lifecycle_commands_array(
             "postAttachCommand" => &fc.lifecycle.post_attach,
             _ => return json!(commands),
         };
-        // lifecycle entries include devcontainer.json entry appended last by
-        // merge_with_devcontainer; skip it since we already added it above.
+        // Already ordered features-then-devcontainer.json by the merge step.
         for entry in feature_entries {
-            if entry.origin != "devcontainer.json" {
-                commands.push(entry.command.clone());
-            }
+            commands.push(entry.command.clone());
         }
+    } else if let Some(cmd) = config.get(singular_key).filter(|v| !v.is_null()) {
+        // No features resolved: the devcontainer.json command is the only entry.
+        commands.push(cmd.clone());
     }
 
     json!(commands)
@@ -556,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_output_lifecycle_base_first_then_features() {
+    fn merged_output_lifecycle_features_then_devcontainer_last() {
         use cella_features::types::{
             FeatureContainerConfig, FeatureLifecycle, LifecycleEntry, ResolvedFeature,
         };
@@ -571,6 +582,8 @@ mod tests {
         // Simulate two features each contributing onCreateCommand
         let fc = FeatureContainerConfig {
             lifecycle: FeatureLifecycle {
+                // As merge_with_devcontainer builds it: features in install
+                // order, then the devcontainer.json entry appended LAST.
                 on_create: vec![
                     LifecycleEntry {
                         origin: "feat-a".to_string(),
@@ -579,6 +592,10 @@ mod tests {
                     LifecycleEntry {
                         origin: "feat-b".to_string(),
                         command: json!("echo feat-b"),
+                    },
+                    LifecycleEntry {
+                        origin: "devcontainer.json".to_string(),
+                        command: json!("echo base"),
                     },
                 ],
                 ..Default::default()
@@ -621,10 +638,11 @@ mod tests {
 
         let out = build_merged_output(&config, Some(&rf));
 
-        // base config command first, then features in install order
+        // Features in install order, then the devcontainer.json command LAST
+        // (matches official mergeConfiguration's metadata-array order).
         assert_eq!(
             out["onCreateCommands"],
-            json!(["echo base", "echo feat-a", "echo feat-b"])
+            json!(["echo feat-a", "echo feat-b", "echo base"])
         );
         assert!(out.get("onCreateCommand").is_none());
     }
@@ -784,6 +802,34 @@ mod tests {
     // -------------------------------------------------------------------------
     // build_merged_output — init / privileged OR
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_container_env_merges_feature_over_base() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+        use std::collections::HashMap;
+
+        let config =
+            json!({ "image": "ubuntu", "containerEnv": { "BASE": "1", "SHARED": "base" } });
+        let fc = FeatureContainerConfig {
+            container_env: HashMap::from([
+                ("FEAT".to_string(), "2".to_string()),
+                ("SHARED".to_string(), "feature".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+        };
+        let out = build_merged_output(&config, Some(&rf));
+        // Base-only key survives, feature key added, feature wins the collision.
+        assert_eq!(out["containerEnv"]["BASE"], json!("1"));
+        assert_eq!(out["containerEnv"]["FEAT"], json!("2"));
+        assert_eq!(out["containerEnv"]["SHARED"], json!("feature"));
+    }
 
     #[test]
     fn merged_output_init_or_semantics() {
