@@ -427,6 +427,45 @@ impl EnsureUpContext<'_> {
         Ok(())
     }
 
+    /// Seed lifecycle state markers for a container created by an external tool
+    /// (VS Code / official CLI) that lacks cella's `/tmp/.cella/` markers.
+    ///
+    /// External containers have no `dev.cella.workspace_path` label. Their
+    /// `/tmp/.cella/lifecycle_state.json` and `/tmp/.cella/content_hash` files
+    /// don't exist, so `run_prebuilt_oncreate_if_needed` would re-run onCreate
+    /// and `check_and_run_content_update` would re-run updateContent + postCreate
+    /// — duplicating or corrupting non-idempotent lifecycle hooks.
+    ///
+    /// This writes `oncreate_done = true` and stamps the current workspace
+    /// content hash so cella treats the container as fully initialized, matching
+    /// the state a cella-created container would have after its first-create
+    /// lifecycle.
+    async fn seed_external_lifecycle_markers(&self, container: &ContainerInfo, remote_user: &str) {
+        // Only seed when the container was NOT created by cella. Cella-managed
+        // containers already have these files; overwriting them would clear the
+        // real oncreate state and reset the content-hash gate.
+        if container.labels.contains_key("dev.cella.workspace_path") {
+            return;
+        }
+
+        debug!(
+            "Seeding lifecycle markers for external container {} (not cella-managed)",
+            container.id
+        );
+
+        let state = LifecycleState {
+            oncreate_done: true,
+        };
+        write_lifecycle_state(self.client, &container.id, remote_user, &state).await;
+        write_content_hash(
+            self.client,
+            &container.id,
+            remote_user,
+            &self.config.resolved.workspace_root,
+        )
+        .await;
+    }
+
     async fn handle_running(
         &self,
         container: &ContainerInfo,
@@ -488,6 +527,12 @@ impl EnsureUpContext<'_> {
         let (_probed_env, lifecycle_env) = self
             .prepare_container_env(&container.id, remote_user)
             .await?;
+
+        // Seed lifecycle markers for external (non-cella) containers so that
+        // onCreate/updateContent/postCreate don't re-run against a container that
+        // has already been fully initialized by VS Code or the official CLI.
+        self.seed_external_lifecycle_markers(container, remote_user)
+            .await;
 
         let metadata = container.labels.get("devcontainer.metadata");
 
@@ -554,6 +599,13 @@ impl EnsureUpContext<'_> {
         let (_probed_env, lifecycle_env) = self
             .prepare_container_env(&container.id, remote_user)
             .await?;
+
+        // Seed lifecycle markers for external (non-cella) containers so that
+        // onCreate/updateContent/postCreate don't re-run against a container that
+        // has already been fully initialized by VS Code or the official CLI.
+        self.seed_external_lifecycle_markers(container, remote_user)
+            .await;
+
         let metadata = container.labels.get("devcontainer.metadata");
 
         if let Some(meta) = metadata {

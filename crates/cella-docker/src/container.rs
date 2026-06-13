@@ -31,11 +31,9 @@ pub(crate) fn container_state_from_bollard(status: ContainerStateStatusEnum) -> 
     }
 }
 
-/// Convert a bollard `ContainerSummary` into a `ContainerInfo`.
-///
 /// Make `path` absolute and lexically normalized — the Rust equivalent of
 /// Node's `path.resolve(path)` (collapses `.`/`..` textually, never follows
-/// symlinks). Used to match the spec `devcontainer.local_folder` label the
+/// symlinks). Used to match the spec `devcontainer.local_folder` label that the
 /// official CLI / VS Code stamp, which is `path.resolve`-derived.
 fn lexical_absolute(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
@@ -62,6 +60,8 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     out
 }
 
+/// Convert a bollard `ContainerSummary` into a `ContainerInfo`.
+///
 /// Used by both `find_container` and `list_cella_containers` to avoid
 /// duplicating the field-mapping logic.
 pub(crate) fn container_info_from_summary(
@@ -113,7 +113,13 @@ pub(crate) fn container_info_from_summary(
 }
 
 impl DockerClient {
-    /// Find an existing cella container by workspace path label.
+    /// Find an existing container for the given workspace.
+    ///
+    /// Tries two label strategies in order:
+    /// 1. `dev.cella.workspace_path` — cella's own canonical label (backward compatible).
+    /// 2. `devcontainer.local_folder` — the spec label stamped by the official CLI / VS Code.
+    ///    Matching this lets `cella up` reuse a container another tool created in the same
+    ///    workspace instead of creating a duplicate.
     ///
     /// # Errors
     ///
@@ -1597,5 +1603,75 @@ mod tests {
         let info = container_info_from_summary(summary);
         let created = info.created_at.unwrap();
         assert!(created.contains("1970"), "epoch should be 1970: {created}");
+    }
+
+    // -----------------------------------------------------------------------
+    // External container detection — regression for the spec-label reuse path
+    // -----------------------------------------------------------------------
+
+    /// Containers created by VS Code / the official CLI have `devcontainer.local_folder`
+    /// but NOT `dev.cella.workspace_path`. Cella uses the absence of the latter to
+    /// detect "external" containers and seed lifecycle markers instead of re-running
+    /// onCreate/updateContent/postCreate hooks.
+    #[test]
+    fn external_container_has_no_cella_workspace_path_label() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "devcontainer.local_folder".to_string(),
+            "/home/user/project".to_string(),
+        );
+        labels.insert(
+            "devcontainer.config_file".to_string(),
+            "/home/user/project/.devcontainer/devcontainer.json".to_string(),
+        );
+
+        let summary = make_summary(
+            Some("ext-id"),
+            Some(vec!["/external-container"]),
+            Some("mcr.microsoft.com/devcontainers/base:ubuntu"),
+            Some(ContainerSummaryStateEnum::RUNNING),
+            Some(labels),
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+
+        assert!(
+            !info.labels.contains_key("dev.cella.workspace_path"),
+            "external container must NOT have dev.cella.workspace_path"
+        );
+        assert!(
+            info.labels.contains_key("devcontainer.local_folder"),
+            "external container must have devcontainer.local_folder"
+        );
+    }
+
+    #[test]
+    fn cella_managed_container_has_workspace_path_label() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "dev.cella.workspace_path".to_string(),
+            "/home/user/project".to_string(),
+        );
+        labels.insert(
+            "devcontainer.local_folder".to_string(),
+            "/home/user/project".to_string(),
+        );
+
+        let summary = make_summary(
+            Some("cella-id"),
+            Some(vec!["/cella-container"]),
+            Some("ubuntu:22.04"),
+            Some(ContainerSummaryStateEnum::RUNNING),
+            Some(labels),
+            None,
+            None,
+        );
+        let info = container_info_from_summary(summary);
+
+        assert!(
+            info.labels.contains_key("dev.cella.workspace_path"),
+            "cella-managed container must have dev.cella.workspace_path"
+        );
     }
 }
