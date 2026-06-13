@@ -720,6 +720,14 @@
 				"target": {
 					"type": "string",
 					"description": "Mount target."
+				},
+				"external": {
+					"type": "boolean",
+					"description": "Whether the volume is externally managed (pre-existing). When true, the tooling will not create or remove the volume."
+				},
+				"readOnly": {
+					"type": "boolean",
+					"description": "Whether the mount is read-only."
 				}
 			},
 			"required": [

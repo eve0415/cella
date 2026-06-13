@@ -64,6 +64,13 @@ pub fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
                     .get("readOnly")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                // `external: true` marks a pre-existing volume (don't auto-create);
+                // part of the official `Mount` object schema, same as the string
+                // form's `external=true`.
+                let external = obj
+                    .get("external")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
 
                 if target.is_empty() {
                     return None;
@@ -75,7 +82,7 @@ pub fn map_additional_mounts(config: &serde_json::Value) -> Vec<MountConfig> {
                     target,
                     consistency: None,
                     read_only,
-                    external: false,
+                    external,
                 })
             }
             _ => None,
@@ -247,6 +254,31 @@ mod tests {
     }
 
     // ── external field ────────────────────────────────────────────
+
+    #[test]
+    fn map_additional_mounts_honors_external_object() {
+        let config = json!({
+            "mounts": [
+                {"type": "volume", "source": "myvol", "target": "/data", "external": true}
+            ]
+        });
+        let mounts = map_additional_mounts(&config);
+        assert_eq!(mounts.len(), 1);
+        assert!(
+            mounts[0].external,
+            "object-form external:true must propagate to MountConfig"
+        );
+    }
+
+    #[test]
+    fn map_additional_mounts_external_defaults_false_object() {
+        let config = json!({
+            "mounts": [{"type": "volume", "source": "myvol", "target": "/data"}]
+        });
+        let mounts = map_additional_mounts(&config);
+        assert_eq!(mounts.len(), 1);
+        assert!(!mounts[0].external, "absent external must default to false");
+    }
 
     #[test]
     fn parse_mount_string_external_true() {
