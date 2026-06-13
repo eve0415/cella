@@ -18,6 +18,7 @@ pub mod index;
 pub mod metadata;
 mod oci_ref;
 pub mod options;
+pub mod publish;
 pub mod tags;
 pub mod types;
 
