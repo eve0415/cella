@@ -103,34 +103,55 @@ fn app_port_item_to_forward(value: &serde_json::Value) -> Option<(String, PortFo
 /// - `"3000"`             → key `"3000/tcp"`, `host_ip` None, `host_port` None
 /// - `"8080:80"`          → key `"80/tcp"`, `host_ip` None, `host_port` Some("8080")
 /// - `"127.0.0.1:3000:3000"` → key `"3000/tcp"`, `host_ip` Some("127.0.0.1"), `host_port` Some("3000")
+/// - `"[::1]:8080:80"`    → key `"80/tcp"`, `host_ip` `Some("::1")`, `host_port` `Some("8080")`
 /// - `"5000/udp"`         → key `"5000/udp"`, `host_ip` None, `host_port` None
 fn parse_docker_p_spec(spec: &str) -> Option<(String, PortForward)> {
-    // Split off optional /proto suffix
+    // Split off optional /proto suffix.
     let (addr_part, proto) = spec.rsplit_once('/').map_or((spec, "tcp"), |(a, p)| (a, p));
 
-    let parts: Vec<&str> = addr_part.splitn(3, ':').collect();
-
-    let (host_ip, host_port, container_port) = match parts.as_slice() {
-        // "containerPort"
-        [cp] => (None, None, (*cp).to_string()),
-        // "hostPort:containerPort"
-        [hp, cp] => (None, Some((*hp).to_string()), (*cp).to_string()),
-        // "ip:hostPort:containerPort"
-        [ip, hp, cp] => (
-            Some((*ip).to_string()),
-            Some((*hp).to_string()),
-            (*cp).to_string(),
-        ),
-        _ => return None,
+    let (host_ip, host_port, container_port) = if addr_part.starts_with('[') {
+        // Bracketed IPv6: "[ip]:hostPort:containerPort" (hostPort may be empty).
+        parse_bracketed_ipv6(addr_part)?
+    } else {
+        match addr_part.splitn(3, ':').collect::<Vec<_>>().as_slice() {
+            [cp] => (None, None, (*cp).to_string()),
+            [hp, cp] => (None, Some((*hp).to_string()), (*cp).to_string()),
+            [ip, hp, cp] => (
+                Some((*ip).to_string()),
+                Some((*hp).to_string()),
+                (*cp).to_string(),
+            ),
+            _ => return None,
+        }
     };
 
-    // Validate that container_port is non-empty
     if container_port.is_empty() {
         return None;
     }
 
+    // An empty host IP / host port means "let Docker choose" — normalize to None
+    // so the binding is structurally unambiguous.
+    let host_ip = host_ip.filter(|s| !s.is_empty());
+    let host_port = host_port.filter(|s| !s.is_empty());
+
     let key = format!("{container_port}/{proto}");
     Some((key, PortForward { host_ip, host_port }))
+}
+
+/// Parse a bracketed-IPv6 Docker `-p` address part: `[ip]:hostPort:containerPort`.
+/// Returns the bare IP (no brackets), host port, and container port.
+fn parse_bracketed_ipv6(addr_part: &str) -> Option<(Option<String>, Option<String>, String)> {
+    let inner = addr_part.strip_prefix('[')?;
+    let (ip, after) = inner.split_once(']')?;
+    // Docker requires the host-port slot when an IP is given (it may be empty):
+    // the tail is ":hostPort:containerPort".
+    let tail = after.strip_prefix(':')?;
+    let (host_port, container_port) = tail.split_once(':')?;
+    Some((
+        Some(ip.to_string()),
+        Some(host_port.to_string()),
+        container_port.to_string(),
+    ))
 }
 
 /// Parse `portsAttributes` from devcontainer.json.
@@ -503,6 +524,38 @@ mod tests {
         assert_eq!(fwd.len(), 1);
         assert_eq!(fwd[0].host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(fwd[0].host_port.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn app_port_string_bracketed_ipv6() {
+        // "[::1]:8080:80" → ip ::1 (brackets stripped), host 8080, container 80
+        let config = json!({"appPort": "[::1]:8080:80"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["80/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip.as_deref(), Some("::1"));
+        assert_eq!(fwd[0].host_port.as_deref(), Some("8080"));
+    }
+
+    #[test]
+    fn app_port_string_ipv6_empty_host_port_is_ephemeral() {
+        // "[::1]::80" → ip ::1, empty host port normalized to None
+        let config = json!({"appPort": "[::1]::80"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["80/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip.as_deref(), Some("::1"));
+        assert_eq!(fwd[0].host_port, None);
+    }
+
+    #[test]
+    fn app_port_string_empty_host_port_is_ephemeral() {
+        // ":80" → empty host port normalized to None
+        let config = json!({"appPort": ":80"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["80/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_port, None);
     }
 
     #[test]
