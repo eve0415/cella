@@ -548,10 +548,13 @@ fn apply_lockfile_policy(
     }
     match policy {
         LockfilePolicy::NoLockfile => Ok(None),
-        LockfilePolicy::Update | LockfilePolicy::Upgrade => {
+        LockfilePolicy::Update => {
             write_lockfile(config_path, &generated)?;
             Ok(Some(generated))
         }
+        // `upgrade` regenerates the lockfile but the caller decides whether to
+        // write it (so `upgrade --dry-run` can print without touching disk).
+        LockfilePolicy::Upgrade => Ok(Some(generated)),
         LockfilePolicy::Frozen => {
             let existing = existing.ok_or(FeatureError::Lockfile(LockfileError::Missing))?;
             compare_lockfile(&existing, &generated).map_err(FeatureError::Lockfile)?;

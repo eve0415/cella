@@ -60,7 +60,9 @@ pub enum LockfilePolicy {
     NoLockfile,
     /// Require the lockfile to match; fail if missing or different.
     Frozen,
-    /// Resolve fresh and write a new lockfile (for `upgrade` command).
+    /// Resolve fresh (ignoring any locked digests) and return the regenerated
+    /// lockfile WITHOUT writing it — the `upgrade` command writes or prints it
+    /// itself so `--dry-run` never touches disk.
     Upgrade,
 }
 
