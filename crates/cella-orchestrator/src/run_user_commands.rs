@@ -209,7 +209,11 @@ async fn maybe_install_dotfiles(lc_ctx: &LifecycleContext<'_>, input: &RunUserCo
     )
     .await
     {
-        tracing::warn!("dotfiles install failed: {e}");
+        // The dotfiles script runs with the secret-bearing lifecycle env;
+        // mask before logging so secret values don't leak.
+        let err_text = e.to_string();
+        let msg = lc_ctx.secret_masker.mask(&err_text);
+        tracing::warn!("Dotfiles install failed (continuing): {msg}");
     }
 }
 
