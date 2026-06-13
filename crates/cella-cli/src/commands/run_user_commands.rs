@@ -260,7 +260,10 @@ impl RunUserCommandsArgs {
             .map(PathBuf::from)
             .or_else(|| self.target.workspace_folder.clone());
 
-        let config = self.read_config(workspace.as_deref())?;
+        let resolved = self.read_config(workspace.as_deref())?;
+        let config = resolved
+            .as_ref()
+            .map_or_else(|| json!({}), |r| r.config.clone());
         let metadata = container.labels.get("devcontainer.metadata").cloned();
 
         // Official `getImageMetadataFromContainer` branches on `hasIdLabels`: a
@@ -294,8 +297,11 @@ impl RunUserCommandsArgs {
                 &*client,
                 &container.id,
                 &remote_user,
-                &config,
-                metadata.as_deref(),
+                &LifecycleConfigSources {
+                    config: &config,
+                    resolved: resolved.as_ref(),
+                    metadata: metadata.as_deref(),
+                },
                 &secrets,
             )
             .await;
@@ -327,27 +333,28 @@ impl RunUserCommandsArgs {
         status
     }
 
-    /// Read the devcontainer config. With `--config`/`--override-config`,
-    /// resolve it against the container's workspace; otherwise return an empty
-    /// object so lifecycle is sourced entirely from the container's metadata
-    /// label.
+    /// Resolve the on-disk devcontainer.json when `--config`/`--override-config`
+    /// is given. Returns the full [`ResolvedConfig`] (not just `.config`) so the
+    /// raw `remoteEnv` snapshot survives for live `${containerEnv:VAR}`
+    /// resolution. Returns `None` when no config path is provided — lifecycle is
+    /// sourced from the container's baked metadata label alone.
     fn read_config(
         &self,
         workspace: Option<&std::path::Path>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<resolve::ResolvedConfig>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(config_path) = self
             .config
             .override_config
             .as_deref()
             .or(self.config.config.as_deref())
         else {
-            return Ok(json!({}));
+            return Ok(None);
         };
         let ws = workspace
             .map(std::path::Path::to_path_buf)
             .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
             .ok_or("could not determine workspace folder for --config")?;
-        Ok(resolve::config(&ws, Some(config_path))?.config)
+        Ok(Some(resolve::config(&ws, Some(config_path))?))
     }
 
     /// Probe the user environment and build the lifecycle env with the official
@@ -369,17 +376,14 @@ impl RunUserCommandsArgs {
         client: &dyn cella_backend::ContainerBackend,
         container_id: &str,
         remote_user: &str,
-        config: &Value,
-        metadata: Option<&str>,
+        sources: &LifecycleConfigSources<'_>,
         secrets: &[String],
     ) -> Vec<String> {
-        // Order the vec for merge_env's later-wins insert: probed first
-        // (provided by merge_env), then CLI --remote-env, then the merged
-        // metadata+config remoteEnv last so it wins.
-        let mut remote_env = self.remote_env.clone();
-        remote_env.extend(orchestrator::metadata_remote_env(metadata));
-        remote_env.extend(map_env_object(config.get("remoteEnv")));
-
+        let LifecycleConfigSources {
+            config,
+            resolved,
+            metadata,
+        } = *sources;
         // userEnvProbe precedence mirrors official mergeConfiguration: the fresh
         // --config wins (it's in pickUpdateableConfigProperties, appended last in
         // every branch), then the baked metadata's value, then the CLI default.
@@ -393,6 +397,15 @@ impl RunUserCommandsArgs {
         let shell = detect_shell(client, container_id, remote_user).await;
         let probed =
             probe_and_cache_user_env(client, container_id, remote_user, probe_type, &shell).await;
+
+        // Order the vec for merge_env's later-wins insert: probed first
+        // (provided by merge_env), then CLI --remote-env, then metadata, then
+        // the on-disk config `remoteEnv` last so it wins. The config portion is
+        // resolved AFTER the probe so `${containerEnv:VAR}` resolves against the
+        // live container env (the baked metadata portion can't be un-collapsed).
+        let mut remote_env = self.remote_env.clone();
+        remote_env.extend(orchestrator::metadata_remote_env(metadata));
+        remote_env.extend(resolve_config_remote_env(config, resolved, probed.as_ref()));
 
         let mut lifecycle_env = probed.as_ref().map_or_else(
             || remote_env.clone(),
@@ -424,6 +437,36 @@ impl RunUserCommandsArgs {
                 config,
             ),
         }
+    }
+}
+
+/// The config sources `build_lifecycle_env` resolves `remoteEnv` from: the
+/// substituted on-disk config, the full resolved config (for the raw remoteEnv
+/// snapshot + substitution inputs), and the container's baked metadata label.
+#[derive(Clone, Copy)]
+struct LifecycleConfigSources<'a> {
+    config: &'a Value,
+    resolved: Option<&'a resolve::ResolvedConfig>,
+    metadata: Option<&'a str>,
+}
+
+/// Resolve the on-disk config `remoteEnv` into `K=V` strings, resolving live
+/// `${containerEnv:VAR}` tokens against the probed container env when the raw
+/// (pre-substitution) snapshot and a probe are both available. Falls back to
+/// the already-substituted config value otherwise (byte-identical to the
+/// prior behavior).
+fn resolve_config_remote_env(
+    config: &Value,
+    resolved: Option<&resolve::ResolvedConfig>,
+    probed: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    if let (Some(r), Some(p)) = (resolved, probed)
+        && let Some(raw) = r.raw_remote_env.as_ref()
+    {
+        let ctx = cella_config::config_map::subst_ctx(r).with_container_env(p.clone());
+        ctx.substitute_remote_env(raw)
+    } else {
+        map_env_object(config.get("remoteEnv"))
     }
 }
 
@@ -481,6 +524,45 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::collections::HashSet;
+
+    fn resolved_with_raw(raw: Option<Value>) -> resolve::ResolvedConfig {
+        resolve::ResolvedConfig {
+            config: json!({"remoteEnv": {"MYPATH": "phase1"}}),
+            config_path: PathBuf::from("/dev/null"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: String::new(),
+            devcontainer_id: "testid".to_string(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env: raw,
+        }
+    }
+
+    #[test]
+    fn resolve_config_remote_env_uses_probe_for_container_env() {
+        let raw = json!({"MYPATH": "${containerEnv:PATH}"});
+        let resolved = resolved_with_raw(Some(raw));
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/c/bin".to_string())].into();
+        let out = resolve_config_remote_env(&resolved.config, Some(&resolved), Some(&probed));
+        assert!(out.contains(&"MYPATH=/c/bin".to_string()), "got {out:?}");
+    }
+
+    #[test]
+    fn resolve_config_remote_env_falls_back_without_raw_or_probe() {
+        // No resolved/raw → uses the already-substituted config value (unchanged).
+        let config = json!({"remoteEnv": {"FOO": "bar"}});
+        assert_eq!(
+            resolve_config_remote_env(&config, None, None),
+            vec!["FOO=bar".to_string()]
+        );
+        // Raw present but no probe → still falls back.
+        let resolved = resolved_with_raw(Some(json!({"FOO": "${containerEnv:X}"})));
+        assert_eq!(
+            resolve_config_remote_env(&resolved.config, Some(&resolved), None),
+            map_env_object(resolved.config.get("remoteEnv"))
+        );
+    }
 
     // ── devcontainer-CLI flag parity ───────────────────────────────
     //
