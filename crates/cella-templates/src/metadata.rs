@@ -16,8 +16,10 @@ const METADATA_ANNOTATION: &str = "dev.containers.metadata";
 /// Fetch the `dev.containers.metadata` annotation from the OCI manifest for
 /// the given template reference.
 ///
-/// The template reference should be in the form `registry/repository[:tag]`
-/// (e.g. `ghcr.io/devcontainers/templates/alpine`).
+/// The template reference may be in the form `registry/repository[:tag]`
+/// (e.g. `ghcr.io/devcontainers/templates/alpine`) or pinned by digest
+/// (e.g. `ghcr.io/devcontainers/templates/alpine@sha256:<hex>`). A digest-pinned
+/// ref fetches the exact manifest by digest rather than by tag.
 ///
 /// Returns:
 /// - `Ok(Some(value))` — annotation found; the raw JSON string value.
@@ -28,11 +30,14 @@ const METADATA_ANNOTATION: &str = "dev.containers.metadata";
 ///
 /// Returns [`TemplateError`] for registry communication failures or invalid refs.
 pub async fn fetch_manifest_metadata(template_ref: &str) -> Result<Option<String>, TemplateError> {
-    let (registry, repository, tag) = parse_template_ref(template_ref)?;
+    let parsed = parse_template_ref(template_ref)?;
+    let registry = parsed.registry.clone();
+    let repository = parsed.repository.clone();
+    let version = parsed.version.as_str().to_owned();
 
-    let (client, oci_ref, auth) = build_oci_client(&registry, &repository, &tag);
+    let (client, oci_ref, auth) = build_oci_client(&parsed);
 
-    debug!("fetching manifest for template {registry}/{repository}:{tag}");
+    debug!("fetching manifest for template {registry}/{repository}@{version}");
 
     let (manifest, _digest) =
         client
@@ -40,7 +45,7 @@ pub async fn fetch_manifest_metadata(template_ref: &str) -> Result<Option<String
             .await
             .map_err(|e| TemplateError::RegistryError {
                 registry: registry.clone(),
-                message: format!("failed to pull manifest for {repository}:{tag}: {e}"),
+                message: format!("failed to pull manifest for {repository}:{version}: {e}"),
             })?;
 
     Ok(extract_metadata_annotation(&manifest))

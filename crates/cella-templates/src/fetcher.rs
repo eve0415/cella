@@ -28,24 +28,27 @@ pub async fn fetch_template(
     template_ref: &str,
     cache: &TemplateCache,
 ) -> Result<PathBuf, TemplateError> {
-    let (registry, repository, tag) = parse_template_ref(template_ref)?;
+    let parsed = parse_template_ref(template_ref)?;
+    let registry = parsed.registry.clone();
+    let repository = parsed.repository.clone();
+    let version = parsed.version.as_str().to_owned();
 
     // Check cache first
-    if let Some(cached) = cache.get_template(&registry, &repository, &tag) {
+    if let Some(cached) = cache.get_template(&registry, &repository, &version) {
         debug!("template cache hit for {template_ref}");
         return Ok(cached);
     }
 
-    let (client, oci_ref, auth) = build_oci_client(&registry, &repository, &tag);
+    let (client, oci_ref, auth) = build_oci_client(&parsed);
 
-    debug!("fetching template {registry}/{repository}:{tag}");
+    debug!("fetching template {registry}/{repository}@{version}");
 
     let (manifest, digest) = client
         .pull_image_manifest(&oci_ref, &auth)
         .await
         .map_err(|e| TemplateError::RegistryError {
             registry: registry.clone(),
-            message: format!("failed to pull manifest for {repository}:{tag}: {e}"),
+            message: format!("failed to pull manifest for {repository}:{version}: {e}"),
         })?;
 
     // Check cache by digest
