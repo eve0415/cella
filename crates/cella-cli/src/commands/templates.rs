@@ -41,7 +41,15 @@ pub enum TemplatesCommand {
 #[derive(Args)]
 pub struct TemplatesMetadataArgs {
     /// Template OCI reference (e.g. ghcr.io/devcontainers/templates/alpine).
-    pub template_id: String,
+    ///
+    /// Optional: the official CLI treats a missing/unresolvable ref as a
+    /// not-found result — it prints `{}` to stdout, warns, and exits 1 —
+    /// rather than erroring out with a clap usage message.
+    pub template_id: Option<String>,
+
+    /// Log verbosity level.
+    #[arg(long = "log-level", value_enum, default_value = "info")]
+    pub log_level: LogLevel,
 }
 
 /// Arguments for `cella templates apply`.
@@ -80,16 +88,19 @@ pub struct TemplatesApplyArgs {
 }
 
 impl TemplatesArgs {
-    /// Return the `--log-level` from the `apply` subcommand, if active.
+    /// Return the `--log-level` from whichever subcommand carries one (`apply`
+    /// or `metadata`), if active.
     ///
     /// Called by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and
     /// `run-user-commands`.
     pub const fn apply_log_level(&self) -> Option<LogLevel> {
-        if let TemplatesCommand::Apply(args) = &self.command {
-            Some(args.log_level)
-        } else {
-            None
+        match &self.command {
+            TemplatesCommand::Apply(args) => Some(args.log_level),
+            TemplatesCommand::Metadata(args) => Some(args.log_level),
+            TemplatesCommand::New { .. }
+            | TemplatesCommand::List
+            | TemplatesCommand::Edit { .. } => None,
         }
     }
 
@@ -178,7 +189,15 @@ impl TemplatesApplyArgs {
 
 impl TemplatesMetadataArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match metadata::fetch_manifest_metadata(&self.template_id).await {
+        // Official behavior: a missing or unresolvable ref is treated as a
+        // not-found result — print `{}` to stdout, warn on stderr, exit 1.
+        let Some(template_id) = self.template_id else {
+            eprintln!("error: no template identifier provided");
+            println!("{{}}");
+            std::process::exit(1);
+        };
+
+        match metadata::fetch_manifest_metadata(&template_id).await {
             Ok(Some(raw)) => match render_metadata_annotation(&raw) {
                 Ok(json) => {
                     println!("{json}");
@@ -192,8 +211,7 @@ impl TemplatesMetadataArgs {
             },
             Ok(None) => {
                 eprintln!(
-                    "Template resolved to '{}' but does not contain metadata on its manifest.",
-                    self.template_id
+                    "Template resolved to '{template_id}' but does not contain metadata on its manifest."
                 );
                 eprintln!(
                     "Ask the Template owner to republish this Template to populate the manifest."
@@ -512,12 +530,80 @@ mod tests {
     // TemplatesMetadataArgs
     // -----------------------------------------------------------------------
 
+    /// Wrapper so we can drive clap parsing of the metadata subcommand in unit
+    /// tests without reaching into the binary's top-level `Cli`.
+    #[derive(clap::Parser)]
+    struct MetadataHarness {
+        #[command(subcommand)]
+        command: TemplatesCommand,
+    }
+
+    fn parse_metadata(argv: &[&str]) -> Result<TemplatesMetadataArgs, clap::Error> {
+        let mut full = vec!["templates", "metadata"];
+        full.extend_from_slice(argv);
+        let parsed = <MetadataHarness as clap::Parser>::try_parse_from(full)?;
+        match parsed.command {
+            TemplatesCommand::Metadata(args) => Ok(args),
+            _ => unreachable!("parsed the metadata subcommand"),
+        }
+    }
+
     #[test]
     fn metadata_args_captures_template_id() {
-        let args = TemplatesMetadataArgs {
-            template_id: "ghcr.io/devcontainers/templates/alpine".to_owned(),
+        let args = parse_metadata(&["ghcr.io/devcontainers/templates/alpine"]).unwrap();
+        assert_eq!(
+            args.template_id.as_deref(),
+            Some("ghcr.io/devcontainers/templates/alpine")
+        );
+    }
+
+    #[test]
+    fn metadata_template_id_is_optional() {
+        // Regression: a missing template id must NOT make clap exit with a usage
+        // error. It parses to `None`, and the command then prints `{}`/exits 1
+        // at runtime (matching the official "unresolvable ref" contract).
+        let args = parse_metadata(&[]).unwrap();
+        assert!(args.template_id.is_none());
+    }
+
+    #[test]
+    fn metadata_accepts_log_level_flag() {
+        // Regression: the metadata subcommand must accept `--log-level`,
+        // matching the official CLI's registered flag surface.
+        for level in ["info", "debug", "trace"] {
+            let args = parse_metadata(&[
+                "ghcr.io/devcontainers/templates/alpine",
+                "--log-level",
+                level,
+            ])
+            .unwrap_or_else(|e| panic!("--log-level {level} should parse: {e}"));
+            assert!(args.template_id.is_some());
+        }
+    }
+
+    #[test]
+    fn metadata_log_level_defaults_to_info() {
+        let args = parse_metadata(&["ghcr.io/devcontainers/templates/alpine"]).unwrap();
+        assert!(matches!(args.log_level, LogLevel::Info));
+    }
+
+    #[test]
+    fn metadata_log_level_wired_through_apply_log_level() {
+        let parsed = <MetadataHarness as clap::Parser>::try_parse_from([
+            "templates",
+            "metadata",
+            "ghcr.io/devcontainers/templates/alpine",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        let templates_args = TemplatesArgs {
+            command: parsed.command,
         };
-        assert_eq!(args.template_id, "ghcr.io/devcontainers/templates/alpine");
+        assert!(matches!(
+            templates_args.apply_log_level(),
+            Some(LogLevel::Debug)
+        ));
     }
 
     // -----------------------------------------------------------------------
