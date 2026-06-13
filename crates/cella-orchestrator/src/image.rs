@@ -240,10 +240,10 @@ async fn resolve_base_image(
             step.finish();
         }
         Ok(image.to_string())
-    } else if let Some(build) = input.config.get("build").and_then(|v| v.as_object()) {
+    } else if let Some(build) = effective_build_config(input.config) {
         let img_name = resolve_image_name(input.workspace_root, input.config_name, input.config);
         let mut build_opts = parse_build_options(
-            build,
+            &build,
             &img_name,
             input.workspace_root,
             input.no_cache,
@@ -285,7 +285,7 @@ async fn resolve_base_image(
         result?;
         Ok(img_name)
     } else {
-        Err("devcontainer.json must specify either 'image' or 'build'".into())
+        Err("devcontainer.json must specify 'image', 'build', or 'dockerFile'".into())
     }
 }
 
@@ -375,6 +375,53 @@ pub fn inject_proxy_build_args(
     tracing::debug!("Injected proxy build args into Docker build");
 }
 
+/// Build a normalized `build` object for a Dockerfile dev container, returning
+/// `None` when the config is not Dockerfile-based.
+///
+/// Supports the legacy top-level `dockerFile` (+ top-level `context`) form
+/// alongside the modern `build.dockerfile`/`build.context` form, mirroring the
+/// official `isDockerFileConfig`/`getDockerfile`: a top-level `dockerFile` wins
+/// over `build.dockerfile`, and `build.context` is preferred over a legacy
+/// top-level `context`. The `args`/`target`/`options`/`cacheFrom` fields live
+/// only under `build` in both forms.
+fn effective_build_config(
+    config: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let build = config.get("build").and_then(|v| v.as_object());
+    let top_dockerfile = config.get("dockerFile").and_then(|v| v.as_str());
+    let build_dockerfile = build
+        .and_then(|b| b.get("dockerfile"))
+        .and_then(|v| v.as_str());
+
+    // Not a Dockerfile-based config: no top-level `dockerFile`, no `build` object, and no
+    // `build.dockerfile`. A `build` object without an explicit `dockerfile` is valid — it
+    // defaults to "Dockerfile" in `parse_build_options`.
+    if top_dockerfile.is_none() && build.is_none() && build_dockerfile.is_none() {
+        return None;
+    }
+
+    let mut map = build.cloned().unwrap_or_default();
+
+    // Legacy top-level `dockerFile` takes precedence (official `getDockerfile`).
+    if let Some(df) = top_dockerfile {
+        map.insert(
+            "dockerfile".to_string(),
+            serde_json::Value::String(df.to_string()),
+        );
+    }
+    // Fall back to the legacy top-level `context` when `build.context` is absent.
+    if !map.contains_key("context")
+        && let Some(ctx) = config.get("context").and_then(|v| v.as_str())
+    {
+        map.insert(
+            "context".to_string(),
+            serde_json::Value::String(ctx.to_string()),
+        );
+    }
+
+    Some(map)
+}
+
 pub fn parse_build_options(
     build: &serde_json::Map<String, serde_json::Value>,
     img_name: &str,
@@ -412,15 +459,16 @@ pub fn parse_build_options(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let config_cache_from: Vec<String> = build
-        .get("cacheFrom")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // `cacheFrom` may be a single string OR an array of strings (spec allows
+    // both); the string form must not be dropped.
+    let config_cache_from: Vec<String> = match build.get("cacheFrom") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
 
     // CLI `--cache-from` is prepended before config `cacheFrom` (matching the
     // official ordering); both are dropped entirely under `--no-cache`.
@@ -839,5 +887,83 @@ mod tests {
             build_config_digest(&config_a),
             build_config_digest(&config_b)
         );
+    }
+
+    #[test]
+    fn cache_from_string_form_is_kept() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile", "cacheFrom": "reg/img:cache"}"#)
+                .unwrap();
+        let opts = parse_build_options(
+            &build,
+            "t:latest",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
+        assert_eq!(opts.cache_from, vec!["reg/img:cache".to_string()]);
+    }
+
+    #[test]
+    fn cache_from_array_form_is_kept() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"dockerfile": "Dockerfile", "cacheFrom": ["a", "b"]}"#)
+                .unwrap();
+        let opts = parse_build_options(
+            &build,
+            "t:latest",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
+        assert_eq!(opts.cache_from, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn effective_build_config_legacy_top_level_dockerfile() {
+        let cfg = serde_json::json!({ "dockerFile": "Dockerfile", "context": ".." });
+        let build = effective_build_config(&cfg).expect("legacy dockerFile is a build config");
+        assert_eq!(build.get("dockerfile").unwrap(), "Dockerfile");
+        // Legacy top-level context falls back when build.context is absent.
+        assert_eq!(build.get("context").unwrap(), "..");
+    }
+
+    #[test]
+    fn effective_build_config_modern_and_image() {
+        assert!(
+            effective_build_config(&serde_json::json!({ "build": { "dockerfile": "Dockerfile" } }))
+                .is_some()
+        );
+        // Pure image config is not a Dockerfile build.
+        assert!(effective_build_config(&serde_json::json!({ "image": "node:20" })).is_none());
+    }
+
+    #[test]
+    fn effective_build_config_build_object_without_dockerfile_is_valid() {
+        // A `build` object with no explicit `dockerfile` is a valid Dockerfile config —
+        // `parse_build_options` defaults `dockerfile` to "Dockerfile".
+        let cfg = serde_json::json!({ "build": { "args": { "FOO": "bar" } } });
+        let build = effective_build_config(&cfg)
+            .expect("build object without dockerfile should return Some");
+        assert_eq!(
+            build.get("args").unwrap(),
+            &serde_json::json!({ "FOO": "bar" })
+        );
+        // No dockerfile key injected — `parse_build_options` will apply the default.
+        assert!(build.get("dockerfile").is_none());
+    }
+
+    #[test]
+    fn effective_build_config_top_level_dockerfile_wins() {
+        let cfg = serde_json::json!({
+            "dockerFile": "Legacy.Dockerfile",
+            "build": { "dockerfile": "Modern.Dockerfile", "target": "dev" }
+        });
+        let build = effective_build_config(&cfg).unwrap();
+        assert_eq!(build.get("dockerfile").unwrap(), "Legacy.Dockerfile");
+        // build-only fields are preserved.
+        assert_eq!(build.get("target").unwrap(), "dev");
     }
 }
