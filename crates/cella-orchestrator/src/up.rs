@@ -199,6 +199,7 @@ impl EnsureUpContext<'_> {
             ),
             is_text: true,
             on_output: Some(Box::new(move |line| progress.println(line))),
+            secret_masker: cella_backend::SecretMasker::new(self.config.lifecycle_secrets),
         }
     }
 

@@ -7,6 +7,7 @@ pub mod names;
 pub mod network;
 pub mod progress;
 pub mod resolve;
+pub mod secret_mask;
 pub mod traits;
 pub mod types;
 pub mod uid_image;
@@ -25,6 +26,7 @@ pub use names::{
 };
 pub use network::{ManagedNetwork, RemovalOutcome};
 pub use resolve::ContainerTarget;
+pub use secret_mask::SecretMasker;
 pub use traits::{BackendCapabilities, BoxFuture, ContainerBackend, Platform};
 pub use types::{
     BackendEndpoint, BackendKind, BuildOptions, BuildSecret, ContainerInfo, ContainerState,

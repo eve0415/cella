@@ -1588,6 +1588,9 @@ fn build_lifecycle_ctx<'a>(
         working_dir,
         is_text: true,
         on_output: Some(Box::new(move |line| p.println(line))),
+        // Compose has no lifecycle `--secrets-file` plumbing yet, so there are
+        // no secret values to mask here (empty masker = passthrough).
+        secret_masker: cella_backend::SecretMasker::default(),
     }
 }
 

@@ -310,6 +310,7 @@ impl RunUserCommandsArgs {
             working_dir: Some(&workspace_folder),
             is_text: false,
             on_output: None,
+            secret_masker: cella_backend::SecretMasker::new(&secrets),
         };
         let input = orchestrator::RunUserCommandsInput {
             config: &config,

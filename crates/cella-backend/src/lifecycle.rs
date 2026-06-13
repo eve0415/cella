@@ -11,6 +11,7 @@ use tracing::{debug, info};
 
 use crate::error::BackendError;
 use crate::progress::{ProgressSender, format_elapsed};
+use crate::secret_mask::SecretMasker;
 use crate::traits::ContainerBackend;
 use crate::types::{ExecOptions, ExecResult};
 
@@ -85,19 +86,26 @@ pub struct LifecycleContext<'a> {
     /// When set, sequential lifecycle output is written through this callback
     /// (e.g., indented under an active spinner) instead of directly to stderr.
     pub on_output: Option<OutputCallback<'a>>,
+    /// Masker applied to all lifecycle output before it reaches any sink.
+    ///
+    /// Built from `--secrets-file` `KEY=VALUE` entries. When no secrets are
+    /// configured the masker is a cheap no-op passthrough.
+    pub secret_masker: SecretMasker,
 }
 
-/// A `Write` adapter that buffers lines and forwards each complete line
-/// through a callback with indentation.
+/// A `Write` adapter that buffers lines, masks secret values, and forwards
+/// each complete line through a callback with indentation.
 struct CallbackWriter<'a> {
     callback: &'a (dyn Fn(&str) + Send + Sync),
+    masker: &'a SecretMasker,
     buf: Vec<u8>,
 }
 
 impl<'a> CallbackWriter<'a> {
-    fn new(callback: &'a (dyn Fn(&str) + Send + Sync)) -> Self {
+    fn new(callback: &'a (dyn Fn(&str) + Send + Sync), masker: &'a SecretMasker) -> Self {
         Self {
             callback,
+            masker,
             buf: Vec::with_capacity(256),
         }
     }
@@ -106,7 +114,8 @@ impl<'a> CallbackWriter<'a> {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]);
             if !line.trim().is_empty() {
-                (self.callback)(&format!("      {line}"));
+                let masked = self.masker.mask(&line);
+                (self.callback)(&format!("      {masked}"));
             }
             self.buf.drain(..=pos);
         }
@@ -116,7 +125,8 @@ impl<'a> CallbackWriter<'a> {
         if !self.buf.is_empty() {
             let line = String::from_utf8_lossy(&self.buf);
             if !line.trim().is_empty() {
-                (self.callback)(&format!("      {line}"));
+                let masked = self.masker.mask(&line);
+                (self.callback)(&format!("      {masked}"));
             }
             self.buf.clear();
         }
@@ -142,6 +152,68 @@ impl Drop for CallbackWriter<'_> {
     }
 }
 
+/// A `Write` adapter that buffers lines, masks secret values, and writes
+/// each complete line to the wrapped sink.
+///
+/// Used for the stderr fallback path in `run_sequential` so that no byte
+/// escapes to stderr unmasked.
+struct MaskingWriter<W: io::Write> {
+    inner: W,
+    masker: SecretMasker,
+    buf: Vec<u8>,
+}
+
+impl<W: io::Write> MaskingWriter<W> {
+    fn new(inner: W, masker: SecretMasker) -> Self {
+        Self {
+            inner,
+            masker,
+            buf: Vec::with_capacity(256),
+        }
+    }
+
+    fn flush_lines(&mut self) -> io::Result<()> {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[..pos]);
+            let masked = self.masker.mask(&line);
+            self.inner.write_all(masked.as_bytes())?;
+            self.inner.write_all(b"\n")?;
+            self.buf.drain(..=pos);
+        }
+        Ok(())
+    }
+
+    fn flush_remaining(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.buf);
+            let masked = self.masker.mask(&line);
+            self.inner.write_all(masked.as_bytes())?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for MaskingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        self.flush_lines()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_remaining()?;
+        self.inner.flush()
+    }
+}
+
+impl<W: io::Write> Drop for MaskingWriter<W> {
+    fn drop(&mut self) {
+        // Best-effort flush on drop; ignore errors (same pattern as BufWriter).
+        let _ = self.flush_remaining();
+    }
+}
+
 /// Run sequential lifecycle commands, streaming output when `is_text`.
 async fn run_sequential(
     ctx: &LifecycleContext<'_>,
@@ -161,23 +233,24 @@ async fn run_sequential(
         };
         let result = if ctx.is_text {
             if let Some(ref on_output) = ctx.on_output {
-                // Route through progress system with indentation
+                // Route through progress system with indentation; mask secrets.
                 ctx.client
                     .exec_stream(
                         ctx.container_id,
                         &opts,
-                        Box::new(CallbackWriter::new(on_output.as_ref())),
-                        Box::new(CallbackWriter::new(on_output.as_ref())),
+                        Box::new(CallbackWriter::new(on_output.as_ref(), &ctx.secret_masker)),
+                        Box::new(CallbackWriter::new(on_output.as_ref(), &ctx.secret_masker)),
                     )
                     .await?
             } else {
-                // Fallback: stream directly to stderr
+                // Fallback: stream to stderr through masking writer so no
+                // secret bytes reach the terminal unmasked.
                 ctx.client
                     .exec_stream(
                         ctx.container_id,
                         &opts,
-                        Box::new(io::stderr()),
-                        Box::new(io::stderr()),
+                        Box::new(MaskingWriter::new(io::stderr(), ctx.secret_masker.clone())),
+                        Box::new(MaskingWriter::new(io::stderr(), ctx.secret_masker.clone())),
                     )
                     .await?
             }
@@ -230,7 +303,7 @@ async fn run_parallel(
     let results = futures_util::future::try_join_all(futures).await?;
 
     if ctx.is_text {
-        print_completed_output(&results);
+        print_completed_output(&results, &ctx.secret_masker);
     }
 
     Ok(())
@@ -256,14 +329,15 @@ fn check_exit_code(
     Ok(())
 }
 
-/// Print stdout/stderr from completed parallel exec results to stderr.
-fn print_completed_output(results: &[ExecResult]) {
+/// Print stdout/stderr from completed parallel exec results to stderr, masking
+/// secret values before any bytes reach the terminal.
+fn print_completed_output(results: &[ExecResult], masker: &SecretMasker) {
     for exec_result in results {
         if !exec_result.stdout.is_empty() {
-            eprint!("{}", exec_result.stdout);
+            eprint!("{}", masker.mask(&exec_result.stdout));
         }
         if !exec_result.stderr.is_empty() {
-            eprint!("{}", exec_result.stderr);
+            eprint!("{}", masker.mask(&exec_result.stderr));
         }
     }
 }
@@ -1167,7 +1241,8 @@ mod tests {
             collected.lock().unwrap().push(line.to_string());
         };
 
-        let mut writer = CallbackWriter::new(&callback);
+        let masker = SecretMasker::default();
+        let mut writer = CallbackWriter::new(&callback, &masker);
         io::Write::write_all(&mut writer, input).unwrap();
         drop(writer);
 
@@ -1180,6 +1255,25 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "      first line");
         assert_eq!(lines[1], "      second line");
+    }
+
+    #[test]
+    fn callback_writer_masks_secret_values() {
+        use std::sync::Mutex;
+        let collected = Mutex::new(Vec::new());
+        let callback = |line: &str| collected.lock().unwrap().push(line.to_string());
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let mut writer = CallbackWriter::new(&callback, &masker);
+        io::Write::write_all(&mut writer, b"echoed s3cr3t value\n").unwrap();
+        drop(writer);
+        let lines = collected.into_inner().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("s3cr3t"), "secret leaked: {}", lines[0]);
+        assert!(
+            lines[0].contains("********"),
+            "expected mask in {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -1481,7 +1575,8 @@ mod tests {
             collected.lock().unwrap().push(line.to_string());
         };
 
-        let mut writer = CallbackWriter::new(&callback);
+        let masker = SecretMasker::default();
+        let mut writer = CallbackWriter::new(&callback, &masker);
         io::Write::write_all(&mut writer, b"hello ").unwrap();
         io::Write::write_all(&mut writer, b"world\n").unwrap();
         drop(writer);
