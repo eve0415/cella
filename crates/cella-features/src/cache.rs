@@ -49,12 +49,17 @@ impl FeatureCache {
     }
 
     /// Compute the cache path for an OCI feature layer.
+    ///
+    /// Each ref component is hashed before being used as a path segment so
+    /// that crafted values containing `..`, absolute paths, or embedded
+    /// separators cannot escape the cache root.  This changes the on-disk
+    /// layout; any existing unhashed entries are treated as misses.
     pub fn oci_path(&self, registry: &str, repository: &str, digest: &str) -> PathBuf {
         self.root
             .join("oci")
-            .join(registry)
-            .join(repository)
-            .join(digest)
+            .join(hash_ref_component(registry))
+            .join(hash_ref_component(repository))
+            .join(hash_ref_component(digest))
     }
 
     /// Check whether a URL-fetched feature tarball is already cached.
@@ -130,6 +135,17 @@ impl Default for FeatureCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Hash an untrusted OCI ref component (registry, repository, or digest) to a
+/// fixed-length hex string safe for use as a single filesystem path segment.
+///
+/// SHA-256 over the raw bytes produces a 64-character hex string that contains
+/// no path separators, no `..` sequences, and no leading dots, regardless of
+/// the input.  This is the same approach used by [`FeatureCache::url_path`]
+/// and by the collection-index path helpers.
+fn hash_ref_component(component: &str) -> String {
+    hex::encode(Sha256::digest(component.as_bytes()))
 }
 
 // ===========================================================================
@@ -279,6 +295,155 @@ mod tests {
         );
         // Staging dir cleaned up.
         assert!(!staging.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // oci_path security: path traversal and injection
+    // -----------------------------------------------------------------------
+
+    /// Assert that `path` is strictly contained under `root` with no traversal
+    /// components and the expected `oci/<reg>/<repo>/<dig>` shape.
+    ///
+    /// `Path::starts_with` is a lexical prefix check and returns `true` for
+    /// `root/oci/../../escape`, so it cannot prove containment on its own.
+    /// This helper additionally:
+    ///   - rejects any `..` or `.` components in the suffix past root
+    ///   - rejects any `RootDir` component in the suffix (absolute injection)
+    ///   - asserts the suffix is exactly 4 segments: `oci`, reg-hash,
+    ///     repo-hash, digest-hash
+    fn assert_oci_path_shape(root: &Path, path: &Path) {
+        use std::path::Component;
+
+        // Strip the root prefix — this also verifies the path shares the root.
+        let suffix = path
+            .strip_prefix(root)
+            .unwrap_or_else(|_| panic!("path {path:?} does not start under root {root:?}"));
+
+        let components: Vec<_> = suffix.components().collect();
+
+        // Exactly 4 segments past root: "oci", reg-hash, repo-hash, dig-hash.
+        assert_eq!(
+            components.len(),
+            4,
+            "expected exactly 4 path components past root (oci/<reg>/<repo>/<dig>), \
+             got {}: {path:?}",
+            components.len(),
+        );
+
+        for c in &components {
+            match c {
+                Component::Normal(_) => {}
+                Component::ParentDir => {
+                    panic!("path contains `..` traversal component: {path:?}");
+                }
+                Component::CurDir => {
+                    panic!("path contains `.` component: {path:?}");
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    panic!("path contains absolute injection component: {path:?}");
+                }
+            }
+        }
+
+        assert_eq!(
+            components[0],
+            Component::Normal(std::ffi::OsStr::new("oci")),
+            "first segment must be \"oci\": {path:?}",
+        );
+
+        // Each of the three hash segments must be a 64-character hex string.
+        for (i, c) in components[1..].iter().enumerate() {
+            let Component::Normal(seg) = c else {
+                unreachable!();
+            };
+            let s = seg.to_string_lossy();
+            assert_eq!(
+                s.len(),
+                64,
+                "hash segment {i} must be 64 hex chars, got {}: {path:?}",
+                s.len(),
+            );
+            assert!(
+                s.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "hash segment {i} contains non-hex characters: {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn oci_path_dotdot_registry_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let path = cache.oci_path("../../escape", "repo", "sha256:abc");
+        assert_oci_path_shape(dir.path(), &path);
+    }
+
+    #[test]
+    fn oci_path_dotdot_repository_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let path = cache.oci_path("ghcr.io", "../../escape", "sha256:abc");
+        assert_oci_path_shape(dir.path(), &path);
+    }
+
+    #[test]
+    fn oci_path_dotdot_digest_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let path = cache.oci_path("ghcr.io", "repo", "../../escape");
+        assert_oci_path_shape(dir.path(), &path);
+    }
+
+    #[test]
+    fn oci_path_absolute_registry_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let path = cache.oci_path("/etc/passwd", "repo", "sha256:abc");
+        assert_oci_path_shape(dir.path(), &path);
+    }
+
+    #[test]
+    fn oci_path_embedded_separator_in_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        // OCI repos legitimately contain slashes (e.g. org/image/name).
+        // After hashing the whole component, the path stays flat.
+        let path = cache.oci_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        assert_oci_path_shape(dir.path(), &path);
+    }
+
+    /// Regression: empty ref components must still produce the 4-segment
+    /// `oci/<reg>/<repo>/<dig>` shape and must not collapse path depth.
+    #[test]
+    fn oci_path_empty_components_preserve_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let path = cache.oci_path("", "", "");
+        assert_oci_path_shape(dir.path(), &path);
+        // Each empty string hashes to a distinct 64-char hex value, so all
+        // three hashes are equal (SHA-256("") is the same each time) but still
+        // present — no segment collapses.
+        let depth = path.components().count();
+        let root_depth = dir.path().components().count();
+        assert_eq!(depth - root_depth, 4, "expected oci/<reg>/<repo>/<dig>");
+    }
+
+    #[test]
+    fn oci_path_distinct_repos_produce_distinct_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let a = cache.oci_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        let b = cache.oci_path("ghcr.io", "devcontainers/features/python", "sha256:abc");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn oci_path_same_inputs_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(dir.path());
+        let a = cache.oci_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        let b = cache.oci_path("ghcr.io", "devcontainers/features/node", "sha256:abc");
+        assert_eq!(a, b);
     }
 
     // -----------------------------------------------------------------------
