@@ -48,6 +48,13 @@ pub enum LockfileError {
     /// The generated lockfile does not match the one on disk.
     #[error("Lockfile does not match.")]
     Mismatch,
+    /// The lockfile exists but could not be read or parsed.
+    ///
+    /// Distinct from [`LockfileError::Missing`] so a corrupt or unreadable
+    /// lockfile is never silently treated as absent (which would, under
+    /// `--frozen-lockfile`, mis-report it as "does not exist").
+    #[error("Lockfile is unreadable: {reason}")]
+    Corrupt { reason: String },
 }
 
 /// Controls how the lockfile is read and written during feature resolution.
@@ -97,13 +104,33 @@ pub fn lockfile_path(config_path: &Path) -> PathBuf {
 // Read / write
 // ---------------------------------------------------------------------------
 
-/// Read and deserialize a lockfile.  Returns `None` on any error (missing,
-/// I/O failure, malformed JSON).
-#[must_use]
-pub fn read_lockfile(config_path: &Path) -> Option<Lockfile> {
+/// Read and deserialize a lockfile.
+///
+/// Returns `Ok(None)` only when the file is genuinely absent. An I/O error
+/// (e.g. permissions) or malformed JSON yields [`LockfileError::Corrupt`] so
+/// callers can surface the real problem instead of conflating it with a
+/// missing file.
+///
+/// # Errors
+///
+/// Returns [`LockfileError::Corrupt`] when the lockfile exists but cannot be
+/// read or parsed.
+pub fn read_lockfile(config_path: &Path) -> Result<Option<Lockfile>, LockfileError> {
     let path = lockfile_path(config_path);
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(LockfileError::Corrupt {
+                reason: format!("cannot read {}: {e}", path.display()),
+            });
+        }
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|e| LockfileError::Corrupt {
+            reason: format!("invalid JSON in {}: {e}", path.display()),
+        })
 }
 
 /// Serialize and write a lockfile to disk, with a trailing newline.
@@ -149,23 +176,6 @@ pub fn generate_lockfile(
         );
     }
     Lockfile { features }
-}
-
-/// Strip the `:version` suffix from a raw feature reference string.
-///
-/// `"ghcr.io/devcontainers/features/git:1"` → `"ghcr.io/devcontainers/features/git"`
-///
-/// Only strips the trailing component when it contains no `'/'` (i.e. it
-/// looks like a tag, not a registry path segment).
-#[must_use]
-pub fn lockfile_key(raw_ref: &str) -> String {
-    if let Some(pos) = raw_ref.rfind(':') {
-        let suffix = &raw_ref[pos + 1..];
-        if !suffix.contains('/') {
-            return raw_ref[..pos].to_string();
-        }
-    }
-    raw_ref.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -337,31 +347,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // lockfile_key
+    // read_lockfile
     // -----------------------------------------------------------------------
 
     #[test]
-    fn lockfile_key_strips_version() {
-        assert_eq!(
-            lockfile_key("ghcr.io/devcontainers/features/git:1"),
-            "ghcr.io/devcontainers/features/git"
-        );
+    fn read_lockfile_absent_is_ok_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("devcontainer.json");
+        assert!(matches!(read_lockfile(&config), Ok(None)));
     }
 
     #[test]
-    fn lockfile_key_no_version() {
-        assert_eq!(
-            lockfile_key("ghcr.io/devcontainers/features/git"),
-            "ghcr.io/devcontainers/features/git"
-        );
+    fn read_lockfile_malformed_is_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("devcontainer.json");
+        std::fs::write(lockfile_path(&config), "{ this is not json").unwrap();
+        assert!(matches!(
+            read_lockfile(&config),
+            Err(LockfileError::Corrupt { .. })
+        ));
     }
 
     #[test]
-    fn lockfile_key_port_not_stripped() {
-        assert_eq!(
-            lockfile_key("localhost:5000/features/git"),
-            "localhost:5000/features/git"
-        );
+    fn read_lockfile_valid_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("devcontainer.json");
+        let lf = generate_lockfile(&[(
+            "ghcr.io/x/y:1".to_string(),
+            "1".to_string(),
+            "ghcr.io/x/y@sha256:aa".to_string(),
+            "sha256:aa".to_string(),
+            vec![],
+        )]);
+        write_lockfile(&config, &lf).unwrap();
+        assert_eq!(read_lockfile(&config).unwrap(), Some(lf));
     }
 
     // -----------------------------------------------------------------------
