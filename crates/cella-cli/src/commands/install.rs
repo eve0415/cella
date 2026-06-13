@@ -37,9 +37,9 @@ pub struct InstallArgs {
     #[arg(long)]
     container_name: Option<String>,
 
-    /// Target container by label.
-    #[arg(long)]
-    id_label: Option<String>,
+    /// Target container by label(s) of the form `name=value` (repeatable).
+    #[arg(long, value_parser = crate::commands::parse_id_label)]
+    id_label: Vec<String>,
 
     /// Target a specific compose service (defaults to primary service).
     #[arg(long)]
@@ -61,7 +61,7 @@ impl InstallArgs {
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
-            id_labels: self.id_label.into_iter().collect(),
+            id_labels: self.id_label,
             workspace_folder: self.workspace_folder,
         };
 
