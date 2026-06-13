@@ -917,14 +917,27 @@ impl EnsureUpContext<'_> {
             self.config.user_env_probe.to_string(),
         );
 
-        let mut label_remote_env = self.config.remote_env.to_vec();
-        for e in &env_fwd.env {
-            label_remote_env.push(format!("{}={}", e.key, e.value));
-        }
+        // Store config remoteEnv and infra-forwarded env in separate labels so
+        // that exec can apply the correct precedence:
+        //   probed < fwd_env < CLI --remote-env < config remoteEnv
+        // Merging them into one label would make infra entries (proxy vars,
+        // SSH_AUTH_SOCK from env_fwd) incorrectly beat explicit --remote-env.
+        let label_remote_env = self.config.remote_env.to_vec();
         if !label_remote_env.is_empty() {
             labels.insert(
                 "dev.cella.remote_env".to_string(),
                 serde_json::to_string(&label_remote_env).unwrap_or_default(),
+            );
+        }
+        let fwd_env: Vec<String> = env_fwd
+            .env
+            .iter()
+            .map(|e| format!("{}={}", e.key, e.value))
+            .collect();
+        if !fwd_env.is_empty() {
+            labels.insert(
+                "dev.cella.fwd_env".to_string(),
+                serde_json::to_string(&fwd_env).unwrap_or_default(),
             );
         }
 

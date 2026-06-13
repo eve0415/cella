@@ -153,9 +153,17 @@ async fn resolve_exec_context(
 > {
     let label_user = container.labels.get("dev.cella.remote_user").cloned();
     let label_workdir = container.labels.get("dev.cella.workspace_folder").cloned();
-    let label_env: Vec<String> = container
+    // Config remoteEnv (wins over --remote-env) and infra-forwarded env (loses
+    // to --remote-env) are stored in separate labels so exec can apply the
+    // correct 4-way precedence: probed < fwd_env < CLI < config.
+    let config_remote_env: Vec<String> = container
         .labels
         .get("dev.cella.remote_env")
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    let fwd_env: Vec<String> = container
+        .labels
+        .get("dev.cella.fwd_env")
         .and_then(|v| serde_json::from_str(v).ok())
         .unwrap_or_default();
 
@@ -170,8 +178,16 @@ async fn resolve_exec_context(
 
     let working_dir = workdir_opt.or(label_workdir);
 
-    let mut env = build_exec_env(client, container, &user, label_env, default_user_env_probe).await;
-    env.extend(remote_env);
+    let env = build_exec_env(
+        client,
+        container,
+        &user,
+        remote_env,
+        fwd_env,
+        config_remote_env,
+        default_user_env_probe,
+    )
+    .await;
 
     let preferred = crate::commands::load_shell_preferred(&container.labels);
     let resolution = resolve_shell(client, &container.id, &user, &preferred).await;
@@ -278,23 +294,45 @@ async fn run_exec(
     Ok(())
 }
 
+/// Layer the exec environment by precedence (low → high):
+///   probed < infra `fwd_env` < CLI `--remote-env` < devcontainer.json `remoteEnv`
+///
+/// Matches the official CLI's `probeRemoteEnv` order while keeping infra-
+/// generated forwarding vars (proxy, credential helpers) below explicit CLI
+/// flags. Config `remoteEnv` still wins on key collision (official behaviour).
+fn layer_exec_remote_env<S: std::hash::BuildHasher>(
+    probed: &std::collections::HashMap<String, String, S>,
+    fwd_env: &[String],
+    cli_remote_env: &[String],
+    config_remote_env: &[String],
+) -> Vec<String> {
+    // Apply in ascending priority order so later entries overwrite earlier ones.
+    let combined: Vec<String> = fwd_env
+        .iter()
+        .chain(cli_remote_env)
+        .chain(config_remote_env)
+        .cloned()
+        .collect();
+    cella_env::user_env_probe::merge_env(probed, &combined)
+}
+
 async fn build_exec_env(
     client: &dyn cella_backend::ContainerBackend,
     container: &cella_backend::ContainerInfo,
     user: &str,
-    label_env: Vec<String>,
+    cli_remote_env: Vec<String>,
+    fwd_env: Vec<String>,
+    config_remote_env: Vec<String>,
     default_user_env_probe: cella_env::user_env_probe::UserEnvProbe,
 ) -> Vec<String> {
     let probe_type =
         super::resolve_probe_type_from_labels(&container.labels, default_user_env_probe);
-    let base_env = if let Some(probed) =
-        read_probed_env_cache(client, &container.id, user, probe_type).await
-    {
-        cella_env::user_env_probe::merge_env(&probed, &label_env)
-    } else {
-        label_env
-    };
-    let mut env = base_env;
+    let probed = read_probed_env_cache(client, &container.id, user, probe_type)
+        .await
+        .unwrap_or_default();
+    // cella infra vars (SSH_AUTH_SOCK, AI keys, terminal) are layered on top
+    // below — they intentionally win over both remoteEnv sources.
+    let mut env = layer_exec_remote_env(&probed, &fwd_env, &cli_remote_env, &config_remote_env);
     ensure_ssh_auth_sock(client, &container.id, user, &mut env).await;
     super::append_ai_keys(&mut env, &container.labels).await;
     for var in super::TERMINAL_ENV_VARS {
@@ -307,6 +345,9 @@ async fn build_exec_env(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
     #[test]
     fn id_label_is_repeatable() {
         use clap::Parser;
@@ -333,5 +374,56 @@ mod tests {
         let r =
             crate::Cli::try_parse_from(["cella", "exec", "--id-label", "novalue", "--", "true"]);
         assert!(r.is_err(), "--id-label without '=value' must be rejected");
+    }
+
+    #[test]
+    fn config_remote_env_wins_over_cli_remote_env() {
+        // Official precedence (probeRemoteEnv): probed < fwd < CLI --remote-env
+        // < config remoteEnv. On a key collision, devcontainer.json wins.
+        let probed = HashMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("FOO".to_string(), "probed".to_string()),
+        ]);
+        let fwd = vec![];
+        let cli = vec!["FOO=cli".to_string(), "ONLY_CLI=x".to_string()];
+        let config = vec!["FOO=config".to_string()];
+
+        let merged = layer_exec_remote_env(&probed, &fwd, &cli, &config);
+
+        assert!(
+            merged.contains(&"FOO=config".to_string()),
+            "config must win"
+        );
+        assert!(!merged.contains(&"FOO=cli".to_string()));
+        assert!(!merged.contains(&"FOO=probed".to_string()));
+        // CLI-only and probed-only keys survive when not overridden.
+        assert!(merged.contains(&"ONLY_CLI=x".to_string()));
+        assert!(merged.contains(&"PATH=/usr/bin".to_string()));
+    }
+
+    #[test]
+    fn cli_remote_env_wins_over_probed() {
+        let probed = HashMap::from([("BAR".to_string(), "probed".to_string())]);
+        let merged = layer_exec_remote_env(&probed, &[], &["BAR=cli".to_string()], &[]);
+        assert!(merged.contains(&"BAR=cli".to_string()));
+        assert!(!merged.contains(&"BAR=probed".to_string()));
+    }
+
+    #[test]
+    fn cli_remote_env_wins_over_fwd_env() {
+        // Regression: infra-forwarded env (proxy vars, SSH_AUTH_SOCK from
+        // env_fwd) must NOT beat explicit --remote-env on a key collision.
+        let probed = HashMap::new();
+        let fwd = vec!["HTTPS_PROXY=http://infra-proxy:8080".to_string()];
+        let cli = vec!["HTTPS_PROXY=http://user-proxy:3128".to_string()];
+        let config = vec![];
+
+        let merged = layer_exec_remote_env(&probed, &fwd, &cli, &config);
+
+        assert!(
+            merged.contains(&"HTTPS_PROXY=http://user-proxy:3128".to_string()),
+            "CLI --remote-env must beat infra fwd_env"
+        );
+        assert!(!merged.contains(&"HTTPS_PROXY=http://infra-proxy:8080".to_string()));
     }
 }
