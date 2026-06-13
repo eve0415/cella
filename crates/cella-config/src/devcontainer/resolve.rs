@@ -96,7 +96,12 @@ impl ResolvedConfig {
         Some(
             raw_map
                 .iter()
-                .map(|(k, v)| (k.clone(), super::secrets::SecretDeclaration::from_value(v)))
+                // filter_map drops entries whose value does not conform to the schema
+                // (non-object or known field with wrong type). Valid but empty objects
+                // {} are retained as SecretDeclaration { description: None, documentation_url: None }.
+                .filter_map(|(k, v)| {
+                    super::secrets::SecretDeclaration::from_value(v).map(|decl| (k.clone(), decl))
+                })
                 .collect(),
         )
     }
@@ -790,6 +795,31 @@ mod tests {
         assert_eq!(secrets.len(), 3);
         assert!(secrets.contains_key("GITHUB_TOKEN"));
         assert!(secrets.contains_key("NPM_TOKEN"));
+        assert!(secrets.contains_key("GITHUB_TOKEN"));
+        assert!(secrets.contains_key("NPM_TOKEN"));
         assert!(secrets.contains_key("DB_PASSWORD"));
+    }
+
+    // Regression: secret entries with a non-object value (e.g. a plain string)
+    // must be silently dropped rather than coerced into an empty declaration.
+    #[test]
+    fn secrets_skips_malformed_non_object_entries() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{
+                "image": "ubuntu",
+                "secrets": {
+                    "VALID_TOKEN": { "description": "A valid secret" },
+                    "BAD_TOKEN": "plain-string-not-allowed"
+                }
+            }"#,
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        let secrets = resolved.secrets().expect("secrets key is present");
+        // Only the valid entry survives; the malformed one is dropped.
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets.contains_key("VALID_TOKEN"));
+        assert!(!secrets.contains_key("BAD_TOKEN"));
     }
 }
