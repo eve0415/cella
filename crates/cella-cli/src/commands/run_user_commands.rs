@@ -100,6 +100,12 @@ pub struct AttachArgs {
     skip_post_attach: bool,
 }
 
+impl AttachArgs {
+    pub(super) const fn skip_post_attach(&self) -> bool {
+        self.skip_post_attach
+    }
+}
+
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
 ///
 /// The data-folder fields, `--docker-path`/`--docker-compose-path`, and the
@@ -167,6 +173,12 @@ pub struct CompatArgs {
     /// Number of rows to render subprocess output for (compatibility no-op).
     #[arg(long = "terminal-rows", requires = "terminal_columns")]
     terminal_rows: Option<u16>,
+}
+
+impl CompatArgs {
+    pub(super) const fn secrets_file(&self) -> Option<&PathBuf> {
+        self.secrets_file.as_ref()
+    }
 }
 
 /// Re-run the user (lifecycle) commands against an existing dev container.

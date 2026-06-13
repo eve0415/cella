@@ -20,6 +20,7 @@ mod ports;
 mod prune;
 mod read_configuration;
 mod run_user_commands;
+mod set_up;
 mod shell;
 mod status;
 mod switch;
@@ -276,6 +277,9 @@ pub enum Command {
     /// Re-run lifecycle hooks against an existing dev container.
     #[command(name = "run-user-commands")]
     RunUserCommands(run_user_commands::RunUserCommandsArgs),
+    /// Apply lifecycle hooks and user personalisation to an already-running container.
+    #[command(name = "set-up")]
+    SetUp(set_up::SetUpArgs),
     /// Generate shell completion scripts.
     Completion(completion::CompletionArgs),
     /// Manage the cella daemon.
@@ -292,7 +296,10 @@ impl Command {
             Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
             // These emit a JSON envelope on stdout; spinners would fight it.
-            Self::ReadConfiguration(_) | Self::RunUserCommands(_) | Self::Templates(_) => false,
+            Self::ReadConfiguration(_)
+            | Self::RunUserCommands(_)
+            | Self::SetUp(_)
+            | Self::Templates(_) => false,
             _ => true,
         }
     }
@@ -332,6 +339,7 @@ impl Command {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
+            Self::SetUp(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
             Self::Features(args) => args.log_level(),
             _ => None,
@@ -349,6 +357,7 @@ impl Command {
             Self::Up(args) => args.compat.log_format,
             Self::Code(args) => args.up.compat.log_format,
             Self::RunUserCommands(args) => args.compat.log_format,
+            Self::SetUp(args) => args.compat.log_format,
             _ => LogFormat::Text,
         }
     }
@@ -372,6 +381,7 @@ impl Command {
             Self::RunUserCommands(args) => {
                 args.execute(progress).await.map_err(boxed_err_to_report)
             }
+            Self::SetUp(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
             Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
