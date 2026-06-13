@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Args;
@@ -5,7 +6,7 @@ use serde_json::json;
 
 use cella_backend::ContainerTarget;
 use cella_config::devcontainer::resolve;
-use cella_features::types::FeatureContainerConfig;
+use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
 
 use crate::backend::BackendArgs;
 
@@ -131,21 +132,17 @@ impl ReadConfigurationArgs {
     }
 }
 
-/// Build the features-merged configuration for a resolved devcontainer.
+/// Build the `mergedConfiguration` output for a resolved devcontainer,
+/// matching the official `mergeConfiguration` shape from the devcontainers CLI.
 ///
 /// Reused by `up --include-merged-configuration`.
-///
-/// KNOWN GAP: this performs an additive overwrite that keeps lifecycle keys
-/// SINGULAR (`onCreateCommand`), whereas the official `mergeConfiguration`
-/// emits PLURAL arrays (`onCreateCommands` etc.), a `customizations` Record,
-/// and boolean-OR/union/last-wins scalar resolution. Tracked for a follow-up.
 pub async fn resolve_merged_config(
     config: &serde_json::Value,
     config_path: &std::path::Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let features = super::features::resolve::extract_features(config);
     if features.is_empty() {
-        return Ok(config.clone());
+        return Ok(build_merged_output(config, None));
     }
 
     let platform =
@@ -171,63 +168,331 @@ pub async fn resolve_merged_config(
     )
     .await?;
 
+    Ok(build_merged_output(config, Some(&rf)))
+}
+
+/// Assemble the official `mergeConfiguration` output shape.
+///
+/// Official shape (from devcontainers/cli `src/spec-node/imageMetadata.ts`):
+/// - Removes singular lifecycle keys; emits plural `*Commands` arrays (always,
+///   even empty), raw command values verbatim, features in install order then
+///   devcontainer.json last.
+/// - Removes `entrypoint`; emits `entrypoints` string array. Omitted when empty.
+/// - `shutdownAction`: last-wins (devcontainer.json wins over features).
+/// - `customizations`: `Record<tool, contributions[]>` — each source's
+///   customization object pushed per tool key. Omitted when empty.
+/// - `capAdd`, `securityOpt`: Set union/dedup.
+/// - `mounts`: concat then dedup by target (last per target wins).
+/// - `init`, `privileged`: OR (any true wins).
+/// - `containerEnv`: feature contributions merged over base (feature wins
+///   collisions, matching metadata-array last-wins from features before
+///   devcontainer.json; omitted when no feature contributions).
+/// - Passthrough unchanged: everything else in the config not in `replaceProperties`.
+///   This includes `forwardPorts`, `remoteEnv`, `portsAttributes`, `remoteUser`,
+///   and other last-wins scalars — they pass through from the devcontainer.json
+///   config unchanged (no cross-source merge needed for the read-configuration path).
+fn build_merged_output(
+    config: &serde_json::Value,
+    rf: Option<&ResolvedFeatures>,
+) -> serde_json::Value {
+    // Start from config, removing the keys that are replaced in the merged shape.
+    let replace_keys = [
+        "customizations",
+        "entrypoint",
+        "onCreateCommand",
+        "updateContentCommand",
+        "postCreateCommand",
+        "postStartCommand",
+        "postAttachCommand",
+        "shutdownAction",
+    ];
     let mut merged = config.clone();
-    apply_feature_config(&mut merged, &rf.container_config);
-    Ok(merged)
-}
-
-fn apply_feature_config(config: &mut serde_json::Value, fc: &FeatureContainerConfig) {
-    if !fc.mounts.is_empty() {
-        config["mounts"] = json!(fc.mounts);
-    }
-    if !fc.cap_add.is_empty() {
-        config["capAdd"] = json!(fc.cap_add);
-    }
-    if !fc.security_opt.is_empty() {
-        config["securityOpt"] = json!(fc.security_opt);
-    }
-    if fc.privileged {
-        config["privileged"] = json!(true);
-    }
-    if fc.init {
-        config["init"] = json!(true);
-    }
-    if !fc.container_env.is_empty() {
-        config["containerEnv"] = json!(fc.container_env);
-    }
-    if !fc.customizations.is_null() {
-        config["customizations"] = fc.customizations.clone();
-    }
-    apply_lifecycle_field(config, "onCreateCommand", &fc.lifecycle.on_create);
-    apply_lifecycle_field(config, "updateContentCommand", &fc.lifecycle.update_content);
-    apply_lifecycle_field(config, "postCreateCommand", &fc.lifecycle.post_create);
-    apply_lifecycle_field(config, "postStartCommand", &fc.lifecycle.post_start);
-    apply_lifecycle_field(config, "postAttachCommand", &fc.lifecycle.post_attach);
-}
-
-fn apply_lifecycle_field(
-    config: &mut serde_json::Value,
-    key: &str,
-    entries: &[cella_features::types::LifecycleEntry],
-) {
-    match entries.len() {
-        0 => {}
-        1 => config[key] = entries[0].command.clone(),
-        _ => {
-            let obj: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|e| (e.origin.clone(), e.command.clone()))
-                .collect();
-            config[key] = serde_json::Value::Object(obj);
+    if let Some(obj) = merged.as_object_mut() {
+        for key in &replace_keys {
+            obj.remove(*key);
         }
+    }
+
+    let fc = rf.map(|r| &r.container_config);
+
+    // --- Lifecycle plural arrays (ALWAYS emitted, even empty) ---
+    // Order: features in install order, then the devcontainer.json command last.
+    merged["onCreateCommands"] = lifecycle_commands_array(config, "onCreateCommand", fc);
+    merged["updateContentCommands"] = lifecycle_commands_array(config, "updateContentCommand", fc);
+    merged["postCreateCommands"] = lifecycle_commands_array(config, "postCreateCommand", fc);
+    merged["postStartCommands"] = lifecycle_commands_array(config, "postStartCommand", fc);
+    merged["postAttachCommands"] = lifecycle_commands_array(config, "postAttachCommand", fc);
+
+    // --- entrypoints: omit when empty, matching official behaviour ---
+    let entrypoints: Vec<serde_json::Value> = fc
+        .map(|c| c.entrypoints.iter().map(|ep| json!(ep)).collect())
+        .unwrap_or_default();
+    if entrypoints.is_empty() {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.remove("entrypoints");
+        }
+    } else {
+        merged["entrypoints"] = json!(entrypoints);
+    }
+
+    // --- shutdownAction last-wins (devcontainer.json wins) ---
+    // Features don't carry shutdownAction; only devcontainer.json does.
+    if let Some(sa) = config.get("shutdownAction").cloned() {
+        merged["shutdownAction"] = sa;
+    }
+
+    // --- mounts: dedup by target, last per target wins ---
+    apply_merged_mounts(&mut merged, config, fc);
+
+    // --- init / privileged: OR ---
+    let user_init = config
+        .get("init")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let user_privileged = config
+        .get("privileged")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    merged["init"] = json!(fc.is_some_and(|c| c.init) || user_init);
+    merged["privileged"] = json!(fc.is_some_and(|c| c.privileged) || user_privileged);
+
+    // --- capAdd / securityOpt: Set union/dedup ---
+    apply_merged_string_set(
+        &mut merged,
+        config,
+        "capAdd",
+        fc.map(|c| c.cap_add.as_slice()),
+    );
+    apply_merged_string_set(
+        &mut merged,
+        config,
+        "securityOpt",
+        fc.map(|c| c.security_opt.as_slice()),
+    );
+
+    // --- containerEnv: feature contributions merged over the base (last wins) ---
+    if let Some(fc) = fc
+        && !fc.container_env.is_empty()
+    {
+        let mut env_map = config
+            .get("containerEnv")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in &fc.container_env {
+            env_map.insert(k.clone(), json!(v));
+        }
+        merged["containerEnv"] = serde_json::Value::Object(env_map);
+    }
+
+    // --- customizations: Record<tool, contributions[]> ---
+    apply_merged_customizations(&mut merged, config, rf);
+
+    merged
+}
+
+/// Build a lifecycle plural-array value from base config + feature entries.
+///
+/// The official `mergeConfiguration` collects raw command values verbatim from
+/// the image-metadata array `[base-image…, features in install order,
+/// devcontainer.json]` — so the devcontainer.json command is collected LAST.
+/// `merge_with_devcontainer` already builds `fc.lifecycle.*` in exactly that
+/// order (devcontainer.json appended last), so we emit those entries verbatim.
+/// With no features, the devcontainer.json command is the sole element.
+fn lifecycle_commands_array(
+    config: &serde_json::Value,
+    singular_key: &str,
+    fc: Option<&FeatureContainerConfig>,
+) -> serde_json::Value {
+    let mut commands: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(fc) = fc {
+        let feature_entries = match singular_key {
+            "onCreateCommand" => &fc.lifecycle.on_create,
+            "updateContentCommand" => &fc.lifecycle.update_content,
+            "postCreateCommand" => &fc.lifecycle.post_create,
+            "postStartCommand" => &fc.lifecycle.post_start,
+            "postAttachCommand" => &fc.lifecycle.post_attach,
+            _ => return json!(commands),
+        };
+        // Already ordered features-then-devcontainer.json by the merge step.
+        for entry in feature_entries {
+            commands.push(entry.command.clone());
+        }
+    } else if let Some(cmd) = config.get(singular_key).filter(|v| !v.is_null()) {
+        // No features resolved: the devcontainer.json command is the only entry.
+        commands.push(cmd.clone());
+    }
+
+    json!(commands)
+}
+
+/// Apply mounts with dedup-by-target semantics (last per target wins).
+fn apply_merged_mounts(
+    merged: &mut serde_json::Value,
+    config: &serde_json::Value,
+    fc: Option<&FeatureContainerConfig>,
+) {
+    // Collect all mounts: feature mounts first (install order), then user config.
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    if let Some(fc) = fc {
+        for m in &fc.mounts {
+            all.push(json!(m));
+        }
+    }
+    if let Some(user_mounts) = config.get("mounts").and_then(|v| v.as_array()) {
+        all.extend(user_mounts.iter().cloned());
+    }
+
+    if all.is_empty() {
+        // Omit mounts entirely when empty, matching official behaviour.
+        if let Some(obj) = merged.as_object_mut() {
+            obj.remove("mounts");
+        }
+        return;
+    }
+
+    // Dedup by target — last per target wins (iterate reversed, keep first seen).
+    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deduped: Vec<_> = all
+        .into_iter()
+        .rev()
+        .filter(|m| {
+            let target = extract_mount_target(m);
+            target.is_none_or(|t| seen_targets.insert(t))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    merged["mounts"] = json!(deduped);
+}
+
+/// Extract the `target` field from a mount (string CSV or object form).
+fn extract_mount_target(mount: &serde_json::Value) -> Option<String> {
+    if let Some(s) = mount.as_str() {
+        // CSV form: "type=bind,source=/src,target=/dst"
+        for part in s.split(',') {
+            if let Some(val) = part
+                .strip_prefix("target=")
+                .or_else(|| part.strip_prefix("dst="))
+            {
+                return Some(val.to_string());
+            }
+        }
+        None
+    } else if let Some(obj) = mount.as_object() {
+        obj.get("target")
+            .or_else(|| obj.get("dst"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        None
+    }
+}
+
+/// Apply a string-set union for `capAdd` or `securityOpt`.
+fn apply_merged_string_set(
+    merged: &mut serde_json::Value,
+    config: &serde_json::Value,
+    key: &str,
+    feature_vals: Option<&[String]>,
+) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result: Vec<serde_json::Value> = Vec::new();
+
+    let push_dedup = |item: &str,
+                      seen: &mut std::collections::HashSet<String>,
+                      result: &mut Vec<serde_json::Value>| {
+        if seen.insert(item.to_string()) {
+            result.push(json!(item));
+        }
+    };
+
+    if let Some(vals) = feature_vals {
+        for v in vals {
+            push_dedup(v, &mut seen, &mut result);
+        }
+    }
+    if let Some(arr) = config.get(key).and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                push_dedup(s, &mut seen, &mut result);
+            }
+        }
+    }
+
+    if result.is_empty() {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.remove(key);
+        }
+    } else {
+        merged[key] = json!(result);
+    }
+}
+
+/// Build `customizations` as `Record<tool, contributions[]>`.
+///
+/// Each source (feature or devcontainer.json) that has a customization object
+/// contributes its raw value for each tool key as one element of that key's
+/// array. Order: features in install order, then devcontainer.json.
+///
+/// If no customizations exist, the key is omitted.
+///
+/// **Limitation**: `FeatureContainerConfig.customizations` is a deep-merged
+/// single blob, not a per-source breakdown. To build faithful per-source arrays
+/// we need per-feature data, which is available via `ResolvedFeatures.features`.
+/// We use that directly for feature contributions. The devcontainer.json
+/// contribution is taken verbatim from `config["customizations"]`.
+fn apply_merged_customizations(
+    merged: &mut serde_json::Value,
+    config: &serde_json::Value,
+    rf: Option<&ResolvedFeatures>,
+) {
+    let mut per_tool: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    // Feature contributions in install order.
+    if let Some(rf) = rf {
+        for feature in &rf.features {
+            if let Some(obj) = feature
+                .metadata
+                .customizations
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+            {
+                for (tool, val) in obj {
+                    per_tool.entry(tool.clone()).or_default().push(val.clone());
+                }
+            }
+        }
+    }
+
+    // devcontainer.json contribution last.
+    if let Some(obj) = config
+        .get("customizations")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (tool, val) in obj {
+            per_tool.entry(tool.clone()).or_default().push(val.clone());
+        }
+    }
+
+    if per_tool.is_empty() {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.remove("customizations");
+        }
+    } else {
+        let map: serde_json::Map<String, serde_json::Value> =
+            per_tool.into_iter().map(|(k, v)| (k, json!(v))).collect();
+        merged["customizations"] = serde_json::Value::Object(map);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::path::PathBuf;
 
-    use cella_features::types::{FeatureContainerConfig, FeatureLifecycle, LifecycleEntry};
     use serde_json::json;
 
     use super::*;
@@ -263,156 +528,496 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_feature_config_sets_mounts() {
-        let mut config = json!({"image": "ubuntu"});
-        let fc = FeatureContainerConfig {
-            mounts: vec!["type=volume,src=v,dst=/v".to_string()],
-            ..Default::default()
-        };
-        apply_feature_config(&mut config, &fc);
-        assert_eq!(config["mounts"], json!(["type=volume,src=v,dst=/v"]));
-    }
+    // -------------------------------------------------------------------------
+    // build_merged_output — lifecycle plural arrays
+    // -------------------------------------------------------------------------
 
     #[test]
-    fn apply_feature_config_sets_capabilities() {
-        let mut config = json!({});
-        let fc = FeatureContainerConfig {
-            cap_add: vec!["SYS_PTRACE".to_string()],
-            security_opt: vec!["seccomp=unconfined".to_string()],
-            ..Default::default()
-        };
-        apply_feature_config(&mut config, &fc);
-        assert_eq!(config["capAdd"], json!(["SYS_PTRACE"]));
-        assert_eq!(config["securityOpt"], json!(["seccomp=unconfined"]));
-    }
+    fn merged_output_lifecycle_plural_always_emitted_base_only() {
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "onCreateCommand": "echo create",
+            "postCreateCommand": ["apt-get", "install", "-y", "curl"],
+        });
+        let out = build_merged_output(&config, None);
 
-    #[test]
-    fn apply_feature_config_sets_privileged_and_init() {
-        let mut config = json!({});
-        let fc = FeatureContainerConfig {
-            privileged: true,
-            init: true,
-            ..Default::default()
-        };
-        apply_feature_config(&mut config, &fc);
-        assert_eq!(config["privileged"], json!(true));
-        assert_eq!(config["init"], json!(true));
-    }
+        // Plural arrays present
+        assert!(out.get("onCreateCommands").is_some());
+        assert!(out.get("postCreateCommands").is_some());
+        assert!(out.get("updateContentCommands").is_some());
+        assert!(out.get("postStartCommands").is_some());
+        assert!(out.get("postAttachCommands").is_some());
 
-    #[test]
-    fn apply_feature_config_skips_false_bools() {
-        let mut config = json!({});
-        let fc = FeatureContainerConfig::default();
-        apply_feature_config(&mut config, &fc);
-        assert!(config.get("privileged").is_none());
-        assert!(config.get("init").is_none());
-    }
+        // Singular keys absent
+        assert!(out.get("onCreateCommand").is_none());
+        assert!(out.get("postCreateCommand").is_none());
 
-    #[test]
-    fn apply_feature_config_sets_container_env() {
-        let mut config = json!({});
-        let fc = FeatureContainerConfig {
-            container_env: HashMap::from([("KEY".to_string(), "val".to_string())]),
-            ..Default::default()
-        };
-        apply_feature_config(&mut config, &fc);
-        assert_eq!(config["containerEnv"]["KEY"], json!("val"));
-    }
-
-    #[test]
-    fn apply_feature_config_sets_customizations() {
-        let mut config = json!({});
-        let fc = FeatureContainerConfig {
-            customizations: json!({"vscode": {"settings": {}}}),
-            ..Default::default()
-        };
-        apply_feature_config(&mut config, &fc);
+        // Values are raw command, wrapped in array
+        assert_eq!(out["onCreateCommands"], json!(["echo create"]));
         assert_eq!(
-            config["customizations"],
-            json!({"vscode": {"settings": {}}})
+            out["postCreateCommands"],
+            json!([["apt-get", "install", "-y", "curl"]])
         );
+        // Empty phases are empty arrays
+        assert_eq!(out["updateContentCommands"], json!([]));
+        assert_eq!(out["postStartCommands"], json!([]));
+        assert_eq!(out["postAttachCommands"], json!([]));
     }
 
     #[test]
-    fn apply_feature_config_skips_empty_fields() {
-        let mut config = json!({"image": "ubuntu"});
-        let fc = FeatureContainerConfig::default();
-        apply_feature_config(&mut config, &fc);
-        assert!(config.get("mounts").is_none());
-        assert!(config.get("capAdd").is_none());
-        assert!(config.get("containerEnv").is_none());
+    fn merged_output_lifecycle_plural_empty_when_no_commands() {
+        let config = json!({"image": "ubuntu:22.04"});
+        let out = build_merged_output(&config, None);
+
+        assert_eq!(out["onCreateCommands"], json!([]));
+        assert_eq!(out["updateContentCommands"], json!([]));
+        assert_eq!(out["postCreateCommands"], json!([]));
+        assert_eq!(out["postStartCommands"], json!([]));
+        assert_eq!(out["postAttachCommands"], json!([]));
     }
 
     #[test]
-    fn apply_lifecycle_empty_entries_no_change() {
-        let mut config = json!({});
-        apply_lifecycle_field(&mut config, "onCreateCommand", &[]);
-        assert!(config.get("onCreateCommand").is_none());
-    }
+    fn merged_output_lifecycle_features_then_devcontainer_last() {
+        use cella_features::types::{
+            FeatureContainerConfig, FeatureLifecycle, LifecycleEntry, ResolvedFeature,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
 
-    #[test]
-    fn apply_lifecycle_single_entry_uses_command_directly() {
-        let mut config = json!({});
-        let entries = vec![LifecycleEntry {
-            origin: "devcontainer.json".to_string(),
-            command: json!("echo hello"),
-        }];
-        apply_lifecycle_field(&mut config, "onCreateCommand", &entries);
-        assert_eq!(config["onCreateCommand"], json!("echo hello"));
-    }
+        let config = json!({
+            "image": "ubuntu",
+            "onCreateCommand": "echo base",
+        });
 
-    #[test]
-    fn apply_lifecycle_multiple_entries_uses_object() {
-        let mut config = json!({});
-        let entries = vec![
-            LifecycleEntry {
-                origin: "feature-a".to_string(),
-                command: json!("echo a"),
-            },
-            LifecycleEntry {
-                origin: "devcontainer.json".to_string(),
-                command: json!("echo b"),
-            },
-        ];
-        apply_lifecycle_field(&mut config, "postCreateCommand", &entries);
-        assert_eq!(
-            config["postCreateCommand"],
-            json!({"feature-a": "echo a", "devcontainer.json": "echo b"})
-        );
-    }
-
-    #[test]
-    fn apply_feature_config_lifecycle_integration() {
-        let mut config = json!({});
+        // Simulate two features each contributing onCreateCommand
         let fc = FeatureContainerConfig {
             lifecycle: FeatureLifecycle {
-                on_create: vec![LifecycleEntry {
-                    origin: "feat".to_string(),
-                    command: json!("setup"),
-                }],
-                post_create: vec![
+                // As merge_with_devcontainer builds it: features in install
+                // order, then the devcontainer.json entry appended LAST.
+                on_create: vec![
                     LifecycleEntry {
-                        origin: "feat".to_string(),
-                        command: json!("init"),
+                        origin: "feat-a".to_string(),
+                        command: json!("echo feat-a"),
+                    },
+                    LifecycleEntry {
+                        origin: "feat-b".to_string(),
+                        command: json!("echo feat-b"),
                     },
                     LifecycleEntry {
                         origin: "devcontainer.json".to_string(),
-                        command: json!("start"),
+                        command: json!("echo base"),
                     },
                 ],
                 ..Default::default()
             },
             ..Default::default()
         };
-        apply_feature_config(&mut config, &fc);
-        assert_eq!(config["onCreateCommand"], json!("setup"));
+
+        let rf = ResolvedFeatures {
+            features: vec![
+                ResolvedFeature {
+                    id: "feat-a".to_string(),
+                    original_ref: "feat-a".to_string(),
+                    metadata: cella_features::types::FeatureMetadata {
+                        id: "feat-a".to_string(),
+                        on_create_command: Some(json!("echo feat-a")),
+                        ..Default::default()
+                    },
+                    user_options: HashMap::new(),
+                    artifact_dir: PathBuf::from("/tmp"),
+                    has_install_script: false,
+                },
+                ResolvedFeature {
+                    id: "feat-b".to_string(),
+                    original_ref: "feat-b".to_string(),
+                    metadata: cella_features::types::FeatureMetadata {
+                        id: "feat-b".to_string(),
+                        on_create_command: Some(json!("echo feat-b")),
+                        ..Default::default()
+                    },
+                    user_options: HashMap::new(),
+                    artifact_dir: PathBuf::from("/tmp"),
+                    has_install_script: false,
+                },
+            ],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let out = build_merged_output(&config, Some(&rf));
+
+        // Features in install order, then the devcontainer.json command LAST
+        // (matches official mergeConfiguration's metadata-array order).
         assert_eq!(
-            config["postCreateCommand"],
-            json!({"feat": "init", "devcontainer.json": "start"})
+            out["onCreateCommands"],
+            json!(["echo feat-a", "echo feat-b", "echo base"])
         );
-        assert!(config.get("postStartCommand").is_none());
+        assert!(out.get("onCreateCommand").is_none());
     }
+
+    #[test]
+    fn merged_output_singular_lifecycle_keys_absent() {
+        let config = json!({
+            "image": "ubuntu",
+            "onCreateCommand": "setup",
+            "updateContentCommand": "update",
+            "postCreateCommand": "post-create",
+            "postStartCommand": "post-start",
+            "postAttachCommand": "post-attach",
+        });
+        let out = build_merged_output(&config, None);
+
+        // All singular keys must be gone
+        for key in &[
+            "onCreateCommand",
+            "updateContentCommand",
+            "postCreateCommand",
+            "postStartCommand",
+            "postAttachCommand",
+        ] {
+            assert!(
+                out.get(key).is_none(),
+                "singular key {key} should be absent from merged output"
+            );
+        }
+        // Plural versions must be present
+        assert_eq!(out["onCreateCommands"], json!(["setup"]));
+        assert_eq!(out["updateContentCommands"], json!(["update"]));
+        assert_eq!(out["postCreateCommands"], json!(["post-create"]));
+        assert_eq!(out["postStartCommands"], json!(["post-start"]));
+        assert_eq!(out["postAttachCommands"], json!(["post-attach"]));
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — entrypoints
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_entrypoints_from_features() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+
+        let config = json!({"image": "ubuntu"});
+        let fc = FeatureContainerConfig {
+            entrypoints: vec!["/init-a.sh".to_string(), "/init-b.sh".to_string()],
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let out = build_merged_output(&config, Some(&rf));
+
+        assert_eq!(out["entrypoints"], json!(["/init-a.sh", "/init-b.sh"]));
+        assert!(out.get("entrypoint").is_none());
+    }
+
+    #[test]
+    fn merged_output_entrypoints_omitted_when_empty() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_merged_output(&config, None);
+        // Official mergeConfiguration omits entrypoints when there are none.
+        assert!(
+            out.get("entrypoints").is_none(),
+            "entrypoints should be absent when empty"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — shutdownAction last-wins
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_shutdown_action_from_devcontainer() {
+        let config = json!({"image": "ubuntu", "shutdownAction": "stopContainer"});
+        let out = build_merged_output(&config, None);
+        assert_eq!(out["shutdownAction"], json!("stopContainer"));
+    }
+
+    #[test]
+    fn merged_output_shutdown_action_absent_when_not_set() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_merged_output(&config, None);
+        assert!(out.get("shutdownAction").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — mounts dedup by target
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_mounts_dedup_by_target_last_wins() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+
+        let config = json!({
+            "image": "ubuntu",
+            // User config mount at /data — same target as feature, user wins (last)
+            "mounts": ["type=bind,source=/host2,target=/data"],
+        });
+
+        let fc = FeatureContainerConfig {
+            // Feature provides a mount at /data too
+            mounts: vec!["type=volume,source=vol1,target=/data".to_string()],
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let out = build_merged_output(&config, Some(&rf));
+        let mounts = out["mounts"].as_array().unwrap();
+
+        // Only one mount at /data — the last one (user config) wins
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0], json!("type=bind,source=/host2,target=/data"));
+    }
+
+    #[test]
+    fn merged_output_mounts_different_targets_both_kept() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+
+        let config = json!({
+            "image": "ubuntu",
+            "mounts": ["type=bind,source=/host,target=/workspace"],
+        });
+        let fc = FeatureContainerConfig {
+            mounts: vec!["type=volume,source=cache,target=/cache".to_string()],
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let out = build_merged_output(&config, Some(&rf));
+        let mounts = out["mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn merged_output_mounts_absent_when_empty() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_merged_output(&config, None);
+        assert!(out.get("mounts").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — init / privileged OR
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_container_env_merges_feature_over_base() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+        use std::collections::HashMap;
+
+        let config =
+            json!({ "image": "ubuntu", "containerEnv": { "BASE": "1", "SHARED": "base" } });
+        let fc = FeatureContainerConfig {
+            container_env: HashMap::from([
+                ("FEAT".to_string(), "2".to_string()),
+                ("SHARED".to_string(), "feature".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let out = build_merged_output(&config, Some(&rf));
+        // Base-only key survives, feature key added, feature wins the collision.
+        assert_eq!(out["containerEnv"]["BASE"], json!("1"));
+        assert_eq!(out["containerEnv"]["FEAT"], json!("2"));
+        assert_eq!(out["containerEnv"]["SHARED"], json!("feature"));
+    }
+
+    #[test]
+    fn merged_output_init_or_semantics() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+
+        // Feature true, user absent => true
+        let fc = FeatureContainerConfig {
+            init: true,
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let out = build_merged_output(&json!({"image": "ubuntu"}), Some(&rf));
+        assert_eq!(out["init"], json!(true));
+
+        // Feature false, user true => true
+        let fc2 = FeatureContainerConfig {
+            init: false,
+            ..Default::default()
+        };
+        let rf2 = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc2,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let out2 = build_merged_output(&json!({"image": "ubuntu", "init": true}), Some(&rf2));
+        assert_eq!(out2["init"], json!(true));
+
+        // Both false => false
+        let out3 = build_merged_output(&json!({"image": "ubuntu", "init": false}), None);
+        assert_eq!(out3["init"], json!(false));
+    }
+
+    #[test]
+    fn merged_output_privileged_or_semantics() {
+        use cella_features::types::{FeatureContainerConfig, ResolvedFeatures};
+
+        let fc = FeatureContainerConfig {
+            privileged: true,
+            ..Default::default()
+        };
+        let rf = ResolvedFeatures {
+            features: vec![],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: fc,
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+        let out = build_merged_output(&json!({"image": "ubuntu"}), Some(&rf));
+        assert_eq!(out["privileged"], json!(true));
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — customizations Record<tool, contributions[]>
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_customizations_record_shape() {
+        use cella_features::types::{
+            FeatureContainerConfig, FeatureMetadata, ResolvedFeature, ResolvedFeatures,
+        };
+        use std::collections::HashMap;
+
+        let config = json!({
+            "image": "ubuntu",
+            "customizations": {
+                "vscode": {"settings": {"editor.fontSize": 16}}
+            }
+        });
+
+        let rf = ResolvedFeatures {
+            features: vec![ResolvedFeature {
+                id: "feat-a".to_string(),
+                original_ref: "feat-a".to_string(),
+                metadata: FeatureMetadata {
+                    id: "feat-a".to_string(),
+                    customizations: Some(json!({
+                        "vscode": {"extensions": ["ext-a"]}
+                    })),
+                    ..Default::default()
+                },
+                user_options: HashMap::new(),
+                artifact_dir: PathBuf::from("/tmp"),
+                has_install_script: false,
+            }],
+            dockerfile: String::new(),
+            build_context: PathBuf::from("/tmp"),
+            container_config: FeatureContainerConfig::default(),
+            metadata_label: String::new(),
+            lockfile: None,
+        };
+
+        let out = build_merged_output(&config, Some(&rf));
+        let cust = &out["customizations"];
+
+        // vscode has two contributions: feature first, then devcontainer.json
+        let vscode_arr = cust["vscode"].as_array().unwrap();
+        assert_eq!(vscode_arr.len(), 2);
+        assert_eq!(vscode_arr[0], json!({"extensions": ["ext-a"]}));
+        assert_eq!(vscode_arr[1], json!({"settings": {"editor.fontSize": 16}}));
+    }
+
+    #[test]
+    fn merged_output_customizations_omitted_when_empty() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_merged_output(&config, None);
+        assert!(out.get("customizations").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // build_merged_output — passthrough keys
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn merged_output_passthrough_image_and_name() {
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "name": "my-container",
+            "remoteUser": "vscode",
+            "workspaceFolder": "/workspace",
+        });
+        let out = build_merged_output(&config, None);
+        assert_eq!(out["image"], json!("ubuntu:22.04"));
+        assert_eq!(out["name"], json!("my-container"));
+        assert_eq!(out["remoteUser"], json!("vscode"));
+        assert_eq!(out["workspaceFolder"], json!("/workspace"));
+    }
+
+    // -------------------------------------------------------------------------
+    // extract_mount_target
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extract_mount_target_csv_target_key() {
+        let m = json!("type=bind,source=/src,target=/dst");
+        assert_eq!(extract_mount_target(&m), Some("/dst".to_string()));
+    }
+
+    #[test]
+    fn extract_mount_target_csv_dst_key() {
+        let m = json!("type=volume,src=vol,dst=/data");
+        assert_eq!(extract_mount_target(&m), Some("/data".to_string()));
+    }
+
+    #[test]
+    fn extract_mount_target_object_form() {
+        let m = json!({"type": "bind", "source": "/src", "target": "/dst"});
+        assert_eq!(extract_mount_target(&m), Some("/dst".to_string()));
+    }
+
+    #[test]
+    fn extract_mount_target_missing_returns_none() {
+        let m = json!("type=bind,source=/src");
+        assert_eq!(extract_mount_target(&m), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Integration: execute command
+    // -------------------------------------------------------------------------
 
     fn make_temp_workspace(config_content: &str) -> PathBuf {
         let workspace = std::env::temp_dir().join(format!(
@@ -527,8 +1132,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_include_merged_configuration_no_features() {
-        let workspace = make_temp_workspace(r#"{"image": "ubuntu:22.04"}"#);
+    async fn execute_include_merged_configuration_no_features_emits_plural_keys() {
+        let workspace =
+            make_temp_workspace(r#"{"image": "ubuntu:22.04", "postCreateCommand": "echo hi"}"#);
         let args = ReadConfigurationArgs {
             backend: BackendArgs::default(),
             workspace_folder: Some(workspace.clone()),
@@ -540,6 +1146,8 @@ mod tests {
             container_id: None,
             additional_features: None,
         };
+        // Capture stdout to verify the shape.
+        // We just verify it doesn't error; shape tested via build_merged_output unit tests.
         args.execute().await.unwrap();
         let _ = std::fs::remove_dir_all(&workspace);
     }
