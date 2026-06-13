@@ -61,7 +61,13 @@ pub fn generate_docs(
     let mut results = Vec::new();
 
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to read directory entry: {e}");
+                continue;
+            }
+        };
         let name = entry.file_name();
         let dir_name = name.to_string_lossy();
 
@@ -70,7 +76,14 @@ pub fn generate_docs(
             continue;
         }
 
-        if !entry.file_type()?.is_dir() {
+        let is_dir = match entry.file_type() {
+            Ok(ft) => ft.is_dir(),
+            Err(e) => {
+                warn!("Failed to stat '{}': {e}", entry.path().display());
+                continue;
+            }
+        };
+        if !is_dir {
             continue;
         }
 
@@ -100,10 +113,23 @@ fn process_feature_dir(
         return ScanOutcome::Skipped;
     }
 
-    let json_text = match std::fs::read_to_string(&manifest_path) {
+    let raw_text = match std::fs::read_to_string(&manifest_path) {
         Ok(t) => t,
         Err(e) => {
             warn!("Failed to read {}: {e}", manifest_path.display());
+            return ScanOutcome::Skipped;
+        }
+    };
+
+    // Strip JSONC (comments + trailing commas) before parsing, matching the
+    // official CLI which uses jsonc-parser and accepts JSONC manifests.
+    let json_text = match cella_jsonc::strip(&raw_text) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "Failed to strip JSONC from {}: {e}",
+                manifest_path.display()
+            );
             return ScanOutcome::Skipped;
         }
     };
@@ -187,26 +213,39 @@ fn extract_major_version(parsed: &serde_json::Value) -> String {
 }
 
 /// Build the URL (or bare filename) for the footer link to `devcontainer-feature.json`.
+///
+/// Normalizes the project folder path: strips leading `./`, collapses a bare
+/// `.` (current-directory default) to an empty segment, and removes trailing
+/// slashes.  The resulting URL path is either `…/blob/main/feature/…` (when
+/// the project folder is `.` / `./`) or `…/blob/main/src/feature/…` (when a
+/// real sub-path is given).
 fn build_repo_url(feature_id: &str, input: &GenerateDocsInput<'_>) -> String {
     if input.github_owner.is_empty() || input.github_repo.is_empty() {
         return "devcontainer-feature.json".to_owned();
     }
 
-    // Strip a leading `./` from the project folder path, matching the official CLI.
-    let base = input
-        .project_folder
-        .to_string_lossy()
-        .strip_prefix("./")
-        .map_or_else(
-            || input.project_folder.to_string_lossy().into_owned(),
-            str::to_owned,
-        );
+    // Normalize: strip leading `./`, then strip a lone `.`, then strip trailing
+    // slashes.  This makes the default `--project-folder .` produce a clean URL
+    // with no stray `./` segment (matching the official CLI behaviour).
+    let raw = input.project_folder.to_string_lossy();
+    let trimmed = raw.strip_prefix("./").unwrap_or(&raw).trim_end_matches('/');
+    // A bare `.` means "current directory" — collapse to empty so we don't
+    // embed a literal `.` in the URL.
+    let base = if trimmed == "." { "" } else { trimmed };
 
-    format!(
-        "https://github.com/{owner}/{repo}/blob/main/{base}/{feature_id}/devcontainer-feature.json",
-        owner = input.github_owner,
-        repo = input.github_repo,
-    )
+    if base.is_empty() {
+        format!(
+            "https://github.com/{owner}/{repo}/blob/main/{feature_id}/devcontainer-feature.json",
+            owner = input.github_owner,
+            repo = input.github_repo,
+        )
+    } else {
+        format!(
+            "https://github.com/{owner}/{repo}/blob/main/{base}/{feature_id}/devcontainer-feature.json",
+            owner = input.github_owner,
+            repo = input.github_repo,
+        )
+    }
 }
 
 /// Generate the options table markdown, or an empty string when there are no options.
@@ -723,5 +762,106 @@ mod tests {
         );
         assert!(readme.contains("'feat-v1'"), "got:\n{readme}");
         assert!(readme.contains("'feat-old'"), "got:\n{readme}");
+    }
+
+    // -------------------------------------------------------------------------
+    // JSONC manifest — comments and trailing commas accepted (regression)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn jsonc_manifest_with_comments_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("jsonc-feat");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a manifest with line comments and a trailing comma — strict
+        // serde_json would reject this; JSONC stripping must run first.
+        std::fs::write(
+            dir.join("devcontainer-feature.json"),
+            r#"{
+    // display name
+    "id": "jsonc-feat",
+    "name": "JSONC Feature",
+    "version": "2.0.0", // trailing comma below
+    "description": "has comments",
+}"#,
+        )
+        .unwrap();
+        let input = default_input(&tmp, "o/r");
+
+        let results = generate_docs(&input).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "JSONC manifest must be parsed, not skipped"
+        );
+        let readme = std::fs::read_to_string(&results[0].readme_path).unwrap();
+        assert!(
+            readme.contains("# JSONC Feature (jsonc-feat)"),
+            "got:\n{readme}"
+        );
+        assert!(readme.contains("has comments"), "got:\n{readme}");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_repo_url — URL normalisation (regression)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn footer_url_dot_project_folder_has_no_stray_dot_segment() {
+        // When --project-folder is `.` (the default), the URL must not contain
+        // a literal `./` or `/.` segment — it should go straight to the feature.
+        let input_struct = GenerateDocsInput {
+            project_folder: Path::new("."),
+            registry: "ghcr.io",
+            namespace: "o/r",
+            github_owner: "owner",
+            github_repo: "repo",
+        };
+        let url = build_repo_url("my-feat", &input_struct);
+        assert!(
+            !url.contains("/."),
+            "URL must not contain a dot segment, got: {url}"
+        );
+        assert!(
+            url.ends_with("/my-feat/devcontainer-feature.json"),
+            "URL must end with feature path, got: {url}"
+        );
+        assert_eq!(
+            url,
+            "https://github.com/owner/repo/blob/main/my-feat/devcontainer-feature.json"
+        );
+    }
+
+    #[test]
+    fn footer_url_dot_slash_project_folder_normalized() {
+        let input_struct = GenerateDocsInput {
+            project_folder: Path::new("./src/features"),
+            registry: "ghcr.io",
+            namespace: "o/r",
+            github_owner: "owner",
+            github_repo: "repo",
+        };
+        let url = build_repo_url("my-feat", &input_struct);
+        assert_eq!(
+            url,
+            "https://github.com/owner/repo/blob/main/src/features/my-feat/devcontainer-feature.json",
+            "leading ./ must be stripped"
+        );
+    }
+
+    #[test]
+    fn footer_url_plain_subfolder() {
+        let input_struct = GenerateDocsInput {
+            project_folder: Path::new("features"),
+            registry: "ghcr.io",
+            namespace: "o/r",
+            github_owner: "owner",
+            github_repo: "repo",
+        };
+        let url = build_repo_url("node", &input_struct);
+        assert_eq!(
+            url,
+            "https://github.com/owner/repo/blob/main/features/node/devcontainer-feature.json"
+        );
     }
 }
