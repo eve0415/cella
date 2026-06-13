@@ -108,6 +108,9 @@ impl BuildArgs {
                 env_files: self.env_file.clone(),
                 pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
                 secrets: secrets.clone(),
+                // Match the single-container build path: update the lockfile when
+                // features are present (`cella build` has no --no-lockfile flag yet).
+                lockfile_policy: cella_features::LockfilePolicy::Update,
             };
             let result = cella_orchestrator::compose_build::compose_build(
                 client.as_ref(),
