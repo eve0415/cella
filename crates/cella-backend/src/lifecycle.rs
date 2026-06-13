@@ -231,19 +231,28 @@ async fn run_parallel(
         });
     }
 
-    // Wait for ALL commands to finish (allSettled), then surface the first
-    // error in command order; only print output on full success.
+    // Wait for ALL commands to finish (allSettled semantics), then surface
+    // the first error in command order. Print output from successful commands
+    // regardless of whether a sibling failed.
     let settled = futures_util::future::join_all(futures).await;
+    let mut first_err: Option<BackendError> = None;
     let mut results = Vec::with_capacity(settled.len());
     for outcome in settled {
-        results.push(outcome?);
+        match outcome {
+            Ok(r) => results.push(r),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
     }
 
     if ctx.is_text {
         print_completed_output(&results);
     }
 
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Check an exec result exit code, returning `LifecycleFailed` on non-zero.
