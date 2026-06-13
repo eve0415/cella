@@ -1283,8 +1283,12 @@ impl UpContext {
                 .or(probed_env)
         };
 
-        let mut lifecycle_env =
-            build_lifecycle_env(&self.resolved, remote_env, final_probed.as_ref());
+        let mut lifecycle_env = build_lifecycle_env(
+            &self.resolved,
+            &self.cli_remote_env,
+            remote_env,
+            final_probed.as_ref(),
+        );
         lifecycle_env.extend(self.lifecycle_secrets.iter().cloned());
 
         (final_probed, lifecycle_env)
@@ -2072,15 +2076,27 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
 /// single-container orchestrator path gets.
 fn build_lifecycle_env(
     resolved: &ResolvedConfig,
+    cli_remote_env: &[String],
     remote_env: &[String],
     probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Vec<String> {
     let effective: Vec<String> = if let (Some(raw), Some(probed)) =
         (resolved.raw_remote_env.as_ref(), probed_env)
     {
+        // Re-resolve the config `remoteEnv` with live `${containerEnv:VAR}`
+        // values. `remote_env` (cli + config, pre-chained by the caller) is
+        // bypassed here, so the CLI `--remote-env` entries must be re-chained
+        // ahead of the resolved config env — same order/precedence as the
+        // single-container `lifecycle_remote_env` (cli first, config wins on
+        // collision under later-wins merge).
         let ctx = cella_config::config_map::subst_ctx(resolved).with_container_env(probed.clone());
-        ctx.substitute_remote_env(raw)
+        cli_remote_env
+            .iter()
+            .cloned()
+            .chain(ctx.substitute_remote_env(raw))
+            .collect()
     } else {
+        // Fallback path unchanged: `remote_env` already contains cli + config.
         remote_env.to_vec()
     };
     probed_env.map_or_else(
@@ -2943,7 +2959,7 @@ mod tests {
         let probed: std::collections::HashMap<String, String> =
             [("PATH".to_string(), "/usr/bin".to_string())].into();
 
-        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+        let result = build_lifecycle_env(&resolved, &[], &remote_env, Some(&probed));
 
         // merge_env puts probed first then config overrides; FOO/BAZ come from config
         assert!(result.contains(&"FOO=bar".to_string()));
@@ -2958,7 +2974,7 @@ mod tests {
         let resolved = minimal_resolved(Some(raw));
         let remote_env = vec!["FOO=original".to_string()];
 
-        let result = build_lifecycle_env(&resolved, &remote_env, None);
+        let result = build_lifecycle_env(&resolved, &[], &remote_env, None);
 
         assert_eq!(result, remote_env);
     }
@@ -2973,12 +2989,36 @@ mod tests {
         let probed: std::collections::HashMap<String, String> =
             [("PATH".to_string(), "/container/bin".to_string())].into();
 
-        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+        let result = build_lifecycle_env(&resolved, &[], &remote_env, Some(&probed));
 
         assert!(
             result.contains(&"MYPATH=/container/bin".to_string()),
             "expected MYPATH=/container/bin in {result:?}"
         );
+    }
+
+    /// CLI `--remote-env` survives the second-pass containerEnv resolution and
+    /// is layered ahead of the resolved config env (regression guard: the raw+
+    /// probed branch must NOT drop `cli_remote_env`).
+    #[test]
+    fn cli_remote_env_preserved_through_container_env_resolution() {
+        let raw = serde_json::json!({"MYPATH": "${containerEnv:PATH}"});
+        let resolved = minimal_resolved(Some(raw));
+        let cli = vec!["CLI_VAR=from_cli".to_string()];
+        let remote_env = vec![
+            "CLI_VAR=from_cli".to_string(),
+            "MYPATH=fallback".to_string(),
+        ];
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/container/bin".to_string())].into();
+
+        let result = build_lifecycle_env(&resolved, &cli, &remote_env, Some(&probed));
+
+        assert!(
+            result.contains(&"CLI_VAR=from_cli".to_string()),
+            "cli --remote-env must survive containerEnv resolution; got {result:?}"
+        );
+        assert!(result.contains(&"MYPATH=/container/bin".to_string()));
     }
 
     /// Config remoteEnv overrides probed env (precedence: config > probe).
@@ -2990,7 +3030,7 @@ mod tests {
         let probed: std::collections::HashMap<String, String> =
             [("FOO".to_string(), "from_probe".to_string())].into();
 
-        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+        let result = build_lifecycle_env(&resolved, &[], &remote_env, Some(&probed));
 
         assert!(
             result.contains(&"FOO=from_config".to_string()),
