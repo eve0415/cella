@@ -19,7 +19,7 @@ use cella_backend::lifecycle::{lifecycle_entries_for_phase, run_lifecycle_entrie
 use cella_backend::progress::ProgressSender;
 use cella_backend::{
     ContainerBackend, ContainerInfo, ContainerState, LifecycleContext, MountSpec,
-    SshAgentProxyStatus, agent_env_vars, run_lifecycle_phase,
+    SshAgentProxyStatus, agent_env_vars, names::lexical_absolute, run_lifecycle_phase,
 };
 use cella_config::devcontainer::resolve::ResolvedConfig;
 
@@ -1288,16 +1288,14 @@ fn build_compose_labels(
     project: &ComposeProject,
     remote_user: &str,
 ) -> BTreeMap<String, String> {
-    let workspace_str = cfg
-        .workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| cfg.workspace_root.to_path_buf())
+    // Use lexical (non-symlink-resolving) paths to match the values hashed by
+    // `devcontainer_id` and by VS Code / the official CLI. Canonicalization
+    // would resolve symlinks (e.g. macOS /tmp → /private/tmp, bind mounts) and
+    // make the labels disagree with the ID in symlinked-workspace scenarios.
+    let workspace_str = lexical_absolute(cfg.workspace_root)
         .to_string_lossy()
         .to_string();
-    let config_str = cfg
-        .config_path
-        .canonicalize()
-        .unwrap_or_else(|_| cfg.config_path.to_path_buf())
+    let config_str = lexical_absolute(cfg.config_path)
         .to_string_lossy()
         .to_string();
 

@@ -1,8 +1,9 @@
 //! Config resolution: discover, parse, merge layers, compute hash.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+use cella_backend::names::lexical_absolute;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -130,37 +131,6 @@ pub fn devcontainer_id(workspace_root: &Path, config_path: &Path) -> String {
         lexical_absolute(config_path).to_string_lossy().to_string(),
     );
     spec_devcontainer_id(&labels)
-}
-
-/// Make `path` absolute and lexically normalized — the Rust equivalent of
-/// Node's `path.resolve(path)`. Relative paths are resolved against the current
-/// directory; `.` and `..` segments are collapsed purely textually, WITHOUT
-/// touching the filesystem or following symlinks.
-fn lexical_absolute(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-    };
-
-    let mut out = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Pop only a real path segment; never ascend past the root.
-                if out
-                    .components()
-                    .next_back()
-                    .is_some_and(|c| matches!(c, Component::Normal(_)))
-                {
-                    out.pop();
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 fn spec_devcontainer_id(labels: &BTreeMap<String, String>) -> String {
@@ -404,6 +374,7 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_backend::names::lexical_absolute;
     use tempfile::TempDir;
 
     fn create_devcontainer(workspace: &Path, content: &str) {

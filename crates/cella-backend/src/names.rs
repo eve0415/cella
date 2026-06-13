@@ -1,7 +1,7 @@
 //! Container/image naming and label generation.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -105,6 +105,44 @@ pub fn image_name_with_features(
     format!("cella-img-{identifier}-{path_hash}-{feat_hash}")
 }
 
+/// Make `path` absolute and lexically normalized — the Rust equivalent of
+/// Node's `path.resolve(path)`.
+///
+/// Relative paths are resolved against the current directory (best-effort OS
+/// query; falls back to the original path when `current_dir()` fails). `.` and
+/// `..` segments are then collapsed purely textually — no symlink resolution,
+/// no existence requirement.
+///
+/// This matches the path values used by VS Code and the official devcontainer
+/// CLI when computing `devcontainerId`, which hash the lexical workspace and
+/// config paths rather than their canonicalized (symlink-resolved) targets.
+pub fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop only a real path segment; never ascend past the root.
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)))
+                {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Label key for the container backend kind.
 pub const BACKEND_LABEL: &str = "dev.cella.backend";
 
@@ -119,14 +157,14 @@ pub fn container_labels(
     config_hash: &str,
     runtime_label: &str,
 ) -> HashMap<String, String> {
-    let canonical_workspace = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let canonical_config = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf());
-    let workspace_str = canonical_workspace.to_string_lossy().to_string();
-    let config_str = canonical_config.to_string_lossy().to_string();
+    // Use lexical (non-symlink-resolving) paths to match the values hashed by
+    // `devcontainer_id` and by VS Code / the official CLI. Canonicalization
+    // would resolve symlinks (e.g. macOS /tmp → /private/tmp, bind mounts) and
+    // make the labels disagree with the ID in symlinked-workspace scenarios.
+    let workspace_str = lexical_absolute(workspace_root)
+        .to_string_lossy()
+        .to_string();
+    let config_str = lexical_absolute(config_path).to_string_lossy().to_string();
 
     let mut labels = HashMap::new();
 
