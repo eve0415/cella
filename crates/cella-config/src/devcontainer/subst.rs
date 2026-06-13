@@ -1,6 +1,7 @@
 //! Devcontainer spec variable substitution.
 //!
-//! Resolves `${localEnv:VAR}`, `${containerEnv:VAR}`, `${localWorkspaceFolder}`,
+//! Resolves `${localEnv:VAR}` (and its `${env:VAR}` alias),
+//! `${containerEnv:VAR}`, `${localWorkspaceFolder}`,
 //! `${containerWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, and
 //! `${devcontainerId}` expressions in configuration values.
 
@@ -102,7 +103,10 @@ impl SubstitutionContext {
         let keyword = parts.next().unwrap_or("");
 
         match keyword {
-            "localEnv" => {
+            // `${env:VAR}` is the official alias for `${localEnv:VAR}`
+            // (the CLI's variableSubstitution.ts has `case 'env'` fall through
+            // to the same handler as `localEnv`).
+            "localEnv" | "env" => {
                 let var_name = parts.next().unwrap_or("");
                 let default = parts.next().unwrap_or("");
                 self.local_env
@@ -159,6 +163,17 @@ mod tests {
     fn local_env_missing_is_empty() {
         let ctx = test_ctx();
         assert_eq!(ctx.substitute_str("${localEnv:NONEXISTENT}"), "");
+    }
+
+    #[test]
+    fn env_alias_resolves_like_local_env() {
+        let ctx = test_ctx();
+        assert_eq!(ctx.substitute_str("${env:HOME}"), "/home/testuser");
+        assert_eq!(ctx.substitute_str("${env:NONEXISTENT}"), "");
+        assert_eq!(
+            ctx.substitute_str("${env:NONEXISTENT:fallback}"),
+            "fallback"
+        );
     }
 
     #[test]
