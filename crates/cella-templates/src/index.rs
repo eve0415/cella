@@ -7,6 +7,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use futures_util::StreamExt as _;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -88,12 +89,39 @@ async fn fetch_index_json() -> Result<String, TemplateError> {
         });
     }
 
-    response
-        .text()
-        .await
-        .map_err(|e| TemplateError::IndexFetchFailed {
+    // Pre-check declared Content-Length before streaming.
+    if let Some(content_length) = response.content_length()
+        && content_length > cella_oci::MAX_COLLECTION_JSON_BYTES
+    {
+        return Err(TemplateError::IndexFetchFailed {
+            message: format!(
+                "index download exceeds size limit: {content_length} bytes > {} bytes",
+                cella_oci::MAX_COLLECTION_JSON_BYTES,
+            ),
+        });
+    }
+
+    // Stream body with a running byte counter to enforce the cap.
+    let mut stream = response.bytes_stream();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| TemplateError::IndexFetchFailed {
             message: format!("failed to read response body: {e}"),
-        })
+        })?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > cella_oci::MAX_COLLECTION_JSON_BYTES {
+            return Err(TemplateError::IndexFetchFailed {
+                message: format!(
+                    "index download exceeds size limit of {} bytes",
+                    cella_oci::MAX_COLLECTION_JSON_BYTES,
+                ),
+            });
+        }
+    }
+
+    String::from_utf8(bytes).map_err(|e| TemplateError::IndexFetchFailed {
+        message: format!("index response is not valid UTF-8: {e}"),
+    })
 }
 
 // ── Cache helpers ────────────────────────────────────────────────────

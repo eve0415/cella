@@ -741,6 +741,7 @@ dependencies = [
  "dirs",
  "filetime",
  "flate2",
+ "futures-util",
  "glob",
  "hex",
  "miette",
