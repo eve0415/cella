@@ -30,6 +30,14 @@ pub struct ResolvedConfig {
     pub warnings: Vec<Diagnostic>,
     /// Typed representation of the merged config, if validation succeeded.
     pub typed: Option<crate::schema::DevContainer>,
+    /// The raw (pre-substitution) `remoteEnv` object from the merged config.
+    ///
+    /// Captured before the phase-1 substitution pass so the orchestrator can
+    /// perform a second-pass resolution after `userEnvProbe` has captured the
+    /// container's live environment, enabling `${containerEnv:VAR}` in
+    /// `remoteEnv` to resolve against the actual running container.  `None`
+    /// when the merged config has no `remoteEnv` key.
+    pub raw_remote_env: Option<serde_json::Value>,
 }
 
 impl ResolvedConfig {
@@ -283,6 +291,12 @@ pub fn config_with_override(
         &devcontainer_id,
         env,
     );
+
+    // Snapshot raw remoteEnv BEFORE phase-1 substitution so the orchestrator
+    // can perform a second pass after userEnvProbe, resolving
+    // ${containerEnv:VAR} against the live container environment.
+    let raw_remote_env = config.get("remoteEnv").cloned();
+
     ctx.substitute_value(&mut config);
 
     // Deprecation warnings for legacy properties
@@ -322,6 +336,7 @@ pub fn config_with_override(
         devcontainer_id,
         warnings,
         typed,
+        raw_remote_env,
     })
 }
 
@@ -353,6 +368,9 @@ pub fn from_config_value(
         devcontainer_id,
         warnings: Vec::new(),
         typed,
+        // Config sourced from a container label is already substituted — no
+        // raw snapshot is available for a second-pass containerEnv resolution.
+        raw_remote_env: None,
     }
 }
 

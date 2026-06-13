@@ -16,6 +16,12 @@ pub struct SubstitutionContext {
     local_workspace_folder_basename: String,
     container_workspace_folder: String,
     devcontainer_id: String,
+    /// Live container environment for `${containerEnv:VAR}` resolution.
+    ///
+    /// Empty by default (config-parse time). Populated for the second-pass
+    /// `remoteEnv` resolution after `userEnvProbe` has captured the container's
+    /// actual env.
+    container_env: HashMap<String, String>,
 }
 
 impl SubstitutionContext {
@@ -44,7 +50,19 @@ impl SubstitutionContext {
             local_workspace_folder_basename: basename,
             container_workspace_folder: container_wf,
             devcontainer_id: devcontainer_id.to_string(),
+            container_env: HashMap::new(),
         }
+    }
+
+    /// Consume this context and return it with `container_env` populated.
+    ///
+    /// Used for the second-pass `remoteEnv` resolution after container start,
+    /// where `${containerEnv:VAR}` should resolve against the live container
+    /// environment captured by `userEnvProbe`.
+    #[must_use]
+    pub fn with_container_env(mut self, container_env: HashMap<String, String>) -> Self {
+        self.container_env = container_env;
+        self
     }
 
     /// Substitute all `${...}` expressions in a string.
@@ -104,6 +122,30 @@ impl SubstitutionContext {
         }
     }
 
+    /// Resolve a raw `remoteEnv` JSON object into `KEY=value` strings.
+    ///
+    /// Accepts the pre-substitution `remoteEnv` value (a `{"K":"V"}` object)
+    /// and returns one `KEY=value` string per entry, with all `${...}`
+    /// expressions in the values resolved by this context.
+    ///
+    /// Non-object or `null` input returns an empty vec.  Used for the
+    /// post-start second pass where `container_env` is populated so that
+    /// `${containerEnv:VAR}` tokens resolve against the live container
+    /// environment.  Config-time `remoteEnv` is handled separately by
+    /// `config_map::env::map_remote_env`.
+    #[must_use]
+    pub fn substitute_remote_env(&self, raw_remote_env: &serde_json::Value) -> Vec<String> {
+        let Some(obj) = raw_remote_env.as_object() else {
+            return Vec::new();
+        };
+        obj.iter()
+            .map(|(k, v)| {
+                let raw_val = v.as_str().unwrap_or("");
+                format!("{k}={}", self.substitute_str(raw_val))
+            })
+            .collect()
+    }
+
     /// Resolve a single expression (the content between `${` and `}`).
     fn resolve_expr(&self, expr: &str) -> String {
         // Split into at most 3 parts: keyword, name, default
@@ -123,10 +165,15 @@ impl SubstitutionContext {
                     .unwrap_or_else(|| default.to_string())
             }
             "containerEnv" => {
-                // Container not running at resolve time — use default or empty
-                parts.next(); // advance past var name to reach default
+                let var_name = parts.next().unwrap_or("");
                 let default = parts.next().unwrap_or("");
-                default.to_string()
+                // When container_env is populated (second pass after container
+                // start), resolve against the live env. At config-parse time
+                // container_env is empty, so we fall through to `default` or ""
+                // — identical to today's behaviour.
+                self.container_env
+                    .get(var_name)
+                    .map_or_else(|| default.to_string(), Clone::clone)
             }
             "localWorkspaceFolder" => self.local_workspace_folder.clone(),
             "containerWorkspaceFolder" => self.container_workspace_folder.clone(),
@@ -158,6 +205,7 @@ mod tests {
             local_workspace_folder_basename: "myapp".to_string(),
             container_workspace_folder: "/workspaces/myapp".to_string(),
             devcontainer_id: "abc123".to_string(),
+            container_env: HashMap::new(),
         }
     }
 
@@ -546,5 +594,155 @@ mod tests {
             ctx.substitute_str("${localEnv:TRICKY}"),
             "${localWorkspaceFolder}"
         );
+    }
+
+    // --- with_container_env / substitute_remote_env tests ---
+
+    fn ctx_with_container_env() -> SubstitutionContext {
+        let mut local = HashMap::new();
+        local.insert("HOME".to_string(), "/home/testuser".to_string());
+        let mut cenv = HashMap::new();
+        cenv.insert(
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        );
+        cenv.insert("SHELL".to_string(), "/bin/bash".to_string());
+        SubstitutionContext {
+            local_env: local,
+            local_workspace_folder: "/projects/myapp".to_string(),
+            local_workspace_folder_basename: "myapp".to_string(),
+            container_workspace_folder: "/workspaces/myapp".to_string(),
+            devcontainer_id: "abc123".to_string(),
+            container_env: cenv,
+        }
+    }
+
+    #[test]
+    fn with_container_env_resolves_container_env_var() {
+        let ctx = ctx_with_container_env();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}"),
+            "/usr/local/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn with_container_env_appends_to_existing_path() {
+        let ctx = ctx_with_container_env();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH}:/extra/bin"),
+            "/usr/local/bin:/usr/bin:/bin:/extra/bin"
+        );
+    }
+
+    #[test]
+    fn with_container_env_missing_var_falls_back_to_default() {
+        let ctx = ctx_with_container_env();
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:NONEXISTENT:fallback}"),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn with_container_env_missing_var_no_default_is_empty() {
+        let ctx = ctx_with_container_env();
+        assert_eq!(ctx.substitute_str("${containerEnv:NONEXISTENT}"), "");
+    }
+
+    /// Prove additive invariant: empty `container_env` produces identical output
+    /// to the pre-feature behaviour.
+    #[test]
+    fn empty_container_env_collapses_to_default() {
+        let ctx = test_ctx(); // container_env is empty
+        assert_eq!(ctx.substitute_str("${containerEnv:PATH}"), "");
+        assert_eq!(
+            ctx.substitute_str("${containerEnv:PATH:/usr/bin}"),
+            "/usr/bin"
+        );
+    }
+
+    #[test]
+    fn substitute_remote_env_resolves_mixed_entries() {
+        let ctx = ctx_with_container_env();
+        let raw = serde_json::json!({
+            "PATH": "${containerEnv:PATH}:/extra/bin",
+            "HOME": "${localEnv:HOME}",
+            "LITERAL": "plain-value"
+        });
+        let result = ctx.substitute_remote_env(&raw);
+        assert!(result.contains(&"PATH=/usr/local/bin:/usr/bin:/bin:/extra/bin".to_string()));
+        assert!(result.contains(&"HOME=/home/testuser".to_string()));
+        assert!(result.contains(&"LITERAL=plain-value".to_string()));
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn substitute_remote_env_non_object_returns_empty() {
+        let ctx = test_ctx();
+        assert!(
+            ctx.substitute_remote_env(&serde_json::json!(null))
+                .is_empty()
+        );
+        assert!(
+            ctx.substitute_remote_env(&serde_json::json!("str"))
+                .is_empty()
+        );
+        assert!(ctx.substitute_remote_env(&serde_json::json!([])).is_empty());
+    }
+
+    #[test]
+    fn substitute_remote_env_without_container_env_uses_defaults() {
+        // Proves the non-containerEnv path is unchanged: same output regardless
+        // of whether container_env is populated.
+        let ctx_empty = test_ctx();
+        let raw = serde_json::json!({
+            "EDITOR": "vim",
+            "HOME": "${localEnv:HOME}"
+        });
+        let result_empty = ctx_empty.substitute_remote_env(&raw);
+        // Now with container_env populated — same entries should be equal
+        let ctx_live = ctx_with_container_env();
+        let result_live = ctx_live.substitute_remote_env(&raw);
+        assert_eq!(result_empty, result_live);
+    }
+
+    #[test]
+    fn with_container_env_builder_leaves_other_fields_intact() {
+        let base = test_ctx();
+        let mut cenv = HashMap::new();
+        cenv.insert("FOO".to_string(), "bar".to_string());
+        let ctx = base.with_container_env(cenv);
+        // Other substitutions still work after with_container_env
+        assert_eq!(ctx.substitute_str("${localEnv:HOME}"), "/home/testuser");
+        assert_eq!(
+            ctx.substitute_str("${localWorkspaceFolder}"),
+            "/projects/myapp"
+        );
+        assert_eq!(ctx.substitute_str("${containerEnv:FOO}"), "bar");
+    }
+
+    /// Regression: when `remoteEnv` contains no `${containerEnv:` tokens, the
+    /// second-pass substitution must produce byte-identical output to the
+    /// phase-1 pass regardless of whether `container_env` is populated.  This
+    /// is the invariant that lets `resolved_remote_env` in the orchestrator
+    /// skip the second pass cheaply.
+    #[test]
+    fn substitute_remote_env_no_container_env_tokens_is_idempotent() {
+        let raw = serde_json::json!({
+            "EDITOR": "vim",
+            "HOME": "${localEnv:HOME}",
+            "WS": "${containerWorkspaceFolder}"
+        });
+        let ctx_empty = test_ctx();
+        let first_pass = ctx_empty.substitute_remote_env(&raw);
+
+        let mut cenv = HashMap::new();
+        cenv.insert("HOME".to_string(), "/container/home".to_string());
+        let ctx_live = test_ctx().with_container_env(cenv);
+        let second_pass = ctx_live.substitute_remote_env(&raw);
+
+        // No ${containerEnv:…} tokens → both passes must agree
+        assert_eq!(first_pass, second_pass);
     }
 }

@@ -1484,6 +1484,7 @@ impl UpContext {
             resolved: &self.resolved,
             container_name: &self.container_nm,
             remote_env: &self.remote_env,
+            raw_remote_env: self.resolved.raw_remote_env.as_ref(),
             cli_remote_env: &self.cli_remote_env,
             workspace_folder_from_config: self.workspace_folder(),
             default_workspace_folder: &self.default_workspace_folder,

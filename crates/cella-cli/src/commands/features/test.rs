@@ -832,6 +832,7 @@ async fn bring_up_test_container(
         resolved: &resolved,
         container_name: &container_name,
         remote_env: &empty_vec,
+        raw_remote_env: None,
         cli_remote_env: &empty_vec,
         workspace_folder_from_config: None,
         default_workspace_folder: &default_workspace_folder,
