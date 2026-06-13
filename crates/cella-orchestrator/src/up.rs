@@ -1692,10 +1692,16 @@ impl EnsureUpContext<'_> {
         {
             Ok(()) => step.finish(),
             Err(e) => {
-                warn!("Dotfiles install failed (continuing): {e}");
+                // The dotfiles script runs with the secret-bearing lifecycle_env;
+                // its failure message can echo stderr containing secret values,
+                // so mask before logging or surfacing to the terminal.
+                let err_text = e.to_string();
+                let masker = cella_backend::SecretMasker::new(self.config.lifecycle_secrets);
+                let msg = masker.mask(&err_text);
+                warn!("Dotfiles install failed (continuing): {msg}");
                 step.fail("failed");
                 self.progress
-                    .warn(&format!("Dotfiles install failed (continuing): {e}"));
+                    .warn(&format!("Dotfiles install failed (continuing): {msg}"));
             }
         }
     }
