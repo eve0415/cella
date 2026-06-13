@@ -66,6 +66,15 @@ fn skip_remap_for_remote_user(remote_user: &str) -> bool {
         || (!remote_user.is_empty() && remote_user.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether UID remap is unsupported on the given host OS.
+///
+/// The official CLI only remaps on Linux: on macOS/Windows the Docker Desktop
+/// VM mediates bind-mount file ownership, so there is no host UID to align the
+/// container user with (`updateRemoteUserUIDOnMacOS` is hardcoded `false`).
+fn remap_unsupported_on_host(host_os: &str) -> bool {
+    host_os != "linux"
+}
+
 /// Build a UID-remapped image on top of `base_image`.
 ///
 /// Returns `Ok(Some(uid_image_name))` when a new image was built, or
@@ -85,6 +94,14 @@ pub async fn build_uid_remap_image(
     toolchain: BuildToolchain<'_>,
     progress: &ProgressSender,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if remap_unsupported_on_host(std::env::consts::OS) {
+        debug!(
+            "Skipping UID remap: host OS is {} (Docker Desktop mediates file ownership off Linux)",
+            std::env::consts::OS
+        );
+        return Ok(None);
+    }
+
     if skip_remap_for_remote_user(remote_user) {
         debug!("Skipping UID remap: remote user is root or numeric ({remote_user})");
         return Ok(None);
@@ -193,5 +210,13 @@ mod tests {
         assert!(!skip_remap_for_remote_user("node"));
         // Empty string is not numeric per /^\d+$/ (requires >=1 digit).
         assert!(!skip_remap_for_remote_user(""));
+    }
+
+    #[test]
+    fn remap_only_on_linux_host() {
+        assert!(!remap_unsupported_on_host("linux"));
+        // Off Linux, Docker Desktop's VM handles bind-mount ownership.
+        assert!(remap_unsupported_on_host("macos"));
+        assert!(remap_unsupported_on_host("windows"));
     }
 }
