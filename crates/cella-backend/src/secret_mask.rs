@@ -28,16 +28,16 @@ impl SecretMasker {
     /// - Empty values are silently dropped (nothing to mask).
     /// - Values are deduplicated and sorted longest-first.
     pub fn new(entries: &[String]) -> Self {
+        // Output is masked per line, so a multiline secret value (e.g. a PEM
+        // key in the secrets file) is registered as its individual non-empty
+        // lines — otherwise the whole value would never match a single line and
+        // leak through.
         let mut values: Vec<String> = entries
             .iter()
-            .filter_map(|e| {
-                let (_, v) = e.split_once('=')?;
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            })
+            .filter_map(|e| e.split_once('=').map(|(_, v)| v))
+            .flat_map(str::lines)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
             .collect();
 
         // Dedup before sorting so identical values don't cause double-passes.
@@ -131,6 +131,16 @@ mod tests {
         let m = masker(&["EMPTY=", "REAL=hunter2"]);
         let out = m.mask("password is hunter2 and EMPTY= stays");
         assert_eq!(out, "password is ******** and EMPTY= stays");
+    }
+
+    #[test]
+    fn multiline_value_masked_per_line() {
+        // A multiline secret (e.g. a PEM key) registers each non-empty line, so
+        // per-line output masking catches it instead of leaking.
+        let m = masker(&["KEY=-----BEGIN-----\nMIIByz\n-----END-----"]);
+        assert_eq!(m.mask("-----BEGIN-----"), "********");
+        assert_eq!(m.mask("MIIByz"), "********");
+        assert_eq!(m.mask("-----END-----"), "********");
     }
 
     #[test]

@@ -258,7 +258,7 @@ async fn run_sequential(
             ctx.client.exec_command(ctx.container_id, &opts).await?
         };
 
-        check_exit_code(&result, phase, None)?;
+        check_exit_code(&result, phase, None, &ctx.secret_masker)?;
     }
     Ok(())
 }
@@ -295,7 +295,7 @@ async fn run_parallel(
                 )
                 .await?;
 
-            check_exit_code(&result, &phase, Some(&name))?;
+            check_exit_code(&result, &phase, Some(&name), &ctx.secret_masker)?;
             Ok::<ExecResult, BackendError>(result)
         });
     }
@@ -314,15 +314,18 @@ fn check_exit_code(
     result: &ExecResult,
     phase: &str,
     name: Option<&str>,
+    masker: &SecretMasker,
 ) -> Result<(), BackendError> {
     if result.exit_code != 0 {
         let prefix = name.map_or(String::new(), |n| format!("[{n}] "));
+        // The failing command's stderr is embedded in the error message, which
+        // surfaces in the JSON error envelope — mask secrets before it does.
         return Err(BackendError::LifecycleFailed {
             phase: phase.to_string(),
             message: format!(
                 "{prefix}exit code {}: {}",
                 result.exit_code,
-                result.stderr.trim()
+                masker.mask(result.stderr.trim())
             ),
         });
     }
@@ -1406,7 +1409,9 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
         };
-        assert!(check_exit_code(&result, "postCreateCommand", None).is_ok());
+        assert!(
+            check_exit_code(&result, "postCreateCommand", None, &SecretMasker::default()).is_ok()
+        );
     }
 
     #[test]
@@ -1416,7 +1421,8 @@ mod tests {
             stdout: String::new(),
             stderr: "command not found".to_string(),
         };
-        let err = check_exit_code(&result, "onCreateCommand", None).unwrap_err();
+        let err = check_exit_code(&result, "onCreateCommand", None, &SecretMasker::default())
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("onCreateCommand"),
@@ -1431,7 +1437,8 @@ mod tests {
             stdout: String::new(),
             stderr: "sh: npm: not found".to_string(),
         };
-        let err = check_exit_code(&result, "postCreateCommand", None).unwrap_err();
+        let err = check_exit_code(&result, "postCreateCommand", None, &SecretMasker::default())
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("127"),
@@ -1446,7 +1453,13 @@ mod tests {
             stdout: "some output\n".to_string(),
             stderr: "fatal error occurred\n".to_string(),
         };
-        let err = check_exit_code(&result, "updateContentCommand", None).unwrap_err();
+        let err = check_exit_code(
+            &result,
+            "updateContentCommand",
+            None,
+            &SecretMasker::default(),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("fatal error occurred"),
@@ -1461,7 +1474,13 @@ mod tests {
             stdout: String::new(),
             stderr: "failed".to_string(),
         };
-        let err = check_exit_code(&result, "postStartCommand", Some("setup")).unwrap_err();
+        let err = check_exit_code(
+            &result,
+            "postStartCommand",
+            Some("setup"),
+            &SecretMasker::default(),
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("[setup]"),
@@ -1476,7 +1495,7 @@ mod tests {
             stdout: String::new(),
             stderr: "err".to_string(),
         };
-        let err = check_exit_code(&result, "phase", None).unwrap_err();
+        let err = check_exit_code(&result, "phase", None, &SecretMasker::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             !msg.contains('['),
@@ -1491,7 +1510,7 @@ mod tests {
             stdout: "done".to_string(),
             stderr: String::new(),
         };
-        assert!(check_exit_code(&result, "phase", Some("task")).is_ok());
+        assert!(check_exit_code(&result, "phase", Some("task"), &SecretMasker::default()).is_ok());
     }
 
     #[test]
@@ -1501,13 +1520,27 @@ mod tests {
             stdout: String::new(),
             stderr: "  whitespace  \n".to_string(),
         };
-        let err = check_exit_code(&result, "phase", None).unwrap_err();
+        let err = check_exit_code(&result, "phase", None, &SecretMasker::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("whitespace"),
             "expected trimmed stderr in message, got: {msg}"
         );
         assert!(!msg.ends_with('\n'), "stderr should be trimmed, got: {msg}");
+    }
+
+    #[test]
+    fn check_exit_code_masks_secret_in_stderr() {
+        let result = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "failed: leaked s3cr3t".to_string(),
+        };
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let err = check_exit_code(&result, "phase", None, &masker).unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("s3cr3t"), "secret leaked into error: {msg}");
+        assert!(msg.contains("********"), "expected mask, got: {msg}");
     }
 
     #[test]
