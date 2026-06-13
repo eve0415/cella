@@ -1476,6 +1476,9 @@ mod tests {
                 user: "vscode".to_string(),
                 env: vec!["PATH=/usr/local/bin".to_string()],
                 metadata: Some("{\"remoteUser\":\"vscode\"}".to_string()),
+                os: Some("linux".to_string()),
+                architecture: Some("amd64".to_string()),
+                variant: None,
             }));
 
         let details = mock.inspect_image_details("ubuntu:latest").await.unwrap();

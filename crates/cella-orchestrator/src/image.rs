@@ -72,6 +72,7 @@ pub async fn build_features_layer(
         secrets: vec![],
         use_buildkit: ctx.build_tuning.use_buildkit,
         docker_path: ctx.build_tuning.docker_path.map(str::to_string),
+        platform: None,
     };
 
     info!(
@@ -516,6 +517,7 @@ pub fn parse_build_options(
         secrets: vec![],
         use_buildkit: build_tuning.use_buildkit,
         docker_path: build_tuning.docker_path.map(str::to_string),
+        platform: None,
     }
 }
 

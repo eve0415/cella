@@ -1859,7 +1859,7 @@ impl EnsureUpContext<'_> {
         &self,
         config: &serde_json::Value,
         img_name: &str,
-        image_user: &str,
+        base: &ImageDetails,
         remote_user: &str,
         create_opts: &mut cella_backend::CreateContainerOptions,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1871,16 +1871,22 @@ impl EnsureUpContext<'_> {
             self.config.update_remote_user_uid_default,
         );
 
+        let image_platform = cella_backend::uid_image::image_platform(
+            base.os.as_deref(),
+            base.architecture.as_deref(),
+            base.variant.as_deref(),
+        );
         if update_uid
             && let Some(uid_img) = crate::uid_image::build_uid_remap_image(
                 self.client,
                 img_name,
-                image_user,
+                &base.user,
                 remote_user,
                 cella_backend::uid_image::BuildToolchain {
                     docker_path: self.config.build_tuning.docker_path,
                     use_buildkit: self.config.build_tuning.use_buildkit,
                 },
+                image_platform.as_deref(),
                 &self.progress,
             )
             .await?
@@ -1925,7 +1931,6 @@ impl EnsureUpContext<'_> {
             })
             .await?;
 
-        let image_user = base_image_details.user.clone();
         let image_metadata = if resolved_features.is_none() {
             base_image_details.metadata.clone()
         } else {
@@ -1940,7 +1945,7 @@ impl EnsureUpContext<'_> {
             mut create_opts,
         } = self.resolve_image_config(
             &img_name,
-            base_image_details,
+            base_image_details.clone(),
             resolved_features.as_ref(),
             &agent_arch,
         )?;
@@ -1952,7 +1957,7 @@ impl EnsureUpContext<'_> {
         self.maybe_remap_uid(
             config,
             &img_name,
-            &image_user,
+            &base_image_details,
             &remote_user,
             &mut create_opts,
         )

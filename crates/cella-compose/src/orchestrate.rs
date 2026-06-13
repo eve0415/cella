@@ -437,19 +437,23 @@ async fn resolve_user_and_env(
 ) -> (
     String,
     String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     cella_env::EnvForwarding,
     Option<SshAgentProxyStatus>,
 ) {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let (image_user, image_meta_user) = resolve_compose_image_info(
-        client,
-        project,
-        features_build,
-        cfg.docker_binaries(),
-        progress,
-    )
-    .await;
+    let (image_user, image_os, image_arch, image_variant, image_meta_user) =
+        resolve_compose_image_info(
+            client,
+            project,
+            features_build,
+            cfg.docker_binaries(),
+            progress,
+        )
+        .await;
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
@@ -462,7 +466,15 @@ async fn resolve_user_and_env(
         client.host_gateway(),
     )
     .await;
-    (remote_user, image_user, env_fwd, ssh_agent_proxy)
+    (
+        remote_user,
+        image_user,
+        image_os,
+        image_arch,
+        image_variant,
+        env_fwd,
+        ssh_agent_proxy,
+    )
 }
 
 /// Prepare environment, write override YAML, and start compose services.
@@ -551,8 +563,15 @@ async fn prepare_and_start(
     .await?;
 
     // 10. Resolve remote user, env forwarding, and ssh-agent proxy.
-    let (remote_user, image_user, mut env_fwd, ssh_agent_proxy) =
-        resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
+    let (
+        remote_user,
+        image_user,
+        image_os,
+        image_arch,
+        image_variant,
+        mut env_fwd,
+        ssh_agent_proxy,
+    ) = resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-15. Build override context, UID remap, write override, and start.
@@ -566,6 +585,9 @@ async fn prepare_and_start(
         &mut env_fwd,
         &remote_user,
         &image_user,
+        image_os.as_deref(),
+        image_arch.as_deref(),
+        image_variant.as_deref(),
         agent_vol_name,
         agent_vol_target,
     )
@@ -916,14 +938,20 @@ async fn resolve_compose_image_info(
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     docker_binaries: (Option<String>, Option<String>),
     progress: &ProgressSender,
-) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<cella_features::ImageMetadataUserInfo>,
+) {
     // If features resolved an image, its metadata was already extracted.
     if let Some(fb) = features_build {
         let meta_user = fb
             .base_image_metadata
             .as_deref()
             .map(|m| cella_features::parse_image_metadata(m).1);
-        return (fb.image_user.clone(), meta_user);
+        return (fb.image_user.clone(), None, None, None, meta_user);
     }
 
     // Resolve compose config to find the service's image source.
@@ -933,7 +961,7 @@ async fn resolve_compose_image_info(
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to resolve compose config for image metadata: {e}");
-            return ("root".to_string(), None);
+            return ("root".to_string(), None, None, None, None);
         }
     };
 
@@ -942,7 +970,7 @@ async fn resolve_compose_image_info(
         Ok(info) => info,
         Err(e) => {
             warn!("Failed to extract service build info: {e}");
-            return ("root".to_string(), None);
+            return ("root".to_string(), None, None, None, None);
         }
     };
 
@@ -971,11 +999,17 @@ async fn resolve_compose_image_info(
                 .metadata
                 .as_deref()
                 .map(|m| cella_features::parse_image_metadata(m).1);
-            (details.user, meta_user)
+            (
+                details.user,
+                details.os,
+                details.architecture,
+                details.variant,
+                meta_user,
+            )
         }
         Err(e) => {
             warn!("Failed to inspect image '{image_name}' for metadata: {e}");
-            ("root".to_string(), None)
+            ("root".to_string(), None, None, None, None)
         }
     }
 }
@@ -1029,6 +1063,7 @@ async fn build_uid_remap_image_compose(
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     remote_user: &str,
     image_user: &str,
+    image_platform: Option<&str>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let config_value = ctx
         .cfg
@@ -1055,6 +1090,7 @@ async fn build_uid_remap_image_compose(
             docker_path: ctx.cfg.build_tuning.docker_path.as_deref(),
             use_buildkit: ctx.cfg.build_tuning.use_buildkit,
         },
+        image_platform,
         ctx.progress,
     )
     .await
@@ -1110,6 +1146,9 @@ async fn build_override_and_start(
     env_fwd: &mut cella_env::EnvForwarding,
     remote_user: &str,
     image_user: &str,
+    image_os: Option<&str>,
+    image_arch: Option<&str>,
+    image_variant: Option<&str>,
     agent_vol_name: String,
     agent_vol_target: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1170,9 +1209,16 @@ async fn build_override_and_start(
         request_gpu,
     };
 
-    let uid_image =
-        build_uid_remap_image_compose(ctx, project, features_build, remote_user, image_user)
-            .await?;
+    let platform = cella_backend::uid_image::image_platform(image_os, image_arch, image_variant);
+    let uid_image = build_uid_remap_image_compose(
+        ctx,
+        project,
+        features_build,
+        remote_user,
+        image_user,
+        platform.as_deref(),
+    )
+    .await?;
 
     compose_up_with_ssh_fallback(
         compose_cmd,

@@ -163,6 +163,12 @@ pub struct ImageDetails {
     pub env: Vec<String>,
     /// Raw JSON from the `devcontainer.metadata` label, if present.
     pub metadata: Option<String>,
+    /// OS reported by the image (e.g. `"linux"`).
+    pub os: Option<String>,
+    /// CPU architecture reported by the image (e.g. `"amd64"`, `"arm64"`).
+    pub architecture: Option<String>,
+    /// Architecture variant reported by the image (e.g. `"v8"`).
+    pub variant: Option<String>,
 }
 
 /// A `BuildKit` build secret (`--secret id=X,src=Y` or `--secret id=X,env=Y`).
@@ -193,6 +199,10 @@ pub struct BuildOptions {
     pub use_buildkit: bool,
     /// Path to the `docker` CLI binary. `None` defaults to `docker` on `PATH`.
     pub docker_path: Option<String>,
+    /// Target platform for the build (e.g. `linux/amd64`, `linux/arm64/v8`).
+    /// When set, emits `--platform <value>` on the docker build command.
+    /// Derived from the base image's inspected OS/architecture/variant.
+    pub platform: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -209,6 +219,7 @@ impl Default for BuildOptions {
             secrets: Vec::new(),
             use_buildkit: true,
             docker_path: None,
+            platform: None,
         }
     }
 }
