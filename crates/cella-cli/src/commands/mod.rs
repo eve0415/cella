@@ -200,8 +200,13 @@ pub enum UpdateRemoteUserUidDefault {
 }
 
 /// Log verbosity for lifecycle/terminal logging.
+///
+/// Mirrors the official CLI's `--log-level` choices. Most subcommands offer
+/// `info`/`debug`/`trace`; `features resolve-dependencies` additionally offers
+/// (and defaults to) `error`.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum LogLevel {
+    Error,
     Info,
     Debug,
     Trace,

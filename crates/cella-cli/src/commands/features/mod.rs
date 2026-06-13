@@ -41,14 +41,16 @@ pub enum FeaturesCommand {
 }
 
 impl FeaturesArgs {
-    /// Return the `--log-level` from the `info` subcommand, if active.
+    /// Return the active subcommand's `--log-level`, if it carries one.
     ///
+    /// `info`, `package`, and `resolve-dependencies` expose `--log-level`.
     /// Read by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and templates.
     pub const fn log_level(&self) -> Option<LogLevel> {
         match &self.command {
             FeaturesCommand::Info(args) => Some(args.log_level),
             FeaturesCommand::Package(args) => Some(args.log_level),
+            FeaturesCommand::ResolveDependencies(args) => Some(args.log_level),
             _ => None,
         }
     }

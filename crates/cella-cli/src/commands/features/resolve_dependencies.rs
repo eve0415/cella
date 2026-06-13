@@ -21,13 +21,14 @@
 //! `computeDependsOnInstallationOrder` and calls `process.exit(1)` — no JSON
 //! output, bold error to stderr. We match that exactly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use serde::Serialize;
 
 use super::resolve::{CommonFeatureFlags, discover_config, extract_features, read_raw_config};
+use crate::commands::LogLevel;
 use cella_features::graph::{
     DepEdge, DependencyGraph, EdgeKind, build_dependency_graph, render_mermaid,
 };
@@ -49,23 +50,13 @@ pub struct ResolveDependenciesArgs {
     /// Workspace folder (defaults to current directory).
     ///
     /// Equivalent to `--workspace-folder` in the official devcontainer CLI.
-    #[arg(long, short = 'w')]
+    /// The official surface exposes the long flag only — no short alias.
+    #[arg(long)]
     pub workspace_folder: Option<PathBuf>,
 
     /// Log verbosity (default `error` matches the official CLI).
     #[arg(long, default_value = "error")]
-    pub log_level: ResolveDepsLogLevel,
-}
-
-/// Log level for the resolve-dependencies command.
-///
-/// Default is `error` to match the official CLI.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ResolveDepsLogLevel {
-    Error,
-    Info,
-    Debug,
-    Trace,
+    pub log_level: LogLevel,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +101,8 @@ impl ResolveDependenciesArgs {
         let feature_pairs = extract_features(&config);
 
         if feature_pairs.is_empty() {
-            println!("flowchart TD");
+            // Bare `flowchart` keyword (no direction) matches the official CLI.
+            println!("flowchart");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&InstallOrderOutput {
@@ -125,22 +117,21 @@ impl ResolveDependenciesArgs {
         // Single OCI fetch pass feeds both Mermaid output AND install-order
         // metadata. Falls back gracefully on fetch errors (warn + declared
         // features only, no transitive deps).
-        let root_refs: Vec<&str> = feature_pairs
-            .iter()
-            .map(|(r, _)| r.as_str())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        //
+        // Dedup while preserving first-seen declaration order — fetch and
+        // traversal order must be deterministic so the resulting installOrder
+        // is stable across runs.
+        let root_refs = dedup_preserving_order(&feature_pairs);
 
         let graph_result = build_dependency_graph(&root_refs).await;
 
-        let (mermaid, ordered_ids) = match graph_result {
+        let (mermaid, ordered_ids, transitive_options) = match graph_result {
             Ok(graph) => {
                 let mermaid = build_mermaid_from_graph(&feature_pairs, &graph);
                 let order_result =
                     compute_order_with_metadata(&feature_pairs, &graph, override_order.as_deref());
                 match order_result {
-                    Ok(ids) => (mermaid, ids),
+                    Ok(ids) => (mermaid, ids, collect_transitive_options(&graph)),
                     Err(cycle_msg) => {
                         // Print the Mermaid diagram first (we have it), then
                         // exit non-zero without JSON output — matches official.
@@ -155,13 +146,15 @@ impl ResolveDependenciesArgs {
                 eprintln!("warning: OCI fetch failed, falling back to declared order: {e}");
                 let mermaid = build_mermaid_declared_only(&feature_pairs);
                 let ids = compute_order_declared_only(&feature_pairs, override_order.as_deref())?;
-                (mermaid, ids)
+                // No graph → no transitive deps, so no transitive options.
+                (mermaid, ids, BTreeMap::new())
             }
         };
 
         println!("{mermaid}");
 
-        let install_order = build_install_order_entries(&ordered_ids, &feature_pairs);
+        let install_order =
+            build_install_order_entries(&ordered_ids, &feature_pairs, &transitive_options);
         println!(
             "{}",
             serde_json::to_string_pretty(&InstallOrderOutput { install_order })?
@@ -234,10 +227,17 @@ fn compute_order_with_metadata(
     let declared_ids: Vec<&str> = feature_pairs.iter().map(|(r, _)| r.as_str()).collect();
     let mut all_ids: Vec<String> = declared_ids.iter().map(|s| (*s).to_owned()).collect();
 
-    for fetched_id in graph.metadata.keys() {
-        if !declared_ids.contains(&fetched_id.as_str()) {
-            all_ids.push(fetched_id.clone());
-        }
+    // `graph.metadata` is a `HashMap`, so iteration order is random. Sort the
+    // transitive IDs before appending so the expanded set — and thus the final
+    // installOrder — is deterministic across runs.
+    let mut transitive_ids: Vec<&String> = graph
+        .metadata
+        .keys()
+        .filter(|id| !declared_ids.contains(&id.as_str()))
+        .collect();
+    transitive_ids.sort_unstable();
+    for fetched_id in transitive_ids {
+        all_ids.push(fetched_id.clone());
     }
 
     // Build (id, metadata) pairs using fetched data where available.
@@ -330,10 +330,59 @@ fn parse_override_order(config: &serde_json::Value) -> Option<Vec<String>> {
     if ids.is_empty() { None } else { Some(ids) }
 }
 
+/// Deduplicate the declared feature references, preserving first-seen order.
+///
+/// A devcontainer config may list the same feature twice; the official CLI
+/// processes each unique reference once. Keeping declaration order makes the
+/// fetch/traversal pass — and therefore the final `installOrder` — deterministic.
+fn dedup_preserving_order(feature_pairs: &[(String, serde_json::Value)]) -> Vec<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut result: Vec<&str> = Vec::new();
+    for (reference, _) in feature_pairs {
+        if seen.insert(reference.as_str()) {
+            result.push(reference.as_str());
+        }
+    }
+    result
+}
+
+/// Collect option values for transitively-pulled-in dependencies.
+///
+/// A feature's `dependsOn` map stores, per dependency reference, the option
+/// values to install that dependency with (e.g.
+/// `dependsOn: {".../common-utils:2": {"installZsh": true}}`). For features
+/// the user never declared directly, those values are the only options we have
+/// — so a transitive dep emits its real options instead of defaulting to `true`.
+///
+/// Earlier entries win (first parent to declare the dep), keeping the result
+/// deterministic; iteration is over a `BTreeMap`-keyed metadata view.
+fn collect_transitive_options(graph: &DependencyGraph) -> BTreeMap<String, serde_json::Value> {
+    let mut options: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    // Iterate parents in a stable order so "first parent wins" is reproducible.
+    let mut parent_ids: Vec<&String> = graph.metadata.keys().collect();
+    parent_ids.sort_unstable();
+    for parent_id in parent_ids {
+        if let Some(meta) = graph.metadata.get(parent_id) {
+            for (dep_id, dep_options) in &meta.depends_on {
+                options
+                    .entry(dep_id.clone())
+                    .or_insert_with(|| dep_options.clone());
+            }
+        }
+    }
+    options
+}
+
 /// Build the `installOrder` entries from ordered IDs and their options.
+///
+/// Option resolution precedence:
+/// 1. Explicit options from the user's `features` declaration (`feature_pairs`).
+/// 2. Options carried by a parent's `dependsOn` value (`transitive_options`).
+/// 3. `true` (the spec default) when neither is present.
 fn build_install_order_entries(
     ordered_ids: &[String],
     feature_pairs: &[(String, serde_json::Value)],
+    transitive_options: &BTreeMap<String, serde_json::Value>,
 ) -> Vec<InstallOrderEntry> {
     ordered_ids
         .iter()
@@ -341,7 +390,9 @@ fn build_install_order_entries(
             let options = feature_pairs
                 .iter()
                 .find(|(ref_id, _)| ref_id == id)
-                .map_or(serde_json::Value::Bool(true), |(_, opts)| opts.clone());
+                .map(|(_, opts)| opts.clone())
+                .or_else(|| transitive_options.get(id).cloned())
+                .unwrap_or(serde_json::Value::Bool(true));
             InstallOrderEntry {
                 id: id.clone(),
                 options,
@@ -447,9 +498,10 @@ mod tests {
 
     #[test]
     fn cycle_in_declared_only_is_fatal() {
-        // installs_after cycles aren't possible with stub metadata (no
-        // installs_after set), but test the error path directly via
-        // compute_order_with_metadata using synthetic metadata with a cycle.
+        // A cycle (here via installs_after) must abort with an error, not fall
+        // back to a partial order. compute_order_with_metadata surfaces the
+        // cyclic-dependency warning as a fatal Err so the caller exits non-zero
+        // without emitting JSON (matches the official CLI).
         let pairs = vec![
             ("feat-a".to_owned(), serde_json::json!({})),
             ("feat-b".to_owned(), serde_json::json!({})),
@@ -495,63 +547,88 @@ mod tests {
     // transitive deps appear in installOrder
     // -----------------------------------------------------------------------
 
+    /// Build graph metadata for a feature with a single hard `dependsOn`,
+    /// where the dependency carries `dep_options` (mirrors real fetched data).
+    fn graph_with_depends_on(
+        feature: &str,
+        dep: &str,
+        dep_options: serde_json::Value,
+    ) -> DependencyGraph {
+        let mut meta_map = HashMap::new();
+        meta_map.insert(
+            feature.to_owned(),
+            FeatureMetadata {
+                id: feature.to_owned(),
+                depends_on: std::iter::once((dep.to_owned(), dep_options)).collect(),
+                ..Default::default()
+            },
+        );
+        meta_map.insert(
+            dep.to_owned(),
+            FeatureMetadata {
+                id: dep.to_owned(),
+                ..Default::default()
+            },
+        );
+        DependencyGraph {
+            edges: vec![(feature.to_owned(), dep.to_owned(), EdgeKind::DependsOn)],
+            metadata: meta_map,
+        }
+    }
+
     #[test]
     fn transitive_dep_appears_in_install_order() {
         // Scenario: config declares only `node`. `node` dependsOn `common-utils`.
-        // After OCI fetch, `common-utils` must appear in installOrder.
-        let pairs = vec![(
-            "ghcr.io/x/features/node:1".to_owned(),
-            serde_json::json!({"version": "lts"}),
-        )];
+        // After OCI fetch, `common-utils` must appear in installOrder AND be
+        // ordered before node — the ordering crate now treats dependsOn as a
+        // hard install-before prerequisite (regression: it previously only
+        // honored installs_after, so a dependsOn-only target had no edge).
+        let node = "ghcr.io/x/features/node:1";
+        let common = "ghcr.io/x/features/common-utils:2";
+        let pairs = vec![(node.to_owned(), serde_json::json!({"version": "lts"}))];
 
-        let mut meta_map = HashMap::new();
-        // node's metadata lists common-utils as a hard dep via installs_after
-        // (the ordering algorithm uses installs_after; dependsOn is recorded
-        // as a graph edge but the ordering crate uses installs_after for topo sort).
-        meta_map.insert(
-            "ghcr.io/x/features/node:1".to_owned(),
-            FeatureMetadata {
-                id: "ghcr.io/x/features/node:1".to_owned(),
-                installs_after: vec!["ghcr.io/x/features/common-utils:2".to_owned()],
-                ..Default::default()
-            },
-        );
-        meta_map.insert(
-            "ghcr.io/x/features/common-utils:2".to_owned(),
-            FeatureMetadata {
-                id: "ghcr.io/x/features/common-utils:2".to_owned(),
-                ..Default::default()
-            },
-        );
-
-        let graph = DependencyGraph {
-            edges: vec![(
-                "ghcr.io/x/features/node:1".to_owned(),
-                "ghcr.io/x/features/common-utils:2".to_owned(),
-                EdgeKind::DependsOn,
-            )],
-            metadata: meta_map,
-        };
+        let graph = graph_with_depends_on(node, common, serde_json::json!({}));
 
         let order = compute_order_with_metadata(&pairs, &graph, None).unwrap();
 
         assert!(
-            order.contains(&"ghcr.io/x/features/common-utils:2".to_owned()),
+            order.contains(&common.to_owned()),
             "transitive dep common-utils must appear in installOrder; got: {order:?}"
         );
-        // common-utils must come before node (it's a prerequisite).
-        let pos_common = order
-            .iter()
-            .position(|x| x == "ghcr.io/x/features/common-utils:2")
-            .unwrap();
-        let pos_node = order
-            .iter()
-            .position(|x| x == "ghcr.io/x/features/node:1")
-            .unwrap();
+        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
         assert!(
-            pos_common < pos_node,
+            pos(common) < pos(node),
             "common-utils must be installed before node; order: {order:?}"
         );
+    }
+
+    #[test]
+    fn transitive_dep_emits_parent_depends_on_options() {
+        // node dependsOn common-utils with concrete options. common-utils is not
+        // declared directly, so its installOrder entry must carry the options
+        // from node's dependsOn value — not the `true` default. (Finding #2.)
+        let node = "ghcr.io/x/features/node:1";
+        let common = "ghcr.io/x/features/common-utils:2";
+        let pairs = vec![(node.to_owned(), serde_json::json!({"version": "lts"}))];
+
+        let dep_options = serde_json::json!({"installZsh": true});
+        let graph = graph_with_depends_on(node, common, dep_options.clone());
+
+        let order = compute_order_with_metadata(&pairs, &graph, None).unwrap();
+        let transitive = collect_transitive_options(&graph);
+        let entries = build_install_order_entries(&order, &pairs, &transitive);
+
+        let common_entry = entries
+            .iter()
+            .find(|e| e.id == common)
+            .expect("common-utils must have an installOrder entry");
+        assert_eq!(
+            common_entry.options, dep_options,
+            "transitive dep must emit parent's dependsOn options, not `true`"
+        );
+        // The directly-declared feature still emits its explicit options.
+        let node_entry = entries.iter().find(|e| e.id == node).unwrap();
+        assert_eq!(node_entry.options, serde_json::json!({"version": "lts"}));
     }
 
     // -----------------------------------------------------------------------
@@ -575,7 +652,7 @@ mod tests {
             "ghcr.io/x/features/node:1".to_owned(),
         ];
 
-        let entries = build_install_order_entries(&ids, &pairs);
+        let entries = build_install_order_entries(&ids, &pairs, &BTreeMap::new());
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "ghcr.io/x/features/git:1");
@@ -592,10 +669,56 @@ mod tests {
         )];
         let ids = vec!["unknown".to_owned()];
 
-        let entries = build_install_order_entries(&ids, &pairs);
+        let entries = build_install_order_entries(&ids, &pairs, &BTreeMap::new());
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].options, serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn install_entries_transitive_options_used_when_not_declared() {
+        // node is declared with explicit options; common-utils is only pulled
+        // in transitively, so its options come from transitive_options.
+        let pairs = vec![(
+            "ghcr.io/x/features/node:1".to_owned(),
+            serde_json::json!({"version": "lts"}),
+        )];
+        let mut transitive = BTreeMap::new();
+        transitive.insert(
+            "ghcr.io/x/features/common-utils:2".to_owned(),
+            serde_json::json!({"installZsh": true}),
+        );
+        let ids = vec![
+            "ghcr.io/x/features/common-utils:2".to_owned(),
+            "ghcr.io/x/features/node:1".to_owned(),
+        ];
+
+        let entries = build_install_order_entries(&ids, &pairs, &transitive);
+
+        assert_eq!(entries[0].id, "ghcr.io/x/features/common-utils:2");
+        assert_eq!(entries[0].options, serde_json::json!({"installZsh": true}));
+        // Declared options take precedence over any transitive entry.
+        assert_eq!(entries[1].options, serde_json::json!({"version": "lts"}));
+    }
+
+    #[test]
+    fn install_entries_declared_options_win_over_transitive() {
+        // If a feature is BOTH declared and a transitive dep, the user's
+        // explicit declaration wins.
+        let pairs = vec![(
+            "ghcr.io/x/features/common-utils:2".to_owned(),
+            serde_json::json!({"installZsh": false}),
+        )];
+        let mut transitive = BTreeMap::new();
+        transitive.insert(
+            "ghcr.io/x/features/common-utils:2".to_owned(),
+            serde_json::json!({"installZsh": true}),
+        );
+        let ids = vec!["ghcr.io/x/features/common-utils:2".to_owned()];
+
+        let entries = build_install_order_entries(&ids, &pairs, &transitive);
+
+        assert_eq!(entries[0].options, serde_json::json!({"installZsh": false}));
     }
 
     // -----------------------------------------------------------------------
@@ -650,5 +773,21 @@ mod tests {
         ];
         let deduped = dedup_edges(&edges);
         assert_eq!(deduped.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_preserving_order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_preserving_order_keeps_first_seen_order() {
+        let pairs = vec![
+            ("b".to_owned(), serde_json::json!({})),
+            ("a".to_owned(), serde_json::json!({})),
+            ("b".to_owned(), serde_json::json!({"dup": true})),
+            ("c".to_owned(), serde_json::json!({})),
+        ];
+        // Duplicate `b` is dropped; declaration order is otherwise preserved.
+        assert_eq!(dedup_preserving_order(&pairs), vec!["b", "a", "c"]);
     }
 }
