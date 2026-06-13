@@ -939,6 +939,19 @@ impl ContainerBackend for AppleContainerBackend {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Wrap an IP address in brackets if it is an IPv6 address (contains `:`).
+///
+/// Docker's CLI port-publish format requires IPv6 addresses to be bracketed:
+/// `[::1]:8080:80/tcp`. The `host_ip` field stores the bare address without
+/// brackets (e.g. `"::1"`), so we re-bracket here when emitting `-p` args.
+fn bracket_ipv6(ip: &str) -> std::borrow::Cow<'_, str> {
+    if ip.contains(':') {
+        std::borrow::Cow::Owned(format!("[{ip}]"))
+    } else {
+        std::borrow::Cow::Borrowed(ip)
+    }
+}
+
 /// Build CLI arguments for `container create` from `CreateContainerOptions`.
 ///
 /// `networks` lists pre-created networks to attach; attachments cannot be
@@ -1006,9 +1019,9 @@ fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<
     for (container_port, forwards) in &opts.port_bindings {
         for fwd in forwards {
             let host_part = match (&fwd.host_ip, &fwd.host_port) {
-                (Some(ip), Some(port)) => format!("{ip}:{port}"),
+                (Some(ip), Some(port)) => format!("{}:{port}", bracket_ipv6(ip)),
                 (None, Some(port)) => port.clone(),
-                (Some(ip), None) => format!("{ip}:"),
+                (Some(ip), None) => format!("{}:", bracket_ipv6(ip)),
                 (None, None) => String::new(),
             };
             args.push("-p".to_string());
@@ -1508,6 +1521,49 @@ mod tests {
 
         let port_idx = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[port_idx + 1], "3000:8080/tcp");
+    }
+
+    #[test]
+    fn build_create_args_ipv6_host_ip_is_bracketed() {
+        // host_ip stores the bare IPv6 address "::1"; the CLI formatter must
+        // bracket it as "[::1]" to produce a valid Docker -p spec.
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "80/tcp".to_string(),
+            vec![PortForward {
+                host_ip: Some("::1".to_string()),
+                host_port: Some("8080".to_string()),
+            }],
+        );
+        let args = build_create_args(&opts, &[]);
+
+        let port_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(
+            args[port_idx + 1],
+            "[::1]:8080:80/tcp",
+            "IPv6 host_ip must be bracketed in -p arg"
+        );
+    }
+
+    #[test]
+    fn build_create_args_ipv4_host_ip_not_bracketed() {
+        // IPv4 addresses must NOT be wrapped in brackets.
+        let mut opts = minimal_create_opts();
+        opts.port_bindings.insert(
+            "80/tcp".to_string(),
+            vec![PortForward {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some("8080".to_string()),
+            }],
+        );
+        let args = build_create_args(&opts, &[]);
+
+        let port_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(
+            args[port_idx + 1],
+            "127.0.0.1:8080:80/tcp",
+            "IPv4 host_ip must not be bracketed"
+        );
     }
 
     #[test]
