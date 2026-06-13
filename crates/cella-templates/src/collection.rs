@@ -150,14 +150,28 @@ async fn fetch_collection_json(collection_ref: &str) -> Result<String, TemplateE
             message: "no layers found in collection manifest".to_owned(),
         })?;
 
-    let mut blob = Vec::with_capacity(usize::try_from(layer.size.max(0)).unwrap_or(0));
+    // Pre-check declared size before downloading.
+    let declared_size = u64::try_from(layer.size.max(0)).unwrap_or(0);
+    if declared_size > cella_oci::MAX_COLLECTION_JSON_BYTES {
+        return Err(TemplateError::CollectionFetchFailed {
+            registry: collection_ref.to_owned(),
+            message: format!(
+                "collection JSON exceeds size limit: {declared_size} bytes > {} bytes",
+                cella_oci::MAX_COLLECTION_JSON_BYTES,
+            ),
+        });
+    }
+
+    let buf = Vec::with_capacity(usize::try_from(declared_size).unwrap_or(0));
+    let mut limited = cella_oci::LimitedWriter::new(buf, cella_oci::MAX_COLLECTION_JSON_BYTES);
     client
-        .pull_blob(&oci_ref, layer, &mut blob)
+        .pull_blob(&oci_ref, layer, &mut limited)
         .await
         .map_err(|e| TemplateError::CollectionFetchFailed {
             registry: collection_ref.to_owned(),
             message: format!("failed to pull collection blob: {e}"),
         })?;
+    let blob = limited.into_inner();
 
     String::from_utf8(blob).map_err(|e| TemplateError::CollectionFetchFailed {
         registry: collection_ref.to_owned(),

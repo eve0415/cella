@@ -658,6 +658,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -732,6 +733,7 @@ dependencies = [
  "dirs",
  "filetime",
  "flate2",
+ "futures-util",
  "glob",
  "hex",
  "miette",
