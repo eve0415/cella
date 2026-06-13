@@ -26,7 +26,7 @@ pub struct LockfileEntry {
     /// Manifest digest, e.g. `"sha256:abc..."`.
     pub integrity: String,
     /// Keys of other features in the lockfile this one depends on.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(rename = "dependsOn", skip_serializing_if = "Vec::is_empty", default)]
     pub depends_on: Vec<String>,
 }
 
@@ -172,17 +172,14 @@ pub fn lockfile_key(raw_ref: &str) -> String {
 
 /// Compare an existing lockfile against a freshly-generated one.
 ///
-/// Returns `Ok(())` when they match, or:
-/// - [`LockfileError::Missing`] when `existing` has no entries, or
-/// - [`LockfileError::Mismatch`] when the two differ.
+/// Returns `Ok(())` when they match, or [`LockfileError::Mismatch`] when they
+/// differ. The missing-file case is handled by the caller before this point
+/// (a `read_lockfile` returning `None`), so this only compares structure.
 ///
 /// # Errors
 ///
-/// Returns [`LockfileError`] on mismatch or empty existing lockfile.
+/// Returns [`LockfileError::Mismatch`] when `existing` differs from `generated`.
 pub fn compare_lockfile(existing: &Lockfile, generated: &Lockfile) -> Result<(), LockfileError> {
-    if existing.features.is_empty() {
-        return Err(LockfileError::Missing);
-    }
     if existing == generated {
         Ok(())
     } else {
@@ -307,8 +304,12 @@ mod tests {
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(
-            json.contains("depends_on") || json.contains("dependsOn"),
-            "non-empty depends_on must be serialized"
+            json.contains("dependsOn"),
+            "non-empty depends_on must serialize as the camelCase `dependsOn` key"
+        );
+        assert!(
+            !json.contains("depends_on"),
+            "must not leak the snake_case field name"
         );
     }
 
@@ -400,7 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn compare_empty_existing_returns_missing() {
+    fn compare_empty_present_lockfile_against_nonempty_is_mismatch() {
+        // A present-but-empty lockfile differs from what resolution produced:
+        // that is a Mismatch, not Missing (Missing is only for an absent file,
+        // handled by the caller before compare_lockfile is reached).
         let empty = Lockfile::default();
         let generated = generate_lockfile(&[(
             "ghcr.io/x/y".to_string(),
@@ -411,7 +415,13 @@ mod tests {
         )]);
         assert!(matches!(
             compare_lockfile(&empty, &generated),
-            Err(LockfileError::Missing)
+            Err(LockfileError::Mismatch)
         ));
+    }
+
+    #[test]
+    fn compare_two_empty_lockfiles_matches() {
+        let empty = Lockfile::default();
+        assert!(compare_lockfile(&empty, &Lockfile::default()).is_ok());
     }
 }
