@@ -607,14 +607,15 @@ fn copy_and_substitute<S: std::hash::BuildHasher>(
         } else if file_type.is_file() {
             // init path: strip JSONC comments from .json files before
             // substitution so user-provided values containing '//' are not eaten.
-            let template_name = file_name.to_string_lossy();
+            let file_display = file_name.to_string_lossy();
             write_leaf_file(template_id, &src_path, &dest_path, options, true).map_err(
                 |e| match e {
-                    // Re-wrap InvalidArtifact with the file name for context.
+                    // Re-wrap InvalidArtifact: preserve the actual template_id and
+                    // include the filename in the reason for diagnostic context.
                     TemplateError::InvalidArtifact { reason, .. } => {
                         TemplateError::InvalidArtifact {
-                            template_id: template_name.into_owned(),
-                            reason,
+                            template_id: template_id.to_owned(),
+                            reason: format!("{file_display}: {reason}"),
                         }
                     }
                     other => other,
@@ -1642,5 +1643,51 @@ mod tests {
             !dest_path.exists(),
             "dest must not be created by a blind copy"
         );
+    }
+
+    // Regression test for finding 5: template_id must be preserved in InvalidArtifact
+
+    #[test]
+    fn copy_and_substitute_error_preserves_template_id() {
+        // An unterminated block comment triggers strip_jsonc → InvalidArtifact.
+        // The re-wrapped error must keep the actual template_id, not replace it
+        // with the filename.
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_dc = dest_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dest_dc).unwrap();
+
+        std::fs::write(
+            src_dir.path().join("broken.json"),
+            r#"{ "key": "value" /* unterminated "#,
+        )
+        .unwrap();
+
+        let result = copy_and_substitute(
+            "my-template-id",
+            src_dir.path(),
+            &dest_dc,
+            &HashMap::new(),
+            src_dir.path(),
+            &[],
+        );
+
+        match result {
+            Err(TemplateError::InvalidArtifact {
+                template_id,
+                reason,
+            }) => {
+                assert_eq!(
+                    template_id, "my-template-id",
+                    "template_id must be the template identifier, not the filename"
+                );
+                assert!(
+                    reason.contains("broken.json"),
+                    "reason should include the filename for diagnostic context: {reason}"
+                );
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+            Ok(()) => panic!("expected error"),
+        }
     }
 }
