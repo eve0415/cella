@@ -45,6 +45,7 @@ impl FeaturesArgs {
     pub const fn log_level(&self) -> Option<LogLevel> {
         match &self.command {
             FeaturesCommand::Info(args) => Some(args.log_level),
+            FeaturesCommand::Package(args) => Some(args.log_level),
             _ => None,
         }
     }
