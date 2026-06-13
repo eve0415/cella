@@ -10,7 +10,8 @@
 
 use std::path::PathBuf;
 
-use flate2::read::GzDecoder;
+use futures_util::StreamExt as _;
+use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
 use tracing::debug;
 
 use crate::Platform;
@@ -25,8 +26,9 @@ use crate::reference::NormalizedRef;
 
 /// Fetches devcontainer features from HTTP(S) tarball URLs.
 ///
-/// Downloads the tarball, verifies the gzip magic bytes, extracts with
-/// `flate2` + `tar`, and commits the result to the feature cache.
+/// Downloads the tarball, verifies the gzip magic bytes, extracts via the
+/// hardened [`cella_oci::extract_layer`] helper (path-traversal and zip-bomb
+/// safe), and commits the result to the feature cache.
 pub struct HttpFetcher;
 
 impl FeatureFetcher for HttpFetcher {
@@ -50,7 +52,7 @@ impl FeatureFetcher for HttpFetcher {
         }
 
         // Step 2: download the tarball.
-        let bytes = reqwest::get(url)
+        let response = reqwest::get(url)
             .await
             .map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
@@ -60,13 +62,46 @@ impl FeatureFetcher for HttpFetcher {
             .map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
                 message: format!("HTTP error status: {e}"),
-            })?
-            .bytes()
-            .await
-            .map_err(|e| FeatureError::FetchFailed {
+            })?;
+
+        // Pre-check declared Content-Length before streaming.
+        if let Some(content_length) = response.content_length()
+            && content_length > cella_oci::MAX_BLOB_COMPRESSED_BYTES
+        {
+            return Err(FeatureError::FetchFailed {
+                url: url.clone(),
+                message: format!(
+                    "tarball download exceeds size limit: {content_length} bytes > {} bytes",
+                    cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                ),
+            });
+        }
+
+        // Stream body with a running byte counter to enforce the cap.
+        let mut stream = response.bytes_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| FeatureError::FetchFailed {
                 url: url.clone(),
                 message: format!("failed to read response body: {e}"),
             })?;
+            // Enforce the cap *before* extending so an oversized chunk cannot
+            // force an allocation past the limit.
+            if cella_oci::would_exceed_cap(
+                bytes.len(),
+                chunk.len(),
+                cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+            ) {
+                return Err(FeatureError::FetchFailed {
+                    url: url.clone(),
+                    message: format!(
+                        "tarball download exceeds size limit of {} bytes",
+                        cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+                    ),
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         debug!("downloaded {} bytes from {url}", bytes.len());
 
@@ -88,9 +123,9 @@ impl FeatureFetcher for HttpFetcher {
             message: format!("failed to create staging directory: {e}"),
         })?;
 
-        let gz = GzDecoder::new(&bytes[..]);
-        let mut archive = tar::Archive::new(gz);
-        archive.unpack(&staging).map_err(|e| {
+        // Extract via the hardened cella-oci helper: it rejects path-traversal
+        // and unsafe-link entries and caps decompressed output (zip-bomb guard).
+        cella_oci::extract_layer(&bytes, IMAGE_LAYER_GZIP_MEDIA_TYPE, &staging).map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
             FeatureError::FetchFailed {
                 url: url.clone(),
