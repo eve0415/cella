@@ -211,12 +211,18 @@ async fn run_reader_loop(
             DaemonMessage::TunnelRequest {
                 connection_id,
                 target_port,
+                target_host,
             } => {
                 if let Some(ref config) = tunnel_config {
                     let config = config.clone();
                     tokio::spawn(async move {
-                        crate::tunnel::handle_tunnel_request(connection_id, target_port, &config)
-                            .await;
+                        crate::tunnel::handle_tunnel_request(
+                            connection_id,
+                            target_port,
+                            target_host,
+                            &config,
+                        )
+                        .await;
                     });
                 }
             }
