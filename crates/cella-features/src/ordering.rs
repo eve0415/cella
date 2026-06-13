@@ -1,14 +1,15 @@
 //! Dependency ordering for devcontainer features.
 //!
-//! Implements topological sort (Kahn's algorithm) over `installsAfter`
-//! dependencies, with tiebreaking rules matching the devcontainer spec:
+//! Implements topological sort (Kahn's algorithm) over both `dependsOn` (hard)
+//! and `installsAfter` (soft) dependencies — every prerequisite must install
+//! first — with tiebreaking rules matching the devcontainer spec:
 //!
 //! 1. Official `ghcr.io/devcontainers/features/*` features sort first.
 //! 2. Among equal-priority features, declaration order is preserved.
 //! 3. `overrideFeatureInstallOrder` takes precedence over computed order.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::error::FeatureWarning;
 use crate::types::FeatureMetadata;
@@ -152,18 +153,35 @@ fn topological_sort_with_original_indices(
     let n = features.len();
     let mut warnings = Vec::new();
 
-    // Adjacency: edge from dependency -> dependent (if dep installs after X,
-    // then X must come before dep, so edge X -> dep).
+    // Adjacency: edge from prerequisite -> dependent. If feature X must be
+    // installed after Y (Y is a prerequisite of X), then Y comes first, so we
+    // record the edge Y -> X.
+    //
+    // Both edge sources impose the same install-before constraint:
+    //   - `dependsOn` keys  — hard dependencies (must install before)
+    //   - `installsAfter`   — soft ordering hints
+    // Matching the official CLI, a round can only install a node once *every*
+    // hard- and soft-dependency has been installed, so both feed the sort.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut in_degree: Vec<usize> = vec![0; n];
 
     for (local_idx, (_, meta)) in features.iter().enumerate() {
-        for dep_id in &meta.installs_after {
-            if let Some(&dep_local_idx) = local_id_to_index.get(dep_id.as_str()) {
-                adj[dep_local_idx].push(local_idx);
-                in_degree[local_idx] += 1;
+        // Deduplicate prerequisites so a dependency declared in both
+        // `dependsOn` and `installsAfter` (or repeated) counts once — otherwise
+        // the inflated in-degree would never reach zero and stall the sort.
+        // `BTreeSet` keeps the adjacency build deterministic.
+        let mut prerequisites: BTreeSet<usize> = BTreeSet::new();
+        let dep_ids = meta.depends_on.keys().map(String::as_str);
+        let after_ids = meta.installs_after.iter().map(String::as_str);
+        for dep_id in dep_ids.chain(after_ids) {
+            if let Some(&dep_local_idx) = local_id_to_index.get(dep_id) {
+                prerequisites.insert(dep_local_idx);
             }
             // Dependencies on features not in our set are ignored.
+        }
+        for dep_local_idx in prerequisites {
+            adj[dep_local_idx].push(local_idx);
+            in_degree[local_idx] += 1;
         }
     }
 
@@ -251,6 +269,19 @@ mod tests {
         FeatureMetadata {
             id: id.to_string(),
             installs_after: installs_after.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Helper to build a `FeatureMetadata` with `depends_on` (hard) deps set.
+    /// Each key maps to an arbitrary option value (`true`).
+    fn meta_depends(id: &str, depends_on: &[&str]) -> FeatureMetadata {
+        FeatureMetadata {
+            id: id.to_string(),
+            depends_on: depends_on
+                .iter()
+                .map(|s| ((*s).to_string(), serde_json::Value::Bool(true)))
+                .collect(),
             ..Default::default()
         }
     }
@@ -557,6 +588,66 @@ mod tests {
         assert!(warnings.is_empty());
         // a's dependency on nonexistent is ignored, so declaration order.
         assert_eq!(order, vec!["a", "b"]);
+    }
+
+    // ---------------------------------------------------------------
+    // `dependsOn` (hard) imposes install-before ordering, like installsAfter
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn depends_on_orders_prerequisite_first() {
+        // a dependsOn b → b must install before a, even though a is declared
+        // first. Regression: previously only installs_after fed the sort, so a
+        // pulled-in dependsOn target had no ordering edge.
+        let items = vec![
+            ("a".to_string(), meta_depends("a", &["b"])),
+            ("b".to_string(), meta("b", &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn depends_on_cycle_is_fatal() {
+        // a dependsOn b, b dependsOn a → cycle must be reported, not silently
+        // ordered. Previously dependsOn edges were never added, so this cycle
+        // went undetected.
+        let items = vec![
+            ("a".to_string(), meta_depends("a", &["b"])),
+            ("b".to_string(), meta_depends("b", &["a"])),
+        ];
+        let features = feature_list(&items);
+
+        let (_order, warnings) = compute_install_order(&features, None);
+
+        assert_eq!(warnings.len(), 1);
+        match &warnings[0] {
+            FeatureWarning::CyclicDependency { features } => {
+                assert!(features.contains(&"a".to_string()));
+                assert!(features.contains(&"b".to_string()));
+            }
+            other => panic!("expected CyclicDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn depends_on_and_installs_after_same_target_counted_once() {
+        // a lists b in BOTH dependsOn and installsAfter. The prerequisite must
+        // be deduplicated; otherwise the doubled in-degree would stall the sort
+        // and spuriously report a cycle.
+        let mut a = meta_depends("a", &["b"]);
+        a.installs_after = vec!["b".to_string()];
+        let items = vec![("a".to_string(), a), ("b".to_string(), meta("b", &[]))];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None);
+
+        assert!(warnings.is_empty(), "no cycle: b is a single prerequisite");
+        assert_eq!(order, vec!["b", "a"]);
     }
 
     // ---------------------------------------------------------------

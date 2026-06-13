@@ -30,6 +30,9 @@ fn resolve_log_directive(rust_log_set: bool, level: Option<LogLevel>) -> Option<
         return None;
     }
     Some(match level.unwrap_or(LogLevel::Info) {
+        // error: only errors surface (the resolve-dependencies default — its
+        // stdout is machine-readable Mermaid + JSON, so logs stay quiet).
+        LogLevel::Error => "error".to_string(),
         // Default/info: a flat `info` directive matches the official default
         // (events at info and above are shown).
         LogLevel::Info => "info".to_string(),

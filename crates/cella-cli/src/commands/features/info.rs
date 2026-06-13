@@ -158,8 +158,8 @@ impl InfoArgs {
                 // implementation. We match that behaviour for parity.
             }
             OutputFormat::Text => {
-                let edges = build_dependency_graph(&self.feature).await?;
-                let diagram = render_mermaid(&self.feature, &edges);
+                let graph = build_dependency_graph(&[self.feature.as_str()]).await?;
+                let diagram = render_mermaid(&[self.feature.as_str()], &graph.edges);
                 println!("{diagram}");
             }
         }
@@ -215,10 +215,10 @@ impl InfoArgs {
                 }
                 // Dependencies section — failure is non-fatal, symmetric with
                 // the manifest and tags sections above.
-                match build_dependency_graph(&self.feature).await {
-                    Ok(edges) => {
+                match build_dependency_graph(&[self.feature.as_str()]).await {
+                    Ok(graph) => {
                         println!("=== Dependency Graph ===");
-                        println!("{}", render_mermaid(&self.feature, &edges));
+                        println!("{}", render_mermaid(&[self.feature.as_str()], &graph.edges));
                     }
                     Err(e) => {
                         eprintln!("Failed to build dependency graph: {e}");

@@ -8,6 +8,7 @@ pub mod list;
 pub mod package;
 pub mod prompts;
 pub mod resolve;
+pub mod resolve_dependencies;
 pub mod update;
 
 use clap::{Args, Subcommand};
@@ -33,19 +34,23 @@ pub enum FeaturesCommand {
     List(list::ListArgs),
     /// Package local feature sources into distributable tarballs.
     Package(package::PackageArgs),
+    /// Resolve feature dependencies and print the installation order.
+    ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
 
 impl FeaturesArgs {
-    /// Return the `--log-level` from the `info` subcommand, if active.
+    /// Return the active subcommand's `--log-level`, if it carries one.
     ///
+    /// `info`, `package`, and `resolve-dependencies` expose `--log-level`.
     /// Read by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and templates.
     pub const fn log_level(&self) -> Option<LogLevel> {
         match &self.command {
             FeaturesCommand::Info(args) => Some(args.log_level),
             FeaturesCommand::Package(args) => Some(args.log_level),
+            FeaturesCommand::ResolveDependencies(args) => Some(args.log_level),
             _ => None,
         }
     }
@@ -59,6 +64,7 @@ impl FeaturesArgs {
             FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
             FeaturesCommand::Package(args) => args.execute(),
+            FeaturesCommand::ResolveDependencies(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
