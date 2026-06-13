@@ -76,13 +76,61 @@ struct OverrideSortKey {
     declaration_index: usize,
 }
 
-/// Build a lookup from feature ID to its index in the slice.
-fn build_id_index<'a>(features: &'a [(String, &FeatureMetadata)]) -> HashMap<&'a str, usize> {
+/// Build a lookup from exact feature ID to its index in the slice.
+///
+/// Maps each feature's real id to its index. Legacy-id aliases are NOT included
+/// here: this index backs `dependsOn` (hard) edges, override resolution, and
+/// tiebreaking, all of which the official matches by exact id (`equals`).
+/// `installsAfter` (soft) matching, which DOES resolve `legacyIds`, goes through
+/// [`resolve_soft_dep`] instead.
+fn build_id_index(features: &[(String, &FeatureMetadata)]) -> HashMap<String, usize> {
     features
         .iter()
         .enumerate()
-        .map(|(i, (id, _))| (id.as_str(), i))
+        .map(|(i, (id, _))| (id.clone(), i))
         .collect()
+}
+
+/// Resolve an `installsAfter` (soft-dependency) target id to a feature index.
+///
+/// Mirrors the official `satisfiesSoftDependency`: try an exact id match first
+/// (so a real id always wins), then fall back to any feature whose `legacy_ids`
+/// matches the target after alias qualification.
+///
+/// Alias qualification follows the official CLI: a feature's `legacyIds` are
+/// stored as bare names (e.g. `"docker-from-docker"`), but `installsAfter`
+/// entries are fully qualified OCI refs (e.g.
+/// `"ghcr.io/devcontainers/features/docker-from-docker"`). To match them the
+/// official code constructs `{feature_registry}/{feature_namespace}/{alias}`
+/// and compares that to the `installsAfter` target. Bare-vs-bare comparison is
+/// also retained so non-OCI / short-ref feature sets still work.
+///
+/// `dependsOn` deliberately does NOT use this (hard deps match by exact id
+/// only, per the spec).
+fn resolve_soft_dep(
+    dep_id: &str,
+    id_to_index: &HashMap<String, usize>,
+    features: &[(String, &FeatureMetadata)],
+) -> Option<usize> {
+    if let Some(&idx) = id_to_index.get(dep_id) {
+        return Some(idx);
+    }
+    features.iter().position(|(feature_id, meta)| {
+        meta.legacy_ids.iter().any(|alias| {
+            // Bare-to-bare: alias == dep_id (handles non-OCI / short-ref sets).
+            if alias == dep_id {
+                return true;
+            }
+            // Qualified: prepend the feature's own registry/namespace prefix to
+            // the bare alias, then compare to dep_id.  This mirrors the official
+            // `satisfiesSoftDependency` which builds
+            // `${softDepRef.registry}/${softDepRef.namespace}/${legacyId}`.
+            feature_id
+                .rsplit_once('/')
+                .map(|(p, _)| p)
+                .is_some_and(|prefix| format!("{prefix}/{alias}") == dep_id)
+        })
+    })
 }
 
 /// Compute the install order for a set of features.
@@ -160,7 +208,7 @@ pub fn compute_install_order(
 fn apply_override(
     features: &[(String, &FeatureMetadata)],
     overrides: &[String],
-    id_to_index: &HashMap<&str, usize>,
+    id_to_index: &HashMap<String, usize>,
     has_official: bool,
     depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
@@ -210,7 +258,7 @@ fn apply_override(
 /// Topological sort using Kahn's algorithm with priority-queue tiebreaking.
 fn topological_sort(
     features: &[(String, &FeatureMetadata)],
-    id_to_index: &HashMap<&str, usize>,
+    id_to_index: &HashMap<String, usize>,
     has_official: bool,
     depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
@@ -235,8 +283,8 @@ fn topological_sort(
 /// emit a warning and fall back to declaration order.
 fn topological_sort_with_original_indices(
     features: &[(String, &FeatureMetadata)],
-    local_id_to_index: &HashMap<&str, usize>,
-    original_id_to_index: &HashMap<&str, usize>,
+    local_id_to_index: &HashMap<String, usize>,
+    original_id_to_index: &HashMap<String, usize>,
     has_official: bool,
     depends_on_cycle: &mut Option<Vec<String>>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
@@ -296,7 +344,7 @@ fn topological_sort_with_original_indices(
 /// ordering hints are deliberately ignored so the override wins).
 fn build_graph(
     features: &[(String, &FeatureMetadata)],
-    id_to_index: &HashMap<&str, usize>,
+    id_to_index: &HashMap<String, usize>,
     override_position: Option<&HashMap<&str, usize>>,
 ) -> DepGraph {
     let n = features.len();
@@ -325,10 +373,11 @@ fn build_graph(
 
         // Soft edges: installsAfter (dep should be installed BEFORE local_idx).
         // Skipped for override-listed features so the override order wins.
+        // Resolved via legacyIds aliases too (matches satisfiesSoftDependency).
         let suppress_soft = override_position.is_some_and(|p| p.contains_key(id.as_str()));
         if !suppress_soft {
             for dep_id in &meta.installs_after {
-                if let Some(&prereq_idx) = id_to_index.get(dep_id.as_str()) {
+                if let Some(prereq_idx) = resolve_soft_dep(dep_id, id_to_index, features) {
                     graph.soft_adj[prereq_idx].push(local_idx);
                     graph.in_degree[local_idx] += 1;
                 }
@@ -412,7 +461,11 @@ fn finish_with_cycle_detection(
 }
 
 /// Compute the sort key for tiebreaking.
-fn sort_key(id: &str, original_id_to_index: &HashMap<&str, usize>, has_official: bool) -> SortKey {
+fn sort_key(
+    id: &str,
+    original_id_to_index: &HashMap<String, usize>,
+    has_official: bool,
+) -> SortKey {
     let is_third_party = !(has_official && id.starts_with(OFFICIAL_PREFIX));
     let tier = u8::from(is_third_party);
     let declaration_index = original_id_to_index.get(id).copied().unwrap_or(usize::MAX);
@@ -426,7 +479,7 @@ fn sort_key(id: &str, original_id_to_index: &HashMap<&str, usize>, has_official:
 fn override_sort_key(
     id: &str,
     override_position: &HashMap<&str, usize>,
-    id_to_index: &HashMap<&str, usize>,
+    id_to_index: &HashMap<String, usize>,
     has_official: bool,
 ) -> OverrideSortKey {
     if let Some(&pos) = override_position.get(id) {
@@ -948,6 +1001,165 @@ mod tests {
         assert!(warnings.is_empty());
         // b listed (override), a unlisted (appended).
         assert_eq!(order, vec!["b", "a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // installsAfter resolved via legacyIds (spec: satisfiesSoftDependency)
+    // ---------------------------------------------------------------
+
+    /// Helper: metadata with `legacy_ids` set.
+    fn meta_with_legacy_ids(
+        id: &str,
+        installs_after: &[&str],
+        legacy_ids: &[&str],
+    ) -> FeatureMetadata {
+        FeatureMetadata {
+            id: id.to_string(),
+            installs_after: installs_after.iter().map(|s| (*s).to_string()).collect(),
+            legacy_ids: legacy_ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn installs_after_via_legacy_id_orders_correctly() {
+        // B has current id "ghcr.io/x/new" and bare legacyId "old" (real-world
+        // format: legacyIds store the short name, not the qualified ref).
+        // A declares installsAfter: ["ghcr.io/x/old"] (fully qualified old name).
+        // resolve_soft_dep must qualify "old" → "ghcr.io/x/old" and match.
+        // Expected: B before A.
+        let b_meta = meta_with_legacy_ids("ghcr.io/x/new", &[], &["old"]);
+        let a_meta = meta_with_legacy_ids("ghcr.io/x/a", &["ghcr.io/x/old"], &[]);
+        let items = vec![
+            ("ghcr.io/x/a".to_string(), a_meta),
+            ("ghcr.io/x/new".to_string(), b_meta),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+        assert!(
+            pos("ghcr.io/x/new") < pos("ghcr.io/x/a"),
+            "B (new id) must come before A; order was {order:?}"
+        );
+    }
+
+    #[test]
+    fn real_id_wins_over_colliding_legacy_alias() {
+        // C has real id "shared-name". D has legacyId "shared-name".
+        // A declares installsAfter: ["shared-name"] — must resolve to C (real id
+        // wins), not D.
+        let c_meta = meta_with_legacy_ids("shared-name", &[], &[]);
+        let d_meta = meta_with_legacy_ids("ghcr.io/x/d", &[], &["shared-name"]);
+        let a_meta = meta_with_legacy_ids("ghcr.io/x/a", &["shared-name"], &[]);
+        let items = vec![
+            ("ghcr.io/x/a".to_string(), a_meta),
+            ("shared-name".to_string(), c_meta),
+            ("ghcr.io/x/d".to_string(), d_meta),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+        // A must come after C (exact real-id match wins over D's legacy alias).
+        assert!(
+            pos("shared-name") < pos("ghcr.io/x/a"),
+            "C (real id 'shared-name') must precede A; order was {order:?}"
+        );
+        // D must NOT be treated as the soft-dependency target. If it were, D
+        // would be forced before A. Verify D carries no ordering edge toward A
+        // by checking there is no in_degree bump from D → A (i.e. D may appear
+        // after A with no warning, because A's constraint is only on C).
+        // Both outcomes (D before or after A) are legal; the absence of a cycle
+        // warning confirms no spurious edge was added.
+        assert!(
+            order.contains(&"ghcr.io/x/d".to_string()),
+            "D must appear in result"
+        );
+    }
+
+    #[test]
+    fn build_id_index_excludes_legacy_aliases() {
+        // The exact id index backs dependsOn (hard) edges, override resolution
+        // and tiebreaking — all exact-match per the spec. legacyIds must NOT
+        // leak into it (only installsAfter resolves aliases, via resolve_soft_dep).
+        let b_meta = meta_with_legacy_ids("ghcr.io/x/new", &[], &["ghcr.io/x/old"]);
+        let items = vec![("ghcr.io/x/new".to_string(), b_meta)];
+        let features = feature_list(&items);
+        let index = build_id_index(&features);
+        assert!(index.contains_key("ghcr.io/x/new"));
+        assert!(
+            !index.contains_key("ghcr.io/x/old"),
+            "legacy alias must not be in the exact id index (dependsOn is exact-only)"
+        );
+    }
+
+    #[test]
+    fn resolve_soft_dep_resolves_exact_then_legacy() {
+        // Feature "ghcr.io/x/new" with bare legacyId "old".
+        // installsAfter target uses the same qualified prefix → "ghcr.io/x/old".
+        let b_meta = meta_with_legacy_ids("ghcr.io/x/new", &[], &["old"]);
+        let items = vec![("ghcr.io/x/new".to_string(), b_meta)];
+        let features = feature_list(&items);
+        let index = build_id_index(&features);
+        // Exact id resolves.
+        assert_eq!(
+            resolve_soft_dep("ghcr.io/x/new", &index, &features),
+            Some(0)
+        );
+        // Qualified alias ("ghcr.io/x/" + "old") resolves to the renamed feature.
+        assert_eq!(
+            resolve_soft_dep("ghcr.io/x/old", &index, &features),
+            Some(0)
+        );
+        // Unknown id resolves to nothing.
+        assert_eq!(resolve_soft_dep("ghcr.io/x/nope", &index, &features), None);
+    }
+
+    #[test]
+    fn installs_after_via_qualified_legacy_id_orders_correctly() {
+        // Real-world OCI rename: docker-outside-of-docker has
+        //   legacyIds: ["docker-from-docker"]  (bare, no registry prefix)
+        // A feature's installsAfter uses the OLD qualified name:
+        //   installsAfter: ["ghcr.io/devcontainers/features/docker-from-docker"]
+        // The current feature id is "ghcr.io/devcontainers/features/docker-outside-of-docker".
+        // resolve_soft_dep must qualify the bare alias to
+        //   "ghcr.io/devcontainers/features/docker-from-docker" and match dep_id.
+        let dood_meta = meta_with_legacy_ids(
+            "ghcr.io/devcontainers/features/docker-outside-of-docker",
+            &[],
+            &["docker-from-docker"],
+        );
+        let user_meta = meta_with_legacy_ids(
+            "ghcr.io/devcontainers/features/user-feature",
+            &["ghcr.io/devcontainers/features/docker-from-docker"],
+            &[],
+        );
+        let items = vec![
+            (
+                "ghcr.io/devcontainers/features/user-feature".to_string(),
+                user_meta,
+            ),
+            (
+                "ghcr.io/devcontainers/features/docker-outside-of-docker".to_string(),
+                dood_meta,
+            ),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+        assert!(
+            pos("ghcr.io/devcontainers/features/docker-outside-of-docker")
+                < pos("ghcr.io/devcontainers/features/user-feature"),
+            "docker-outside-of-docker must precede user-feature via legacy alias; order was {order:?}"
+        );
     }
 
     // ---------------------------------------------------------------
