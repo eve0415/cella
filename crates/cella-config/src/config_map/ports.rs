@@ -4,39 +4,133 @@ use cella_backend::PortForward;
 use cella_protocol::{OnAutoForward, PortAttributes, PortPattern};
 
 pub(super) fn map_port_bindings(config: &serde_json::Value) -> HashMap<String, Vec<PortForward>> {
-    let Some(ports) = config.get("forwardPorts").and_then(|v| v.as_array()) else {
-        return HashMap::new();
-    };
-
     let ports_attrs = config.get("portsAttributes").and_then(|v| v.as_object());
     let mut bindings = HashMap::new();
 
-    for port_value in ports {
-        let port = match port_value {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            _ => continue,
-        };
+    // forwardPorts: array of number | string, bound to 0.0.0.0
+    if let Some(ports) = config.get("forwardPorts").and_then(|v| v.as_array()) {
+        for port_value in ports {
+            let port = match port_value {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => continue,
+            };
 
-        let protocol = ports_attrs
-            .and_then(|attrs| attrs.get(&port))
-            .and_then(|attr| attr.get("protocol"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("tcp");
+            let protocol = ports_attrs
+                .and_then(|attrs| attrs.get(&port))
+                .and_then(|attr| attr.get("protocol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("tcp");
 
-        let container_port = format!("{port}/{protocol}");
-        let host_port = port.clone();
+            let container_port = format!("{port}/{protocol}");
 
-        bindings.insert(
-            container_port,
-            vec![PortForward {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(host_port),
-            }],
-        );
+            bindings
+                .entry(container_port)
+                .or_insert_with(Vec::new)
+                .push(PortForward {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(port),
+                });
+        }
+    }
+
+    // appPort: number | string | array thereof, bound to 127.0.0.1 (official behaviour)
+    let app_port_entries = collect_app_port_entries(config);
+    for entry in app_port_entries {
+        let (container_port_key, forward) = entry;
+        bindings
+            .entry(container_port_key)
+            .or_insert_with(Vec::new)
+            .push(forward);
     }
 
     bindings
+}
+
+/// Collect `PortForward` entries from the `appPort` field.
+///
+/// Official behaviour (devcontainers/cli `singleContainer.ts`):
+/// - NUMBER `N`  → `-p 127.0.0.1:N:N`  (host 127.0.0.1:N → container N/tcp)
+/// - STRING `s`  → `-p s` verbatim — `s` is a Docker `-p` spec:
+///   `[ip:][hostPort:]containerPort[/proto]`
+///
+/// For strings we parse the Docker `-p` format ourselves so we can fill in
+/// the `PortForward` struct. Bare `"N"` (single part) maps to container port N
+/// with `host_port: None` so Docker assigns an ephemeral host port — matching
+/// Docker's own behaviour when you write `-p N` without a host side.
+fn collect_app_port_entries(config: &serde_json::Value) -> Vec<(String, PortForward)> {
+    let Some(raw) = config.get("appPort") else {
+        return Vec::new();
+    };
+
+    let items: Vec<&serde_json::Value> = match raw {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        other => vec![other],
+    };
+
+    items
+        .into_iter()
+        .filter_map(app_port_item_to_forward)
+        .collect()
+}
+
+/// Convert a single `appPort` element (number or string) to a
+/// `(container_port_key, PortForward)` pair.
+fn app_port_item_to_forward(value: &serde_json::Value) -> Option<(String, PortForward)> {
+    match value {
+        serde_json::Value::Number(n) => {
+            let port = n.as_u64()?.to_string();
+            let key = format!("{port}/tcp");
+            Some((
+                key,
+                PortForward {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(port),
+                },
+            ))
+        }
+        serde_json::Value::String(s) => parse_docker_p_spec(s),
+        _ => None,
+    }
+}
+
+/// Parse a Docker `-p` spec string: `[ip:][hostPort:]containerPort[/proto]`
+///
+/// Returns `(container_port_key, PortForward)` where the key is
+/// `"containerPort/proto"` (defaulting to tcp).
+///
+/// Examples:
+/// - `"3000"`             → key `"3000/tcp"`, `host_ip` None, `host_port` None
+/// - `"8080:80"`          → key `"80/tcp"`, `host_ip` None, `host_port` Some("8080")
+/// - `"127.0.0.1:3000:3000"` → key `"3000/tcp"`, `host_ip` Some("127.0.0.1"), `host_port` Some("3000")
+/// - `"5000/udp"`         → key `"5000/udp"`, `host_ip` None, `host_port` None
+fn parse_docker_p_spec(spec: &str) -> Option<(String, PortForward)> {
+    // Split off optional /proto suffix
+    let (addr_part, proto) = spec.rsplit_once('/').map_or((spec, "tcp"), |(a, p)| (a, p));
+
+    let parts: Vec<&str> = addr_part.splitn(3, ':').collect();
+
+    let (host_ip, host_port, container_port) = match parts.as_slice() {
+        // "containerPort"
+        [cp] => (None, None, (*cp).to_string()),
+        // "hostPort:containerPort"
+        [hp, cp] => (None, Some((*hp).to_string()), (*cp).to_string()),
+        // "ip:hostPort:containerPort"
+        [ip, hp, cp] => (
+            Some((*ip).to_string()),
+            Some((*hp).to_string()),
+            (*cp).to_string(),
+        ),
+        _ => return None,
+    };
+
+    // Validate that container_port is non-empty
+    if container_port.is_empty() {
+        return None;
+    }
+
+    let key = format!("{container_port}/{proto}");
+    Some((key, PortForward { host_ip, host_port }))
 }
 
 /// Parse `portsAttributes` from devcontainer.json.
@@ -375,5 +469,105 @@ mod tests {
         let (deserialized, other) = deserialize_ports_attributes_label(&label);
         assert_eq!(deserialized.len(), 1);
         assert!(other.is_none());
+    }
+
+    // ── appPort tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn app_port_number_binds_loopback() {
+        let config = json!({"appPort": 3000});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["3000/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(fwd[0].host_port.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn app_port_string_host_container() {
+        // "8080:80" → host 8080, container 80
+        let config = json!({"appPort": "8080:80"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["80/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip, None);
+        assert_eq!(fwd[0].host_port.as_deref(), Some("8080"));
+    }
+
+    #[test]
+    fn app_port_string_with_ip() {
+        // "127.0.0.1:3000:3000" → ip 127.0.0.1, host 3000, container 3000
+        let config = json!({"appPort": "127.0.0.1:3000:3000"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["3000/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(fwd[0].host_port.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn app_port_string_bare_port_ephemeral_host() {
+        // "9000" → container 9000, no host port (docker assigns ephemeral)
+        let config = json!({"appPort": "9000"});
+        let bindings = map_port_bindings(&config);
+        let fwd = &bindings["9000/tcp"];
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].host_ip, None);
+        assert_eq!(fwd[0].host_port, None);
+    }
+
+    #[test]
+    fn app_port_string_udp_protocol() {
+        // "5000/udp" → container 5000/udp
+        let config = json!({"appPort": "5000/udp"});
+        let bindings = map_port_bindings(&config);
+        assert!(bindings.contains_key("5000/udp"), "key should be 5000/udp");
+        assert!(
+            !bindings.contains_key("5000/tcp"),
+            "should not create tcp key"
+        );
+        let fwd = &bindings["5000/udp"];
+        assert_eq!(fwd[0].host_ip, None);
+        assert_eq!(fwd[0].host_port, None);
+    }
+
+    #[test]
+    fn app_port_array_mixed() {
+        // [3000, "8080:80"] → two bindings
+        let config = json!({"appPort": [3000, "8080:80"]});
+        let bindings = map_port_bindings(&config);
+        assert!(bindings.contains_key("3000/tcp"));
+        assert!(bindings.contains_key("80/tcp"));
+        assert_eq!(
+            bindings["3000/tcp"][0].host_ip.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(bindings["80/tcp"][0].host_port.as_deref(), Some("8080"));
+    }
+
+    #[test]
+    fn app_port_and_forward_ports_merged() {
+        // Both appPort and forwardPorts present — entries end up in the same map
+        let config = json!({
+            "forwardPorts": [5432],
+            "appPort": 3000,
+        });
+        let bindings = map_port_bindings(&config);
+        // forwardPorts binds to 0.0.0.0
+        let fwd_5432 = &bindings["5432/tcp"];
+        assert_eq!(fwd_5432[0].host_ip.as_deref(), Some("0.0.0.0"));
+        // appPort binds to 127.0.0.1
+        let fwd_3000 = &bindings["3000/tcp"];
+        assert_eq!(fwd_3000[0].host_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn app_port_ignored_on_non_number_non_string_elements() {
+        // Arrays may contain booleans or null — those must be silently skipped
+        let config = json!({"appPort": [3000, true, null, "4000"]});
+        let bindings = map_port_bindings(&config);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.contains_key("3000/tcp"));
+        assert!(bindings.contains_key("4000/tcp"));
     }
 }

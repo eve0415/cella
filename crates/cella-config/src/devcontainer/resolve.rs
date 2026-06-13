@@ -261,10 +261,12 @@ pub fn config_with_override(
     if config.get("appPort").is_some() {
         warnings.push(Diagnostic {
             severity: Severity::Warning,
-            message: "\"appPort\" is deprecated. Use \"forwardPorts\" instead. Ports declared in \"appPort\" will not be bound.".into(),
+            message: "\"appPort\" is deprecated. Use \"forwardPorts\" instead.".into(),
             path: "$.appPort".into(),
             span: None,
-            help: Some("Replace \"appPort\" with \"forwardPorts\" in your devcontainer.json".into()),
+            help: Some(
+                "Replace \"appPort\" with \"forwardPorts\" in your devcontainer.json".into(),
+            ),
         });
     }
 
