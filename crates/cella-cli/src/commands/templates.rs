@@ -82,10 +82,7 @@ impl TemplatesArgs {
         }
     }
 
-    pub async fn execute(
-        self,
-        _progress: crate::progress::Progress,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             TemplatesCommand::Apply(args) => args.execute().await,
             TemplatesCommand::New { .. }
@@ -152,7 +149,7 @@ impl TemplatesApplyArgs {
 
         // Inject features into extracted devcontainer.json if requested.
         if !features.is_empty() {
-            inject_features(&workspace, &features)?;
+            inject_features(&workspace, &features, &metadata.id)?;
         }
 
         // Print success JSON to stdout (official contract).
@@ -272,6 +269,7 @@ fn parse_string_array(
 fn inject_features(
     workspace: &std::path::Path,
     features: &[SelectedFeature],
+    template_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Look for .devcontainer/devcontainer.json or devcontainer.json at root.
     let candidates = [
@@ -282,7 +280,7 @@ fn inject_features(
     let config_path = candidates.iter().find(|p| p.exists()).ok_or_else(
         || -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(TemplateError::InvalidArtifact {
-                template_id: "apply".to_owned(),
+                template_id: template_id.to_owned(),
                 reason: "no devcontainer.json found after template extraction".to_owned(),
             })
         },
@@ -430,10 +428,6 @@ mod tests {
     // TemplatesCommand stubs still return not-implemented
     // -----------------------------------------------------------------------
 
-    fn dummy_progress() -> crate::progress::Progress {
-        crate::progress::Progress::new(false, crate::progress::Verbosity::Normal)
-    }
-
     #[tokio::test]
     async fn new_returns_not_implemented() {
         let args = TemplatesArgs {
@@ -441,7 +435,7 @@ mod tests {
                 name: "rust".to_owned(),
             },
         };
-        let result = args.execute(dummy_progress()).await;
+        let result = args.execute().await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "not yet implemented");
     }
@@ -451,7 +445,7 @@ mod tests {
         let args = TemplatesArgs {
             command: TemplatesCommand::List,
         };
-        let result = args.execute(dummy_progress()).await;
+        let result = args.execute().await;
         assert!(result.is_err());
     }
 }
