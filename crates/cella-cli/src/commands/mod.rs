@@ -199,7 +199,7 @@ pub enum UpdateRemoteUserUidDefault {
 }
 
 /// Log verbosity for lifecycle/terminal logging.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum LogLevel {
     Info,
     Debug,
@@ -333,6 +333,7 @@ impl Command {
             Self::Code(args) => args.up.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
+            Self::Features(args) => args.log_level(),
             _ => None,
         }
     }

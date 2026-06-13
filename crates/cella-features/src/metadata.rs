@@ -1,6 +1,6 @@
 //! Parser for `devcontainer-feature.json` metadata files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -51,6 +51,13 @@ struct FeatureMetadataDto {
     description: Option<String>,
     #[serde(default)]
     options: HashMap<String, FeatureOptionDto>,
+    /// Hard dependencies: `Record<featureId, options>` where options is
+    /// `string | boolean | Record<string, string | boolean>`.
+    ///
+    /// `BTreeMap` for deterministic iteration (stable dependency-graph output).
+    #[serde(default)]
+    depends_on: BTreeMap<String, serde_json::Value>,
+    /// Soft ordering hints: array of feature reference strings.
     #[serde(default)]
     installs_after: Vec<String>,
     container_user: Option<String>,
@@ -134,6 +141,7 @@ impl FeatureMetadataDto {
             name: self.name,
             description: self.description,
             options,
+            depends_on: self.depends_on,
             installs_after: self.installs_after,
             container_user: self.container_user,
             entrypoint: self.entrypoint,
@@ -168,6 +176,7 @@ mod tests {
         assert!(meta.name.is_none());
         assert!(meta.description.is_none());
         assert!(meta.options.is_empty());
+        assert!(meta.depends_on.is_empty());
         assert!(meta.installs_after.is_empty());
         assert!(meta.container_user.is_none());
         assert!(meta.entrypoint.is_none());
@@ -206,6 +215,9 @@ mod tests {
                     "default": true,
                     "description": "Install Yarn package manager"
                 }
+            },
+            "dependsOn": {
+                "ghcr.io/devcontainers/features/git:1": {}
             },
             "installsAfter": ["ghcr.io/devcontainers/features/common-utils"],
             "containerUser": "node",
@@ -255,6 +267,11 @@ mod tests {
         assert!(yarn_opt.enum_values.is_none());
 
         // Other fields
+        assert!(
+            meta.depends_on
+                .contains_key("ghcr.io/devcontainers/features/git:1"),
+            "dependsOn key missing"
+        );
         assert_eq!(
             meta.installs_after,
             vec!["ghcr.io/devcontainers/features/common-utils"]
@@ -474,6 +491,42 @@ mod tests {
         }"#;
         let meta = parse_feature_metadata(json).expect("mount without source should parse");
         assert_eq!(meta.mounts[0], "type=volume,source=,target=/data");
+    }
+
+    #[test]
+    fn depends_on_and_installs_after_parsed() {
+        // dependsOn values may be empty object, options map, or scalar bool/string per spec.
+        let json = r#"{
+            "id": "my-feature",
+            "version": "1.0.0",
+            "dependsOn": {
+                "ghcr.io/devcontainers/features/git:1": {},
+                "ghcr.io/devcontainers/features/common-utils:2": {
+                    "installZsh": true,
+                    "username": "vscode"
+                }
+            },
+            "installsAfter": [
+                "ghcr.io/devcontainers/features/base:1"
+            ]
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse dependsOn + installsAfter");
+
+        // dependsOn: two hard-dependency refs
+        assert_eq!(meta.depends_on.len(), 2);
+        assert!(
+            meta.depends_on
+                .contains_key("ghcr.io/devcontainers/features/git:1")
+        );
+        let cu_opts = &meta.depends_on["ghcr.io/devcontainers/features/common-utils:2"];
+        assert_eq!(cu_opts["installZsh"], serde_json::json!(true));
+        assert_eq!(cu_opts["username"], serde_json::json!("vscode"));
+
+        // installsAfter: soft ordering hint
+        assert_eq!(
+            meta.installs_after,
+            vec!["ghcr.io/devcontainers/features/base:1"]
+        );
     }
 
     #[test]
