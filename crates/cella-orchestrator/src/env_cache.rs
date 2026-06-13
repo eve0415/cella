@@ -65,7 +65,8 @@ pub async fn probe_and_cache_user_env(
     probe_type: UserEnvProbe,
     shell: &str,
 ) -> Option<HashMap<String, String>> {
-    let env = run_env_probe(client, container_id, user, probe_type, shell).await?;
+    let mut env = run_env_probe(client, container_id, user, probe_type, shell).await?;
+    merge_container_base_path(client, container_id, user, &mut env).await;
     write_env_cache(client, container_id, user, probe_type, &env).await;
     Some(env)
 }
@@ -135,6 +136,46 @@ async fn try_probe_method(
     }
 
     Ok(env)
+}
+
+/// Whether `user` identifies the root account.
+///
+/// Docker's `--user` flag accepts several formats: a plain name (`root`), a
+/// plain UID (`0`), or `uid:gid` / `name:group` pairs (`0:0`, `root:root`,
+/// `root:0`, `0:root`). Inspect the part before `:` (if any) and treat the
+/// user as root when it is `"root"` or `"0"`.
+fn is_root_user(user: &str) -> bool {
+    let uid_or_name = user.split(':').next().unwrap_or(user);
+    uid_or_name == "root" || uid_or_name == "0"
+}
+
+/// Merge the container's base `PATH` (from image config) into the probed env so
+/// PATH entries a shell startup script dropped are recovered. Non-fatal: any
+/// lookup failure leaves the probed PATH untouched. Mirrors the official CLI.
+async fn merge_container_base_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    env: &mut HashMap<String, String>,
+) {
+    let Some(shell_path) = env.get("PATH").cloned() else {
+        return;
+    };
+    let Ok(info) = client.inspect_container(container_id).await else {
+        return;
+    };
+    let Some(image) = info.image else {
+        return;
+    };
+    let Ok(image_env) = client.inspect_image_env(&image).await else {
+        return;
+    };
+    let Some(container_path) = image_env.iter().find_map(|e| e.strip_prefix("PATH=")) else {
+        return;
+    };
+    let root_user = is_root_user(user);
+    let merged = cella_env::user_env_probe::merge_paths(&shell_path, container_path, root_user);
+    env.insert("PATH".to_string(), merged);
 }
 
 /// Execute the environment probe command and parse the output.
@@ -296,5 +337,48 @@ mod tests {
     fn cache_path_interactive_shell() {
         let path = cache_path("devuser", UserEnvProbe::InteractiveShell);
         assert!(path.ends_with("/.cella/env-interactiveShell.json"));
+    }
+
+    // -- is_root_user tests --
+
+    /// Regression: Docker `--user` accepts `uid:gid` and `name:group` forms.
+    /// `is_root_user` must recognise all root-identifying formats so that sbin
+    /// entries are correctly retained in the merged PATH for root containers.
+    #[test]
+    fn is_root_user_plain_name() {
+        assert!(is_root_user("root"));
+    }
+
+    #[test]
+    fn is_root_user_plain_uid() {
+        assert!(is_root_user("0"));
+    }
+
+    #[test]
+    fn is_root_user_uid_gid() {
+        assert!(is_root_user("0:0"));
+    }
+
+    #[test]
+    fn is_root_user_name_group() {
+        assert!(is_root_user("root:root"));
+    }
+
+    #[test]
+    fn is_root_user_root_gid() {
+        assert!(is_root_user("root:0"));
+    }
+
+    #[test]
+    fn is_root_user_uid_group_name() {
+        assert!(is_root_user("0:root"));
+    }
+
+    #[test]
+    fn is_root_user_non_root() {
+        assert!(!is_root_user("vscode"));
+        assert!(!is_root_user("1000"));
+        assert!(!is_root_user("1000:1000"));
+        assert!(!is_root_user("user:group"));
     }
 }

@@ -166,6 +166,43 @@ pub fn parse_probed_env(output: &str, marker: &str, separator: char) -> HashMap<
         .collect()
 }
 
+/// Merge a probed shell `PATH` with the container's base `PATH`.
+///
+/// Preserves shell-PATH precedence while re-inserting any container entries the
+/// shell dropped (e.g. a startup script that reset `PATH`). Mirrors the official
+/// CLI `mergePaths`: container-only entries are spliced in at their relative
+/// position; non-root users skip `*/sbin` entries.
+///
+/// Empty segments (from leading/trailing/doubled `:`) are filtered out before
+/// merging to prevent accidentally inserting `.` (current-working-directory) into
+/// `PATH`, which would be a security issue.
+#[must_use]
+pub fn merge_paths(shell_path: &str, container_path: &str, root_user: bool) -> String {
+    let mut result: Vec<&str> = shell_path.split(':').filter(|s| !s.is_empty()).collect();
+    let mut insert_at = 0usize;
+    for entry in container_path.split(':').filter(|s| !s.is_empty()) {
+        if let Some(i) = result.iter().position(|e| *e == entry) {
+            insert_at = i + 1;
+        } else if root_user || !is_sbin_path(entry) {
+            result.insert(insert_at, entry);
+            insert_at += 1;
+        }
+    }
+    result.join(":")
+}
+
+/// Whether a PATH entry is an sbin path component.
+///
+/// Matches the official regex `/\/sbin(\/|$)/` — requires a literal `/sbin`
+/// boundary, so `/sbin`, `/usr/sbin`, and `/usr/sbin/x` match, but
+/// `/usr/sbinfoo` and a bare `sbin` (no leading slash) do not.
+fn is_sbin_path(entry: &str) -> bool {
+    entry
+        .split('/')
+        .skip(1) // skip the empty segment before the leading '/'
+        .any(|seg| seg == "sbin")
+}
+
 /// Merge probed environment with `remoteEnv` from config.
 ///
 /// `remote_env` values override `probed` values.
@@ -461,6 +498,110 @@ mod tests {
         assert!(!merged.contains(&"FOO=cli".to_string()));
         assert!(merged.contains(&"BAR=cli".to_string()));
         assert!(merged.contains(&"PATH=/usr/bin".to_string()));
+    }
+
+    // -- merge_paths tests --
+
+    #[test]
+    fn merge_paths_shell_superset_unchanged() {
+        // Shell PATH already contains all container entries — no-op.
+        let shell = "/opt/tool/bin:/usr/bin:/bin";
+        let container = "/usr/bin:/bin";
+        assert_eq!(merge_paths(shell, container, false), shell);
+    }
+
+    #[test]
+    fn merge_paths_shell_reset_non_root_skips_sbin() {
+        // Shell startup script reset PATH to something simpler.
+        // Container entries missing from shell are re-inserted, but
+        // /usr/sbin and /sbin are skipped for non-root.
+        let shell = "/opt/tool/bin:/usr/bin";
+        let container = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        let result = merge_paths(shell, container, false);
+        // /usr/local/sbin, /usr/sbin, /sbin must be absent
+        assert!(!result.split(':').any(|e| e == "/usr/local/sbin"));
+        assert!(!result.split(':').any(|e| e == "/usr/sbin"));
+        assert!(!result.split(':').any(|e| e == "/sbin"));
+        // /usr/local/bin, /usr/bin, /bin must be present
+        assert!(result.split(':').any(|e| e == "/usr/local/bin"));
+        assert!(result.split(':').any(|e| e == "/usr/bin"));
+        assert!(result.split(':').any(|e| e == "/bin"));
+        // Shell-original entries must be present
+        assert!(result.split(':').any(|e| e == "/opt/tool/bin"));
+    }
+
+    #[test]
+    fn merge_paths_shell_reset_root_keeps_sbin() {
+        // Same scenario but root — /sbin paths are kept.
+        let shell = "/opt/tool/bin:/usr/bin";
+        let container = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        let result = merge_paths(shell, container, true);
+        assert!(result.split(':').any(|e| e == "/usr/local/sbin"));
+        assert!(result.split(':').any(|e| e == "/usr/sbin"));
+        assert!(result.split(':').any(|e| e == "/sbin"));
+    }
+
+    #[test]
+    fn merge_paths_interleaving_preserves_relative_order() {
+        // shell="/a:/c", container="/a:/b:/c:/d", non-root (no sbin entries).
+        // Expected: /a:/b:/c:/d  — container-only entries land in their
+        // relative position (b after a, d after c).
+        let result = merge_paths("/a:/c", "/a:/b:/c:/d", false);
+        assert_eq!(result, "/a:/b:/c:/d");
+    }
+
+    // -- is_sbin_path tests --
+
+    #[test]
+    fn is_sbin_path_matches_sbin_root() {
+        assert!(is_sbin_path("/sbin"));
+    }
+
+    #[test]
+    fn is_sbin_path_matches_usr_sbin() {
+        assert!(is_sbin_path("/usr/sbin"));
+    }
+
+    #[test]
+    fn is_sbin_path_matches_usr_sbin_subdir() {
+        assert!(is_sbin_path("/usr/sbin/x"));
+    }
+
+    #[test]
+    fn is_sbin_path_ignores_sbinfoo() {
+        assert!(!is_sbin_path("/usr/sbinfoo"));
+    }
+
+    #[test]
+    fn is_sbin_path_ignores_usr_bin() {
+        assert!(!is_sbin_path("/usr/bin"));
+    }
+
+    /// Regression: bare `"sbin"` (no leading slash) must NOT match the
+    /// `/\/sbin(\/|$)/` regex — it is not an absolute path and the regex
+    /// requires a `/` before `sbin`.
+    #[test]
+    fn is_sbin_path_bare_sbin_no_match() {
+        assert!(!is_sbin_path("sbin"));
+    }
+
+    /// Regression: empty PATH segments (from `PATH=:` or `PATH=/bin:`) must
+    /// never appear in the merged result, since an empty segment means `.`
+    /// (current working directory) which is a security hazard.
+    #[test]
+    fn merge_paths_filters_empty_segments() {
+        // container_path with a trailing ':' produces an empty segment
+        let result = merge_paths("/usr/bin:/bin", "/usr/bin:/bin:", false);
+        assert!(
+            !result.split(':').any(str::is_empty),
+            "merged PATH must not contain empty segments (implicit '.'): {result}"
+        );
+        // shell_path with a leading ':' also filtered
+        let result = merge_paths(":/usr/bin:/bin", "/usr/bin:/bin", false);
+        assert!(
+            !result.split(':').any(str::is_empty),
+            "merged PATH must not contain empty segments from shell path: {result}"
+        );
     }
 
     #[test]
