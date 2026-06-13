@@ -102,6 +102,10 @@ struct CliComposeUpHooks<'a> {
 }
 
 impl ComposeUpHooks for CliComposeUpHooks<'_> {
+    fn lifecycle_secret_masker(&self) -> cella_backend::SecretMasker {
+        self.ctx.lifecycle_secret_masker()
+    }
+
     fn daemon_env<'a>(
         &'a self,
         container_name: &'a str,

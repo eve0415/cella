@@ -1294,6 +1294,10 @@ impl UpContext {
         (final_probed, lifecycle_env)
     }
 
+    pub(crate) fn lifecycle_secret_masker(&self) -> cella_backend::SecretMasker {
+        cella_backend::SecretMasker::new(&self.lifecycle_secrets)
+    }
+
     /// Delegates to [`cella_orchestrator::tool_install::install_tools`].
     async fn install_tools(
         &self,

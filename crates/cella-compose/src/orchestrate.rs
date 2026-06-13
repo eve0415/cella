@@ -255,6 +255,13 @@ pub trait ComposeUpHooks: Send + Sync {
         remote_env: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>>;
 
+    /// Masker over the lifecycle `--secrets-file` values, used to redact
+    /// secret values from compose lifecycle command output. Defaults to an
+    /// empty (passthrough) masker for implementors without secrets.
+    fn lifecycle_secret_masker(&self) -> cella_backend::SecretMasker {
+        cella_backend::SecretMasker::default()
+    }
+
     /// Clone and install dotfiles inside the container, as `remote_user`.
     ///
     /// Bridges the orchestrator-owned install logic (which cella-compose cannot
@@ -649,6 +656,7 @@ async fn finalize_compose(
     let gate = cfg.lifecycle_gate;
     let metadata = resolved_features.map(|rf| rf.metadata_label.as_str());
     let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
+    let secret_masker = hooks.lifecycle_secret_masker();
     for phase in [
         "onCreateCommand",
         "updateContentCommand",
@@ -668,6 +676,7 @@ async fn finalize_compose(
             &lifecycle_env,
             Some(&project.workspace_folder),
             progress,
+            secret_masker.clone(),
         );
         run_lifecycle_entries(&lc_ctx, phase, &entries, progress).await?;
 
@@ -825,6 +834,7 @@ async fn handle_compose_running(
             &lifecycle_env,
             Some(project.workspace_folder.as_str()),
             progress,
+            hooks.lifecycle_secret_masker(),
         );
 
         let label = "Running the postAttachCommand from devcontainer.json...";
@@ -1632,6 +1642,7 @@ fn build_lifecycle_ctx<'a>(
     env: &'a [String],
     working_dir: Option<&'a str>,
     progress: &ProgressSender,
+    masker: cella_backend::SecretMasker,
 ) -> LifecycleContext<'a> {
     let p = progress.clone();
     LifecycleContext {
@@ -1642,9 +1653,7 @@ fn build_lifecycle_ctx<'a>(
         working_dir,
         is_text: true,
         on_output: Some(Box::new(move |line| p.println(line))),
-        // Compose has no lifecycle `--secrets-file` plumbing yet, so there are
-        // no secret values to mask here (empty masker = passthrough).
-        secret_masker: cella_backend::SecretMasker::default(),
+        secret_masker: masker,
     }
 }
 
@@ -1906,6 +1915,95 @@ mod tests {
             .expect("updated fingerprint label");
 
         assert_ne!(&base, changed);
+    }
+
+    /// Test that `lifecycle_secret_masker` from the trait default is passthrough,
+    /// and that a non-empty masker built from `SecretMasker::new` actually redacts.
+    ///
+    /// `build_lifecycle_ctx` is not called directly here because it requires a
+    /// `&dyn ContainerBackend` — no test double exists in this crate. The CLI
+    /// override path (`CliComposeUpHooks::lifecycle_secret_masker`) is covered
+    /// transitively by `cella_backend::SecretMasker`'s own unit tests. This test
+    /// verifies the plumbing at the trait boundary: default → passthrough, and
+    /// the non-default value produced by `SecretMasker::new` actually masks.
+    #[test]
+    fn lifecycle_secret_masker_trait_default_is_passthrough() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct NoopHooks;
+
+        impl ComposeUpHooks for NoopHooks {
+            fn daemon_env<'a>(
+                &'a self,
+                _container_name: &'a str,
+                _host_gateway: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+                Box::pin(async { vec![] })
+            }
+
+            fn sync_agent_runtime<'a>(
+                &'a self,
+                _client: &'a dyn ContainerBackend,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+
+            fn register_container<'a>(
+                &'a self,
+                _client: &'a dyn ContainerBackend,
+                _container_id: &'a str,
+                _config: &'a serde_json::Value,
+                _container_name: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+
+            fn launch_agent<'a>(
+                &'a self,
+                _client: &'a dyn ContainerBackend,
+                _container_id: &'a str,
+                _agent_arch: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+
+            fn post_create_setup<'a>(
+                &'a self,
+                _client: &'a dyn ContainerBackend,
+                _container_id: &'a str,
+                _remote_user: &'a str,
+                _config: &'a serde_json::Value,
+                _workspace_root: &'a Path,
+                _remote_env: &'a [String],
+            ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+                Box::pin(async { vec![] })
+            }
+        }
+
+        let hooks = NoopHooks;
+
+        // Default impl returns an empty (passthrough) masker.
+        let default_masker = hooks.lifecycle_secret_masker();
+        assert!(
+            default_masker.is_empty(),
+            "default lifecycle_secret_masker must be empty (passthrough)"
+        );
+        let s = "token=s3cr3tvalue";
+        assert_eq!(
+            default_masker.mask(s),
+            s,
+            "empty masker must not modify the input"
+        );
+
+        // A masker built from real secret entries does redact.
+        let real_masker = cella_backend::SecretMasker::new(&["SECRET=s3cr3tvalue".to_string()]);
+        assert!(
+            !real_masker
+                .mask("token=s3cr3tvalue")
+                .contains("s3cr3tvalue"),
+            "non-empty masker must redact the secret value"
+        );
     }
 
     #[test]
