@@ -2124,19 +2124,18 @@ impl EnsureUpContext<'_> {
             // container matched by spec-identity), a legacy cella container for
             // the same workspace may still hold our target name. Remove it now
             // to avoid a Docker name-conflict on create.
-            if remove_container && container.name != self.config.container_name {
-                if let Some(legacy) = self
+            if remove_container
+                && container.name != self.config.container_name
+                && let Some(legacy) = self
                     .client
                     .find_container(&self.config.resolved.workspace_root)
                     .await?
-                {
-                    if legacy.name == self.config.container_name {
-                        if legacy.state == ContainerState::Running {
-                            let _ = self.client.stop_container(&legacy.id).await;
-                        }
-                        let _ = self.client.remove_container(&legacy.id, false).await;
-                    }
+                && legacy.name == self.config.container_name
+            {
+                if legacy.state == ContainerState::Running {
+                    let _ = self.client.stop_container(&legacy.id).await;
                 }
+                let _ = self.client.remove_container(&legacy.id, false).await;
             }
         }
 
