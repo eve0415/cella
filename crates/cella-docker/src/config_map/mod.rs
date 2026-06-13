@@ -17,6 +17,7 @@ struct MergedOverrides {
     cap_add: Vec<String>,
     security_opt: Vec<String>,
     privileged: bool,
+    init: bool,
 }
 
 /// Convert `CreateContainerOptions` (from `cella-backend`) to a bollard
@@ -41,6 +42,7 @@ pub fn to_bollard_config(opts: &CreateContainerOptions) -> ContainerCreateBody {
         Some(merged.security_opt)
     };
     host_config.privileged = Some(merged.privileged);
+    host_config.init = Some(merged.init);
 
     ContainerCreateBody {
         image: Some(opts.image.clone()),
@@ -118,6 +120,7 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
     let mut extra_hosts = vec!["host.docker.internal:host-gateway".to_string()];
     let mut security_opt = opts.security_opt.clone();
     let mut privileged = opts.privileged;
+    let mut init = opts.init;
     let cap_add = opts.cap_add.clone();
     let mut labels = opts.labels.clone();
     let mut hostname = None;
@@ -128,6 +131,9 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
         security_opt.extend(ra.security_opt.clone());
         if let Some(p) = ra.privileged {
             privileged = p || privileged;
+        }
+        if let Some(i) = ra.init {
+            init = i || init;
         }
         for (k, v) in &ra.labels {
             labels.insert(k.clone(), v.clone());
@@ -162,6 +168,7 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
         cap_add,
         security_opt,
         privileged,
+        init,
     }
 }
 
@@ -346,9 +353,8 @@ fn apply_misc_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
             maximum_retry_count: max,
         });
     }
-    if let Some(v) = ra.init {
-        hc.init = Some(v);
-    }
+    // `init` is OR'd with the top-level/feature `init` in `apply_overrides`
+    // and applied to `host_config.init` there.
 }
 
 /// Convert a `GpuRequest` to a bollard `DeviceRequest`.
@@ -437,6 +443,7 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            init: false,
             run_args_overrides: None,
             gpu_request: None,
         };
@@ -481,6 +488,7 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            init: false,
             run_args_overrides: None,
             gpu_request: None,
         };
@@ -511,6 +519,7 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            init: false,
             run_args_overrides: None,
             gpu_request: None,
         };
@@ -537,6 +546,7 @@ mod tests {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             privileged: false,
+            init: false,
             run_args_overrides: None,
             gpu_request: None,
         }
@@ -803,6 +813,35 @@ mod tests {
         let config = to_bollard_config(&opts);
         let hc = config.host_config.unwrap();
         assert_eq!(hc.privileged, Some(true));
+    }
+
+    #[test]
+    fn init_flag_reaches_host_config() {
+        // Top-level/feature `init: true` (CreateContainerOptions.init) must
+        // reach host_config.init even with no runArgs --init.
+        let mut opts = minimal_opts();
+        opts.init = true;
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.host_config.unwrap().init, Some(true));
+    }
+
+    #[test]
+    fn init_defaults_off() {
+        let config = to_bollard_config(&minimal_opts());
+        assert_eq!(config.host_config.unwrap().init, Some(false));
+    }
+
+    #[test]
+    fn run_args_init_or_with_base() {
+        // runArgs --init alone enables init even when the base opts.init is false.
+        let mut opts = minimal_opts();
+        opts.init = false;
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            init: Some(true),
+            ..Default::default()
+        });
+        let config = to_bollard_config(&opts);
+        assert_eq!(config.host_config.unwrap().init, Some(true));
     }
 
     #[test]

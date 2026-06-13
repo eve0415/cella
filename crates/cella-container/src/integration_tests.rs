@@ -81,6 +81,7 @@ fn minimal_create_opts(name: &str) -> CreateContainerOptions {
         cap_add: Vec::new(),
         security_opt: Vec::new(),
         privileged: false,
+        init: false,
         run_args_overrides: None,
         gpu_request: None,
     }

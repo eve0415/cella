@@ -110,6 +110,12 @@ pub fn map_config<S: std::hash::BuildHasher>(
         .unwrap_or(false)
         || feature_config.is_some_and(|fc| fc.privileged);
 
+    let init = config
+        .get("init")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || feature_config.is_some_and(|fc| fc.init);
+
     let gpu_request = map_gpu_device_request(config);
     let run_args_overrides = parse_run_args_from_config(config);
 
@@ -129,6 +135,7 @@ pub fn map_config<S: std::hash::BuildHasher>(
         cap_add,
         security_opt,
         privileged,
+        init,
         run_args_overrides,
         gpu_request,
     }
@@ -583,6 +590,31 @@ mod tests {
         assert!(cmd[1].contains("/usr/local/share/docker-init.sh"));
         assert!(cmd[1].contains("while sleep 1 & wait $!; do :; done"));
         assert_eq!(cmd[2], "-");
+    }
+
+    #[test]
+    fn map_config_init_from_top_level() {
+        let config = json!({ "image": "ubuntu", "init": true });
+        let opts = test_map_config(&config, None, &[]);
+        assert!(opts.init);
+    }
+
+    #[test]
+    fn map_config_init_from_feature() {
+        let config = json!({ "image": "ubuntu" });
+        let feature_config = FeatureContainerConfig {
+            init: true,
+            ..Default::default()
+        };
+        let opts = test_map_config(&config, Some(&feature_config), &[]);
+        assert!(opts.init);
+    }
+
+    #[test]
+    fn map_config_init_defaults_false() {
+        let config = json!({ "image": "ubuntu" });
+        let opts = test_map_config(&config, None, &[]);
+        assert!(!opts.init);
     }
 
     #[test]
