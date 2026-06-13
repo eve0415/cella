@@ -206,20 +206,22 @@ pub async fn publish_templates(opts: PublishOptions) -> Result<PublishOutput, Pu
         }
     }
 
-    // Publish collection index
-    let index_result = publish_collection_index(
-        &opts.registry,
-        &opts.namespace,
-        &output,
-        &template_dirs,
-        &target,
-    )
-    .await;
-
     // Best-effort cleanup of tmp directory.
     let _ = std::fs::remove_dir_all(&tmp_path);
 
-    index_result?;
+    // Only publish the collection index when at least one template was actually pushed.
+    let any_published = output.values().any(|r| !r.skipped);
+    if any_published {
+        publish_collection_index(
+            &opts.registry,
+            &opts.namespace,
+            &output,
+            &template_dirs,
+            &target,
+        )
+        .await?;
+    }
+
     Ok(output)
 }
 
@@ -364,29 +366,68 @@ async fn publish_single_template(
         })?;
 
     // Compute semver fan-out tags
-    let Some(tags) = compute_semver_tags(&version, &existing_tags) else {
-        warn!("(!) WARNING: Version {version} already exists, skipping {id}...");
-        return Ok(TemplatePublishResult {
-            skipped: true,
-            digest: None,
-            published_tags: Vec::new(),
-            version: None,
-        });
+    let tags = match compute_semver_tags(&version, &existing_tags) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!("(!) WARNING: Version {version} already exists, skipping {id}...");
+            return Ok(TemplatePublishResult {
+                skipped: true,
+                digest: None,
+                published_tags: Vec::new(),
+                version: None,
+            });
+        }
+        Err(e) => {
+            return Err(PublishError::InvalidVersion {
+                id: id.to_owned(),
+                version: version.clone(),
+                reason: e.to_string(),
+            });
+        }
     };
 
-    // Compute enriched metadata
+    // Compute enriched metadata, package, and push.
     let annotation_meta = compute_annotation_metadata(id, dir, base_meta)?;
+    package_and_push_template(
+        id,
+        dir,
+        out_dir,
+        &PushTarget {
+            registry,
+            repository: &repository,
+            tags: &tags,
+        },
+        &annotation_meta,
+        &version,
+    )
+    .await
+}
 
-    // Package template
+/// Registry destination for a single template push.
+struct PushTarget<'a> {
+    registry: &'a str,
+    repository: &'a str,
+    tags: &'a [String],
+}
+
+/// Package the template into a tarball and push it under `target.tags`,
+/// returning the publish result. Split out of [`publish_single_template`] to
+/// keep each function within the line limit.
+async fn package_and_push_template(
+    id: &str,
+    dir: &Path,
+    out_dir: &Path,
+    target: &PushTarget<'_>,
+    annotation_meta: &AnnotationMetadata,
+    version: &str,
+) -> Result<TemplatePublishResult, PublishError> {
     let tgz_path = package_template(id, dir, out_dir)?;
 
-    // Build annotation
     let annotation_json =
-        serde_json::to_string(&annotation_meta).expect("annotation metadata is serializable");
+        serde_json::to_string(annotation_meta).expect("annotation metadata is serializable");
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert("dev.containers.metadata".to_owned(), annotation_json);
 
-    // Read tarball bytes
     let tgz_bytes = std::fs::read(&tgz_path).map_err(|source| PublishError::Io {
         id: id.to_owned(),
         source,
@@ -405,12 +446,15 @@ async fn publish_single_template(
         }),
     };
 
-    debug!("pushing {registry}/{repository} tags={tags:?}");
+    debug!(
+        "pushing {}/{} tags={:?}",
+        target.registry, target.repository, target.tags
+    );
 
     let push_result = cella_oci::push::push_artifact(
-        registry,
-        &repository,
-        &tags,
+        target.registry,
+        target.repository,
+        target.tags,
         vec![layer],
         "application/vnd.devcontainers",
         Some(manifest_annotations),
@@ -421,20 +465,20 @@ async fn publish_single_template(
         source: Box::new(source),
     })?;
 
-    match push_result {
-        Some(r) => Ok(TemplatePublishResult {
+    Ok(match push_result {
+        Some(r) => TemplatePublishResult {
             skipped: false,
             digest: Some(r.digest),
             published_tags: r.pushed_tags,
-            version: Some(version.clone()),
-        }),
-        None => Ok(TemplatePublishResult {
+            version: Some(version.to_owned()),
+        },
+        None => TemplatePublishResult {
             skipped: true,
             digest: None,
             published_tags: Vec::new(),
             version: None,
-        }),
-    }
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +509,15 @@ fn compute_annotation_metadata(
             reason: format!("devcontainer.json parse error: {e}"),
         })?;
 
-    let template_type = derive_template_type(&dc)?;
+    let template_type = derive_template_type(&dc).map_err(|e| match e {
+        PublishError::MissingDevcontainerJson { reason, .. } => {
+            PublishError::MissingDevcontainerJson {
+                id: id.to_owned(),
+                reason,
+            }
+        }
+        other => other,
+    })?;
     let files = collect_files(dir);
     let file_count = files.len();
     let feature_ids = extract_feature_ids(&dc);
@@ -481,15 +533,21 @@ fn compute_annotation_metadata(
 
 /// Derive the template type from the devcontainer config.
 ///
-/// Logic mirrors `addsAdditionalTemplateProps` in the official CLI:
+/// Logic mirrors `isDockerFileConfig` / `addsAdditionalTemplateProps` in the official CLI:
 /// - `image` key present → `Image`
-/// - `dockerFile`/`build.dockerfile` present → `Dockerfile`
+/// - `dockerFile`, `build.dockerfile`, or `build.dockerfilePath` present → `Dockerfile`
 /// - `dockerComposeFile` present → `DockerCompose`
+///
+/// Returns a `MissingDevcontainerJson` error with `id: "?"` — callers must remap the
+/// error to carry the real template ID (see [`compute_annotation_metadata`]).
 fn derive_template_type(dc: &serde_json::Value) -> Result<TemplateType, PublishError> {
     if dc.get("image").is_some() {
         return Ok(TemplateType::Image);
     }
-    if dc.get("dockerFile").is_some() || dc.get("build").and_then(|b| b.get("dockerfile")).is_some()
+    let build = dc.get("build");
+    if dc.get("dockerFile").is_some()
+        || build.and_then(|b| b.get("dockerfile")).is_some()
+        || build.and_then(|b| b.get("dockerfilePath")).is_some()
     {
         return Ok(TemplateType::Dockerfile);
     }
@@ -508,19 +566,26 @@ fn derive_template_type(dc: &serde_json::Value) -> Result<TemplateType, PublishE
 /// The official CLI calls `getRef(output, f)?.resource` for each key — here
 /// we just normalize the key form: strip the tag/digest suffix if it looks
 /// like a fully-qualified reference, otherwise keep it as-is.
+///
+/// The result is sorted and deduplicated so that annotation output is deterministic
+/// even when multiple tag variants of the same feature appear as separate keys.
 fn extract_feature_ids(dc: &serde_json::Value) -> Vec<String> {
     let Some(features) = dc.get("features").and_then(|f| f.as_object()) else {
         return Vec::new();
     };
 
-    features
+    let mut ids: Vec<String> = features
         .keys()
         .map(|k| {
             // Normalise to base reference (drop `:tag` suffix) matching OCI resource form.
             let base = k.split_once(':').map_or(k.as_str(), |(base, _)| base);
             base.to_owned()
         })
-        .collect()
+        .collect();
+
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Recursively collect all file paths under `dir`, relative to `dir`, sorted.
@@ -542,22 +607,38 @@ fn collect_files_recursive(base: &Path, current: &Path, out: &mut Vec<String>) {
         } else if path.is_file()
             && let Ok(rel) = path.strip_prefix(base)
         {
-            out.push(rel.to_string_lossy().into_owned());
+            // Emit `./`-prefixed paths consistent with tar entry names.
+            out.push(format!("./{}", rel.to_string_lossy()));
         }
     }
 }
 
-/// Locate `devcontainer.json` inside a template directory.
+/// Locate `devcontainer.json` inside a template source directory.
 ///
-/// Checks `.devcontainer.json` at root, then `.devcontainer/devcontainer.json`.
+/// Search order (first match wins):
+/// 1. `.devcontainer.json` — the official flat layout used by the official CLI's
+///    `getDevcontainerFilePath` and shown in the spec's config-discovery list.
+///    This is what the official CLI exclusively uses for template source dirs.
+/// 2. `.devcontainer/devcontainer.json` — the standard nested layout.
+/// 3. `devcontainer.json` — plain root file without a leading dot.  The devcontainer
+///    spec's workspace-level config-discovery list does NOT include this form (the
+///    spec enumerates `.devcontainer/devcontainer.json`, `.devcontainer.json`, and
+///    `.devcontainer/<folder>/devcontainer.json`).  The official CLI's template
+///    packaging also does not check it.  We support it anyway as an author
+///    convenience — it is harmless to accept, and it is a natural mistake to omit
+///    the leading dot when creating a template by hand.
 fn find_devcontainer_json(dir: &Path) -> Option<PathBuf> {
-    let flat = dir.join(".devcontainer.json");
-    if flat.exists() {
-        return Some(flat);
+    let flat_dot = dir.join(".devcontainer.json");
+    if flat_dot.exists() {
+        return Some(flat_dot);
     }
     let nested = dir.join(".devcontainer").join("devcontainer.json");
     if nested.exists() {
         return Some(nested);
+    }
+    let flat = dir.join("devcontainer.json");
+    if flat.exists() {
+        return Some(flat);
     }
     None
 }
@@ -714,18 +795,26 @@ fn collect_collection_dirs(target: &Path) -> Result<Vec<PathBuf>, PublishError> 
 /// `tags`.
 ///
 /// Mirrors `getSemanticTags` from the official CLI:
-/// - If `tags` already contains the exact version → return `None` (skip).
+/// - If `version` is not valid semver → `Err(..)` (hard error, caller must reject).
+/// - If `tags` already contains the exact version → `Ok(None)` (skip).
 /// - Otherwise, push `version` itself, plus the major, major.minor, and
 ///   `"latest"` alias **when** the new version is the highest in that range.
 ///
-/// Returns `None` when the version should be skipped entirely.
-pub fn compute_semver_tags(version: &str, tags: &[String]) -> Option<Vec<String>> {
+/// Returns `Ok(None)` when the version should be skipped (already published).
+///
+/// # Errors
+///
+/// Returns the underlying [`semver::Error`] when `version` is not valid semver.
+pub fn compute_semver_tags(
+    version: &str,
+    tags: &[String],
+) -> Result<Option<Vec<String>>, semver::Error> {
     // If exact version already published, skip.
     if tags.iter().any(|t| t == version) {
-        return None;
+        return Ok(None);
     }
 
-    let parsed = Version::parse(version).ok()?;
+    let parsed = Version::parse(version)?;
 
     let mut result = Vec::new();
 
@@ -754,7 +843,7 @@ pub fn compute_semver_tags(version: &str, tags: &[String]) -> Option<Vec<String>
         result.push("latest".to_owned());
     }
 
-    Some(result)
+    Ok(Some(result))
 }
 
 /// Returns `true` if `new_version` is strictly greater than the maximum
@@ -800,7 +889,7 @@ mod tests {
 
     #[test]
     fn first_publish_gets_all_aliases() {
-        let tags = compute_semver_tags("1.2.3", &[]).unwrap();
+        let tags = compute_semver_tags("1.2.3", &[]).unwrap().unwrap();
         // Must contain exact version + aliases
         assert!(tags.contains(&"1.2.3".to_owned()));
         assert!(tags.contains(&"1.2".to_owned()));
@@ -809,9 +898,17 @@ mod tests {
     }
 
     #[test]
-    fn already_published_exact_returns_none() {
+    fn already_published_exact_returns_ok_none() {
         let existing = vec!["1.2.3".to_owned()];
-        assert!(compute_semver_tags("1.2.3", &existing).is_none());
+        assert_eq!(compute_semver_tags("1.2.3", &existing).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_semver_returns_err() {
+        // "1.0" is not valid semver — must be a hard error, not skip
+        assert!(compute_semver_tags("1.0", &[]).is_err());
+        // "v1.2.3" has a leading 'v' — not valid semver
+        assert!(compute_semver_tags("v1.2.3", &[]).is_err());
     }
 
     #[test]
@@ -823,7 +920,7 @@ mod tests {
             "1".to_owned(),
             "latest".to_owned(),
         ];
-        let tags = compute_semver_tags("1.2.3", &existing).unwrap();
+        let tags = compute_semver_tags("1.2.3", &existing).unwrap().unwrap();
         assert!(tags.contains(&"1.2.3".to_owned()));
         assert!(!tags.contains(&"1.2".to_owned()), "should not retag 1.2");
         assert!(
@@ -836,7 +933,7 @@ mod tests {
     fn higher_patch_gets_aliases() {
         // 1.2.2 already published; 1.2.3 should get 1.2 and latest aliases
         let existing = vec!["1.2.2".to_owned()];
-        let tags = compute_semver_tags("1.2.3", &existing).unwrap();
+        let tags = compute_semver_tags("1.2.3", &existing).unwrap().unwrap();
         assert!(tags.contains(&"1.2.3".to_owned()));
         assert!(tags.contains(&"1.2".to_owned()));
         assert!(tags.contains(&"1".to_owned()));
@@ -847,7 +944,7 @@ mod tests {
     fn new_minor_gets_major_and_latest_but_old_minor_alias_not_retagged() {
         // 1.3.0 is higher than existing 1.2.x — gets 1, 1.3, latest
         let existing = vec!["1.2.0".to_owned()];
-        let tags = compute_semver_tags("1.3.0", &existing).unwrap();
+        let tags = compute_semver_tags("1.3.0", &existing).unwrap().unwrap();
         assert!(tags.contains(&"1.3.0".to_owned()));
         assert!(tags.contains(&"1.3".to_owned()));
         assert!(tags.contains(&"1".to_owned()));
@@ -857,7 +954,7 @@ mod tests {
     #[test]
     fn new_major_gets_full_set() {
         let existing = vec!["1.0.0".to_owned(), "1".to_owned(), "latest".to_owned()];
-        let tags = compute_semver_tags("2.0.0", &existing).unwrap();
+        let tags = compute_semver_tags("2.0.0", &existing).unwrap().unwrap();
         assert!(tags.contains(&"2.0.0".to_owned()));
         assert!(tags.contains(&"2.0".to_owned()));
         assert!(tags.contains(&"2".to_owned()));
@@ -873,14 +970,20 @@ mod tests {
     }
 
     #[test]
-    fn detects_dockerfile_type() {
+    fn detects_dockerfile_type_via_dockerfile_key() {
         let dc = serde_json::json!({"dockerFile": "Dockerfile"});
         assert_eq!(derive_template_type(&dc).unwrap(), TemplateType::Dockerfile);
     }
 
     #[test]
-    fn detects_dockerfile_build_type() {
+    fn detects_dockerfile_type_via_build_dockerfile() {
         let dc = serde_json::json!({"build": {"dockerfile": "Dockerfile"}});
+        assert_eq!(derive_template_type(&dc).unwrap(), TemplateType::Dockerfile);
+    }
+
+    #[test]
+    fn detects_dockerfile_type_via_build_dockerfile_path() {
+        let dc = serde_json::json!({"build": {"dockerfilePath": "path/to/Dockerfile"}});
         assert_eq!(derive_template_type(&dc).unwrap(), TemplateType::Dockerfile);
     }
 
@@ -909,10 +1012,28 @@ mod tests {
                 "ghcr.io/devcontainers/features/rust:latest": {}
             }
         });
-        let mut ids = extract_feature_ids(&dc);
-        ids.sort();
-        assert!(ids.contains(&"ghcr.io/devcontainers/features/node".to_owned()));
-        assert!(ids.contains(&"ghcr.io/devcontainers/features/rust".to_owned()));
+        let ids = extract_feature_ids(&dc);
+        // Result is sorted and deduplicated
+        assert_eq!(
+            ids,
+            vec![
+                "ghcr.io/devcontainers/features/node".to_owned(),
+                "ghcr.io/devcontainers/features/rust".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_feature_ids_after_tag_strip() {
+        // Two keys that normalize to the same base after stripping their tags
+        let dc = serde_json::json!({
+            "features": {
+                "ghcr.io/devcontainers/features/node:1": {},
+                "ghcr.io/devcontainers/features/node:lts": {}
+            }
+        });
+        let ids = extract_feature_ids(&dc);
+        assert_eq!(ids, vec!["ghcr.io/devcontainers/features/node".to_owned()]);
     }
 
     #[test]
@@ -924,7 +1045,7 @@ mod tests {
     // ── collect_files ───────────────────────────────────────────────────────
 
     #[test]
-    fn collects_files_recursively() {
+    fn collects_files_recursively_with_dot_slash_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("devcontainer-template.json"), "{}").unwrap();
         let sub = tmp.path().join(".devcontainer");
@@ -932,12 +1053,17 @@ mod tests {
         std::fs::write(sub.join("devcontainer.json"), "{}").unwrap();
 
         let files = collect_files(tmp.path());
+
+        // All paths must start with "./" consistent with tar entry names.
+        for f in &files {
+            assert!(f.starts_with("./"), "expected './' prefix, got: {f}");
+        }
+        assert!(files.iter().any(|f| f == "./devcontainer-template.json"));
         assert!(
             files
                 .iter()
-                .any(|f| f.contains("devcontainer-template.json"))
+                .any(|f| f == "./.devcontainer/devcontainer.json")
         );
-        assert!(files.iter().any(|f| f.contains("devcontainer.json")));
     }
 
     // ── strip_jsonc_comments ────────────────────────────────────────────────
@@ -970,10 +1096,12 @@ mod tests {
     // ── find_devcontainer_json ──────────────────────────────────────────────
 
     #[test]
-    fn finds_flat_devcontainer_json() {
+    fn finds_dot_devcontainer_json_flat() {
+        // Official flat layout: `.devcontainer.json` (dot-prefixed)
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".devcontainer.json"), "{}").unwrap();
-        assert!(find_devcontainer_json(tmp.path()).is_some());
+        let found = find_devcontainer_json(tmp.path()).unwrap();
+        assert_eq!(found, tmp.path().join(".devcontainer.json"));
     }
 
     #[test]
@@ -982,7 +1110,27 @@ mod tests {
         let sub = tmp.path().join(".devcontainer");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("devcontainer.json"), "{}").unwrap();
-        assert!(find_devcontainer_json(tmp.path()).is_some());
+        let found = find_devcontainer_json(tmp.path()).unwrap();
+        assert_eq!(found, sub.join("devcontainer.json"));
+    }
+
+    #[test]
+    fn finds_plain_devcontainer_json_at_root() {
+        // Cella extension: also accept `devcontainer.json` (no leading dot) as author convenience.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("devcontainer.json"), "{}").unwrap();
+        let found = find_devcontainer_json(tmp.path()).unwrap();
+        assert_eq!(found, tmp.path().join("devcontainer.json"));
+    }
+
+    #[test]
+    fn dot_devcontainer_json_takes_priority_over_plain() {
+        // `.devcontainer.json` wins over `devcontainer.json` when both exist.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".devcontainer.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("devcontainer.json"), "{}").unwrap();
+        let found = find_devcontainer_json(tmp.path()).unwrap();
+        assert_eq!(found, tmp.path().join(".devcontainer.json"));
     }
 
     #[test]
