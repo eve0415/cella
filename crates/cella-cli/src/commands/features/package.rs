@@ -39,21 +39,13 @@ impl PackageArgs {
             force_clean_output_folder: self.force_clean_output_folder,
         };
 
-        match package::package(&opts) {
-            Ok(result) => {
-                let n = result.features.len();
-                if n == 1 {
-                    eprintln!("Packaged feature '{}'", result.features[0].id);
-                } else {
-                    eprintln!("Packaged {n} features!");
-                }
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                eprintln!("Failed to package features");
-                Err(Box::new(e))
-            }
+        let result = package::package(&opts)?;
+        let n = result.features.len();
+        if n == 1 {
+            eprintln!("Packaged feature '{}'", result.features[0].id);
+        } else {
+            eprintln!("Packaged {n} features!");
         }
+        Ok(())
     }
 }

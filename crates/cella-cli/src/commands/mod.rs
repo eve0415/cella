@@ -329,11 +329,11 @@ impl Command {
 
     /// The `--log-level` value, if the subcommand carries one.
     ///
-    /// Only `up` (and `code`, which embeds the `up` arg surface) expose
-    /// `--log-level`; every other variant returns `None`. main.rs reads this
-    /// once, before subcommand dispatch, to seed the global tracing filter —
-    /// the level can't be applied inside `execute()` because the subscriber is
-    /// already installed by then.
+    /// `up` (and `code`, which embeds the `up` arg surface), `run-user-commands`,
+    /// and `features package` expose `--log-level`; every other variant returns
+    /// `None`. main.rs reads this once, before subcommand dispatch, to seed the
+    /// global tracing filter — the level can't be applied inside `execute()`
+    /// because the subscriber is already installed by then.
     pub const fn log_level(&self) -> Option<LogLevel> {
         match self {
             Self::Up(args) => args.compat.log_level,
