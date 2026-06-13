@@ -33,7 +33,7 @@ pub use ordering::compute_install_order;
 pub use reference::{FeatureRef, NormalizedRef};
 pub use types::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Parse lifecycle commands for a phase from a `devcontainer.metadata` label.
@@ -84,11 +84,29 @@ pub struct BaseImageContext<'a> {
 
 /// Intermediate representation of a parsed feature before ordering.
 struct FeatureEntry {
-    key: String,
+    /// Unique install identity = `(normalized_ref, options)`.
+    ///
+    /// The same feature pulled in twice with **different** options is two
+    /// distinct installs per the spec, so a raw ref alone is not a unique key:
+    /// it would collapse the two variants in any map keyed by it (ordering,
+    /// assembly). `install_id` keeps them apart — see [`install_identity`].
+    install_id: String,
     metadata: FeatureMetadata,
     artifact_dir: PathBuf,
     user_options: HashMap<String, serde_json::Value>,
+    /// The raw reference the user (or a `dependsOn` key) wrote, kept for
+    /// display and surfaced on the [`ResolvedFeature`].
     original_ref: String,
+}
+
+/// Build the unique install identity for a feature instance.
+///
+/// Two installs are the same feature iff their **normalized reference** and
+/// their **options** match (devcontainer spec identity). The two parts are
+/// joined with a NUL byte, which cannot appear in a ref or in serialized JSON
+/// text, so the composite is unambiguous and stable.
+fn install_identity(normalized_ref: &str, options_json: &str) -> String {
+    format!("{normalized_ref}\u{0}{options_json}")
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +162,7 @@ pub async fn resolve_features(
     expand_depends_on(&mut feature_entries, workspace_root, platform, cache).await?;
 
     // Step 6: Compute install order.
-    let ordered_ids = compute_order(&feature_entries, config)?;
+    let ordered_ids = compute_order(&feature_entries, config, workspace_root)?;
 
     // Step 7: Assemble resolved features in install order.
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
@@ -394,7 +412,7 @@ fn parse_metadata_and_validate(
 ) -> Result<Vec<FeatureEntry>, FeatureError> {
     let mut entries = Vec::with_capacity(parsed_entries.len());
 
-    for (i, (key, _, options_value)) in parsed_entries.iter().enumerate() {
+    for (i, (key, normalized, options_value)) in parsed_entries.iter().enumerate() {
         let artifact_dir = &artifact_paths[i];
         let metadata_path = artifact_dir.join("devcontainer-feature.json");
         let metadata_json =
@@ -412,8 +430,12 @@ fn parse_metadata_and_validate(
             log_option_warning(key, w);
         }
 
+        // Identity keys on the NORMALIZED ref so shorthand and fully-qualified
+        // spellings of the same feature deduplicate together, and on the raw
+        // options value so option variants stay distinct.
+        let options_json = serde_json::to_string(options_value).unwrap_or_default();
         entries.push(FeatureEntry {
-            key: key.clone(),
+            install_id: install_identity(&normalized.to_string(), &options_json),
             metadata,
             artifact_dir: artifact_dir.clone(),
             user_options,
@@ -426,6 +448,12 @@ fn parse_metadata_and_validate(
 
 /// Compute install order from feature entries and config overrides.
 ///
+/// The ordering graph is keyed by each entry's unique [`FeatureEntry::install_id`]
+/// (not the raw ref), so two installs of the same feature with different
+/// options stay distinct. Each entry's `dependsOn` / `installsAfter` edges are
+/// resolved from raw refs to the matching install identities before sorting,
+/// so an edge points at the specific option-variant instance it names.
+///
 /// # Errors
 ///
 /// Returns [`FeatureError::CyclicDependsOn`] when a hard `dependsOn` cycle
@@ -433,20 +461,15 @@ fn parse_metadata_and_validate(
 fn compute_order(
     feature_entries: &[FeatureEntry],
     config: &serde_json::Value,
+    workspace_root: &Path,
 ) -> Result<Vec<String>, FeatureError> {
-    let order_input: Vec<(String, &FeatureMetadata)> = feature_entries
+    let order_metadata = build_order_metadata(feature_entries, workspace_root);
+    let order_input: Vec<(String, &FeatureMetadata)> = order_metadata
         .iter()
-        .map(|entry| (entry.key.clone(), &entry.metadata))
+        .map(|(id, meta)| (id.clone(), meta))
         .collect();
 
-    let override_order = config
-        .get("overrideFeatureInstallOrder")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
+    let override_order = resolve_override_order(config, feature_entries, workspace_root);
 
     let mut depends_on_cycle: Option<Vec<String>> = None;
     let (ordered_ids, order_warnings) = compute_install_order(
@@ -466,7 +489,131 @@ fn compute_order(
     Ok(ordered_ids)
 }
 
+/// Normalize a raw feature reference for identity matching, falling back to the
+/// raw string when it cannot be parsed (invalid refs surface elsewhere).
+fn normalize_ref_for_identity(raw: &str, workspace_root: &Path) -> String {
+    FeatureRef::parse(raw)
+        .and_then(|r| r.normalize(workspace_root))
+        .map_or_else(|_| raw.to_owned(), |(n, _)| n.to_string())
+}
+
+/// Build per-entry ordering metadata keyed by `install_id`, with `dependsOn`
+/// and `installsAfter` edges rewritten from raw refs to the matching
+/// `install_id`s.
+///
+/// - `dependsOn` matches on `(normalized_ref, options)` — the full identity, so
+///   it targets the exact option-variant instance it names.
+/// - `installsAfter` matches on `normalized_ref` only (the spec gives it no
+///   options); it therefore expands to **every** option-variant of that ref.
+fn build_order_metadata(
+    feature_entries: &[FeatureEntry],
+    workspace_root: &Path,
+) -> Vec<(String, FeatureMetadata)> {
+    // Set of valid install identities, for dependsOn resolution.
+    let identities: HashSet<&str> = feature_entries
+        .iter()
+        .map(|e| e.install_id.as_str())
+        .collect();
+    let by_ref = index_by_ref(feature_entries);
+
+    feature_entries
+        .iter()
+        .map(|entry| {
+            let mut meta = entry.metadata.clone();
+
+            // Rewrite hard (dependsOn) edges to matching install identities.
+            let depends_on = std::mem::take(&mut meta.depends_on);
+            meta.depends_on = depends_on
+                .into_iter()
+                .filter_map(|(dep_ref, opts)| {
+                    let norm = normalize_ref_for_identity(&dep_ref, workspace_root);
+                    let opts_json = serde_json::to_string(&opts).unwrap_or_default();
+                    let id = install_identity(&norm, &opts_json);
+                    identities.contains(id.as_str()).then_some((id, opts))
+                })
+                .collect();
+
+            // Rewrite soft (installsAfter) edges; one ref may fan out to
+            // several option-variant installs.
+            let installs_after = std::mem::take(&mut meta.installs_after);
+            meta.installs_after = installs_after
+                .into_iter()
+                .flat_map(|after_ref| {
+                    let norm = normalize_ref_for_identity(&after_ref, workspace_root);
+                    by_ref
+                        .get(norm.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|id| (*id).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            (entry.install_id.clone(), meta)
+        })
+        .collect()
+}
+
+/// Index install identities by their normalized ref.
+///
+/// One ref may map to several identities when the same feature is installed
+/// more than once with different options. Used to resolve option-agnostic
+/// references (`installsAfter`, `overrideFeatureInstallOrder`) to the concrete
+/// install identities they cover.
+fn index_by_ref(feature_entries: &[FeatureEntry]) -> HashMap<&str, Vec<&str>> {
+    let mut by_ref: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in feature_entries {
+        // The install_id is `normalized_ref \0 options_json`; the ref is the
+        // part before the NUL separator.
+        let normalized_ref = entry
+            .install_id
+            .split('\u{0}')
+            .next()
+            .unwrap_or(&entry.install_id);
+        by_ref
+            .entry(normalized_ref)
+            .or_default()
+            .push(entry.install_id.as_str());
+    }
+    by_ref
+}
+
+/// Resolve `overrideFeatureInstallOrder` (raw refs) to install identities.
+///
+/// Each override ref names a feature without options, so it expands to every
+/// matching option-variant install, preserving the override's declared order.
+fn resolve_override_order(
+    config: &serde_json::Value,
+    feature_entries: &[FeatureEntry],
+    workspace_root: &Path,
+) -> Option<Vec<String>> {
+    let raw = config
+        .get("overrideFeatureInstallOrder")
+        .and_then(|v| v.as_array())?;
+
+    let by_ref = index_by_ref(feature_entries);
+
+    let resolved: Vec<String> = raw
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .flat_map(|ref_str| {
+            let norm = normalize_ref_for_identity(ref_str, workspace_root);
+            by_ref
+                .get(norm.as_str())
+                .into_iter()
+                .flatten()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    Some(resolved)
+}
+
 /// Assemble `ResolvedFeature` structs in install order.
+///
+/// `ordered_ids` are unique [`FeatureEntry::install_id`]s, so the lookup never
+/// collapses two option-variants of the same ref onto one entry.
 fn assemble_resolved(
     feature_entries: &[FeatureEntry],
     ordered_ids: &[String],
@@ -474,13 +621,18 @@ fn assemble_resolved(
     let entry_map: HashMap<&str, usize> = feature_entries
         .iter()
         .enumerate()
-        .map(|(i, entry)| (entry.key.as_str(), i))
+        .map(|(i, entry)| (entry.install_id.as_str(), i))
         .collect();
 
     let mut resolved = Vec::with_capacity(ordered_ids.len());
 
     for id in ordered_ids {
-        let idx = entry_map[id.as_str()];
+        let Some(&idx) = entry_map.get(id.as_str()) else {
+            // An ordered id with no backing entry would be a logic bug in the
+            // ordering step; skip rather than panic.
+            warn!("install order produced unknown id {id:?}; skipping");
+            continue;
+        };
         let entry = &feature_entries[idx];
 
         let has_install = entry.artifact_dir.join("install.sh").is_file();
@@ -496,7 +648,7 @@ fn assemble_resolved(
 
         debug!(
             "resolved feature {} -> {} (install_script={})",
-            entry.key, entry.metadata.id, has_install
+            entry.original_ref, entry.metadata.id, has_install
         );
     }
 
@@ -585,17 +737,13 @@ async fn expand_depends_on(
 
     // Normalize a raw ref string for identity keying, ignoring parse errors
     // (invalid refs are caught later during fetch).
-    let normalize_key = |raw: &str| -> String {
-        FeatureRef::parse(raw)
-            .and_then(|r| r.normalize(workspace_root))
-            .map_or_else(|_| raw.to_owned(), |(n, _)| n.to_string())
-    };
+    let normalize_key = |raw: &str| normalize_ref_for_identity(raw, workspace_root);
 
     // Visited set: (normalised_ref_string, options_json) — spec identity
     // semantics.  Pre-populate with user-declared entries using their
     // NORMALISED ref so that spelling variants of the same OCI ref
     // (e.g. shorthand vs. fully-qualified) deduplicate correctly.
-    let mut visited: std::collections::HashSet<(String, String)> = feature_entries
+    let mut visited: HashSet<(String, String)> = feature_entries
         .iter()
         .map(|e| {
             let norm_key = normalize_key(&e.original_ref);
@@ -627,12 +775,16 @@ async fn expand_depends_on(
         }
 
         let opts_json = serde_json::to_string(&dep_opts).unwrap_or_default();
-        let visit_key = (normalized.to_string(), opts_json);
+        let visit_key = (normalized.to_string(), opts_json.clone());
 
         if visited.contains(&visit_key) {
             continue;
         }
         visited.insert(visit_key);
+
+        // Unique install identity for this expanded instance — same composite
+        // as the `visited` key so option variants of one ref stay distinct.
+        let install_id = install_identity(&normalized.to_string(), &opts_json);
 
         // Fetch the artifact.
         let artifact_dir = fetch_one(
@@ -674,7 +826,7 @@ async fn expand_depends_on(
         }
 
         feature_entries.push(FeatureEntry {
-            key: dep_ref.clone(),
+            install_id,
             metadata,
             artifact_dir,
             user_options,
@@ -817,7 +969,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FeatureError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use serde_json::json;
 
@@ -1737,6 +1889,21 @@ mod tests {
             "base-tool with different options should appear twice, got: {ids:?}"
         );
         assert_eq!(ids.len(), 4);
+
+        // Regression (unique-key fix): the two base-tool installs must keep
+        // their DISTINCT options. With a non-unique key both collapsed onto one
+        // entry and the surviving copy carried the wrong option set.
+        let base_versions: HashSet<Option<&str>> = result
+            .features
+            .iter()
+            .filter(|f| f.id == "base-tool")
+            .map(|f| f.user_options.get("version").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            base_versions,
+            HashSet::from([Some("1"), Some("2")]),
+            "both base-tool option variants must survive distinctly, got: {base_versions:?}"
+        );
     }
 
     #[tokio::test]
