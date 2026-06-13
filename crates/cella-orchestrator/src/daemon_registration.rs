@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cella_backend::{BACKEND_LABEL, ContainerInfo};
-use cella_protocol::ContainerRegistrationData;
+use cella_protocol::{ContainerRegistrationData, HostForwardPort};
 
 use crate::forward_ports::forward_port_number;
 
@@ -25,6 +25,7 @@ pub fn from_devcontainer_config(
         ports_attributes: crate::config_map::ports::parse_ports_attributes(config),
         other_ports_attributes: crate::config_map::ports::parse_other_ports_attributes(config),
         forward_ports: parse_forward_ports(config),
+        forward_host_ports: parse_forward_host_ports(config),
         shutdown_action: config
             .get("shutdownAction")
             .and_then(|v| v.as_str())
@@ -55,6 +56,7 @@ pub fn from_container_labels(
         ports_attributes,
         other_ports_attributes,
         forward_ports: Vec::new(),
+        forward_host_ports: Vec::new(),
         shutdown_action: container.labels.get("dev.cella.shutdown_action").cloned(),
         backend_kind: container.labels.get(BACKEND_LABEL).cloned(),
         docker_host,
@@ -102,6 +104,38 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
         .unwrap_or_default()
 }
 
+/// Extract `host:port` entries from `forwardPorts`.
+///
+/// Only string values matching `<host>:<port>` where host contains
+/// `[A-Za-z0-9._-]+` and port is a valid `u16` are returned. Bare numbers,
+/// numeric strings, and malformed entries are excluded (handled by
+/// `parse_forward_ports`).
+pub(crate) fn parse_forward_host_ports(config: &serde_json::Value) -> Vec<HostForwardPort> {
+    config
+        .get("forwardPorts")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(forward_host_port).collect())
+        .unwrap_or_default()
+}
+
+fn forward_host_port(value: &serde_json::Value) -> Option<HostForwardPort> {
+    let s = value.as_str()?;
+    let (host, port_str) = s.rsplit_once(':')?;
+    // Host must be non-empty and contain only valid DNS label characters.
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    Some(HostForwardPort {
+        host: host.to_string(),
+        port,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -122,6 +156,68 @@ mod tests {
         assert_eq!(forward_port_number(&json!("localhost:3000")), None);
         // Non-numeric junk.
         assert_eq!(forward_port_number(&json!("abc")), None);
+    }
+
+    #[test]
+    fn forward_host_port_parses_service_colon_port() {
+        assert_eq!(
+            forward_host_port(&json!("db:5432")),
+            Some(HostForwardPort {
+                host: "db".to_string(),
+                port: 5432,
+            })
+        );
+        assert_eq!(
+            forward_host_port(&json!("localhost:3000")),
+            Some(HostForwardPort {
+                host: "localhost".to_string(),
+                port: 3000,
+            })
+        );
+        assert_eq!(
+            forward_host_port(&json!("my-service.internal:8080")),
+            Some(HostForwardPort {
+                host: "my-service.internal".to_string(),
+                port: 8080,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_host_port_rejects_bare_numbers_and_junk() {
+        // Bare numbers → handled by parse_forward_ports, not here.
+        assert_eq!(forward_host_port(&json!(3000)), None);
+        // Numeric string → handled by parse_forward_ports.
+        assert_eq!(forward_host_port(&json!("9000")), None);
+        // Out-of-range port in host:port form.
+        assert_eq!(forward_host_port(&json!("db:70000")), None);
+        // Empty host.
+        assert_eq!(forward_host_port(&json!(":5432")), None);
+        // No colon — not a host:port.
+        assert_eq!(forward_host_port(&json!("abc")), None);
+        // Invalid host characters.
+        assert_eq!(forward_host_port(&json!("my service:80")), None);
+    }
+
+    #[test]
+    fn parse_forward_host_ports_extracts_host_port_entries() {
+        let config = json!({
+            "forwardPorts": [3000, "9000", "db:5432", "cache:6379", "70000", "localhost:3001"]
+        });
+        let result = parse_forward_host_ports(&config);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&HostForwardPort {
+            host: "db".to_string(),
+            port: 5432,
+        }));
+        assert!(result.contains(&HostForwardPort {
+            host: "cache".to_string(),
+            port: 6379,
+        }));
+        assert!(result.contains(&HostForwardPort {
+            host: "localhost".to_string(),
+            port: 3001,
+        }));
     }
 
     #[test]
@@ -152,6 +248,14 @@ mod tests {
         // Numeric strings ("9000") are accepted; out-of-range (70000) and
         // "host:port" forms ("db:5432") are dropped by the number-only path.
         assert_eq!(data.forward_ports, vec![3000, 8080, 9000]);
+        // "db:5432" is extracted into forward_host_ports.
+        assert_eq!(
+            data.forward_host_ports,
+            vec![HostForwardPort {
+                host: "db".to_string(),
+                port: 5432
+            }]
+        );
         assert_eq!(data.shutdown_action.as_deref(), Some("none"));
         assert_eq!(data.backend_kind.as_deref(), Some("docker"));
         assert_eq!(
