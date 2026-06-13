@@ -508,6 +508,9 @@ pub struct CreateContainerOptions {
     pub cap_add: Vec<String>,
     pub security_opt: Vec<String>,
     pub privileged: bool,
+    /// Wrap the container entrypoint with an init process (`init: true` in
+    /// devcontainer.json or a feature). OR'd with `runArgs: ["--init"]`.
+    pub init: bool,
     /// Parsed `runArgs` overrides from devcontainer.json.
     pub run_args_overrides: Option<RunArgsOverrides>,
     /// GPU request from `hostRequirements.gpu` (lower precedence than runArgs `--gpus`).
