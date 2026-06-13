@@ -1000,6 +1000,29 @@ mod tests {
     }
 
     #[test]
+    fn templates_metadata_log_level_wired() {
+        use super::commands::LogLevel;
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "metadata",
+            "ghcr.io/devcontainers/templates/rust",
+            "--log-level",
+            "trace",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Trace)));
+    }
+
+    #[test]
+    fn templates_metadata_template_id_optional() {
+        // Regression: a missing template id must parse (clap must not exit 2);
+        // the runtime path then prints `{}`/exits 1 per the official contract.
+        let cli = parse(&["cella", "templates", "metadata"]).unwrap();
+        assert!(cli.command.log_level().is_some());
+    }
+
+    #[test]
     fn templates_apply_default_log_level_is_info() {
         use super::commands::LogLevel;
         let cli = parse(&[
