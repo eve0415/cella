@@ -46,6 +46,7 @@ pub async fn compose_ensure_up(
         gpu_availability: ctx.gpu_availability(),
         update_remote_user_uid_default: ctx.update_remote_user_uid_default(),
         omit_remote_env_from_metadata: ctx.omit_remote_env_from_metadata(),
+        lockfile_policy: ctx.lockfile_policy,
         dotfiles: cella_orchestrator::compose_up::DotfilesConfig {
             repository: ctx.dotfiles.repository.clone(),
             install_command: ctx.dotfiles.install_command.clone(),

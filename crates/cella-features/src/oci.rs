@@ -68,6 +68,20 @@ impl Default for OciFetcher {
     }
 }
 
+/// Result of an OCI feature fetch that includes the manifest digest.
+pub struct OciFetchResult {
+    /// Local filesystem path to the extracted feature artifact.
+    pub artifact_dir: PathBuf,
+    /// Manifest digest, e.g. `"sha256:abcdef..."`.
+    pub digest: String,
+    /// The OCI tag that was fetched (e.g. `"1"`, `"latest"`).
+    pub version: String,
+    /// The OCI registry hostname.
+    pub registry: String,
+    /// The OCI repository path.
+    pub repository: String,
+}
+
 /// Find the first extractable layer in a manifest, or return an error listing available types.
 fn find_feature_layer<'a>(
     manifest: &'a oci_distribution::manifest::OciImageManifest,
@@ -217,6 +231,155 @@ impl OciFetcher {
         verify_blob_digest(&blob, &layer.digest, oci_ref.repository())?;
 
         Ok(blob)
+    }
+}
+
+impl OciFetcher {
+    /// Fetch an OCI feature and return full digest metadata alongside the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FeatureError`] if the reference is not an OCI target, if the
+    /// registry fetch fails, or if the digest does not match the locked value.
+    pub async fn fetch_oci_with_digest(
+        &self,
+        reference: &NormalizedRef,
+        cache: &FeatureCache,
+        locked_digest: Option<&str>,
+    ) -> Result<OciFetchResult, FeatureError> {
+        let NormalizedRef::OciTarget {
+            registry,
+            repository,
+            tag,
+        } = reference
+        else {
+            return Err(FeatureError::InvalidReference {
+                reference: reference.to_string(),
+                reason: "OciFetcher only handles OCI targets".to_owned(),
+            });
+        };
+
+        if let Some(digest) = locked_digest {
+            return self
+                .fetch_by_locked_digest(registry, repository, tag, digest, cache)
+                .await;
+        }
+
+        self.fetch_by_tag(registry, repository, tag, cache).await
+    }
+
+    /// Fetch by a known locked digest (pinning mode).
+    async fn fetch_by_locked_digest(
+        &self,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+        digest: &str,
+        cache: &FeatureCache,
+    ) -> Result<OciFetchResult, FeatureError> {
+        if let Some(cached) = cache.get_oci(registry, repository, digest) {
+            return Ok(OciFetchResult {
+                artifact_dir: cached,
+                digest: digest.to_owned(),
+                version: tag.to_owned(),
+                registry: registry.to_owned(),
+                repository: repository.to_owned(),
+            });
+        }
+
+        // Request the manifest by the pinned digest directly (not the mutable
+        // tag) so a moved tag can never substitute different content: the
+        // registry serves the exact `@sha256:...` artifact or 404s. This
+        // matches the official CLI's locked-build behavior.
+        let oci_ref = Reference::with_digest(
+            registry.to_owned(),
+            repository.to_owned(),
+            digest.to_owned(),
+        );
+        let auth = build_registry_auth(registry);
+        let (manifest, resolved_digest) = self
+            .pull_manifest(&oci_ref, &auth, registry, repository, tag)
+            .await?;
+
+        if resolved_digest != digest {
+            return Err(FeatureError::DigestMismatch {
+                feature_id: format!("{registry}/{repository}"),
+                expected: digest.to_owned(),
+                actual: resolved_digest,
+            });
+        }
+
+        let layer = find_feature_layer(&manifest, registry, repository, tag)?;
+        let blob = self.pull_layer_blob(&oci_ref, layer, registry).await?;
+        let artifact_dir = extract_and_commit(
+            &blob,
+            &layer.media_type,
+            cache,
+            registry,
+            repository,
+            tag,
+            &resolved_digest,
+        )?;
+        Ok(OciFetchResult {
+            artifact_dir,
+            digest: resolved_digest,
+            version: tag.to_owned(),
+            registry: registry.to_owned(),
+            repository: repository.to_owned(),
+        })
+    }
+
+    /// Fetch by OCI tag (no pinning).
+    ///
+    /// Always resolves the manifest digest from the registry first, then keys
+    /// the cache lookup on that **content-addressed** digest. A tag-addressed
+    /// cache entry is never trusted on its own: if the tag has moved, returning
+    /// the stale tag directory paired with the freshly-resolved digest would
+    /// produce an [`OciFetchResult`] whose artifact and digest disagree (and
+    /// thus a wrong lockfile). Digest-addressed entries can never drift.
+    async fn fetch_by_tag(
+        &self,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+        cache: &FeatureCache,
+    ) -> Result<OciFetchResult, FeatureError> {
+        let oci_ref =
+            Reference::with_tag(registry.to_owned(), repository.to_owned(), tag.to_owned());
+        let auth = build_registry_auth(registry);
+        let (manifest, digest) = self
+            .pull_manifest(&oci_ref, &auth, registry, repository, tag)
+            .await?;
+
+        if let Some(cached) = cache.get_oci(registry, repository, &digest) {
+            debug!("cache hit by digest {digest} for {registry}/{repository}:{tag}");
+            return Ok(OciFetchResult {
+                artifact_dir: cached,
+                digest,
+                version: tag.to_owned(),
+                registry: registry.to_owned(),
+                repository: repository.to_owned(),
+            });
+        }
+
+        let layer = find_feature_layer(&manifest, registry, repository, tag)?;
+        let blob = self.pull_layer_blob(&oci_ref, layer, registry).await?;
+        let artifact_dir = extract_and_commit(
+            &blob,
+            &layer.media_type,
+            cache,
+            registry,
+            repository,
+            tag,
+            &digest,
+        )?;
+        Ok(OciFetchResult {
+            artifact_dir,
+            digest,
+            version: tag.to_owned(),
+            registry: registry.to_owned(),
+            repository: repository.to_owned(),
+        })
     }
 }
 

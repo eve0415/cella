@@ -76,6 +76,10 @@ pub struct ComposeUpConfig<'a> {
     /// generated `devcontainer.metadata` label. Does NOT affect the runtime
     /// `dev.cella.remote_env` label.
     pub omit_remote_env_from_metadata: bool,
+    /// Feature lockfile policy derived from `--no-lockfile` / `--frozen-lockfile`.
+    /// Threaded into compose feature resolution so dockerCompose devcontainers
+    /// write/validate `devcontainer-lock.json` like single-container builds.
+    pub lockfile_policy: cella_features::LockfilePolicy,
     /// Dotfiles install inputs (`--dotfiles-repository` / `-install-command` /
     /// `-target-path`). Installed via [`ComposeUpHooks::install_dotfiles`] in
     /// the post-create flow, between `postCreateCommand` and `postStartCommand`,
@@ -495,6 +499,7 @@ async fn prepare_and_start(
         cfg.config_path,
         project,
         cfg.omit_remote_env_from_metadata,
+        cfg.lockfile_policy,
         progress,
     )
     .await?;
@@ -1697,6 +1702,7 @@ mod tests {
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
             omit_remote_env_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::default(),
             dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {
@@ -1763,6 +1769,7 @@ mod tests {
             gpu_availability: cella_backend::GpuAvailability::default(),
             update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::default(),
             omit_remote_env_from_metadata: false,
+            lockfile_policy: cella_features::LockfilePolicy::default(),
             dotfiles: DotfilesConfig::default(),
         };
         let project = ComposeProject {

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::lockfile::LockfileError;
+
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -73,6 +75,11 @@ pub enum FeatureError {
     #[error("invalid feature reference: {reference}: {reason}")]
     #[diagnostic(code(cella::features::invalid_reference))]
     InvalidReference { reference: String, reason: String },
+
+    /// Lockfile validation failed.
+    #[error(transparent)]
+    #[diagnostic(code(cella::features::lockfile))]
+    Lockfile(#[from] LockfileError),
 
     /// Generic I/O error.
     #[error(transparent)]

@@ -62,6 +62,7 @@ pub async fn resolve_compose_features(
     config_path: &Path,
     project: &ComposeProject,
     omit_remote_env_from_metadata: bool,
+    lockfile_policy: cella_features::LockfilePolicy,
     progress: &ProgressSender,
 ) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error + Send + Sync>> {
     // 1. Check if features are present
@@ -157,6 +158,7 @@ pub async fn resolve_compose_features(
                 omit_remote_env: omit_remote_env_from_metadata,
             },
             true, // compose builds use named content source via additional_contexts
+            lockfile_policy,
         )
         .await
         .map_err(|e| format!("feature resolution failed: {e}"))

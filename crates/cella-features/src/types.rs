@@ -112,4 +112,6 @@ pub struct ResolvedFeatures {
     pub build_context: PathBuf,
     pub container_config: FeatureContainerConfig,
     pub metadata_label: String,
+    /// The lockfile written or validated during feature resolution, if any.
+    pub lockfile: Option<crate::lockfile::Lockfile>,
 }

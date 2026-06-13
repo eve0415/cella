@@ -1517,6 +1517,7 @@ mod tests {
                 ..Default::default()
             },
             metadata_label: String::new(),
+            lockfile: None,
         }
     }
 

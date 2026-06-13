@@ -5,6 +5,7 @@ pub mod docs;
 mod error;
 pub mod fetch;
 pub mod graph;
+pub mod lockfile;
 pub mod merge;
 pub mod metadata;
 pub mod oci;
@@ -24,6 +25,10 @@ pub use dockerfile::{
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
+pub use lockfile::{
+    Lockfile, LockfileEntry, LockfileError, LockfilePolicy, compare_lockfile, generate_lockfile,
+    lockfile_path, read_lockfile, write_lockfile,
+};
 pub use merge::{
     ImageMetadataUserInfo, merge_features, merge_with_devcontainer, parse_image_metadata,
     validate_options,
@@ -83,6 +88,20 @@ pub struct BaseImageContext<'a> {
     pub omit_remote_env: bool,
 }
 
+/// OCI digest metadata captured for a feature so it can be pinned in the
+/// lockfile. Present only for OCI-sourced features (HTTP / local have no
+/// digest to lock).
+struct OciLockInfo {
+    /// The OCI tag that was fetched (e.g. `"1"`, `"latest"`).
+    version: String,
+    /// The OCI registry hostname.
+    registry: String,
+    /// The OCI repository path.
+    repository: String,
+    /// The resolved manifest digest, e.g. `"sha256:abc..."`.
+    digest: String,
+}
+
 /// Intermediate representation of a parsed feature before ordering.
 struct FeatureEntry {
     /// Unique install identity = `(normalized_ref, options)`.
@@ -98,6 +117,10 @@ struct FeatureEntry {
     /// The raw reference the user (or a `dependsOn` key) wrote, kept for
     /// display and surfaced on the [`ResolvedFeature`].
     original_ref: String,
+    /// OCI pin metadata, present only when this entry was fetched from an OCI
+    /// registry. Drives lockfile generation, including transitive `dependsOn`
+    /// features (which are appended to the install set during expansion).
+    oci: Option<OciLockInfo>,
 }
 
 /// Build the unique install identity for a feature instance.
@@ -130,6 +153,7 @@ pub async fn resolve_features(
     cache: &FeatureCache,
     base_image_ctx: &BaseImageContext<'_>,
     use_named_content_source: bool,
+    lockfile_policy: LockfilePolicy,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
@@ -153,22 +177,49 @@ pub async fn resolve_features(
     let config_hash = compute_config_hash(features_obj);
     let build_context = cache.build_context_path(&config_hash);
 
-    // Step 4: Fetch all concurrently.
-    let artifact_paths = fetch_all(&parsed_entries, platform, cache).await?;
+    // Step 4: Read the existing lockfile (no-op for NoLockfile/Upgrade). Its
+    // pinned digests, keyed by verbatim feature ref, drive digest pinning for
+    // both top-level and transitive `dependsOn` features.
+    let existing_lockfile = read_existing_lockfile(config_path, lockfile_policy)?;
 
-    // Step 5: Parse metadata and validate options.
-    let mut feature_entries = parse_metadata_and_validate(&parsed_entries, &artifact_paths)?;
+    // Step 5: Fetch all top-level features concurrently (OCI pins to the locked
+    // digest when one exists for that ref).
+    let fetch_results =
+        fetch_all_with_results(&parsed_entries, platform, cache, existing_lockfile.as_ref())
+            .await?;
 
-    // Step 5b: Expand the install set with transitive `dependsOn` features.
-    expand_depends_on(&mut feature_entries, workspace_root, platform, cache).await?;
+    // Step 6: Parse metadata, validate options, and capture OCI pin metadata.
+    let mut feature_entries = parse_metadata_and_validate(&parsed_entries, &fetch_results)?;
 
-    // Step 6: Compute install order.
+    // Step 6b: Expand the install set with transitive `dependsOn` features,
+    // pinning them to the lockfile too.
+    expand_depends_on(
+        &mut feature_entries,
+        workspace_root,
+        platform,
+        cache,
+        existing_lockfile.as_ref(),
+    )
+    .await?;
+
+    // Step 7: Compute install order.
     let ordered_ids = compute_order(&feature_entries, config, workspace_root)?;
 
-    // Step 7: Assemble resolved features in install order.
+    // Step 8: Assemble resolved features in install order.
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
-    // Step 8: Generate Dockerfile and build context.
+    // Step 9: Build and apply lockfile policy. The lockfile is generated from
+    // the full install set (top-level + expanded `dependsOn`), so transitive
+    // OCI dependencies are pinned and surfaced via each entry's `dependsOn`.
+    let generated_lockfile = build_lockfile_from_entries(&feature_entries);
+    let final_lockfile = apply_lockfile_policy(
+        lockfile_policy,
+        config_path,
+        existing_lockfile,
+        generated_lockfile,
+    )?;
+
+    // Step 10: Generate Dockerfile and build context.
     let dockerfile = generate_and_write_build_context(
         &build_context,
         &resolved,
@@ -179,7 +230,7 @@ pub async fn resolve_features(
         use_named_content_source,
     )?;
 
-    // Step 9: Merge feature metadata and generate label.
+    // Step 11: Merge feature metadata and generate label.
     let container_config = merge_all_metadata(&resolved, config, base_image_ctx.metadata);
     let metadata_label = generate_metadata_label(
         &resolved,
@@ -200,6 +251,7 @@ pub async fn resolve_features(
         build_context,
         container_config,
         metadata_label,
+        lockfile: final_lockfile,
     })
 }
 
@@ -286,6 +338,7 @@ fn resolve_empty_features(
         build_context,
         container_config,
         metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit_remote_env),
+        lockfile: None,
     })
 }
 
@@ -371,12 +424,53 @@ fn parse_and_normalize(
     Ok(parsed_entries)
 }
 
-/// Fetch all features concurrently, returning their artifact paths.
-async fn fetch_all(
+/// Result of fetching a single feature — OCI fetches carry digest metadata,
+/// other fetchers return only the artifact path.
+enum FetchResult {
+    Oci(oci::OciFetchResult),
+    Other(PathBuf),
+}
+
+impl FetchResult {
+    const fn artifact_dir(&self) -> &PathBuf {
+        match self {
+            Self::Oci(r) => &r.artifact_dir,
+            Self::Other(p) => p,
+        }
+    }
+
+    /// OCI pin metadata for this fetch, if it came from an OCI registry.
+    fn oci_lock_info(&self) -> Option<OciLockInfo> {
+        match self {
+            Self::Oci(r) => Some(OciLockInfo {
+                version: r.version.clone(),
+                registry: r.registry.clone(),
+                repository: r.repository.clone(),
+                digest: r.digest.clone(),
+            }),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// Look up the locked manifest digest for a verbatim feature ref.
+///
+/// The lockfile is keyed by the ref exactly as authored (tag included), so the
+/// lookup is a direct map hit — a ref whose tag changed (`:1` → `:2`) simply
+/// misses and is re-resolved against the registry, matching the official CLI.
+fn locked_digest_for<'a>(existing: Option<&'a Lockfile>, raw_ref: &str) -> Option<&'a str> {
+    existing?
+        .features
+        .get(raw_ref)
+        .map(|e| e.integrity.as_str())
+}
+
+async fn fetch_all_with_results(
     parsed_entries: &[(String, NormalizedRef, serde_json::Value)],
     platform: &Platform,
     cache: &FeatureCache,
-) -> Result<Vec<PathBuf>, FeatureError> {
+    existing_lockfile: Option<&Lockfile>,
+) -> Result<Vec<FetchResult>, FeatureError> {
     let oci_fetcher = OciFetcher::default();
     let http_fetcher = HttpFetcher;
     let local_fetcher = LocalFetcher;
@@ -384,37 +478,155 @@ async fn fetch_all(
     let fetch_futures: Vec<_> = parsed_entries
         .iter()
         .map(|(key, norm_ref, _)| {
-            fetch_one(
-                key,
+            let locked = locked_digest_for(existing_lockfile, key);
+            fetch_one_with_digest(
                 norm_ref,
                 platform,
                 cache,
                 &oci_fetcher,
                 &http_fetcher,
+                locked,
                 &local_fetcher,
             )
         })
         .collect();
 
-    let fetch_results = join_all(fetch_futures).await;
+    let results = join_all(fetch_futures).await;
+    let mut fetch_results = Vec::with_capacity(parsed_entries.len());
+    for result in results {
+        fetch_results.push(result?);
+    }
+    Ok(fetch_results)
+}
 
-    let mut artifact_paths = Vec::with_capacity(parsed_entries.len());
-    for result in fetch_results {
-        artifact_paths.push(result?);
+async fn fetch_one_with_digest(
+    norm_ref: &NormalizedRef,
+    platform: &Platform,
+    cache: &FeatureCache,
+    oci_fetcher: &OciFetcher,
+    http_fetcher: &HttpFetcher,
+    locked_digest: Option<&str>,
+    local_fetcher: &LocalFetcher,
+) -> Result<FetchResult, FeatureError> {
+    debug!("fetching feature from {norm_ref}");
+    match norm_ref {
+        NormalizedRef::OciTarget { .. } => {
+            let result = oci_fetcher
+                .fetch_oci_with_digest(norm_ref, cache, locked_digest)
+                .await?;
+            Ok(FetchResult::Oci(result))
+        }
+        NormalizedRef::HttpTarget { .. } => {
+            let path = http_fetcher.fetch(norm_ref, platform, cache).await?;
+            Ok(FetchResult::Other(path))
+        }
+        NormalizedRef::LocalTarget { .. } => {
+            let path = local_fetcher.fetch(norm_ref, platform, cache).await?;
+            Ok(FetchResult::Other(path))
+        }
+    }
+}
+
+/// Read the existing lockfile from disk, honoring the policy.
+///
+/// Returns `Ok(None)` when no lockfile is consulted (`NoLockfile` / `Upgrade`)
+/// or when the file is genuinely absent. A corrupt or unreadable lockfile is
+/// surfaced as an error rather than treated as missing. Under
+/// [`LockfilePolicy::Frozen`] an absent file is a hard [`LockfileError::Missing`].
+fn read_existing_lockfile(
+    config_path: &Path,
+    policy: LockfilePolicy,
+) -> Result<Option<Lockfile>, FeatureError> {
+    if matches!(policy, LockfilePolicy::NoLockfile | LockfilePolicy::Upgrade) {
+        return Ok(None);
     }
 
-    Ok(artifact_paths)
+    let existing = read_lockfile(config_path).map_err(FeatureError::Lockfile)?;
+
+    if matches!(policy, LockfilePolicy::Frozen) && existing.is_none() {
+        return Err(FeatureError::Lockfile(LockfileError::Missing));
+    }
+
+    Ok(existing)
+}
+
+/// Build a lockfile from the full resolved install set.
+///
+/// Each OCI feature (top-level or pulled in transitively via `dependsOn`)
+/// becomes one entry keyed by its verbatim ref. The `dependsOn` array lists the
+/// raw refs of an entry's hard dependencies that resolved to OCI features, so
+/// transitive pins are recorded and `--frozen-lockfile` validates them.
+fn build_lockfile_from_entries(feature_entries: &[FeatureEntry]) -> Lockfile {
+    // Refs that resolved to an OCI feature; a dependsOn edge is only recorded
+    // when its target is itself lockable (OCI), matching the official CLI.
+    let oci_refs: HashSet<&str> = feature_entries
+        .iter()
+        .filter(|e| e.oci.is_some())
+        .map(|e| e.original_ref.as_str())
+        .collect();
+
+    let data: Vec<_> = feature_entries
+        .iter()
+        .filter_map(|entry| {
+            let oci = entry.oci.as_ref()?;
+            let resolved = format!("{}/{}@{}", oci.registry, oci.repository, oci.digest);
+            let mut depends_on: Vec<String> = entry
+                .metadata
+                .depends_on
+                .keys()
+                .filter(|dep| oci_refs.contains(dep.as_str()))
+                .cloned()
+                .collect();
+            depends_on.sort();
+            depends_on.dedup();
+            Some((
+                entry.original_ref.clone(),
+                oci.version.clone(),
+                resolved,
+                oci.digest.clone(),
+                depends_on,
+            ))
+        })
+        .collect();
+    generate_lockfile(&data)
+}
+
+fn apply_lockfile_policy(
+    policy: LockfilePolicy,
+    config_path: &Path,
+    existing: Option<Lockfile>,
+    generated: Lockfile,
+) -> Result<Option<Lockfile>, FeatureError> {
+    if generated.features.is_empty() {
+        return Ok(None);
+    }
+    match policy {
+        LockfilePolicy::NoLockfile => Ok(None),
+        LockfilePolicy::Update => {
+            write_lockfile(config_path, &generated)?;
+            Ok(Some(generated))
+        }
+        // `upgrade` regenerates the lockfile but the caller decides whether to
+        // write it (so `upgrade --dry-run` can print without touching disk).
+        LockfilePolicy::Upgrade => Ok(Some(generated)),
+        LockfilePolicy::Frozen => {
+            let existing = existing.ok_or(FeatureError::Lockfile(LockfileError::Missing))?;
+            compare_lockfile(&existing, &generated).map_err(FeatureError::Lockfile)?;
+            Ok(Some(existing))
+        }
+    }
 }
 
 /// Parse metadata from fetched artifacts and validate user options.
 fn parse_metadata_and_validate(
     parsed_entries: &[(String, NormalizedRef, serde_json::Value)],
-    artifact_paths: &[PathBuf],
+    fetch_results: &[FetchResult],
 ) -> Result<Vec<FeatureEntry>, FeatureError> {
     let mut entries = Vec::with_capacity(parsed_entries.len());
 
     for (i, (key, normalized, options_value)) in parsed_entries.iter().enumerate() {
-        let artifact_dir = &artifact_paths[i];
+        let fetch_result = &fetch_results[i];
+        let artifact_dir = fetch_result.artifact_dir();
         let metadata_path = artifact_dir.join("devcontainer-feature.json");
         let metadata_json =
             std::fs::read_to_string(&metadata_path).map_err(|e| FeatureError::InvalidMetadata {
@@ -441,6 +653,7 @@ fn parse_metadata_and_validate(
             artifact_dir: artifact_dir.clone(),
             user_options,
             original_ref: key.clone(),
+            oci: fetch_result.oci_lock_info(),
         });
     }
 
@@ -731,6 +944,7 @@ async fn expand_depends_on(
     workspace_root: &Path,
     platform: &Platform,
     cache: &FeatureCache,
+    existing_lockfile: Option<&Lockfile>,
 ) -> Result<(), FeatureError> {
     let oci_fetcher = OciFetcher::default();
     let http_fetcher = HttpFetcher;
@@ -787,17 +1001,20 @@ async fn expand_depends_on(
         // as the `visited` key so option variants of one ref stay distinct.
         let install_id = install_identity(&normalized.to_string(), &opts_json);
 
-        // Fetch the artifact.
-        let artifact_dir = fetch_one(
-            &dep_ref,
+        // Fetch the artifact, pinning to the locked digest (keyed by the
+        // verbatim dependsOn ref) when the lockfile has one.
+        let locked = locked_digest_for(existing_lockfile, &dep_ref);
+        let fetch_result = fetch_one_with_digest(
             &normalized,
             platform,
             cache,
             &oci_fetcher,
             &http_fetcher,
+            locked,
             &local_fetcher,
         )
         .await?;
+        let artifact_dir = fetch_result.artifact_dir().clone();
 
         // Parse metadata.
         let metadata_path = artifact_dir.join("devcontainer-feature.json");
@@ -832,6 +1049,7 @@ async fn expand_depends_on(
             artifact_dir,
             user_options,
             original_ref: dep_ref,
+            oci: fetch_result.oci_lock_info(),
         });
     }
 
@@ -911,25 +1129,6 @@ fn log_option_warning(key: &str, w: &FeatureWarning) {
     }
 }
 
-/// Dispatch a single fetch to the appropriate fetcher based on the normalized ref.
-async fn fetch_one(
-    key: &str,
-    norm_ref: &NormalizedRef,
-    platform: &Platform,
-    cache: &FeatureCache,
-    oci_fetcher: &OciFetcher,
-    http_fetcher: &HttpFetcher,
-    local_fetcher: &LocalFetcher,
-) -> Result<PathBuf, FeatureError> {
-    debug!("fetching feature {key} from {norm_ref}");
-
-    match norm_ref {
-        NormalizedRef::OciTarget { .. } => oci_fetcher.fetch(norm_ref, platform, cache).await,
-        NormalizedRef::HttpTarget { .. } => http_fetcher.fetch(norm_ref, platform, cache).await,
-        NormalizedRef::LocalTarget { .. } => local_fetcher.fetch(norm_ref, platform, cache).await,
-    }
-}
-
 /// Parse user options from a JSON value (object -> `HashMap`, anything else -> empty).
 fn parse_user_options(value: &serde_json::Value) -> HashMap<String, serde_json::Value> {
     value.as_object().map_or_else(HashMap::new, |obj| {
@@ -971,6 +1170,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FeatureError> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
+    use crate::LockfilePolicy;
 
     use serde_json::json;
 
@@ -1177,6 +1378,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1206,6 +1408,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1259,6 +1462,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1375,6 +1579,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1440,6 +1645,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1484,6 +1690,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await;
 
@@ -1528,6 +1735,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await;
         let resolved = result.expect("resolve_features should succeed");
@@ -1661,6 +1869,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1749,6 +1958,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1815,6 +2025,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1878,6 +2089,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1954,6 +2166,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap_err();
@@ -2017,6 +2230,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap_err();
@@ -2025,5 +2239,151 @@ mod tests {
             matches!(err, FeatureError::CyclicDependsOn { .. }),
             "expected CyclicDependsOn error for transitive cycle, got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // lockfile generation from the resolved install set
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal OCI-backed [`FeatureEntry`] for lockfile tests.
+    fn oci_entry(
+        original_ref: &str,
+        registry: &str,
+        repo: &str,
+        tag: &str,
+        digest: &str,
+    ) -> FeatureEntry {
+        FeatureEntry {
+            install_id: install_identity(original_ref, "{}"),
+            metadata: FeatureMetadata {
+                id: repo.rsplit('/').next().unwrap_or(repo).to_string(),
+                ..Default::default()
+            },
+            artifact_dir: PathBuf::from("/tmp/feature"),
+            user_options: HashMap::new(),
+            original_ref: original_ref.to_string(),
+            oci: Some(OciLockInfo {
+                version: tag.to_string(),
+                registry: registry.to_string(),
+                repository: repo.to_string(),
+                digest: digest.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn lockfile_keys_on_verbatim_ref_including_tag() {
+        // Per the devcontainer spec the lockfile key is the ref exactly as
+        // authored — the `:1` tag is part of the key, never stripped.
+        let entries = vec![oci_entry(
+            "ghcr.io/devcontainers/features/node:1",
+            "ghcr.io",
+            "devcontainers/features/node",
+            "1",
+            "sha256:abc",
+        )];
+        let lf = build_lockfile_from_entries(&entries);
+        assert!(
+            lf.features
+                .contains_key("ghcr.io/devcontainers/features/node:1")
+        );
+        let entry = &lf.features["ghcr.io/devcontainers/features/node:1"];
+        assert_eq!(entry.version, "1");
+        assert_eq!(entry.integrity, "sha256:abc");
+        assert_eq!(
+            entry.resolved,
+            "ghcr.io/devcontainers/features/node@sha256:abc"
+        );
+    }
+
+    #[test]
+    fn lockfile_records_transitive_depends_on() {
+        // A feature whose `dependsOn` names another OCI feature must record
+        // that dependency both as its own lockfile entry and in the parent's
+        // `dependsOn` array — keyed by the verbatim dep ref.
+        let mut parent = oci_entry("ghcr.io/x/parent:1", "ghcr.io", "x/parent", "1", "sha256:p");
+        parent
+            .metadata
+            .depends_on
+            .insert("ghcr.io/x/child".to_string(), json!({}));
+        let child = oci_entry(
+            "ghcr.io/x/child",
+            "ghcr.io",
+            "x/child",
+            "latest",
+            "sha256:c",
+        );
+
+        let lf = build_lockfile_from_entries(&[parent, child]);
+
+        assert_eq!(
+            lf.features.len(),
+            2,
+            "both parent and transitive dep recorded"
+        );
+        assert!(lf.features.contains_key("ghcr.io/x/child"));
+        assert_eq!(
+            lf.features["ghcr.io/x/parent:1"].depends_on,
+            vec!["ghcr.io/x/child".to_string()]
+        );
+        // The transitive dep has no further deps.
+        assert!(lf.features["ghcr.io/x/child"].depends_on.is_empty());
+    }
+
+    #[test]
+    fn lockfile_depends_on_excludes_non_oci_targets() {
+        // A dependsOn edge to a non-OCI (local) feature is not lockable, so it
+        // must not appear in the parent's dependsOn array.
+        let mut parent = oci_entry("ghcr.io/x/parent:1", "ghcr.io", "x/parent", "1", "sha256:p");
+        parent
+            .metadata
+            .depends_on
+            .insert("./local-feature".to_string(), json!({}));
+        let lf = build_lockfile_from_entries(&[parent]);
+        assert!(lf.features["ghcr.io/x/parent:1"].depends_on.is_empty());
+    }
+
+    #[test]
+    fn lockfile_skips_non_oci_features() {
+        // HTTP / local features carry no digest and produce no lockfile entry.
+        let entry = FeatureEntry {
+            install_id: install_identity("./local", "{}"),
+            metadata: FeatureMetadata {
+                id: "local".to_string(),
+                ..Default::default()
+            },
+            artifact_dir: PathBuf::from("/tmp/local"),
+            user_options: HashMap::new(),
+            original_ref: "./local".to_string(),
+            oci: None,
+        };
+        let lf = build_lockfile_from_entries(&[entry]);
+        assert!(lf.features.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // locked_digest_for
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn locked_digest_lookup_uses_verbatim_ref() {
+        let lf = generate_lockfile(&[(
+            "ghcr.io/x/y:1".to_string(),
+            "1".to_string(),
+            "ghcr.io/x/y@sha256:aa".to_string(),
+            "sha256:aa".to_string(),
+            vec![],
+        )]);
+        // Exact tagged ref hits.
+        assert_eq!(
+            locked_digest_for(Some(&lf), "ghcr.io/x/y:1"),
+            Some("sha256:aa")
+        );
+        // A changed tag (`:1` -> `:2`) misses, so resolution re-fetches `:2`.
+        assert_eq!(locked_digest_for(Some(&lf), "ghcr.io/x/y:2"), None);
+        // Untagged form misses too — the key is verbatim.
+        assert_eq!(locked_digest_for(Some(&lf), "ghcr.io/x/y"), None);
+        // No lockfile -> never pinned.
+        assert_eq!(locked_digest_for(None, "ghcr.io/x/y:1"), None);
     }
 }

@@ -164,6 +164,8 @@ pub struct UpConfig<'a> {
     /// `-target-path`). Installed in the post-create flow when armed and the
     /// lifecycle gate permits (after `postCreateCommand`, before `postStart`).
     pub dotfiles: DotfilesConfig,
+    /// Lockfile policy for feature resolution (default: Update).
+    pub lockfile_policy: cella_features::LockfilePolicy,
 }
 
 /// How the up pipeline should handle the container image.

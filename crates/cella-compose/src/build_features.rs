@@ -35,6 +35,8 @@ pub struct ComposeBuildConfig<'a> {
     pub pull_policy: Option<String>,
     /// `BuildKit` secrets forwarded to compose builds.
     pub secrets: Vec<BuildSecret>,
+    /// Feature lockfile policy derived from `--no-lockfile` / `--frozen-lockfile`.
+    pub lockfile_policy: cella_features::LockfilePolicy,
 }
 
 /// Run the compose build pipeline: resolve features, write override, build.
@@ -75,6 +77,7 @@ pub async fn compose_build(
         // `cella build` does not yet expose --omit-config-remote-env-from-metadata
         // (it's wired on the `up` path only); keep the full metadata label here.
         false,
+        cfg.lockfile_policy,
         progress,
     )
     .await?;
