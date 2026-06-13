@@ -27,6 +27,10 @@ pub struct UpgradeArgs {
     /// Print the new lockfile to stdout without writing it.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Log verbosity level.
+    #[arg(long, value_enum, default_value_t = crate::commands::LogLevel::Info)]
+    pub log_level: crate::commands::LogLevel,
 }
 
 impl UpgradeArgs {

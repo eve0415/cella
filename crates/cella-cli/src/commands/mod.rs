@@ -338,7 +338,8 @@ impl Command {
     /// The `--log-level` value, if the subcommand carries one.
     ///
     /// `up` (and `code`, which embeds the `up` arg surface), `run-user-commands`,
-    /// and `features package` expose `--log-level`; every other variant returns
+    /// `set-up`, `templates`, `features`, and `upgrade` expose `--log-level`;
+    /// every other variant returns
     /// `None`. main.rs reads this once, before subcommand dispatch, to seed the
     /// global tracing filter — the level can't be applied inside `execute()`
     /// because the subscriber is already installed by then.
@@ -350,6 +351,7 @@ impl Command {
             Self::SetUp(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
             Self::Features(args) => args.log_level(),
+            Self::Upgrade(args) => Some(args.log_level),
             _ => None,
         }
     }
