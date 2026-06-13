@@ -25,14 +25,6 @@ pub enum GenerateDocsError {
         #[source]
         source: std::io::Error,
     },
-
-    /// An I/O error while writing a README.md.
-    #[error("failed to write README for template '{id}': {source}")]
-    WriteReadme {
-        id: String,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +64,18 @@ pub fn generate_docs(
     github_owner: Option<&str>,
     github_repo: Option<&str>,
 ) -> Result<GenerateDocsReport, GenerateDocsError> {
-    let src_dir = project_folder.join("src");
+    // Support two calling conventions:
+    // 1. project root — append `src/` when a `src/` sub-directory exists there
+    // 2. the `src/` collection directory itself — use it directly
+    //
+    // The official CLI always receives the project root and appends `src/`
+    // internally, but callers that already resolved the src dir must also work.
+    let src_candidate = project_folder.join("src");
+    let src_dir = if src_candidate.is_dir() {
+        src_candidate
+    } else {
+        project_folder.to_owned()
+    };
     let entries = std::fs::read_dir(&src_dir).map_err(|e| GenerateDocsError::ReadSrcDir {
         path: src_dir.clone(),
         source: e,
@@ -137,7 +140,21 @@ fn process_template_dir(
         }
     };
 
-    let metadata: TemplateMetadata = match serde_json::from_str(&raw) {
+    // Strip JSONC (comments + trailing commas) before parsing — template
+    // manifests in the wild frequently contain comments.
+    let stripped = match cella_jsonc::strip(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "Failed to strip JSONC from {}: {e}",
+                manifest_path.display()
+            );
+            report.errors.push(dir_name.to_owned());
+            return;
+        }
+    };
+
+    let metadata: TemplateMetadata = match serde_json::from_str(&stripped) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse {}: {e}", manifest_path.display());
@@ -184,14 +201,24 @@ fn render_readme(
     github_repo: Option<&str>,
 ) -> Result<String, std::io::Error> {
     let name_line = build_name_line(metadata);
-    let description = metadata.description.as_deref().unwrap_or_default();
+    let description = metadata
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let options_section = build_options_section(&metadata.options);
     let notes = read_notes(template_dir)?;
     let repo_url = build_repo_url(template_dir, github_owner, github_repo);
 
     // Build body sections conditionally to avoid consecutive blank lines when
-    // options_section or notes are empty.
-    let mut body = format!("# {name_line}\n\n{description}");
+    // description, options_section, or notes are empty.
+    // Official behavior: missing description → no extra blank line (just the
+    // heading, then options/notes or directly the footer separator).
+    let mut body = format!("# {name_line}");
+    if let Some(desc) = description {
+        body.push_str("\n\n");
+        body.push_str(desc);
+    }
     if !options_section.is_empty() {
         body.push_str("\n\n");
         body.push_str(&options_section);
@@ -581,6 +608,106 @@ mod tests {
         assert!(
             !readme.contains("\n\n\n"),
             "README must not contain three consecutive newlines, got:\n{readme}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: JSONC manifests (comments + trailing commas) must parse OK
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jsonc_manifest_with_comments_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let tpl_dir = src.join("jsonc-tpl");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+
+        // Manifest contains line comments and a trailing comma — strict JSON
+        // would reject this; JSONC stripping must happen first.
+        write_manifest(
+            &tpl_dir,
+            r#"{
+                // This is a JSONC comment
+                "id": "jsonc-tpl",
+                "version": "1.0.0",
+                "name": "JSONC Template",
+                "description": "Has comments.",
+                /* another comment */
+                "options": {} // trailing
+            }"#,
+        );
+
+        let report = generate_docs(tmp.path(), None, None).unwrap();
+
+        assert!(
+            report.errors.is_empty(),
+            "JSONC manifest should parse without error, got: {:?}",
+            report.errors
+        );
+        assert_eq!(report.written, vec!["jsonc-tpl"]);
+        let readme = read_readme(&tpl_dir);
+        assert!(
+            readme.contains("# JSONC Template (jsonc-tpl)"),
+            "title missing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: src/ path passed directly (already the collection dir)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn accepts_src_dir_passed_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create `tmp/src/my-tpl/` — the "src" directory IS `tmp`.
+        let tpl_dir = tmp.path().join("my-tpl");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+
+        write_manifest(
+            &tpl_dir,
+            r#"{"id": "my-tpl", "version": "1.0.0", "name": "My Template", "description": "Direct src."}"#,
+        );
+
+        // Pass the directory that contains "my-tpl/" directly (no "src/" sub-dir).
+        let report = generate_docs(tmp.path(), None, None).unwrap();
+
+        assert!(
+            report.errors.is_empty(),
+            "passing src dir directly should work, got errors: {:?}",
+            report.errors
+        );
+        assert_eq!(report.written, vec!["my-tpl"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: empty description → no double blank line before options/footer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_description_no_double_blank_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let tpl_dir = src.join("no-desc");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+
+        // No "description" field at all.
+        write_manifest(
+            &tpl_dir,
+            r#"{"id": "no-desc", "version": "1.0.0", "name": "No Description"}"#,
+        );
+
+        generate_docs(tmp.path(), None, None).unwrap();
+
+        let readme = read_readme(&tpl_dir);
+        // No triple newline — missing description must not leave a blank paragraph.
+        assert!(
+            !readme.contains("\n\n\n"),
+            "empty description must not produce triple newline, got:\n{readme}"
+        );
+        // Heading must be present.
+        assert!(
+            readme.contains("# No Description (no-desc)"),
+            "title missing"
         );
     }
 }
