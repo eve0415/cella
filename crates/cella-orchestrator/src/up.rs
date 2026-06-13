@@ -2339,25 +2339,26 @@ fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
 ///
 /// When both `raw_remote_env` (the pre-substitution snapshot from config
 /// parse) and `probed_env` (the live container env from `userEnvProbe`) are
-/// available, performs a second-pass substitution so that
-/// `${containerEnv:VAR}` tokens in `remoteEnv` resolve against the actual
-/// running container environment — matching the official CLI's
+/// available **and** at least one value contains a `${containerEnv:` token,
+/// performs a second-pass substitution so that those tokens resolve against
+/// the actual running container environment — matching the official CLI's
 /// `containerSubstitute` pass.
 ///
 /// Falls back to `config.remote_env` (the phase-1-substituted slice) when
-/// either input is absent, preserving identical behaviour for all existing
-/// callers that have no `${containerEnv:...}` tokens.
+/// either input is absent or no `${containerEnv:` tokens are present,
+/// preserving identical behaviour for configs that don't use them.
 fn resolved_remote_env(
     config: &UpConfig<'_>,
     probed_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Vec<String> {
-    if let (Some(raw), Some(probed)) = (config.raw_remote_env, probed_env) {
+    if let (Some(raw), Some(probed)) = (config.raw_remote_env, probed_env)
+        && raw.to_string().contains("${containerEnv:")
+    {
         let ctx =
             cella_config::config_map::subst_ctx(config.resolved).with_container_env(probed.clone());
-        ctx.substitute_remote_env(raw)
-    } else {
-        config.remote_env.to_vec()
+        return ctx.substitute_remote_env(raw);
     }
+    config.remote_env.to_vec()
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ impl SubstitutionContext {
         }
     }
 
-    /// Return a clone of this context with `container_env` populated.
+    /// Consume this context and return it with `container_env` populated.
     ///
     /// Used for the second-pass `remoteEnv` resolution after container start,
     /// where `${containerEnv:VAR}` should resolve against the live container
@@ -119,10 +119,11 @@ impl SubstitutionContext {
     /// and returns one `KEY=value` string per entry, with all `${...}`
     /// expressions in the values resolved by this context.
     ///
-    /// Non-object or `null` input returns an empty vec.  This is the canonical
-    /// place to resolve `remoteEnv` — both the config-time pass and the
-    /// post-start second pass go through here so ordering and formatting are
-    /// consistent.
+    /// Non-object or `null` input returns an empty vec.  Used for the
+    /// post-start second pass where `container_env` is populated so that
+    /// `${containerEnv:VAR}` tokens resolve against the live container
+    /// environment.  Config-time `remoteEnv` is handled separately by
+    /// `config_map::env::map_remote_env`.
     #[must_use]
     pub fn substitute_remote_env(&self, raw_remote_env: &serde_json::Value) -> Vec<String> {
         let Some(obj) = raw_remote_env.as_object() else {
@@ -666,5 +667,29 @@ mod tests {
             "/projects/myapp"
         );
         assert_eq!(ctx.substitute_str("${containerEnv:FOO}"), "bar");
+    }
+
+    /// Regression: when `remoteEnv` contains no `${containerEnv:` tokens, the
+    /// second-pass substitution must produce byte-identical output to the
+    /// phase-1 pass regardless of whether `container_env` is populated.  This
+    /// is the invariant that lets `resolved_remote_env` in the orchestrator
+    /// skip the second pass cheaply.
+    #[test]
+    fn substitute_remote_env_no_container_env_tokens_is_idempotent() {
+        let raw = serde_json::json!({
+            "EDITOR": "vim",
+            "HOME": "${localEnv:HOME}",
+            "WS": "${containerWorkspaceFolder}"
+        });
+        let ctx_empty = test_ctx();
+        let first_pass = ctx_empty.substitute_remote_env(&raw);
+
+        let mut cenv = HashMap::new();
+        cenv.insert("HOME".to_string(), "/container/home".to_string());
+        let ctx_live = test_ctx().with_container_env(cenv);
+        let second_pass = ctx_live.substitute_remote_env(&raw);
+
+        // No ${containerEnv:…} tokens → both passes must agree
+        assert_eq!(first_pass, second_pass);
     }
 }
