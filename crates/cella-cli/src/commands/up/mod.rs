@@ -1283,13 +1283,9 @@ impl UpContext {
                 .or(probed_env)
         };
 
-        let mut lifecycle_env = final_probed.as_ref().map_or_else(
-            || remote_env.to_vec(),
-            |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
-        );
-        if !self.lifecycle_secrets.is_empty() {
-            lifecycle_env.extend(self.lifecycle_secrets.iter().cloned());
-        }
+        let mut lifecycle_env =
+            build_lifecycle_env(&self.resolved, remote_env, final_probed.as_ref());
+        lifecycle_env.extend(self.lifecycle_secrets.iter().cloned());
 
         (final_probed, lifecycle_env)
     }
@@ -2059,6 +2055,38 @@ pub async fn write_daemon_addr_to_volume(client: &dyn ContainerBackend) -> bool 
         return false;
     }
     true
+}
+
+/// Build the lifecycle environment for a container.
+///
+/// Performs a second-pass `${containerEnv:VAR}` substitution when the config
+/// carried a raw (pre-substitution) `remoteEnv` snapshot *and* the probe
+/// captured live container env.  The resolved `remoteEnv` is then merged with
+/// `probed_env` so the container's environment forms the base layer and config
+/// values override it.  When either input is absent the behaviour is identical
+/// to the pre-substitution path (additive invariant: no `${containerEnv:...}`
+/// tokens → byte-identical output).
+///
+/// Mirrors `resolved_remote_env` in `cella-orchestrator` but also incorporates
+/// the `merge_env` step, giving the compose path the same resolution the
+/// single-container orchestrator path gets.
+fn build_lifecycle_env(
+    resolved: &ResolvedConfig,
+    remote_env: &[String],
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let effective: Vec<String> = if let (Some(raw), Some(probed)) =
+        (resolved.raw_remote_env.as_ref(), probed_env)
+    {
+        let ctx = cella_config::config_map::subst_ctx(resolved).with_container_env(probed.clone());
+        ctx.substitute_remote_env(raw)
+    } else {
+        remote_env.to_vec()
+    };
+    probed_env.map_or_else(
+        || effective.clone(),
+        |probed| cella_env::user_env_probe::merge_env(probed, &effective),
+    )
 }
 
 #[cfg(test)]
@@ -2888,5 +2916,85 @@ mod tests {
         );
         // terminal-columns requires terminal-rows.
         assert!(crate::Cli::try_parse_from(["cella", "up", "--terminal-columns", "80"]).is_err());
+    }
+
+    // ── build_lifecycle_env ────────────────────────────────────────────────
+
+    fn minimal_resolved(raw_remote_env: Option<serde_json::Value>) -> ResolvedConfig {
+        use std::path::PathBuf;
+        ResolvedConfig {
+            config: serde_json::json!({}),
+            config_path: PathBuf::from("/dev/null"),
+            workspace_root: PathBuf::from("/workspace"),
+            config_hash: String::new(),
+            devcontainer_id: "testid".to_string(),
+            warnings: Vec::new(),
+            typed: None,
+            raw_remote_env,
+        }
+    }
+
+    /// No `${containerEnv:...}` tokens and no raw snapshot → output equals
+    /// `remote_env` unchanged (additive invariant).
+    #[test]
+    fn no_container_env_tokens_unchanged() {
+        let resolved = minimal_resolved(None);
+        let remote_env = vec!["FOO=bar".to_string(), "BAZ=qux".to_string()];
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/usr/bin".to_string())].into();
+
+        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+
+        // merge_env puts probed first then config overrides; FOO/BAZ come from config
+        assert!(result.contains(&"FOO=bar".to_string()));
+        assert!(result.contains(&"BAZ=qux".to_string()));
+    }
+
+    /// `raw_remote_env` present but `probed_env` absent → falls back to `remote_env`
+    /// (additive invariant: no probe, no second-pass).
+    #[test]
+    fn no_probe_falls_back_to_remote_env() {
+        let raw = serde_json::json!({"PATH": "${containerEnv:PATH}"});
+        let resolved = minimal_resolved(Some(raw));
+        let remote_env = vec!["FOO=original".to_string()];
+
+        let result = build_lifecycle_env(&resolved, &remote_env, None);
+
+        assert_eq!(result, remote_env);
+    }
+
+    /// When both raw snapshot and probe are present, `${containerEnv:VAR}`
+    /// resolves against the probed container env.
+    #[test]
+    fn container_env_token_resolves_from_probe() {
+        let raw = serde_json::json!({"MYPATH": "${containerEnv:PATH}"});
+        let resolved = minimal_resolved(Some(raw));
+        let remote_env = vec!["MYPATH=fallback".to_string()];
+        let probed: std::collections::HashMap<String, String> =
+            [("PATH".to_string(), "/container/bin".to_string())].into();
+
+        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+
+        assert!(
+            result.contains(&"MYPATH=/container/bin".to_string()),
+            "expected MYPATH=/container/bin in {result:?}"
+        );
+    }
+
+    /// Config remoteEnv overrides probed env (precedence: config > probe).
+    #[test]
+    fn config_remote_env_overrides_probe() {
+        let raw = serde_json::json!({"FOO": "from_config"});
+        let resolved = minimal_resolved(Some(raw));
+        let remote_env = vec!["FOO=phase1".to_string()];
+        let probed: std::collections::HashMap<String, String> =
+            [("FOO".to_string(), "from_probe".to_string())].into();
+
+        let result = build_lifecycle_env(&resolved, &remote_env, Some(&probed));
+
+        assert!(
+            result.contains(&"FOO=from_config".to_string()),
+            "config should win over probe; got {result:?}"
+        );
     }
 }
