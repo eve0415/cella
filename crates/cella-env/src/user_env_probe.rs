@@ -172,11 +172,15 @@ pub fn parse_probed_env(output: &str, marker: &str, separator: char) -> HashMap<
 /// shell dropped (e.g. a startup script that reset `PATH`). Mirrors the official
 /// CLI `mergePaths`: container-only entries are spliced in at their relative
 /// position; non-root users skip `*/sbin` entries.
+///
+/// Empty segments (from leading/trailing/doubled `:`) are filtered out before
+/// merging to prevent accidentally inserting `.` (current-working-directory) into
+/// `PATH`, which would be a security issue.
 #[must_use]
 pub fn merge_paths(shell_path: &str, container_path: &str, root_user: bool) -> String {
-    let mut result: Vec<&str> = shell_path.split(':').collect();
+    let mut result: Vec<&str> = shell_path.split(':').filter(|s| !s.is_empty()).collect();
     let mut insert_at = 0usize;
-    for entry in container_path.split(':') {
+    for entry in container_path.split(':').filter(|s| !s.is_empty()) {
         if let Some(i) = result.iter().position(|e| *e == entry) {
             insert_at = i + 1;
         } else if root_user || !is_sbin_path(entry) {
@@ -187,13 +191,16 @@ pub fn merge_paths(shell_path: &str, container_path: &str, root_user: bool) -> S
     result.join(":")
 }
 
-/// Whether a PATH entry contains an `sbin` path component.
+/// Whether a PATH entry is an sbin path component.
 ///
-/// Matches the official regex `/\/sbin(\/|$)/` — a path segment that equals
-/// exactly `sbin` (e.g. `/sbin`, `/usr/sbin`, `/usr/sbin/x`), but NOT
-/// `/usr/sbinfoo`.
+/// Matches the official regex `/\/sbin(\/|$)/` — requires a literal `/sbin`
+/// boundary, so `/sbin`, `/usr/sbin`, and `/usr/sbin/x` match, but
+/// `/usr/sbinfoo` and a bare `sbin` (no leading slash) do not.
 fn is_sbin_path(entry: &str) -> bool {
-    entry.split('/').any(|seg| seg == "sbin")
+    entry
+        .split('/')
+        .skip(1) // skip the empty segment before the leading '/'
+        .any(|seg| seg == "sbin")
 }
 
 /// Merge probed environment with `remoteEnv` from config.
@@ -568,6 +575,33 @@ mod tests {
     #[test]
     fn is_sbin_path_ignores_usr_bin() {
         assert!(!is_sbin_path("/usr/bin"));
+    }
+
+    /// Regression: bare `"sbin"` (no leading slash) must NOT match the
+    /// `/\/sbin(\/|$)/` regex — it is not an absolute path and the regex
+    /// requires a `/` before `sbin`.
+    #[test]
+    fn is_sbin_path_bare_sbin_no_match() {
+        assert!(!is_sbin_path("sbin"));
+    }
+
+    /// Regression: empty PATH segments (from `PATH=:` or `PATH=/bin:`) must
+    /// never appear in the merged result, since an empty segment means `.`
+    /// (current working directory) which is a security hazard.
+    #[test]
+    fn merge_paths_filters_empty_segments() {
+        // container_path with a trailing ':' produces an empty segment
+        let result = merge_paths("/usr/bin:/bin", "/usr/bin:/bin:", false);
+        assert!(
+            !result.split(':').any(str::is_empty),
+            "merged PATH must not contain empty segments (implicit '.'): {result}"
+        );
+        // shell_path with a leading ':' also filtered
+        let result = merge_paths(":/usr/bin:/bin", "/usr/bin:/bin", false);
+        assert!(
+            !result.split(':').any(str::is_empty),
+            "merged PATH must not contain empty segments from shell path: {result}"
+        );
     }
 
     #[test]
