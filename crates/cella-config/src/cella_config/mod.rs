@@ -123,6 +123,7 @@ mod tests {
             devcontainer_id: String::new(),
             warnings: vec![],
             typed,
+            raw_remote_env: None,
         }
     }
 
