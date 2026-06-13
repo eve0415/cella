@@ -81,14 +81,6 @@ reportResults() {
 }
 "#;
 
-/// Log level for test output.
-#[derive(Clone, clap::ValueEnum)]
-pub enum TestLogLevel {
-    Info,
-    Debug,
-    Trace,
-}
-
 /// Scenario-scope selectors for `features test`.
 ///
 /// Separated from [`TestArgs`] to keep its bool-field count under
@@ -132,6 +124,10 @@ pub struct TestArgs {
     pub project_folder: PathBuf,
 
     /// DEPRECATED: use `--project-folder` instead.
+    ///
+    /// Honoured as a fallback for `--project-folder`: when `--project-folder`
+    /// is left at its default (`.`), this value is used instead. Matches the
+    /// official CLI's deprecated positional `target` argument.
     #[arg(long, hide = true, default_value = ".")]
     pub target: PathBuf,
 
@@ -152,8 +148,13 @@ pub struct TestArgs {
     pub remote_user: Option<String>,
 
     /// Log level for test output.
-    #[arg(long, value_enum, default_value = "info")]
-    pub log_level: TestLogLevel,
+    ///
+    /// The official `features test` exposes `info`/`debug`/`trace` (default
+    /// `info`); cella standardises on the shared [`crate::commands::LogLevel`]
+    /// used by the other `features` subcommands, which additionally accepts
+    /// `error`.
+    #[arg(long, value_enum, default_value_t = crate::commands::LogLevel::Info)]
+    pub log_level: crate::commands::LogLevel,
 
     /// Preserve test containers after run (skip cleanup).
     #[arg(long)]
@@ -193,38 +194,14 @@ impl TestArgs {
     /// Returns an error if the project structure is invalid, container
     /// operations fail, or a test script is not found.
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Resolve the project folder: --target is deprecated but has the same
-        // default ("."), so --project-folder wins unless it was left at default
-        // and --target was explicitly given (both default to "." so there is no
-        // reliable way to detect which one was provided; use project_folder as
-        // the authoritative source, matching the official CLI).
-        let project_folder = self.project_folder.canonicalize().map_err(|e| {
-            format!(
-                "Cannot resolve project folder '{}': {e}",
-                self.project_folder.display()
-            )
-        })?;
-
+        let project_folder = self.resolve_project_folder()?;
         let src_dir = project_folder.join("src");
         let test_dir = project_folder.join("test");
 
-        if !src_dir.is_dir() {
-            return Err(format!(
-                "No 'src/' directory found in '{}'",
-                project_folder.display()
-            )
-            .into());
-        }
-        if !test_dir.is_dir() {
-            return Err(format!(
-                "No 'test/' directory found in '{}'",
-                project_folder.display()
-            )
-            .into());
-        }
-
         let client = self.backend.resolve_client().await?;
         client.ping().await?;
+
+        warn_unsupported_duplicate_flags(&self.duplicate);
 
         // Track whether specific features were explicitly selected. When they
         // are, global scenarios are skipped — matching the official CLI, which
@@ -308,6 +285,74 @@ impl TestArgs {
         } else {
             std::process::exit(1);
         }
+    }
+
+    /// Resolve, validate, and canonicalize the project folder.
+    ///
+    /// Applies the `--project-folder` / deprecated `--target` precedence (see
+    /// [`resolve_project_folder`]), warns when the deprecated flag is in effect,
+    /// then verifies the `src/` and `test/` subdirectories exist.
+    fn resolve_project_folder(&self) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        let selected = resolve_project_folder(&self.project_folder, &self.target);
+        if selected == self.target.as_path() && self.target != Path::new(".") {
+            tracing::warn!(
+                "--target is deprecated; use --project-folder instead (honoring --target '{}')",
+                self.target.display()
+            );
+        }
+        let project_folder = selected.canonicalize().map_err(|e| {
+            format!(
+                "Cannot resolve project folder '{}': {e}",
+                selected.display()
+            )
+        })?;
+
+        if !project_folder.join("src").is_dir() {
+            return Err(format!(
+                "No 'src/' directory found in '{}'",
+                project_folder.display()
+            )
+            .into());
+        }
+        if !project_folder.join("test").is_dir() {
+            return Err(format!(
+                "No 'test/' directory found in '{}'",
+                project_folder.display()
+            )
+            .into());
+        }
+        Ok(project_folder)
+    }
+}
+
+/// Emit a visible notice for accepted-but-unsupported duplicate-test flags.
+///
+/// `--skip-duplicated` and `--permit-randomization` only affect the official
+/// CLI's `duplicate.sh` tests, which cella does not run. They are accepted for
+/// CLI-surface parity, so surface the no-op rather than silently ignoring it.
+fn warn_unsupported_duplicate_flags(duplicate: &TestDuplicateArgs) {
+    if duplicate.skip_duplicated {
+        tracing::warn!("--skip-duplicated has no effect: duplicate.sh tests are not run by cella");
+    }
+    if duplicate.permit_randomization {
+        tracing::warn!(
+            "--permit-randomization has no effect: duplicate.sh tests are not run by cella"
+        );
+    }
+}
+
+/// Select the project folder from `--project-folder` and the deprecated
+/// `--target`.
+///
+/// Matches the official CLI: `--project-folder` wins unless it was left at its
+/// default (`.`), in which case the deprecated `--target` is used as a
+/// fallback. Both default to `.`, so an explicit `--project-folder .` cannot
+/// override a `--target` value — exactly as upstream behaves.
+fn resolve_project_folder<'a>(project_folder: &'a Path, target: &'a Path) -> &'a Path {
+    if project_folder == Path::new(".") {
+        target
+    } else {
+        project_folder
     }
 }
 
@@ -829,21 +874,7 @@ async fn bring_up_test_container(
 
     // Apply remoteUser override if given.
     if let Some(user) = remote_user {
-        let _ = client
-            .exec_command(
-                &result.container_id,
-                &cella_backend::ExecOptions {
-                    cmd: vec![
-                        "sh".into(),
-                        "-c".into(),
-                        format!("id -u {user} > /dev/null 2>&1 || useradd -m {user}"),
-                    ],
-                    user: Some("root".to_string()),
-                    env: None,
-                    working_dir: None,
-                },
-            )
-            .await;
+        ensure_remote_user(client, &result.container_id, user).await;
     }
 
     // Upload test-lib to a known scratch location so inject_and_run_test can
@@ -862,6 +893,48 @@ async fn bring_up_test_container(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     Ok(result.container_id)
+}
+
+/// Ensure the requested remote user exists in the container, creating it if not.
+///
+/// The username is passed as a discrete argv element to `id`/`useradd` — never
+/// interpolated into a shell command string — so a crafted name (e.g.
+/// `foo; rm -rf /`) cannot break out and execute injected commands. We first
+/// probe with `id -u <user>` and only run `useradd -m <user>` when the probe
+/// reports the user is missing (non-zero exit).
+async fn ensure_remote_user(
+    client: &dyn cella_backend::ContainerBackend,
+    container_id: &str,
+    user: &str,
+) {
+    use cella_backend::ExecOptions;
+
+    let exists = client
+        .exec_command(
+            container_id,
+            &ExecOptions {
+                cmd: vec!["id".into(), "-u".into(), user.to_string()],
+                user: Some("root".to_string()),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .is_ok_and(|r| r.exit_code == 0);
+
+    if !exists {
+        let _ = client
+            .exec_command(
+                container_id,
+                &ExecOptions {
+                    cmd: vec!["useradd".into(), "-m".into(), user.to_string()],
+                    user: Some("root".to_string()),
+                    env: None,
+                    working_dir: None,
+                },
+            )
+            .await;
+    }
 }
 
 /// Copy the test directory and test-lib into the workspace folder, then run the
@@ -1185,18 +1258,56 @@ impl cella_orchestrator::up::UpHooks for NullUpHooks {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Mutex;
 
     use cella_backend::{
-        BackendCapabilities, BackendError, BackendKind, BoxFuture, ContainerBackend,
+        BackendCapabilities, BackendError, BackendKind, BoxFuture, ContainerBackend, ExecResult,
     };
 
     use super::*;
 
     // ---------------------------------------------------------------------------
-    // Minimal panic-on-call backend for tests that must never reach container ops
+    // Backend that panics on every container op except `exec_command`, which it
+    // records. With no recorder configured it panics on `exec_command` too, so
+    // it doubles as the "must never reach container ops" backend.
     // ---------------------------------------------------------------------------
 
-    struct NeverCalledBackend;
+    /// One recorded `exec_command` invocation: the resolved argv and the `user`.
+    #[derive(Clone)]
+    struct ExecCall {
+        cmd: Vec<String>,
+        user: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct NeverCalledBackend {
+        /// When `Some`, `exec_command` records each call here and returns an
+        /// `ExecResult` with the next queued exit code (default 0) instead of
+        /// panicking.
+        recorder: Option<Mutex<Vec<ExecCall>>>,
+        /// Exit codes to return from successive `exec_command` calls (FIFO).
+        /// Falls back to 0 once exhausted.
+        exit_codes: Mutex<Vec<i64>>,
+    }
+
+    impl NeverCalledBackend {
+        /// A recording backend that captures `exec_command` argv/user instead of
+        /// panicking. `exit_codes` are returned in order (then 0).
+        fn recording(exit_codes: Vec<i64>) -> Self {
+            Self {
+                recorder: Some(Mutex::new(Vec::new())),
+                exit_codes: Mutex::new(exit_codes),
+            }
+        }
+
+        /// Snapshot of the recorded `exec_command` calls.
+        fn recorded(&self) -> Vec<ExecCall> {
+            self.recorder
+                .as_ref()
+                .map(|r| r.lock().unwrap().clone())
+                .unwrap_or_default()
+        }
+    }
 
     impl ContainerBackend for NeverCalledBackend {
         fn kind(&self) -> BackendKind {
@@ -1280,9 +1391,26 @@ mod tests {
         fn exec_command<'a>(
             &'a self,
             _: &'a str,
-            _: &'a cella_backend::ExecOptions,
-        ) -> BoxFuture<'a, Result<cella_backend::ExecResult, BackendError>> {
-            panic!("unexpected exec_command call");
+            opts: &'a cella_backend::ExecOptions,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            let Some(recorder) = self.recorder.as_ref() else {
+                panic!("unexpected exec_command call");
+            };
+            recorder.lock().unwrap().push(ExecCall {
+                cmd: opts.cmd.clone(),
+                user: opts.user.clone(),
+            });
+            let exit_code = {
+                let mut codes = self.exit_codes.lock().unwrap();
+                if codes.is_empty() { 0 } else { codes.remove(0) }
+            };
+            Box::pin(async move {
+                Ok(ExecResult {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            })
         }
 
         fn exec_stream<'a>(
@@ -1291,7 +1419,7 @@ mod tests {
             _: &'a cella_backend::ExecOptions,
             _: Box<dyn std::io::Write + Send + 'a>,
             _: Box<dyn std::io::Write + Send + 'a>,
-        ) -> BoxFuture<'a, Result<cella_backend::ExecResult, BackendError>> {
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
             panic!("unexpected exec_stream call");
         }
 
@@ -1535,7 +1663,7 @@ mod tests {
         // "no_script" is in scenarios.json but there is no `no_script.sh`.
         scenarios.insert("no_script".to_string(), serde_json::json!({}));
 
-        let backend = NeverCalledBackend;
+        let backend = NeverCalledBackend::default();
         let flags = RunFlags {
             quiet: true,
             preserve_test_containers: false,
@@ -1577,7 +1705,7 @@ mod tests {
         )
         .unwrap();
 
-        let backend = NeverCalledBackend;
+        let backend = NeverCalledBackend::default();
         let flags = RunFlags {
             quiet: true,
             preserve_test_containers: false,
@@ -1615,7 +1743,7 @@ mod tests {
         let mut scenarios = HashMap::new();
         scenarios.insert("ghost".to_string(), serde_json::json!({}));
 
-        let backend = NeverCalledBackend;
+        let backend = NeverCalledBackend::default();
         let flags = RunFlags {
             quiet: true,
             preserve_test_containers: true, // preserve = true: error still propagates
@@ -1849,5 +1977,123 @@ mod tests {
         );
 
         cleanup_workspace(&workspace).unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // --target / --project-folder precedence (deprecated alias)
+    // ---------------------------------------------------------------------------
+
+    /// An explicit `--project-folder` wins over the deprecated `--target`.
+    #[test]
+    fn resolve_project_folder_prefers_project_folder() {
+        let project = Path::new("/some/project");
+        let target = Path::new("/other/target");
+        assert_eq!(resolve_project_folder(project, target), project);
+    }
+
+    /// When `--project-folder` is left at its default (`.`), `--target` is the
+    /// fallback — matching the official CLI.
+    #[test]
+    fn resolve_project_folder_falls_back_to_target() {
+        let project = Path::new(".");
+        let target = Path::new("/legacy/target");
+        assert_eq!(resolve_project_folder(project, target), target);
+    }
+
+    /// Both defaulted → resolves to the current dir (`.`).
+    #[test]
+    fn resolve_project_folder_both_default() {
+        let dot = Path::new(".");
+        assert_eq!(resolve_project_folder(dot, dot), dot);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Shell-injection regression: ensure_remote_user must use an argv vector
+    // ---------------------------------------------------------------------------
+
+    /// A username containing shell metacharacters must be passed as a single
+    /// discrete argv element to `id`/`useradd` — never interpolated into a
+    /// `sh -c` command string — so injected commands cannot execute.
+    #[tokio::test]
+    async fn ensure_remote_user_does_not_shell_inject() {
+        // `id -u` returns non-zero (user missing) so `useradd` also runs.
+        let backend = NeverCalledBackend::recording(vec![1]);
+        let malicious = "foo; rm -rf /";
+
+        ensure_remote_user(&backend, "container", malicious).await;
+
+        let calls = backend.recorded();
+        assert_eq!(calls.len(), 2, "expected an `id` probe then a `useradd`");
+
+        for call in &calls {
+            // No call may go through a shell interpreter.
+            let head = call.cmd.first().map(String::as_str);
+            assert!(
+                head != Some("sh") && head != Some("bash"),
+                "remote-user setup must not shell out: {:?}",
+                call.cmd
+            );
+            // The username must appear verbatim as its own discrete argv element.
+            assert!(
+                call.cmd.iter().any(|a| a == malicious),
+                "username must be a discrete argv element: {:?}",
+                call.cmd
+            );
+            // The injection payload must never be spliced into any *other* argv
+            // element (which would only happen via shell-string concatenation).
+            assert!(
+                !call
+                    .cmd
+                    .iter()
+                    .any(|a| a != malicious && a.contains("rm -rf")),
+                "no argv element may embed the username inside a shell string: {:?}",
+                call.cmd
+            );
+        }
+
+        // Exact argv vectors.
+        assert_eq!(calls[0].cmd, vec!["id", "-u", malicious]);
+        assert_eq!(calls[1].cmd, vec!["useradd", "-m", malicious]);
+        assert_eq!(calls[0].user.as_deref(), Some("root"));
+        assert_eq!(calls[1].user.as_deref(), Some("root"));
+    }
+
+    /// When the user already exists (`id -u` exits 0), `useradd` is NOT run.
+    #[tokio::test]
+    async fn ensure_remote_user_skips_useradd_when_present() {
+        let backend = NeverCalledBackend::recording(vec![0]); // id -u succeeds
+        ensure_remote_user(&backend, "container", "vscode").await;
+
+        let calls = backend.recorded();
+        assert_eq!(calls.len(), 1, "only the `id` probe should run");
+        assert_eq!(calls[0].cmd, vec!["id", "-u", "vscode"]);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test script invocation pins official behaviour: no positional args
+    // ---------------------------------------------------------------------------
+
+    /// The official `@devcontainers/cli` runs the test script with ZERO
+    /// positional arguments (`const args: string[] = []`), so the embedded
+    /// `dev-container-features-test-lib` always sees `USERNAME=${1:-root}` as
+    /// `root`. cella must match: `run_test_script` invokes `bash <script>` with
+    /// no trailing username argument. (Regression guard against re-introducing a
+    /// `$USERNAME` pass-through that would diverge from upstream.)
+    #[tokio::test]
+    async fn run_test_script_passes_no_positional_args() {
+        let backend = NeverCalledBackend::recording(vec![0]);
+
+        let passed = run_test_script(&backend, "container", "/workspaces/proj", "test.sh", true)
+            .await
+            .unwrap();
+        assert!(passed, "exit code 0 should report a pass");
+
+        let calls = backend.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].cmd,
+            vec!["bash", "/workspaces/proj/test.sh"],
+            "test script must run with no positional args (matches official CLI)"
+        );
     }
 }
