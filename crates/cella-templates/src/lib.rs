@@ -18,6 +18,7 @@ pub mod options;
 pub mod tags;
 pub mod types;
 
+pub use apply::{SubstitutionReport, apply_to_workspace};
 pub use cache::TemplateCache;
 pub use collection::{DEFAULT_FEATURE_COLLECTION, DEFAULT_TEMPLATE_COLLECTION};
 pub use error::TemplateError;

@@ -828,18 +828,96 @@ mod tests {
         assert!(matches!(cli.command, super::commands::Command::Config(_)));
     }
 
-    // ── template command ────────────────────────────────────────────
+    // ── templates command ───────────────────────────────────────────
 
     #[test]
-    fn parse_template_requires_subcommand() {
-        let result = parse(&["cella", "template"]);
+    fn parse_templates_requires_subcommand() {
+        let result = parse(&["cella", "templates"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn parse_template_list() {
+    fn parse_templates_list() {
+        let cli = parse(&["cella", "templates", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::commands::Command::Templates(_)
+        ));
+    }
+
+    #[test]
+    fn parse_template_singular_alias_list() {
+        // `cella template list` (singular) must route to the same Templates variant.
         let cli = parse(&["cella", "template", "list"]).unwrap();
-        assert!(matches!(cli.command, super::commands::Command::Template(_)));
+        assert!(matches!(
+            cli.command,
+            super::commands::Command::Templates(_)
+        ));
+    }
+
+    #[test]
+    fn parse_templates_apply_requires_template_id() {
+        let result = parse(&["cella", "templates", "apply"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_templates_apply_with_template_id() {
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "--template-id",
+            "ghcr.io/devcontainers/templates/rust",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::commands::Command::Templates(_)
+        ));
+    }
+
+    #[test]
+    fn parse_templates_apply_short_flags() {
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+            "-w",
+            "/tmp/ws",
+            "-a",
+            "{}",
+            "-f",
+            "[]",
+        ])
+        .unwrap();
+        if let super::commands::Command::Templates(args) = cli.command {
+            if let super::commands::templates::TemplatesCommand::Apply(apply_args) = args.command {
+                assert_eq!(
+                    apply_args.template_id,
+                    "ghcr.io/devcontainers/templates/rust"
+                );
+            } else {
+                panic!("expected Apply subcommand");
+            }
+        } else {
+            panic!("expected Templates command");
+        }
+    }
+
+    #[test]
+    fn templates_apply_is_not_text_output() {
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+        ])
+        .unwrap();
+        assert!(!cli.command.is_text_output());
     }
 
     // ── ports command ───────────────────────────────────────────────
@@ -903,6 +981,36 @@ mod tests {
         // Commands that don't carry --log-level return None.
         let cli = parse(&["cella", "list"]).unwrap();
         assert!(cli.command.log_level().is_none());
+    }
+
+    #[test]
+    fn templates_apply_log_level_wired() {
+        use super::commands::LogLevel;
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn templates_apply_default_log_level_is_info() {
+        use super::commands::LogLevel;
+        let cli = parse(&[
+            "cella",
+            "templates",
+            "apply",
+            "-t",
+            "ghcr.io/devcontainers/templates/rust",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Info)));
     }
 
     #[test]

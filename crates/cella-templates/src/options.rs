@@ -273,4 +273,40 @@ mod tests {
         let err = resolve_options("test", &declared, &user).unwrap_err();
         assert!(matches!(err, TemplateError::InvalidOptionValue { .. }));
     }
+
+    // -----------------------------------------------------------------------
+    // Undeclared user keys: simulate the apply-path merge pattern.
+    //
+    // The CLI's templates apply path merges undeclared user keys into
+    // resolved_opts after calling resolve_options (entry().or_insert_with()).
+    // This test verifies that the merge keeps undeclared keys intact and that
+    // they would reach substitution without generating an unknown-token warning.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn undeclared_user_key_passes_through_after_merge() {
+        // Template declares "variant" only.
+        let mut declared = HashMap::new();
+        declared.insert("variant".to_owned(), make_string_option("trixie", None));
+
+        // User supplies "variant" (declared) and "custom" (undeclared).
+        let mut user = HashMap::new();
+        user.insert("variant".to_owned(), json!("bookworm"));
+        user.insert("custom".to_owned(), json!("myvalue"));
+
+        // resolve_options only processes declared keys — "custom" is absent.
+        let mut resolved = resolve_options("test", &declared, &user).unwrap();
+        assert_eq!(resolved["variant"], json!("bookworm"));
+        assert!(!resolved.contains_key("custom"));
+
+        // Apply the CLI-layer merge: undeclared user keys fill in any gaps.
+        for (k, v) in &user {
+            resolved.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        // After the merge, "custom" is present and ready for substitution.
+        assert_eq!(resolved["custom"], json!("myvalue"));
+        // Declared key must not be clobbered.
+        assert_eq!(resolved["variant"], json!("bookworm"));
+    }
 }
