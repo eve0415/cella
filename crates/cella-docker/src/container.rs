@@ -1,7 +1,7 @@
 //! Container create/start/stop/remove/inspect operations.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use bollard::models::ContainerStateStatusEnum;
 use bollard::query_parameters::{
@@ -33,6 +33,35 @@ pub(crate) fn container_state_from_bollard(status: ContainerStateStatusEnum) -> 
 
 /// Convert a bollard `ContainerSummary` into a `ContainerInfo`.
 ///
+/// Make `path` absolute and lexically normalized — the Rust equivalent of
+/// Node's `path.resolve(path)` (collapses `.`/`..` textually, never follows
+/// symlinks). Used to match the spec `devcontainer.local_folder` label the
+/// official CLI / VS Code stamp, which is `path.resolve`-derived.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)))
+                {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Used by both `find_container` and `list_cella_containers` to avoid
 /// duplicating the field-mapping logic.
 pub(crate) fn container_info_from_summary(
@@ -93,23 +122,43 @@ impl DockerClient {
         &self,
         workspace_root: &Path,
     ) -> Result<Option<ContainerInfo>, CellaDockerError> {
+        // Primary: cella's own canonical workspace label (backward compatible).
         let canonical = workspace_root
             .canonicalize()
             .unwrap_or_else(|_| workspace_root.to_path_buf());
+        if let Some(c) = self
+            .find_one_by_label(&format!("dev.cella.workspace_path={}", canonical.display()))
+            .await?
+        {
+            return Ok(Some(c));
+        }
 
-        let filters: HashMap<String, Vec<String>> = HashMap::from([(
-            "label".to_string(),
-            vec![format!("dev.cella.workspace_path={}", canonical.display())],
-        )]);
+        // Fallback: the spec `devcontainer.local_folder` label, using a LEXICAL
+        // absolute path (path.resolve-style, no symlink resolution) — matching
+        // how the official CLI / VS Code stamp it. This lets `cella up` reuse a
+        // container another tool created in the same workspace instead of
+        // creating a duplicate.
+        let lexical = lexical_absolute(workspace_root);
+        self.find_one_by_label(&format!(
+            "devcontainer.local_folder={}",
+            lexical.to_string_lossy()
+        ))
+        .await
+    }
 
+    /// Return the first container matching a single `key=value` label filter.
+    async fn find_one_by_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<ContainerInfo>, CellaDockerError> {
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("label".to_string(), vec![label.to_string()])]);
         let options = ListContainersOptions {
             all: true,
             filters: Some(filters),
             ..Default::default()
         };
-
         let containers = self.inner().list_containers(Some(options)).await?;
-
         Ok(containers
             .into_iter()
             .next()
@@ -441,6 +490,15 @@ mod tests {
         ContainerSummary, ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum,
     };
     use cella_backend::ContainerBackend;
+
+    #[test]
+    fn lexical_absolute_collapses_without_following_symlinks() {
+        use super::lexical_absolute;
+        assert_eq!(lexical_absolute(Path::new("/a/b/../c")), Path::new("/a/c"));
+        assert_eq!(lexical_absolute(Path::new("/a/./b")), Path::new("/a/b"));
+        // Cannot ascend past the root.
+        assert_eq!(lexical_absolute(Path::new("/../x")), Path::new("/x"));
+    }
 
     use super::*;
     use crate::client::mock::{MockCall, MockDockerClient};
