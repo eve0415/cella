@@ -327,6 +327,7 @@ async fn resolve_and_build_features(
             omit_remote_env: input.omit_remote_env_from_metadata,
         },
         false, // non-compose: build context IS the features dir, bare COPY works
+        cella_features::LockfilePolicy::Update,
     )
     .await
     .map_err(|e| format!("feature resolution failed: {e}"))?;

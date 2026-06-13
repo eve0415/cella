@@ -157,6 +157,7 @@ pub async fn resolve_compose_features(
                 omit_remote_env: omit_remote_env_from_metadata,
             },
             true, // compose builds use named content source via additional_contexts
+            cella_features::LockfilePolicy::NoLockfile,
         )
         .await
         .map_err(|e| format!("feature resolution failed: {e}"))

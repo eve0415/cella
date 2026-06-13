@@ -160,9 +160,16 @@ pub async fn resolve_merged_config(
         // omit-remote-env flag does not apply here.
         omit_remote_env: false,
     };
-    let rf =
-        cella_features::resolve_features(config, config_path, &platform, &cache, &base_ctx, false)
-            .await?;
+    let rf = cella_features::resolve_features(
+        config,
+        config_path,
+        &platform,
+        &cache,
+        &base_ctx,
+        false,
+        cella_features::LockfilePolicy::NoLockfile,
+    )
+    .await?;
 
     let mut merged = config.clone();
     apply_feature_config(&mut merged, &rf.container_config);

@@ -26,6 +26,7 @@ mod status;
 mod switch;
 pub mod templates;
 pub mod up;
+mod upgrade;
 
 use std::io::IsTerminal;
 
@@ -262,6 +263,8 @@ pub enum Command {
     Templates(templates::TemplatesArgs),
     /// Manage devcontainer features.
     Features(features::FeaturesArgs),
+    /// Upgrade the feature lockfile to the latest digests.
+    Upgrade(upgrade::UpgradeArgs),
     /// Show current and available versions.
     Outdated(outdated::OutdatedArgs),
     /// Initialize cella in the current repository.
@@ -390,6 +393,7 @@ impl Command {
             Self::Config(args) => args.execute().map_err(boxed_err_to_report),
             Self::Templates(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Features(args) => args.execute(progress).await.map_err(boxed_err_to_report),
+            Self::Upgrade(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Outdated(args) => args.execute().await.map_err(boxed_err_to_report),
             Self::Init(args) => args.execute(progress).await.map_err(boxed_err_to_report),
             Self::Completion(args) => {
