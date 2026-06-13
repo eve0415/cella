@@ -2,10 +2,18 @@
 //!
 //! Implements topological sort (Kahn's algorithm) over both `dependsOn` (hard)
 //! and `installsAfter` (soft) dependencies — every prerequisite must install
-//! first — with tiebreaking rules matching the devcontainer spec:
+//! first — with tiebreaking rules matching the devcontainer spec's "Round
+//! Stable Sort":
 //!
-//! 1. Official `ghcr.io/devcontainers/features/*` features sort first.
-//! 2. Among equal-priority features, declaration order is preserved.
+//! 1. Same-level features (no ordering constraint between them) sort
+//!    lexicographically by their canonical resource name — the feature
+//!    reference with any `:tag`/`@digest` version stripped — mirroring
+//!    `compareTo` -> `ociResourceCompareTo` in the official CLI's
+//!    `containerFeaturesOrder.ts`. There is no "official features first"
+//!    heuristic; `ghcr.io/devcontainers/...` only wins ties when it sorts
+//!    earlier alphabetically.
+//! 2. Equal canonical names break the tie by version tag (lexicographically),
+//!    then by declaration order for byte-identical references.
 //! 3. `overrideFeatureInstallOrder` takes precedence over computed order.
 //!
 //! `dependsOn` edges are hard ordering constraints — a feature cannot be
@@ -21,14 +29,33 @@
 //! (e.g. `A dependsOn B`, `B installsAfter A` — satisfiable by installing `B`
 //! first) is never misclassified as a fatal `dependsOn` cycle.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::error::FeatureWarning;
 use crate::types::FeatureMetadata;
 
-/// Prefix for official devcontainer features in the OCI namespace.
-const OFFICIAL_PREFIX: &str = "ghcr.io/devcontainers/features/";
+/// Split a feature reference into its canonical resource name and version.
+///
+/// Mirrors the official `ociResourceCompareTo`, which sorts on the resource
+/// (`registry/namespace/id`) first and the tag only as a secondary key. We
+/// strip a trailing `@digest` first, then a trailing `:tag`, but never touch
+/// the `:` inside a `host:port` registry — a version separator only appears
+/// after the final path segment, so we look past the last `/`.
+fn split_ref_version(id: &str) -> (&str, &str) {
+    // A digest (`@…`) always wins over a tag, and may itself contain a `:`
+    // (`@sha256:…`), so look for it first and split there.
+    if let Some(at) = id.rfind('@') {
+        return id.split_at(at);
+    }
+    // Otherwise a `:tag` separator only appears after the final path segment —
+    // never inside a `host:port` registry, which lives before the first `/`.
+    let last_segment_start = id.rfind('/').map_or(0, |slash| slash + 1);
+    id[last_segment_start..]
+        .find(':')
+        .map_or((id, ""), |rel| id.split_at(last_segment_start + rel))
+    // The returned version keeps its leading separator (`:1` / `@sha256:…`);
+    // that's fine for a stable secondary sort.
+}
 
 /// Adjacency lists plus degree counters for a Kahn sort.
 ///
@@ -48,31 +75,21 @@ struct DepGraph {
     hard_in_degree: Vec<usize>,
 }
 
-/// Priority bucket for tiebreaking in the topological sort (no override).
+/// Tiebreak key for same-level features within an install round.
 ///
-/// Lower numeric value = higher priority (installed first).
+/// Matches the official CLI's `compareTo` -> `ociResourceCompareTo`: sort by
+/// canonical resource name lexicographically, then by version tag, then by
+/// declaration order for byte-identical references. Smaller key = installed
+/// first. Borrows the feature reference from the input slice, so building a key
+/// is allocation-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SortKey {
-    /// 0 for official features, 1 for third-party.
-    tier: u8,
-    /// Index in the original declaration order.
-    declaration_index: usize,
-}
-
-/// Extended sort key used when `overrideFeatureInstallOrder` is active.
-///
-/// Override-listed features get `override_tier = 0` and sort by their
-/// position in the override list.  Unlisted features get `override_tier = 1`
-/// and fall back to the standard official-first + declaration-order tiebreak.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct OverrideSortKey {
-    /// 0 = in override list, 1 = not in override list.
-    override_tier: u8,
-    /// Position in the override list (only meaningful when `override_tier == 0`).
-    override_pos: usize,
-    /// 0 = official, 1 = third-party (only meaningful when `override_tier == 1`).
-    official_tier: u8,
-    /// Declaration index tiebreaker (only meaningful when `override_tier == 1`).
+struct SortKey<'a> {
+    /// Canonical resource name (the feature reference without its version).
+    resource: &'a str,
+    /// Version tag/digest (with its leading separator), as a secondary key.
+    version: &'a str,
+    /// Index in the original declaration order — stable fallback for
+    /// byte-identical references.
     declaration_index: usize,
 }
 
@@ -137,7 +154,7 @@ fn resolve_soft_dep(
 ///
 /// Takes features in their declaration order and returns them reordered
 /// according to `dependsOn` (hard) and `installsAfter` (soft) dependencies,
-/// official-first tiebreaking, and any explicit override.
+/// lexicographic same-level tiebreaking, and any explicit override.
 ///
 /// # Arguments
 ///
@@ -165,51 +182,37 @@ pub fn compute_install_order(
     // Build lookup: id -> declaration index
     let id_to_index = build_id_index(features);
 
-    // Determine whether any feature is official (for tiebreaking).
-    let has_official = features
-        .iter()
-        .any(|(id, _)| id.starts_with(OFFICIAL_PREFIX));
-
     // Handle override ordering.
     if let Some(overrides) = override_order {
         return apply_override(
             features,
             overrides,
             &id_to_index,
-            has_official,
             depends_on_cycle,
             &mut warnings,
         );
     }
 
     // No override — run full topological sort.
-    topological_sort(
-        features,
-        &id_to_index,
-        has_official,
-        depends_on_cycle,
-        &mut warnings,
-    )
+    topological_sort(features, &id_to_index, depends_on_cycle, &mut warnings)
 }
 
-/// Apply `overrideFeatureInstallOrder` as a **priority hint** inside the
-/// topological sort.
+/// Apply `overrideFeatureInstallOrder` as a per-round **priority hint**.
 ///
-/// Per the devcontainer spec, `overrideFeatureInstallOrder` controls which
-/// `in_degree == 0` candidate is picked first in each Kahn round.  It does
-/// NOT bypass `dependsOn` hard constraints — a feature that `dependsOn`
+/// Per the devcontainer spec, `overrideFeatureInstallOrder` raises the round
+/// priority of the listed features so they are committed in earlier rounds. It
+/// does NOT bypass `dependsOn` hard constraints — a feature that `dependsOn`
 /// another must still wait for that prerequisite regardless of its position in
-/// the override list.
+/// the override list. Mirrors `applyOverrideFeatureInstallOrder`: the first
+/// override entry gets the highest priority (`len`), the last gets `1`, and
+/// unlisted features keep priority `0`.
 ///
-/// Override-listed features use `OverrideSortKey` tier 0 (highest priority)
-/// with their override position as tiebreak, and have their own
-/// `installsAfter` soft edges ignored.  Unlisted features fall back to the
-/// standard official-first + declaration-order tiebreak (tier 1).
+/// Listed features also have their own `installsAfter` soft edges ignored so
+/// the override order wins among them.
 fn apply_override(
     features: &[(String, &FeatureMetadata)],
     overrides: &[String],
     id_to_index: &HashMap<String, usize>,
-    has_official: bool,
     depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
@@ -221,119 +224,116 @@ fn apply_override(
         .collect();
 
     let graph = build_graph(features, id_to_index, Some(&override_position));
-    let ext_key = |id: &str| override_sort_key(id, &override_position, id_to_index, has_official);
 
-    let mut in_degree = graph.in_degree.clone();
-    let mut heap: BinaryHeap<Reverse<(OverrideSortKey, usize)>> = BinaryHeap::new();
-    for (local_idx, (id, _)) in features.iter().enumerate() {
-        if in_degree[local_idx] == 0 {
-            heap.push(Reverse((ext_key(id), local_idx)));
-        }
-    }
+    // Round priority: first override entry installs soonest (highest priority).
+    let len = overrides.len();
+    let round_priority: Vec<usize> = features
+        .iter()
+        .map(|(id, _)| {
+            override_position
+                .get(id.as_str())
+                .map_or(0, |&pos| len - pos)
+        })
+        .collect();
 
-    let mut result = Vec::with_capacity(features.len());
-    while let Some(Reverse((_, local_idx))) = heap.pop() {
-        result.push(features[local_idx].0.clone());
-        // Iterate adjacency slices by reference — no per-pop clone needed.
-        for &dep in graph.hard_adj[local_idx]
-            .iter()
-            .chain(&graph.soft_adj[local_idx])
-        {
-            in_degree[dep] -= 1;
-            if in_degree[dep] == 0 {
-                heap.push(Reverse((ext_key(&features[dep].0), dep)));
-            }
-        }
-    }
-
-    if let Some(fallback) =
-        finish_with_cycle_detection(features, &graph, &result, depends_on_cycle, warnings)
-    {
-        result.extend(fallback);
-    }
-
-    (result, warnings.clone())
+    let result = schedule_rounds(features, &graph, id_to_index, &round_priority);
+    finish_schedule(features, &graph, result, depends_on_cycle, warnings)
 }
 
-/// Topological sort using Kahn's algorithm with priority-queue tiebreaking.
+/// Topological sort with the spec's "Round Stable Sort" tiebreaking and no
+/// override priorities (every feature shares round priority `0`).
 fn topological_sort(
     features: &[(String, &FeatureMetadata)],
     id_to_index: &HashMap<String, usize>,
-    has_official: bool,
     depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
-    topological_sort_with_original_indices(
-        features,
-        id_to_index,
-        id_to_index,
-        has_official,
-        depends_on_cycle,
-    )
-    .pipe_warnings(warnings)
+    let graph = build_graph(features, id_to_index, None);
+    let round_priority = vec![0; features.len()];
+    let result = schedule_rounds(features, &graph, id_to_index, &round_priority);
+    finish_schedule(features, &graph, result, depends_on_cycle, warnings)
 }
 
-/// Inner topological sort that accepts separate index maps for adjacency
-/// lookup vs. tiebreaking (needed when sorting a subset of features while
-/// preserving original declaration order).
+/// Round-based scheduler matching the official `computeDependsOnInstallationOrder`.
 ///
-/// Both `dependsOn` (hard) and `installsAfter` (soft) edges contribute to
-/// `in_degree`.  Cycle detection reasons about the hard graph in isolation so
-/// hard cycles are signalled via `depends_on_cycle` while soft-only cycles
-/// emit a warning and fall back to declaration order.
-fn topological_sort_with_original_indices(
+/// Each round collects **every** currently-eligible feature (all hard and soft
+/// prerequisites already committed in prior rounds), keeps only those at the
+/// highest round priority present, sorts that batch by [`SortKey`], and commits
+/// the whole batch before any feature it unblocks becomes eligible. Committing
+/// per-round — rather than per-node from a global priority queue — is what
+/// preserves the spec's round boundaries: a dependent unblocked this round
+/// cannot leap ahead of features that were already eligible at the round start.
+///
+/// Returns the committed feature ids in install order. A short result (fewer
+/// than `features.len()`) signals a stall for the caller's cycle detection.
+fn schedule_rounds(
     features: &[(String, &FeatureMetadata)],
-    local_id_to_index: &HashMap<String, usize>,
+    graph: &DepGraph,
     original_id_to_index: &HashMap<String, usize>,
-    has_official: bool,
-    depends_on_cycle: &mut Option<Vec<String>>,
-) -> (Vec<String>, Vec<FeatureWarning>) {
-    let mut warnings = Vec::new();
-
-    let graph = build_graph(features, local_id_to_index, None);
+    round_priority: &[usize],
+) -> Vec<String> {
+    let n = features.len();
     let mut in_degree = graph.in_degree.clone();
+    let mut committed = vec![false; n];
+    let mut result = Vec::with_capacity(n);
 
-    // Priority queue: smallest SortKey wins (installed first).
-    // BinaryHeap is max-heap, so wrap in Reverse.
-    let mut heap: BinaryHeap<Reverse<(SortKey, usize)>> = BinaryHeap::new();
-    for (local_idx, (id, _)) in features.iter().enumerate() {
-        if in_degree[local_idx] == 0 {
-            heap.push(Reverse((
-                sort_key(id, original_id_to_index, has_official),
-                local_idx,
-            )));
+    loop {
+        // Eligible = not yet committed and all prerequisites already committed.
+        let eligible: Vec<usize> = (0..n)
+            .filter(|&idx| !committed[idx] && in_degree[idx] == 0)
+            .collect();
+        if eligible.is_empty() {
+            break;
         }
-    }
 
-    let mut result = Vec::with_capacity(features.len());
-    while let Some(Reverse((_, local_idx))) = heap.pop() {
-        result.push(features[local_idx].0.clone());
-
-        // Both edge kinds impose the same install-before constraint, so a
-        // dependent only becomes schedulable once every hard AND soft
-        // prerequisite has been emitted. Iterating the adjacency slices by
-        // reference avoids cloning them on every pop.
-        for &dependent in graph.hard_adj[local_idx]
+        // Honor round priority: only commit the highest-priority eligible nodes
+        // this round (overrideFeatureInstallOrder raises listed features).
+        let max_priority = eligible
             .iter()
-            .chain(&graph.soft_adj[local_idx])
-        {
-            in_degree[dependent] -= 1;
-            if in_degree[dependent] == 0 {
-                heap.push(Reverse((
-                    sort_key(&features[dependent].0, original_id_to_index, has_official),
-                    dependent,
-                )));
+            .map(|&idx| round_priority[idx])
+            .max()
+            .unwrap_or(0);
+        let mut round: Vec<usize> = eligible
+            .into_iter()
+            .filter(|&idx| round_priority[idx] == max_priority)
+            .collect();
+
+        // Sort the round lexicographically (the spec's stable tiebreak).
+        round.sort_by(|&a, &b| {
+            sort_key(&features[a].0, original_id_to_index)
+                .cmp(&sort_key(&features[b].0, original_id_to_index))
+        });
+
+        // Commit the whole round, then unblock dependents for the next round.
+        for &idx in &round {
+            committed[idx] = true;
+            result.push(features[idx].0.clone());
+        }
+        for &idx in &round {
+            for &dependent in graph.hard_adj[idx].iter().chain(&graph.soft_adj[idx]) {
+                in_degree[dependent] -= 1;
             }
         }
     }
 
+    result
+}
+
+/// Finalize a scheduled order: append the warnings/fallback from cycle
+/// detection when the scheduler stalled before placing every feature.
+fn finish_schedule(
+    features: &[(String, &FeatureMetadata)],
+    graph: &DepGraph,
+    mut result: Vec<String>,
+    depends_on_cycle: &mut Option<Vec<String>>,
+    warnings: &mut Vec<FeatureWarning>,
+) -> (Vec<String>, Vec<FeatureWarning>) {
     if let Some(fallback) =
-        finish_with_cycle_detection(features, &graph, &result, depends_on_cycle, &mut warnings)
+        finish_with_cycle_detection(features, graph, &result, depends_on_cycle, warnings)
     {
         result.extend(fallback);
     }
-
-    (result, warnings)
+    (result, warnings.clone())
 }
 
 /// Build hard/soft adjacency lists and degree counters for the Kahn passes.
@@ -460,55 +460,19 @@ fn finish_with_cycle_detection(
     Some(leftover)
 }
 
-/// Compute the sort key for tiebreaking.
-fn sort_key(
-    id: &str,
-    original_id_to_index: &HashMap<String, usize>,
-    has_official: bool,
-) -> SortKey {
-    let is_third_party = !(has_official && id.starts_with(OFFICIAL_PREFIX));
-    let tier = u8::from(is_third_party);
+/// Compute the lexicographic tiebreak key for a feature id.
+///
+/// Matches the official CLI's `compareTo` -> `ociResourceCompareTo`: sort by
+/// canonical resource name first, then by version tag, then by declaration
+/// order as a stable fallback for byte-identical references. Borrows from `id`,
+/// so the returned key lives as long as the reference it was built from.
+fn sort_key<'a>(id: &'a str, original_id_to_index: &HashMap<String, usize>) -> SortKey<'a> {
+    let (resource, version) = split_ref_version(id);
     let declaration_index = original_id_to_index.get(id).copied().unwrap_or(usize::MAX);
     SortKey {
-        tier,
+        resource,
+        version,
         declaration_index,
-    }
-}
-
-/// Compute the `OverrideSortKey` for a feature id.
-fn override_sort_key(
-    id: &str,
-    override_position: &HashMap<&str, usize>,
-    id_to_index: &HashMap<String, usize>,
-    has_official: bool,
-) -> OverrideSortKey {
-    if let Some(&pos) = override_position.get(id) {
-        OverrideSortKey {
-            override_tier: 0,
-            override_pos: pos,
-            official_tier: 0,
-            declaration_index: 0,
-        }
-    } else {
-        let is_third_party = !(has_official && id.starts_with(OFFICIAL_PREFIX));
-        OverrideSortKey {
-            override_tier: 1,
-            override_pos: 0,
-            official_tier: u8::from(is_third_party),
-            declaration_index: id_to_index.get(id).copied().unwrap_or(usize::MAX),
-        }
-    }
-}
-
-/// Helper trait to thread warnings through.
-trait PipeWarnings {
-    fn pipe_warnings(self, target: &mut Vec<FeatureWarning>) -> (Vec<String>, Vec<FeatureWarning>);
-}
-
-impl PipeWarnings for (Vec<String>, Vec<FeatureWarning>) {
-    fn pipe_warnings(self, target: &mut Vec<FeatureWarning>) -> (Vec<String>, Vec<FeatureWarning>) {
-        target.extend(self.1.clone());
-        self
     }
 }
 
@@ -545,11 +509,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // No dependencies → declaration order preserved
+    // No dependencies → lexicographic order (here == declaration order)
     // ---------------------------------------------------------------
 
     #[test]
-    fn no_dependencies_preserves_declaration_order() {
+    fn no_dependencies_sorts_lexicographically() {
         let items = vec![
             ("alpha".to_string(), meta("alpha", &[])),
             ("beta".to_string(), meta("beta", &[])),
@@ -560,6 +524,8 @@ mod tests {
         let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
+        // alpha < beta < gamma — lexicographic order, which here coincides
+        // with declaration order.
         assert_eq!(order, vec!["alpha", "beta", "gamma"]);
     }
 
@@ -583,11 +549,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Official features sort first when tiebreaking
+    // Lexicographic tiebreak: official id sorts before third-party here
     // ---------------------------------------------------------------
 
     #[test]
-    fn official_features_sort_first_during_tiebreak() {
+    fn official_sorts_before_third_party_lexicographically() {
         let official_id = "ghcr.io/devcontainers/features/node";
         let third_party = "ghcr.io/someuser/features/foo";
 
@@ -600,16 +566,18 @@ mod tests {
         let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
-        // Official sorts first despite being declared second.
+        // "ghcr.io/devcontainers/..." < "ghcr.io/someuser/..." lexicographically
+        // ('d' < 's'), so official sorts first despite being declared second —
+        // no official-first tier, just lex order.
         assert_eq!(order, vec![official_id, third_party]);
     }
 
     // ---------------------------------------------------------------
-    // All third-party → pure declaration order (no official-first heuristic)
+    // All third-party → lexicographic by id (here == declaration order)
     // ---------------------------------------------------------------
 
     #[test]
-    fn all_third_party_uses_declaration_order() {
+    fn all_third_party_sorted_lexicographically() {
         let items = vec![
             (
                 "ghcr.io/user1/features/a".to_string(),
@@ -772,16 +740,16 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Official tiebreaking with dependencies
+    // Lexicographic tiebreak with dependencies
     // ---------------------------------------------------------------
 
     #[test]
-    fn official_tiebreak_with_dependencies() {
+    fn lexicographic_tiebreak_with_dependencies() {
         let official = "ghcr.io/devcontainers/features/node";
         let third = "ghcr.io/someuser/features/tool";
         let another = "ghcr.io/anotheruser/features/util";
 
-        // third depends on another, official has no deps.
+        // third installsAfter another, official has no deps.
         let items = vec![
             (third.to_string(), meta(third, &[another])),
             (official.to_string(), meta(official, &[])),
@@ -792,9 +760,11 @@ mod tests {
         let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
-        // official sorts first (tier 0), then another (tier 1, index 2),
-        // then third (tier 1, depends on another).
-        assert_eq!(order, vec![official, another, third]);
+        // `another` and `official` are both unconstrained at the start;
+        // "ghcr.io/anotheruser/..." < "ghcr.io/devcontainers/..." ('a' < 'd'),
+        // so `another` emits first, then `official`, then `third`
+        // (installsAfter another). No official-first tier.
+        assert_eq!(order, vec![another, official, third]);
     }
 
     // ---------------------------------------------------------------
@@ -1227,6 +1197,205 @@ mod tests {
         let members = cycle.expect("expected CyclicDependsOn signal");
         assert!(members.contains(&"a".to_string()));
         assert!(members.contains(&"b".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Lexicographic tiebreak: independent features declared out of lex order
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn independent_features_sorted_lexicographically() {
+        // Declared in reverse lex order — install order must be alphabetical.
+        let items = vec![
+            ("ghcr.io/x/zebra".to_string(), meta("ghcr.io/x/zebra", &[])),
+            ("ghcr.io/x/alpha".to_string(), meta("ghcr.io/x/alpha", &[])),
+            ("ghcr.io/x/mango".to_string(), meta("ghcr.io/x/mango", &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        // Lexicographic order: alpha < mango < zebra (not declaration order).
+        assert_eq!(
+            order,
+            vec!["ghcr.io/x/alpha", "ghcr.io/x/mango", "ghcr.io/x/zebra"]
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Lexicographic tiebreak: third-party before official when lex says so
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn third_party_before_official_when_lex_order_demands() {
+        // "ghcr.io/aaa-corp/..." < "ghcr.io/devcontainers/..." ('a' < 'd'),
+        // so the third-party feature must install BEFORE the official one —
+        // proving there is no official-first tier, only lexicographic order.
+        let official = "ghcr.io/devcontainers/features/node";
+        let third_party = "ghcr.io/aaa-corp/features/tool";
+
+        let items = vec![
+            (official.to_string(), meta(official, &[])),
+            (third_party.to_string(), meta(third_party, &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec![third_party, official]);
+    }
+
+    // ---------------------------------------------------------------
+    // Tiebreak primary key is the canonical resource (version ignored first)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tiebreak_sorts_by_resource_before_version() {
+        // `node:2` shares the `node` resource; `python:1` is a different
+        // resource. Resource name is the primary key, so node:2 (resource
+        // "...node") sorts before python:1 ("...python") even though '2' > '1'.
+        let node = "ghcr.io/devcontainers/features/node:2";
+        let python = "ghcr.io/devcontainers/features/python:1";
+
+        let items = vec![
+            (python.to_string(), meta(python, &[])),
+            (node.to_string(), meta(node, &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec![node, python]);
+    }
+
+    // ---------------------------------------------------------------
+    // Version tag is the secondary tiebreak for the same resource
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tiebreak_falls_back_to_version_for_same_resource() {
+        // Same resource, differing tags — secondary key (version) orders them
+        // lexicographically: ":1" < ":2".
+        let v2 = "ghcr.io/devcontainers/features/node:2";
+        let v1 = "ghcr.io/devcontainers/features/node:1";
+
+        let items = vec![
+            (v2.to_string(), meta(v2, &[])),
+            (v1.to_string(), meta(v1, &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec![v1, v2]);
+    }
+
+    // ---------------------------------------------------------------
+    // Tiebreak compares canonical resource, not the raw ref with its tag
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tiebreak_compares_resource_not_raw_ref_with_tag() {
+        // Raw-ref comparison would order `go-tools:1` before `go:1` because
+        // '-' (0x2d) < ':' (0x3a). Comparing the canonical resource instead
+        // puts `go` (shorter prefix) before `go-tools`, matching the official.
+        let go = "ghcr.io/devcontainers/features/go:1";
+        let go_tools = "ghcr.io/devcontainers/features/go-tools:1";
+
+        let items = vec![
+            (go_tools.to_string(), meta(go_tools, &[])),
+            (go.to_string(), meta(go, &[])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec![go, go_tools]);
+    }
+
+    // ---------------------------------------------------------------
+    // Round boundaries: a dependent unblocked mid-schedule waits a round
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn unblocked_dependent_does_not_leap_eligible_features() {
+        // `b` and `z` are eligible in round 1; `a` installsAfter `b`.
+        // Round 1 commits {b, z} (sorted: b < z); only then does `a` become
+        // eligible (round 2). Result must be b, z, a — NOT b, a, z, which a
+        // global priority queue would produce (popping b unblocks a, and
+        // a < z). This is the official round-stable behavior.
+        let items = vec![
+            ("b".to_string(), meta("b", &[])),
+            ("z".to_string(), meta("z", &[])),
+            ("a".to_string(), meta("a", &["b"])),
+        ];
+        let features = feature_list(&items);
+
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec!["b", "z", "a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Override priority installs listed features in earlier rounds
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_priority_pulls_listed_feature_into_earlier_round() {
+        // All three are independent. Override lists only `z`, so `z` gets the
+        // highest round priority and is committed alone in round 1, ahead of
+        // `a` and `b` (which would otherwise sort first lexicographically).
+        let items = vec![
+            ("a".to_string(), meta("a", &[])),
+            ("b".to_string(), meta("b", &[])),
+            ("z".to_string(), meta("z", &[])),
+        ];
+        let features = feature_list(&items);
+        let overrides = vec!["z".to_string()];
+
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
+
+        assert!(warnings.is_empty());
+        // z (override priority) first, then a, b (lex order) in the next round.
+        assert_eq!(order, vec!["z", "a", "b"]);
+    }
+
+    // ---------------------------------------------------------------
+    // split_ref_version: tag/digest stripping, host:port left intact
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn split_ref_version_handles_tag_digest_and_port() {
+        // Plain ref, no version.
+        assert_eq!(
+            split_ref_version("ghcr.io/devcontainers/features/node"),
+            ("ghcr.io/devcontainers/features/node", "")
+        );
+        // Tagged ref splits at the final-segment colon.
+        assert_eq!(
+            split_ref_version("ghcr.io/devcontainers/features/node:1"),
+            ("ghcr.io/devcontainers/features/node", ":1")
+        );
+        // Digest splits at '@' and keeps the digest as the version.
+        assert_eq!(
+            split_ref_version("ghcr.io/x/node@sha256:abc"),
+            ("ghcr.io/x/node", "@sha256:abc")
+        );
+        // host:port in the registry must NOT be mistaken for a version.
+        assert_eq!(
+            split_ref_version("localhost:5000/x/node"),
+            ("localhost:5000/x/node", "")
+        );
+        assert_eq!(
+            split_ref_version("localhost:5000/x/node:1"),
+            ("localhost:5000/x/node", ":1")
+        );
     }
 
     #[test]
