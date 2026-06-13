@@ -285,7 +285,7 @@ async fn resolve_base_image(
         result?;
         Ok(img_name)
     } else {
-        Err("devcontainer.json must specify 'image', 'build.dockerfile', or 'dockerFile'".into())
+        Err("devcontainer.json must specify 'image', 'build', or 'dockerFile'".into())
     }
 }
 
@@ -393,8 +393,10 @@ fn effective_build_config(
         .and_then(|b| b.get("dockerfile"))
         .and_then(|v| v.as_str());
 
-    // Not a Dockerfile-based config.
-    if top_dockerfile.is_none() && build_dockerfile.is_none() {
+    // Not a Dockerfile-based config: no top-level `dockerFile`, no `build` object, and no
+    // `build.dockerfile`. A `build` object without an explicit `dockerfile` is valid — it
+    // defaults to "Dockerfile" in `parse_build_options`.
+    if top_dockerfile.is_none() && build.is_none() && build_dockerfile.is_none() {
         return None;
     }
 
@@ -936,6 +938,21 @@ mod tests {
         );
         // Pure image config is not a Dockerfile build.
         assert!(effective_build_config(&serde_json::json!({ "image": "node:20" })).is_none());
+    }
+
+    #[test]
+    fn effective_build_config_build_object_without_dockerfile_is_valid() {
+        // A `build` object with no explicit `dockerfile` is a valid Dockerfile config —
+        // `parse_build_options` defaults `dockerfile` to "Dockerfile".
+        let cfg = serde_json::json!({ "build": { "args": { "FOO": "bar" } } });
+        let build = effective_build_config(&cfg)
+            .expect("build object without dockerfile should return Some");
+        assert_eq!(
+            build.get("args").unwrap(),
+            &serde_json::json!({ "FOO": "bar" })
+        );
+        // No dockerfile key injected — `parse_build_options` will apply the default.
+        assert!(build.get("dockerfile").is_none());
     }
 
     #[test]
