@@ -78,6 +78,28 @@ impl ResolvedConfig {
     pub fn host_requirements(&self) -> Option<&crate::schema::DevContainerCommonHostRequirements> {
         self.typed.as_ref().and_then(|t| t.host_requirements())
     }
+
+    /// Returns the declared secrets from the top-level `secrets` property.
+    ///
+    /// Each entry names an environment variable that the container expects to
+    /// have set, along with optional documentation metadata. These are
+    /// advisory — they do not inject values. Use `--secrets-file` for
+    /// value injection.
+    ///
+    /// Returns `None` when the config has no `secrets` key, or an empty map
+    /// when the key is present but empty.
+    #[must_use]
+    pub fn secrets(
+        &self,
+    ) -> Option<std::collections::HashMap<String, super::secrets::SecretDeclaration>> {
+        let raw_map = self.typed.as_ref()?.secrets()?;
+        Some(
+            raw_map
+                .iter()
+                .map(|(k, v)| (k.clone(), super::secrets::SecretDeclaration::from_value(v)))
+                .collect(),
+        )
+    }
 }
 
 /// Compute the spec-compliant `devcontainerId`.
@@ -688,5 +710,86 @@ mod tests {
         create_devcontainer(tmp.path(), r#"{"image": "ubuntu", "unknownField": true}"#);
         let resolved = config(tmp.path(), None).unwrap();
         assert!(resolved.typed.is_some());
+    }
+
+    #[test]
+    fn secrets_returns_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(tmp.path(), r#"{"image": "ubuntu"}"#);
+        let resolved = config(tmp.path(), None).unwrap();
+        assert!(resolved.secrets().is_none());
+    }
+
+    #[test]
+    fn secrets_parses_full_declaration() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{
+                "image": "ubuntu",
+                "secrets": {
+                    "GITHUB_TOKEN": {
+                        "description": "GitHub personal access token",
+                        "documentationUrl": "https://docs.github.com/en/authentication"
+                    }
+                }
+            }"#,
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        let secrets = resolved.secrets().expect("secrets should be present");
+        assert_eq!(secrets.len(), 1);
+        let decl = secrets
+            .get("GITHUB_TOKEN")
+            .expect("GITHUB_TOKEN should exist");
+        assert_eq!(
+            decl.description.as_deref(),
+            Some("GitHub personal access token")
+        );
+        assert_eq!(
+            decl.documentation_url.as_deref(),
+            Some("https://docs.github.com/en/authentication")
+        );
+    }
+
+    #[test]
+    fn secrets_parses_declaration_without_optional_fields() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{
+                "image": "ubuntu",
+                "secrets": {
+                    "API_KEY": {}
+                }
+            }"#,
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        let secrets = resolved.secrets().expect("secrets should be present");
+        assert_eq!(secrets.len(), 1);
+        let decl = secrets.get("API_KEY").expect("API_KEY should exist");
+        assert!(decl.description.is_none());
+        assert!(decl.documentation_url.is_none());
+    }
+
+    #[test]
+    fn secrets_parses_multiple_declarations() {
+        let tmp = TempDir::new().unwrap();
+        create_devcontainer(
+            tmp.path(),
+            r#"{
+                "image": "ubuntu",
+                "secrets": {
+                    "GITHUB_TOKEN": { "description": "GitHub token" },
+                    "NPM_TOKEN": { "description": "npm registry token" },
+                    "DB_PASSWORD": {}
+                }
+            }"#,
+        );
+        let resolved = config(tmp.path(), None).unwrap();
+        let secrets = resolved.secrets().expect("secrets should be present");
+        assert_eq!(secrets.len(), 3);
+        assert!(secrets.contains_key("GITHUB_TOKEN"));
+        assert!(secrets.contains_key("NPM_TOKEN"));
+        assert!(secrets.contains_key("DB_PASSWORD"));
     }
 }
