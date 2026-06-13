@@ -70,13 +70,12 @@ pub async fn probe_and_cache_user_env(
     Some(env)
 }
 
-/// Try one probe method and return the parsed env, or `None` to signal the
+/// Try one probe method and return the parsed env, or an error to signal the
 /// caller should fall back to the next method.
 ///
-/// Returns `None` on timeout (caller must not retry — a hang is a hang), on
-/// exec error, on non-zero exit, or when the parsed map is empty.
-/// A timeout is signalled by setting the bool to `true`; all other failures
-/// leave it `false`.
+/// Returns `Ok(env)` on success. Returns `Err(true)` on timeout (caller must
+/// not retry — a hang is a hang). Returns `Err(false)` on exec error,
+/// non-zero exit, or when the parsed map is empty.
 async fn try_probe_method(
     client: &dyn ContainerBackend,
     container_id: &str,

@@ -87,7 +87,12 @@ pub const PROBE_METHODS: &[ProbeMethod] = &[
 /// from the output. Returns `None` when `probe_type` is `None`.
 ///
 /// PowerShell (`pwsh` / `pwsh-preview`) uses `-Login -Command` or `-Command`
-/// instead of POSIX flags, matching the official devcontainer CLI behaviour.
+/// instead of POSIX flags. Because PowerShell's `echo` is an alias for
+/// `Write-Output` (which always appends a newline, treating `-n` as literal
+/// data), the marker write uses `[Console]::Write(...)` instead. Similarly,
+/// `/proc/self/environ` is not reliable in PowerShell, so the PowerShell path
+/// uses `Get-ChildItem Env:` with `printenv`-style newline separation and
+/// ignores `method` for the env-dump command.
 pub fn probe_command(
     probe_type: UserEnvProbe,
     shell: &str,
@@ -97,12 +102,18 @@ pub fn probe_command(
     if probe_type == UserEnvProbe::None {
         return None;
     }
-    let wrapped = format!("echo -n {marker}; {}; echo -n {marker}", method.command);
     let name = std::path::Path::new(shell)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
     if name == "pwsh" || name == "pwsh-preview" {
+        // PowerShell: use [Console]::Write for no-newline marker and
+        // Get-ChildItem Env: for newline-delimited KEY=VALUE output.
+        let wrapped = format!(
+            "[Console]::Write('{marker}'); \
+             Get-ChildItem Env: | ForEach-Object {{ \"$($_.Name)=$($_.Value)\" }}; \
+             [Console]::Write('{marker}')"
+        );
         let mut args = vec![shell.to_string()];
         if matches!(
             probe_type,
@@ -114,6 +125,7 @@ pub fn probe_command(
         args.push(wrapped);
         Some(args)
     } else {
+        let wrapped = format!("echo -n {marker}; {}; echo -n {marker}", method.command);
         let flags = probe_type.shell_flags()?;
         Some(vec![
             shell.to_string(),
@@ -239,7 +251,6 @@ mod tests {
     #[test]
     fn probe_command_pwsh_login_interactive_uses_login_flag() {
         let marker = "M";
-        let inner = format!("echo -n {marker}; cat /proc/self/environ; echo -n {marker}");
         let cmd = probe_command(
             UserEnvProbe::LoginInteractiveShell,
             "/usr/bin/pwsh",
@@ -247,17 +258,28 @@ mod tests {
             PROBE_METHODS[0],
         )
         .unwrap();
-        assert_eq!(
-            cmd,
-            vec!["/usr/bin/pwsh", "-Login", "-Command", &inner],
-            "pwsh LoginInteractiveShell must include -Login"
+        assert_eq!(cmd[0], "/usr/bin/pwsh");
+        assert_eq!(cmd[1], "-Login");
+        assert_eq!(cmd[2], "-Command");
+        // Must use [Console]::Write for no-newline marker (not echo -n)
+        assert!(
+            cmd[3].contains("[Console]::Write('M')"),
+            "pwsh marker must use [Console]::Write, not echo -n: {cmd:?}"
+        );
+        // Must use Get-ChildItem Env: instead of cat /proc/self/environ
+        assert!(
+            cmd[3].contains("Get-ChildItem Env:"),
+            "pwsh env dump must use Get-ChildItem Env:: {cmd:?}"
+        );
+        assert!(
+            !cmd[3].contains("echo -n"),
+            "pwsh must NOT use echo -n (emits -n as literal data): {cmd:?}"
         );
     }
 
     #[test]
     fn probe_command_pwsh_interactive_no_login_flag() {
         let marker = "M";
-        let inner = format!("echo -n {marker}; cat /proc/self/environ; echo -n {marker}");
         let cmd = probe_command(
             UserEnvProbe::InteractiveShell,
             "/usr/bin/pwsh",
@@ -265,10 +287,11 @@ mod tests {
             PROBE_METHODS[0],
         )
         .unwrap();
-        assert_eq!(
-            cmd,
-            vec!["/usr/bin/pwsh", "-Command", &inner],
-            "pwsh InteractiveShell must NOT include -Login"
+        assert_eq!(cmd[0], "/usr/bin/pwsh");
+        assert_eq!(cmd[1], "-Command");
+        assert!(
+            !cmd[2].contains("echo -n"),
+            "pwsh must NOT use echo -n: {cmd:?}"
         );
     }
 
@@ -283,6 +306,57 @@ mod tests {
         .unwrap();
         assert_eq!(cmd[1], "-Login");
         assert_eq!(cmd[2], "-Command");
+    }
+
+    /// Regression: PowerShell `echo -n` outputs `-n` literally (emits a
+    /// newline before the probed content), corrupting the first env var.
+    /// The fix is `[Console]::Write(marker)` which writes without a newline.
+    #[test]
+    fn probe_command_pwsh_marker_no_newline_regression() {
+        let marker = "UNIQUE-MARKER-123";
+        let cmd = probe_command(
+            UserEnvProbe::LoginInteractiveShell,
+            "/usr/bin/pwsh",
+            marker,
+            PROBE_METHODS[0],
+        )
+        .unwrap();
+        let inner = &cmd[cmd.len() - 1];
+        assert!(
+            inner.contains(&format!("[Console]::Write('{marker}')")),
+            "marker must be written with [Console]::Write to avoid leading newline: {inner}"
+        );
+        assert!(
+            !inner.contains("echo"),
+            "must not use echo for marker in pwsh — echo is Write-Output and adds a newline: {inner}"
+        );
+    }
+
+    /// Regression: PowerShell does not reliably pass NUL bytes through stdout,
+    /// so `cat /proc/self/environ` output is unreliable under pwsh. The probe
+    /// must use `Get-ChildItem Env:` (newline-delimited) instead, regardless
+    /// of which `ProbeMethod` is passed.
+    #[test]
+    fn probe_command_pwsh_uses_get_child_item_not_proc_environ() {
+        for method in PROBE_METHODS {
+            let cmd = probe_command(
+                UserEnvProbe::LoginInteractiveShell,
+                "/usr/bin/pwsh",
+                "M",
+                *method,
+            )
+            .unwrap();
+            let inner = &cmd[cmd.len() - 1];
+            assert!(
+                inner.contains("Get-ChildItem Env:"),
+                "pwsh probe must use Get-ChildItem Env: (method={}): {inner}",
+                method.command
+            );
+            assert!(
+                !inner.contains("/proc/self/environ"),
+                "pwsh probe must NOT use /proc/self/environ (NUL passthrough unreliable): {inner}"
+            );
+        }
     }
 
     #[test]
