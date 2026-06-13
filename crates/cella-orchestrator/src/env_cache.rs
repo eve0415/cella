@@ -5,7 +5,9 @@ use tracing::{debug, warn};
 
 use cella_backend::{ContainerBackend, ExecOptions, FileToUpload};
 use cella_env::platform::DockerRuntime;
-use cella_env::user_env_probe::UserEnvProbe;
+use cella_env::user_env_probe::{
+    PROBE_METHODS, ProbeMethod, UserEnvProbe, parse_probed_env, probe_command,
+};
 
 /// Compute the per-user, per-probe-type cache path for the probed environment.
 ///
@@ -68,10 +70,81 @@ pub async fn probe_and_cache_user_env(
     Some(env)
 }
 
+/// Try one probe method and return the parsed env, or an error to signal the
+/// caller should fall back to the next method.
+///
+/// Returns `Ok(env)` on success. Returns `Err(true)` on timeout (caller must
+/// not retry — a hang is a hang). Returns `Err(false)` on exec error,
+/// non-zero exit, or when the parsed map is empty.
+async fn try_probe_method(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    probe_type: UserEnvProbe,
+    shell: &str,
+    marker: &str,
+    method: ProbeMethod,
+) -> Result<HashMap<String, String>, bool> {
+    let Some(cmd) = probe_command(probe_type, shell, marker, method) else {
+        // Only happens for UserEnvProbe::None — already guarded in run_env_probe.
+        return Err(false);
+    };
+
+    debug!(
+        "Running userEnvProbe ({probe_type}) with {shell} via `{}`: {cmd:?}",
+        method.command
+    );
+
+    let exec_opts = ExecOptions {
+        cmd,
+        user: Some(user.to_string()),
+        env: None,
+        working_dir: None,
+    };
+    let exec_future = client.exec_command(container_id, &exec_opts);
+
+    let result = match tokio::time::timeout(Duration::from_secs(10), exec_future).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => return Err(false),
+        Err(_) => {
+            warn!(
+                "userEnvProbe timed out after 10s \
+                 — avoid waiting for user input in shell startup scripts"
+            );
+            return Err(true); // timed out — abort all further methods
+        }
+    };
+
+    if result.exit_code != 0 {
+        debug!(
+            "userEnvProbe method `{}` failed (exit {}): {}",
+            method.command,
+            result.exit_code,
+            result.stderr.trim()
+        );
+        return Err(false);
+    }
+
+    let env = parse_probed_env(&result.stdout, marker, method.separator);
+    if env.is_empty() {
+        debug!(
+            "userEnvProbe method `{}` yielded empty env — trying fallback",
+            method.command
+        );
+        return Err(false);
+    }
+
+    Ok(env)
+}
+
 /// Execute the environment probe command and parse the output.
 ///
-/// Applies a 10-second timeout to prevent indefinite hangs from shell
-/// startup scripts that wait for user input.
+/// Tries each method in [`PROBE_METHODS`] in order, returning the first
+/// non-empty result. A UUID marker is embedded in the shell command so that
+/// shell-startup noise printed to stdout is stripped before parsing.
+///
+/// Applies a 10-second timeout per method. A timeout aborts all further
+/// attempts — a hanging shell startup script won't be retried.
 async fn run_env_probe(
     client: &dyn ContainerBackend,
     container_id: &str,
@@ -79,39 +152,31 @@ async fn run_env_probe(
     probe_type: UserEnvProbe,
     shell: &str,
 ) -> Option<HashMap<String, String>> {
-    let probe_cmd = cella_env::user_env_probe::probe_command(probe_type, shell)?;
-
-    debug!("Running userEnvProbe ({probe_type}) with {shell}: {probe_cmd:?}");
-
-    let exec_opts = ExecOptions {
-        cmd: probe_cmd,
-        user: Some(user.to_string()),
-        env: None,
-        working_dir: None,
-    };
-    let exec_future = client.exec_command(container_id, &exec_opts);
-
-    let result = if let Ok(r) = tokio::time::timeout(Duration::from_secs(10), exec_future).await {
-        r.ok()?
-    } else {
-        warn!(
-            "userEnvProbe timed out after 10s \
-             — avoid waiting for user input in shell startup scripts"
-        );
-        return None;
-    };
-
-    if result.exit_code != 0 {
-        debug!(
-            "userEnvProbe failed (exit {}): {}",
-            result.exit_code,
-            result.stderr.trim()
-        );
+    if probe_type == UserEnvProbe::None {
         return None;
     }
 
-    let env = cella_env::user_env_probe::parse_probed_env(&result.stdout);
-    if env.is_empty() { None } else { Some(env) }
+    let marker = uuid::Uuid::new_v4().to_string();
+
+    for method in PROBE_METHODS {
+        match try_probe_method(
+            client,
+            container_id,
+            user,
+            probe_type,
+            shell,
+            &marker,
+            *method,
+        )
+        .await
+        {
+            Ok(env) => return Some(env),
+            Err(true) => return None, // timed out — don't retry a hanging shell
+            Err(false) => {}          // other failure — fall back to next method
+        }
+    }
+
+    None
 }
 
 /// Write the probed environment to a cache file inside the container.
