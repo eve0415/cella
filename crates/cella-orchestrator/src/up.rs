@@ -1931,6 +1931,9 @@ impl EnsureUpContext<'_> {
             None
         };
 
+        // Clone only what's needed after `resolve_image_config` consumes `base_image_details`.
+        let image_user = base_image_details.user.clone();
+
         let agent_arch = self.detect_arch().await;
         let ImageConfig {
             image_env,
@@ -1939,7 +1942,7 @@ impl EnsureUpContext<'_> {
             mut create_opts,
         } = self.resolve_image_config(
             &img_name,
-            base_image_details.clone(),
+            base_image_details,
             resolved_features.as_ref(),
             &agent_arch,
         )?;
@@ -1951,7 +1954,7 @@ impl EnsureUpContext<'_> {
         self.maybe_remap_uid(
             config,
             &img_name,
-            &base_image_details.user,
+            &image_user,
             &remote_user,
             &mut create_opts,
         )

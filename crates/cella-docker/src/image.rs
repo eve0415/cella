@@ -104,7 +104,11 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push("--load".to_string());
     }
 
-    if let Some(platform) = &opts.platform {
+    // `--platform` requires BuildKit; the classic builder (use_buildkit=false) doesn't
+    // support it. Emit on both buildx and non-buildx paths when BuildKit is allowed.
+    if opts.use_buildkit
+        && let Some(platform) = &opts.platform
+    {
         args.extend(["--platform".to_string(), platform.clone()]);
     }
 
@@ -782,6 +786,20 @@ mod tests {
         assert!(
             !args.contains(&"--platform".to_string()),
             "platform:None must not emit --platform; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_platform_suppressed_on_classic_builder() {
+        // use_buildkit=false (classic builder) must never emit --platform,
+        // even when opts.platform is set. The classic builder doesn't support it.
+        let mut opts = basic_opts();
+        opts.use_buildkit = false;
+        opts.platform = Some("linux/amd64".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(
+            !args.contains(&"--platform".to_string()),
+            "--platform must be suppressed on classic builder; args: {args:?}"
         );
     }
 
