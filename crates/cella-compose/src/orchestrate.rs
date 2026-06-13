@@ -727,9 +727,14 @@ async fn install_dotfiles_step(
     {
         Ok(()) => step.finish(),
         Err(e) => {
-            warn!("Dotfiles install failed (continuing): {e}");
+            // The dotfiles script runs with the secret-bearing lifecycle_env;
+            // its failure message can echo stderr that contains secret values,
+            // so mask before logging or surfacing to the terminal.
+            let err_text = e.to_string();
+            let msg = hooks.lifecycle_secret_masker().mask(&err_text);
+            warn!("Dotfiles install failed (continuing): {msg}");
             step.fail("failed");
-            progress.warn(&format!("Dotfiles install failed (continuing): {e}"));
+            progress.warn(&format!("Dotfiles install failed (continuing): {msg}"));
         }
     }
 }
