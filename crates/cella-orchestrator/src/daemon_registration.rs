@@ -106,8 +106,8 @@ fn parse_forward_ports(config: &serde_json::Value) -> Vec<u16> {
 
 /// Extract `host:port` entries from `forwardPorts`.
 ///
-/// Only string values matching `<host>:<port>` where host contains
-/// `[A-Za-z0-9._-]+` and port is a valid `u16` are returned. Bare numbers,
+/// Only string values matching the devcontainer schema's `host:port` pattern
+/// (`^([a-z0-9-]+):(\d{1,5})$`) with a `u16` port are returned. Bare numbers,
 /// numeric strings, and malformed entries are excluded (handled by
 /// `parse_forward_ports`).
 pub(crate) fn parse_forward_host_ports(config: &serde_json::Value) -> Vec<HostForwardPort> {
@@ -120,12 +120,15 @@ pub(crate) fn parse_forward_host_ports(config: &serde_json::Value) -> Vec<HostFo
 
 fn forward_host_port(value: &serde_json::Value) -> Option<HostForwardPort> {
     let s = value.as_str()?;
-    let (host, port_str) = s.rsplit_once(':')?;
-    // Host must be non-empty and contain only valid DNS label characters.
+    let (host, port_str) = s.split_once(':')?;
+    // Match the devcontainer schema's `host:port` host charset exactly
+    // (`[a-z0-9-]+`): lowercase alphanumerics and dashes. VS Code and the
+    // official CLI reject other characters (uppercase, `_`, `.`) as invalid
+    // hostnames, so accepting them here would diverge from the spec.
     if host.is_empty()
         || !host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return None;
     }
@@ -175,9 +178,9 @@ mod tests {
             })
         );
         assert_eq!(
-            forward_host_port(&json!("my-service.internal:8080")),
+            forward_host_port(&json!("my-service:8080")),
             Some(HostForwardPort {
-                host: "my-service.internal".to_string(),
+                host: "my-service".to_string(),
                 port: 8080,
             })
         );
@@ -195,8 +198,14 @@ mod tests {
         assert_eq!(forward_host_port(&json!(":5432")), None);
         // No colon — not a host:port.
         assert_eq!(forward_host_port(&json!("abc")), None);
-        // Invalid host characters.
+        // Invalid host characters (the schema host charset is `[a-z0-9-]`).
         assert_eq!(forward_host_port(&json!("my service:80")), None);
+        // Uppercase, dots, and underscores are not in the schema host charset.
+        assert_eq!(forward_host_port(&json!("MyService:80")), None);
+        assert_eq!(forward_host_port(&json!("my.service:80")), None);
+        assert_eq!(forward_host_port(&json!("my_service:80")), None);
+        // Multiple colons (extra `:` is not a valid host character).
+        assert_eq!(forward_host_port(&json!("a:b:80")), None);
     }
 
     #[test]
