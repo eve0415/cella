@@ -104,6 +104,14 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push("--load".to_string());
     }
 
+    // `--platform` requires BuildKit; the classic builder (use_buildkit=false) doesn't
+    // support it. Emit on both buildx and non-buildx paths when BuildKit is allowed.
+    if opts.use_buildkit
+        && let Some(platform) = &opts.platform
+    {
+        args.extend(["--platform".to_string(), platform.clone()]);
+    }
+
     args.extend(["-t".to_string(), opts.image_name.clone()]);
 
     args.extend([
@@ -342,6 +350,9 @@ impl DockerClient {
                     user,
                     env,
                     metadata,
+                    os: details.os.clone(),
+                    architecture: details.architecture.clone(),
+                    variant: details.variant.clone(),
                 })
             }
             Err(bollard::errors::Error::DockerResponseServerError {
@@ -394,6 +405,7 @@ mod tests {
             secrets: Vec::new(),
             use_buildkit: true,
             docker_path: None,
+            platform: None,
         }
     }
 
@@ -725,6 +737,70 @@ mod tests {
         assert_eq!(positions.len(), 2);
         assert_eq!(args[positions[0] + 1], "cli:1");
         assert_eq!(args[positions[1] + 1], "cfg:1");
+    }
+
+    #[test]
+    fn build_args_with_platform() {
+        let mut opts = basic_opts();
+        opts.platform = Some("linux/amd64".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(args.contains(&"--platform".to_string()));
+        assert!(args.contains(&"linux/amd64".to_string()));
+    }
+
+    #[test]
+    fn build_args_no_platform_omits_flag() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert!(!args.contains(&"--platform".to_string()));
+    }
+
+    #[test]
+    fn build_args_platform_with_buildkit_correct_order() {
+        // buildx path: ["buildx", "build", "--progress=plain", "--load",
+        //               "--platform", "linux/amd64", "-t", …]
+        // --platform must appear before -t and after --load.
+        let mut opts = basic_opts();
+        opts.platform = Some("linux/amd64".to_string());
+        let args = build_command_args(&opts, true);
+        assert!(args.contains(&"--platform".to_string()));
+        assert!(args.contains(&"linux/amd64".to_string()));
+        let platform_idx = args.iter().position(|a| a == "--platform").unwrap();
+        let tag_idx = args.iter().position(|a| a == "-t").unwrap();
+        let load_idx = args.iter().position(|a| a == "--load").unwrap();
+        assert!(
+            load_idx < platform_idx,
+            "--platform should come after --load; args: {args:?}"
+        );
+        assert!(
+            platform_idx < tag_idx,
+            "--platform should come before -t; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_no_platform_none_omits_flag_buildkit() {
+        // platform: None on the buildx path must not emit --platform at all.
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert!(
+            !args.contains(&"--platform".to_string()),
+            "platform:None must not emit --platform; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_platform_suppressed_on_classic_builder() {
+        // use_buildkit=false (classic builder) must never emit --platform,
+        // even when opts.platform is set. The classic builder doesn't support it.
+        let mut opts = basic_opts();
+        opts.use_buildkit = false;
+        opts.platform = Some("linux/amd64".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(
+            !args.contains(&"--platform".to_string()),
+            "--platform must be suppressed on classic builder; args: {args:?}"
+        );
     }
 
     #[test]

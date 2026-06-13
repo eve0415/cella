@@ -591,6 +591,11 @@ impl ContainerBackend for AppleContainerBackend {
                 user,
                 env,
                 metadata,
+                // Apple Container CLI inspect doesn't expose OS/arch fields;
+                // platform is not needed for UID remap on this backend.
+                os: None,
+                architecture: None,
+                variant: None,
             })
         })
     }

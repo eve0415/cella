@@ -75,6 +75,23 @@ fn remap_unsupported_on_host(host_os: &str) -> bool {
     host_os != "linux"
 }
 
+/// Compute the platform string from image inspect fields.
+///
+/// Joins non-empty fields with `/`: `linux/amd64` or `linux/arm64/v8`.
+/// Returns `None` when os is absent or empty (platform cannot be determined).
+pub fn image_platform(
+    os: Option<&str>,
+    arch: Option<&str>,
+    variant: Option<&str>,
+) -> Option<String> {
+    let os = os.filter(|s| !s.is_empty())?;
+    let parts: Vec<&str> = std::iter::once(os)
+        .chain(arch.into_iter().filter(|s| !s.is_empty()))
+        .chain(variant.into_iter().filter(|s| !s.is_empty()))
+        .collect();
+    Some(parts.join("/"))
+}
+
 /// Build a UID-remapped image on top of `base_image`.
 ///
 /// Returns `Ok(Some(uid_image_name))` when a new image was built, or
@@ -86,6 +103,10 @@ fn remap_unsupported_on_host(host_os: &str) -> bool {
 ///
 /// On build failure, logs a warning and returns `Ok(None)` so the caller
 /// can fall back to the unmodified base image.
+///
+/// The platform (`--platform`) is derived by inspecting `base_image` after
+/// the skip guards pass. On inspect failure the flag is omitted, which is
+/// byte-identical to the pre-platform behaviour.
 ///
 /// # Errors
 ///
@@ -119,6 +140,20 @@ pub async fn build_uid_remap_image(
         return Ok(None);
     }
 
+    // Inspect the base image to derive `--platform`. Failures are non-fatal:
+    // omitting `--platform` is byte-identical to the pre-platform behaviour.
+    let platform = client
+        .inspect_image_details(base_image)
+        .await
+        .ok()
+        .and_then(|d| {
+            image_platform(
+                d.os.as_deref(),
+                d.architecture.as_deref(),
+                d.variant.as_deref(),
+            )
+        });
+
     let uid_image = format!("{base_image}-uid");
 
     let context_dir = uid_context_dir()?;
@@ -144,6 +179,7 @@ pub async fn build_uid_remap_image(
         secrets: vec![],
         use_buildkit: toolchain.use_buildkit,
         docker_path: toolchain.docker_path.map(str::to_string),
+        platform,
     };
 
     info!("Building UID remap image: {uid_image} (UID {host_uid}:{host_gid})");
@@ -222,5 +258,53 @@ mod tests {
         // Off Linux, Docker Desktop's VM handles bind-mount ownership.
         assert!(remap_unsupported_on_host("macos"));
         assert!(remap_unsupported_on_host("windows"));
+    }
+
+    // -----------------------------------------------------------------------
+    // image_platform
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn image_platform_linux_amd64() {
+        assert_eq!(
+            image_platform(Some("linux"), Some("amd64"), None),
+            Some("linux/amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn image_platform_linux_arm64_v8() {
+        assert_eq!(
+            image_platform(Some("linux"), Some("arm64"), Some("v8")),
+            Some("linux/arm64/v8".to_string())
+        );
+    }
+
+    #[test]
+    fn image_platform_missing_os_returns_none() {
+        assert_eq!(image_platform(None, Some("amd64"), None), None);
+    }
+
+    #[test]
+    fn image_platform_empty_os_returns_none() {
+        assert_eq!(image_platform(Some(""), Some("amd64"), None), None);
+    }
+
+    #[test]
+    fn image_platform_os_only() {
+        assert_eq!(
+            image_platform(Some("linux"), None, None),
+            Some("linux".to_string())
+        );
+    }
+
+    #[test]
+    fn image_platform_empty_arch_skipped_no_trailing_slash() {
+        // OS present, ARCH is an empty string — must be filtered, not joined.
+        // Expected: "linux", not "linux/".
+        assert_eq!(
+            image_platform(Some("linux"), Some(""), None),
+            Some("linux".to_string())
+        );
     }
 }

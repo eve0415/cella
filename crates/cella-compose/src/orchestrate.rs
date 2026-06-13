@@ -1023,6 +1023,10 @@ async fn resolve_compose_gpu(ctx: &Ctx<'_>, config: &serde_json::Value) -> bool 
 /// Build a UID-remapped image for the compose service.
 ///
 /// Returns the UID-remapped image name, or `None` if remap was skipped.
+///
+/// The platform (`--platform`) is resolved internally by
+/// [`cella_backend::uid_image::build_uid_remap_image`] via image inspection,
+/// covering both image-only and features-build paths correctly.
 async fn build_uid_remap_image_compose(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
@@ -1042,6 +1046,10 @@ async fn build_uid_remap_image_compose(
         return Ok(None);
     }
 
+    // compose_image is the ACTUAL image that will be used as the remap base:
+    // either the features-build image override or the default {project}-{service}.
+    // build_uid_remap_image inspects THIS image to derive --platform, so the
+    // compose+features path (features_build is Some) gets the correct platform.
     let compose_image = features_build
         .and_then(|b| b.image_name_override.clone())
         .unwrap_or_else(|| format!("{}-{}", project.project_name, project.primary_service));

@@ -1925,12 +1925,14 @@ impl EnsureUpContext<'_> {
             })
             .await?;
 
-        let image_user = base_image_details.user.clone();
         let image_metadata = if resolved_features.is_none() {
             base_image_details.metadata.clone()
         } else {
             None
         };
+
+        // Clone only what's needed after `resolve_image_config` consumes `base_image_details`.
+        let image_user = base_image_details.user.clone();
 
         let agent_arch = self.detect_arch().await;
         let ImageConfig {
