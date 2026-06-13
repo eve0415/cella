@@ -175,18 +175,22 @@ pub async fn resolve_merged_config(
 ///
 /// Official shape (from devcontainers/cli `src/spec-node/imageMetadata.ts`):
 /// - Removes singular lifecycle keys; emits plural `*Commands` arrays (always,
-///   even empty), raw command values verbatim, base config first then features.
-/// - Removes `entrypoint`; emits `entrypoints` string array.
+///   even empty), raw command values verbatim, features in install order then
+///   devcontainer.json last.
+/// - Removes `entrypoint`; emits `entrypoints` string array. Omitted when empty.
 /// - `shutdownAction`: last-wins (devcontainer.json wins over features).
 /// - `customizations`: `Record<tool, contributions[]>` — each source's
 ///   customization object pushed per tool key. Omitted when empty.
-/// - `capAdd`, `securityOpt`, `forwardPorts`: Set union/dedup.
+/// - `capAdd`, `securityOpt`: Set union/dedup.
 /// - `mounts`: concat then dedup by target (last per target wins).
 /// - `init`, `privileged`: OR (any true wins).
-/// - `containerEnv`, `remoteEnv`, `portsAttributes`: last-wins maps.
-/// - Last-wins scalars: `remoteUser`, `containerUser`, `userEnvProbe`,
-///   `overrideCommand`, `updateRemoteUserUID`, `waitFor`, `otherPortsAttributes`.
+/// - `containerEnv`: feature contributions merged over base (feature wins
+///   collisions, matching metadata-array last-wins from features before
+///   devcontainer.json; omitted when no feature contributions).
 /// - Passthrough unchanged: everything else in the config not in `replaceProperties`.
+///   This includes `forwardPorts`, `remoteEnv`, `portsAttributes`, `remoteUser`,
+///   and other last-wins scalars — they pass through from the devcontainer.json
+///   config unchanged (no cross-source merge needed for the read-configuration path).
 fn build_merged_output(
     config: &serde_json::Value,
     rf: Option<&ResolvedFeatures>,
@@ -219,11 +223,17 @@ fn build_merged_output(
     merged["postStartCommands"] = lifecycle_commands_array(config, "postStartCommand", fc);
     merged["postAttachCommands"] = lifecycle_commands_array(config, "postAttachCommand", fc);
 
-    // --- entrypoints ---
-    let entrypoints: Vec<_> = fc
+    // --- entrypoints: omit when empty, matching official behaviour ---
+    let entrypoints: Vec<serde_json::Value> = fc
         .map(|c| c.entrypoints.iter().map(|ep| json!(ep)).collect())
         .unwrap_or_default();
-    merged["entrypoints"] = json!(entrypoints);
+    if entrypoints.is_empty() {
+        if let Some(obj) = merged.as_object_mut() {
+            obj.remove("entrypoints");
+        }
+    } else {
+        merged["entrypoints"] = json!(entrypoints);
+    }
 
     // --- shutdownAction last-wins (devcontainer.json wins) ---
     // Features don't carry shutdownAction; only devcontainer.json does.
@@ -634,6 +644,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
 
         let out = build_merged_output(&config, Some(&rf));
@@ -699,6 +710,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
 
         let out = build_merged_output(&config, Some(&rf));
@@ -708,10 +720,14 @@ mod tests {
     }
 
     #[test]
-    fn merged_output_entrypoints_empty_when_no_features() {
+    fn merged_output_entrypoints_omitted_when_empty() {
         let config = json!({"image": "ubuntu"});
         let out = build_merged_output(&config, None);
-        assert_eq!(out["entrypoints"], json!([]));
+        // Official mergeConfiguration omits entrypoints when there are none.
+        assert!(
+            out.get("entrypoints").is_none(),
+            "entrypoints should be absent when empty"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -757,6 +773,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
 
         let out = build_merged_output(&config, Some(&rf));
@@ -785,6 +802,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
 
         let out = build_merged_output(&config, Some(&rf));
@@ -823,6 +841,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
         let out = build_merged_output(&config, Some(&rf));
         // Base-only key survives, feature key added, feature wins the collision.
@@ -846,6 +865,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
         let out = build_merged_output(&json!({"image": "ubuntu"}), Some(&rf));
         assert_eq!(out["init"], json!(true));
@@ -861,6 +881,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc2,
             metadata_label: String::new(),
+            lockfile: None,
         };
         let out2 = build_merged_output(&json!({"image": "ubuntu", "init": true}), Some(&rf2));
         assert_eq!(out2["init"], json!(true));
@@ -884,6 +905,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: fc,
             metadata_label: String::new(),
+            lockfile: None,
         };
         let out = build_merged_output(&json!({"image": "ubuntu"}), Some(&rf));
         assert_eq!(out["privileged"], json!(true));
@@ -926,6 +948,7 @@ mod tests {
             build_context: PathBuf::from("/tmp"),
             container_config: FeatureContainerConfig::default(),
             metadata_label: String::new(),
+            lockfile: None,
         };
 
         let out = build_merged_output(&config, Some(&rf));
