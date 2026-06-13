@@ -190,6 +190,17 @@ pub fn container_labels(
 }
 
 /// Generate compose project name: `cella-<name|folder>-<hash8>`.
+///
+/// INTENTIONAL divergence from the official CLI, which names the project
+/// `<workspaceFolderBasename>_devcontainer` (docker-compose's convention). The
+/// `<hash8>` is derived from the workspace path, so two git worktrees of the
+/// same repo get distinct project names and therefore isolated compose
+/// stacks — cella's core feature. The official scheme would collide them onto
+/// one project. The trade-off is that cella and the official CLI/VS Code do
+/// NOT reuse each other's *compose* containers (compose reuse is keyed on the
+/// project name, not on the `devcontainer.local_folder`/`devcontainer.config_file`
+/// labels that the single-container path matches on). This is a deliberate
+/// product decision: worktree isolation over cross-tool compose reuse.
 pub fn compose_project_name(workspace_root: &Path, config_name: Option<&str>) -> String {
     let identifier = identifier_from(workspace_root, config_name);
     let hash = workspace_hash(workspace_root);
