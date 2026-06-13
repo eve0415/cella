@@ -1294,6 +1294,89 @@ mod tests {
         assert_eq!(lines[1], "      another");
     }
 
+    // ── MaskingWriter tests ──────────────────────────────────────────────────
+
+    // Shared sink for MaskingWriter tests: an `io::Write` backed by an
+    // `Arc<Mutex<Vec<u8>>>` so the buffer can be recovered after the writer is
+    // dropped.
+    use std::sync::{Arc, Mutex};
+
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Write `input` into a `MaskingWriter` backed by a shared `Vec<u8>` and
+    /// return the bytes collected after the writer is dropped (which flushes
+    /// any trailing partial line).
+    fn masking_writer_bytes(input: &[u8], masker: SecretMasker) -> Vec<u8> {
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = MaskingWriter::new(SharedBuf(Arc::clone(&shared)), masker);
+        io::Write::write_all(&mut writer, input).unwrap();
+        drop(writer);
+        Arc::try_unwrap(shared).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn masking_writer_masks_on_newline() {
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let out = masking_writer_bytes(b"got s3cr3t value\n", masker);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("s3cr3t"), "secret leaked: {s}");
+        assert!(s.contains("********"), "mask missing: {s}");
+        assert!(s.ends_with('\n'), "newline stripped");
+    }
+
+    #[test]
+    fn masking_writer_masks_trailing_partial_line_on_drop() {
+        // No trailing newline — the remainder is flushed in Drop.
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let out = masking_writer_bytes(b"s3cr3t", masker);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("s3cr3t"), "secret leaked: {s}");
+        assert!(s.contains("********"), "mask missing: {s}");
+    }
+
+    #[test]
+    fn masking_writer_multiple_lines_all_masked() {
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let out = masking_writer_bytes(b"line1 s3cr3t\nline2 s3cr3t\n", masker);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("s3cr3t"), "secret leaked: {s}");
+        assert_eq!(s.matches("********").count(), 2);
+    }
+
+    #[test]
+    fn masking_writer_passthrough_when_no_secrets() {
+        let masker = SecretMasker::default();
+        let out = masking_writer_bytes(b"hello world\n", masker);
+        assert_eq!(out, b"hello world\n");
+    }
+
+    #[test]
+    fn masking_writer_split_write_masks_correctly() {
+        // Secret split across two writes — the buffer holds incomplete bytes
+        // until the newline arrives, then masks the full line.
+        let masker = SecretMasker::new(&["TOKEN=s3cr3t".to_string()]);
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = MaskingWriter::new(SharedBuf(Arc::clone(&shared)), masker);
+        io::Write::write_all(&mut writer, b"s3cr").unwrap();
+        io::Write::write_all(&mut writer, b"3t\n").unwrap();
+        drop(writer);
+        let out = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("s3cr3t"), "secret leaked: {s}");
+        assert!(s.contains("********"), "mask missing: {s}");
+    }
+
     #[test]
     fn spec_string_command_wrapped_in_sh() {
         let value = json!("echo hello && echo world");

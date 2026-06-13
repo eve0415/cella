@@ -68,18 +68,19 @@ impl SecretMasker {
             return std::borrow::Cow::Borrowed(s);
         }
 
-        let mut result = s.to_string();
+        // Delay allocation until the first match so the common no-match path
+        // is zero-allocation.
+        let mut result: Option<String> = None;
         for secret in &self.values {
-            if result.contains(secret.as_str()) {
-                result = result.replace(secret.as_str(), MASK);
+            let haystack: &str = result.as_deref().unwrap_or(s);
+            if haystack.contains(secret.as_str()) {
+                result = Some(haystack.replace(secret.as_str(), MASK));
             }
         }
 
-        if result == s {
-            std::borrow::Cow::Borrowed(s)
-        } else {
-            std::borrow::Cow::Owned(result)
-        }
+        result.map_or(std::borrow::Cow::Borrowed(s), |owned| {
+            std::borrow::Cow::Owned(owned)
+        })
     }
 }
 
