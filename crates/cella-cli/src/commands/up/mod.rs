@@ -2099,10 +2099,11 @@ fn build_lifecycle_env(
         // Fallback path unchanged: `remote_env` already contains cli + config.
         remote_env.to_vec()
     };
-    probed_env.map_or_else(
-        || effective.clone(),
-        |probed| cella_env::user_env_probe::merge_env(probed, &effective),
-    )
+    if let Some(probed) = probed_env {
+        cella_env::user_env_probe::merge_env(probed, &effective)
+    } else {
+        effective
+    }
 }
 
 #[cfg(test)]
@@ -2950,8 +2951,8 @@ mod tests {
         }
     }
 
-    /// No `${containerEnv:...}` tokens and no raw snapshot → output equals
-    /// `remote_env` unchanged (additive invariant).
+    /// No `${containerEnv:...}` tokens and no raw snapshot → config entries
+    /// appear in the output (merged with the probe; additive invariant).
     #[test]
     fn no_container_env_tokens_unchanged() {
         let resolved = minimal_resolved(None);
