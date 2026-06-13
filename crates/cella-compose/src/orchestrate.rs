@@ -1118,6 +1118,18 @@ async fn build_override_and_start(
 
     let managed = ctx.client.capabilities().managed_agent;
     let mut extra_env = build_extra_env(daemon_env, env_fwd, cfg.remote_env, managed);
+    // When `remoteEnv` contains `${containerEnv:VAR}` tokens, phase-1
+    // substitution collapses them to `""` (container env is unavailable at
+    // parse time).  Injecting those phase-1 values into the compose service
+    // environment pollutes the `userEnvProbe` result: the probe reads e.g.
+    // `PATH=:/opt/bin` instead of the real image PATH, so the subsequent
+    // second-pass resolution in `build_lifecycle_env` expands
+    // `${containerEnv:PATH}` from the polluted value and produces
+    // `:/opt/bin:/opt/bin` instead of `<real_PATH>:/opt/bin`.
+    //
+    // Guard: only strip when the raw snapshot actually has tokens — the
+    // common case (no `containerEnv` references) is unaffected.
+    strip_container_env_polluted_entries(&mut extra_env, cfg.resolved.raw_remote_env.as_ref());
     let mut labels = build_compose_labels(cfg, project, remote_user);
 
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
@@ -1373,6 +1385,50 @@ fn build_extra_env(
         extra_env.extend(agent_env_vars());
     }
     extra_env
+}
+
+/// Remove from `extra_env` any `KEY=…` entries whose key appears in
+/// `raw_remote_env` with a value that contains a `${containerEnv:…}` token.
+///
+/// Phase-1 substitution collapses `${containerEnv:VAR}` to `""` because the
+/// container doesn't exist yet.  If those phase-1 values are baked into the
+/// compose service `environment:` block, the `userEnvProbe` reads corrupted
+/// values (e.g. `PATH=:/opt/bin` instead of the real image PATH).  The
+/// second-pass resolution in `build_lifecycle_env` then expands
+/// `${containerEnv:PATH}` from the corrupted probe and doubles the suffix.
+///
+/// Stripping only the affected entries leaves daemon/agent/forwarded env vars
+/// intact — the lifecycle env from `build_lifecycle_env` supplies the
+/// correctly resolved `remoteEnv` values after the probe runs.
+fn strip_container_env_polluted_entries(
+    extra_env: &mut Vec<String>,
+    raw_remote_env: Option<&serde_json::Value>,
+) {
+    let Some(obj) = raw_remote_env.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+
+    // Collect keys whose raw value contains a ${containerEnv:...} token.
+    let polluted_keys: std::collections::HashSet<&str> = obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let s = v.as_str()?;
+            if s.contains("${containerEnv:") {
+                Some(k.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if polluted_keys.is_empty() {
+        return;
+    }
+
+    extra_env.retain(|entry| {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(k, _)| k);
+        !polluted_keys.contains(key)
+    });
 }
 
 /// Compute the mount-input fingerprint and insert it as a label on the
@@ -1878,5 +1934,60 @@ mod tests {
         assert!(daemon_idx < fwd_idx);
         assert!(fwd_idx < user_idx);
         assert!(user_idx < browser_idx);
+    }
+
+    // ── strip_container_env_polluted_entries ──────────────────────────────────
+
+    /// Keys with `${containerEnv:…}` in their raw value are stripped from
+    /// `extra_env` so the `userEnvProbe` reads the real image env instead of the
+    /// phase-1 collapsed (empty) value.
+    #[test]
+    fn strip_removes_container_env_token_keys() {
+        let raw = serde_json::json!({
+            "PATH": "${containerEnv:PATH}:/opt/bin",
+            "PLAIN": "no_token"
+        });
+        let mut extra = vec![
+            "PATH=:/opt/bin".to_string(), // phase-1 collapsed value
+            "PLAIN=no_token".to_string(),
+            "OTHER=untouched".to_string(),
+        ];
+        strip_container_env_polluted_entries(&mut extra, Some(&raw));
+        // PATH had a token → stripped; PLAIN and OTHER are clean → preserved.
+        assert!(
+            !extra.iter().any(|e| e.starts_with("PATH=")),
+            "PATH with ${{containerEnv:…}} must be stripped; got {extra:?}"
+        );
+        assert!(
+            extra.contains(&"PLAIN=no_token".to_string()),
+            "PLAIN without token must be preserved; got {extra:?}"
+        );
+        assert!(
+            extra.contains(&"OTHER=untouched".to_string()),
+            "non-remoteEnv entries must be preserved; got {extra:?}"
+        );
+    }
+
+    /// When `raw_remote_env` is absent, the function is a no-op.
+    #[test]
+    fn strip_no_op_when_raw_remote_env_absent() {
+        let mut extra = vec!["PATH=/usr/bin".to_string(), "FOO=bar".to_string()];
+        let before = extra.clone();
+        strip_container_env_polluted_entries(&mut extra, None);
+        assert_eq!(extra, before, "no-op when raw_remote_env is absent");
+    }
+
+    /// When `raw_remote_env` has no `${containerEnv:…}` tokens, nothing is
+    /// stripped (additive invariant: common case unaffected).
+    #[test]
+    fn strip_no_op_when_no_container_env_tokens() {
+        let raw = serde_json::json!({"MYVAR": "static_value"});
+        let mut extra = vec!["MYVAR=static_value".to_string(), "OTHER=x".to_string()];
+        let before = extra.clone();
+        strip_container_env_polluted_entries(&mut extra, Some(&raw));
+        assert_eq!(
+            extra, before,
+            "no-op when no ${{containerEnv:…}} tokens present"
+        );
     }
 }
