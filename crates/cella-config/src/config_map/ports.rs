@@ -249,7 +249,7 @@ pub fn parse_other_ports_attributes(config: &serde_json::Value) -> Option<PortAt
 /// Parse a single port key + attributes object.
 fn parse_single_port_attributes(key: &str, value: &serde_json::Value) -> Option<PortAttributes> {
     let obj = value.as_object()?;
-    let port = parse_port_pattern(key)?;
+    let port = parse_port_pattern(key);
 
     let on_auto_forward = obj
         .get("onAutoForward")
@@ -284,20 +284,64 @@ fn parse_single_port_attributes(key: &str, value: &serde_json::Value) -> Option<
     })
 }
 
+/// VS Code `HOST_AND_PORT` pattern: `^([a-z0-9-]+):(\d{1,5})$`.
+///
+/// Matches `"db:5432"`, `"localhost:3000"`, etc.
+/// Only lowercase host names are accepted, matching the devcontainer schema.
+fn is_host_port(key: &str) -> Option<(String, u16)> {
+    let (host, port_str) = key.split_once(':')?;
+    // host must be non-empty and match [a-z0-9-]+
+    if host.is_empty() || port_str.is_empty() || port_str.len() > 5 {
+        return None;
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    if !port_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    Some((host.to_string(), port))
+}
+
 /// Parse a port key into a `PortPattern`.
 ///
 /// Supports:
-/// - `"3000"` -> Single(3000)
-/// - `"3000-3010"` -> Range(3000, 3010)
-fn parse_port_pattern(key: &str) -> Option<PortPattern> {
-    if let Some((start, end)) = key.split_once('-') {
-        let start: u16 = start.trim().parse().ok()?;
-        let end: u16 = end.trim().parse().ok()?;
-        Some(PortPattern::Range(start, end))
-    } else {
-        let port: u16 = key.trim().parse().ok()?;
-        Some(PortPattern::Single(port))
+/// - `"3000"` → `Single(3000)`
+/// - `"3000-3010"` → `Range(3000, 3010)`
+/// - `"db:5432"` / `"localhost:3000"` → `HostPort { host, port }`
+/// - any other string → `Regex(key)` (invalid regex becomes a never-matching entry)
+///
+/// Always succeeds: an unrecognized key falls through to `Regex`.
+fn parse_port_pattern(key: &str) -> PortPattern {
+    // Bare port number?
+    if let Ok(port) = key.trim().parse::<u16>() {
+        return PortPattern::Single(port);
     }
+
+    // Range "N-N"?  Only if both sides are pure digits after trimming (avoids
+    // treating regex alternation like "3000|4000" as a failed range).
+    if let Some((start_str, end_str)) = key.split_once('-')
+        && let start_trimmed = start_str.trim()
+        && let end_trimmed = end_str.trim()
+        && start_trimmed.chars().all(|c| c.is_ascii_digit())
+        && end_trimmed.chars().all(|c| c.is_ascii_digit())
+        && let (Ok(start), Ok(end)) = (start_trimmed.parse::<u16>(), end_trimmed.parse::<u16>())
+    {
+        return PortPattern::Range(start, end);
+    }
+
+    // Host:port?
+    if let Some((host, port)) = is_host_port(key) {
+        return PortPattern::HostPort { host, port };
+    }
+
+    // Treat as regex.  Even an invalid pattern is kept — the Regex variant
+    // always returns false from matches(), never panics.
+    PortPattern::Regex(key.to_string())
 }
 
 /// Parse `onAutoForward` string value to enum.
@@ -364,19 +408,61 @@ mod tests {
 
     #[test]
     fn parse_single_port() {
-        let pattern = parse_port_pattern("3000").unwrap();
+        let pattern = parse_port_pattern("3000");
         assert_eq!(pattern, PortPattern::Single(3000));
     }
 
     #[test]
     fn parse_range_port() {
-        let pattern = parse_port_pattern("3000-3010").unwrap();
+        let pattern = parse_port_pattern("3000-3010");
         assert_eq!(pattern, PortPattern::Range(3000, 3010));
     }
 
     #[test]
-    fn parse_invalid_port() {
-        assert!(parse_port_pattern("abc").is_none());
+    fn parse_unknown_key_becomes_regex() {
+        // Previously-dropped keys are now Regex variants.
+        let pattern = parse_port_pattern("abc");
+        assert!(matches!(pattern, PortPattern::Regex(_)));
+    }
+
+    #[test]
+    fn parse_host_port_key() {
+        let pattern = parse_port_pattern("db:5432");
+        assert_eq!(
+            pattern,
+            PortPattern::HostPort {
+                host: "db".to_string(),
+                port: 5432
+            }
+        );
+    }
+
+    #[test]
+    fn parse_localhost_host_port_key() {
+        let pattern = parse_port_pattern("localhost:3000");
+        assert_eq!(
+            pattern,
+            PortPattern::HostPort {
+                host: "localhost".to_string(),
+                port: 3000
+            }
+        );
+    }
+
+    #[test]
+    fn parse_regex_key() {
+        let pattern = parse_port_pattern("^30\\d\\d$");
+        assert!(matches!(pattern, PortPattern::Regex(_)));
+    }
+
+    // regression: uppercase host name must NOT be parsed as HostPort (spec: [a-z0-9-]+)
+    #[test]
+    fn uppercase_host_falls_through_to_regex() {
+        let pattern = parse_port_pattern("DB:5432");
+        assert!(
+            matches!(pattern, PortPattern::Regex(_)),
+            "uppercase host names are not valid per spec and must fall through to Regex"
+        );
     }
 
     #[test]
@@ -704,6 +790,116 @@ mod tests {
         assert_eq!(
             bindings["3000/tcp"][0].host_ip.as_deref(),
             Some("127.0.0.1")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regex key tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regex_key_matches_in_range() {
+        // "^30\d\d$" should match 3000–3099 but not 4000 or 30000
+        let p = PortPattern::Regex(r"^30\d\d$".to_string());
+        assert!(p.matches(3000));
+        assert!(p.matches(3099));
+        assert!(!p.matches(4000));
+        assert!(!p.matches(30_000));
+    }
+
+    #[test]
+    fn regex_key_plain_single_still_single() {
+        let p = parse_port_pattern("3000");
+        assert_eq!(p, PortPattern::Single(3000));
+        assert!(p.matches(3000));
+        assert!(!p.matches(3001));
+    }
+
+    #[test]
+    fn regex_key_range_still_range() {
+        let p = parse_port_pattern("3000-3010");
+        assert_eq!(p, PortPattern::Range(3000, 3010));
+        assert!(p.matches(3000));
+        assert!(p.matches(3010));
+        assert!(!p.matches(3011));
+    }
+
+    #[test]
+    fn host_port_key_matches_port_only() {
+        let p = parse_port_pattern("db:5432");
+        assert!(p.matches(5432));
+        assert!(!p.matches(5433));
+    }
+
+    #[test]
+    fn invalid_regex_never_matches_no_panic() {
+        // A syntactically invalid regex pattern must not panic, just never match.
+        let p = PortPattern::Regex("[invalid".to_string());
+        assert!(!p.matches(3000));
+        assert!(!p.matches(0));
+    }
+
+    #[test]
+    fn regex_serde_roundtrip() {
+        let attrs = vec![PortAttributes {
+            port: PortPattern::Regex(r"^30\d\d$".to_string()),
+            on_auto_forward: OnAutoForward::Silent,
+            ..PortAttributes::default()
+        }];
+        let label = serialize_ports_attributes_label(&attrs, None);
+        let (deserialized, _) = deserialize_ports_attributes_label(&label);
+        assert_eq!(deserialized.len(), 1);
+        assert!(matches!(&deserialized[0].port, PortPattern::Regex(p) if p == r"^30\d\d$"));
+        // And it still matches correctly after round-trip
+        assert!(deserialized[0].port.matches(3000));
+        assert!(!deserialized[0].port.matches(4000));
+    }
+
+    #[test]
+    fn host_port_serde_roundtrip() {
+        let attrs = vec![PortAttributes {
+            port: PortPattern::HostPort {
+                host: "db".to_string(),
+                port: 5432,
+            },
+            on_auto_forward: OnAutoForward::Ignore,
+            ..PortAttributes::default()
+        }];
+        let label = serialize_ports_attributes_label(&attrs, None);
+        let (deserialized, _) = deserialize_ports_attributes_label(&label);
+        assert_eq!(deserialized.len(), 1);
+        assert!(matches!(
+            &deserialized[0].port,
+            PortPattern::HostPort { host, port: 5432 } if host == "db"
+        ));
+    }
+
+    #[test]
+    fn regex_keys_in_ports_attributes_not_dropped() {
+        let config = json!({
+            "portsAttributes": {
+                "3000": {"onAutoForward": "silent"},
+                "^30\\d\\d$": {"onAutoForward": "ignore"},
+                "db:5432": {"onAutoForward": "notify"},
+            }
+        });
+        let attrs = parse_ports_attributes(&config);
+        // All three keys must survive — previously the regex and host:port were silently dropped
+        assert_eq!(attrs.len(), 3);
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(a.port, PortPattern::Single(3000)))
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(&a.port, PortPattern::Regex(_)))
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| matches!(&a.port, PortPattern::HostPort { .. }))
         );
     }
 }

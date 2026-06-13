@@ -669,20 +669,115 @@ impl Default for PortAttributes {
 }
 
 /// A port pattern for matching detected ports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Keys in `portsAttributes` can be:
+/// - `"3000"` — exact port number → [`Single`](PortPattern::Single)
+/// - `"3000-3010"` — inclusive range → [`Range`](PortPattern::Range)
+/// - `"hostname:3000"` — host-qualified port; cella matches on port number only → [`HostPort`](PortPattern::HostPort)
+/// - anything else — treated as a Rust regex (RE2-like syntax) tested
+///   against the port number string (e.g. `"^30\\d\\d$"` matches 3000–3099).
+///
+/// ## Regex semantics
+///
+/// The devcontainer spec (VS Code `tunnelModel.ts`) tests regex keys against the
+/// **process command line** of the port.  cella's daemon does not yet expose
+/// per-port process metadata at match time, so we test against the decimal
+/// port-number string instead (e.g. port 3000 → `"3000"`).
+///
+/// Note: the Rust `regex` crate uses RE2-like syntax — look-around and
+/// backreferences are not supported.
+///
+/// Invalid regex patterns compile to a never-matching variant — they never panic.
+///
+/// ## Serialization
+///
+/// Serializes with an adjacent tag (`{"type":"single","value":3000}`).
+/// Deserialization additionally accepts the legacy externally-tagged format
+/// (`{"Single":3000}`) written by cella versions prior to `HostPort`/`Regex`
+/// support, so existing container labels remain readable after an upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum PortPattern {
-    /// Exact port number.
+    /// Exact port number (e.g. `"3000"`).
     Single(u16),
-    /// Range of ports (inclusive).
+    /// Inclusive port range (e.g. `"3000-3010"`).
     Range(u16, u16),
+    /// Host-qualified port key (e.g. `"db:5432"`).  Matched on port number only.
+    HostPort { host: String, port: u16 },
+    /// Rust RE2-like regex pattern tested against the decimal port-number string.
+    ///
+    /// Stores the original source pattern so the value survives serde round-trips.
+    /// An invalid pattern stored here will always return `false` from [`matches`](Self::matches).
+    Regex(String),
+}
+
+impl<'de> Deserialize<'de> for PortPattern {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+
+        // Try the current adjacent-tag format first.
+        if let Ok(p) = serde_json::from_value::<PortPatternTagged>(raw.clone()) {
+            return Ok(p.into());
+        }
+
+        // Fall back to the legacy external-tag format written before HostPort/Regex
+        // were introduced: {"Single":3000} or {"Range":[3000,3010]}.
+        serde_json::from_value::<PortPatternLegacy>(raw)
+            .map(Into::into)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Internal helper — mirrors `PortPattern` with the adjacent-tag serde layout.
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum PortPatternTagged {
+    Single(u16),
+    Range(u16, u16),
+    HostPort { host: String, port: u16 },
+    Regex(String),
+}
+
+impl From<PortPatternTagged> for PortPattern {
+    fn from(t: PortPatternTagged) -> Self {
+        match t {
+            PortPatternTagged::Single(p) => Self::Single(p),
+            PortPatternTagged::Range(lo, hi) => Self::Range(lo, hi),
+            PortPatternTagged::HostPort { host, port } => Self::HostPort { host, port },
+            PortPatternTagged::Regex(s) => Self::Regex(s),
+        }
+    }
+}
+
+/// Legacy external-tag format: `{"Single":3000}` / `{"Range":[3000,3010]}`.
+/// Only `Single` and `Range` existed before `HostPort`/`Regex` were added.
+#[derive(Deserialize)]
+enum PortPatternLegacy {
+    Single(u16),
+    Range(u16, u16),
+}
+
+impl From<PortPatternLegacy> for PortPattern {
+    fn from(l: PortPatternLegacy) -> Self {
+        match l {
+            PortPatternLegacy::Single(p) => Self::Single(p),
+            PortPatternLegacy::Range(lo, hi) => Self::Range(lo, hi),
+        }
+    }
 }
 
 impl PortPattern {
     /// Check if a port number matches this pattern.
-    pub const fn matches(&self, port: u16) -> bool {
+    ///
+    /// For [`Regex`](Self::Regex): tests the compiled regex against the decimal
+    /// string of `port`.  An invalid stored pattern never matches (returns `false`).
+    pub fn matches(&self, port: u16) -> bool {
         match self {
-            Self::Single(p) => *p == port,
+            Self::Single(p) | Self::HostPort { port: p, .. } => *p == port,
             Self::Range(lo, hi) => port >= *lo && port <= *hi,
+            Self::Regex(pattern) => {
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&port.to_string()))
+            }
         }
     }
 }
@@ -1039,6 +1134,41 @@ mod tests {
         assert!(p.matches(3010));
         assert!(!p.matches(2999));
         assert!(!p.matches(3011));
+    }
+
+    #[test]
+    fn port_pattern_host_port_match() {
+        let p = PortPattern::HostPort {
+            host: "db".to_string(),
+            port: 5432,
+        };
+        assert!(p.matches(5432));
+        assert!(!p.matches(5433));
+    }
+
+    #[test]
+    fn port_pattern_regex_anchored_match() {
+        // "^30\d\d$" matches 3000–3099, not 4000, not 30000
+        let p = PortPattern::Regex(r"^30\d\d$".to_string());
+        assert!(p.matches(3000));
+        assert!(p.matches(3099));
+        assert!(!p.matches(4000));
+        assert!(!p.matches(30_000));
+    }
+
+    #[test]
+    fn port_pattern_invalid_regex_no_panic() {
+        let p = PortPattern::Regex("[bad".to_string());
+        assert!(!p.matches(3000));
+    }
+
+    #[test]
+    fn port_pattern_regex_serde_roundtrip() {
+        let p = PortPattern::Regex(r"^30\d\d$".to_string());
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: PortPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
+        assert!(p2.matches(3000));
     }
 
     #[test]
@@ -2135,5 +2265,35 @@ mod tests {
             decoded,
             ManagementResponse::PhantomTokenValues { tokens } if tokens.is_empty()
         ));
+    }
+
+    // ── PortPattern backward-compat deserialization ───────────────────────────
+
+    /// Labels written before `HostPort`/`Regex` were introduced used serde's
+    /// default external-tag format: `{"Single":3000}` / `{"Range":[3000,3010]}`.
+    /// Upgrading the daemon must not drop those settings.
+    #[test]
+    fn port_pattern_deserialize_legacy_single() {
+        let p: PortPattern = serde_json::from_str(r#"{"Single":3000}"#).unwrap();
+        assert_eq!(p, PortPattern::Single(3000));
+    }
+
+    #[test]
+    fn port_pattern_deserialize_legacy_range() {
+        let p: PortPattern = serde_json::from_str(r#"{"Range":[3000,3010]}"#).unwrap();
+        assert_eq!(p, PortPattern::Range(3000, 3010));
+    }
+
+    /// New format must still round-trip correctly.
+    #[test]
+    fn port_pattern_serialize_uses_new_format() {
+        let p = PortPattern::Single(8080);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            json.contains("\"type\""),
+            "should use adjacent-tag format: {json}"
+        );
+        let p2: PortPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
     }
 }
