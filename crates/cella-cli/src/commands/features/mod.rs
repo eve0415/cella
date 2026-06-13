@@ -1,7 +1,8 @@
-//! `cella features` subcommands: edit, list, package, and update features in
-//! devcontainer configurations.
+//! `cella features` subcommands: edit, generate-docs, info, list, package,
+//! resolve-dependencies, and update features in devcontainer configurations.
 
 pub mod edit;
+pub mod generate_docs;
 pub mod info;
 pub mod jsonc_edit;
 pub mod list;
@@ -28,6 +29,8 @@ pub struct FeaturesArgs {
 pub enum FeaturesCommand {
     /// Edit features in an existing devcontainer configuration.
     Edit(edit::EditArgs),
+    /// Generate README.md documentation for each feature in a collection.
+    GenerateDocs(generate_docs::GenerateDocsArgs),
     /// Show information about a feature (manifest, tags, dependencies).
     Info(info::InfoArgs),
     /// List configured or available features.
@@ -43,11 +46,13 @@ pub enum FeaturesCommand {
 impl FeaturesArgs {
     /// Return the active subcommand's `--log-level`, if it carries one.
     ///
-    /// `info`, `package`, and `resolve-dependencies` expose `--log-level`.
+    /// `generate-docs`, `info`, `package`, and `resolve-dependencies` expose
+    /// `--log-level`.
     /// Read by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and templates.
     pub const fn log_level(&self) -> Option<LogLevel> {
         match &self.command {
+            FeaturesCommand::GenerateDocs(args) => Some(args.log_level),
             FeaturesCommand::Info(args) => Some(args.log_level),
             FeaturesCommand::Package(args) => Some(args.log_level),
             FeaturesCommand::ResolveDependencies(args) => Some(args.log_level),
@@ -61,6 +66,7 @@ impl FeaturesArgs {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.command {
             FeaturesCommand::Edit(args) => args.execute().await,
+            FeaturesCommand::GenerateDocs(args) => args.execute(),
             FeaturesCommand::Info(args) => args.execute().await,
             FeaturesCommand::List(args) => args.execute().await,
             FeaturesCommand::Package(args) => args.execute(),
