@@ -25,6 +25,11 @@ pub struct BuildTuning<'a> {
     pub cli_cache_from: &'a [String],
     /// CLI `--cache-to` cache export (`BuildKit` only; dropped otherwise).
     pub cache_to: Option<&'a str>,
+    /// Target platform(s) for the build (`--platform`, e.g. `linux/amd64`).
+    /// `build`-command only; threaded into `BuildOptions.platform`. Applies to
+    /// every build site (base + features layer) so the whole chain targets the
+    /// same arch.
+    pub platform: Option<&'a str>,
 }
 
 impl Default for BuildTuning<'_> {
@@ -36,6 +41,7 @@ impl Default for BuildTuning<'_> {
             use_buildkit: true,
             cli_cache_from: &[],
             cache_to: None,
+            platform: None,
         }
     }
 }
@@ -50,6 +56,7 @@ impl BuildTuning<'_> {
             use_buildkit: self.use_buildkit,
             cli_cache_from: &[],
             cache_to: None,
+            platform: self.platform,
         }
     }
 }

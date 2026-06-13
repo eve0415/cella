@@ -1529,6 +1529,7 @@ impl UpContext {
                 use_buildkit: self.use_buildkit,
                 cli_cache_from: &self.cache_from,
                 cache_to: self.cache_to.as_deref(),
+                platform: None,
             },
             gpu_availability: self.gpu_availability,
             update_remote_user_uid_default: self.update_remote_user_uid_default,

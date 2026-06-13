@@ -55,6 +55,11 @@ pub struct BuildArgs {
     /// Pull policy for Docker Compose services.
     #[arg(long = "pull-policy", value_enum)]
     pull_policy: Option<ComposePullPolicy>,
+
+    /// Set target platform(s) for the build (e.g. `linux/amd64`). Passed to the
+    /// underlying docker/buildx build. Not supported on the Docker Compose path.
+    #[arg(long)]
+    platform: Option<String>,
 }
 
 impl BuildArgs {
@@ -99,6 +104,9 @@ impl BuildArgs {
 
         // Docker Compose path: delegate to orchestrator
         if config.get("dockerComposeFile").is_some() {
+            if self.platform.is_some() {
+                return Err("--platform or --push not supported.".into());
+            }
             let (sender, renderer) = crate::progress::bridge(&progress);
             let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
                 config,
@@ -139,9 +147,13 @@ impl BuildArgs {
             no_cache: self.no_cache,
             pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
-            // `cella build` has no build-tuning flags yet; use defaults
-            // (BuildKit auto, default docker binary, no CLI cache I/O).
-            build_tuning: cella_orchestrator::BuildTuning::default(),
+            build_tuning: cella_orchestrator::BuildTuning {
+                docker_path: None,
+                use_buildkit: true,
+                cli_cache_from: &[],
+                cache_to: None,
+                platform: self.platform.as_deref(),
+            },
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
             // `cella build` keeps the full metadata label.
             omit_remote_env_from_metadata: false,

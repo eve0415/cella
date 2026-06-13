@@ -104,11 +104,11 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push("--load".to_string());
     }
 
-    // `--platform` requires BuildKit; the classic builder (use_buildkit=false) doesn't
-    // support it. Emit on both buildx and non-buildx paths when BuildKit is allowed.
-    if opts.use_buildkit
-        && let Some(platform) = &opts.platform
-    {
+    // `--platform` is a BuildKit/buildx flag; the classic `docker build`
+    // rejects it with "unknown flag: --platform". Emit it only on the buildx
+    // path. On the classic builder it is dropped (build_image warns on each
+    // invocation with a non-None platform).
+    if use_buildx && let Some(platform) = &opts.platform {
         args.extend(["--platform".to_string(), platform.clone()]);
     }
 
@@ -251,6 +251,17 @@ impl DockerClient {
         // on the base build's BuildOptions, so this fires at most once per up.
         if !use_buildx && opts.cache_to.is_some() {
             tracing::warn!("--cache-to is ignored without BuildKit/buildx (classic docker build)");
+        }
+
+        // `--platform` is likewise buildx-only (the classic builder rejects it
+        // with "unknown flag: --platform"). It is dropped from the command on
+        // the classic builder; warn so a requested target arch isn't silently
+        // ignored — the image is built for the host architecture instead.
+        if !use_buildx && opts.platform.is_some() {
+            tracing::warn!(
+                "--platform is ignored without BuildKit/buildx (classic docker build); \
+                 building for the host architecture"
+            );
         }
 
         let args = build_command_args(opts, use_buildx);
@@ -740,12 +751,17 @@ mod tests {
     }
 
     #[test]
-    fn build_args_with_platform() {
+    fn build_args_platform_dropped_on_classic_builder() {
+        // `--platform` is buildx-only; the classic builder rejects it
+        // ("unknown flag: --platform"). With use_buildx = false it must NOT be
+        // emitted, even when a platform is set.
         let mut opts = basic_opts();
         opts.platform = Some("linux/amd64".to_string());
         let args = build_command_args(&opts, false);
-        assert!(args.contains(&"--platform".to_string()));
-        assert!(args.contains(&"linux/amd64".to_string()));
+        assert!(
+            !args.contains(&"--platform".to_string()),
+            "classic builder must not receive --platform; args: {args:?}"
+        );
     }
 
     #[test]

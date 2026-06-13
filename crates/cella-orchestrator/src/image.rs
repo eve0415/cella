@@ -72,7 +72,7 @@ pub async fn build_features_layer(
         secrets: vec![],
         use_buildkit: ctx.build_tuning.use_buildkit,
         docker_path: ctx.build_tuning.docker_path.map(str::to_string),
-        platform: None,
+        platform: ctx.build_tuning.platform.map(str::to_string),
     };
 
     info!(
@@ -306,18 +306,42 @@ struct FeaturesBuildInput<'a> {
     progress: &'a ProgressSender,
 }
 
+/// Parse a `--platform` string (e.g. `linux/amd64`) into `(os, arch)`.
+///
+/// Returns `None` when the string is malformed (no `/` separator or empty
+/// component). The arch component is passed through as-is; normalisation to
+/// Go/OCI conventions (`amd64`, `arm64`) is done by
+/// [`cella_features::oci::detect_platform`].
+fn parse_platform_str(platform: &str) -> Option<(&str, &str)> {
+    let (os, arch) = platform.split_once('/')?;
+    if os.is_empty() || arch.is_empty() {
+        return None;
+    }
+    Some((os, arch))
+}
+
 /// Resolve features and build the features layer image.
 async fn resolve_and_build_features(
     input: &FeaturesBuildInput<'_>,
 ) -> Result<(String, ResolvedFeatures), Box<dyn std::error::Error + Send + Sync>> {
     info!("Resolving devcontainer features...");
-    let backend_platform = input
-        .client
-        .detect_platform()
-        .await
-        .map_err(|e| format!("platform detection failed: {e}"))?;
-    let platform =
-        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch);
+
+    // When `--platform` is set (cross-arch build), resolve feature artifacts
+    // for the *requested* platform rather than the Docker engine's host arch.
+    // Without this, host-arch feature payloads would be baked into a foreign-
+    // arch image, breaking or silently mis-installing platform-specific scripts.
+    let platform = if let Some(plat_str) = input.build_tuning.platform
+        && let Some((os, arch)) = parse_platform_str(plat_str)
+    {
+        cella_features::oci::detect_platform(os, arch)
+    } else {
+        let backend_platform = input
+            .client
+            .detect_platform()
+            .await
+            .map_err(|e| format!("platform detection failed: {e}"))?;
+        cella_features::oci::detect_platform(&backend_platform.os, &backend_platform.arch)
+    };
     let cache = cella_features::FeatureCache::new();
 
     let resolved = cella_features::resolve_features(
@@ -517,7 +541,7 @@ pub fn parse_build_options(
         secrets: vec![],
         use_buildkit: build_tuning.use_buildkit,
         docker_path: build_tuning.docker_path.map(str::to_string),
-        platform: None,
+        platform: build_tuning.platform.map(str::to_string),
     }
 }
 
@@ -728,6 +752,7 @@ mod tests {
             use_buildkit: true,
             cache_to: Some("type=registry,ref=r"),
             cli_cache_from: &[],
+            platform: None,
         };
         let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
         assert_eq!(opts.cache_to.as_deref(), Some("type=registry,ref=r"));
@@ -892,6 +917,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_build_options_platform_is_forwarded() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let tuning = BuildTuning {
+            platform: Some("linux/amd64"),
+            ..Default::default()
+        };
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
+        assert_eq!(opts.platform.as_deref(), Some("linux/amd64"));
+    }
+
+    #[test]
+    fn parse_build_options_platform_none_by_default() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
+        assert!(opts.platform.is_none());
+    }
+
+    #[test]
     fn cache_from_string_form_is_kept() {
         let build: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"dockerfile": "Dockerfile", "cacheFrom": "reg/img:cache"}"#)
@@ -967,5 +1019,25 @@ mod tests {
         assert_eq!(build.get("dockerfile").unwrap(), "Legacy.Dockerfile");
         // build-only fields are preserved.
         assert_eq!(build.get("target").unwrap(), "dev");
+    }
+
+    // ── parse_platform_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_platform_str_standard_forms() {
+        assert_eq!(parse_platform_str("linux/amd64"), Some(("linux", "amd64")));
+        assert_eq!(parse_platform_str("linux/arm64"), Some(("linux", "arm64")));
+        assert_eq!(
+            parse_platform_str("linux/arm/v7"),
+            Some(("linux", "arm/v7"))
+        );
+    }
+
+    #[test]
+    fn parse_platform_str_rejects_malformed() {
+        assert!(parse_platform_str("linuxamd64").is_none());
+        assert!(parse_platform_str("/amd64").is_none());
+        assert!(parse_platform_str("linux/").is_none());
+        assert!(parse_platform_str("").is_none());
     }
 }
