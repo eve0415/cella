@@ -4,7 +4,7 @@ pub mod extract;
 
 pub use auth::{DockerCredentials, resolve_credentials};
 pub use cache::{commit_staging, staging_path};
-pub use extract::{extract_layer, is_extractable_layer};
+pub use extract::{ExtractionError, extract_layer, is_extractable_layer};
 
 use oci_distribution::secrets::RegistryAuth;
 use tracing::debug;
