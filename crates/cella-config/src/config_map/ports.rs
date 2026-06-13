@@ -324,17 +324,14 @@ fn parse_port_pattern(key: &str) -> PortPattern {
 
     // Range "N-N"?  Only if both sides are pure digits after trimming (avoids
     // treating regex alternation like "3000|4000" as a failed range).
-    if let Some((start_str, end_str)) = key.split_once('-') {
-        let start_trimmed = start_str.trim();
-        let end_trimmed = end_str.trim();
-        if start_trimmed.chars().all(|c| c.is_ascii_digit())
-            && end_trimmed.chars().all(|c| c.is_ascii_digit())
-        {
-            if let (Ok(start), Ok(end)) = (start_trimmed.parse::<u16>(), end_trimmed.parse::<u16>())
-            {
-                return PortPattern::Range(start, end);
-            }
-        }
+    if let Some((start_str, end_str)) = key.split_once('-')
+        && let start_trimmed = start_str.trim()
+        && let end_trimmed = end_str.trim()
+        && start_trimmed.chars().all(|c| c.is_ascii_digit())
+        && end_trimmed.chars().all(|c| c.is_ascii_digit())
+        && let (Ok(start), Ok(end)) = (start_trimmed.parse::<u16>(), end_trimmed.parse::<u16>())
+    {
+        return PortPattern::Range(start, end);
     }
 
     // Host:port?

@@ -711,7 +711,7 @@ pub enum PortPattern {
     Regex(String),
 }
 
-impl<'de> serde::Deserialize<'de> for PortPattern {
+impl<'de> Deserialize<'de> for PortPattern {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(deserializer)?;
 
@@ -729,7 +729,7 @@ impl<'de> serde::Deserialize<'de> for PortPattern {
 }
 
 /// Internal helper — mirrors `PortPattern` with the adjacent-tag serde layout.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 enum PortPatternTagged {
     Single(u16),
@@ -751,7 +751,7 @@ impl From<PortPatternTagged> for PortPattern {
 
 /// Legacy external-tag format: `{"Single":3000}` / `{"Range":[3000,3010]}`.
 /// Only `Single` and `Range` existed before `HostPort`/`Regex` were added.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 enum PortPatternLegacy {
     Single(u16),
     Range(u16, u16),
