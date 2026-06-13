@@ -669,20 +669,51 @@ impl Default for PortAttributes {
 }
 
 /// A port pattern for matching detected ports.
+///
+/// Keys in `portsAttributes` can be:
+/// - `"3000"` — exact port number → [`Single`](PortPattern::Single)
+/// - `"3000-3010"` — inclusive range → [`Range`](PortPattern::Range)
+/// - `"hostname:3000"` — host-qualified port; cella matches on port number only → [`HostPort`](PortPattern::HostPort)
+/// - anything else — treated as a JavaScript-compatible regular expression tested
+///   against the port number string (e.g. `"^30\\d\\d$"` matches 3000–3099).
+///
+/// ## Regex semantics
+///
+/// VS Code's `tunnelModel.ts` tests regex keys against the **process command line**
+/// of the port (`commandLine ? value.key.test(commandLine) : false`).  cella's daemon
+/// does not yet expose per-port process metadata at match time, so we test the regex
+/// against the decimal port-number string instead (e.g. port 3000 → `"3000"`).
+/// This is the correct adaptation for cella's number-based port model.
+///
+/// Invalid regex patterns compile to a never-matching variant — they never panic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum PortPattern {
-    /// Exact port number.
+    /// Exact port number (e.g. `"3000"`).
     Single(u16),
-    /// Range of ports (inclusive).
+    /// Inclusive port range (e.g. `"3000-3010"`).
     Range(u16, u16),
+    /// Host-qualified port key (e.g. `"db:5432"`).  Matched on port number only.
+    HostPort { host: String, port: u16 },
+    /// Regex pattern tested against the decimal port-number string.
+    ///
+    /// Stores the original source pattern so the value survives serde round-trips.
+    /// An invalid pattern stored here will always return `false` from [`matches`](Self::matches).
+    Regex(String),
 }
 
 impl PortPattern {
     /// Check if a port number matches this pattern.
-    pub const fn matches(&self, port: u16) -> bool {
+    ///
+    /// For [`Regex`](Self::Regex): tests the compiled regex against the decimal
+    /// string of `port`.  An invalid stored pattern never matches (returns `false`).
+    pub fn matches(&self, port: u16) -> bool {
         match self {
-            Self::Single(p) => *p == port,
+            Self::Single(p) | Self::HostPort { port: p, .. } => *p == port,
             Self::Range(lo, hi) => port >= *lo && port <= *hi,
+            Self::Regex(pattern) => {
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&port.to_string()))
+            }
         }
     }
 }
@@ -1039,6 +1070,41 @@ mod tests {
         assert!(p.matches(3010));
         assert!(!p.matches(2999));
         assert!(!p.matches(3011));
+    }
+
+    #[test]
+    fn port_pattern_host_port_match() {
+        let p = PortPattern::HostPort {
+            host: "db".to_string(),
+            port: 5432,
+        };
+        assert!(p.matches(5432));
+        assert!(!p.matches(5433));
+    }
+
+    #[test]
+    fn port_pattern_regex_anchored_match() {
+        // "^30\d\d$" matches 3000–3099, not 4000, not 30000
+        let p = PortPattern::Regex(r"^30\d\d$".to_string());
+        assert!(p.matches(3000));
+        assert!(p.matches(3099));
+        assert!(!p.matches(4000));
+        assert!(!p.matches(30_000));
+    }
+
+    #[test]
+    fn port_pattern_invalid_regex_no_panic() {
+        let p = PortPattern::Regex("[bad".to_string());
+        assert!(!p.matches(3000));
+    }
+
+    #[test]
+    fn port_pattern_regex_serde_roundtrip() {
+        let p = PortPattern::Regex(r"^30\d\d$".to_string());
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: PortPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
+        assert!(p2.matches(3000));
     }
 
     #[test]

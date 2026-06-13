@@ -713,6 +713,7 @@ dependencies = [
 name = "cella-protocol"
 version = "0.4.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
