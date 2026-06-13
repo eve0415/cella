@@ -12,6 +12,7 @@ pub mod prompts;
 pub mod publish;
 pub mod resolve;
 pub mod resolve_dependencies;
+pub mod test;
 pub mod update;
 
 use clap::{Args, Subcommand};
@@ -43,6 +44,8 @@ pub enum FeaturesCommand {
     Publish(publish::PublishArgs),
     /// Resolve feature dependencies and print the installation order.
     ResolveDependencies(resolve_dependencies::ResolveDependenciesArgs),
+    /// Run devcontainer feature tests.
+    Test(test::TestArgs),
     /// Check for and apply feature version updates.
     Update(update::UpdateArgs),
 }
@@ -50,8 +53,8 @@ pub enum FeaturesCommand {
 impl FeaturesArgs {
     /// Return the active subcommand's `--log-level`, if it carries one.
     ///
-    /// `generate-docs`, `info`, `package`, `publish`, and
-    /// `resolve-dependencies` expose `--log-level`.
+    /// `generate-docs`, `info`, `package`, `publish`, `resolve-dependencies`,
+    /// and `test` expose `--log-level`.
     /// Read by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and templates.
     pub const fn log_level(&self) -> Option<LogLevel> {
@@ -61,6 +64,7 @@ impl FeaturesArgs {
             FeaturesCommand::Package(args) => Some(args.log_level),
             FeaturesCommand::Publish(args) => Some(args.log_level),
             FeaturesCommand::ResolveDependencies(args) => Some(args.log_level),
+            FeaturesCommand::Test(args) => Some(args.log_level),
             _ => None,
         }
     }
@@ -77,6 +81,7 @@ impl FeaturesArgs {
             FeaturesCommand::Package(args) => args.execute(),
             FeaturesCommand::Publish(args) => args.execute().await,
             FeaturesCommand::ResolveDependencies(args) => args.execute().await,
+            FeaturesCommand::Test(args) => args.execute().await,
             FeaturesCommand::Update(args) => args.execute().await,
         }
     }
