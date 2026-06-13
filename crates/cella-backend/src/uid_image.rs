@@ -78,7 +78,11 @@ fn remap_unsupported_on_host(host_os: &str) -> bool {
 /// Build a UID-remapped image on top of `base_image`.
 ///
 /// Returns `Ok(Some(uid_image_name))` when a new image was built, or
-/// `Ok(None)` when remapping was skipped (root user, UID 0, etc.).
+/// `Ok(None)` when remapping was skipped for any of the following reasons:
+/// - The host OS is not Linux (Docker Desktop's VM mediates file ownership
+///   on macOS/Windows, so there is no host UID to align with).
+/// - The remote user is `root` or an all-numeric UID.
+/// - The host UID is 0 (root).
 ///
 /// On build failure, logs a warning and returns `Ok(None)` so the caller
 /// can fall back to the unmodified base image.
