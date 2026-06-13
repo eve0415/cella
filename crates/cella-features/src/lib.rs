@@ -34,7 +34,7 @@ pub use ordering::compute_install_order;
 pub use reference::{FeatureRef, NormalizedRef};
 pub use types::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Parse lifecycle commands for a phase from a `devcontainer.metadata` label.
@@ -85,11 +85,29 @@ pub struct BaseImageContext<'a> {
 
 /// Intermediate representation of a parsed feature before ordering.
 struct FeatureEntry {
-    key: String,
+    /// Unique install identity = `(normalized_ref, options)`.
+    ///
+    /// The same feature pulled in twice with **different** options is two
+    /// distinct installs per the spec, so a raw ref alone is not a unique key:
+    /// it would collapse the two variants in any map keyed by it (ordering,
+    /// assembly). `install_id` keeps them apart — see [`install_identity`].
+    install_id: String,
     metadata: FeatureMetadata,
     artifact_dir: PathBuf,
     user_options: HashMap<String, serde_json::Value>,
+    /// The raw reference the user (or a `dependsOn` key) wrote, kept for
+    /// display and surfaced on the [`ResolvedFeature`].
     original_ref: String,
+}
+
+/// Build the unique install identity for a feature instance.
+///
+/// Two installs are the same feature iff their **normalized reference** and
+/// their **options** match (devcontainer spec identity). The two parts are
+/// joined with a NUL byte, which cannot appear in a ref or in serialized JSON
+/// text, so the composite is unambiguous and stable.
+fn install_identity(normalized_ref: &str, options_json: &str) -> String {
+    format!("{normalized_ref}\u{0}{options_json}")
 }
 
 // ---------------------------------------------------------------------------
@@ -139,10 +157,13 @@ pub async fn resolve_features(
     let artifact_paths = fetch_all(&parsed_entries, platform, cache).await?;
 
     // Step 5: Parse metadata and validate options.
-    let feature_entries = parse_metadata_and_validate(&parsed_entries, &artifact_paths)?;
+    let mut feature_entries = parse_metadata_and_validate(&parsed_entries, &artifact_paths)?;
+
+    // Step 5b: Expand the install set with transitive `dependsOn` features.
+    expand_depends_on(&mut feature_entries, workspace_root, platform, cache).await?;
 
     // Step 6: Compute install order.
-    let ordered_ids = compute_order(&feature_entries, config);
+    let ordered_ids = compute_order(&feature_entries, config, workspace_root)?;
 
     // Step 7: Assemble resolved features in install order.
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
@@ -392,7 +413,7 @@ fn parse_metadata_and_validate(
 ) -> Result<Vec<FeatureEntry>, FeatureError> {
     let mut entries = Vec::with_capacity(parsed_entries.len());
 
-    for (i, (key, _, options_value)) in parsed_entries.iter().enumerate() {
+    for (i, (key, normalized, options_value)) in parsed_entries.iter().enumerate() {
         let artifact_dir = &artifact_paths[i];
         let metadata_path = artifact_dir.join("devcontainer-feature.json");
         let metadata_json =
@@ -410,8 +431,12 @@ fn parse_metadata_and_validate(
             log_option_warning(key, w);
         }
 
+        // Identity keys on the NORMALIZED ref so shorthand and fully-qualified
+        // spellings of the same feature deduplicate together, and on the raw
+        // options value so option variants stay distinct.
+        let options_json = serde_json::to_string(options_value).unwrap_or_default();
         entries.push(FeatureEntry {
-            key: key.clone(),
+            install_id: install_identity(&normalized.to_string(), &options_json),
             metadata,
             artifact_dir: artifact_dir.clone(),
             user_options,
@@ -423,32 +448,173 @@ fn parse_metadata_and_validate(
 }
 
 /// Compute install order from feature entries and config overrides.
-fn compute_order(feature_entries: &[FeatureEntry], config: &serde_json::Value) -> Vec<String> {
-    let order_input: Vec<(String, &FeatureMetadata)> = feature_entries
+///
+/// The ordering graph is keyed by each entry's unique [`FeatureEntry::install_id`]
+/// (not the raw ref), so two installs of the same feature with different
+/// options stay distinct. Each entry's `dependsOn` / `installsAfter` edges are
+/// resolved from raw refs to the matching install identities before sorting,
+/// so an edge points at the specific option-variant instance it names.
+///
+/// # Errors
+///
+/// Returns [`FeatureError::CyclicDependsOn`] when a hard `dependsOn` cycle
+/// is detected.
+fn compute_order(
+    feature_entries: &[FeatureEntry],
+    config: &serde_json::Value,
+    workspace_root: &Path,
+) -> Result<Vec<String>, FeatureError> {
+    let order_metadata = build_order_metadata(feature_entries, workspace_root);
+    let order_input: Vec<(String, &FeatureMetadata)> = order_metadata
         .iter()
-        .map(|entry| (entry.key.clone(), &entry.metadata))
+        .map(|(id, meta)| (id.clone(), meta))
         .collect();
 
-    let override_order = config
-        .get("overrideFeatureInstallOrder")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
+    let override_order = resolve_override_order(config, feature_entries, workspace_root);
 
-    let (ordered_ids, order_warnings) =
-        compute_install_order(&order_input, override_order.as_deref());
+    let mut depends_on_cycle: Option<Vec<String>> = None;
+    let (ordered_ids, order_warnings) = compute_install_order(
+        &order_input,
+        override_order.as_deref(),
+        &mut depends_on_cycle,
+    );
+
+    if let Some(cycle) = depends_on_cycle {
+        return Err(FeatureError::CyclicDependsOn { cycle });
+    }
 
     for w in &order_warnings {
         warn!("install order: {w:?}");
     }
 
-    ordered_ids
+    Ok(ordered_ids)
+}
+
+/// Normalize a raw feature reference for identity matching, falling back to the
+/// raw string when it cannot be parsed (invalid refs surface elsewhere).
+fn normalize_ref_for_identity(raw: &str, workspace_root: &Path) -> String {
+    FeatureRef::parse(raw)
+        .and_then(|r| r.normalize(workspace_root))
+        .map_or_else(|_| raw.to_owned(), |(n, _)| n.to_string())
+}
+
+/// Build per-entry ordering metadata keyed by `install_id`, with `dependsOn`
+/// and `installsAfter` edges rewritten from raw refs to the matching
+/// `install_id`s.
+///
+/// - `dependsOn` matches on `(normalized_ref, options)` — the full identity, so
+///   it targets the exact option-variant instance it names.
+/// - `installsAfter` matches on `normalized_ref` only (the spec gives it no
+///   options); it therefore expands to **every** option-variant of that ref.
+fn build_order_metadata(
+    feature_entries: &[FeatureEntry],
+    workspace_root: &Path,
+) -> Vec<(String, FeatureMetadata)> {
+    // Set of valid install identities, for dependsOn resolution.
+    let identities: HashSet<&str> = feature_entries
+        .iter()
+        .map(|e| e.install_id.as_str())
+        .collect();
+    let by_ref = index_by_ref(feature_entries);
+
+    feature_entries
+        .iter()
+        .map(|entry| {
+            let mut meta = entry.metadata.clone();
+
+            // Rewrite hard (dependsOn) edges to matching install identities.
+            let depends_on = std::mem::take(&mut meta.depends_on);
+            meta.depends_on = depends_on
+                .into_iter()
+                .filter_map(|(dep_ref, opts)| {
+                    let norm = normalize_ref_for_identity(&dep_ref, workspace_root);
+                    let opts_json = serde_json::to_string(&opts).unwrap_or_default();
+                    let id = install_identity(&norm, &opts_json);
+                    identities.contains(id.as_str()).then_some((id, opts))
+                })
+                .collect();
+
+            // Rewrite soft (installsAfter) edges; one ref may fan out to
+            // several option-variant installs.
+            let installs_after = std::mem::take(&mut meta.installs_after);
+            meta.installs_after = installs_after
+                .into_iter()
+                .flat_map(|after_ref| {
+                    let norm = normalize_ref_for_identity(&after_ref, workspace_root);
+                    by_ref
+                        .get(norm.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|id| (*id).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            (entry.install_id.clone(), meta)
+        })
+        .collect()
+}
+
+/// Index install identities by their normalized ref.
+///
+/// One ref may map to several identities when the same feature is installed
+/// more than once with different options. Used to resolve option-agnostic
+/// references (`installsAfter`, `overrideFeatureInstallOrder`) to the concrete
+/// install identities they cover.
+fn index_by_ref(feature_entries: &[FeatureEntry]) -> HashMap<&str, Vec<&str>> {
+    let mut by_ref: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in feature_entries {
+        // The install_id is `normalized_ref \0 options_json`; the ref is the
+        // part before the NUL separator.
+        let normalized_ref = entry
+            .install_id
+            .split('\u{0}')
+            .next()
+            .unwrap_or(&entry.install_id);
+        by_ref
+            .entry(normalized_ref)
+            .or_default()
+            .push(entry.install_id.as_str());
+    }
+    by_ref
+}
+
+/// Resolve `overrideFeatureInstallOrder` (raw refs) to install identities.
+///
+/// Each override ref names a feature without options, so it expands to every
+/// matching option-variant install, preserving the override's declared order.
+fn resolve_override_order(
+    config: &serde_json::Value,
+    feature_entries: &[FeatureEntry],
+    workspace_root: &Path,
+) -> Option<Vec<String>> {
+    let raw = config
+        .get("overrideFeatureInstallOrder")
+        .and_then(|v| v.as_array())?;
+
+    let by_ref = index_by_ref(feature_entries);
+
+    let resolved: Vec<String> = raw
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .flat_map(|ref_str| {
+            let norm = normalize_ref_for_identity(ref_str, workspace_root);
+            by_ref
+                .get(norm.as_str())
+                .into_iter()
+                .flatten()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    Some(resolved)
 }
 
 /// Assemble `ResolvedFeature` structs in install order.
+///
+/// `ordered_ids` are unique [`FeatureEntry::install_id`]s, so the lookup never
+/// collapses two option-variants of the same ref onto one entry.
 fn assemble_resolved(
     feature_entries: &[FeatureEntry],
     ordered_ids: &[String],
@@ -456,13 +622,18 @@ fn assemble_resolved(
     let entry_map: HashMap<&str, usize> = feature_entries
         .iter()
         .enumerate()
-        .map(|(i, entry)| (entry.key.as_str(), i))
+        .map(|(i, entry)| (entry.install_id.as_str(), i))
         .collect();
 
     let mut resolved = Vec::with_capacity(ordered_ids.len());
 
     for id in ordered_ids {
-        let idx = entry_map[id.as_str()];
+        let Some(&idx) = entry_map.get(id.as_str()) else {
+            // An ordered id with no backing entry would be a logic bug in the
+            // ordering step; skip rather than panic.
+            warn!("install order produced unknown id {id:?}; skipping");
+            continue;
+        };
         let entry = &feature_entries[idx];
 
         let has_install = entry.artifact_dir.join("install.sh").is_file();
@@ -478,7 +649,7 @@ fn assemble_resolved(
 
         debug!(
             "resolved feature {} -> {} (install_script={})",
-            entry.key, entry.metadata.id, has_install
+            entry.original_ref, entry.metadata.id, has_install
         );
     }
 
@@ -529,6 +700,139 @@ fn prepare_build_context(
 
     if let Some(script) = entrypoint_script {
         std::fs::write(build_context.join("docker-init.sh"), script)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dependsOn expansion
+// ---------------------------------------------------------------------------
+
+/// Recursively expand `dependsOn` references into `feature_entries`.
+///
+/// Starting from the already-fetched user-declared features, this function
+/// performs a worklist BFS over every `dependsOn` key found in each feature's
+/// metadata.  For each referenced feature not yet in the install set it:
+///
+/// 1. Parses and normalises the reference (reusing the same path as
+///    user-declared features).
+/// 2. Fetches the artifact (OCI / HTTP / local) via the same fetchers.
+/// 3. Parses its `devcontainer-feature.json` and validates options.
+/// 4. Pushes the new entry onto `feature_entries` and enqueues its own
+///    `dependsOn` keys for further expansion.
+///
+/// Identity / dedup semantics per spec: two references are the same feature
+/// when their normalised reference string **and** their options JSON are
+/// identical.  Same feature with different options = two separate install
+/// entries (not merged).
+async fn expand_depends_on(
+    feature_entries: &mut Vec<FeatureEntry>,
+    workspace_root: &Path,
+    platform: &Platform,
+    cache: &FeatureCache,
+) -> Result<(), FeatureError> {
+    let oci_fetcher = OciFetcher::default();
+    let http_fetcher = HttpFetcher;
+    let local_fetcher = LocalFetcher;
+
+    // Normalize a raw ref string for identity keying, ignoring parse errors
+    // (invalid refs are caught later during fetch).
+    let normalize_key = |raw: &str| normalize_ref_for_identity(raw, workspace_root);
+
+    // Visited set: (normalised_ref_string, options_json) — spec identity
+    // semantics.  Pre-populate with user-declared entries using their
+    // NORMALISED ref so that spelling variants of the same OCI ref
+    // (e.g. shorthand vs. fully-qualified) deduplicate correctly.
+    let mut visited: HashSet<(String, String)> = feature_entries
+        .iter()
+        .map(|e| {
+            let norm_key = normalize_key(&e.original_ref);
+            let opts = serde_json::to_string(&e.user_options).unwrap_or_default();
+            (norm_key, opts)
+        })
+        .collect();
+
+    // Worklist: (raw_ref_string, options_value) pairs to process.
+    // Pre-populate from the dependsOn of already-fetched entries.
+    let mut worklist: Vec<(String, serde_json::Value)> = feature_entries
+        .iter()
+        .flat_map(|e| {
+            e.metadata
+                .depends_on
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+        })
+        .collect();
+
+    while let Some((dep_ref, dep_opts)) = worklist.pop() {
+        // Parse and normalise the reference first so we can deduplicate on
+        // the canonical identity, not the raw string the author wrote.
+        let feature_ref = FeatureRef::parse(&dep_ref)?;
+        let (normalized, warning) = feature_ref.normalize(workspace_root)?;
+        if let Some(w) = warning {
+            warn!("{dep_ref}: deprecated feature reference in dependsOn ({w:?})");
+            let _ = w;
+        }
+
+        let opts_json = serde_json::to_string(&dep_opts).unwrap_or_default();
+        let visit_key = (normalized.to_string(), opts_json.clone());
+
+        if visited.contains(&visit_key) {
+            continue;
+        }
+        visited.insert(visit_key);
+
+        // Unique install identity for this expanded instance — same composite
+        // as the `visited` key so option variants of one ref stay distinct.
+        let install_id = install_identity(&normalized.to_string(), &opts_json);
+
+        // Fetch the artifact.
+        let artifact_dir = fetch_one(
+            &dep_ref,
+            &normalized,
+            platform,
+            cache,
+            &oci_fetcher,
+            &http_fetcher,
+            &local_fetcher,
+        )
+        .await?;
+
+        // Parse metadata.
+        let metadata_path = artifact_dir.join("devcontainer-feature.json");
+        let metadata_json =
+            std::fs::read_to_string(&metadata_path).map_err(|e| FeatureError::InvalidMetadata {
+                feature_id: dep_ref.clone(),
+                reason: format!("cannot read devcontainer-feature.json: {e}"),
+            })?;
+        let metadata = parse_feature_metadata(&metadata_json)?;
+
+        // Parse and validate user options.
+        let user_options = parse_user_options(&dep_opts);
+        let warnings = validate_options(&dep_ref, &user_options, &metadata.options);
+        for w in &warnings {
+            log_option_warning(&dep_ref, w);
+        }
+
+        // Enqueue this entry's own dependsOn for further expansion,
+        // pre-filtering with the normalised key to avoid redundant fetches.
+        for (transitive_ref, transitive_opts) in &metadata.depends_on {
+            let t_norm = normalize_key(transitive_ref);
+            let t_opts_json = serde_json::to_string(transitive_opts).unwrap_or_default();
+            let t_key = (t_norm, t_opts_json);
+            if !visited.contains(&t_key) {
+                worklist.push((transitive_ref.clone(), transitive_opts.clone()));
+            }
+        }
+
+        feature_entries.push(FeatureEntry {
+            install_id,
+            metadata,
+            artifact_dir,
+            user_options,
+            original_ref: dep_ref,
+        });
     }
 
     Ok(())
@@ -666,7 +970,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FeatureError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use serde_json::json;
 
@@ -1369,6 +1673,357 @@ mod tests {
                 .any(|m| m.contains("${devcontainerId}")),
             "mounts should contain raw ${{devcontainerId}} before orchestrator substitution: {:?}",
             result.container_config.mounts
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_features: dependsOn expansion
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal local feature dir with optional dependsOn and install.sh.
+    fn make_local_feature(
+        base: &Path,
+        name: &str,
+        depends_on: &[(&str, serde_json::Value)],
+        has_install: bool,
+    ) {
+        let path = base.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut meta = serde_json::json!({
+            "id": name,
+            "version": "1.0.0"
+        });
+        if !depends_on.is_empty() {
+            let deps: serde_json::Map<String, serde_json::Value> = depends_on
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect();
+            meta.as_object_mut()
+                .unwrap()
+                .insert("dependsOn".to_string(), serde_json::Value::Object(deps));
+        }
+        std::fs::write(path.join("devcontainer-feature.json"), meta.to_string()).unwrap();
+        if has_install {
+            std::fs::write(path.join("install.sh"), "#!/bin/sh\necho ok").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn depends_on_transitive_dep_auto_added_and_ordered_first() {
+        // Feature "child" depends on "parent". Only "child" is declared in
+        // devcontainer.json. After expansion both should be resolved, and
+        // "parent" must appear before "child".
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        make_local_feature(feature_dir.path(), "parent", &[], true);
+        // child declares dependsOn on ./parent
+        let child_dep_ref = "./parent".to_string();
+        make_local_feature(
+            feature_dir.path(),
+            "child",
+            &[(&child_dep_ref, serde_json::json!({}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": { "./child": {} }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<&str> = result.features.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "both child and parent should be resolved");
+        assert!(ids.contains(&"parent"));
+        assert!(ids.contains(&"child"));
+
+        let parent_pos = ids.iter().position(|&x| x == "parent").unwrap();
+        let child_pos = ids.iter().position(|&x| x == "child").unwrap();
+        assert!(
+            parent_pos < child_pos,
+            "parent must be installed before child, got order: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn depends_on_dedup_same_ref_same_options() {
+        // Two features both declare dependsOn on the same "shared" feature with
+        // the same options. It should only appear once in the install set.
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        make_local_feature(feature_dir.path(), "shared", &[], true);
+
+        let shared_ref = "./shared".to_string();
+        make_local_feature(
+            feature_dir.path(),
+            "feat-a",
+            &[(&shared_ref, serde_json::json!({}))],
+            true,
+        );
+        make_local_feature(
+            feature_dir.path(),
+            "feat-b",
+            &[(&shared_ref, serde_json::json!({}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": {
+                "./feat-a": {},
+                "./feat-b": {}
+            }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<&str> = result.features.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids.iter().filter(|&&x| x == "shared").count(),
+            1,
+            "shared should appear exactly once, got: {ids:?}"
+        );
+        assert_eq!(ids.len(), 3, "feat-a, feat-b, shared: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn depends_on_same_ref_different_options_two_entries() {
+        // Same feature referenced with different options = two separate entries.
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        make_local_feature(feature_dir.path(), "base-tool", &[], true);
+
+        // feat-a depends on base-tool with version="1"
+        let base_ref = "./base-tool".to_string();
+        make_local_feature(
+            feature_dir.path(),
+            "feat-a",
+            &[(&base_ref, serde_json::json!({"version": "1"}))],
+            true,
+        );
+        // feat-b depends on base-tool with version="2"
+        make_local_feature(
+            feature_dir.path(),
+            "feat-b",
+            &[(&base_ref, serde_json::json!({"version": "2"}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": {
+                "./feat-a": {},
+                "./feat-b": {}
+            }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let result = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<&str> = result.features.iter().map(|f| f.id.as_str()).collect();
+        // Per spec: same feature with different options = different entries.
+        assert_eq!(
+            ids.iter().filter(|&&x| x == "base-tool").count(),
+            2,
+            "base-tool with different options should appear twice, got: {ids:?}"
+        );
+        assert_eq!(ids.len(), 4);
+
+        // Regression (unique-key fix): the two base-tool installs must keep
+        // their DISTINCT options. With a non-unique key both collapsed onto one
+        // entry and the surviving copy carried the wrong option set.
+        let base_versions: HashSet<Option<&str>> = result
+            .features
+            .iter()
+            .filter(|f| f.id == "base-tool")
+            .map(|f| f.user_options.get("version").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            base_versions,
+            HashSet::from([Some("1"), Some("2")]),
+            "both base-tool option variants must survive distinctly, got: {base_versions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn depends_on_cycle_returns_error() {
+        // Feature A depends on B, B depends on A → fatal error.
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        let a_ref = "./feat-a".to_string();
+        let b_ref = "./feat-b".to_string();
+        make_local_feature(
+            feature_dir.path(),
+            "feat-a",
+            &[(&b_ref, serde_json::json!({}))],
+            true,
+        );
+        make_local_feature(
+            feature_dir.path(),
+            "feat-b",
+            &[(&a_ref, serde_json::json!({}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": {
+                "./feat-a": {},
+                "./feat-b": {}
+            }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let err = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, FeatureError::CyclicDependsOn { .. }),
+            "expected CyclicDependsOn error, got: {err:?}"
+        );
+    }
+
+    /// Regression: transitive cycle discovered during dependsOn expansion where
+    /// only the root feature is user-declared.
+    ///
+    /// User declares only A.  A dependsOn B (not declared).  B dependsOn A
+    /// (back-edge, completing the cycle).  `resolve_features` must return
+    /// `CyclicDependsOn`, not loop or silently mis-order.
+    #[tokio::test]
+    async fn depends_on_transitive_cycle_not_user_declared_returns_error() {
+        let feature_dir = tempfile::tempdir().unwrap();
+
+        let a_ref = "./feat-a".to_string();
+        let b_ref = "./feat-b".to_string();
+
+        // A depends on B (B is not in the user's features list).
+        make_local_feature(
+            feature_dir.path(),
+            "feat-a",
+            &[(&b_ref, serde_json::json!({}))],
+            true,
+        );
+        // B depends back on A — completes the cycle.
+        make_local_feature(
+            feature_dir.path(),
+            "feat-b",
+            &[(&a_ref, serde_json::json!({}))],
+            true,
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = FeatureCache::with_root(cache_dir.path().join("features"));
+        let config_path = feature_dir.path().join("devcontainer.json");
+        // Only feat-a is declared — B is auto-injected via dependsOn expansion.
+        let config = json!({
+            "image": "ubuntu:22.04",
+            "features": { "./feat-a": {} }
+        });
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+        };
+
+        let err = resolve_features(
+            &config,
+            &config_path,
+            &platform,
+            &cache,
+            &BaseImageContext {
+                base_image: "ubuntu:22.04",
+                image_user: "root",
+                metadata: None,
+                omit_remote_env: false,
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, FeatureError::CyclicDependsOn { .. }),
+            "expected CyclicDependsOn error for transitive cycle, got: {err:?}"
         );
     }
 }

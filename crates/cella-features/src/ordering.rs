@@ -7,9 +7,22 @@
 //! 1. Official `ghcr.io/devcontainers/features/*` features sort first.
 //! 2. Among equal-priority features, declaration order is preserved.
 //! 3. `overrideFeatureInstallOrder` takes precedence over computed order.
+//!
+//! `dependsOn` edges are hard ordering constraints — a feature cannot be
+//! emitted until ALL its `dependsOn` targets appear earlier in the result.
+//! Cycles in `dependsOn` edges are surfaced via the `depends_on_cycle`
+//! out-parameter so callers can return a fatal error. `installsAfter` cycles
+//! are merely soft hints: they are reported as a non-fatal warning and the
+//! affected features fall back to declaration order.
+//!
+//! Hard and soft cycles are detected independently. A hard cycle is determined
+//! solely from the `dependsOn`-only graph, so a soft `installsAfter` edge that
+//! merely *participates* in a loop with otherwise-acyclic `dependsOn` edges
+//! (e.g. `A dependsOn B`, `B installsAfter A` — satisfiable by installing `B`
+//! first) is never misclassified as a fatal `dependsOn` cycle.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::error::FeatureWarning;
 use crate::types::FeatureMetadata;
@@ -17,7 +30,25 @@ use crate::types::FeatureMetadata;
 /// Prefix for official devcontainer features in the OCI namespace.
 const OFFICIAL_PREFIX: &str = "ghcr.io/devcontainers/features/";
 
-/// Priority bucket for tiebreaking in the topological sort.
+/// Adjacency lists plus degree counters for a Kahn sort.
+///
+/// Hard (`dependsOn`) and soft (`installsAfter`) edges are kept apart so the
+/// scheduler can apply both while cycle detection reasons about the hard graph
+/// in isolation. All edges flow prerequisite → dependent (emit prereq first).
+struct DepGraph {
+    /// Hard-edge adjacency: `hard_adj[prereq]` lists dependents that
+    /// `dependsOn` `prereq`.
+    hard_adj: Vec<Vec<usize>>,
+    /// Soft-edge adjacency: `soft_adj[prereq]` lists dependents that
+    /// `installsAfter` `prereq`.
+    soft_adj: Vec<Vec<usize>>,
+    /// Combined (hard + soft) in-degree used by the scheduling Kahn pass.
+    in_degree: Vec<usize>,
+    /// Hard-only in-degree, used to seed the hard-cycle detection pass.
+    hard_in_degree: Vec<usize>,
+}
+
+/// Priority bucket for tiebreaking in the topological sort (no override).
 ///
 /// Lower numeric value = higher priority (installed first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,6 +56,23 @@ struct SortKey {
     /// 0 for official features, 1 for third-party.
     tier: u8,
     /// Index in the original declaration order.
+    declaration_index: usize,
+}
+
+/// Extended sort key used when `overrideFeatureInstallOrder` is active.
+///
+/// Override-listed features get `override_tier = 0` and sort by their
+/// position in the override list.  Unlisted features get `override_tier = 1`
+/// and fall back to the standard official-first + declaration-order tiebreak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OverrideSortKey {
+    /// 0 = in override list, 1 = not in override list.
+    override_tier: u8,
+    /// Position in the override list (only meaningful when `override_tier == 0`).
+    override_pos: usize,
+    /// 0 = official, 1 = third-party (only meaningful when `override_tier == 1`).
+    official_tier: u8,
+    /// Declaration index tiebreaker (only meaningful when `override_tier == 1`).
     declaration_index: usize,
 }
 
@@ -40,22 +88,25 @@ fn build_id_index<'a>(features: &'a [(String, &FeatureMetadata)]) -> HashMap<&'a
 /// Compute the install order for a set of features.
 ///
 /// Takes features in their declaration order and returns them reordered
-/// according to `installsAfter` dependencies, official-first tiebreaking,
-/// and any explicit override.
+/// according to `dependsOn` (hard) and `installsAfter` (soft) dependencies,
+/// official-first tiebreaking, and any explicit override.
 ///
 /// # Arguments
 ///
 /// * `features` - Pairs of `(feature_id, metadata)` in declaration order.
 /// * `override_order` - Optional explicit ordering from `overrideFeatureInstallOrder`.
+/// * `depends_on_cycle` - Set to the cycle members when a hard `dependsOn`
+///   cycle is detected; caller should return a fatal error in that case.
 ///
 /// # Returns
 ///
 /// A tuple of `(ordered_ids, warnings)`. Warnings are emitted for cyclic
-/// dependencies. On cycle detection, affected features fall back to
-/// declaration order.
+/// `installsAfter` soft deps only. Cyclic `dependsOn` hard deps are
+/// signalled via `depends_on_cycle` instead.
 pub fn compute_install_order(
     features: &[(String, &FeatureMetadata)],
     override_order: Option<&[String]>,
+    depends_on_cycle: &mut Option<Vec<String>>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
     if features.is_empty() {
         return (Vec::new(), Vec::new());
@@ -78,53 +129,79 @@ pub fn compute_install_order(
             overrides,
             &id_to_index,
             has_official,
+            depends_on_cycle,
             &mut warnings,
         );
     }
 
     // No override — run full topological sort.
-    topological_sort(features, &id_to_index, has_official, &mut warnings)
+    topological_sort(
+        features,
+        &id_to_index,
+        has_official,
+        depends_on_cycle,
+        &mut warnings,
+    )
 }
 
-/// Apply `overrideFeatureInstallOrder`: listed features go first in override
-/// order (ignoring `installsAfter`), unlisted features are appended in
-/// default topological sort order.
+/// Apply `overrideFeatureInstallOrder` as a **priority hint** inside the
+/// topological sort.
+///
+/// Per the devcontainer spec, `overrideFeatureInstallOrder` controls which
+/// `in_degree == 0` candidate is picked first in each Kahn round.  It does
+/// NOT bypass `dependsOn` hard constraints — a feature that `dependsOn`
+/// another must still wait for that prerequisite regardless of its position in
+/// the override list.
+///
+/// Override-listed features use `OverrideSortKey` tier 0 (highest priority)
+/// with their override position as tiebreak, and have their own
+/// `installsAfter` soft edges ignored.  Unlisted features fall back to the
+/// standard official-first + declaration-order tiebreak (tier 1).
 fn apply_override(
     features: &[(String, &FeatureMetadata)],
     overrides: &[String],
     id_to_index: &HashMap<&str, usize>,
     has_official: bool,
+    depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
-    let override_set: HashSet<&str> = overrides.iter().map(String::as_str).collect();
-
-    // Listed features in override order (skip any that aren't in our feature set).
-    let mut result: Vec<String> = overrides
+    let override_position: HashMap<&str, usize> = overrides
         .iter()
-        .filter(|id| id_to_index.contains_key(id.as_str()))
-        .cloned()
+        .enumerate()
+        .filter(|(_, id)| id_to_index.contains_key(id.as_str()))
+        .map(|(pos, id)| (id.as_str(), pos))
         .collect();
 
-    // Unlisted features: topological sort among themselves only.
-    let unlisted: Vec<(String, &FeatureMetadata)> = features
-        .iter()
-        .filter(|(id, _)| !override_set.contains(id.as_str()))
-        .cloned()
-        .collect();
+    let graph = build_graph(features, id_to_index, Some(&override_position));
+    let ext_key = |id: &str| override_sort_key(id, &override_position, id_to_index, has_official);
 
-    if !unlisted.is_empty() {
-        let unlisted_id_to_index = build_id_index(&unlisted);
+    let mut in_degree = graph.in_degree.clone();
+    let mut heap: BinaryHeap<Reverse<(OverrideSortKey, usize)>> = BinaryHeap::new();
+    for (local_idx, (id, _)) in features.iter().enumerate() {
+        if in_degree[local_idx] == 0 {
+            heap.push(Reverse((ext_key(id), local_idx)));
+        }
+    }
 
-        // For unlisted features, only consider dependencies among unlisted features.
-        // Use the original declaration order for tiebreaking.
-        let (unlisted_order, mut unlisted_warnings) = topological_sort_with_original_indices(
-            &unlisted,
-            &unlisted_id_to_index,
-            id_to_index,
-            has_official,
-        );
-        result.extend(unlisted_order);
-        warnings.append(&mut unlisted_warnings);
+    let mut result = Vec::with_capacity(features.len());
+    while let Some(Reverse((_, local_idx))) = heap.pop() {
+        result.push(features[local_idx].0.clone());
+        // Iterate adjacency slices by reference — no per-pop clone needed.
+        for &dep in graph.hard_adj[local_idx]
+            .iter()
+            .chain(&graph.soft_adj[local_idx])
+        {
+            in_degree[dep] -= 1;
+            if in_degree[dep] == 0 {
+                heap.push(Reverse((ext_key(&features[dep].0), dep)));
+            }
+        }
+    }
+
+    if let Some(fallback) =
+        finish_with_cycle_detection(features, &graph, &result, depends_on_cycle, warnings)
+    {
+        result.extend(fallback);
     }
 
     (result, warnings.clone())
@@ -135,105 +212,203 @@ fn topological_sort(
     features: &[(String, &FeatureMetadata)],
     id_to_index: &HashMap<&str, usize>,
     has_official: bool,
+    depends_on_cycle: &mut Option<Vec<String>>,
     warnings: &mut Vec<FeatureWarning>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
-    topological_sort_with_original_indices(features, id_to_index, id_to_index, has_official)
-        .pipe_warnings(warnings)
+    topological_sort_with_original_indices(
+        features,
+        id_to_index,
+        id_to_index,
+        has_official,
+        depends_on_cycle,
+    )
+    .pipe_warnings(warnings)
 }
 
 /// Inner topological sort that accepts separate index maps for adjacency
 /// lookup vs. tiebreaking (needed when sorting a subset of features while
 /// preserving original declaration order).
+///
+/// Both `dependsOn` (hard) and `installsAfter` (soft) edges contribute to
+/// `in_degree`.  Cycle detection reasons about the hard graph in isolation so
+/// hard cycles are signalled via `depends_on_cycle` while soft-only cycles
+/// emit a warning and fall back to declaration order.
 fn topological_sort_with_original_indices(
     features: &[(String, &FeatureMetadata)],
     local_id_to_index: &HashMap<&str, usize>,
     original_id_to_index: &HashMap<&str, usize>,
     has_official: bool,
+    depends_on_cycle: &mut Option<Vec<String>>,
 ) -> (Vec<String>, Vec<FeatureWarning>) {
-    let n = features.len();
     let mut warnings = Vec::new();
 
-    // Adjacency: edge from prerequisite -> dependent. If feature X must be
-    // installed after Y (Y is a prerequisite of X), then Y comes first, so we
-    // record the edge Y -> X.
-    //
-    // Both edge sources impose the same install-before constraint:
-    //   - `dependsOn` keys  — hard dependencies (must install before)
-    //   - `installsAfter`   — soft ordering hints
-    // Matching the official CLI, a round can only install a node once *every*
-    // hard- and soft-dependency has been installed, so both feed the sort.
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut in_degree: Vec<usize> = vec![0; n];
-
-    for (local_idx, (_, meta)) in features.iter().enumerate() {
-        // Deduplicate prerequisites so a dependency declared in both
-        // `dependsOn` and `installsAfter` (or repeated) counts once — otherwise
-        // the inflated in-degree would never reach zero and stall the sort.
-        // `BTreeSet` keeps the adjacency build deterministic.
-        let mut prerequisites: BTreeSet<usize> = BTreeSet::new();
-        let dep_ids = meta.depends_on.keys().map(String::as_str);
-        let after_ids = meta.installs_after.iter().map(String::as_str);
-        for dep_id in dep_ids.chain(after_ids) {
-            if let Some(&dep_local_idx) = local_id_to_index.get(dep_id) {
-                prerequisites.insert(dep_local_idx);
-            }
-            // Dependencies on features not in our set are ignored.
-        }
-        for dep_local_idx in prerequisites {
-            adj[dep_local_idx].push(local_idx);
-            in_degree[local_idx] += 1;
-        }
-    }
+    let graph = build_graph(features, local_id_to_index, None);
+    let mut in_degree = graph.in_degree.clone();
 
     // Priority queue: smallest SortKey wins (installed first).
     // BinaryHeap is max-heap, so wrap in Reverse.
     let mut heap: BinaryHeap<Reverse<(SortKey, usize)>> = BinaryHeap::new();
-
     for (local_idx, (id, _)) in features.iter().enumerate() {
         if in_degree[local_idx] == 0 {
-            let key = sort_key(id, original_id_to_index, has_official);
-            heap.push(Reverse((key, local_idx)));
+            heap.push(Reverse((
+                sort_key(id, original_id_to_index, has_official),
+                local_idx,
+            )));
         }
     }
 
-    let mut result = Vec::with_capacity(n);
-
+    let mut result = Vec::with_capacity(features.len());
     while let Some(Reverse((_, local_idx))) = heap.pop() {
-        let id = &features[local_idx].0;
-        result.push(id.clone());
+        result.push(features[local_idx].0.clone());
 
-        for &neighbor in &adj[local_idx] {
-            in_degree[neighbor] -= 1;
-            if in_degree[neighbor] == 0 {
-                let neighbor_id = &features[neighbor].0;
-                let key = sort_key(neighbor_id, original_id_to_index, has_official);
-                heap.push(Reverse((key, neighbor)));
+        // Both edge kinds impose the same install-before constraint, so a
+        // dependent only becomes schedulable once every hard AND soft
+        // prerequisite has been emitted. Iterating the adjacency slices by
+        // reference avoids cloning them on every pop.
+        for &dependent in graph.hard_adj[local_idx]
+            .iter()
+            .chain(&graph.soft_adj[local_idx])
+        {
+            in_degree[dependent] -= 1;
+            if in_degree[dependent] == 0 {
+                heap.push(Reverse((
+                    sort_key(&features[dependent].0, original_id_to_index, has_official),
+                    dependent,
+                )));
             }
         }
     }
 
-    // Cycle detection: if we couldn't process all nodes, remaining form a cycle.
-    if result.len() < n {
-        let processed: HashSet<String> = result.iter().cloned().collect();
-        let cycle_members: Vec<String> = features
-            .iter()
-            .filter(|(id, _)| !processed.contains(id.as_str()))
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        warnings.push(FeatureWarning::CyclicDependency {
-            features: cycle_members,
-        });
-
-        // Append cyclic features in declaration order as fallback.
-        for (id, _) in features {
-            if !processed.contains(id.as_str()) {
-                result.push(id.clone());
-            }
-        }
+    if let Some(fallback) =
+        finish_with_cycle_detection(features, &graph, &result, depends_on_cycle, &mut warnings)
+    {
+        result.extend(fallback);
     }
 
     (result, warnings)
+}
+
+/// Build hard/soft adjacency lists and degree counters for the Kahn passes.
+///
+/// Hard (`dependsOn`) edges are always included.  Soft (`installsAfter`) edges
+/// are included for every feature, except — when `override_position` is
+/// provided — for features that appear in the override list (their soft
+/// ordering hints are deliberately ignored so the override wins).
+fn build_graph(
+    features: &[(String, &FeatureMetadata)],
+    id_to_index: &HashMap<&str, usize>,
+    override_position: Option<&HashMap<&str, usize>>,
+) -> DepGraph {
+    let n = features.len();
+    let mut graph = DepGraph {
+        hard_adj: vec![Vec::new(); n],
+        soft_adj: vec![Vec::new(); n],
+        in_degree: vec![0; n],
+        hard_in_degree: vec![0; n],
+    };
+
+    for (local_idx, (id, meta)) in features.iter().enumerate() {
+        // Hard edges: dependsOn (dep must be installed BEFORE local_idx).
+        // Option values on the dependsOn key form part of the dependency's
+        // identity, but the install set has already been expanded to one entry
+        // per (ref, options) pair upstream, so matching by feature id here
+        // lands on the correct instance.
+        for dep_id in meta.depends_on.keys() {
+            if let Some(&prereq_idx) = id_to_index.get(dep_id.as_str()) {
+                graph.hard_adj[prereq_idx].push(local_idx);
+                graph.in_degree[local_idx] += 1;
+                graph.hard_in_degree[local_idx] += 1;
+            }
+            // dependsOn targets outside the current set were already injected
+            // by resolve_features; any remaining unknowns are ignored here.
+        }
+
+        // Soft edges: installsAfter (dep should be installed BEFORE local_idx).
+        // Skipped for override-listed features so the override order wins.
+        let suppress_soft = override_position.is_some_and(|p| p.contains_key(id.as_str()));
+        if !suppress_soft {
+            for dep_id in &meta.installs_after {
+                if let Some(&prereq_idx) = id_to_index.get(dep_id.as_str()) {
+                    graph.soft_adj[prereq_idx].push(local_idx);
+                    graph.in_degree[local_idx] += 1;
+                }
+            }
+        }
+    }
+
+    graph
+}
+
+/// Run Kahn's algorithm on the **hard-only** (`dependsOn`) graph and return the
+/// members of any hard cycle — i.e. nodes that can never be scheduled when
+/// only `dependsOn` edges are considered.
+///
+/// This is the authoritative hard-cycle test: it ignores soft `installsAfter`
+/// edges entirely, so a satisfiable-but-tangled case like `A dependsOn B`,
+/// `B installsAfter A` reports *no* hard cycle (the `dependsOn` graph `B → A`
+/// is acyclic) even though the combined graph stalls.
+fn hard_cycle_members(features: &[(String, &FeatureMetadata)], graph: &DepGraph) -> Vec<String> {
+    let n = features.len();
+    let mut hard_in_degree = graph.hard_in_degree.clone();
+    let mut queue: Vec<usize> = (0..n).filter(|&i| hard_in_degree[i] == 0).collect();
+    let mut processed = vec![false; n];
+
+    while let Some(idx) = queue.pop() {
+        processed[idx] = true;
+        for &dependent in &graph.hard_adj[idx] {
+            hard_in_degree[dependent] -= 1;
+            if hard_in_degree[dependent] == 0 {
+                queue.push(dependent);
+            }
+        }
+    }
+
+    features
+        .iter()
+        .zip(processed)
+        .filter(|(_, done)| !done)
+        .map(|((id, _), _)| id.clone())
+        .collect()
+}
+
+/// Classify the outcome of the scheduling Kahn pass.
+///
+/// - Complete schedule → `None` (nothing more to do).
+/// - Hard (`dependsOn`) cycle → sets `depends_on_cycle` and returns `None`
+///   (the caller surfaces a fatal error; no fallback is appended).
+/// - Soft-only (`installsAfter`) cycle → pushes a non-fatal warning and
+///   returns `Some(leftover)` — the unscheduled features in declaration order
+///   for the caller to append as a best-effort fallback.
+fn finish_with_cycle_detection(
+    features: &[(String, &FeatureMetadata)],
+    graph: &DepGraph,
+    scheduled: &[String],
+    depends_on_cycle: &mut Option<Vec<String>>,
+    warnings: &mut Vec<FeatureWarning>,
+) -> Option<Vec<String>> {
+    if scheduled.len() == features.len() {
+        return None;
+    }
+
+    // A hard cycle is determined purely from the dependsOn-only graph.
+    let hard_cycle = hard_cycle_members(features, graph);
+    if !hard_cycle.is_empty() {
+        *depends_on_cycle = Some(hard_cycle);
+        return None;
+    }
+
+    // Soft-only (installsAfter) cycle: warn and fall back to declaration order.
+    let processed: HashSet<&str> = scheduled.iter().map(String::as_str).collect();
+    let leftover: Vec<String> = features
+        .iter()
+        .filter(|(id, _)| !processed.contains(id.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    warnings.push(FeatureWarning::CyclicDependency {
+        features: leftover.clone(),
+    });
+    Some(leftover)
 }
 
 /// Compute the sort key for tiebreaking.
@@ -244,6 +419,31 @@ fn sort_key(id: &str, original_id_to_index: &HashMap<&str, usize>, has_official:
     SortKey {
         tier,
         declaration_index,
+    }
+}
+
+/// Compute the `OverrideSortKey` for a feature id.
+fn override_sort_key(
+    id: &str,
+    override_position: &HashMap<&str, usize>,
+    id_to_index: &HashMap<&str, usize>,
+    has_official: bool,
+) -> OverrideSortKey {
+    if let Some(&pos) = override_position.get(id) {
+        OverrideSortKey {
+            override_tier: 0,
+            override_pos: pos,
+            official_tier: 0,
+            declaration_index: 0,
+        }
+    } else {
+        let is_third_party = !(has_official && id.starts_with(OFFICIAL_PREFIX));
+        OverrideSortKey {
+            override_tier: 1,
+            override_pos: 0,
+            official_tier: u8::from(is_third_party),
+            declaration_index: id_to_index.get(id).copied().unwrap_or(usize::MAX),
+        }
     }
 }
 
@@ -273,7 +473,7 @@ mod tests {
         }
     }
 
-    /// Helper to build a `FeatureMetadata` with `depends_on` (hard) deps set.
+    /// Helper to build a `FeatureMetadata` with `depends_on` (hard deps) set.
     /// Each key maps to an arbitrary option value (`true`).
     fn meta_depends(id: &str, depends_on: &[&str]) -> FeatureMetadata {
         FeatureMetadata {
@@ -304,7 +504,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(order, vec!["alpha", "beta", "gamma"]);
@@ -323,7 +523,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(order, vec!["c", "b", "a"]);
@@ -344,7 +544,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         // Official sorts first despite being declared second.
@@ -373,7 +573,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(
@@ -398,7 +598,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert_eq!(warnings.len(), 1);
         match &warnings[0] {
@@ -425,7 +625,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert_eq!(warnings.len(), 1);
         // x has no cycle, gets processed first.
@@ -448,7 +648,7 @@ mod tests {
         let features = feature_list(&items);
         let overrides = vec!["c".to_string(), "a".to_string(), "b".to_string()];
 
-        let (order, warnings) = compute_install_order(&features, Some(&overrides));
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(order, vec!["c", "a", "b"]);
@@ -469,7 +669,7 @@ mod tests {
         let features = feature_list(&items);
         let overrides = vec!["c".to_string(), "a".to_string()];
 
-        let (order, warnings) = compute_install_order(&features, Some(&overrides));
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
 
         assert!(warnings.is_empty());
         // c, a listed first; b, d unlisted in declaration order.
@@ -490,7 +690,7 @@ mod tests {
         let features = feature_list(&items);
         let overrides = vec!["a".to_string(), "b".to_string()];
 
-        let (order, warnings) = compute_install_order(&features, Some(&overrides));
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
 
         assert!(warnings.is_empty());
         // Override order takes precedence over installsAfter.
@@ -511,7 +711,7 @@ mod tests {
         let features = feature_list(&items);
         let overrides = vec!["listed".to_string()];
 
-        let (order, warnings) = compute_install_order(&features, Some(&overrides));
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
 
         assert!(warnings.is_empty());
         // listed first (override), then y before x (dependency).
@@ -536,7 +736,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         // official sorts first (tier 0), then another (tier 1, index 2),
@@ -551,7 +751,7 @@ mod tests {
     #[test]
     fn empty_input_returns_empty() {
         let features: Vec<(String, &FeatureMetadata)> = vec![];
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
         assert!(order.is_empty());
         assert!(warnings.is_empty());
     }
@@ -565,7 +765,7 @@ mod tests {
         let items = vec![("only".to_string(), meta("only", &[]))];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(order, vec!["only"]);
@@ -583,7 +783,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         // a's dependency on nonexistent is ignored, so declaration order.
@@ -605,7 +805,7 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         assert_eq!(order, vec!["b", "a"]);
@@ -613,41 +813,96 @@ mod tests {
 
     #[test]
     fn depends_on_cycle_is_fatal() {
-        // a dependsOn b, b dependsOn a → cycle must be reported, not silently
-        // ordered. Previously dependsOn edges were never added, so this cycle
-        // went undetected.
+        // a dependsOn b, b dependsOn a → hard cycle must be signalled fatally
+        // via depends_on_cycle, not silently ordered or merely warned.
         let items = vec![
             ("a".to_string(), meta_depends("a", &["b"])),
             ("b".to_string(), meta_depends("b", &["a"])),
         ];
         let features = feature_list(&items);
 
-        let (_order, warnings) = compute_install_order(&features, None);
+        let mut cycle = None;
+        let (_order, warnings) = compute_install_order(&features, None, &mut cycle);
 
-        assert_eq!(warnings.len(), 1);
-        match &warnings[0] {
-            FeatureWarning::CyclicDependency { features } => {
-                assert!(features.contains(&"a".to_string()));
-                assert!(features.contains(&"b".to_string()));
-            }
-            other => panic!("expected CyclicDependency, got {other:?}"),
-        }
+        assert!(warnings.is_empty(), "hard cycle is fatal, not a warning");
+        let members = cycle.expect("expected a hard dependsOn cycle signal");
+        assert!(members.contains(&"a".to_string()));
+        assert!(members.contains(&"b".to_string()));
     }
 
     #[test]
-    fn depends_on_and_installs_after_same_target_counted_once() {
+    fn depends_on_and_installs_after_same_target_counted_correctly() {
         // a lists b in BOTH dependsOn and installsAfter. The prerequisite must
-        // be deduplicated; otherwise the doubled in-degree would stall the sort
-        // and spuriously report a cycle.
+        // resolve cleanly; the doubled in-degree must not stall the sort or
+        // spuriously report a cycle.
         let mut a = meta_depends("a", &["b"]);
         a.installs_after = vec!["b".to_string()];
         let items = vec![("a".to_string(), a), ("b".to_string(), meta("b", &[]))];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let mut cycle = None;
+        let (order, warnings) = compute_install_order(&features, None, &mut cycle);
 
         assert!(warnings.is_empty(), "no cycle: b is a single prerequisite");
+        assert!(cycle.is_none());
         assert_eq!(order, vec!["b", "a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // P1 regression: soft installsAfter participating in a loop with an
+    // acyclic dependsOn graph must NOT be misclassified as a hard cycle.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn soft_edge_in_loop_with_acyclic_hard_graph_is_not_fatal() {
+        // a dependsOn b (hard: b before a), b installsAfter a (soft: a before b).
+        // The combined graph stalls, but the dependsOn-only graph (b → a) is
+        // acyclic and satisfiable by installing b first. This must NOT be a
+        // fatal dependsOn cycle — it should warn and fall back instead.
+        let mut b = meta("b", &["a"]); // installsAfter a
+        b.id = "b".to_string();
+        let items = vec![
+            ("a".to_string(), meta_depends("a", &["b"])),
+            ("b".to_string(), b),
+        ];
+        let features = feature_list(&items);
+
+        let mut cycle = None;
+        let (order, warnings) = compute_install_order(&features, None, &mut cycle);
+
+        assert!(
+            cycle.is_none(),
+            "soft installsAfter must not trigger a fatal dependsOn cycle, got {cycle:?}"
+        );
+        // Combined-graph stall is reported as a soft warning, not a hard error.
+        assert_eq!(warnings.len(), 1, "expected a soft-cycle warning");
+        match &warnings[0] {
+            FeatureWarning::CyclicDependency { .. } => {}
+            other => panic!("expected CyclicDependency warning, got {other:?}"),
+        }
+        // Every feature still appears in the result.
+        assert!(order.contains(&"a".to_string()));
+        assert!(order.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn override_soft_edge_in_loop_with_acyclic_hard_graph_is_not_fatal() {
+        // Same scenario as above but exercised through the override path.
+        let mut b = meta("b", &["a"]);
+        b.id = "b".to_string();
+        let items = vec![
+            ("a".to_string(), meta_depends("a", &["b"])),
+            ("b".to_string(), b),
+        ];
+        let features = feature_list(&items);
+        let overrides = vec!["a".to_string(), "b".to_string()];
+
+        let mut cycle = None;
+        let (_order, _warnings) = compute_install_order(&features, Some(&overrides), &mut cycle);
+
+        // Override suppresses soft edges for listed features, so b's
+        // installsAfter is dropped entirely; either way no hard cycle exists.
+        assert!(cycle.is_none(), "no hard cycle expected, got {cycle:?}");
     }
 
     // ---------------------------------------------------------------
@@ -664,11 +919,11 @@ mod tests {
         ];
         let features = feature_list(&items);
 
-        let (order, warnings) = compute_install_order(&features, None);
+        let (order, warnings) = compute_install_order(&features, None, &mut None);
 
         assert!(warnings.is_empty());
         // d must come before b and c; b and c before a.
-        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+        let pos = |id: &str| order.iter().position(|x| x == id).expect("id present");
         assert!(pos("d") < pos("b"));
         assert!(pos("d") < pos("c"));
         assert!(pos("b") < pos("a"));
@@ -688,11 +943,78 @@ mod tests {
         let features = feature_list(&items);
         let overrides = vec!["nonexistent".to_string(), "b".to_string()];
 
-        let (order, warnings) = compute_install_order(&features, Some(&overrides));
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
 
         assert!(warnings.is_empty());
         // b listed (override), a unlisted (appended).
         assert_eq!(order, vec!["b", "a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Override cannot bypass dependsOn hard constraints
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_respects_depends_on_hard_constraint() {
+        // child dependsOn parent — override lists child first, but parent must
+        // still be emitted before child per hard-dep semantics.
+        let items = vec![
+            ("child".to_string(), meta_depends("child", &["parent"])),
+            ("parent".to_string(), meta_depends("parent", &[])),
+        ];
+        let features = feature_list(&items);
+        let overrides = vec!["child".to_string(), "parent".to_string()];
+
+        let mut cycle = None;
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut cycle);
+
+        assert!(warnings.is_empty());
+        assert!(cycle.is_none(), "no cycle expected");
+        // parent must appear before child despite override listing child first.
+        let pos = |id: &str| order.iter().position(|x| x == id).expect("id present");
+        assert!(pos("parent") < pos("child"), "order was {order:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // Override respects order among independent features
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_order_respected_for_independent_features() {
+        // c, b, a have no deps — override dictates their install order.
+        let items = vec![
+            ("a".to_string(), meta("a", &[])),
+            ("b".to_string(), meta("b", &[])),
+            ("c".to_string(), meta("c", &[])),
+        ];
+        let features = feature_list(&items);
+        let overrides = vec!["c".to_string(), "b".to_string(), "a".to_string()];
+
+        let (order, warnings) = compute_install_order(&features, Some(&overrides), &mut None);
+
+        assert!(warnings.is_empty());
+        assert_eq!(order, vec!["c", "b", "a"]);
+    }
+
+    // ---------------------------------------------------------------
+    // dependsOn cycle in override path → fatal signal
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn override_with_depends_on_cycle_signals_fatal() {
+        let items = vec![
+            ("a".to_string(), meta_depends("a", &["b"])),
+            ("b".to_string(), meta_depends("b", &["a"])),
+        ];
+        let features = feature_list(&items);
+        let overrides = vec!["a".to_string(), "b".to_string()];
+
+        let mut cycle = None;
+        let (_order, _warnings) = compute_install_order(&features, Some(&overrides), &mut cycle);
+
+        let members = cycle.expect("expected CyclicDependsOn signal");
+        assert!(members.contains(&"a".to_string()));
+        assert!(members.contains(&"b".to_string()));
     }
 
     // --- Spec compliance: feature option env var transformation ---

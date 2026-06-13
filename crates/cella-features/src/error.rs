@@ -36,6 +36,15 @@ pub enum FeatureError {
     #[diagnostic(code(cella::features::cyclic_dependency))]
     CyclicDependency { features: Vec<String> },
 
+    /// Cyclic hard dependency (`dependsOn`) detected — fatal.
+    ///
+    /// `cycle` holds the *set* of features caught in the cycle (not an ordered
+    /// traversal path), so it is rendered comma-separated rather than with
+    /// arrows that would imply a specific path.
+    #[error("cyclic dependsOn among features: {}", cycle.join(", "))]
+    #[diagnostic(code(cella::features::cyclic_depends_on))]
+    CyclicDependsOn { cycle: Vec<String> },
+
     /// Feature install script failed during container build.
     #[error("feature build failed for {feature_id}: {message}")]
     #[diagnostic(code(cella::features::build_failed))]
