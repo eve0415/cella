@@ -36,7 +36,7 @@ pub enum ExtractionError {
 
     /// An entry that `Entry::unpack_in` silently skipped — meaning the tar
     /// crate also considers it unsafe.  We surface it as a hard error.
-    #[error("tar entry '{path}' was rejected by the tar crate (would escape destination)")]
+    #[error("tar entry '{path}' was skipped as unsafe by the tar crate")]
     EntrySkipped { path: String },
 
     /// Underlying I/O or tar error.
@@ -199,11 +199,19 @@ fn validate_link_target<R: Read>(
         });
     }
 
-    // Resolve relative target against the entry's parent directory inside dest.
-    let entry_parent = entry_path
-        .parent()
-        .map_or_else(|| dest.to_path_buf(), |p| dest.join(p));
-    if escapes_dest(&entry_parent.join(&link_target), dest) {
+    // Resolve the relative target against its correct base inside dest.
+    // POSIX semantics differ by link kind: symlink targets are relative to the
+    // link's own directory, while hardlink targets are relative to the archive
+    // root (dest). Using the entry parent for both would under-validate
+    // hardlinks (e.g. `a/b/link -> ../../etc/passwd` would look contained).
+    let base = if kind.is_hard_link() {
+        dest.to_path_buf()
+    } else {
+        entry_path
+            .parent()
+            .map_or_else(|| dest.to_path_buf(), |p| dest.join(p))
+    };
+    if escapes_dest(&base.join(&link_target), dest) {
         return Err(ExtractionError::UnsafeLinkTarget {
             entry: entry_name,
             target: target_display,
@@ -330,8 +338,7 @@ mod tests {
         write_field(&mut h[148..156], "        "); // 8 spaces
         h[156] = typeflag;
         write_field(&mut h[157..257], linkname); // linkname
-        write_field(&mut h[257..265], "ustar  \0"); // magic
-        write_field(&mut h[265..267], "  "); // version (space-space for GNU compat)
+        write_field(&mut h[257..265], "ustar  \0"); // GNU magic (8 bytes: "ustar", two spaces, NUL)
         let cksum = tar_checksum(&h);
         let cksum_str = format!("{cksum:06o}\0 ");
         write_field(&mut h[148..156], &cksum_str);
@@ -483,6 +490,21 @@ mod tests {
         let tar = gz_compress(&build_raw_tar(&[("link", b'2', "/etc/passwd", b"")]));
         let dest = dest_dir();
         let err = extract_layer(&tar, IMAGE_LAYER_GZIP_MEDIA_TYPE, dest.path()).unwrap_err();
+        assert!(
+            matches!(err, ExtractionError::UnsafeLinkTarget { .. }),
+            "expected UnsafeLinkTarget, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_hardlink_escaping_via_archive_root() {
+        // Hardlink targets are relative to the archive root, not the entry's
+        // own directory. `a/b/link -> ../../etc/passwd` resolves to
+        // `dest/../../etc/passwd` and must be rejected by first-line
+        // validation (typeflag b'1' = hard link).
+        let tar = build_raw_tar(&[("a/b/link", b'1', "../../etc/passwd", b"")]);
+        let dest = dest_dir();
+        let err = extract_layer(&tar, IMAGE_LAYER_MEDIA_TYPE, dest.path()).unwrap_err();
         assert!(
             matches!(err, ExtractionError::UnsafeLinkTarget { .. }),
             "expected UnsafeLinkTarget, got {err}"
