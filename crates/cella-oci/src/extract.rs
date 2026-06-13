@@ -14,7 +14,7 @@ use oci_distribution::manifest::{
 use thiserror::Error;
 use tracing::warn;
 
-use crate::limits::{LimitedReader, MAX_BLOB_DECOMPRESSED_BYTES};
+use crate::limits::{LimitedReader, MAX_BLOB_DECOMPRESSED_BYTES, limit_from_io_error};
 
 /// Media type for devcontainer feature layers (plain tar).
 pub const DEVCONTAINERS_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
@@ -41,17 +41,9 @@ pub enum ExtractionError {
     #[error("tar entry '{path}' was skipped as unsafe by the tar crate")]
     EntrySkipped { path: String },
 
-    /// A blob's compressed download size exceeds the configured limit.
-    #[error("blob download exceeds size limit: {size} bytes > {limit} bytes for {digest}")]
-    BlobTooLarge {
-        size: u64,
-        limit: u64,
-        digest: String,
-    },
-
     /// Decompressed output exceeded the configured cap — possible zip-bomb.
-    #[error("decompressed output exceeds limit of {limit} bytes for blob {digest}")]
-    DecompressedTooLarge { limit: u64, digest: String },
+    #[error("decompressed output exceeds limit of {limit} bytes")]
+    DecompressedTooLarge { limit: u64 },
 
     /// Underlying I/O or tar error.
     #[error(transparent)]
@@ -110,7 +102,7 @@ pub fn extract_layer_with_limit(
     if media_type.contains("gzip") || media_type == IMAGE_LAYER_GZIP_MEDIA_TYPE {
         if is_gzip {
             let limited = LimitedReader::new(GzDecoder::new(blob), decompress_limit);
-            unpack_archive(tar::Archive::new(limited), dest)
+            unpack_archive(tar::Archive::new(limited), dest).map_err(map_limit_error)
         } else {
             warn!("layer declared as gzip but does not have gzip magic; trying raw tar");
             unpack_archive(tar::Archive::new(blob), dest)
@@ -118,10 +110,23 @@ pub fn extract_layer_with_limit(
     } else if is_gzip {
         warn!("layer declared as plain tar but has gzip magic; decompressing");
         let limited = LimitedReader::new(GzDecoder::new(blob), decompress_limit);
-        unpack_archive(tar::Archive::new(limited), dest)
+        unpack_archive(tar::Archive::new(limited), dest).map_err(map_limit_error)
     } else {
         unpack_archive(tar::Archive::new(blob), dest)
     }
+}
+
+/// Remap an [`ExtractionError::Io`] that originated from the decompression
+/// cap into the typed [`ExtractionError::DecompressedTooLarge`] variant.
+///
+/// Non-limit errors pass through unchanged.
+fn map_limit_error(err: ExtractionError) -> ExtractionError {
+    if let ExtractionError::Io(io_err) = &err
+        && let Some(limit) = limit_from_io_error(io_err)
+    {
+        return ExtractionError::DecompressedTooLarge { limit };
+    }
+    err
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +708,23 @@ mod tests {
             result.is_err(),
             "expected error for oversized decompressed output, got Ok"
         );
+    }
+
+    #[test]
+    fn decompression_cap_surfaces_typed_variant() {
+        // Regression: exceeding the decompression cap must surface the typed
+        // `DecompressedTooLarge` variant (carrying the limit), not an opaque
+        // `Io` error — callers and the docs rely on this distinction.
+        let gz_tar = build_gz_tar_with_large_content(4096);
+        let dest = dest_dir();
+        let err = extract_layer_with_limit(&gz_tar, IMAGE_LAYER_GZIP_MEDIA_TYPE, dest.path(), 1024)
+            .unwrap_err();
+        match err {
+            ExtractionError::DecompressedTooLarge { limit } => {
+                assert_eq!(limit, 1024, "the configured cap must be reported");
+            }
+            other => panic!("expected DecompressedTooLarge, got {other:?}"),
+        }
     }
 
     #[test]

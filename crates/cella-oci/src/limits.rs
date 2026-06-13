@@ -27,6 +27,85 @@ pub const MAX_BLOB_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_COLLECTION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// Streaming accumulation guard
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when appending a chunk of `chunk_len` bytes to a buffer that
+/// already holds `current_len` bytes would push the total past `cap`.
+///
+/// Call this *before* extending the buffer so a single oversized chunk cannot
+/// force an allocation past the cap.  Saturating arithmetic keeps the check
+/// sound even if the lengths cannot be represented exactly.
+#[must_use]
+pub fn would_exceed_cap(current_len: usize, chunk_len: usize, cap: u64) -> bool {
+    let projected = u64::try_from(current_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(chunk_len).unwrap_or(u64::MAX));
+    projected > cap
+}
+
+// ---------------------------------------------------------------------------
+// Typed limit error
+// ---------------------------------------------------------------------------
+
+/// Marker error carried inside the [`io::Error`] that [`LimitedReader`] emits
+/// when the decompressed byte count exceeds its limit.
+///
+/// Callers can recover the limit from a bubbled-up [`io::Error`] via
+/// [`limit_from_io_error`] and surface a typed, non-`Io` diagnostic (e.g.
+/// `ExtractionError::DecompressedTooLarge`) instead of an opaque I/O failure.
+#[derive(Debug)]
+pub struct LimitExceeded {
+    /// The configured byte cap that was exceeded.
+    pub limit: u64,
+}
+
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "output exceeds limit of {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
+
+impl LimitExceeded {
+    /// Wrap this marker in an [`io::Error`] of kind [`io::ErrorKind::Other`].
+    fn into_io_error(self) -> io::Error {
+        io::Error::other(self)
+    }
+}
+
+/// If `err` (or any error nested inside it by the `tar`/`flate2` stack)
+/// originated from a [`LimitedReader`] hitting its cap, return the cap.
+///
+/// The `tar` crate re-wraps reader failures as `io::Error -> TarError ->
+/// io::Error -> … -> LimitExceeded`.  A plain `Error::source()` walk misses
+/// the [`LimitExceeded`] payload because each `io::Error` stores its inner
+/// error in `get_ref()`, not in `source()`.  This walk descends through both.
+///
+/// Returns `None` for unrelated I/O errors.
+#[must_use]
+pub fn limit_from_io_error(err: &io::Error) -> Option<u64> {
+    fn descend(err: &(dyn std::error::Error + 'static)) -> Option<u64> {
+        if let Some(exceeded) = err.downcast_ref::<LimitExceeded>() {
+            return Some(exceeded.limit);
+        }
+        // An inner `io::Error` keeps its payload in `get_ref()`.
+        if let Some(io_err) = err.downcast_ref::<io::Error>()
+            && let Some(inner) = io_err.get_ref()
+            && let Some(found) = descend(inner)
+        {
+            return Some(found);
+        }
+        // Fall back to the standard source chain (e.g. `TarError`).
+        err.source().and_then(descend)
+    }
+
+    let inner = err.get_ref()?;
+    descend(inner)
+}
+
+// ---------------------------------------------------------------------------
 // LimitedReader
 // ---------------------------------------------------------------------------
 
@@ -76,10 +155,7 @@ impl<R: Read> Read for LimitedReader<R> {
                     self.at_eof = true;
                     Ok(0)
                 }
-                Ok(_) => Err(io::Error::other(format!(
-                    "decompressed output exceeds limit of {} bytes",
-                    self.limit
-                ))),
+                Ok(_) => Err(LimitExceeded { limit: self.limit }.into_io_error()),
                 Err(e) => Err(e),
             };
         }
@@ -89,7 +165,9 @@ impl<R: Read> Read for LimitedReader<R> {
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let n = self.inner.read(&mut buf[..capped_len])?;
-        self.consumed += n as u64;
+        self.consumed = self
+            .consumed
+            .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
 
         // If we've now consumed exactly `limit` bytes, peek to check for
         // overflow on the *current* call rather than waiting for the next one.
@@ -100,10 +178,7 @@ impl<R: Read> Read for LimitedReader<R> {
                     self.at_eof = true;
                 }
                 Ok(_) => {
-                    return Err(io::Error::other(format!(
-                        "decompressed output exceeds limit of {} bytes",
-                        self.limit
-                    )));
+                    return Err(LimitExceeded { limit: self.limit }.into_io_error());
                 }
                 Err(e) => return Err(e),
             }
@@ -170,7 +245,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for LimitedWriter<W> {
         let result = Pin::new(&mut self.inner).poll_write(cx, &buf[..capped_len]);
 
         if let Poll::Ready(Ok(n)) = result {
-            self.written += n as u64;
+            self.written = self
+                .written
+                .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
             // If we just hit the exact limit, check whether the caller is
             // sending more data (i.e. the next byte would overflow).  We
             // cannot peek asynchronously here, so we simply update written
@@ -204,6 +281,42 @@ mod tests {
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
+
+    // ── would_exceed_cap tests ──────────────────────────────────────────────
+
+    #[test]
+    fn under_cap_does_not_trip() {
+        assert!(!would_exceed_cap(10, 20, 100));
+    }
+
+    #[test]
+    fn exactly_at_cap_does_not_trip() {
+        // Reaching the cap exactly is allowed; only *exceeding* it fails.
+        assert!(!would_exceed_cap(60, 40, 100));
+    }
+
+    #[test]
+    fn one_byte_over_cap_trips() {
+        assert!(would_exceed_cap(60, 41, 100));
+    }
+
+    #[test]
+    fn single_oversized_chunk_trips_before_extend() {
+        // Regression: the buffer is empty but a single huge chunk would blow
+        // past the cap.  The guard must fail *before* the chunk is appended,
+        // so the oversized allocation never happens.
+        assert!(would_exceed_cap(0, 10_000, 1024));
+    }
+
+    #[test]
+    fn saturating_arithmetic_does_not_overflow() {
+        // Pathological lengths must saturate, not wrap, and still trip the cap.
+        assert!(would_exceed_cap(
+            usize::MAX,
+            usize::MAX,
+            MAX_BLOB_COMPRESSED_BYTES
+        ));
+    }
 
     // ── LimitedReader tests ─────────────────────────────────────────────────
 

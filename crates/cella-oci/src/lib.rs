@@ -11,7 +11,7 @@ pub use extract::{ExtractionError, extract_layer, is_extractable_layer};
 pub use inspect::{fetch_manifest_with_digest, fetch_published_tags, parse_reference};
 pub use limits::{
     LimitedReader, LimitedWriter, MAX_BLOB_COMPRESSED_BYTES, MAX_BLOB_DECOMPRESSED_BYTES,
-    MAX_COLLECTION_JSON_BYTES,
+    MAX_COLLECTION_JSON_BYTES, would_exceed_cap,
 };
 pub use push::{LayerSpec, PushError, PushResult, list_published_tags, push_artifact};
 
