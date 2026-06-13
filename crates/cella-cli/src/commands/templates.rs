@@ -137,8 +137,8 @@ pub struct TemplatesApplyArgs {
 }
 
 impl TemplatesArgs {
-    /// Return the `--log-level` from whichever subcommand carries one (`apply`
-    /// or `metadata`), if active.
+    /// Return the `--log-level` from whichever subcommand carries one (`apply`,
+    /// `metadata`, or `publish`), if active.
     ///
     /// Called by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and
@@ -147,6 +147,7 @@ impl TemplatesArgs {
         match &self.command {
             TemplatesCommand::Apply(args) => Some(args.log_level),
             TemplatesCommand::Metadata(args) => Some(args.log_level),
+            TemplatesCommand::Publish(args) => Some(args.log_level),
             TemplatesCommand::GenerateDocs(_)
             | TemplatesCommand::New { .. }
             | TemplatesCommand::List
@@ -179,10 +180,7 @@ impl TemplatesPublishArgs {
         };
 
         let output = publish_templates(opts).await?;
-        println!(
-            "{}",
-            serde_json::to_string(&output).expect("output is serializable")
-        );
+        println!("{}", serde_json::to_string(&output)?);
         Ok(())
     }
 }

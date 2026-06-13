@@ -193,14 +193,14 @@ pub async fn publish_templates(opts: PublishOptions) -> Result<PublishOutput, Pu
             |n| n.to_string_lossy().into_owned(),
         );
 
-        let result =
-            publish_single_template(&id, dir, &tmp_path, &opts.registry, &opts.namespace).await;
-
-        match result {
+        match publish_single_template(&id, dir, &tmp_path, &opts.registry, &opts.namespace).await {
             Ok(r) => {
                 output.insert(id, r);
             }
             Err(e) => {
+                // Clean up the temp packaging dir before propagating — otherwise
+                // an early error from one template leaks the whole staging dir.
+                let _ = std::fs::remove_dir_all(&tmp_path);
                 return Err(e);
             }
         }
@@ -275,7 +275,10 @@ async fn publish_collection_index(
         "templates": templates_meta
     });
     let collection_bytes =
-        serde_json::to_vec_pretty(&collection_json).expect("collection JSON is serializable");
+        serde_json::to_vec_pretty(&collection_json).map_err(|e| PublishError::InvalidMetadata {
+            id: "<collection>".to_owned(),
+            reason: e.to_string(),
+        })?;
 
     let layer = cella_oci::push::LayerSpec {
         data: collection_bytes,
@@ -290,6 +293,19 @@ async fn publish_collection_index(
         }),
     };
 
+    // ghcr.io reads this for package-type UI presentation. The official CLI sets
+    // only this annotation on the collection manifest (no `dev.containers.metadata`).
+    let manifest_annotations = if registry == "ghcr.io" {
+        let mut m = HashMap::new();
+        m.insert(
+            "com.github.package.type".to_owned(),
+            "devcontainer_collection".to_owned(),
+        );
+        Some(m)
+    } else {
+        None
+    };
+
     let repository = namespace.to_owned();
     debug!("publishing collection index to {registry}/{repository}");
 
@@ -299,7 +315,7 @@ async fn publish_collection_index(
         &["latest".to_owned()],
         vec![layer],
         "application/vnd.devcontainers.collection",
-        None::<HashMap<String, String>>,
+        manifest_annotations,
     )
     .await
     .map_err(|source| PublishError::PushFailed {
@@ -325,34 +341,21 @@ async fn publish_single_template(
     let json_path = dir.join("devcontainer-template.json");
     if !json_path.exists() {
         warn!("template '{id}' is missing devcontainer-template.json, skipping");
-        return Ok(TemplatePublishResult {
-            skipped: true,
-            digest: None,
-            published_tags: Vec::new(),
-            version: None,
-        });
+        return Ok(skipped_result());
     }
 
     let raw = std::fs::read_to_string(&json_path).map_err(|source| PublishError::Io {
         id: id.to_owned(),
         source,
     })?;
-    let base_meta: TemplateMetadata =
-        serde_json::from_str(&raw).map_err(|e| PublishError::InvalidMetadata {
-            id: id.to_owned(),
-            reason: e.to_string(),
-        })?;
 
-    // Version-skip check
-    if base_meta.version.is_empty() {
-        warn!("(!) WARNING: Version does not exist, skipping {id}...");
-        return Ok(TemplatePublishResult {
-            skipped: true,
-            digest: None,
-            published_tags: Vec::new(),
-            version: None,
-        });
-    }
+    let base_meta = match parse_template_manifest(id, &raw)? {
+        ManifestParse::Metadata(meta) => *meta,
+        ManifestParse::SkipVersionless => {
+            warn!("(!) WARNING: Version does not exist, skipping {id}...");
+            return Ok(skipped_result());
+        }
+    };
 
     let version = base_meta.version.clone();
     let repository = format!("{namespace}/{id}");
@@ -370,12 +373,7 @@ async fn publish_single_template(
         Ok(Some(t)) => t,
         Ok(None) => {
             warn!("(!) WARNING: Version {version} already exists, skipping {id}...");
-            return Ok(TemplatePublishResult {
-                skipped: true,
-                digest: None,
-                published_tags: Vec::new(),
-                version: None,
-            });
+            return Ok(skipped_result());
         }
         Err(e) => {
             return Err(PublishError::InvalidVersion {
@@ -424,9 +422,19 @@ async fn package_and_push_template(
     let tgz_path = package_template(id, dir, out_dir)?;
 
     let annotation_json =
-        serde_json::to_string(annotation_meta).expect("annotation metadata is serializable");
+        serde_json::to_string(annotation_meta).map_err(|e| PublishError::InvalidMetadata {
+            id: id.to_owned(),
+            reason: e.to_string(),
+        })?;
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert("dev.containers.metadata".to_owned(), annotation_json);
+    // ghcr.io reads this for package-type UI presentation, matching the official CLI.
+    if target.registry == "ghcr.io" {
+        manifest_annotations.insert(
+            "com.github.package.type".to_owned(),
+            "devcontainer_template".to_owned(),
+        );
+    }
 
     let tgz_bytes = std::fs::read(&tgz_path).map_err(|source| PublishError::Io {
         id: id.to_owned(),
@@ -472,13 +480,58 @@ async fn package_and_push_template(
             published_tags: r.pushed_tags,
             version: Some(version.to_owned()),
         },
-        None => TemplatePublishResult {
-            skipped: true,
-            digest: None,
-            published_tags: Vec::new(),
-            version: None,
-        },
+        None => skipped_result(),
     })
+}
+
+/// A [`TemplatePublishResult`] marking a template as skipped (missing version,
+/// already published, or no manifest).
+const fn skipped_result() -> TemplatePublishResult {
+    TemplatePublishResult {
+        skipped: true,
+        digest: None,
+        published_tags: Vec::new(),
+        version: None,
+    }
+}
+
+/// Outcome of parsing a `devcontainer-template.json` manifest.
+enum ManifestParse {
+    /// A fully-parsed manifest with a non-empty version.
+    Metadata(Box<TemplateMetadata>),
+    /// The manifest is missing a `version` (or it is empty) — warn and skip.
+    SkipVersionless,
+}
+
+/// Parse a `devcontainer-template.json` manifest from its raw (JSONC) contents.
+///
+/// The manifest is JSONC (the official CLI parses it with `jsonc.parse`), so we
+/// strip comments and trailing commas first.
+///
+/// A missing or empty `version` is detected *before* strict deserialization:
+/// `TemplateMetadata::version` is a required field, so a versionless manifest
+/// would otherwise fail with "missing field `version`" and abort the whole
+/// collection — but the contract (matching the official CLI) is to warn and skip
+/// just that template, returning [`ManifestParse::SkipVersionless`].
+fn parse_template_manifest(id: &str, raw: &str) -> Result<ManifestParse, PublishError> {
+    let invalid = |e: &dyn std::fmt::Display| PublishError::InvalidMetadata {
+        id: id.to_owned(),
+        reason: e.to_string(),
+    };
+
+    let stripped = cella_jsonc::strip(raw).map_err(|e| invalid(&e))?;
+    let value: serde_json::Value = serde_json::from_str(&stripped).map_err(|e| invalid(&e))?;
+
+    let version_missing = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty);
+    if version_missing {
+        return Ok(ManifestParse::SkipVersionless);
+    }
+
+    let meta: TemplateMetadata = serde_json::from_value(value).map_err(|e| invalid(&e))?;
+    Ok(ManifestParse::Metadata(Box::new(meta)))
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +546,9 @@ fn compute_annotation_metadata(
     let dc_path =
         find_devcontainer_json(dir).ok_or_else(|| PublishError::MissingDevcontainerJson {
             id: id.to_owned(),
-            reason: "no devcontainer.json or .devcontainer/devcontainer.json found".to_owned(),
+            reason:
+                "no .devcontainer.json, .devcontainer/devcontainer.json, or devcontainer.json found"
+                    .to_owned(),
         })?;
 
     let dc_raw = std::fs::read_to_string(&dc_path).map_err(|source| PublishError::Io {
@@ -501,8 +556,14 @@ fn compute_annotation_metadata(
         source,
     })?;
 
-    // Strip JSONC comments before parsing
-    let stripped = strip_jsonc_comments(&dc_raw);
+    // Strip JSONC comments and trailing commas before parsing — the official CLI
+    // parses devcontainer.json with `jsonc.parse`, so we must match it via the
+    // project-wide stripper rather than a comments-only pass.
+    let stripped =
+        cella_jsonc::strip(&dc_raw).map_err(|e| PublishError::MissingDevcontainerJson {
+            id: id.to_owned(),
+            reason: format!("devcontainer.json parse error: {e}"),
+        })?;
     let dc: serde_json::Value =
         serde_json::from_str(&stripped).map_err(|e| PublishError::MissingDevcontainerJson {
             id: id.to_owned(),
@@ -563,9 +624,9 @@ fn derive_template_type(dc: &serde_json::Value) -> Result<TemplateType, PublishE
 
 /// Extract resolved feature resource IDs from `features` in devcontainer.json.
 ///
-/// The official CLI calls `getRef(output, f)?.resource` for each key — here
-/// we just normalize the key form: strip the tag/digest suffix if it looks
-/// like a fully-qualified reference, otherwise keep it as-is.
+/// The official CLI calls `getRef(output, f)?.resource` for each key, which
+/// resolves the OCI reference to its resource (registry/namespace/id) by
+/// stripping the version. We mirror that with [`feature_resource`].
 ///
 /// The result is sorted and deduplicated so that annotation output is deterministic
 /// even when multiple tag variants of the same feature appear as separate keys.
@@ -574,18 +635,40 @@ fn extract_feature_ids(dc: &serde_json::Value) -> Vec<String> {
         return Vec::new();
     };
 
-    let mut ids: Vec<String> = features
-        .keys()
-        .map(|k| {
-            // Normalise to base reference (drop `:tag` suffix) matching OCI resource form.
-            let base = k.split_once(':').map_or(k.as_str(), |(base, _)| base);
-            base.to_owned()
-        })
-        .collect();
+    let mut ids: Vec<String> = features.keys().map(|k| feature_resource(k)).collect();
 
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Resolve a feature reference to its OCI *resource* (registry/namespace/id),
+/// dropping any `:tag` or `@sha256:…` version suffix.
+///
+/// Mirrors the official CLI's `getRef(...)?.resource`:
+/// - The input is lowercased.
+/// - An `@`-delimited digest (the last `@`) is stripped first.
+/// - A trailing `:tag` is stripped only when the last `:` comes after the last
+///   `/` — otherwise the colon belongs to a registry port (e.g.
+///   `localhost:5000/owner/feat`) and must be preserved.
+fn feature_resource(reference: &str) -> String {
+    let lowered = reference.to_lowercase();
+
+    // Digest pin wins: everything before the last `@` is the resource.
+    if let Some((resource, _digest)) = lowered.rsplit_once('@') {
+        return resource.to_owned();
+    }
+
+    // Otherwise a trailing `:tag`, but only if the `:` is after the last `/`
+    // (so a registry port like `localhost:5000/...` is not mistaken for a tag).
+    let last_slash = lowered.rfind('/');
+    if let Some(colon) = lowered.rfind(':')
+        && last_slash.is_none_or(|slash| colon > slash)
+    {
+        return lowered[..colon].to_owned();
+    }
+
+    lowered
 }
 
 /// Recursively collect all file paths under `dir`, relative to `dir`, sorted.
@@ -641,69 +724,6 @@ fn find_devcontainer_json(dir: &Path) -> Option<PathBuf> {
         return Some(flat);
     }
     None
-}
-
-/// Minimal JSONC comment stripper — removes `//` line comments and `/* */` blocks.
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if escape {
-            out.push(c);
-            escape = false;
-            continue;
-        }
-        if in_string {
-            if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            out.push(c);
-            continue;
-        }
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    // Line comment — consume through newline
-                    for nc in chars.by_ref() {
-                        if nc == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                }
-                Some('*') => {
-                    // Block comment — consume through `*/`
-                    chars.next(); // consume `*`
-                    let mut prev = ' ';
-                    for nc in chars.by_ref() {
-                        if prev == '*' && nc == '/' {
-                            break;
-                        }
-                        if nc == '\n' {
-                            out.push('\n');
-                        }
-                        prev = nc;
-                    }
-                }
-                _ => {
-                    out.push(c);
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -818,48 +838,44 @@ pub fn compute_semver_tags(
 
     let mut result = Vec::new();
 
-    // Major alias: push if new version > current max satisfying `major.x.x`
-    let major_str = parsed.major.to_string();
-    let major_req = semver::VersionReq::parse(&format!("={}.x", parsed.major))
-        .unwrap_or(semver::VersionReq::STAR);
-    if is_new_highest(version, tags, &major_req) {
-        result.push(major_str);
+    // Major alias: push if new version is the highest among existing versions
+    // sharing the same major (mirrors `maxSatisfying(tags, "{major}.x.x")`).
+    if is_new_highest(&parsed, tags, |v| v.major == parsed.major) {
+        result.push(parsed.major.to_string());
     }
 
-    // Major.minor alias
-    let minor_str = format!("{}.{}", parsed.major, parsed.minor);
-    let minor_req = semver::VersionReq::parse(&format!("={}.{}.x", parsed.major, parsed.minor))
-        .unwrap_or(semver::VersionReq::STAR);
-    if is_new_highest(version, tags, &minor_req) {
-        result.push(minor_str);
+    // Major.minor alias: highest among versions sharing the same major.minor.
+    if is_new_highest(&parsed, tags, |v| {
+        v.major == parsed.major && v.minor == parsed.minor
+    }) {
+        result.push(format!("{}.{}", parsed.major, parsed.minor));
     }
 
     // Exact version is always included.
     result.push(version.to_owned());
 
-    // Latest alias: push if new version > current max of all versions.
-    let star_req = semver::VersionReq::STAR;
-    if is_new_highest(version, tags, &star_req) {
+    // Latest alias: push if new version is the highest of all existing versions.
+    if is_new_highest(&parsed, tags, |_| true) {
         result.push("latest".to_owned());
     }
 
     Ok(Some(result))
 }
 
-/// Returns `true` if `new_version` is strictly greater than the maximum
-/// version in `tags` that satisfies `req`, or if no such version exists.
-fn is_new_highest(new_version: &str, tags: &[String], req: &semver::VersionReq) -> bool {
-    let Ok(new) = Version::parse(new_version) else {
-        return false;
-    };
-
+/// Returns `true` if `new_version` is strictly greater than the maximum parseable
+/// version in `tags` for which `in_range` holds, or if no such version exists.
+fn is_new_highest(
+    new_version: &Version,
+    tags: &[String],
+    in_range: impl Fn(&Version) -> bool,
+) -> bool {
     let max_existing: Option<Version> = tags
         .iter()
         .filter_map(|t| Version::parse(t).ok())
-        .filter(|v| req.matches(v))
+        .filter(|v| in_range(v))
         .max();
 
-    max_existing.is_none_or(|existing| new > existing)
+    max_existing.is_none_or(|existing| *new_version > existing)
 }
 
 // ===========================================================================
@@ -1042,6 +1058,118 @@ mod tests {
         assert!(extract_feature_ids(&dc).is_empty());
     }
 
+    // ── feature_resource ────────────────────────────────────────────────────
+
+    #[test]
+    fn feature_resource_strips_tag() {
+        assert_eq!(
+            feature_resource("ghcr.io/devcontainers/features/node:1"),
+            "ghcr.io/devcontainers/features/node"
+        );
+    }
+
+    #[test]
+    fn feature_resource_no_tag_kept_as_is() {
+        assert_eq!(
+            feature_resource("ghcr.io/devcontainers/features/node"),
+            "ghcr.io/devcontainers/features/node"
+        );
+    }
+
+    #[test]
+    fn feature_resource_preserves_registry_port() {
+        // Regression: splitting on the first ':' turned `localhost:5000/owner/feat:1`
+        // into `localhost`. The port colon (before the last '/') must be preserved
+        // and only the trailing tag stripped.
+        assert_eq!(
+            feature_resource("localhost:5000/owner/feat:1"),
+            "localhost:5000/owner/feat"
+        );
+    }
+
+    #[test]
+    fn feature_resource_preserves_registry_port_without_tag() {
+        assert_eq!(
+            feature_resource("localhost:5000/owner/feat"),
+            "localhost:5000/owner/feat"
+        );
+    }
+
+    #[test]
+    fn feature_resource_strips_digest() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            feature_resource(&format!("ghcr.io/owner/feat@sha256:{hex}")),
+            "ghcr.io/owner/feat"
+        );
+    }
+
+    #[test]
+    fn extract_feature_ids_preserves_registry_port() {
+        let dc = serde_json::json!({
+            "features": {
+                "localhost:5000/owner/feat:1": {}
+            }
+        });
+        assert_eq!(
+            extract_feature_ids(&dc),
+            vec!["localhost:5000/owner/feat".to_owned()]
+        );
+    }
+
+    // ── parse_template_manifest ─────────────────────────────────────────────
+
+    #[test]
+    fn manifest_missing_version_is_skipped_not_errored() {
+        // Regression: a versionless manifest must skip (warn) rather than abort.
+        // `TemplateMetadata::version` is required, so strict deserialization would
+        // have failed with "missing field `version`" and killed the whole run.
+        let raw = r#"{"id": "no-version", "name": "Test"}"#;
+        let parsed = parse_template_manifest("no-version", raw).unwrap();
+        assert!(matches!(parsed, ManifestParse::SkipVersionless));
+    }
+
+    #[test]
+    fn manifest_empty_version_is_skipped() {
+        let raw = r#"{"id": "empty", "version": ""}"#;
+        let parsed = parse_template_manifest("empty", raw).unwrap();
+        assert!(matches!(parsed, ManifestParse::SkipVersionless));
+    }
+
+    #[test]
+    fn manifest_with_version_parses() {
+        let raw = r#"{"id": "ok", "version": "1.2.3"}"#;
+        match parse_template_manifest("ok", raw).unwrap() {
+            ManifestParse::Metadata(meta) => assert_eq!(meta.version, "1.2.3"),
+            ManifestParse::SkipVersionless => panic!("expected metadata, got skip"),
+        }
+    }
+
+    #[test]
+    fn manifest_with_jsonc_comments_and_trailing_commas_parses() {
+        // Regression: the old comments-only stripper choked on trailing commas.
+        // `cella_jsonc::strip` handles both, matching the official `jsonc.parse`.
+        let raw = r#"{
+            // template id
+            "id": "jsonc",
+            "name": "JSONC", /* block comment */
+            "version": "2.0.0",
+        }"#;
+        match parse_template_manifest("jsonc", raw).unwrap() {
+            ManifestParse::Metadata(meta) => {
+                assert_eq!(meta.id, "jsonc");
+                assert_eq!(meta.version, "2.0.0");
+            }
+            ManifestParse::SkipVersionless => panic!("expected metadata, got skip"),
+        }
+    }
+
+    #[test]
+    fn manifest_invalid_json_errors() {
+        let raw = "{ not json }";
+        assert!(parse_template_manifest("bad", raw).is_err());
+    }
+
     // ── collect_files ───────────────────────────────────────────────────────
 
     #[test]
@@ -1064,33 +1192,6 @@ mod tests {
                 .iter()
                 .any(|f| f == "./.devcontainer/devcontainer.json")
         );
-    }
-
-    // ── strip_jsonc_comments ────────────────────────────────────────────────
-
-    #[test]
-    fn strips_line_comments() {
-        let input = r#"{ // a comment
-"key": "value" }"#;
-        let out = strip_jsonc_comments(input);
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["key"], "value");
-    }
-
-    #[test]
-    fn strips_block_comments() {
-        let input = r#"{ /* block */ "key": "value" }"#;
-        let out = strip_jsonc_comments(input);
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["key"], "value");
-    }
-
-    #[test]
-    fn preserves_url_slashes_in_strings() {
-        let input = r#"{"url": "https://example.com/path"}"#;
-        let out = strip_jsonc_comments(input);
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["url"], "https://example.com/path");
     }
 
     // ── find_devcontainer_json ──────────────────────────────────────────────
