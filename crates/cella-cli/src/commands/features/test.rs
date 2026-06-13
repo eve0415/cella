@@ -860,6 +860,7 @@ async fn bring_up_test_container(
         update_remote_user_uid_default: cella_backend::UpdateRemoteUserUidDefault::On,
         metadata_options: cella_orchestrator::MetadataOptions::default(),
         dotfiles: cella_orchestrator::config::DotfilesConfig::default(),
+        lockfile_policy: cella_features::LockfilePolicy::NoLockfile,
     };
 
     let hooks = NullUpHooks;
