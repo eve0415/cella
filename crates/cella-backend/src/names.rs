@@ -410,6 +410,21 @@ mod tests {
     }
 
     #[test]
+    fn lexical_absolute_normalizes_without_touching_fs() {
+        // `.` and `..` are collapsed textually — no filesystem access, no
+        // symlink resolution.  `..` never ascends past the root.
+        assert_eq!(
+            lexical_absolute(Path::new("/tmp/a/../b/./c")),
+            PathBuf::from("/tmp/b/c")
+        );
+        assert_eq!(lexical_absolute(Path::new("/../..")), PathBuf::from("/"));
+        assert_eq!(
+            lexical_absolute(Path::new("/already/clean")),
+            PathBuf::from("/already/clean")
+        );
+    }
+
+    #[test]
     fn labels_contain_docker_runtime() {
         let labels = container_labels(
             &PathBuf::from("/tmp/test"),
