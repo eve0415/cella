@@ -106,6 +106,13 @@ pub struct UpConfig<'a> {
     /// Remote environment entries from config (`remoteEnv`). Used for lifecycle
     /// command env AND persisted in the `dev.cella.remote_env` metadata label.
     pub remote_env: &'a [String],
+    /// Raw (pre-substitution) `remoteEnv` JSON value from the merged config.
+    ///
+    /// `Some` when the config was read from disk and has a `remoteEnv` key;
+    /// `None` when the config was reconstructed from a container label (already
+    /// substituted) or when `remoteEnv` was absent.  Used by the orchestrator
+    /// for the second-pass containerEnv resolution after `userEnvProbe`.
+    pub raw_remote_env: Option<&'a serde_json::Value>,
     /// Remote environment entries from the CLI `--remote-env` flag. Applied to
     /// lifecycle command env ONLY (config `remote_env` wins on key collision);
     /// runtime-only — must NOT enter labels, image layers, or `containerEnv`.

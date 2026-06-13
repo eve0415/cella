@@ -380,7 +380,8 @@ impl EnsureUpContext<'_> {
                 .or(probed_env)
         };
 
-        let combined_remote_env = self.lifecycle_remote_env(self.config.remote_env);
+        let resolved_remote_env = resolved_remote_env(self.config, final_probed.as_ref());
+        let combined_remote_env = self.lifecycle_remote_env(&resolved_remote_env);
         let mut lifecycle_env = final_probed.as_ref().map_or_else(
             || combined_remote_env.clone(),
             |probed| cella_env::user_env_probe::merge_env(probed, &combined_remote_env),
@@ -1242,7 +1243,6 @@ impl EnsureUpContext<'_> {
         remote_user: &str,
         env_fwd: &cella_env::EnvForwarding,
         settings: &cella_config::CellaConfig,
-        remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
         Vec<String>,
@@ -1339,15 +1339,8 @@ impl EnsureUpContext<'_> {
                 .await;
         }
 
-        self.install_tools_and_probe_env(
-            container_id,
-            remote_user,
-            settings,
-            &shell,
-            probed_env,
-            remote_env,
-        )
-        .await
+        self.install_tools_and_probe_env(container_id, remote_user, settings, &shell, probed_env)
+            .await
     }
 
     async fn install_tools_and_probe_env(
@@ -1357,7 +1350,6 @@ impl EnsureUpContext<'_> {
         settings: &cella_config::CellaConfig,
         shell: &str,
         probed_env: Option<std::collections::HashMap<String, String>>,
-        remote_env: &[String],
     ) -> (
         Option<std::collections::HashMap<String, String>>,
         Vec<String>,
@@ -1404,9 +1396,11 @@ impl EnsureUpContext<'_> {
                 .or(probed_env)
         };
 
+        let resolved = resolved_remote_env(self.config, final_probed.as_ref());
+        let effective_remote_env = self.lifecycle_remote_env(&resolved);
         let mut lifecycle_env = final_probed.as_ref().map_or_else(
-            || remote_env.to_vec(),
-            |probed| cella_env::user_env_probe::merge_env(probed, remote_env),
+            || effective_remote_env.clone(),
+            |probed| cella_env::user_env_probe::merge_env(probed, &effective_remote_env),
         );
         if !self.config.lifecycle_secrets.is_empty() {
             lifecycle_env.extend_from_slice(self.config.lifecycle_secrets);
@@ -1942,15 +1936,8 @@ impl EnsureUpContext<'_> {
 
         self.start_and_notify(&container_id).await?;
 
-        let create_lifecycle_remote_env = self.lifecycle_remote_env(&create_opts.remote_env);
         let (_probed_env, lifecycle_env) = self
-            .post_create_setup(
-                &container_id,
-                &remote_user,
-                &env_fwd,
-                &settings,
-                &create_lifecycle_remote_env,
-            )
+            .post_create_setup(&container_id, &remote_user, &env_fwd, &settings)
             .await;
 
         let lifecycle_err = self
@@ -2348,14 +2335,31 @@ fn injected_proxy_config(post_start: &cella_env::PostStartInjection) -> bool {
         .any(|upload| upload.container_path == cella_env::PROXY_CONFIG_PATH)
 }
 
-/// Restart the in-container agent daemon.
+/// Resolve `remoteEnv` to a `KEY=value` vec for lifecycle command injection.
 ///
-/// Kills only the `cella-agent daemon` process (not credential or browser
-/// helpers that exec the same binary), waits briefly for the entrypoint
-/// restart loop to respawn it, and only explicitly starts a replacement
-/// if nothing came back. This avoids double-launching the daemon on
-/// containers with the restart loop while remaining backward compatible
-/// with containers created before it was introduced.
+/// When both `raw_remote_env` (the pre-substitution snapshot from config
+/// parse) and `probed_env` (the live container env from `userEnvProbe`) are
+/// available, performs a second-pass substitution so that
+/// `${containerEnv:VAR}` tokens in `remoteEnv` resolve against the actual
+/// running container environment — matching the official CLI's
+/// `containerSubstitute` pass.
+///
+/// Falls back to `config.remote_env` (the phase-1-substituted slice) when
+/// either input is absent, preserving identical behaviour for all existing
+/// callers that have no `${containerEnv:...}` tokens.
+fn resolved_remote_env(
+    config: &UpConfig<'_>,
+    probed_env: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    if let (Some(raw), Some(probed)) = (config.raw_remote_env, probed_env) {
+        let ctx =
+            cella_config::config_map::subst_ctx(config.resolved).with_container_env(probed.clone());
+        ctx.substitute_remote_env(raw)
+    } else {
+        config.remote_env.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

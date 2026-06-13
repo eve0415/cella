@@ -1681,6 +1681,7 @@ mod tests {
             devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
+            raw_remote_env: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,
@@ -1748,6 +1749,7 @@ mod tests {
             devcontainer_id: String::new(),
             warnings: vec![],
             typed: None,
+            raw_remote_env: None,
         };
         let cfg = ComposeUpConfig {
             resolved: &resolved,
