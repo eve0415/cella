@@ -2,8 +2,16 @@
 //!
 //! [`LimitedReader`] wraps any [`Read`] and returns a hard [`io::Error`] when
 //! the byte count exceeds the configured limit — it never silently truncates.
+//!
+//! [`LimitedWriter`] wraps any [`tokio::io::AsyncWrite`] and returns a hard
+//! error when bytes written exceed the configured limit — used when streaming
+//! blobs via `pull_blob`.
 
 use std::io::{self, Read};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::AsyncWrite;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -14,6 +22,9 @@ pub const MAX_BLOB_COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Maximum decompressed output size: 2 GiB.
 pub const MAX_BLOB_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum size for collection/index JSON: 64 MiB.
+pub const MAX_COLLECTION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // LimitedReader
@@ -69,7 +80,6 @@ impl<R: Read> Read for LimitedReader<R> {
                     "decompressed output exceeds limit of {} bytes",
                     self.limit
                 ))),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
                 Err(e) => Err(e),
             };
         }
@@ -95,7 +105,6 @@ impl<R: Read> Read for LimitedReader<R> {
                         self.limit
                     )));
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
             }
         }
@@ -103,6 +112,86 @@ impl<R: Read> Read for LimitedReader<R> {
         Ok(n)
     }
 }
+
+// ---------------------------------------------------------------------------
+// LimitedWriter
+// ---------------------------------------------------------------------------
+
+/// An [`AsyncWrite`] adaptor that returns a hard error when the total bytes
+/// written exceeds `limit`.
+///
+/// Used to cap blob downloads mid-stream (e.g. `pull_blob` from
+/// `oci-distribution`) so a lying or malicious manifest cannot force
+/// unbounded memory growth.
+///
+/// When the limit is hit the error message includes the limit value so
+/// callers can surface a human-readable diagnostic.
+pub struct LimitedWriter<W> {
+    inner: W,
+    limit: u64,
+    written: u64,
+}
+
+impl<W: AsyncWrite + Unpin> LimitedWriter<W> {
+    /// Wrap `inner`, refusing to accept more than `limit` bytes in total.
+    pub const fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            written: 0,
+        }
+    }
+
+    /// Consume the wrapper and return the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for LimitedWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let remaining = self.limit.saturating_sub(self.written);
+        if remaining == 0 {
+            return Poll::Ready(Err(io::Error::other(format!(
+                "blob download exceeds limit of {} bytes",
+                self.limit
+            ))));
+        }
+
+        // Clamp the write to at most `remaining` bytes.
+        let capped_len = buf
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+
+        let result = Pin::new(&mut self.inner).poll_write(cx, &buf[..capped_len]);
+
+        if let Poll::Ready(Ok(n)) = result {
+            self.written += n as u64;
+            // If we just hit the exact limit, check whether the caller is
+            // sending more data (i.e. the next byte would overflow).  We
+            // cannot peek asynchronously here, so we simply update written
+            // and let the *next* poll_write call return the error.
+        }
+
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+// LimitedWriter is Unpin because its only non-marker field is W: Unpin, and
+// all others (u64) are always Unpin.
+impl<W: Unpin> Unpin for LimitedWriter<W> {}
 
 // ===========================================================================
 // Tests
@@ -112,7 +201,11 @@ impl<R: Read> Read for LimitedReader<R> {
 mod tests {
     use std::io::Read as _;
 
+    use tokio::io::AsyncWriteExt as _;
+
     use super::*;
+
+    // ── LimitedReader tests ─────────────────────────────────────────────────
 
     #[test]
     fn under_limit_reads_all() {
@@ -155,5 +248,39 @@ mod tests {
         let mut buf = [0u8; 1];
         let result = reader.read(&mut buf);
         assert!(result.is_err(), "limit=0 should error on first read");
+    }
+
+    // ── LimitedWriter tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn writer_exactly_at_cap_succeeds() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = LimitedWriter::new(inner, 5);
+        writer
+            .write_all(b"12345")
+            .await
+            .expect("should succeed at cap");
+        let out = writer.into_inner();
+        assert_eq!(out, b"12345");
+    }
+
+    #[tokio::test]
+    async fn writer_over_cap_errors() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = LimitedWriter::new(inner, 5);
+        // First 5 bytes should be accepted.
+        writer.write_all(b"12345").await.expect("first 5 bytes ok");
+        // One more byte must error.
+        let result = writer.write_all(b"6").await;
+        assert!(result.is_err(), "writing past cap should return an error");
+    }
+
+    #[tokio::test]
+    async fn writer_under_cap_succeeds() {
+        let inner: Vec<u8> = Vec::new();
+        let mut writer = LimitedWriter::new(inner, 100);
+        writer.write_all(b"hello").await.expect("well under cap");
+        let out = writer.into_inner();
+        assert_eq!(out, b"hello");
     }
 }
