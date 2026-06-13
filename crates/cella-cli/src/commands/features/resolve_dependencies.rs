@@ -264,7 +264,12 @@ fn compute_order_with_metadata(
         compute_install_order(&order_input, override_order, &mut depends_on_cycle);
 
     if let Some(cycle) = depends_on_cycle {
-        return Err(format!("cyclic dependsOn detected: {}", cycle.join(" -> ")));
+        // `cycle` is the set of features in the cycle, not an ordered path —
+        // render comma-separated so arrows don't imply a traversal order.
+        return Err(format!(
+            "cyclic dependsOn among features: {}",
+            cycle.join(", ")
+        ));
     }
 
     for w in &warnings {
@@ -310,7 +315,9 @@ fn compute_order_declared_only(
         compute_install_order(&order_input, override_order, &mut depends_on_cycle);
 
     if let Some(cycle) = depends_on_cycle {
-        return Err(format!("cyclic dependsOn detected: {}", cycle.join(" -> ")).into());
+        // `cycle` is the set of features in the cycle, not an ordered path —
+        // render comma-separated so arrows don't imply a traversal order.
+        return Err(format!("cyclic dependsOn among features: {}", cycle.join(", ")).into());
     }
 
     for w in &warnings {
