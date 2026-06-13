@@ -701,6 +701,7 @@ async fn handle_port_open(
             ProxyStartTarget::AgentTunnel {
                 container_name: name.to_string(),
                 port: target_port,
+                target_host: None,
             }
         } else {
             warn!("No container name for tunnel proxy, skipping port {port}");
@@ -4876,6 +4877,25 @@ branch refs/heads/feat-b
         (h.agent_tx.is_some(), h.agent_tx_generation)
     }
 
+    /// Poll the shared handle until `agent_tx.is_some()` matches `want`, or the
+    /// deadline passes. Agent connect/disconnect cleanup runs in a spawned task,
+    /// so the observable state lags the socket event by an unbounded amount under
+    /// load (coverage instrumentation on CI in particular). Polling makes these
+    /// ownership assertions deterministic instead of racing a fixed sleep.
+    async fn wait_for_agent_tx(handles: &Arc<Mutex<HashMap<String, ContainerHandle>>>, want: bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if get_handle_state(&*handles.lock().await).0 == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for agent_tx.is_some() == {want}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn transient_connect_does_not_set_agent_tx() {
         use tokio::io::AsyncWriteExt;
@@ -4903,17 +4923,13 @@ branch refs/heads/feat-b
     async fn persistent_connect_sets_and_clears_agent_tx() {
         let srv = start_ownership_test_server(None, 0).await;
         let stream = agent_handshake(srv.addr, false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        wait_for_agent_tx(&srv.handles, true).await;
 
-        let (has_tx, generation) = get_handle_state(&*srv.handles.lock().await);
-        assert!(has_tx, "persistent connect must set agent_tx");
+        let generation = get_handle_state(&*srv.handles.lock().await).1;
         assert!(generation > 0, "persistent connect must bump generation");
 
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
-        assert!(!has_tx, "persistent disconnect must clear agent_tx");
+        wait_for_agent_tx(&srv.handles, false).await;
         let _ = srv.shutdown_tx.send(true);
     }
 
@@ -4922,15 +4938,27 @@ branch refs/heads/feat-b
         let srv = start_ownership_test_server(None, 0).await;
 
         let stream1 = agent_handshake(srv.addr, false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        wait_for_agent_tx(&srv.handles, true).await;
         let gen1 = get_handle_state(&*srv.handles.lock().await).1;
 
         let stream2 = agent_handshake(srv.addr, false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let gen2 = get_handle_state(&*srv.handles.lock().await).1;
-        assert!(gen2 > gen1, "second connect must bump generation");
+        // Wait until the second connection has taken ownership (generation bumped).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let gen2 = loop {
+            let (has_tx, g) = get_handle_state(&*srv.handles.lock().await);
+            if has_tx && g > gen1 {
+                break g;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for second connect to bump generation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
 
-        // Disconnect #1 — stale cleanup must NOT clear #2's agent_tx.
+        // Disconnect #1 — stale cleanup must NOT clear #2's agent_tx. The
+        // generation guard makes this a no-op, so the state stays stable; a
+        // brief settle gives the stale cleanup task a chance to (wrongly) run.
         drop(stream1);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -4940,10 +4968,7 @@ branch refs/heads/feat-b
 
         // Disconnect #2 — owning cleanup should clear.
         drop(stream2);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let (has_tx, _) = get_handle_state(&*srv.handles.lock().await);
-        assert!(!has_tx, "owning disconnect must clear agent_tx");
+        wait_for_agent_tx(&srv.handles, false).await;
         let _ = srv.shutdown_tx.send(true);
     }
 
@@ -4955,11 +4980,7 @@ branch refs/heads/feat-b
 
         // Persistent agent connects.
         let persistent = agent_handshake(srv.addr, false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(
-            get_handle_state(&*srv.handles.lock().await).0,
-            "persistent must set agent_tx"
-        );
+        wait_for_agent_tx(&srv.handles, true).await;
 
         // Transient browser-open connects, sends, disconnects.
         let mut transient = agent_handshake(srv.addr, true).await;
@@ -4994,6 +5015,7 @@ branch refs/heads/feat-b
             tx.send(DaemonMessage::TunnelRequest {
                 connection_id: 1,
                 target_port: 45973,
+                target_host: None,
             })
             .await
             .is_ok(),

@@ -15,8 +15,18 @@ pub struct TunnelConfig {
 
 /// Handle a single `TunnelRequest` by connecting back to the daemon and relaying
 /// to the local service.
-pub async fn handle_tunnel_request(connection_id: u64, target_port: u16, config: &TunnelConfig) {
-    debug!("Tunnel request: connection_id={connection_id} target_port={target_port}");
+///
+/// `target_host` overrides the hostname to connect to inside the container.
+/// `None` uses `localhost` (the existing numeric-port path — byte-identical
+/// behaviour).
+pub async fn handle_tunnel_request(
+    connection_id: u64,
+    target_port: u16,
+    target_host: Option<String>,
+    config: &TunnelConfig,
+) {
+    let host = target_host.as_deref().unwrap_or("localhost");
+    debug!("Tunnel request: connection_id={connection_id} target={host}:{target_port}");
 
     let tunnel_result = TcpStream::connect(&config.daemon_addr).await;
     let mut tunnel = match tunnel_result {
@@ -48,16 +58,16 @@ pub async fn handle_tunnel_request(connection_id: u64, target_port: u16, config:
         return;
     }
 
-    let local_result = TcpStream::connect(("localhost", target_port)).await;
+    let local_result = TcpStream::connect((host, target_port)).await;
     let mut local = match local_result {
         Ok(s) => s,
         Err(e) => {
-            warn!("Tunnel local connect to localhost:{target_port} failed: {e}");
+            warn!("Tunnel local connect to {host}:{target_port} failed: {e}");
             return;
         }
     };
 
-    debug!("Tunnel {connection_id}: connected to localhost:{target_port}");
+    debug!("Tunnel {connection_id}: connected to {host}:{target_port}");
     let _ = copy_bidirectional(&mut tunnel, &mut local).await;
     debug!("Tunnel connection {connection_id} closed");
 }
@@ -99,6 +109,16 @@ mod tests {
             auth_token: "token".to_string(),
         };
         // Should not panic — just logs a warning.
-        handle_tunnel_request(1, 3000, &config).await;
+        handle_tunnel_request(1, 3000, None, &config).await;
+    }
+
+    #[tokio::test]
+    async fn handle_tunnel_request_with_target_host_fails_gracefully() {
+        let config = TunnelConfig {
+            daemon_addr: "127.0.0.1:1".to_string(),
+            auth_token: "token".to_string(),
+        };
+        // target_host path should also fail gracefully on unreachable daemon.
+        handle_tunnel_request(2, 5432, Some("db".to_string()), &config).await;
     }
 }

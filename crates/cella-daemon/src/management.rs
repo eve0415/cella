@@ -404,6 +404,7 @@ struct ContainerRegistration {
     ports_attributes: Vec<PortAttributes>,
     other_ports_attributes: Option<PortAttributes>,
     forward_ports: Vec<u16>,
+    forward_host_ports: Vec<cella_protocol::HostForwardPort>,
     backend_kind: Option<String>,
     docker_host: Option<String>,
     project_name: Option<String>,
@@ -419,6 +420,7 @@ impl From<cella_protocol::ContainerRegistrationData> for ContainerRegistration {
             ports_attributes: data.ports_attributes,
             other_ports_attributes: data.other_ports_attributes,
             forward_ports: data.forward_ports,
+            forward_host_ports: data.forward_host_ports,
             backend_kind: data.backend_kind,
             docker_host: data.docker_host,
             project_name: data.project_name,
@@ -482,6 +484,7 @@ async fn handle_register(
         &container_name,
         container_ip_clone.as_deref(),
         &reg.forward_ports,
+        &reg.forward_host_ports,
     )
     .await;
 
@@ -496,6 +499,7 @@ async fn preload_forward_ports(
     container_name: &str,
     container_ip: Option<&str>,
     forward_ports: &[u16],
+    forward_host_ports: &[cella_protocol::HostForwardPort],
 ) {
     ctx.hostname_route_table
         .write()
@@ -503,65 +507,154 @@ async fn preload_forward_ports(
         .remove_container(container_id);
 
     for &port in forward_ports {
-        let host_port = {
-            let mut pm = ctx.port_manager.lock().await;
-            pm.handle_port_open(container_id, port, cella_protocol::PortProtocol::Tcp, None)
-        };
-        let Some(host_port) = host_port else { continue };
+        preload_numeric_forward(ctx, container_id, container_name, container_ip, port).await;
+    }
 
-        let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
-        let target = if use_direct_ip {
-            if let Some(ip) = container_ip {
-                crate::proxy::ProxyStartTarget::DirectIp {
-                    ip: ip.to_string(),
-                    port,
-                }
-            } else {
-                warn!("No container IP for direct proxy, skipping forwardPort {port}");
-                ctx.port_manager
-                    .lock()
-                    .await
-                    .handle_port_closed(container_id, port);
-                continue;
-            }
-        } else {
-            crate::proxy::ProxyStartTarget::AgentTunnel {
-                container_name: container_name.to_string(),
+    // host:port entries always use AgentTunnel — DNS names like "db" are only
+    // resolvable inside the workspace container, so DirectIp cannot work here.
+    // Each (host, port) is a distinct forward with its own host port: `db:5432`
+    // and `analytics-db:5432` must not collapse into one mapping.
+    for hfp in forward_host_ports {
+        preload_host_forward(ctx, container_id, container_name, hfp).await;
+    }
+}
+
+/// Preload a single numeric `forwardPorts` entry: allocate a host port, start
+/// its proxy, and register the hostname route.
+async fn preload_numeric_forward(
+    ctx: &ManagementContext,
+    container_id: &str,
+    container_name: &str,
+    container_ip: Option<&str>,
+    port: u16,
+) {
+    let Some(host_port) = ctx.port_manager.lock().await.handle_port_open(
+        container_id,
+        port,
+        cella_protocol::PortProtocol::Tcp,
+        None,
+    ) else {
+        return;
+    };
+
+    let use_direct_ip = cfg!(target_os = "linux") || ctx.is_orbstack;
+    let target = if use_direct_ip {
+        if let Some(ip) = container_ip {
+            crate::proxy::ProxyStartTarget::DirectIp {
+                ip: ip.to_string(),
                 port,
             }
-        };
-
-        if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+        } else {
+            warn!("No container IP for direct proxy, skipping forwardPort {port}");
             ctx.port_manager
                 .lock()
                 .await
                 .handle_port_closed(container_id, port);
-            continue;
+            return;
         }
+    } else {
+        crate::proxy::ProxyStartTarget::AgentTunnel {
+            container_name: container_name.to_string(),
+            port,
+            target_host: None,
+        }
+    };
 
-        let route = ctx
-            .port_manager
+    if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+        ctx.port_manager
             .lock()
             .await
-            .hostname_route_for(container_id, port);
-        if let Some(route) = route {
-            let mut rt = ctx.hostname_route_table.write().await;
-            rt.insert(
-                cella_proxy::router::RouteKey {
-                    project: route.project.clone(),
-                    branch: route.branch.clone(),
-                    port: route.container_port,
-                },
-                cella_proxy::router::BackendTarget {
-                    container_id: container_id.to_string(),
-                    container_name: container_name.to_string(),
-                    target_port: route.host_port,
-                    mode: cella_proxy::router::ProxyMode::Localhost,
-                },
-            );
-            rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
-        }
+            .handle_port_closed(container_id, port);
+        return;
     }
+
+    let route = ctx
+        .port_manager
+        .lock()
+        .await
+        .hostname_route_for(container_id, port);
+    if let Some(route) = route {
+        let mut rt = ctx.hostname_route_table.write().await;
+        rt.insert(
+            cella_proxy::router::RouteKey {
+                project: route.project.clone(),
+                branch: route.branch.clone(),
+                port: route.container_port,
+            },
+            cella_proxy::router::BackendTarget {
+                container_id: container_id.to_string(),
+                container_name: container_name.to_string(),
+                target_port: route.host_port,
+                mode: cella_proxy::router::ProxyMode::Localhost,
+            },
+        );
+        rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
+    }
+}
+
+/// Preload a single `host:port` cross-service forward through the agent tunnel.
+async fn preload_host_forward(
+    ctx: &ManagementContext,
+    container_id: &str,
+    container_name: &str,
+    hfp: &cella_protocol::HostForwardPort,
+) {
+    let (host_port, route) = {
+        let mut pm = ctx.port_manager.lock().await;
+        let host_port = pm.handle_forward_open(
+            container_id,
+            hfp.port,
+            Some(&hfp.host),
+            cella_protocol::PortProtocol::Tcp,
+            None,
+        );
+        (host_port, pm.hostname_route_for(container_id, hfp.port))
+    };
+    let Some(host_port) = host_port else { return };
+
+    let target = crate::proxy::ProxyStartTarget::AgentTunnel {
+        container_name: container_name.to_string(),
+        port: hfp.port,
+        target_host: Some(hfp.host.clone()),
+    };
+
+    if !crate::control_server::start_port_proxy(host_port, target, &ctx.proxy_cmd_tx).await {
+        ctx.port_manager.lock().await.handle_forward_closed(
+            container_id,
+            hfp.port,
+            Some(&hfp.host),
+        );
+        return;
+    }
+
+    // Advertise a hostname route so `<port>.<branch>.<project>.localhost`
+    // resolves to this forward's localhost proxy. The hostname scheme keys on
+    // the container port alone and cannot encode the cross-service host, so
+    // register only if the key is still free — a numeric forward (or an earlier
+    // host:port forward) on the same port keeps ownership, and this forward
+    // stays reachable at `localhost:<host_port>` regardless.
+    let Some(route) = route else { return };
+    let mut rt = ctx.hostname_route_table.write().await;
+    if rt
+        .lookup(&route.project, &route.branch, route.container_port)
+        .is_some()
+    {
+        return;
+    }
+    rt.insert(
+        cella_proxy::router::RouteKey {
+            project: route.project.clone(),
+            branch: route.branch.clone(),
+            port: route.container_port,
+        },
+        cella_proxy::router::BackendTarget {
+            container_id: container_id.to_string(),
+            container_name: container_name.to_string(),
+            target_port: host_port,
+            mode: cella_proxy::router::ProxyMode::Localhost,
+        },
+    );
+    rt.set_default_port_if_absent(&route.project, &route.branch, route.container_port);
 }
 
 /// Handle container deregistration.
@@ -788,6 +881,7 @@ mod tests {
                     ports_attributes: vec![],
                     other_ports_attributes: None,
                     forward_ports: vec![],
+                    forward_host_ports: vec![],
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,
@@ -875,6 +969,99 @@ mod tests {
         assert_eq!(
             ports[0].hostname.as_deref(),
             Some("http://3000.feature-auth.myapp.localhost:49180")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_forward_registers_hostname_route() {
+        // Regression: a host:port forward (web:3000) must register a hostname
+        // route so `3000.<branch>.<project>.localhost` resolves instead of
+        // returning the no-route page.
+        let (ctx, _srx) = test_management_context(0);
+        ctx.port_manager.lock().await.register_container(
+            crate::port_manager::ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: Some("myapp".to_string()),
+                branch: Some("main".to_string()),
+            },
+        );
+
+        preload_forward_ports(
+            &ctx,
+            "c1",
+            "test-container",
+            Some("172.20.0.5"),
+            &[],
+            &[cella_protocol::HostForwardPort {
+                host: "web".to_string(),
+                port: 3000,
+            }],
+        )
+        .await;
+
+        let is_localhost_route = {
+            let rt = ctx.hostname_route_table.read().await;
+            rt.lookup("myapp", "main", 3000)
+                .map(|target| matches!(target.mode, cella_proxy::router::ProxyMode::Localhost))
+        };
+        assert_eq!(
+            is_localhost_route,
+            Some(true),
+            "host:port forward must register a localhost hostname route"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_forward_does_not_clobber_numeric_route() {
+        // A bare numeric forward owns the hostname route for its port; a
+        // host:port forward sharing that port must not overwrite it (the
+        // hostname scheme cannot disambiguate the cross-service host).
+        let (ctx, _srx) = test_management_context(0);
+        ctx.port_manager.lock().await.register_container(
+            crate::port_manager::ContainerRegistrationInfo {
+                container_id: "c1".to_string(),
+                container_name: "test-container".to_string(),
+                container_ip: Some("172.20.0.5".to_string()),
+                ports_attributes: vec![],
+                other_ports_attributes: None,
+                project_name: Some("myapp".to_string()),
+                branch: Some("main".to_string()),
+            },
+        );
+
+        // A numeric 3000 forward and a host:port web:3000 forward share the
+        // container port. The numeric forward is processed first and owns the
+        // route; the host:port forward gets its own (distinct) host port and
+        // must not overwrite the route.
+        preload_forward_ports(
+            &ctx,
+            "c1",
+            "test-container",
+            Some("172.20.0.5"),
+            &[3000],
+            &[cella_protocol::HostForwardPort {
+                host: "web".to_string(),
+                port: 3000,
+            }],
+        )
+        .await;
+
+        // The host:port forward received its own distinct host port.
+        let forward_count = ctx.port_manager.lock().await.all_forwarded_ports().len();
+        assert_eq!(forward_count, 2, "two distinct forwards expected");
+
+        let route_target_port = {
+            let rt = ctx.hostname_route_table.read().await;
+            rt.lookup("myapp", "main", 3000).map(|t| t.target_port)
+        };
+        assert_eq!(
+            route_target_port,
+            Some(3000),
+            "numeric forward (native host port 3000) must keep route ownership"
         );
     }
 
@@ -1220,6 +1407,7 @@ mod tests {
                     ports_attributes: vec![],
                     other_ports_attributes: None,
                     forward_ports: vec![],
+                    forward_host_ports: vec![],
                     shutdown_action: None,
                     backend_kind: Some("docker".to_string()),
                     docker_host: None,

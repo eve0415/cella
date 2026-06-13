@@ -45,6 +45,11 @@ struct DetectedPort {
     protocol: PortProtocol,
     process: Option<String>,
     host_port: Option<u16>,
+    /// Cross-service target host for `host:port` forwards (e.g. `db` in
+    /// `db:5432`). `None` for ordinary forwards reached on the workspace
+    /// container itself. Part of a detected port's identity: `db:5432` and a
+    /// bare `5432` are distinct forwards that each need their own host port.
+    target_host: Option<String>,
 }
 
 /// Data needed to register a container for port management.
@@ -249,10 +254,32 @@ impl PortManager {
         protocol: PortProtocol,
         process: Option<String>,
     ) -> Option<u16> {
-        // Duplicate guard: if this container+port is already detected, return
-        // the existing mapping. Handles agent reconnections re-reporting ports.
+        self.handle_forward_open(container_id, port, None, protocol, process)
+    }
+
+    /// Handle a forward becoming active, optionally bound to a cross-service
+    /// `target_host` (the `host` in a `host:port` forward).
+    ///
+    /// A detected port's identity is `(port, target_host)`: `db:5432` and a
+    /// bare `5432` — or `db:5432` and `analytics-db:5432` — are distinct
+    /// forwards that each receive their own host port, rather than aliasing to
+    /// one mapping.
+    pub fn handle_forward_open(
+        &mut self,
+        container_id: &str,
+        port: u16,
+        target_host: Option<&str>,
+        protocol: PortProtocol,
+        process: Option<String>,
+    ) -> Option<u16> {
+        // Duplicate guard: if this exact forward (container + port + target
+        // host) is already detected, return the existing mapping. Handles agent
+        // reconnections re-reporting ports.
         if let Some(container) = self.containers.get(container_id)
-            && let Some(existing) = container.detected_ports.iter().find(|d| d.port == port)
+            && let Some(existing) = container
+                .detected_ports
+                .iter()
+                .find(|d| d.port == port && d.target_host.as_deref() == target_host)
         {
             return existing.host_port;
         }
@@ -284,6 +311,7 @@ impl PortManager {
             protocol,
             process,
             host_port: Some(host_port),
+            target_host: target_host.map(str::to_string),
         };
 
         if let Some(container) = self.containers.get_mut(container_id) {
@@ -305,15 +333,31 @@ impl PortManager {
     ///
     /// Returns the host port that was released, if any.
     pub fn handle_port_closed(&mut self, container_id: &str, port: u16) -> Option<u16> {
+        self.handle_forward_closed(container_id, port, None)
+    }
+
+    /// Close a single forward identified by `(port, target_host)`, releasing
+    /// only that forward's host port. Closing `db:5432` must not tear down a
+    /// bare `5432` (or vice versa) that happens to share the container port.
+    ///
+    /// Returns the host port that was released, if any.
+    pub fn handle_forward_closed(
+        &mut self,
+        container_id: &str,
+        port: u16,
+        target_host: Option<&str>,
+    ) -> Option<u16> {
         let host_port = self.containers.get(container_id).and_then(|c| {
             c.detected_ports
                 .iter()
-                .find(|p| p.port == port)
+                .find(|p| p.port == port && p.target_host.as_deref() == target_host)
                 .and_then(|p| p.host_port)
         });
 
         if let Some(container) = self.containers.get_mut(container_id) {
-            container.detected_ports.retain(|p| p.port != port);
+            container
+                .detected_ports
+                .retain(|p| !(p.port == port && p.target_host.as_deref() == target_host));
         }
 
         if let Some(hp) = host_port {
@@ -347,6 +391,7 @@ impl PortManager {
                         branch: container.branch.clone(),
                         project_slug: container.project_slug.clone(),
                         branch_slug: container.branch_slug.clone(),
+                        target_host: detected.target_host.clone(),
                     });
                 }
             }
@@ -384,6 +429,9 @@ pub struct ForwardedPortInfo {
     pub branch: Option<String>,
     pub project_slug: Option<String>,
     pub branch_slug: Option<String>,
+    /// Cross-service target host for `host:port` forwards. `None` for forwards
+    /// reached on the workspace container itself.
+    pub target_host: Option<String>,
 }
 
 /// Metadata needed to add/remove a hostname route.
@@ -568,6 +616,7 @@ mod tests {
             branch: None,
             project_slug: None,
             branch_slug: None,
+            target_host: None,
         };
         // url() always returns localhost
         assert_eq!(info.url(), "localhost:3000");
@@ -592,6 +641,7 @@ mod tests {
             branch: None,
             project_slug: None,
             branch_slug: None,
+            target_host: None,
         };
         assert_eq!(info.orb_url(), None);
     }
@@ -610,6 +660,7 @@ mod tests {
             branch: None,
             project_slug: None,
             branch_slug: None,
+            target_host: None,
         };
         assert_eq!(info.url(), "localhost:3001");
     }
@@ -766,5 +817,104 @@ mod tests {
     fn update_container_ip_unknown_container() {
         let mut pm = PortManager::new(false);
         assert!(!pm.update_container_ip("unknown", Some("1.2.3.4".to_string())));
+    }
+
+    #[test]
+    fn host_forwards_sharing_a_port_get_distinct_host_ports() {
+        // Regression: two host:port forwards on the same container port
+        // (db:5432, analytics-db:5432) must not alias to one host port. The
+        // dedup guard is keyed on (port, target_host), so each is distinct.
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+
+        let db = pm.handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None);
+        let analytics =
+            pm.handle_forward_open("c1", 5432, Some("analytics-db"), PortProtocol::Tcp, None);
+        let numeric = pm.handle_port_open("c1", 5432, PortProtocol::Tcp, None);
+
+        assert!(db.is_some() && analytics.is_some() && numeric.is_some());
+        assert_ne!(db, analytics, "distinct hosts must get distinct host ports");
+        assert_ne!(db, numeric, "host:port and bare port must not alias");
+        assert_ne!(analytics, numeric);
+        assert_eq!(pm.all_forwarded_ports().len(), 3);
+    }
+
+    #[test]
+    fn re_opening_same_host_forward_reuses_host_port() {
+        // The dedup guard still coalesces a re-reported identical forward.
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+
+        let first = pm.handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None);
+        let again = pm.handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None);
+        assert_eq!(first, again);
+        assert_eq!(pm.all_forwarded_ports().len(), 1);
+    }
+
+    #[test]
+    fn closing_one_host_forward_leaves_the_other_intact() {
+        // Regression: closing db:5432 must not tear down a bare 5432 (or the
+        // other host:port forward) sharing the container port.
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+
+        let db = pm
+            .handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None)
+            .unwrap();
+        let numeric = pm
+            .handle_port_open("c1", 5432, PortProtocol::Tcp, None)
+            .unwrap();
+
+        // Close only the host:port forward.
+        let released = pm.handle_forward_closed("c1", 5432, Some("db"));
+        assert_eq!(released, Some(db));
+
+        let remaining = pm.all_forwarded_ports();
+        assert_eq!(remaining.len(), 1, "bare 5432 must survive db:5432 closing");
+        assert_eq!(remaining[0].host_port, numeric);
+        assert!(remaining[0].target_host.is_none());
+    }
+
+    #[test]
+    fn host_forward_carries_target_host_in_forwarded_info() {
+        let mut pm = PortManager::new(false);
+        pm.register_container(ContainerRegistrationInfo {
+            container_id: "c1".to_string(),
+            container_name: "test".to_string(),
+            container_ip: None,
+            ports_attributes: vec![],
+            other_ports_attributes: None,
+            project_name: None,
+            branch: None,
+        });
+        pm.handle_forward_open("c1", 5432, Some("db"), PortProtocol::Tcp, None);
+
+        let ports = pm.all_forwarded_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].target_host.as_deref(), Some("db"));
     }
 }
