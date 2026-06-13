@@ -246,6 +246,14 @@ pub enum AgentMessage {
 // Management protocol (CLI ↔ daemon via ~/.cella/daemon.sock)
 // ---------------------------------------------------------------------------
 
+/// A `host:port` entry from `forwardPorts` — a port reachable via the named
+/// DNS host from inside the workspace container (e.g. a Compose service name).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostForwardPort {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Data for a container registration request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerRegistrationData {
@@ -257,6 +265,10 @@ pub struct ContainerRegistrationData {
     /// Ports from `forwardPorts` in devcontainer.json (pre-allocate on registration).
     #[serde(default)]
     pub forward_ports: Vec<u16>,
+    /// `host:port` entries from `forwardPorts` — DNS names only resolvable from
+    /// inside the workspace container (e.g. Compose service names).
+    #[serde(default)]
+    pub forward_host_ports: Vec<HostForwardPort>,
     /// The `shutdownAction` from devcontainer.json (`"none"` or `"stopContainer"`).
     #[serde(default)]
     pub shutdown_action: Option<String>,
@@ -499,6 +511,10 @@ pub enum DaemonMessage {
     TunnelRequest {
         connection_id: u64,
         target_port: u16,
+        /// DNS hostname to connect to inside the container. `None` means
+        /// `localhost` (the existing numeric-port path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_host: Option<String>,
     },
     /// Push the canonical `~/.claude.json` content to the agent so it can write
     /// it into the container. Only sent to agents that advertised
@@ -1073,19 +1089,85 @@ mod tests {
         let msg = DaemonMessage::TunnelRequest {
             connection_id: 99,
             target_port: 3000,
+            target_host: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"tunnel_request\""));
         assert!(json.contains("\"connection_id\":99"));
         assert!(json.contains("\"target_port\":3000"));
+        // target_host: None is skipped in serialization
+        assert!(!json.contains("target_host"));
         let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
             DaemonMessage::TunnelRequest {
                 connection_id: 99,
-                target_port: 3000
+                target_port: 3000,
+                target_host: None,
             }
         ));
+    }
+
+    #[test]
+    fn roundtrip_tunnel_request_with_target_host() {
+        let msg = DaemonMessage::TunnelRequest {
+            connection_id: 7,
+            target_port: 5432,
+            target_host: Some("db".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"target_host\":\"db\""));
+        let decoded: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::TunnelRequest {
+                connection_id: 7,
+                target_port: 5432,
+                ref target_host,
+            } if target_host.as_deref() == Some("db")
+        ));
+    }
+
+    #[test]
+    fn tunnel_request_backward_compat_no_target_host() {
+        // Old wire format without target_host should deserialize with target_host=None
+        let json = r#"{"type":"tunnel_request","connection_id":1,"target_port":8080}"#;
+        let decoded: DaemonMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonMessage::TunnelRequest {
+                connection_id: 1,
+                target_port: 8080,
+                target_host: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn host_forward_port_roundtrip() {
+        let hfp = HostForwardPort {
+            host: "db".to_string(),
+            port: 5432,
+        };
+        let json = serde_json::to_string(&hfp).unwrap();
+        let decoded: HostForwardPort = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, hfp);
+    }
+
+    #[test]
+    fn container_registration_data_backward_compat_no_forward_host_ports() {
+        // Old wire format without forward_host_ports should deserialize with empty vec
+        let json = r#"{
+            "container_id": "abc",
+            "container_name": "cella-test",
+            "container_ip": null,
+            "ports_attributes": [],
+            "other_ports_attributes": null,
+            "forward_ports": [3000]
+        }"#;
+        let data: ContainerRegistrationData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.forward_ports, vec![3000]);
+        assert!(data.forward_host_ports.is_empty());
     }
 
     #[test]
@@ -1186,6 +1268,7 @@ mod tests {
             ports_attributes: vec![],
             other_ports_attributes: None,
             forward_ports: vec![],
+            forward_host_ports: vec![],
             shutdown_action: None,
             backend_kind: Some("docker".to_string()),
             docker_host: None,
