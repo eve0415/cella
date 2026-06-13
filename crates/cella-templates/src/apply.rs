@@ -352,11 +352,11 @@ const ALWAYS_EXCLUDED: &[&str] = &["devcontainer-template.json", "README.md", "N
 /// - `devcontainer-template.json`, `README.md`, `NOTES.md` at the root only
 ///   (exact full-relative-path matches; a nested `.devcontainer/README.md` is
 ///   **not** excluded)
-/// - Any path matched by an `omit_paths` entry. Patterns ending in `/*` become
-///   directory-prefix filters: the bare `*` is stripped and the entry's relative
-///   path is tested with `starts_with(prefix)`. All other patterns are treated as
-///   exact full-relative-path matches.  This mirrors the official CLI's
-///   `getBlob` filtering in `containerCollectionsOCI.ts`.
+/// - Any path matched by an `omit_paths` entry. Only patterns ending in `/*`
+///   are directory-prefix filters (the `*` is stripped; entries are matched with
+///   `starts_with("<dir>/")`). Patterns with a bare `*` suffix (e.g. `foo*`) or
+///   no wildcard are treated as exact full-relative-path matches. This mirrors
+///   the official CLI's `getBlob` filtering in `containerCollectionsOCI.ts`.
 ///
 /// Template option placeholders (`${templateOption:KEY}`) are substituted in
 /// text files; binary files (not valid UTF-8) are copied verbatim.
@@ -376,15 +376,20 @@ pub fn apply_to_workspace<S: std::hash::BuildHasher>(
     std::fs::create_dir_all(workspace_folder)?;
 
     // Compile omit-path rules per official semantics:
-    // - Patterns ending in `/*`: strip the `*`, keep the trailing `/` as a
-    //   directory prefix tested with `starts_with`.
+    // - Patterns ending in `/*`: strip the trailing `*` (keeping the `/`),
+    //   tested with `starts_with(prefix)` on the entry's relative path.
+    //   Only the literal `/*` suffix qualifies — bare `*` (e.g. `foo*`) is
+    //   treated as an exact match, not a directory-prefix rule.
     // - All other patterns: exact full-relative-path match.
     let omit_rules: Vec<OmitRule> = omit_paths
         .iter()
         .map(|p| {
-            p.strip_suffix('*').map_or_else(
+            // Only treat as a directory-prefix rule when the pattern ends in `/*`.
+            // Keep the trailing `/` in the stored prefix so that `starts_with`
+            // checks are boundary-correct (`.github/` won't match `.github-ci/`).
+            p.strip_suffix("/*").map_or_else(
                 || OmitRule::Exact(p.clone()),
-                |prefix| OmitRule::DirPrefix(prefix.to_owned()),
+                |prefix| OmitRule::DirPrefix(format!("{prefix}/")),
             )
         })
         .collect();
@@ -406,7 +411,9 @@ pub fn apply_to_workspace<S: std::hash::BuildHasher>(
 
 /// An omit-path rule derived from a single `--omit-paths` entry.
 enum OmitRule {
-    /// Pattern `<prefix>/*`: omit any entry whose relative path starts with `<prefix>/`.
+    /// Pattern `<dir>/*`: omit any entry whose relative path starts with `<dir>/`.
+    /// The stored string already includes the trailing `/` (e.g. `.github/`),
+    /// so `starts_with` checks are plain string prefix tests.
     DirPrefix(String),
     /// Exact full-relative-path match.
     Exact(String),
@@ -1513,6 +1520,60 @@ mod tests {
         // Nested .devcontainer/README.md and NOTES.md must be kept.
         assert!(workspace.path().join(".devcontainer/README.md").exists());
         assert!(workspace.path().join(".devcontainer/NOTES.md").exists());
+    }
+
+    // Regression tests for finding 3: only `/*`-ending patterns are dir-prefix rules
+
+    #[test]
+    fn omit_paths_bare_star_is_exact_match_not_dir_prefix() {
+        // `foobar*` must NOT act as a directory-prefix rule — only `foobar/*` should.
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let foo_dir = template_dir.path().join("foobar");
+        std::fs::create_dir_all(&foo_dir).unwrap();
+        std::fs::write(foo_dir.join("file.txt"), "content").unwrap();
+        std::fs::write(template_dir.path().join("setup.sh"), "#!/bin/sh").unwrap();
+
+        let files = apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &["foobar*".to_owned()],
+        )
+        .unwrap();
+
+        // foobar* is an exact-path match, no file is literally named `foobar*`,
+        // so both entries must be present.
+        assert!(workspace.path().join("foobar/file.txt").exists());
+        assert!(workspace.path().join("setup.sh").exists());
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn omit_paths_slash_star_excludes_directory() {
+        // `foobar/*` must act as a directory-prefix rule.
+        let template_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let foo_dir = template_dir.path().join("foobar");
+        std::fs::create_dir_all(&foo_dir).unwrap();
+        std::fs::write(foo_dir.join("file.txt"), "content").unwrap();
+        std::fs::write(template_dir.path().join("setup.sh"), "#!/bin/sh").unwrap();
+
+        let files = apply_to_workspace(
+            "test",
+            template_dir.path(),
+            workspace.path(),
+            &HashMap::new(),
+            &["foobar/*".to_owned()],
+        )
+        .unwrap();
+
+        assert!(!workspace.path().join("foobar/file.txt").exists());
+        assert!(workspace.path().join("setup.sh").exists());
+        assert_eq!(files, vec![PathBuf::from("setup.sh")]);
     }
 
     #[test]
