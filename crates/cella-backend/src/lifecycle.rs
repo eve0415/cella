@@ -190,10 +190,14 @@ async fn run_sequential(
     Ok(())
 }
 
-/// Run named lifecycle commands in parallel, cancelling siblings on first failure.
+/// Run named lifecycle commands in parallel, letting every command finish
+/// before surfacing a failure.
 ///
-/// Uses `try_join_all` so that when any command fails, remaining in-flight
-/// commands are cancelled (their futures are dropped) per the spec requirement.
+/// Matches the official runner's `Promise.allSettled` semantics: all named
+/// commands run to completion even if a sibling fails, then the first error
+/// (in command order) is returned. Using `try_join_all` here would cancel the
+/// remaining in-flight commands on the first failure, leaving parallel setup
+/// steps half-done.
 async fn run_parallel(
     ctx: &LifecycleContext<'_>,
     phase: &str,
@@ -227,7 +231,13 @@ async fn run_parallel(
         });
     }
 
-    let results = futures_util::future::try_join_all(futures).await?;
+    // Wait for ALL commands to finish (allSettled), then surface the first
+    // error in command order; only print output on full success.
+    let settled = futures_util::future::join_all(futures).await;
+    let mut results = Vec::with_capacity(settled.len());
+    for outcome in settled {
+        results.push(outcome?);
+    }
 
     if ctx.is_text {
         print_completed_output(&results);

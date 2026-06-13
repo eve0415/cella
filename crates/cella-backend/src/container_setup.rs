@@ -25,30 +25,65 @@ pub fn run_host_command(
     info!("Running {phase} on host");
 
     match value {
-        serde_json::Value::String(s) => {
-            run_single_host_command(phase, &["sh", "-c", s])?;
+        serde_json::Value::String(_) | serde_json::Value::Array(_) => {
+            run_host_command_value(phase, value)?;
         }
-        serde_json::Value::Array(arr) => {
-            run_json_array_command(phase, arr)?;
-        }
+        // Object form runs the named commands in PARALLEL (official `Promise.all`
+        // over `cliHost.ptyExec`). All entries run to completion; the first
+        // error in iteration order is surfaced.
         serde_json::Value::Object(map) => {
-            for (name, v) in map {
-                info!("{phase} [{name}]");
-                match v {
-                    serde_json::Value::String(s) => {
-                        run_single_host_command(phase, &["sh", "-c", s])?;
-                    }
-                    serde_json::Value::Array(arr) => {
-                        run_json_array_command(phase, arr)?;
-                    }
-                    _ => {}
-                }
-            }
+            run_host_object_parallel(phase, map)?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+/// Run a single host lifecycle command value: a string via `sh -c`, an array as
+/// argv (no shell). Other JSON types are a no-op.
+fn run_host_command_value(
+    phase: &str,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match value {
+        serde_json::Value::String(s) => run_single_host_command(phase, &["sh", "-c", s]),
+        serde_json::Value::Array(arr) => run_json_array_command(phase, arr),
+        _ => Ok(()),
+    }
+}
+
+/// Run the named entries of an object-form host lifecycle command in parallel
+/// (one OS thread each), waiting for all to finish, then returning the first
+/// error in iteration order.
+fn run_host_object_parallel(
+    phase: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = map
+            .iter()
+            .map(|(name, v)| {
+                scope.spawn(move || {
+                    info!("{phase} [{name}]");
+                    run_host_command_value(phase, v)
+                })
+            })
+            .collect();
+
+        let mut first_err = None;
+        for handle in handles {
+            let outcome = handle
+                .join()
+                .unwrap_or_else(|_| Err(format!("{phase} host command thread panicked").into()));
+            if let Err(e) = outcome
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    })
 }
 
 fn run_json_array_command(
@@ -819,6 +854,33 @@ mod tests {
         let cmd = json!("false");
         let result = run_host_command("test", &cmd);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_host_command_object_form_surfaces_failure() {
+        let cmd = json!({"ok": "true", "bad": "false"});
+        assert!(run_host_command("test", &cmd).is_err());
+    }
+
+    #[test]
+    fn run_host_command_object_form_runs_all_despite_failure() {
+        // A slow sibling must run to completion even though another entry fails
+        // (parallel + allSettled semantics, not cancel-on-first-error).
+        let marker = std::env::temp_dir().join(format!(
+            "cella-lifecycle-parallel-{}.marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let touch = format!("sleep 0.3 && touch '{}'", marker.display());
+        let cmd = json!({"slow": touch, "fail": "false"});
+
+        let result = run_host_command("test", &cmd);
+        assert!(result.is_err(), "the failing entry must surface an error");
+        assert!(
+            marker.exists(),
+            "the slow sibling must complete despite the failure (not be cancelled)"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
