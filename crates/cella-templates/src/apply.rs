@@ -538,9 +538,13 @@ fn write_leaf_file<S: std::hash::BuildHasher>(
             }
             std::fs::write(dest, report.content)?;
         }
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             // Not valid UTF-8 — copy binary verbatim.
             std::fs::copy(src, dest)?;
+        }
+        Err(e) => {
+            // Genuine I/O error (permission denied, ENOENT, etc.) — propagate.
+            return Err(e.into());
         }
     }
     Ok(())
@@ -1616,5 +1620,27 @@ mod tests {
 
         let result = std::fs::read(workspace.path().join("data.bin")).unwrap();
         assert_eq!(result, binary_data);
+    }
+
+    // Regression test for finding 4: non-InvalidData I/O errors must propagate
+
+    #[test]
+    fn write_leaf_file_propagates_non_utf8_io_error() {
+        // Pointing `src` at a directory triggers a non-InvalidData I/O error
+        // (EISDIR / IsADirectory). This must propagate, not be swallowed as
+        // "binary file" and silently copied.
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        let src_path = src_dir.path().to_path_buf();
+        let dest_path = dest_dir.path().join("out.txt");
+
+        let result = write_leaf_file("test-id", &src_path, &dest_path, &HashMap::new(), false);
+
+        assert!(result.is_err(), "expected I/O error to propagate");
+        assert!(
+            !dest_path.exists(),
+            "dest must not be created by a blind copy"
+        );
     }
 }
