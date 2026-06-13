@@ -65,7 +65,8 @@ pub async fn probe_and_cache_user_env(
     probe_type: UserEnvProbe,
     shell: &str,
 ) -> Option<HashMap<String, String>> {
-    let env = run_env_probe(client, container_id, user, probe_type, shell).await?;
+    let mut env = run_env_probe(client, container_id, user, probe_type, shell).await?;
+    merge_container_base_path(client, container_id, user, &mut env).await;
     write_env_cache(client, container_id, user, probe_type, &env).await;
     Some(env)
 }
@@ -135,6 +136,35 @@ async fn try_probe_method(
     }
 
     Ok(env)
+}
+
+/// Merge the container's base `PATH` (from image config) into the probed env so
+/// PATH entries a shell startup script dropped are recovered. Non-fatal: any
+/// lookup failure leaves the probed PATH untouched. Mirrors the official CLI.
+async fn merge_container_base_path(
+    client: &dyn ContainerBackend,
+    container_id: &str,
+    user: &str,
+    env: &mut HashMap<String, String>,
+) {
+    let Some(shell_path) = env.get("PATH").cloned() else {
+        return;
+    };
+    let Ok(info) = client.inspect_container(container_id).await else {
+        return;
+    };
+    let Some(image) = info.image else {
+        return;
+    };
+    let Ok(image_env) = client.inspect_image_env(&image).await else {
+        return;
+    };
+    let Some(container_path) = image_env.iter().find_map(|e| e.strip_prefix("PATH=")) else {
+        return;
+    };
+    let root_user = user == "root" || user == "0";
+    let merged = cella_env::user_env_probe::merge_paths(&shell_path, container_path, root_user);
+    env.insert("PATH".to_string(), merged);
 }
 
 /// Execute the environment probe command and parse the output.
