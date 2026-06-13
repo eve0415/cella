@@ -431,12 +431,6 @@ impl EnsureUpContext<'_> {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<UpResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Spec: initializeCommand runs on the host during every start, including reconnects.
-        let config = self.config_json();
-        if let Some(init_cmd) = config.get("initializeCommand") {
-            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
-        }
-
         let capabilities = self.client.capabilities();
 
         if let Ok(result) = self
@@ -672,13 +666,6 @@ impl EnsureUpContext<'_> {
         container: &ContainerInfo,
         remote_user: &str,
     ) -> Result<Option<UpResult>, Box<dyn std::error::Error + Send + Sync>> {
-        // Spec: initializeCommand runs on the host during every `up`, including
-        // restarting a stopped container — the create and reconnect paths
-        // already do this (official runs it before any container-state branch).
-        if let Some(init_cmd) = self.config_json().get("initializeCommand") {
-            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
-        }
-
         let capabilities = self.client.capabilities();
 
         self.warn_config_drift(container);
@@ -1868,10 +1855,6 @@ impl EnsureUpContext<'_> {
     ) -> Result<CreateResult, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_json();
 
-        if let Some(init_cmd) = config.get("initializeCommand") {
-            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
-        }
-
         let (img_name, resolved_features, base_image_details) =
             crate::image::ensure_image(&crate::image::EnsureImageInput {
                 client: self.client,
@@ -2006,6 +1989,14 @@ impl EnsureUpContext<'_> {
         // only fires when nothing was found.
         if existing.is_none() && self.config.expect_existing_container {
             return Err(EXPECTED_CONTAINER_MISSING.into());
+        }
+
+        // Spec: initializeCommand runs on the host before any container work on
+        // every `up` invocation — create, restart, or reconnect. Centralised
+        // here so it fires exactly once regardless of which path is taken below
+        // (running, stopped→start, stopped→recreate, fresh create).
+        if let Some(init_cmd) = self.config_json().get("initializeCommand") {
+            crate::container_setup::run_host_command("initializeCommand", init_cmd)?;
         }
 
         if let Some(container) = existing {
