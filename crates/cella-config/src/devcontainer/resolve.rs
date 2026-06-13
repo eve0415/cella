@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use cella_backend::names::lexical_absolute;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -112,21 +113,22 @@ impl ResolvedConfig {
 /// Per <https://containers.dev/implementors/spec/#devcontainerid>:
 /// SHA-256 of the sorted JSON label object, base-32 encoded, left-padded to 52 chars.
 pub fn devcontainer_id(workspace_root: &Path, config_path: &Path) -> String {
-    let canonical_workspace = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let canonical_config = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf());
-
+    // Match the official CLI's label values, which use a LEXICAL absolute path
+    // (Node's `path.resolve`) — it collapses `.`/`..` but never follows
+    // symlinks. Using `canonicalize()` here would resolve symlinks (e.g. macOS
+    // `/tmp` -> `/private/tmp`, bind mounts) and produce a different id than VS
+    // Code / the official CLI, breaking cross-tool container reuse and shared
+    // volume names.
     let mut labels = BTreeMap::new();
     labels.insert(
         "devcontainer.local_folder".to_string(),
-        canonical_workspace.to_string_lossy().to_string(),
+        lexical_absolute(workspace_root)
+            .to_string_lossy()
+            .to_string(),
     );
     labels.insert(
         "devcontainer.config_file".to_string(),
-        canonical_config.to_string_lossy().to_string(),
+        lexical_absolute(config_path).to_string_lossy().to_string(),
     );
     spec_devcontainer_id(&labels)
 }
@@ -372,6 +374,7 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cella_backend::names::lexical_absolute;
     use tempfile::TempDir;
 
     fn create_devcontainer(workspace: &Path, content: &str) {
@@ -595,6 +598,39 @@ mod tests {
 
     // --- Spec: devcontainerId computation ---
     // Reference: https://containers.dev/implementors/spec/#devcontainerid
+
+    #[test]
+    fn lexical_absolute_collapses_dot_dot_without_symlinks() {
+        assert_eq!(lexical_absolute(Path::new("/a/b/../c")), Path::new("/a/c"));
+        assert_eq!(lexical_absolute(Path::new("/a/./b")), Path::new("/a/b"));
+        // Cannot ascend past the root.
+        assert_eq!(lexical_absolute(Path::new("/../x")), Path::new("/x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devcontainer_id_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let real = TempDir::new().unwrap();
+        create_devcontainer(real.path(), r#"{"image": "ubuntu"}"#);
+        let real_cfg = real.path().join(".devcontainer/devcontainer.json");
+
+        // A symlink pointing at the real workspace.
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("link");
+        symlink(real.path(), &link).unwrap();
+        let link_cfg = link.join(".devcontainer/devcontainer.json");
+
+        // The id must derive from the symlink PATH (lexical), not its target —
+        // otherwise it wouldn't match VS Code / the official CLI, which never
+        // resolve symlinks for the id labels.
+        let via_link = devcontainer_id(&link, &link_cfg);
+        let via_real = devcontainer_id(real.path(), &real_cfg);
+        assert_ne!(via_link, via_real);
+        // And it's stable for the same (symlink) path.
+        assert_eq!(via_link, devcontainer_id(&link, &link_cfg));
+    }
 
     #[test]
     fn devcontainer_id_is_52_chars() {
