@@ -287,8 +287,15 @@ impl OciFetcher {
             });
         }
 
-        let oci_ref =
-            Reference::with_tag(registry.to_owned(), repository.to_owned(), tag.to_owned());
+        // Request the manifest by the pinned digest directly (not the mutable
+        // tag) so a moved tag can never substitute different content: the
+        // registry serves the exact `@sha256:...` artifact or 404s. This
+        // matches the official CLI's locked-build behavior.
+        let oci_ref = Reference::with_digest(
+            registry.to_owned(),
+            repository.to_owned(),
+            digest.to_owned(),
+        );
         let auth = build_registry_auth(registry);
         let (manifest, resolved_digest) = self
             .pull_manifest(&oci_ref, &auth, registry, repository, tag)
@@ -323,6 +330,13 @@ impl OciFetcher {
     }
 
     /// Fetch by OCI tag (no pinning).
+    ///
+    /// Always resolves the manifest digest from the registry first, then keys
+    /// the cache lookup on that **content-addressed** digest. A tag-addressed
+    /// cache entry is never trusted on its own: if the tag has moved, returning
+    /// the stale tag directory paired with the freshly-resolved digest would
+    /// produce an [`OciFetchResult`] whose artifact and digest disagree (and
+    /// thus a wrong lockfile). Digest-addressed entries can never drift.
     async fn fetch_by_tag(
         &self,
         registry: &str,
@@ -330,22 +344,6 @@ impl OciFetcher {
         tag: &str,
         cache: &FeatureCache,
     ) -> Result<OciFetchResult, FeatureError> {
-        if let Some(cached) = cache.get_oci(registry, repository, tag) {
-            let oci_ref =
-                Reference::with_tag(registry.to_owned(), repository.to_owned(), tag.to_owned());
-            let auth = build_registry_auth(registry);
-            let (_, digest) = self
-                .pull_manifest(&oci_ref, &auth, registry, repository, tag)
-                .await?;
-            return Ok(OciFetchResult {
-                artifact_dir: cached,
-                digest,
-                version: tag.to_owned(),
-                registry: registry.to_owned(),
-                repository: repository.to_owned(),
-            });
-        }
-
         let oci_ref =
             Reference::with_tag(registry.to_owned(), repository.to_owned(), tag.to_owned());
         let auth = build_registry_auth(registry);
@@ -354,6 +352,7 @@ impl OciFetcher {
             .await?;
 
         if let Some(cached) = cache.get_oci(registry, repository, &digest) {
+            debug!("cache hit by digest {digest} for {registry}/{repository}:{tag}");
             return Ok(OciFetchResult {
                 artifact_dir: cached,
                 digest,
