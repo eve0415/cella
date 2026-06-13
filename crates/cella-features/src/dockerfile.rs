@@ -293,14 +293,19 @@ pub fn generate_feature_env(feature: &ResolvedFeature) -> String {
         let value = if let Some(user_val) = feature.user_options.get(key) {
             json_value_to_string(user_val)
         } else if let Some(opt) = feature.metadata.options.get(key) {
+            // No `default` declared (absent → Null): omit the key entirely,
+            // matching the official `'default' in options[key]` guard. An
+            // explicit empty-string default still emits `KEY=""`.
+            if opt.default.is_null() {
+                continue;
+            }
             json_value_to_string(&opt.default)
         } else {
             // User-provided key with no declared option and no value -- skip
             continue;
         };
 
-        let env_name = key.to_uppercase();
-        writeln!(out, "{env_name}=\"{value}\"").unwrap();
+        writeln!(out, "{}=\"{value}\"", option_key_to_env_var(key)).unwrap();
     }
 
     out
@@ -334,6 +339,35 @@ fn json_value_to_string(val: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Convert a feature option id to its install-time env var name, matching the
+/// official CLI's `getSafeId`: every non-`[A-Za-z0-9_]` char becomes `_`, a
+/// leading run of digits/underscores collapses to a single `_`, then the whole
+/// thing is uppercased (e.g. `my-option` → `MY_OPTION`, `node.version` →
+/// `NODE_VERSION`, `123bad` → `_BAD`). A bare `to_uppercase()` would emit
+/// invalid shell names like `MY-OPTION`, which `install.sh` would never see.
+pub(crate) fn option_key_to_env_var(key: &str) -> String {
+    let sanitized: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let first_valid = sanitized
+        .chars()
+        .position(|c| c != '_' && !c.is_ascii_digit())
+        .unwrap_or(sanitized.len());
+    let normalized = if first_valid > 0 {
+        format!("_{}", &sanitized[first_valid..])
+    } else {
+        sanitized
+    };
+    normalized.to_uppercase()
 }
 
 #[cfg(test)]
@@ -912,5 +946,83 @@ mod tests {
 
         let env = generate_feature_env(&feature);
         assert!(env.is_empty());
+    }
+
+    // --- Spec compliance: option id → env var name (getSafeId) ---
+    // Reference: https://containers.dev/implementors/spec/#dev-container-features
+
+    #[test]
+    fn option_key_to_env_var_simple_uppercase() {
+        assert_eq!(option_key_to_env_var("version"), "VERSION");
+    }
+
+    #[test]
+    fn option_key_to_env_var_hyphens() {
+        assert_eq!(option_key_to_env_var("my-option"), "MY_OPTION");
+    }
+
+    #[test]
+    fn option_key_to_env_var_dots() {
+        assert_eq!(option_key_to_env_var("node.version"), "NODE_VERSION");
+    }
+
+    #[test]
+    fn option_key_to_env_var_leading_digit() {
+        assert_eq!(option_key_to_env_var("123bad"), "_BAD");
+    }
+
+    #[test]
+    fn option_key_to_env_var_special_chars() {
+        assert_eq!(option_key_to_env_var("my@option#1"), "MY_OPTION_1");
+    }
+
+    #[test]
+    fn feature_env_sanitizes_option_key_for_install_sh() {
+        // A hyphenated option key must become a valid shell var name so
+        // install.sh actually receives it.
+        let mut options = HashMap::new();
+        options.insert(
+            "install-zsh".to_string(),
+            make_option(serde_json::json!(true)),
+        );
+        let feature = make_feature(
+            "common",
+            "ghcr.io/devcontainers/features/common-utils:2",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "common".to_string(),
+                options,
+                ..Default::default()
+            },
+        );
+        let env = generate_feature_env(&feature);
+        assert!(env.contains("INSTALL_ZSH=\"true\""), "got: {env}");
+        assert!(!env.contains("INSTALL-ZSH"), "invalid shell name: {env}");
+    }
+
+    #[test]
+    fn feature_env_omits_option_without_default() {
+        // An option with no declared default (Null) and no user value must be
+        // omitted entirely (matches official `'default' in options`), not
+        // emitted as KEY="".
+        let mut options = HashMap::new();
+        options.insert("opt".to_string(), make_option(serde_json::Value::Null));
+        let feature = make_feature(
+            "f",
+            "ghcr.io/example/f:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "f".to_string(),
+                options,
+                ..Default::default()
+            },
+        );
+        let env = generate_feature_env(&feature);
+        assert!(
+            !env.contains("OPT="),
+            "no-default option must be omitted: {env}"
+        );
     }
 }
