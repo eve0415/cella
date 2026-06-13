@@ -53,8 +53,10 @@ pub fn substitute_template_options<S: std::hash::BuildHasher>(
     options: &HashMap<String, serde_json::Value, S>,
 ) -> SubstitutionReport {
     // Regex: ${templateOption: key } — key is captured, whitespace trimmed.
+    // The capture uses `[^}\s]+?` instead of `\w+?` so that option IDs
+    // containing `-` or `.` (e.g. `base-image`, `node.version`) are matched.
     static TOKEN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\$\{templateOption:\s*(\w+?)\s*\}").expect("valid regex")
+        regex::Regex::new(r"\$\{templateOption:\s*([^}\s]+?)\s*\}").expect("valid regex")
     });
 
     let mut unknown_tokens: Vec<String> = Vec::new();
@@ -721,6 +723,32 @@ mod tests {
         let input = format!("a={tv} b={tv}");
         let report = substitute_template_options(&input, &opts);
         assert_eq!(report.content, "a=3.14 b=3.14");
+        assert!(report.unknown_tokens.is_empty());
+    }
+
+    // Regression tests for finding 1: regex must match IDs with `-` and `.`
+
+    #[test]
+    fn substitute_option_id_with_hyphen() {
+        // Option IDs like `base-image` must be substituted (not left as-is).
+        let mut opts = HashMap::new();
+        opts.insert("base-image".to_owned(), serde_json::json!("ubuntu:22.04"));
+
+        let input = "FROM ${templateOption:base-image}";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "FROM ubuntu:22.04");
+        assert!(report.unknown_tokens.is_empty());
+    }
+
+    #[test]
+    fn substitute_option_id_with_dot() {
+        // Option IDs like `node.version` must be substituted.
+        let mut opts = HashMap::new();
+        opts.insert("node.version".to_owned(), serde_json::json!("20"));
+
+        let input = "NODE_VERSION=${templateOption:node.version}";
+        let report = substitute_template_options(input, &opts);
+        assert_eq!(report.content, "NODE_VERSION=20");
         assert!(report.unknown_tokens.is_empty());
     }
 
