@@ -2,7 +2,8 @@
 //!
 //! Builds the dependency graph by recursively fetching and parsing
 //! `devcontainer-feature.json` from OCI registries, then renders the result as
-//! a Mermaid `flowchart TD` diagram.
+//! a Mermaid `flowchart` diagram (matching the official CLI, which emits no
+//! direction keyword).
 //!
 //! Two edge kinds are modelled to match the official devcontainer CLI renderer:
 //! - **`dependsOn`** (hard dependency) → solid arrow `A --> B`
@@ -83,7 +84,7 @@ pub async fn build_dependency_graph(root_refs: &[&str]) -> Result<DependencyGrap
     Ok(DependencyGraph { edges, metadata })
 }
 
-/// Render a dependency graph as a Mermaid `flowchart TD` diagram.
+/// Render a dependency graph as a Mermaid `flowchart` diagram.
 ///
 /// Matches the official devcontainer CLI's `generateMermaidDiagram`: each
 /// user-provided root gets its own entry at the top of the diagram, with edges
@@ -91,7 +92,8 @@ pub async fn build_dependency_graph(root_refs: &[&str]) -> Result<DependencyGrap
 /// `name:tag` (last path segment + tag).
 ///
 /// When `edges` is empty for a given root, that root is rendered as an isolated
-/// node. The official CLI uses `flowchart` (no `TD`); we match that.
+/// node. The official CLI emits the bare `flowchart` keyword with no direction
+/// (`TD`/`LR`/…); we match that exactly.
 ///
 /// Edge rendering:
 /// - `dependsOn` → solid arrow `A --> B`
@@ -117,8 +119,8 @@ pub fn render_mermaid(roots: &[&str], edges: &[DepEdge]) -> String {
         get_id(root);
     }
 
-    // Official CLI uses `flowchart` (no direction keyword).
-    let mut lines: Vec<String> = vec!["flowchart TD".to_owned()];
+    // Official CLI uses the bare `flowchart` keyword (no direction).
+    let mut lines: Vec<String> = vec!["flowchart".to_owned()];
 
     // Track which roots have at least one outgoing edge so we can emit isolated
     // nodes for those that don't.
@@ -340,7 +342,7 @@ mod tests {
     fn render_mermaid_no_edges() {
         let root = "ghcr.io/devcontainers/features/node:1";
         let output = render_mermaid(&[root], &[]);
-        assert!(output.starts_with("flowchart TD"));
+        assert!(output.starts_with("flowchart"));
         assert!(output.contains("A[\"node:1\"]"));
         // No arrow present
         assert!(!output.contains("-->"));
@@ -355,7 +357,7 @@ mod tests {
             EdgeKind::DependsOn,
         )];
         let output = render_mermaid(&[root], &edges);
-        assert!(output.starts_with("flowchart TD"));
+        assert!(output.starts_with("flowchart"));
         // Hard dep → solid arrow
         assert!(output.contains("-->"), "expected solid arrow");
         assert!(!output.contains("-.-"), "unexpected dashed arrow");
@@ -372,7 +374,7 @@ mod tests {
             EdgeKind::InstallsAfter,
         )];
         let output = render_mermaid(&[root], &edges);
-        assert!(output.starts_with("flowchart TD"));
+        assert!(output.starts_with("flowchart"));
         // Soft dep → dashed arrow
         assert!(output.contains("-.-"), "expected dashed arrow");
         assert!(output.contains("node:1"));
@@ -414,7 +416,7 @@ mod tests {
             "ghcr.io/devcontainers/features/python:1",
         ];
         let output = render_mermaid(&roots, &[]);
-        assert!(output.starts_with("flowchart TD"));
+        assert!(output.starts_with("flowchart"));
         // Both roots appear as isolated nodes
         assert!(output.contains("node:1"), "node root missing");
         assert!(output.contains("python:1"), "python root missing");
@@ -431,7 +433,7 @@ mod tests {
             (python.to_owned(), common.to_owned(), EdgeKind::DependsOn),
         ];
         let output = render_mermaid(&[node, python], &edges);
-        assert!(output.starts_with("flowchart TD"));
+        assert!(output.starts_with("flowchart"));
         assert!(output.contains("node:1"));
         assert!(output.contains("python:1"));
         assert!(output.contains("common-utils:2"));
