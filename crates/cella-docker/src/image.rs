@@ -752,6 +752,40 @@ mod tests {
     }
 
     #[test]
+    fn build_args_platform_with_buildkit_correct_order() {
+        // buildx path: ["buildx", "build", "--progress=plain", "--load",
+        //               "--platform", "linux/amd64", "-t", …]
+        // --platform must appear before -t and after --load.
+        let mut opts = basic_opts();
+        opts.platform = Some("linux/amd64".to_string());
+        let args = build_command_args(&opts, true);
+        assert!(args.contains(&"--platform".to_string()));
+        assert!(args.contains(&"linux/amd64".to_string()));
+        let platform_idx = args.iter().position(|a| a == "--platform").unwrap();
+        let tag_idx = args.iter().position(|a| a == "-t").unwrap();
+        let load_idx = args.iter().position(|a| a == "--load").unwrap();
+        assert!(
+            load_idx < platform_idx,
+            "--platform should come after --load; args: {args:?}"
+        );
+        assert!(
+            platform_idx < tag_idx,
+            "--platform should come before -t; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_no_platform_none_omits_flag_buildkit() {
+        // platform: None on the buildx path must not emit --platform at all.
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert!(
+            !args.contains(&"--platform".to_string()),
+            "platform:None must not emit --platform; args: {args:?}"
+        );
+    }
+
+    #[test]
     fn is_cache_to_inline_matches() {
         assert!(is_cache_to_inline("type=inline"));
         assert!(is_cache_to_inline("type = inline"));

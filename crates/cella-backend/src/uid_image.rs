@@ -117,7 +117,6 @@ pub async fn build_uid_remap_image(
     image_user: &str,
     remote_user: &str,
     toolchain: BuildToolchain<'_>,
-    image_platform: Option<&str>,
     progress: &ProgressSender,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     if remap_unsupported_on_host(std::env::consts::OS) {
@@ -140,6 +139,20 @@ pub async fn build_uid_remap_image(
         debug!("Skipping UID remap: host UID is 0 (root)");
         return Ok(None);
     }
+
+    // Inspect the base image to derive `--platform`. Failures are non-fatal:
+    // omitting `--platform` is byte-identical to the pre-platform behaviour.
+    let platform = client
+        .inspect_image_details(base_image)
+        .await
+        .ok()
+        .and_then(|d| {
+            image_platform(
+                d.os.as_deref(),
+                d.architecture.as_deref(),
+                d.variant.as_deref(),
+            )
+        });
 
     let uid_image = format!("{base_image}-uid");
 
@@ -166,7 +179,7 @@ pub async fn build_uid_remap_image(
         secrets: vec![],
         use_buildkit: toolchain.use_buildkit,
         docker_path: toolchain.docker_path.map(str::to_string),
-        platform: image_platform.map(str::to_string),
+        platform,
     };
 
     info!("Building UID remap image: {uid_image} (UID {host_uid}:{host_gid})");
