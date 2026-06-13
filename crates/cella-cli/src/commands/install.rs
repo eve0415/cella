@@ -321,6 +321,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn id_label_is_repeatable() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "install",
+            "--id-label",
+            "a=1",
+            "--id-label",
+            "b=2",
+        ])
+        .expect("two --id-label values must parse");
+        let crate::commands::Command::Install(args) = &cli.command else {
+            panic!("expected install subcommand");
+        };
+        assert_eq!(args.id_label, ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn id_label_rejects_missing_value() {
+        use clap::Parser;
+        let r = crate::Cli::try_parse_from(["cella", "install", "--id-label", "novalue"]);
+        assert!(r.is_err(), "--id-label without '=value' must be rejected");
+    }
+
+    #[test]
     fn resolve_tool_args_valid_names() {
         let args = vec!["claude-code".to_string(), "nvim".to_string()];
         let result = resolve_tool_args(&args, &[]).unwrap();
