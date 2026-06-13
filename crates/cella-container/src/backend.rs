@@ -1034,6 +1034,17 @@ fn build_create_args(opts: &CreateContainerOptions, networks: &[String]) -> Vec<
         args.push(cap.clone());
     }
 
+    // init: OR top-level/feature flag with runArgs --init so either source
+    // enables the tini/init process wrapper.
+    let run_args_init = opts
+        .run_args_overrides
+        .as_ref()
+        .and_then(|o| o.init)
+        .unwrap_or(false);
+    if opts.init || run_args_init {
+        args.push("--init".to_string());
+    }
+
     // runArgs overrides with native CLI equivalents.
     if let Some(ref overrides) = opts.run_args_overrides {
         push_override_args(&mut args, overrides);
@@ -1083,10 +1094,6 @@ fn push_override_args(args: &mut Vec<String>, overrides: &RunArgsOverrides) {
     {
         args.push("--shm-size".to_string());
         args.push(shm_size.to_string());
-    }
-
-    if overrides.init == Some(true) {
-        args.push("--init".to_string());
     }
 
     for ip in &overrides.dns {
@@ -1797,11 +1804,12 @@ mod tests {
 
     #[test]
     fn push_override_args_maps_resources() {
+        // init is handled at the build_create_args level (not here), so it is
+        // intentionally absent from this overrides set.
         let overrides = RunArgsOverrides {
             memory: Some(2_147_483_648),
             nano_cpus: Some(1_500_000_000),
             shm_size: Some(67_108_864),
-            init: Some(true),
             ..RunArgsOverrides::default()
         };
         let mut args = Vec::new();
@@ -1815,7 +1823,53 @@ mod tests {
         // 1.5 CPUs rounds up to 2 whole vCPUs.
         assert!(pairs.contains(&("--cpus", "2")));
         assert!(pairs.contains(&("--shm-size", "67108864")));
+        assert!(
+            !args.contains(&"--init".to_string()),
+            "--init must not appear here; it is OR-d and emitted in build_create_args"
+        );
+    }
+
+    #[test]
+    fn build_create_args_init_from_opts() {
+        // opts.init = true should emit --init even with no runArgs.
+        let mut opts = minimal_create_opts();
+        opts.init = true;
+        let args = build_create_args(&opts, &[]);
         assert!(args.contains(&"--init".to_string()));
+    }
+
+    #[test]
+    fn build_create_args_init_from_run_args() {
+        // runArgs --init alone should emit --init when opts.init is false.
+        let mut opts = minimal_create_opts();
+        opts.init = false;
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            init: Some(true),
+            ..RunArgsOverrides::default()
+        });
+        let args = build_create_args(&opts, &[]);
+        assert!(args.contains(&"--init".to_string()));
+    }
+
+    #[test]
+    fn build_create_args_init_no_duplicate() {
+        // Both opts.init and runArgs init = true must not produce two --init flags.
+        let mut opts = minimal_create_opts();
+        opts.init = true;
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            init: Some(true),
+            ..RunArgsOverrides::default()
+        });
+        let args = build_create_args(&opts, &[]);
+        let count = args.iter().filter(|a| a.as_str() == "--init").count();
+        assert_eq!(count, 1, "--init should appear exactly once");
+    }
+
+    #[test]
+    fn build_create_args_init_off_by_default() {
+        let opts = minimal_create_opts();
+        let args = build_create_args(&opts, &[]);
+        assert!(!args.contains(&"--init".to_string()));
     }
 
     #[test]
