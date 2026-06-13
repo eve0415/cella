@@ -10,8 +10,8 @@
 
 use std::path::PathBuf;
 
-use flate2::read::GzDecoder;
 use futures_util::StreamExt as _;
+use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
 use tracing::debug;
 
 use crate::Platform;
@@ -26,8 +26,9 @@ use crate::reference::NormalizedRef;
 
 /// Fetches devcontainer features from HTTP(S) tarball URLs.
 ///
-/// Downloads the tarball, verifies the gzip magic bytes, extracts with
-/// `flate2` + `tar`, and commits the result to the feature cache.
+/// Downloads the tarball, verifies the gzip magic bytes, extracts via the
+/// hardened [`cella_oci::extract_layer`] helper (path-traversal and zip-bomb
+/// safe), and commits the result to the feature cache.
 pub struct HttpFetcher;
 
 impl FeatureFetcher for HttpFetcher {
@@ -84,8 +85,13 @@ impl FeatureFetcher for HttpFetcher {
                 url: url.clone(),
                 message: format!("failed to read response body: {e}"),
             })?;
-            bytes.extend_from_slice(&chunk);
-            if bytes.len() as u64 > cella_oci::MAX_BLOB_COMPRESSED_BYTES {
+            // Enforce the cap *before* extending so an oversized chunk cannot
+            // force an allocation past the limit.
+            if cella_oci::would_exceed_cap(
+                bytes.len(),
+                chunk.len(),
+                cella_oci::MAX_BLOB_COMPRESSED_BYTES,
+            ) {
                 return Err(FeatureError::FetchFailed {
                     url: url.clone(),
                     message: format!(
@@ -94,6 +100,7 @@ impl FeatureFetcher for HttpFetcher {
                     ),
                 });
             }
+            bytes.extend_from_slice(&chunk);
         }
 
         debug!("downloaded {} bytes from {url}", bytes.len());
@@ -116,10 +123,9 @@ impl FeatureFetcher for HttpFetcher {
             message: format!("failed to create staging directory: {e}"),
         })?;
 
-        let gz = GzDecoder::new(&bytes[..]);
-        let limited_gz = cella_oci::LimitedReader::new(gz, cella_oci::MAX_BLOB_DECOMPRESSED_BYTES);
-        let mut archive = tar::Archive::new(limited_gz);
-        archive.unpack(&staging).map_err(|e| {
+        // Extract via the hardened cella-oci helper: it rejects path-traversal
+        // and unsafe-link entries and caps decompressed output (zip-bomb guard).
+        cella_oci::extract_layer(&bytes, IMAGE_LAYER_GZIP_MEDIA_TYPE, &staging).map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
             FeatureError::FetchFailed {
                 url: url.clone(),

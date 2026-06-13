@@ -108,8 +108,13 @@ async fn fetch_index_json() -> Result<String, TemplateError> {
         let chunk = chunk.map_err(|e| TemplateError::IndexFetchFailed {
             message: format!("failed to read response body: {e}"),
         })?;
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() as u64 > cella_oci::MAX_COLLECTION_JSON_BYTES {
+        // Enforce the cap *before* extending so an oversized chunk cannot
+        // force an allocation past the limit.
+        if cella_oci::would_exceed_cap(
+            bytes.len(),
+            chunk.len(),
+            cella_oci::MAX_COLLECTION_JSON_BYTES,
+        ) {
             return Err(TemplateError::IndexFetchFailed {
                 message: format!(
                     "index download exceeds size limit of {} bytes",
@@ -117,6 +122,7 @@ async fn fetch_index_json() -> Result<String, TemplateError> {
                 ),
             });
         }
+        bytes.extend_from_slice(&chunk);
     }
 
     String::from_utf8(bytes).map_err(|e| TemplateError::IndexFetchFailed {
