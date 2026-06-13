@@ -35,9 +35,9 @@ pub struct ReadConfigurationArgs {
     #[arg(long = "override-config")]
     override_config: Option<PathBuf>,
 
-    /// Target container by label.
-    #[arg(long = "id-label")]
-    id_label: Option<String>,
+    /// Target container by label(s) of the form `name=value` (repeatable).
+    #[arg(long = "id-label", value_parser = crate::commands::parse_id_label)]
+    id_label: Vec<String>,
 
     /// Target container by ID.
     #[arg(long = "container-id")]
@@ -50,7 +50,7 @@ pub struct ReadConfigurationArgs {
 
 impl ReadConfigurationArgs {
     pub async fn execute(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let has_container_target = self.id_label.is_some() || self.container_id.is_some();
+        let has_container_target = !self.id_label.is_empty() || self.container_id.is_some();
 
         let config_path = self.override_config.as_deref().or(self.config.as_deref());
 
@@ -59,7 +59,7 @@ impl ReadConfigurationArgs {
             let target = ContainerTarget {
                 container_id: self.container_id.clone(),
                 container_name: None,
-                id_labels: self.id_label.iter().cloned().collect(),
+                id_labels: self.id_label.clone(),
                 workspace_folder: self.workspace_folder.clone(),
             };
             let container = target.resolve(&*client, false).await?;
@@ -231,6 +231,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn id_label_is_repeatable_and_validated() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ReadConfigurationArgs,
+        }
+
+        // Repeatable: two --id-label flags collect into the Vec.
+        let cli = Cli::try_parse_from([
+            "read-configuration",
+            "--id-label",
+            "a=1",
+            "--id-label",
+            "b=2",
+        ])
+        .expect("two id-labels must parse");
+        assert_eq!(
+            cli.args.id_label,
+            vec!["a=1".to_string(), "b=2".to_string()]
+        );
+
+        // Validated: a malformed label (no `=`) is rejected.
+        assert!(
+            Cli::try_parse_from(["read-configuration", "--id-label", "noequals"]).is_err(),
+            "malformed --id-label must be rejected"
+        );
+    }
 
     #[test]
     fn apply_feature_config_sets_mounts() {
@@ -408,7 +439,7 @@ mod tests {
             include_merged_configuration: false,
             include_features_configuration: false,
             override_config: None,
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: None,
         };
@@ -429,7 +460,7 @@ mod tests {
             include_merged_configuration: false,
             include_features_configuration: false,
             override_config: Some(override_path),
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: None,
         };
@@ -447,7 +478,7 @@ mod tests {
             include_merged_configuration: false,
             include_features_configuration: false,
             override_config: None,
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: Some(
                 r#"{"ghcr.io/devcontainers/features/git:1": {}}"#.to_string(),
@@ -467,7 +498,7 @@ mod tests {
             include_merged_configuration: false,
             include_features_configuration: false,
             override_config: None,
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: Some("not valid json".to_string()),
         };
@@ -486,7 +517,7 @@ mod tests {
             include_merged_configuration: false,
             include_features_configuration: false,
             override_config: None,
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: Some(r#"["not", "an", "object"]"#.to_string()),
         };
@@ -505,7 +536,7 @@ mod tests {
             include_merged_configuration: true,
             include_features_configuration: false,
             override_config: None,
-            id_label: None,
+            id_label: Vec::new(),
             container_id: None,
             additional_features: None,
         };

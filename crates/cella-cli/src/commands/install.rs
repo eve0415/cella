@@ -37,9 +37,9 @@ pub struct InstallArgs {
     #[arg(long)]
     container_name: Option<String>,
 
-    /// Target container by label.
-    #[arg(long)]
-    id_label: Option<String>,
+    /// Target container by label(s) of the form `name=value` (repeatable).
+    #[arg(long, value_parser = crate::commands::parse_id_label)]
+    id_label: Vec<String>,
 
     /// Target a specific compose service (defaults to primary service).
     #[arg(long)]
@@ -61,7 +61,7 @@ impl InstallArgs {
         let target = ContainerTarget {
             container_id: self.container_id,
             container_name: self.container_name,
-            id_labels: self.id_label.into_iter().collect(),
+            id_labels: self.id_label,
             workspace_folder: self.workspace_folder,
         };
 
@@ -319,6 +319,31 @@ fn validate_version_flag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_label_is_repeatable() {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "install",
+            "--id-label",
+            "a=1",
+            "--id-label",
+            "b=2",
+        ])
+        .expect("two --id-label values must parse");
+        let crate::commands::Command::Install(args) = &cli.command else {
+            panic!("expected install subcommand");
+        };
+        assert_eq!(args.id_label, ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn id_label_rejects_missing_value() {
+        use clap::Parser;
+        let r = crate::Cli::try_parse_from(["cella", "install", "--id-label", "novalue"]);
+        assert!(r.is_err(), "--id-label without '=value' must be rejected");
+    }
 
     #[test]
     fn resolve_tool_args_valid_names() {
