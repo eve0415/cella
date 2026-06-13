@@ -1,6 +1,7 @@
 //! Devcontainer spec variable substitution.
 //!
-//! Resolves `${localEnv:VAR}`, `${containerEnv:VAR}`, `${localWorkspaceFolder}`,
+//! Resolves `${localEnv:VAR}` (and its `${env:VAR}` alias),
+//! `${containerEnv:VAR}`, `${localWorkspaceFolder}`,
 //! `${containerWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, and
 //! `${devcontainerId}` expressions in configuration values.
 
@@ -73,6 +74,14 @@ impl SubstitutionContext {
     /// Recursively substitute string values in a JSON tree.
     ///
     /// Walks arrays and object values. Does NOT substitute object keys.
+    ///
+    /// This intentionally includes `customizations.vscode.settings` — the official
+    /// devcontainer CLI (`replaceWithContext` in variableSubstitution.ts) applies
+    /// the same host-side substitution to the entire config object. VS Code's own
+    /// remote `${env:...}` expansion runs in the extension host after the config
+    /// has been handed off; by that point any remaining unresolved expressions
+    /// (variables that were set to an empty string because the host env var was
+    /// absent) have already been substituted to their default or empty string.
     pub fn substitute_value(&self, value: &mut serde_json::Value) {
         match value {
             serde_json::Value::String(s) => {
@@ -102,7 +111,10 @@ impl SubstitutionContext {
         let keyword = parts.next().unwrap_or("");
 
         match keyword {
-            "localEnv" => {
+            // `${env:VAR}` is the official alias for `${localEnv:VAR}`
+            // (the CLI's variableSubstitution.ts has `case 'env'` fall through
+            // to the same handler as `localEnv`).
+            "localEnv" | "env" => {
                 let var_name = parts.next().unwrap_or("");
                 let default = parts.next().unwrap_or("");
                 self.local_env
@@ -159,6 +171,17 @@ mod tests {
     fn local_env_missing_is_empty() {
         let ctx = test_ctx();
         assert_eq!(ctx.substitute_str("${localEnv:NONEXISTENT}"), "");
+    }
+
+    #[test]
+    fn env_alias_resolves_like_local_env() {
+        let ctx = test_ctx();
+        assert_eq!(ctx.substitute_str("${env:HOME}"), "/home/testuser");
+        assert_eq!(ctx.substitute_str("${env:NONEXISTENT}"), "");
+        assert_eq!(
+            ctx.substitute_str("${env:NONEXISTENT:fallback}"),
+            "fallback"
+        );
     }
 
     #[test]
@@ -482,6 +505,36 @@ mod tests {
         let ctx = spec_default_ctx();
         let result = ctx.substitute_str("${containerEnv:SOME_VAR:default_value}");
         assert_eq!(result, "default_value");
+    }
+
+    // Regression: the bot review raised a concern that ${env:VAR} in
+    // customizations.vscode.settings would be expanded host-side and prevent
+    // VS Code from doing its own remote expansion. This is intentional and
+    // matches the official CLI, which applies host-side substitution to the
+    // entire config including customizations. A container-only var absent on the
+    // host resolves to its default (or empty string), exactly as in the reference.
+    #[test]
+    fn env_alias_in_vscode_settings_resolves_host_side() {
+        // VAR only defined in the container, absent on host → falls back to default.
+        let ctx = spec_ctx_with_env(HashMap::new());
+        let mut config = serde_json::json!({
+            "customizations": {
+                "vscode": {
+                    "settings": {
+                        "cmake.cmakePath": "${env:SDK_NATIVE_SYSROOT:}/usr/bin/cmake",
+                        "other": "${env:HOST_ONLY_VAR}"
+                    }
+                }
+            }
+        });
+        ctx.substitute_value(&mut config);
+        // Default is empty string → path becomes "/usr/bin/cmake"
+        assert_eq!(
+            config["customizations"]["vscode"]["settings"]["cmake.cmakePath"],
+            "/usr/bin/cmake"
+        );
+        // No default, var absent → empty string
+        assert_eq!(config["customizations"]["vscode"]["settings"]["other"], "");
     }
 
     #[test]
