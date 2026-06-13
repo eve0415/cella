@@ -72,7 +72,7 @@ pub async fn build_features_layer(
         secrets: vec![],
         use_buildkit: ctx.build_tuning.use_buildkit,
         docker_path: ctx.build_tuning.docker_path.map(str::to_string),
-        platform: None,
+        platform: ctx.build_tuning.platform.map(str::to_string),
     };
 
     info!(
@@ -517,7 +517,7 @@ pub fn parse_build_options(
         secrets: vec![],
         use_buildkit: build_tuning.use_buildkit,
         docker_path: build_tuning.docker_path.map(str::to_string),
-        platform: None,
+        platform: build_tuning.platform.map(str::to_string),
     }
 }
 
@@ -728,6 +728,7 @@ mod tests {
             use_buildkit: true,
             cache_to: Some("type=registry,ref=r"),
             cli_cache_from: &[],
+            platform: None,
         };
         let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
         assert_eq!(opts.cache_to.as_deref(), Some("type=registry,ref=r"));
@@ -889,6 +890,33 @@ mod tests {
             build_config_digest(&config_a),
             build_config_digest(&config_b)
         );
+    }
+
+    #[test]
+    fn parse_build_options_platform_is_forwarded() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let tuning = BuildTuning {
+            platform: Some("linux/amd64"),
+            ..Default::default()
+        };
+        let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
+        assert_eq!(opts.platform.as_deref(), Some("linux/amd64"));
+    }
+
+    #[test]
+    fn parse_build_options_platform_none_by_default() {
+        let build: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r"{}").unwrap();
+        let opts = parse_build_options(
+            &build,
+            "img",
+            Path::new("/ws"),
+            false,
+            None,
+            BuildTuning::default(),
+        );
+        assert!(opts.platform.is_none());
     }
 
     #[test]
