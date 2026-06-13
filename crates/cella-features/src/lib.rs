@@ -5,6 +5,7 @@ pub mod docs;
 mod error;
 pub mod fetch;
 pub mod graph;
+pub mod lockfile;
 pub mod merge;
 pub mod metadata;
 pub mod oci;
@@ -24,6 +25,10 @@ pub use dockerfile::{
 };
 pub use error::{FeatureError, FeatureWarning};
 pub use fetch::{HttpFetcher, LocalFetcher};
+pub use lockfile::{
+    Lockfile, LockfileEntry, LockfileError, LockfilePolicy, compare_lockfile, generate_lockfile,
+    lockfile_key, lockfile_path, read_lockfile, write_lockfile,
+};
 pub use merge::{
     ImageMetadataUserInfo, merge_features, merge_with_devcontainer, parse_image_metadata,
     validate_options,
@@ -130,6 +135,7 @@ pub async fn resolve_features(
     cache: &FeatureCache,
     base_image_ctx: &BaseImageContext<'_>,
     use_named_content_source: bool,
+    lockfile_policy: LockfilePolicy,
 ) -> Result<ResolvedFeatures, FeatureError> {
     // Step 1: Extract the "features" object from the config.
     let features_obj = match config.get("features").and_then(|v| v.as_object()) {
@@ -153,22 +159,42 @@ pub async fn resolve_features(
     let config_hash = compute_config_hash(features_obj);
     let build_context = cache.build_context_path(&config_hash);
 
-    // Step 4: Fetch all concurrently.
-    let artifact_paths = fetch_all(&parsed_entries, platform, cache).await?;
+    // Step 4: Read locked digests (no-op for NoLockfile/Upgrade).
+    let (existing_lockfile, locked_digests) =
+        read_locked_digests(config_path, &parsed_entries, lockfile_policy)?;
 
-    // Step 5: Parse metadata and validate options.
+    // Step 5: Fetch all concurrently (OCI uses digest pinning when available).
+    let fetch_results =
+        fetch_all_with_results(&parsed_entries, platform, cache, &locked_digests).await?;
+
+    // Step 5a: Extract artifact paths for metadata parsing.
+    let artifact_paths: Vec<PathBuf> = fetch_results
+        .iter()
+        .map(|r| r.artifact_dir().clone())
+        .collect();
+
+    // Step 6: Parse metadata and validate options.
     let mut feature_entries = parse_metadata_and_validate(&parsed_entries, &artifact_paths)?;
 
-    // Step 5b: Expand the install set with transitive `dependsOn` features.
+    // Step 6b: Expand the install set with transitive `dependsOn` features.
     expand_depends_on(&mut feature_entries, workspace_root, platform, cache).await?;
 
-    // Step 6: Compute install order.
+    // Step 7: Compute install order.
     let ordered_ids = compute_order(&feature_entries, config, workspace_root)?;
 
-    // Step 7: Assemble resolved features in install order.
+    // Step 8: Assemble resolved features in install order.
     let resolved = assemble_resolved(&feature_entries, &ordered_ids);
 
-    // Step 8: Generate Dockerfile and build context.
+    // Step 9: Build and apply lockfile policy.
+    let generated_lockfile = build_lockfile_from_results(&parsed_entries, &fetch_results);
+    let final_lockfile = apply_lockfile_policy(
+        lockfile_policy,
+        config_path,
+        existing_lockfile,
+        generated_lockfile,
+    )?;
+
+    // Step 10: Generate Dockerfile and build context.
     let dockerfile = generate_and_write_build_context(
         &build_context,
         &resolved,
@@ -179,7 +205,7 @@ pub async fn resolve_features(
         use_named_content_source,
     )?;
 
-    // Step 9: Merge feature metadata and generate label.
+    // Step 11: Merge feature metadata and generate label.
     let container_config = merge_all_metadata(&resolved, config, base_image_ctx.metadata);
     let metadata_label = generate_metadata_label(
         &resolved,
@@ -200,6 +226,7 @@ pub async fn resolve_features(
         build_context,
         container_config,
         metadata_label,
+        lockfile: final_lockfile,
     })
 }
 
@@ -286,6 +313,7 @@ fn resolve_empty_features(
         build_context,
         container_config,
         metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit_remote_env),
+        lockfile: None,
     })
 }
 
@@ -371,12 +399,28 @@ fn parse_and_normalize(
     Ok(parsed_entries)
 }
 
-/// Fetch all features concurrently, returning their artifact paths.
-async fn fetch_all(
+/// Result of fetching a single feature — OCI fetches carry digest metadata,
+/// other fetchers return only the artifact path.
+enum FetchResult {
+    Oci(oci::OciFetchResult),
+    Other(PathBuf),
+}
+
+impl FetchResult {
+    const fn artifact_dir(&self) -> &PathBuf {
+        match self {
+            Self::Oci(r) => &r.artifact_dir,
+            Self::Other(p) => p,
+        }
+    }
+}
+
+async fn fetch_all_with_results(
     parsed_entries: &[(String, NormalizedRef, serde_json::Value)],
     platform: &Platform,
     cache: &FeatureCache,
-) -> Result<Vec<PathBuf>, FeatureError> {
+    locked_digests: &HashMap<String, String>,
+) -> Result<Vec<FetchResult>, FeatureError> {
     let oci_fetcher = OciFetcher::default();
     let http_fetcher = HttpFetcher;
     let local_fetcher = LocalFetcher;
@@ -384,26 +428,136 @@ async fn fetch_all(
     let fetch_futures: Vec<_> = parsed_entries
         .iter()
         .map(|(key, norm_ref, _)| {
-            fetch_one(
-                key,
+            let locked = locked_digests.get(key.as_str()).map(String::as_str);
+            fetch_one_with_digest(
                 norm_ref,
                 platform,
                 cache,
                 &oci_fetcher,
                 &http_fetcher,
+                locked,
                 &local_fetcher,
             )
         })
         .collect();
 
-    let fetch_results = join_all(fetch_futures).await;
+    let results = join_all(fetch_futures).await;
+    let mut fetch_results = Vec::with_capacity(parsed_entries.len());
+    for result in results {
+        fetch_results.push(result?);
+    }
+    Ok(fetch_results)
+}
 
-    let mut artifact_paths = Vec::with_capacity(parsed_entries.len());
-    for result in fetch_results {
-        artifact_paths.push(result?);
+async fn fetch_one_with_digest(
+    norm_ref: &NormalizedRef,
+    platform: &Platform,
+    cache: &FeatureCache,
+    oci_fetcher: &OciFetcher,
+    http_fetcher: &HttpFetcher,
+    locked_digest: Option<&str>,
+    local_fetcher: &LocalFetcher,
+) -> Result<FetchResult, FeatureError> {
+    debug!("fetching feature from {norm_ref}");
+    match norm_ref {
+        NormalizedRef::OciTarget { .. } => {
+            let result = oci_fetcher
+                .fetch_oci_with_digest(norm_ref, cache, locked_digest)
+                .await?;
+            Ok(FetchResult::Oci(result))
+        }
+        NormalizedRef::HttpTarget { .. } => {
+            let path = http_fetcher.fetch(norm_ref, platform, cache).await?;
+            Ok(FetchResult::Other(path))
+        }
+        NormalizedRef::LocalTarget { .. } => {
+            let path = local_fetcher.fetch(norm_ref, platform, cache).await?;
+            Ok(FetchResult::Other(path))
+        }
+    }
+}
+
+fn read_locked_digests(
+    config_path: &Path,
+    parsed_entries: &[(String, NormalizedRef, serde_json::Value)],
+    policy: LockfilePolicy,
+) -> Result<(Option<Lockfile>, HashMap<String, String>), FeatureError> {
+    if matches!(policy, LockfilePolicy::NoLockfile | LockfilePolicy::Upgrade) {
+        return Ok((None, HashMap::new()));
     }
 
-    Ok(artifact_paths)
+    let existing = read_lockfile(config_path);
+
+    if matches!(policy, LockfilePolicy::Frozen) && existing.is_none() {
+        return Err(FeatureError::Lockfile(LockfileError::Missing));
+    }
+
+    let locked_digests = existing.as_ref().map_or_else(HashMap::new, |lf| {
+        parsed_entries
+            .iter()
+            .filter_map(|(key, norm_ref, _)| {
+                if matches!(norm_ref, NormalizedRef::OciTarget { .. }) {
+                    let lock_key = lockfile_key(key);
+                    lf.features
+                        .get(&lock_key)
+                        .map(|e| (key.clone(), e.integrity.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    });
+
+    Ok((existing, locked_digests))
+}
+
+fn build_lockfile_from_results(
+    parsed_entries: &[(String, NormalizedRef, serde_json::Value)],
+    fetch_results: &[FetchResult],
+) -> Lockfile {
+    let data: Vec<_> = parsed_entries
+        .iter()
+        .zip(fetch_results.iter())
+        .filter_map(|((key, _, _), result)| {
+            if let FetchResult::Oci(r) = result {
+                let lock_key = lockfile_key(key);
+                let resolved = format!("{}/{}@{}", r.registry, r.repository, r.digest);
+                Some((
+                    lock_key,
+                    r.version.clone(),
+                    resolved,
+                    r.digest.clone(),
+                    vec![],
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    generate_lockfile(&data)
+}
+
+fn apply_lockfile_policy(
+    policy: LockfilePolicy,
+    config_path: &Path,
+    existing: Option<Lockfile>,
+    generated: Lockfile,
+) -> Result<Option<Lockfile>, FeatureError> {
+    if generated.features.is_empty() {
+        return Ok(None);
+    }
+    match policy {
+        LockfilePolicy::NoLockfile => Ok(None),
+        LockfilePolicy::Update | LockfilePolicy::Upgrade => {
+            write_lockfile(config_path, &generated)?;
+            Ok(Some(generated))
+        }
+        LockfilePolicy::Frozen => {
+            let existing = existing.ok_or(FeatureError::Lockfile(LockfileError::Missing))?;
+            compare_lockfile(&existing, &generated).map_err(FeatureError::Lockfile)?;
+            Ok(Some(existing))
+        }
+    }
 }
 
 /// Parse metadata from fetched artifacts and validate user options.
@@ -972,6 +1126,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FeatureError> {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use crate::LockfilePolicy;
+
     use serde_json::json;
 
     use super::*;
@@ -1177,6 +1333,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1206,6 +1363,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1259,6 +1417,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1375,6 +1534,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1440,6 +1600,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1484,6 +1645,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await;
 
@@ -1528,6 +1690,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await;
         let resolved = result.expect("resolve_features should succeed");
@@ -1661,6 +1824,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1749,6 +1913,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1815,6 +1980,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1878,6 +2044,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap();
@@ -1954,6 +2121,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap_err();
@@ -2017,6 +2185,7 @@ mod tests {
                 omit_remote_env: false,
             },
             false,
+            LockfilePolicy::NoLockfile,
         )
         .await
         .unwrap_err();
