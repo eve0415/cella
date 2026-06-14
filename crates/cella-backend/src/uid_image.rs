@@ -180,6 +180,9 @@ pub async fn build_uid_remap_image(
         use_buildkit: toolchain.use_buildkit,
         docker_path: toolchain.docker_path.map(str::to_string),
         platform,
+        // The UID-remap build is a post-build transform on an already-built
+        // image, never the `--output` export target — keep the default --load.
+        output: None,
     };
 
     info!("Building UID remap image: {uid_image} (UID {host_uid}:{host_gid})");

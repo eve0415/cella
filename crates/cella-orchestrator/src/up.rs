@@ -1939,6 +1939,9 @@ impl EnsureUpContext<'_> {
                 pull_policy: self.config.pull_policy,
                 secrets: &self.config.build_secrets,
                 build_tuning: self.config.build_tuning,
+                // `up` has no `--output` (it must load the image to run the
+                // container); the buildx export spec is a `build`-only flag.
+                output: None,
                 omit_remote_env_from_metadata: self.config.metadata_options.omit_remote_env,
                 lockfile_policy: self.config.lockfile_policy,
                 progress: &self.progress,

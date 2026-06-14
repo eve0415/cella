@@ -124,11 +124,18 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
     }
     args.push("build".to_string());
 
-    // `--progress=plain` and `--load` are buildx-only. The classic builder
-    // rejects `--progress`, and official emits neither on the legacy path.
+    // `--progress=plain`, `--load`, and `--output` are buildx-only. The classic
+    // builder rejects `--progress`, and official emits none of these on the
+    // legacy path. A `--output <spec>` *replaces* `--load` (which is itself
+    // shorthand for `--output=docker`); the two are mutually exclusive, so the
+    // export spec wins when set (mirrors the official singleContainer.ts).
     if use_buildx {
         args.push("--progress=plain".to_string());
-        args.push("--load".to_string());
+        if let Some(output) = &opts.output {
+            args.extend(["--output".to_string(), output.clone()]);
+        } else {
+            args.push("--load".to_string());
+        }
     }
 
     // `--platform` is a BuildKit/buildx flag; the classic `docker build`
@@ -289,6 +296,19 @@ impl DockerClient {
                 "--platform is ignored without BuildKit/buildx (classic docker build); \
                  building for the host architecture"
             );
+        }
+
+        // `--output` is buildx-only too, but unlike --cache-to/--platform it
+        // cannot be silently dropped: doing so would exit 0 having written
+        // nothing to the user's `dest=`, a silent success with the wrong result.
+        // Error clearly instead (the classic builder has no equivalent, and we
+        // can't "force" a buildx that isn't installed).
+        if !use_buildx && opts.output.is_some() {
+            return Err(CellaDockerError::BuildFailed {
+                message: "--output requires BuildKit/buildx, which is not available \
+                          (enable BuildKit or install docker buildx)"
+                    .to_string(),
+            });
         }
 
         let args = build_command_args(opts, use_buildx);
@@ -469,6 +489,7 @@ mod tests {
             use_buildkit: true,
             docker_path: None,
             platform: None,
+            output: None,
         }
     }
 
@@ -613,6 +634,49 @@ mod tests {
         let opts = basic_opts();
         let args = build_command_args(&opts, false);
         assert!(!args.contains(&"--load".to_string()));
+    }
+
+    #[test]
+    fn build_args_output_replaces_load_on_buildx() {
+        // `--output <spec>` and `--load` are mutually exclusive (--load is
+        // shorthand for --output=docker). When output is set on the buildx path,
+        // `--output <spec>` is emitted and `--load` is suppressed.
+        let mut opts = basic_opts();
+        opts.output = Some("type=local,dest=/tmp/out".to_string());
+        let args = build_command_args(&opts, true);
+        assert!(
+            !args.contains(&"--load".to_string()),
+            "--load must be suppressed when --output is set; args: {args:?}"
+        );
+        let idx = args
+            .iter()
+            .position(|a| a == "--output")
+            .expect("--output emitted on buildx path");
+        assert_eq!(args[idx + 1], "type=local,dest=/tmp/out");
+    }
+
+    #[test]
+    fn build_args_output_not_emitted_on_classic_builder() {
+        // `--output` is buildx-only; the classic builder must never receive it
+        // (build_image errors before reaching here on that path, but the arg
+        // builder must not emit it regardless).
+        let mut opts = basic_opts();
+        opts.output = Some("type=local,dest=/tmp/out".to_string());
+        let args = build_command_args(&opts, false);
+        assert!(
+            !args.contains(&"--output".to_string()),
+            "classic builder must not receive --output; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_no_output_keeps_load_on_buildx() {
+        // Without --output, the buildx path keeps the default --load so the
+        // built image lands in the local docker store.
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert!(args.contains(&"--load".to_string()));
+        assert!(!args.contains(&"--output".to_string()));
     }
 
     #[test]

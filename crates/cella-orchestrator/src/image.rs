@@ -30,6 +30,11 @@ pub struct FeaturesLayerContext<'a> {
     /// features layer never inherits CLI cache I/O — its FROM image is a
     /// cella-internal base no external registry cache would match.
     pub build_tuning: crate::config::BuildTuning<'a>,
+    /// buildx output spec (`--output`) for the FINAL image. When features are
+    /// layered, the features image *is* the final image, so the export spec
+    /// belongs here — never on the base build, which must stay loadable for the
+    /// features `FROM`.
+    pub output: Option<&'a str>,
     pub progress: &'a ProgressSender,
 }
 
@@ -73,6 +78,9 @@ pub async fn build_features_layer(
         use_buildkit: ctx.build_tuning.use_buildkit,
         docker_path: ctx.build_tuning.docker_path.map(str::to_string),
         platform: ctx.build_tuning.platform.map(str::to_string),
+        // Features layer is the final image when features are present, so the
+        // buildx `--output` export spec is applied here.
+        output: ctx.output.map(str::to_string),
     };
 
     info!(
@@ -110,12 +118,31 @@ pub struct EnsureImageInput<'a> {
     /// Build/backend tuning. Toolchain inputs (`docker_path`, `use_buildkit`)
     /// apply to every build site; cache I/O applies to the base build only.
     pub build_tuning: crate::config::BuildTuning<'a>,
+    /// buildx output spec (`--output <spec>`, e.g. `type=local,dest=…`). Applied
+    /// to exactly ONE build — the final image: the base build when there are no
+    /// features, or the features layer when there are. It is never applied to a
+    /// base build that a features layer will `FROM`, since an export spec does
+    /// not load an image into the docker store. `None` keeps the default
+    /// `--load` everywhere (the `up` path, which must run the container).
+    pub output: Option<&'a str>,
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
     /// generated `devcontainer.metadata` label baked into the built image.
     pub omit_remote_env_from_metadata: bool,
     /// Lockfile policy for feature resolution.
     pub lockfile_policy: cella_features::LockfilePolicy,
     pub progress: &'a ProgressSender,
+}
+
+/// The buildx output spec for the *base* image build.
+///
+/// `--output` belongs on exactly one build — the final image. When a features
+/// layer will be built on top (`will_build_features`), that layer is the final
+/// image and carries `--output`; the base build must NOT, because an export
+/// spec (e.g. `type=local`) does not load an image into the docker store, so a
+/// features `FROM <base>` would fail. Returns `None` in that case; otherwise
+/// the base build is the final image and gets the spec.
+const fn base_output(will_build_features: bool, output: Option<&str>) -> Option<&str> {
+    if will_build_features { None } else { output }
 }
 
 /// Ensure the dev container image exists (pull or build), including features layer.
@@ -161,6 +188,7 @@ pub async fn ensure_image(
         base_image_details: &base_image_details,
         no_cache: input.no_cache,
         build_tuning: input.build_tuning,
+        output: input.output,
         omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
         lockfile_policy: input.lockfile_policy,
         progress: input.progress,
@@ -240,6 +268,12 @@ async fn resolve_base_image(
             input.client.pull_image(image).await?;
             step.finish();
         }
+        // Image-only config: there is no build here. With features, the export
+        // spec rides the features layer (handled by the caller); with no
+        // features there is no build at all, so a `--output` has nothing to
+        // attach to and is a no-op. This matches the official CLI, whose
+        // `extendImage` is a passthrough for an image-only, zero-feature config
+        // and never runs a buildx `--output` build.
         Ok(image.to_string())
     } else if let Some(build) = effective_build_config(input.config) {
         let img_name = resolve_image_name(input.workspace_root, input.config_name, input.config);
@@ -252,6 +286,10 @@ async fn resolve_base_image(
             input.build_tuning,
         );
         build_opts.secrets = input.secrets.to_vec();
+        // `--output` lands on the base build only when it is the final image
+        // (no features layer to follow). With features, the export spec goes on
+        // the features layer instead so the base stays loadable for its `FROM`.
+        build_opts.output = base_output(will_build_features, input.output).map(str::to_string);
 
         if !will_build_features {
             let metadata_label = cella_features::generate_metadata_label(
@@ -301,6 +339,9 @@ struct FeaturesBuildInput<'a> {
     base_image_details: &'a ImageDetails,
     no_cache: bool,
     build_tuning: crate::config::BuildTuning<'a>,
+    /// buildx output spec for the features layer (the final image when features
+    /// are present). Threaded straight through from [`EnsureImageInput::output`].
+    output: Option<&'a str>,
     omit_remote_env_from_metadata: bool,
     lockfile_policy: cella_features::LockfilePolicy,
     progress: &'a ProgressSender,
@@ -371,6 +412,7 @@ async fn resolve_and_build_features(
         image_user: &input.base_image_details.user,
         no_cache: input.no_cache,
         build_tuning: input.build_tuning.toolchain(),
+        output: input.output,
         progress: input.progress,
     };
     let features_image = build_features_layer(&ctx).await?;
@@ -542,6 +584,10 @@ pub fn parse_build_options(
         use_buildkit: build_tuning.use_buildkit,
         docker_path: build_tuning.docker_path.map(str::to_string),
         platform: build_tuning.platform.map(str::to_string),
+        // `--output` is not part of BuildTuning (it must reach only the final
+        // build, not every site): the caller sets it via `base_output` when this
+        // base build is the final image.
+        output: None,
     }
 }
 
@@ -1039,5 +1085,33 @@ mod tests {
         assert!(parse_platform_str("/amd64").is_none());
         assert!(parse_platform_str("linux/").is_none());
         assert!(parse_platform_str("").is_none());
+    }
+
+    // ── base_output: --output placement (final-build only) ───────────
+    //
+    // `ensure_image` is Docker-coupled, so the load-bearing placement rule
+    // (the base build gets `--output` *only* when it is the final image) is
+    // pinned here on the pure helper instead. A regression that applied the
+    // export spec to a base build that a features layer will `FROM` would break
+    // every featured devcontainer — these arms guard exactly that.
+
+    #[test]
+    fn base_output_suppressed_when_features_will_build() {
+        // With a features layer to follow, the base build must NOT carry the
+        // export spec — it has to stay loadable for the features `FROM`. The
+        // spec moves to the features layer (the final image) instead.
+        assert_eq!(base_output(true, Some("type=local,dest=/tmp/out")), None);
+        assert_eq!(base_output(true, None), None);
+    }
+
+    #[test]
+    fn base_output_applied_when_base_is_final() {
+        // No features: the base build IS the final image, so it carries the
+        // export spec verbatim (and stays `None` when none was requested).
+        assert_eq!(
+            base_output(false, Some("type=local,dest=/tmp/out")),
+            Some("type=local,dest=/tmp/out")
+        );
+        assert_eq!(base_output(false, None), None);
     }
 }
