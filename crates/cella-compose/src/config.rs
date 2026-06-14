@@ -97,6 +97,10 @@ pub enum ServiceBuildInfo {
         target: Option<String>,
         /// Build arguments.
         args: HashMap<String, String>,
+        /// Explicit `image:` reference when the service declares both `build:`
+        /// and `image:`. Docker Compose tags the build output with this name
+        /// instead of the default `{project}-{service}`.
+        image: Option<String>,
     },
 }
 
@@ -104,13 +108,17 @@ impl ServiceBuildInfo {
     /// The image name the primary service resolves to after `docker compose build`.
     ///
     /// For an image-only service this is the image reference itself. For a
-    /// build-based service it is `{project}-{service}`, the name Docker Compose
-    /// assigns to the image it builds.
+    /// build-based service it is the explicit `image:` reference if one is
+    /// declared (Docker Compose tags the build output with it), otherwise
+    /// `{project}-{service}`, the default name Compose assigns.
     #[must_use]
     pub fn resolved_image_name(&self, project_name: &str, service: &str) -> String {
         match self {
-            Self::Image { image } => image.clone(),
-            Self::Build { .. } => format!("{project_name}-{service}"),
+            Self::Image { image }
+            | Self::Build {
+                image: Some(image), ..
+            } => image.clone(),
+            Self::Build { image: None, .. } => format!("{project_name}-{service}"),
         }
     }
 }
@@ -153,6 +161,8 @@ pub fn extract_service_build_info(
             dockerfile,
             target: build.target.clone(),
             args: build.args.clone(),
+            // A co-present `image:` is the tag Compose applies to the build output.
+            image: svc.image.clone(),
         });
     }
 
@@ -209,6 +219,7 @@ mod tests {
                 dockerfile,
                 target,
                 args,
+                ..
             } => {
                 assert_eq!(context, PathBuf::from("/workspace"));
                 assert_eq!(dockerfile, "Dockerfile.dev");
@@ -233,7 +244,13 @@ mod tests {
         }"#;
         let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
         let info = extract_service_build_info(&config, "app").unwrap();
-        assert!(matches!(info, ServiceBuildInfo::Build { .. }));
+        // `build` takes precedence (cella still builds), but the co-present
+        // `image:` is captured — Docker Compose tags the build output with it, so
+        // it's the resolved image name rather than the `{project}-{service}` default.
+        assert!(
+            matches!(&info, ServiceBuildInfo::Build { image: Some(img), .. } if img == "myapp:latest")
+        );
+        assert_eq!(info.resolved_image_name("proj", "app"), "myapp:latest");
     }
 
     #[test]
@@ -270,6 +287,7 @@ mod tests {
             dockerfile: "Dockerfile".to_string(),
             target: None,
             args: HashMap::new(),
+            image: None,
         };
         assert_eq!(info.resolved_image_name("myproj", "app"), "myproj-app");
     }
@@ -291,6 +309,7 @@ mod tests {
                 dockerfile,
                 target,
                 args,
+                ..
             } => {
                 assert_eq!(context, PathBuf::from("."));
                 assert_eq!(dockerfile, "Dockerfile");

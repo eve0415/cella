@@ -148,8 +148,11 @@ pub async fn compose_build(
     let image_name = if let Some(image) = features_build.and_then(|b| b.image_name_override) {
         image
     } else {
-        // No features: resolve the service's real image. `compose_cmd` was built
-        // without the override above, so it is safe for `docker compose config`.
+        // No image-name override — the no-features path, or a build-based service
+        // whose features image is the default `{project}-{service}`. Resolve the
+        // real image via `docker compose config`; `compose_cmd` is the same one
+        // used for the build above, so it only references the override when it
+        // actually exists.
         resolve_primary_service_image(&compose_cmd, &project).await?
     };
 
@@ -162,10 +165,12 @@ pub async fn compose_build(
 /// Resolve the primary service's image name from the resolved compose config.
 ///
 /// Runs `docker compose config` through `compose_cmd` and maps the primary
-/// service's build/image info to the name it resolves to after a build
-/// (`image:` reference, or `{project}-{service}` for a build-based service).
-/// `compose_cmd` must be built without the override file, since this runs on the
-/// no-features path where that file is never written.
+/// service's build/image info to the name it resolves to after a build (the
+/// service's `image:` reference, or `{project}-{service}` for a build-based
+/// service without one). Pass the same `compose_cmd` used for the preceding
+/// build: it must not reference a non-existent override file (the no-features
+/// path uses `without_override`; on the features path the override exists by the
+/// time this runs).
 ///
 /// # Errors
 ///
