@@ -453,6 +453,10 @@ struct ComposeRuntimeResolution {
     /// The `devcontainer.metadata` label value (base image + features + config
     /// entries), stamped on the primary service for tooling interop.
     metadata_label: String,
+    /// Feature `entrypoint` scripts in install order, `${devcontainerId}`-
+    /// substituted, sourced from the same merged feature/image-metadata config as
+    /// the security props (mirrors the single-container `feature_config.entrypoints`).
+    feature_entrypoints: Vec<String>,
 }
 
 /// Resolve the compose project's remote user, env-forwarding plan, ssh-agent
@@ -486,6 +490,17 @@ async fn resolve_user_and_env(
         cfg.config,
         effective_feature_config.as_ref(),
     );
+    // Feature entrypoints (install order), `${devcontainerId}`-substituted, from
+    // the same merged config the security props use. Empty when no feature (or
+    // base-image-metadata feature) declares an entrypoint, in which case the
+    // wrapped entrypoint is skipped unless `overrideCommand` is set.
+    let feature_entrypoints = effective_feature_config
+        .as_ref()
+        .map(|fc| {
+            let subst_ctx = cella_config::config_map::subst_ctx(cfg.resolved);
+            cella_config::config_map::substitute_feature_config(fc.clone(), &subst_ctx).entrypoints
+        })
+        .unwrap_or_default();
     // Merged `devcontainer.metadata` label: the features path reuses the label
     // computed during feature resolution; otherwise merge the base image's
     // metadata with the devcontainer.json config entry (mirrors single-container
@@ -515,6 +530,7 @@ async fn resolve_user_and_env(
         ssh_agent_proxy,
         security,
         metadata_label,
+        feature_entrypoints,
     }
 }
 
@@ -592,6 +608,10 @@ async fn prepare_and_start(
         request_gpu: false,
         // Runtime security props are applied in the final override, not at build.
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        // Feature entrypoints + entrypoint/command resolution are emitted only in
+        // the final override; the build override never runs the container.
+        feature_entrypoints: Vec::new(),
+        user_entrypoint_command: crate::override_file::UserEntrypointCommand::default(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
@@ -613,25 +633,27 @@ async fn prepare_and_start(
         ssh_agent_proxy,
         security,
         metadata_label,
+        feature_entrypoints,
     } = resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-15. Build override context, UID remap, write override, and start.
-    build_override_and_start(
+    build_override_and_start(BuildAndStartParams {
         ctx,
-        &compose_cmd,
+        compose_cmd: &compose_cmd,
         project,
-        features_build.as_ref(),
+        features_build: features_build.as_ref(),
         config,
         daemon_env,
-        &mut env_fwd,
-        &remote_user,
-        &image_user,
+        env_fwd: &mut env_fwd,
+        remote_user: &remote_user,
+        image_user: &image_user,
         agent_vol_name,
         agent_vol_target,
         security,
         metadata_label,
-    )
+        feature_entrypoints,
+    })
     .await?;
 
     let resolved_features = features_build.map(|b| b.resolved_features);
@@ -932,6 +954,14 @@ struct OverrideContext {
     /// Merged container security/runtime properties (containerUser, init,
     /// privileged, capAdd, securityOpt) applied to the primary service.
     security: cella_config::config_map::MergedSecurityConfig,
+    /// Feature `entrypoint` scripts (install order, `${devcontainerId}`-
+    /// substituted) to run before the service's entrypoint+command in the wrapped
+    /// entrypoint. Read only by `write_final_override` (the runtime override); the
+    /// build override leaves entrypoints empty.
+    feature_entrypoints: Vec<String>,
+    /// Resolved `userEntrypoint`/`userCommand` for the wrapped entrypoint (per the
+    /// official compose logic). Read only by `write_final_override`.
+    user_entrypoint_command: crate::override_file::UserEntrypointCommand,
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +998,12 @@ fn write_build_override(
         request_gpu: false,
         // build_ov carries default (empty) security props at build time.
         security: ov.security.clone(),
+        // Feature entrypoints + entrypoint/command resolution are emitted only in
+        // the final override; this build override is overwritten by
+        // `write_final_override` before `compose up`.
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         // The `up` flow provisions the agent volume during setup and reuses this
         // override at runtime, so keep the runtime sections (agent volume).
         build_only: false,
@@ -1073,6 +1109,71 @@ async fn resolve_compose_image_info(
             ("root".to_string(), None, None, None)
         }
     }
+}
+
+/// Resolve the wrapped entrypoint's `userEntrypoint`/`userCommand` for the
+/// primary service, mirroring the official compose logic.
+///
+/// Reads the service's resolved `entrypoint`/`command` from `docker compose
+/// config` and the base image's `ENTRYPOINT`/`CMD` from an inspect, then applies
+/// [`crate::override_file::resolve_user_entrypoint_command`]. Falls back to the
+/// default (empty entrypoint, no command) when the compose config can't be
+/// resolved — the wrapped entrypoint then just runs feature entrypoints and
+/// `exec "$@"` over whatever the service already had.
+async fn resolve_compose_user_entrypoint_command(
+    ctx: &Ctx<'_>,
+    project: &ComposeProject,
+    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
+) -> crate::override_file::UserEntrypointCommand {
+    let (dp, dcp) = ctx.cfg.docker_binaries();
+    let compose_cmd = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
+    let resolved = match compose_cmd.config().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to resolve compose config for entrypoint/command: {e}");
+            return crate::override_file::UserEntrypointCommand::default();
+        }
+    };
+
+    let (compose_entrypoint, compose_command) =
+        match crate::extract_service_entrypoint_command(&resolved, &project.primary_service) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("Failed to extract service entrypoint/command: {e}");
+                (None, None)
+            }
+        };
+
+    // The base image to inspect for the ENTRYPOINT/CMD fallback: the
+    // features-build override if present, otherwise the service's resolved image.
+    let image_name = features_build
+        .and_then(|b| b.image_name_override.clone())
+        .or_else(|| {
+            crate::extract_service_build_info(&resolved, &project.primary_service)
+                .ok()
+                .map(|info| {
+                    info.resolved_image_name(&project.project_name, &project.primary_service)
+                })
+        });
+
+    let (image_entrypoint, image_cmd) = match image_name {
+        Some(name) => match ctx.client.inspect_image_details(&name).await {
+            Ok(details) => (details.entrypoint, details.cmd),
+            Err(e) => {
+                warn!("Failed to inspect image '{name}' for entrypoint/cmd: {e}");
+                (Vec::new(), Vec::new())
+            }
+        },
+        None => (Vec::new(), Vec::new()),
+    };
+
+    crate::override_file::resolve_user_entrypoint_command(
+        project.override_command,
+        compose_entrypoint.as_deref(),
+        compose_command.as_deref(),
+        &image_entrypoint,
+        &image_cmd,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,6 +1295,11 @@ fn write_final_override(
         extra_volumes: ov.extra_volumes.clone(),
         request_gpu: ov.request_gpu,
         security: ov.security.clone(),
+        // Wrapped entrypoint: feature entrypoints run before the service's
+        // original entrypoint+command is exec'd (resolved in build_override_and_start).
+        feature_entrypoints: ov.feature_entrypoints.clone(),
+        user_entrypoint: ov.user_entrypoint_command.entrypoint.clone(),
+        user_command: ov.user_entrypoint_command.command.clone(),
         // The final `up` override runs the container; keep the runtime sections.
         build_only: false,
     };
@@ -1206,24 +1312,47 @@ fn write_final_override(
     Ok(())
 }
 
-/// Build the override context (env, labels, mounts), UID remap image,
-/// and start compose services with SSH fallback retry.
-#[expect(clippy::too_many_arguments)]
-async fn build_override_and_start(
-    ctx: &Ctx<'_>,
-    compose_cmd: &ComposeCommand,
-    project: &ComposeProject,
-    features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
-    config: &serde_json::Value,
+/// Inputs to [`build_override_and_start`], bundled to keep the call under the
+/// `clippy::too_many_arguments` ceiling.
+struct BuildAndStartParams<'a> {
+    ctx: &'a Ctx<'a>,
+    compose_cmd: &'a ComposeCommand,
+    project: &'a ComposeProject,
+    features_build: Option<&'a crate::combined_dockerfile_build::ComposeFeaturesBuild>,
+    config: &'a serde_json::Value,
     daemon_env: Vec<String>,
-    env_fwd: &mut cella_env::EnvForwarding,
-    remote_user: &str,
-    image_user: &str,
+    env_fwd: &'a mut cella_env::EnvForwarding,
+    remote_user: &'a str,
+    image_user: &'a str,
     agent_vol_name: String,
     agent_vol_target: String,
     security: cella_config::config_map::MergedSecurityConfig,
     metadata_label: String,
+    /// Feature entrypoints (install order, substituted) for the wrapped entrypoint.
+    feature_entrypoints: Vec<String>,
+}
+
+/// Build the override context (env, labels, mounts), UID remap image,
+/// and start compose services with SSH fallback retry.
+async fn build_override_and_start(
+    params: BuildAndStartParams<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let BuildAndStartParams {
+        ctx,
+        compose_cmd,
+        project,
+        features_build,
+        config,
+        daemon_env,
+        env_fwd,
+        remote_user,
+        image_user,
+        agent_vol_name,
+        agent_vol_target,
+        security,
+        metadata_label,
+        feature_entrypoints,
+    } = params;
     let cfg = ctx.cfg;
     let progress = ctx.progress;
 
@@ -1276,6 +1405,17 @@ async fn build_override_and_start(
 
     let request_gpu = resolve_compose_gpu(ctx, config).await;
 
+    // Resolve the wrapped entrypoint's userEntrypoint/userCommand: the service's
+    // own entrypoint/command (from the resolved compose config) falling back to
+    // the image's ENTRYPOINT/CMD, gated by `overrideCommand`. Skipped (default —
+    // empty/None) when there are no feature entrypoints and the command is not
+    // overridden, so the no-feature override stays byte-for-byte unchanged.
+    let user_entrypoint_command = if feature_entrypoints.is_empty() && !project.override_command {
+        crate::override_file::UserEntrypointCommand::default()
+    } else {
+        resolve_compose_user_entrypoint_command(ctx, project, features_build).await
+    };
+
     let mut ov_ctx = OverrideContext {
         agent_vol_name,
         agent_vol_target,
@@ -1284,6 +1424,8 @@ async fn build_override_and_start(
         extra_volumes: mount_specs,
         request_gpu,
         security,
+        feature_entrypoints,
+        user_entrypoint_command,
     };
 
     let uid_image =

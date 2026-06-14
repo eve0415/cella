@@ -132,6 +132,12 @@ pub async fn compose_build(
             request_gpu: false,
             // `cella build` only builds the image; runtime security props apply at `up`.
             security: cella_config::config_map::MergedSecurityConfig::default(),
+            // Feature entrypoints + entrypoint/command resolution belong to the
+            // runtime override (`write_final_override`); the build override never
+            // runs the container, and `docker compose build` ignores these keys.
+            feature_entrypoints: Vec::new(),
+            user_entrypoint: Vec::new(),
+            user_command: None,
             // This override persists and is reused at `up`, where the container
             // runs and needs the agent volume — keep the runtime sections.
             build_only: false,
@@ -275,6 +281,9 @@ fn write_labels_only_override(
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         build_only: true,
     };
     let yaml = crate::override_file::generate_override_yaml(&override_config);

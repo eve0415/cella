@@ -80,6 +80,24 @@ pub struct OverrideConfig {
     /// compose override. Shares the type with the single-container create path so
     /// both apply identical values.
     pub security: MergedSecurityConfig,
+    /// Devcontainer feature `entrypoint` scripts, in install order, already
+    /// `${devcontainerId}`-substituted. Each runs (verbatim, not `$`-escaped) in
+    /// the wrapped entrypoint before the service's original entrypoint+command is
+    /// `exec`d. Empty (with `override_command == false`) emits no entrypoint block
+    /// at all, preserving the current override byte-for-byte.
+    pub feature_entrypoints: Vec<String>,
+    /// The resolved `userEntrypoint` for the wrapped entrypoint, per the official
+    /// compose logic: `overrideCommand ? [] : (service.entrypoint || image
+    /// entrypoint($-escaped))`. Emitted as JSON-quoted array elements after the
+    /// `"-"` sentinel. Service-derived values arrive already compose-escaped (the
+    /// resolved compose config re-escapes `$`→`$$`); image-derived values are
+    /// `$`→`$$` escaped at resolution time.
+    pub user_entrypoint: Vec<String>,
+    /// The resolved `userCommand` for the wrapped entrypoint. `Some(cmd)` emits a
+    /// `command:` key (when it differs from the compose-declared command);
+    /// `None` omits it (the compose command already applies). Mirrors the
+    /// official `userCommand !== composeCommand` gate.
+    pub user_command: Option<Vec<String>>,
     /// Restrict the override to build-time only: skip the runtime sections that a
     /// `docker compose build` never needs — the agent volume mount and the
     /// top-level `volumes:` declarations. Set for the `--label`-only compose
@@ -88,6 +106,85 @@ pub struct OverrideConfig {
     /// path and the features build override leave this `false` to keep emitting
     /// the agent volume unchanged.
     pub build_only: bool,
+}
+
+/// The resolved `userEntrypoint`/`userCommand` for the wrapped compose entrypoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserEntrypointCommand {
+    /// Args appended after the `"-"` sentinel in the wrapped `entrypoint:` array.
+    pub entrypoint: Vec<String>,
+    /// The `command:` to emit (`None` = omit, value already equals the compose
+    /// command; `Some` = emit, possibly empty).
+    pub command: Option<Vec<String>>,
+}
+
+/// Escape `docker compose` interpolation in an image-derived value (`$` → `$$`).
+///
+/// Image `ENTRYPOINT`/`CMD` values are emitted into cella's `-f` override, which
+/// `docker compose` interpolates. Doubling each `$` makes compose yield a literal
+/// `$` for the shell (mirrors the official `c.replace(/\$/g, '$$$$')`). Service
+/// values are NOT escaped here — the resolved compose config already returns them
+/// in `$$`-escaped form.
+fn escape_dollars(value: &str) -> String {
+    value.replace('$', "$$")
+}
+
+/// Resolve the wrapped entrypoint's `userEntrypoint`/`userCommand`, mirroring the
+/// official `dockerCompose.ts` logic exactly:
+///
+/// ```text
+/// userEntrypoint = overrideCommand ? [] : (composeEntrypoint ?? imageEntrypoint($-esc))
+/// userCommand    = overrideCommand ? [] : (composeCommand ?? (composeEntrypoint ? [] : imageCmd($-esc)))
+/// emit command   = userCommand is NOT taken directly from composeCommand
+/// ```
+///
+/// `compose_entrypoint`/`compose_command` are `Some` when the service declares the
+/// key (even as an empty array — distinct from absent `None`), already in
+/// compose-escaped form. Image values are `$`→`$$` escaped here. The returned
+/// `command` is `None` exactly in the official "`userCommand === composeCommand`"
+/// case (the service command applies unchanged, so no `command:` key is emitted).
+#[must_use]
+pub fn resolve_user_entrypoint_command(
+    override_command: bool,
+    compose_entrypoint: Option<&[String]>,
+    compose_command: Option<&[String]>,
+    image_entrypoint: &[String],
+    image_cmd: &[String],
+) -> UserEntrypointCommand {
+    if override_command {
+        // overrideCommand discards the original: userEntrypoint = userCommand = [].
+        // userCommand ([]) is a fresh value, never === composeCommand, so it is
+        // always emitted (as `command: []`).
+        return UserEntrypointCommand {
+            entrypoint: Vec::new(),
+            command: Some(Vec::new()),
+        };
+    }
+
+    // composeEntrypoint present (even empty) is used verbatim; absent falls back
+    // to the image entrypoint ($-escaped) — official `composeEntrypoint || image`.
+    let entrypoint = compose_entrypoint.map_or_else(
+        || image_entrypoint.iter().map(|a| escape_dollars(a)).collect(),
+        <[String]>::to_vec,
+    );
+
+    // userCommand and whether to emit it. The `command:` key is omitted only when
+    // userCommand is taken directly from composeCommand (official `===`): i.e.
+    // when composeCommand is present. When absent, userCommand is a fresh array
+    // (always emitted) — `[]` if the service overrides the entrypoint (image CMD
+    // ignored per the compose spec), otherwise the image CMD ($-escaped).
+    let command = if compose_command.is_some() {
+        None
+    } else if compose_entrypoint.is_some() {
+        Some(Vec::new())
+    } else {
+        Some(image_cmd.iter().map(|a| escape_dollars(a)).collect())
+    };
+
+    UserEntrypointCommand {
+        entrypoint,
+        command,
+    }
 }
 
 /// Escape a string for embedding in a YAML double-quoted scalar (`key: "{v}"`).
@@ -116,6 +213,72 @@ fn yaml_dq_escape(value: &str) -> String {
     out
 }
 
+/// Emit one element of a YAML flow sequence as a double-quoted scalar.
+///
+/// Reuses [`yaml_dq_escape`] (escapes `"`/`\`/newlines/controls, leaves `$`
+/// untouched) so an embedded literal `$$` — which `docker compose` interpolates
+/// back to `$` when it reads this `-f` override — survives intact.
+fn yaml_flow_scalar(value: &str) -> String {
+    format!("\"{}\"", yaml_dq_escape(value))
+}
+
+/// Build the wrapped entrypoint shell script.
+///
+/// Mirrors the official compose override's `/bin/sh -c` script verbatim:
+/// announce start, install a SIGTERM trap, run each feature entrypoint, `exec`
+/// the service's original entrypoint+command (`"$@"`), then idle so the
+/// container stays up. The `$$@`/`$$!` are emitted as literal double-dollars so
+/// that, after `docker compose` interpolates this `-f` file (`$$`→`$`), the
+/// shell receives `$@`/`$!`. Feature entrypoints are inserted verbatim (NOT
+/// `$`-escaped), matching the official `customEntrypoints.join(...)`.
+///
+/// Deliberately contains NO agent restart loop: on the compose path the agent is
+/// launched separately via `nohup` after `up` (see `compose_up::launch_agent_exec`).
+fn build_wrapped_entrypoint_script(feature_entrypoints: &[String]) -> String {
+    let mut script = String::from("echo Container started\ntrap \"exit 0\" 15\n");
+    for ep in feature_entrypoints {
+        script.push_str(ep);
+        script.push('\n');
+    }
+    script.push_str("exec \"$$@\"\nwhile sleep 1 & wait $$!; do :; done");
+    script
+}
+
+/// Emit the `entrypoint:` (and conditional `command:`) keys for the primary
+/// service, wrapping feature entrypoints around the service's original
+/// entrypoint+command.
+///
+/// Emits nothing when there are no feature entrypoints AND the command is not
+/// being overridden — preserving the no-feature override byte-for-byte.
+/// Otherwise writes:
+/// - `entrypoint: ["/bin/sh", "-c", "<script>", "-"<, userEntrypoint args>]`
+/// - `command: <userCommand>` — only when `user_command` is `Some` (the resolver
+///   sets `None` when it equals the compose-declared command, matching the
+///   official `userCommand !== composeCommand` gate).
+fn write_entrypoint_section(yaml: &mut String, config: &OverrideConfig) {
+    if config.feature_entrypoints.is_empty() && !config.override_command {
+        return;
+    }
+
+    let script = build_wrapped_entrypoint_script(&config.feature_entrypoints);
+
+    let mut elements = vec![
+        yaml_flow_scalar("/bin/sh"),
+        yaml_flow_scalar("-c"),
+        yaml_flow_scalar(&script),
+        yaml_flow_scalar("-"),
+    ];
+    for arg in &config.user_entrypoint {
+        elements.push(yaml_flow_scalar(arg));
+    }
+    let _ = writeln!(yaml, "    entrypoint: [{}]", elements.join(", "));
+
+    if let Some(ref command) = config.user_command {
+        let items: Vec<String> = command.iter().map(|c| yaml_flow_scalar(c)).collect();
+        let _ = writeln!(yaml, "    command: [{}]", items.join(", "));
+    }
+}
+
 /// Generate the override compose YAML as a string.
 ///
 /// The output is a valid Docker Compose file that overrides the primary service
@@ -139,11 +302,11 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     // and/or image labels).
     write_build_section(&mut yaml, config);
 
-    // Command override (only if explicitly enabled; compose default is false)
-    if config.override_command {
-        yaml.push_str("    entrypoint: [\"/bin/sh\", \"-c\"]\n");
-        yaml.push_str("    command: [\"while sleep 1000; do :; done\"]\n");
-    }
+    // Wrapped entrypoint that runs feature entrypoints, then execs the service's
+    // original entrypoint+command. Emitted only when there is something to wrap
+    // (feature entrypoints) or when the command is being overridden; otherwise no
+    // entrypoint/command keys are written and the service runs unchanged.
+    write_entrypoint_section(&mut yaml, config);
 
     // Container security/runtime properties (init, user, privileged, caps).
     write_security_section(&mut yaml, &config.security);
@@ -374,6 +537,9 @@ mod tests {
             extra_volumes: Vec::new(),
             request_gpu: false,
             security: MergedSecurityConfig::default(),
+            feature_entrypoints: Vec::new(),
+            user_entrypoint: Vec::new(),
+            user_command: None,
             build_only: false,
         }
     }
@@ -540,11 +706,25 @@ mod tests {
 
     #[test]
     fn with_command_override() {
+        // overrideCommand=true discards the service's original entrypoint/command:
+        // userEntrypoint = [] (no args after "-"), userCommand = Some([]) so the
+        // wrapped entrypoint's `exec "$@"` runs nothing and the keepalive loop
+        // holds the container open. (The resolver produces these values; here we
+        // set them directly to exercise the emitter.)
         let mut config = base_config();
         config.override_command = true;
+        config.user_entrypoint = Vec::new();
+        config.user_command = Some(Vec::new());
         let yaml = generate_override_yaml(&config);
-        assert!(yaml.contains("entrypoint:"));
-        assert!(yaml.contains("command:"));
+        assert!(
+            yaml.contains(
+                "    entrypoint: [\"/bin/sh\", \"-c\", \
+                 \"echo Container started\\ntrap \\\"exit 0\\\" 15\\n\
+                 exec \\\"$$@\\\"\\nwhile sleep 1 & wait $$!; do :; done\", \"-\"]\n"
+            ),
+            "yaml:\n{yaml}"
+        );
+        assert!(yaml.contains("    command: []\n"), "yaml:\n{yaml}");
     }
 
     #[test]
@@ -589,6 +769,10 @@ mod tests {
         let mut config = base_config();
         config.image_override = Some("cella-img-app-12345678".to_string());
         config.override_command = true;
+        // overrideCommand=true resolves to an empty userCommand (the resolver
+        // emits Some([])), which clears the original command; the wrapped
+        // entrypoint's keepalive loop keeps the container up.
+        config.user_command = Some(Vec::new());
         config.extra_env = vec!["CELLA_DAEMON_PORT=9876".to_string()];
         config
             .extra_labels
@@ -599,8 +783,8 @@ mod tests {
         services:
           app:
             image: "cella-img-app-12345678"
-            entrypoint: ["/bin/sh", "-c"]
-            command: ["while sleep 1000; do :; done"]
+            entrypoint: ["/bin/sh", "-c", "echo Container started\ntrap \"exit 0\" 15\nexec \"$$@\"\nwhile sleep 1 & wait $$!; do :; done", "-"]
+            command: []
             environment:
               - "CELLA_DAEMON_PORT=9876"
             labels:
@@ -618,6 +802,7 @@ mod tests {
         let mut config = base_config();
         config.image_override = Some("cella-img-app-12345678".to_string());
         config.override_command = true;
+        config.user_command = Some(Vec::new());
         config.extra_env = vec!["CELLA_DAEMON_PORT=9876".to_string()];
         config
             .extra_labels
@@ -632,8 +817,8 @@ mod tests {
         services:
           app:
             image: "cella-img-app-12345678"
-            entrypoint: ["/bin/sh", "-c"]
-            command: ["while sleep 1000; do :; done"]
+            entrypoint: ["/bin/sh", "-c", "echo Container started\ntrap \"exit 0\" 15\nexec \"$$@\"\nwhile sleep 1 & wait $$!; do :; done", "-"]
+            command: []
             environment:
               - "CELLA_DAEMON_PORT=9876"
             labels:
@@ -1144,5 +1329,206 @@ mod tests {
             external_count, 1,
             "only the agent volume should be external; yaml:\n{yaml}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wrapped entrypoint: resolution + emission
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_feature_no_override_emits_no_entrypoint_or_command() {
+        // The byte-for-byte preservation guarantee: with no feature entrypoints
+        // and overrideCommand=false, neither key is emitted.
+        let config = base_config();
+        let yaml = generate_override_yaml(&config);
+        assert!(!yaml.contains("entrypoint:"), "yaml:\n{yaml}");
+        assert!(!yaml.contains("command:"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn feature_entrypoints_build_wrapped_script_with_dollar_escaping() {
+        // Feature entrypoints run (verbatim) between the trap and `exec "$@"`.
+        // The script emits literal `$$@`/`$$!` so docker compose interpolates
+        // them back to `$@`/`$!`; feature entrypoint text is NOT $-escaped.
+        let mut config = base_config();
+        config.feature_entrypoints = vec![
+            "/usr/local/share/feat-a/entry.sh".to_string(),
+            "echo from-feature-b".to_string(),
+        ];
+        let yaml = generate_override_yaml(&config);
+        let expected = "    entrypoint: [\"/bin/sh\", \"-c\", \
+             \"echo Container started\\ntrap \\\"exit 0\\\" 15\\n\
+             /usr/local/share/feat-a/entry.sh\\necho from-feature-b\\n\
+             exec \\\"$$@\\\"\\nwhile sleep 1 & wait $$!; do :; done\", \"-\"]\n";
+        assert!(yaml.contains(expected), "yaml:\n{yaml}");
+        // No agent restart loop in the compose entrypoint.
+        assert!(!yaml.contains("cella-agent daemon"), "yaml:\n{yaml}");
+        assert!(!yaml.contains("while true"), "yaml:\n{yaml}");
+        // No `command:` when user_command is None (compose command applies).
+        assert!(!yaml.contains("command:"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn user_entrypoint_passthrough_after_dash_sentinel() {
+        // userEntrypoint args are appended as JSON-quoted elements after "-",
+        // preserving the service's/image's original entrypoint inside the wrap.
+        // An image-derived `$$` stays doubled (already escaped at resolution).
+        let mut config = base_config();
+        config.feature_entrypoints = vec!["echo hi".to_string()];
+        config.user_entrypoint = vec![
+            "/docker-entrypoint.sh".to_string(),
+            "--config=$$HOME/cfg".to_string(),
+        ];
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("\"-\", \"/docker-entrypoint.sh\", \"--config=$$HOME/cfg\"]\n"),
+            "yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn user_command_emitted_only_when_some() {
+        // Some(cmd) -> `command:` is emitted as a JSON array; None -> omitted.
+        let mut config = base_config();
+        config.feature_entrypoints = vec!["echo hi".to_string()];
+        config.user_command = Some(vec!["node".to_string(), "server.js".to_string()]);
+        let yaml = generate_override_yaml(&config);
+        assert!(
+            yaml.contains("    command: [\"node\", \"server.js\"]\n"),
+            "yaml:\n{yaml}"
+        );
+
+        let mut none_config = base_config();
+        none_config.feature_entrypoints = vec!["echo hi".to_string()];
+        none_config.user_command = None;
+        let none_yaml = generate_override_yaml(&none_config);
+        assert!(!none_yaml.contains("command:"), "yaml:\n{none_yaml}");
+    }
+
+    #[test]
+    fn generated_wrapped_entrypoint_is_valid_yaml() {
+        // The flow-sequence entrypoint (with escaped quotes/newlines and `$$`)
+        // must parse as valid YAML and round-trip the script intact.
+        let mut config = base_config();
+        config.feature_entrypoints = vec!["echo hi".to_string()];
+        config.user_entrypoint = vec!["/entry".to_string()];
+        config.user_command = Some(vec!["run".to_string()]);
+        let yaml = generate_override_yaml(&config);
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("wrapped-entrypoint override must be valid YAML");
+        let ep = &parsed["services"]["app"]["entrypoint"];
+        let elems = ep.as_sequence().expect("entrypoint is a sequence");
+        assert_eq!(elems[0].as_str(), Some("/bin/sh"));
+        assert_eq!(elems[1].as_str(), Some("-c"));
+        let script = elems[2].as_str().expect("script element is a string");
+        // YAML parse resolves the `\n`/`\"` escapes; `$$` is left for compose.
+        assert!(script.contains("echo Container started\ntrap \"exit 0\" 15\n"));
+        assert!(script.contains("echo hi\n"));
+        assert!(script.contains("exec \"$$@\"\nwhile sleep 1 & wait $$!; do :; done"));
+        assert_eq!(elems[3].as_str(), Some("-"));
+        assert_eq!(elems[4].as_str(), Some("/entry"));
+        assert_eq!(
+            parsed["services"]["app"]["command"][0].as_str(),
+            Some("run")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_user_entrypoint_command (parity with dockerCompose.ts)
+    // -----------------------------------------------------------------------
+
+    fn sv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn resolve_override_command_discards_to_empty() {
+        // overrideCommand=true => userEntrypoint=[] and userCommand=Some([])
+        // regardless of service/image values.
+        let r = resolve_user_entrypoint_command(
+            true,
+            Some(&sv(&["/svc-entry"])),
+            Some(&sv(&["svc-cmd"])),
+            &sv(&["img-entry"]),
+            &sv(&["img-cmd"]),
+        );
+        assert_eq!(r.entrypoint, Vec::<String>::new());
+        assert_eq!(r.command, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolve_uses_service_entrypoint_and_omits_command_when_service_has_command() {
+        // composeEntrypoint present -> userEntrypoint = it (verbatim).
+        // composeCommand present -> userCommand === composeCommand -> omit command.
+        let r = resolve_user_entrypoint_command(
+            false,
+            Some(&sv(&["/svc-entry", "--x"])),
+            Some(&sv(&["svc-cmd"])),
+            &sv(&["img-entry"]),
+            &sv(&["img-cmd"]),
+        );
+        assert_eq!(r.entrypoint, sv(&["/svc-entry", "--x"]));
+        assert_eq!(r.command, None);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_image_entrypoint_and_cmd_when_service_absent() {
+        // Neither service entrypoint nor command -> image entrypoint + image cmd,
+        // both $-escaped, and command IS emitted (fresh array, != composeCommand).
+        let r = resolve_user_entrypoint_command(
+            false,
+            None,
+            None,
+            &sv(&["/img-entry", "$VAR"]),
+            &sv(&["img-cmd", "$X"]),
+        );
+        assert_eq!(r.entrypoint, sv(&["/img-entry", "$$VAR"]));
+        assert_eq!(r.command, Some(sv(&["img-cmd", "$$X"])));
+    }
+
+    #[test]
+    fn resolve_service_entrypoint_present_ignores_image_cmd() {
+        // composeEntrypoint present but composeCommand absent -> image CMD is
+        // ignored (compose spec) -> userCommand = Some([]) (emitted as empty).
+        let r = resolve_user_entrypoint_command(
+            false,
+            Some(&sv(&["/svc-entry"])),
+            None,
+            &sv(&["img-entry"]),
+            &sv(&["img-cmd"]),
+        );
+        assert_eq!(r.entrypoint, sv(&["/svc-entry"]));
+        assert_eq!(r.command, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolve_empty_service_entrypoint_is_used_not_image() {
+        // An explicit empty service entrypoint (Some([])) is truthy in the
+        // official `composeEntrypoint || image` -> it is used (empty), NOT the
+        // image entrypoint. Image CMD is then ignored too.
+        let r = resolve_user_entrypoint_command(
+            false,
+            Some(&[]),
+            None,
+            &sv(&["/img-entry"]),
+            &sv(&["img-cmd"]),
+        );
+        assert_eq!(r.entrypoint, Vec::<String>::new());
+        assert_eq!(r.command, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolve_service_command_present_without_entrypoint_omits_command() {
+        // composeCommand present (even without entrypoint) -> omit command;
+        // userEntrypoint falls back to the image entrypoint ($-escaped).
+        let r = resolve_user_entrypoint_command(
+            false,
+            None,
+            Some(&sv(&["svc-cmd"])),
+            &sv(&["/img-entry", "$Z"]),
+            &sv(&["img-cmd"]),
+        );
+        assert_eq!(r.entrypoint, sv(&["/img-entry", "$$Z"]));
+        assert_eq!(r.command, None);
     }
 }

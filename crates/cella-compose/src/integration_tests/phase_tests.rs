@@ -41,6 +41,9 @@ fn override_file_exists_before_compose_uses_it() {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         build_only: false,
     };
 
@@ -195,6 +198,9 @@ fn additional_contexts_in_override_for_features() {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         build_only: false,
     };
 
