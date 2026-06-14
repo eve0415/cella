@@ -82,8 +82,10 @@ impl ReadConfigurationArgs {
             super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
-        // Match cella's own mount behaviour: `up` mounts the git-root folder
-        // (mountWorkspaceGitRoot defaults to true), so report that, not the cwd.
+        // Report the default single-container mount `up` would create: it
+        // bind-mounts the git-root folder (mountWorkspaceGitRoot defaults to
+        // true). read-configuration exposes no flag to override this, so the
+        // default is reported. Compose configs ignore this (no bind mount).
         let host_mount_folder = cella_git::find_git_root_folder(&cwd, true);
         let mut output = build_base_output(
             &resolved.config,
@@ -106,53 +108,67 @@ impl ReadConfigurationArgs {
 /// Build the base `read-configuration` envelope: `{configuration, workspace}`.
 ///
 /// Matches the official shape: `configFilePath` is nested *inside*
-/// `configuration` (not a top-level sibling), and `workspace` carries
-/// `{workspaceFolder, workspaceMount}` (the official `WorkspaceConfiguration`),
-/// not the cella-only `deviceContainerType`.
+/// `configuration` (not a top-level sibling), and `workspace` is the official
+/// `WorkspaceConfiguration` (`workspaceFolder` plus, for single-container
+/// configs, `workspaceMount`), not the cella-only `deviceContainerType`.
 ///
-/// `host_mount_folder` is the folder cella actually bind-mounts (the git root
-/// when `mountWorkspaceGitRoot` is on, else the workspace root); it may be a
-/// parent of `workspace_root` when the workspace is a git subdirectory.
+/// `host_mount_folder` is the folder the caller resolved as cella's bind-mount
+/// source (the git root by default); it may be a parent of `workspace_root`
+/// when the workspace is a git subdirectory. It is unused for Compose configs,
+/// which own their workspace volumes in the service definition.
 fn build_base_output(
     config: &serde_json::Value,
     config_path: &Path,
     workspace_root: &Path,
     host_mount_folder: &Path,
 ) -> serde_json::Value {
-    // The container mount point mirrors the host mount folder's name; the
-    // workspace folder may sit in a subdirectory beneath it.
-    let mount_basename = host_mount_folder.file_name().map_or_else(
-        || "workspace".to_string(),
-        |n| n.to_string_lossy().to_string(),
-    );
-    let container_mount_folder = format!("/workspaces/{mount_basename}");
-    let workspace_folder = config
-        .get("workspaceFolder")
-        .and_then(|v| v.as_str())
-        .map_or_else(
-            || super::up::compute_default_workspace_folder(workspace_root, host_mount_folder),
-            String::from,
-        );
-
-    // Report the mount cella would create. An explicit `workspaceMount` in the
-    // config (including `""`) is reported verbatim — official keys on the
-    // property's presence — otherwise derive the default git-root bind string.
-    let workspace_mount = config.get("workspaceMount").cloned().unwrap_or_else(|| {
-        json!(derive_workspace_mount(
-            host_mount_folder,
-            &container_mount_folder
-        ))
-    });
-
     let mut configuration = config.clone();
     super::up::inject_config_file_path(&mut configuration, config_path);
 
-    json!({
-        "configuration": configuration,
-        "workspace": {
+    let workspace = if config.get("dockerComposeFile").is_some() {
+        // Compose: the service definition owns the workspace volume, so cella
+        // (like the official CLI) creates no single-container bind mount —
+        // `workspaceMount` is omitted. `workspaceFolder` defaults to "/".
+        let workspace_folder = config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("/")
+            .to_string();
+        json!({ "workspaceFolder": workspace_folder })
+    } else {
+        // The container mount point mirrors the host mount folder's name; the
+        // workspace folder may sit in a subdirectory beneath it.
+        let mount_basename = host_mount_folder.file_name().map_or_else(
+            || "workspace".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let container_mount_folder = format!("/workspaces/{mount_basename}");
+        let workspace_folder = config
+            .get("workspaceFolder")
+            .and_then(|v| v.as_str())
+            .map_or_else(
+                || super::up::compute_default_workspace_folder(workspace_root, host_mount_folder),
+                String::from,
+            );
+
+        // An explicit `workspaceMount` in the config (including `""`) is
+        // reported verbatim — official keys on the property's presence —
+        // otherwise derive the default git-root bind string.
+        let workspace_mount = config.get("workspaceMount").cloned().unwrap_or_else(|| {
+            json!(derive_workspace_mount(
+                host_mount_folder,
+                &container_mount_folder
+            ))
+        });
+        json!({
             "workspaceFolder": workspace_folder,
             "workspaceMount": workspace_mount,
-        }
+        })
+    };
+
+    json!({
+        "configuration": configuration,
+        "workspace": workspace,
     })
 }
 
@@ -1264,6 +1280,42 @@ mod tests {
         let mount = ws["workspaceMount"].as_str().unwrap();
         assert!(mount.contains("target=/workspaces/repo"), "got: {mount}");
         assert!(mount.contains("source=/repo"), "got: {mount}");
+    }
+
+    // Compose: the service owns its volumes, so no single-container workspace
+    // bind mount is reported (matches official `getWorkspaceConfiguration`).
+    #[test]
+    fn base_output_compose_omits_workspace_mount() {
+        let config = json!({
+            "dockerComposeFile": "docker-compose.yml",
+            "service": "app",
+            "workspaceFolder": "/workspace"
+        });
+        let out = build_base_output(
+            &config,
+            Path::new("/repo/.devcontainer/devcontainer.json"),
+            Path::new("/repo"),
+            Path::new("/repo"),
+        );
+        let ws = &out["workspace"];
+        assert_eq!(ws["workspaceFolder"], json!("/workspace"));
+        assert!(
+            ws.get("workspaceMount").is_none(),
+            "compose configs have no single-container workspace bind mount"
+        );
+    }
+
+    #[test]
+    fn base_output_compose_workspace_folder_defaults_to_root() {
+        let config = json!({"dockerComposeFile": "docker-compose.yml", "service": "app"});
+        let out = build_base_output(
+            &config,
+            Path::new("/repo/.devcontainer/devcontainer.json"),
+            Path::new("/repo"),
+            Path::new("/repo"),
+        );
+        assert_eq!(out["workspace"]["workspaceFolder"], json!("/"));
+        assert!(out["workspace"].get("workspaceMount").is_none());
     }
 
     #[test]
