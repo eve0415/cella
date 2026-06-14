@@ -114,7 +114,13 @@ pub async fn compose_build(
         let override_config = crate::OverrideConfig {
             primary_service: project.primary_service.clone(),
             image_override: fb.image_name_override.clone(),
-            override_command: project.override_command,
+            // The build override is for `cella build` only: it builds the image and
+            // never runs the container (`cella up` writes its own runtime override
+            // via `write_final_override`). Force `override_command` false so this
+            // override emits NO runtime entrypoint — emitting the wrapper here
+            // without a resolved `command` would, if the persisted file were used
+            // to start the service, drop `overrideCommand`'s keepalive semantics.
+            override_command: false,
             agent_volume_name: agent_vol_name,
             agent_volume_target: agent_vol_target,
             extra_env: Vec::new(),
@@ -132,9 +138,16 @@ pub async fn compose_build(
             request_gpu: false,
             // `cella build` only builds the image; runtime security props apply at `up`.
             security: cella_config::config_map::MergedSecurityConfig::default(),
-            // This override persists and is reused at `up`, where the container
-            // runs and needs the agent volume — keep the runtime sections.
-            build_only: false,
+            // Runtime entrypoint/command resolution belongs to the runtime
+            // override (`write_final_override`); `docker compose build` ignores
+            // these keys, so leave them empty.
+            feature_entrypoints: Vec::new(),
+            user_entrypoint: Vec::new(),
+            user_command: None,
+            // Build-only: `docker compose build` needs no agent volume and this
+            // override never runs the container, so omit the runtime volume
+            // sections (same as the labels-only build override).
+            build_only: true,
         };
         let yaml = crate::override_file::generate_override_yaml(&override_config);
         crate::override_file::write_override_file(&project.override_file, &yaml)?;
@@ -275,6 +288,9 @@ fn write_labels_only_override(
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         build_only: true,
     };
     let yaml = crate::override_file::generate_override_yaml(&override_config);

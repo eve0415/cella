@@ -604,6 +604,13 @@ impl ContainerBackend for AppleContainerBackend {
                 os: None,
                 architecture: None,
                 variant: None,
+                // Image entrypoint/cmd only feed the docker-compose override's
+                // entrypoint fallback. The Apple `container` backend reports
+                // `compose: false` (see `capabilities()`), so compose is
+                // docker-only and this fallback is never exercised here — leave
+                // both empty rather than extend the CLI inspect parse.
+                entrypoint: Vec::new(),
+                cmd: Vec::new(),
             })
         })
     }

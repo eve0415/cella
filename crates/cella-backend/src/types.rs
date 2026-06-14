@@ -169,6 +169,17 @@ pub struct ImageDetails {
     pub architecture: Option<String>,
     /// Architecture variant reported by the image (e.g. `"v8"`).
     pub variant: Option<String>,
+    /// Image `ENTRYPOINT` (the `Config.Entrypoint` array), empty when unset.
+    ///
+    /// Used by the compose override to preserve a service's original entrypoint
+    /// when the compose file doesn't restate it (the official CLI's
+    /// `imageDetails().Config.Entrypoint` fallback).
+    pub entrypoint: Vec<String>,
+    /// Image `CMD` (the `Config.Cmd` array), empty when unset.
+    ///
+    /// Used by the compose override to preserve a service's original command
+    /// when the compose file doesn't restate it.
+    pub cmd: Vec<String>,
 }
 
 /// A `BuildKit` build secret (`--secret id=X,src=Y` or `--secret id=X,env=Y`).

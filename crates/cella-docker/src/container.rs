@@ -1479,12 +1479,16 @@ mod tests {
                 os: Some("linux".to_string()),
                 architecture: Some("amd64".to_string()),
                 variant: None,
+                entrypoint: vec!["/entrypoint.sh".to_string()],
+                cmd: vec!["bash".to_string()],
             }));
 
         let details = mock.inspect_image_details("ubuntu:latest").await.unwrap();
         assert_eq!(details.user, "vscode");
         assert_eq!(details.env.len(), 1);
         assert!(details.metadata.is_some());
+        assert_eq!(details.entrypoint, vec!["/entrypoint.sh".to_string()]);
+        assert_eq!(details.cmd, vec!["bash".to_string()]);
     }
 
     // -----------------------------------------------------------------------

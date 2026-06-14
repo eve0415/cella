@@ -26,6 +26,9 @@ fn plain_override(service: &str) -> OverrideConfig {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        feature_entrypoints: Vec::new(),
+        user_entrypoint: Vec::new(),
+        user_command: None,
         build_only: false,
     }
 }
@@ -125,6 +128,97 @@ async fn image_only_features_lifecycle() {
     assert!(app_running, "app service should be running");
 
     // Down
+    ctx.cleanup().await;
+    crate::override_file::cleanup_override_file(&project.override_file);
+}
+
+/// Run a command inside the primary service via `docker compose -p <project> exec`
+/// and return its trimmed stdout (empty on failure).
+async fn compose_exec_stdout(project: &str, service: &str, script: &str) -> String {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "compose", "-p", project, "exec", "-T", service, "sh", "-c", script,
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// A devcontainer feature `entrypoint` must run on container start for the
+/// compose path, then the service's original command must still run (the wrapped
+/// entrypoint `exec`s it). Proves the Phase 3 wrapped-entrypoint emission works
+/// end-to-end.
+#[cella_testing::runtime_test(docker, compose)]
+async fn compose_feature_entrypoint_runs() {
+    let ctx = ComposeTestContext::new("plain-compose");
+    let config = load_fixture_config(&ctx.fixture_dir);
+    let config_path = ctx.fixture_dir.join("devcontainer.json");
+    let project = ComposeProject::from_resolved(&config, &config_path, &ctx.fixture_dir)
+        .unwrap()
+        .with_project_name(ctx.project_name.clone());
+
+    // Ensure the cella-agent volume exists (the override mounts it read-only).
+    let _ = tokio::process::Command::new("docker")
+        .args(["volume", "create", "cella-agent"])
+        .output()
+        .await;
+
+    // Host dir bind-mounted into the container; the feature entrypoint drops a
+    // sentinel here so the host side can confirm it ran. Pre-created because the
+    // bind mount uses create_host_path: false.
+    let sentinel_dir = ctx.fixture_dir.join("sentinel");
+    std::fs::create_dir_all(&sentinel_dir).expect("failed to create sentinel dir");
+    let sentinel_host = sentinel_dir.join("ran");
+
+    // Build the override with a feature entrypoint that writes the sentinel, plus
+    // the bind mount. The fixture's `command: ["sleep","infinity"]` stays in the
+    // base compose, so the wrapped `exec "$@"` runs it (user_command = None).
+    let mut override_cfg = plain_override(&project.primary_service);
+    override_cfg.feature_entrypoints = vec!["touch /sentinel/ran".to_string()];
+    override_cfg.extra_volumes = vec![cella_backend::MountSpec::bind(
+        sentinel_dir.to_string_lossy().to_string(),
+        "/sentinel",
+    )];
+    let yaml = generate_override_yaml(&override_cfg);
+    write_override_file(&project.override_file, &yaml).unwrap();
+
+    let cmd = ComposeCommand::new(&project);
+    cmd.up(None, false).await.expect("compose up failed");
+
+    // The service must be running (the wrapped entrypoint's keepalive / the
+    // exec'd `sleep infinity` both hold it open).
+    let statuses = cmd.ps_json().await.expect("compose ps failed");
+    assert!(
+        statuses
+            .iter()
+            .any(|s| s.service == "app" && s.state == "running"),
+        "app service should be running; statuses: {statuses:?}"
+    );
+
+    // 1. The feature entrypoint ran (sentinel written, visible on the host).
+    assert!(
+        sentinel_host.exists(),
+        "feature entrypoint sentinel must exist at {} (entrypoint did not run)",
+        sentinel_host.display()
+    );
+
+    // 2. The service's original command still runs: `sleep infinity` is in the
+    //    process table (the wrapped entrypoint exec'd `$@`). `[s]leep` avoids the
+    //    grep matching its own argv.
+    let count = compose_exec_stdout(
+        &project.project_name,
+        "app",
+        "ps -o args 2>/dev/null | grep -c '[s]leep infinity'",
+    )
+    .await;
+    assert_eq!(
+        count, "1",
+        "original `sleep infinity` command must still run after the wrapped entrypoint execs it; got count={count:?}"
+    );
+
     ctx.cleanup().await;
     crate::override_file::cleanup_override_file(&project.override_file);
 }

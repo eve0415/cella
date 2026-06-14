@@ -25,6 +25,34 @@ pub(crate) fn normalize_user(raw: &str) -> String {
     }
 }
 
+/// Map a bollard image-inspect response into cella's [`ImageDetails`].
+///
+/// Pulls user (normalized), env, the `devcontainer.metadata` label, OS/arch, and
+/// the image `ENTRYPOINT`/`CMD` arrays out of `Config`. Pure (no I/O) so the
+/// mapping is unit-testable against a deserialized inspect response.
+fn image_details_from_inspect(details: &bollard::models::ImageInspect) -> ImageDetails {
+    let config = details.config.as_ref();
+    let user = normalize_user(config.and_then(|c| c.user.as_deref()).unwrap_or(""));
+    let env = config.and_then(|c| c.env.clone()).unwrap_or_default();
+    let metadata = config
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|labels| labels.get("devcontainer.metadata").cloned());
+    let entrypoint = config
+        .and_then(|c| c.entrypoint.clone())
+        .unwrap_or_default();
+    let cmd = config.and_then(|c| c.cmd.clone()).unwrap_or_default();
+    ImageDetails {
+        user,
+        env,
+        metadata,
+        os: details.os.clone(),
+        architecture: details.architecture.clone(),
+        variant: details.variant.clone(),
+        entrypoint,
+        cmd,
+    }
+}
+
 /// Split an image reference into its repository and optional tag.
 ///
 /// The tag is the part after the LAST `:` that comes *after* the last `/`. A
@@ -427,26 +455,7 @@ impl DockerClient {
         image: &str,
     ) -> Result<ImageDetails, CellaDockerError> {
         match self.inner().inspect_image(image).await {
-            Ok(details) => {
-                let config = details.config.as_ref();
-                let user = normalize_user(config.and_then(|c| c.user.as_deref()).unwrap_or(""));
-                let env = details
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.env.clone())
-                    .unwrap_or_default();
-                let metadata = config
-                    .and_then(|c| c.labels.as_ref())
-                    .and_then(|labels| labels.get("devcontainer.metadata").cloned());
-                Ok(ImageDetails {
-                    user,
-                    env,
-                    metadata,
-                    os: details.os.clone(),
-                    architecture: details.architecture.clone(),
-                    variant: details.variant.clone(),
-                })
-            }
+            Ok(details) => Ok(image_details_from_inspect(&details)),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => Err(CellaDockerError::ImageNotFound {
@@ -1075,5 +1084,91 @@ mod tests {
     #[test]
     fn has_buildx_false_for_missing_binary() {
         assert!(!has_buildx(Some("/nonexistent/docker-binary-xyz")));
+    }
+
+    // -----------------------------------------------------------------------
+    // image_details_from_inspect (Config -> ImageDetails mapping)
+    // -----------------------------------------------------------------------
+
+    fn image_config(
+        user: Option<&str>,
+        entrypoint: Option<Vec<&str>>,
+        cmd: Option<Vec<&str>>,
+    ) -> bollard::models::ImageConfig {
+        bollard::models::ImageConfig {
+            user: user.map(ToString::to_string),
+            entrypoint: entrypoint.map(|v| v.into_iter().map(ToString::to_string).collect()),
+            cmd: cmd.map(|v| v.into_iter().map(ToString::to_string).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn image_details_maps_entrypoint_and_cmd() {
+        // A real `docker inspect` Config carries Entrypoint/Cmd arrays; the
+        // mapping must surface both for the compose override's entrypoint
+        // fallback, alongside user/env/metadata/os/arch. Os/Architecture/Variant
+        // are a pure passthrough (no arch-dependent logic), so the mapping test
+        // asserts whatever the inspect response carries rather than the host
+        // platform.
+        let mut labels = HashMap::new();
+        labels.insert(
+            "devcontainer.metadata".to_string(),
+            r#"[{"id":"x"}]"#.to_string(),
+        );
+        let config = bollard::models::ImageConfig {
+            env: Some(vec!["PATH=/usr/local/bin".to_string()]),
+            labels: Some(labels),
+            ..image_config(
+                Some("vscode:vscode"),
+                Some(vec!["/usr/local/bin/entry", "--flag"]),
+                Some(vec!["bash", "-l"]),
+            )
+        };
+        let inspect = bollard::models::ImageInspect {
+            os: Some("linux".to_string()),
+            architecture: Some("arm64".to_string()),
+            variant: Some("v8".to_string()),
+            config: Some(config),
+            ..Default::default()
+        };
+        let details = image_details_from_inspect(&inspect);
+        assert_eq!(details.user, "vscode");
+        assert_eq!(details.env, vec!["PATH=/usr/local/bin".to_string()]);
+        assert_eq!(details.os.as_deref(), Some("linux"));
+        assert_eq!(details.architecture.as_deref(), Some("arm64"));
+        assert_eq!(details.variant.as_deref(), Some("v8"));
+        assert_eq!(
+            details.entrypoint,
+            vec!["/usr/local/bin/entry".to_string(), "--flag".to_string()]
+        );
+        assert_eq!(details.cmd, vec!["bash".to_string(), "-l".to_string()]);
+        assert_eq!(details.metadata.as_deref(), Some(r#"[{"id":"x"}]"#));
+    }
+
+    #[test]
+    fn image_details_entrypoint_and_cmd_default_empty_when_absent() {
+        // No Entrypoint/Cmd in Config -> empty vecs (not a panic / missing key).
+        let inspect = bollard::models::ImageInspect {
+            config: Some(image_config(Some("root"), None, None)),
+            ..Default::default()
+        };
+        let details = image_details_from_inspect(&inspect);
+        assert!(details.entrypoint.is_empty());
+        assert!(details.cmd.is_empty());
+        assert_eq!(details.user, "root");
+    }
+
+    #[test]
+    fn image_details_no_config_yields_root_and_empty() {
+        // A Config-less inspect response (rare, but possible) must not panic and
+        // must default user to "root" with empty entrypoint/cmd/env.
+        let inspect = bollard::models::ImageInspect::default();
+        let details = image_details_from_inspect(&inspect);
+        assert_eq!(details.user, "root");
+        assert!(details.env.is_empty());
+        assert!(details.entrypoint.is_empty());
+        assert!(details.cmd.is_empty());
+        assert!(details.metadata.is_none());
     }
 }

@@ -63,6 +63,17 @@ pub struct ResolvedService {
     /// Secret file mounts. Same shape as `configs`.
     #[serde(default)]
     pub secrets: Vec<serde_json::Value>,
+    /// Service `entrypoint`. May be absent (→ `Value::Null`), a string (shell
+    /// form, e.g. `"/docker-entrypoint.sh foo"`), or an array of strings (exec
+    /// form). Kept as raw `serde_json::Value` and normalized by
+    /// [`extract_service_entrypoint_command`]; the compose override needs it to
+    /// preserve the service's original entrypoint when wrapping for feature
+    /// entrypoints.
+    #[serde(default)]
+    pub entrypoint: serde_json::Value,
+    /// Service `command`. Same string/array/absent shape as `entrypoint`.
+    #[serde(default)]
+    pub command: serde_json::Value,
 }
 
 /// Resolved build config for a compose service.
@@ -175,6 +186,70 @@ pub fn extract_service_build_info(
     Err(CellaComposeError::ServiceHasNoBuildOrImage {
         service: service.to_string(),
     })
+}
+
+/// A service's resolved `(entrypoint, command)` argv token lists.
+///
+/// Each is `None` when the service does not declare that key, and `Some(tokens)`
+/// otherwise (string forms shell-split, array forms verbatim). `Some(empty)`
+/// means an explicit empty list (`command: []`), which is distinct from absent.
+pub type ServiceEntrypointCommand = (Option<Vec<String>>, Option<Vec<String>>);
+
+/// Normalize a compose `entrypoint`/`command` value into argv tokens.
+///
+/// Mirrors the official CLI's `typeof x === 'string' ? shellQuote.parse(x) : x`:
+/// - **String** → POSIX shell word-split (so `"sh -c 'echo hi'"` becomes three
+///   tokens). A string that fails to parse (e.g. an unbalanced quote, which a
+///   resolved compose config should never produce) is kept as a single token
+///   rather than dropped.
+/// - **Array** → its string elements verbatim (non-string elements are skipped).
+/// - **Null / anything else** → `None` (the key was absent).
+fn compose_value_to_words(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(s) => {
+            Some(shell_words::split(s).unwrap_or_else(|_| vec![s.clone()]))
+        }
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Extract a service's resolved `entrypoint` and `command` as argv token lists.
+///
+/// Returns `(entrypoint, command)` where each is `None` when the service does
+/// not declare that key and `Some(tokens)` otherwise (string forms are
+/// shell-split, array forms taken as-is). Used by the compose override to
+/// resolve the wrapped entrypoint's `userEntrypoint`/`userCommand` the same way
+/// the official CLI does.
+///
+/// # Errors
+///
+/// Returns an error if the service is not present in the resolved config.
+pub fn extract_service_entrypoint_command(
+    config: &ResolvedComposeConfig,
+    service: &str,
+) -> Result<ServiceEntrypointCommand, CellaComposeError> {
+    let svc = config
+        .services
+        .get(service)
+        .ok_or_else(|| CellaComposeError::ServiceNotFound {
+            service: service.to_string(),
+            available: config
+                .services
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        })?;
+    Ok((
+        compose_value_to_words(&svc.entrypoint),
+        compose_value_to_words(&svc.command),
+    ))
 }
 
 #[cfg(test)]
@@ -482,5 +557,89 @@ mod tests {
         assert!(svc.tmpfs.is_array());
         assert_eq!(svc.configs.len(), 1);
         assert_eq!(svc.secrets.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_service_entrypoint_command (string / array / absent)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn entrypoint_command_string_form_is_shell_split() {
+        // Compose string form is shell-split (matching shellQuote.parse): the
+        // quoted segment stays a single token.
+        let json = r#"{
+            "services": {
+                "app": {
+                    "entrypoint": "/docker-entrypoint.sh",
+                    "command": "sh -c 'echo hi there'"
+                }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let (ep, cmd) = extract_service_entrypoint_command(&config, "app").unwrap();
+        assert_eq!(ep, Some(vec!["/docker-entrypoint.sh".to_string()]));
+        assert_eq!(
+            cmd,
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hi there".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn entrypoint_command_array_form_is_verbatim() {
+        // Exec (array) form is taken element-for-element, no splitting.
+        let json = r#"{
+            "services": {
+                "app": {
+                    "entrypoint": ["/bin/tini", "--"],
+                    "command": ["node", "server.js", "--port=3000"]
+                }
+            }
+        }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let (ep, cmd) = extract_service_entrypoint_command(&config, "app").unwrap();
+        assert_eq!(ep, Some(vec!["/bin/tini".to_string(), "--".to_string()]));
+        assert_eq!(
+            cmd,
+            Some(vec![
+                "node".to_string(),
+                "server.js".to_string(),
+                "--port=3000".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn entrypoint_command_absent_yields_none() {
+        // No keys declared -> both None (so the override falls back to image
+        // entrypoint/cmd, mirroring the official `composeEntrypoint || image`).
+        let json = r#"{ "services": { "app": { "image": "nginx" } } }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let (ep, cmd) = extract_service_entrypoint_command(&config, "app").unwrap();
+        assert_eq!(ep, None);
+        assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn entrypoint_command_empty_array_is_some_empty() {
+        // An explicit empty array (`command: []`) is distinct from absent: it
+        // resolves to Some(empty), which the override must honor (it clears the
+        // image CMD) rather than treat as "fall back to image".
+        let json = r#"{ "services": { "app": { "command": [] } } }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let (ep, cmd) = extract_service_entrypoint_command(&config, "app").unwrap();
+        assert_eq!(ep, None);
+        assert_eq!(cmd, Some(Vec::new()));
+    }
+
+    #[test]
+    fn entrypoint_command_service_not_found_errors() {
+        let json = r#"{ "services": { "app": { "image": "nginx" } } }"#;
+        let config: ResolvedComposeConfig = serde_json::from_str(json).unwrap();
+        let err = extract_service_entrypoint_command(&config, "web").unwrap_err();
+        assert!(matches!(err, CellaComposeError::ServiceNotFound { .. }));
     }
 }
