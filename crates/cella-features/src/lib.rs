@@ -75,6 +75,23 @@ use tracing::{debug, warn};
 // Internal intermediate type for parsed feature entries
 // ---------------------------------------------------------------------------
 
+/// Controls which keys are omitted from the generated `devcontainer.metadata`
+/// image label.
+///
+/// Each field corresponds to one CLI flag. `Default` yields full output
+/// (nothing omitted). Adding a new axis is a non-breaking, additive change.
+#[derive(Clone, Copy, Default)]
+pub struct MetadataOmit {
+    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
+    /// user-config entry so host-specific or secret values are not persisted.
+    /// Wired on `up` only; `build` leaves this false.
+    pub remote_env: bool,
+    /// `--skip-persisting-customizations-from-features`: strip `customizations`
+    /// from per-feature entries only (not the user-config entry).
+    /// Wired on `build` only; `up` leaves this false.
+    pub feature_customizations: bool,
+}
+
 /// Context about the base image for feature resolution.
 pub struct BaseImageContext<'a> {
     /// The base image reference (e.g., stage name or `ubuntu:22.04`).
@@ -83,9 +100,8 @@ pub struct BaseImageContext<'a> {
     pub image_user: &'a str,
     /// `devcontainer.metadata` label from the base image, if available.
     pub metadata: Option<&'a str>,
-    /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
-    /// user-config entry of the generated `devcontainer.metadata` label.
-    pub omit_remote_env: bool,
+    /// Which keys to omit from the generated `devcontainer.metadata` label.
+    pub omit: MetadataOmit,
 }
 
 /// OCI digest metadata captured for a feature so it can be pinned in the
@@ -163,7 +179,7 @@ pub async fn resolve_features(
                 config,
                 cache,
                 base_image_ctx.metadata,
-                base_image_ctx.omit_remote_env,
+                base_image_ctx.omit,
             );
         }
     };
@@ -236,7 +252,7 @@ pub async fn resolve_features(
         &resolved,
         config,
         base_image_ctx.metadata,
-        base_image_ctx.omit_remote_env,
+        base_image_ctx.omit,
     );
 
     debug!(
@@ -267,18 +283,21 @@ pub async fn resolve_features(
 ///   mounts, customizations, and lifecycle commands).
 /// - The last element is the user's `devcontainer.json` properties.
 ///
-/// When `omit_remote_env` is set (the `--omit-config-remote-env-from-metadata`
-/// flag), the `remoteEnv` key is stripped from the user-config entry so that
-/// host-specific or secret remote-env values are not persisted into the image
-/// label. This mirrors the official CLI, which removes `remoteEnv` from the
-/// `pickConfigProperties` whitelist when the flag is set. It affects ONLY the
-/// `devcontainer.metadata` label, never the runtime `dev.cella.remote_env`
-/// label used to re-inject env across restarts.
+/// `omit` controls selective key removal:
+/// - `omit.remote_env` (`--omit-config-remote-env-from-metadata`): strips
+///   `remoteEnv` from the user-config entry so host-specific or secret values
+///   are not persisted. Mirrors the official CLI's `pickConfigProperties`
+///   whitelist exclusion. Affects ONLY the user-config entry, never the
+///   runtime `dev.cella.remote_env` label.
+/// - `omit.feature_customizations` (`--skip-persisting-customizations-from-features`):
+///   strips `customizations` from per-feature entries only (not the
+///   user-config entry). Mirrors the official CLI's
+///   `skipFeaturesCustomizationsKindMetadata` flag.
 pub fn generate_metadata_label(
     features: &[ResolvedFeature],
     user_config: &serde_json::Value,
     base_image_metadata: Option<&str>,
-    omit_remote_env: bool,
+    omit: MetadataOmit,
 ) -> String {
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
@@ -294,11 +313,14 @@ pub fn generate_metadata_label(
 
     // One entry per feature.
     for feature in features {
-        entries.push(build_feature_metadata_entry(feature));
+        entries.push(build_feature_metadata_entry(
+            feature,
+            omit.feature_customizations,
+        ));
     }
 
     // Last element: user config properties. Optionally strip `remoteEnv`.
-    let user_entry = if omit_remote_env {
+    let user_entry = if omit.remote_env {
         let mut stripped = user_config.clone();
         if let Some(obj) = stripped.as_object_mut() {
             obj.remove("remoteEnv");
@@ -321,7 +343,7 @@ fn resolve_empty_features(
     config: &serde_json::Value,
     cache: &FeatureCache,
     base_image_metadata: Option<&str>,
-    omit_remote_env: bool,
+    omit: MetadataOmit,
 ) -> Result<ResolvedFeatures, FeatureError> {
     debug!("no features declared in devcontainer.json");
     let build_context = cache.build_context_path("empty");
@@ -337,7 +359,7 @@ fn resolve_empty_features(
         dockerfile: String::new(),
         build_context,
         container_config,
-        metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit_remote_env),
+        metadata_label: generate_metadata_label(&[], config, base_image_metadata, omit),
         lockfile: None,
     })
 }
@@ -1061,7 +1083,14 @@ async fn expand_depends_on(
 // ---------------------------------------------------------------------------
 
 /// Build a single metadata label entry for a resolved feature.
-fn build_feature_metadata_entry(feature: &ResolvedFeature) -> serde_json::Value {
+///
+/// When `omit_customizations` is `true` (the
+/// `--skip-persisting-customizations-from-features` flag), the `customizations`
+/// key is excluded from the entry. All other fields are unaffected.
+fn build_feature_metadata_entry(
+    feature: &ResolvedFeature,
+    omit_customizations: bool,
+) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert("id".into(), serde_json::json!(feature.id));
 
@@ -1080,7 +1109,7 @@ fn build_feature_metadata_entry(feature: &ResolvedFeature) -> serde_json::Value 
         entry.insert("mounts".into(), serde_json::json!(feature.metadata.mounts));
     }
 
-    if let Some(cust) = &feature.metadata.customizations {
+    if !omit_customizations && let Some(cust) = &feature.metadata.customizations {
         entry.insert("customizations".into(), cust.clone());
     }
 
@@ -1185,7 +1214,12 @@ mod tests {
 
     #[test]
     fn metadata_label_empty_features() {
-        let label = generate_metadata_label(&[], &json!({"image": "ubuntu"}), None, false);
+        let label = generate_metadata_label(
+            &[],
+            &json!({"image": "ubuntu"}),
+            None,
+            MetadataOmit::default(),
+        );
         let parsed: serde_json::Value = serde_json::from_str(&label).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1208,7 +1242,7 @@ mod tests {
             has_install_script: true,
         }];
 
-        let label = generate_metadata_label(&features, &json!({}), None, false);
+        let label = generate_metadata_label(&features, &json!({}), None, MetadataOmit::default());
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         assert_eq!(parsed.len(), 2);
@@ -1220,7 +1254,8 @@ mod tests {
     #[test]
     fn metadata_label_with_base_image_metadata() {
         let base_meta = r#"[{"id":"base","containerEnv":{"LANG":"C.UTF-8"}}]"#;
-        let label = generate_metadata_label(&[], &json!({}), Some(base_meta), false);
+        let label =
+            generate_metadata_label(&[], &json!({}), Some(base_meta), MetadataOmit::default());
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         // base entry + user config entry
@@ -1231,7 +1266,8 @@ mod tests {
     #[test]
     fn metadata_label_base_image_non_array() {
         let base_meta = r#"{"id":"single"}"#;
-        let label = generate_metadata_label(&[], &json!({}), Some(base_meta), false);
+        let label =
+            generate_metadata_label(&[], &json!({}), Some(base_meta), MetadataOmit::default());
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
 
         assert_eq!(parsed.len(), 2);
@@ -1246,8 +1282,16 @@ mod tests {
             "remoteUser": "vscode",
         });
 
-        // omit=true strips remoteEnv from the user-config entry...
-        let omitted = generate_metadata_label(&[], &config, None, true);
+        // remote_env=true strips remoteEnv from the user-config entry...
+        let omitted = generate_metadata_label(
+            &[],
+            &config,
+            None,
+            MetadataOmit {
+                remote_env: true,
+                ..Default::default()
+            },
+        );
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&omitted).unwrap();
         let entry = parsed.last().unwrap();
         assert!(entry.get("remoteEnv").is_none());
@@ -1255,8 +1299,8 @@ mod tests {
         assert_eq!(entry["remoteUser"], "vscode");
         assert_eq!(entry["image"], "ubuntu");
 
-        // omit=false retains remoteEnv.
-        let kept = generate_metadata_label(&[], &config, None, false);
+        // default (omit nothing) retains remoteEnv.
+        let kept = generate_metadata_label(&[], &config, None, MetadataOmit::default());
         let parsed_kept: Vec<serde_json::Value> = serde_json::from_str(&kept).unwrap();
         assert_eq!(parsed_kept.last().unwrap()["remoteEnv"]["SECRET"], "value");
     }
@@ -1265,10 +1309,71 @@ mod tests {
     fn metadata_label_omit_remote_env_is_noop_without_key() {
         // A config that has no remoteEnv must not panic and must be unchanged.
         let config = json!({"image": "ubuntu"});
-        let label = generate_metadata_label(&[], &config, None, true);
+        let label = generate_metadata_label(
+            &[],
+            &config,
+            None,
+            MetadataOmit {
+                remote_env: true,
+                ..Default::default()
+            },
+        );
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
         assert_eq!(parsed.last().unwrap()["image"], "ubuntu");
         assert!(parsed.last().unwrap().get("remoteEnv").is_none());
+    }
+
+    #[test]
+    fn metadata_label_omits_feature_customizations_when_requested() {
+        let features = vec![ResolvedFeature {
+            id: "python".to_string(),
+            original_ref: "ghcr.io/devcontainers/features/python:1".to_string(),
+            metadata: FeatureMetadata {
+                id: "python".to_string(),
+                customizations: Some(json!({"vscode": {"extensions": ["ms-python.python"]}})),
+                entrypoint: Some("/init.sh".to_string()),
+                ..Default::default()
+            },
+            user_options: HashMap::new(),
+            artifact_dir: PathBuf::from("/tmp/features/python"),
+            has_install_script: true,
+        }];
+        let user_config = json!({
+            "image": "ubuntu",
+            "customizations": {"vscode": {"extensions": ["user.ext"]}},
+        });
+
+        // flag on: feature entry drops customizations; user-config entry keeps them.
+        let omit = MetadataOmit {
+            feature_customizations: true,
+            ..Default::default()
+        };
+        let label = generate_metadata_label(&features, &user_config, None, omit);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&label).unwrap();
+        // [feature_entry, user_config_entry]
+        assert_eq!(parsed.len(), 2);
+        let feature_entry = &parsed[0];
+        let user_entry = &parsed[1];
+        assert!(
+            feature_entry.get("customizations").is_none(),
+            "feature customizations must be absent when flag is set"
+        );
+        assert_eq!(feature_entry["id"], "python");
+        assert_eq!(feature_entry["entrypoint"], "/init.sh");
+        // user-config customizations must be untouched.
+        assert!(
+            user_entry.get("customizations").is_some(),
+            "user-config customizations must be retained"
+        );
+
+        // flag off: both present.
+        let label_full =
+            generate_metadata_label(&features, &user_config, None, MetadataOmit::default());
+        let parsed_full: Vec<serde_json::Value> = serde_json::from_str(&label_full).unwrap();
+        assert!(
+            parsed_full[0].get("customizations").is_some(),
+            "feature customizations must be present when flag is not set"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1375,7 +1480,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1405,7 +1510,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1459,7 +1564,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1576,7 +1681,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1642,7 +1747,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1687,7 +1792,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1732,7 +1837,7 @@ mod tests {
                 base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1866,7 +1971,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -1955,7 +2060,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2022,7 +2127,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2086,7 +2191,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2163,7 +2268,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
@@ -2227,7 +2332,7 @@ mod tests {
                 base_image: "ubuntu:22.04",
                 image_user: "root",
                 metadata: None,
-                omit_remote_env: false,
+                omit: MetadataOmit::default(),
             },
             false,
             LockfilePolicy::NoLockfile,
