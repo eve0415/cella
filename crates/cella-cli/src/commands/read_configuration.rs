@@ -262,15 +262,6 @@ pub async fn resolve_merged_config(
     Ok(build_merged_output(config, Some(&rf)))
 }
 
-/// Build `mergedConfiguration` from a container's baked `devcontainer.metadata` label.
-///
-/// When a container target is provided, the official CLI reads the container's
-/// `devcontainer.metadata` label (a JSON array baked during `up`) instead of
-/// re-resolving features from OCI registries. This matches
-/// `getImageMetadataFromContainer` → `mergeConfiguration` in the official CLI.
-///
-/// If the label is absent or empty, merges with an empty metadata array, which
-/// is equivalent to no features — only the devcontainer.json config contributes.
 /// Build `mergedConfiguration` from a container's baked `devcontainer.metadata`
 /// label, with no OCI/network access — mirroring the official
 /// `getImageMetadataFromContainer` + `mergeConfiguration`.
