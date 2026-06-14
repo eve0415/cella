@@ -6,6 +6,7 @@ use clap::Args;
 use serde_json::json;
 use tracing::{debug, warn};
 
+use super::exec::spec_identity_labels;
 use super::{
     BuildKitMode, ComposePullPolicy, GpuAvailability, ImagePullPolicy, LogFormat, LogLevel,
     MountConsistency, OutputFormat, StrictnessLevel, UpdateRemoteUserUidDefault,
@@ -1612,13 +1613,32 @@ impl UpArgs {
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resolved_format = self.output.resolve();
+
+        // Capture inputs needed for the best-effort container re-find BEFORE
+        // `self` is moved into `execute_inner`. These are cloned early so the
+        // success path is byte-for-byte unchanged.
+        let backend = self.backend.clone();
+        let workspace_folder = self.workspace_folder.clone();
+        let config = self.config.clone();
+        let override_config = self.config_inputs.override_config.clone();
+
         // The `up` argument surface is large; box the inner future to keep
         // the wrapper's frame small (clippy::large_futures).
         match Box::pin(self.execute_inner(progress)).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if matches!(resolved_format, OutputFormat::Json) {
-                    output_error_result(&e.to_string());
+                    let container_id = best_effort_container_id(
+                        &backend,
+                        workspace_folder.as_deref(),
+                        config.as_deref(),
+                        override_config.as_deref(),
+                    )
+                    .await;
+                    output_error_result(ErrorEnvelope {
+                        message: &e.to_string(),
+                        container_id: container_id.as_deref(),
+                    });
                     std::process::exit(1);
                 }
                 Err(e)
@@ -1783,26 +1803,82 @@ pub fn output_result(data: &UpRenderData<'_>) {
     }
 }
 
+/// The structured error envelope emitted to STDOUT on `up` failure in JSON mode.
+///
+/// Mirrors the official `devcontainer` CLI's `ContainerError` result shape.
+/// Fields beyond `message` and `container_id` are deliberately absent:
+/// - `containerId`: populated here via a best-effort container re-find when an
+///   id can be recovered after failure; absent if the container was never created
+///   or cannot be found.
+/// - `disallowedFeatureId`: cella has no disallowed-feature policy.
+/// - `didStopContainer`: cella does not stop containers on failure and cannot
+///   attribute a stop to a specific error without deep structured-error
+///   instrumentation (intentionally not introduced here).
+/// - `learnMoreUrl`: cella has no structured error → URL mapping.
+#[derive(Clone, Copy)]
+pub struct ErrorEnvelope<'a> {
+    /// The error message (`e.to_string()`).
+    pub message: &'a str,
+    /// Container id recovered by best-effort re-find; `None` when unavailable.
+    pub container_id: Option<&'a str>,
+}
+
 /// Render the JSON error envelope and write it to STDOUT.
 ///
-/// Mirrors the official CLI's failure result: `{ outcome: "error", message,
-/// description }`. cella has no structured container error carrying
-/// `containerId`/`didStopContainer`/`disallowedFeatureId`/`learnMoreUrl`, so
-/// those keys are simply absent (documented gap).
-pub fn output_error_result(message: &str) {
-    println!("{}", render_error_result(message));
+/// Mirrors the official CLI's failure result: `{ outcome, message, description
+/// [, containerId] }`. `containerId` is included when the envelope carries one
+/// (recovered via best-effort re-find after failure). The remaining official
+/// partial-failure fields (`didStopContainer`, `disallowedFeatureId`,
+/// `learnMoreUrl`) are absent — see [`ErrorEnvelope`] doc for reasons.
+pub fn output_error_result(envelope: ErrorEnvelope<'_>) {
+    println!("{}", render_error_result(envelope));
 }
 
 /// Pure formatter for the error envelope (single-line JSON, no trailing
 /// newline) so the shape can be unit-tested without capturing stdout.
+///
+/// Inserts `"containerId"` only when [`ErrorEnvelope::container_id`] is
+/// `Some`, keeping the None-case output byte-identical to the previous shape.
 #[must_use]
-pub fn render_error_result(message: &str) -> String {
-    let output = json!({
-        "outcome": "error",
-        "message": message,
-        "description": "An error occurred setting up the container.",
-    });
-    serde_json::to_string(&output).unwrap_or_default()
+pub fn render_error_result(envelope: ErrorEnvelope<'_>) -> String {
+    let mut map = serde_json::Map::new();
+    map.insert("outcome".to_string(), json!("error"));
+    map.insert("message".to_string(), json!(envelope.message));
+    map.insert(
+        "description".to_string(),
+        json!("An error occurred setting up the container."),
+    );
+    if let Some(id) = envelope.container_id {
+        map.insert("containerId".to_string(), json!(id));
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+/// Best-effort recovery of a partial container's id after a failed `up`.
+///
+/// Resolves the spec-identity labels (`devcontainer.local_folder` +
+/// `devcontainer.config_file`) from the same inputs `up` used, then asks the
+/// backend for any container — regardless of state — that carries those labels.
+/// Any failure (backend unavailable, paths unresolvable, no container found)
+/// silently returns `None`; the original error message is always preserved.
+async fn best_effort_container_id(
+    backend: &crate::backend::BackendArgs,
+    workspace_folder: Option<&Path>,
+    config: Option<&Path>,
+    override_config: Option<&Path>,
+) -> Option<String> {
+    let cwd = crate::commands::resolve_workspace_folder(workspace_folder).ok()?;
+    let resolved = resolve::config_with_override(&cwd, config, override_config).ok()?;
+    let client = backend.resolve_client().await.ok()?;
+    client
+        .find_container_by_labels(&spec_identity_labels(
+            &resolved.workspace_root,
+            &resolved.config_path,
+        ))
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.id)
 }
 
 /// Pure formatter for the `cella up` success output. Returns the exact
@@ -2611,16 +2687,38 @@ mod tests {
 
     #[test]
     fn render_error_result_shape() {
-        // The error envelope carries only outcome/message/description —
-        // cella has no structured ContainerError, so containerId and the
-        // other partial-failure keys are absent.
-        let out = render_error_result("could not resolve devcontainer.json");
+        // Without a container id the envelope carries only outcome/message/description.
+        // containerId is absent (container never created or not found); the
+        // other partial-failure fields (didStopContainer, disallowedFeatureId,
+        // learnMoreUrl) are permanently absent — see ErrorEnvelope doc.
+        let out = render_error_result(ErrorEnvelope {
+            message: "could not resolve devcontainer.json",
+            container_id: None,
+        });
         insta::assert_snapshot!(
             out,
             @r#"{"description":"An error occurred setting up the container.","message":"could not resolve devcontainer.json","outcome":"error"}"#
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(parsed.get("containerId").is_none());
+        assert!(parsed.get("didStopContainer").is_none());
+    }
+
+    #[test]
+    fn render_error_result_with_container_id() {
+        // When a partial container can be recovered by spec-identity re-find,
+        // containerId is included in the envelope.
+        let out = render_error_result(ErrorEnvelope {
+            message: "postCreateCommand failed",
+            container_id: Some("abc123def456"),
+        });
+        insta::assert_snapshot!(
+            out,
+            @r#"{"containerId":"abc123def456","description":"An error occurred setting up the container.","message":"postCreateCommand failed","outcome":"error"}"#
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["containerId"], json!("abc123def456"));
+        assert_eq!(parsed["outcome"], json!("error"));
         assert!(parsed.get("didStopContainer").is_none());
     }
 
