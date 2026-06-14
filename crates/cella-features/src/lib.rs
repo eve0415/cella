@@ -78,8 +78,11 @@ use tracing::{debug, warn};
 /// Controls which keys are omitted from the generated `devcontainer.metadata`
 /// image label.
 ///
-/// Each field corresponds to one CLI flag. `Default` yields full output
-/// (nothing omitted). Adding a new axis is a non-breaking, additive change.
+/// Each field corresponds to one CLI flag; `Default` yields full output
+/// (nothing omitted). New omit axes are added as fields — a struct-literal
+/// change that the in-workspace constructors are updated for together (this is a
+/// `pub` struct, so a new field is not source-compatible for outside callers,
+/// but cella keeps all callers in-tree).
 #[derive(Clone, Copy, Default)]
 pub struct MetadataOmit {
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
