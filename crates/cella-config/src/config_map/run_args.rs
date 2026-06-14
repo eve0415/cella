@@ -70,9 +70,14 @@ pub fn parse_run_args(args: &[String]) -> RunArgsOverrides {
                 parse_other_arg(flag, &mut i, inline_val, &next_val, &mut result);
             }
 
+            "--cap-add" | "--cap-drop" | "--group-add" | "--volume" | "-v" => {
+                parse_capability_arg(flag, &mut i, inline_val, &next_val, &mut result);
+            }
+
             // -- Boolean flags (no value) --
             "--init" => result.init = Some(true),
             "--privileged" => result.privileged = Some(true),
+            "--read-only" => result.read_only = Some(true),
 
             _ => {
                 result.unrecognized.push(arg.clone());
@@ -369,6 +374,39 @@ fn parse_other_arg(
     }
 }
 
+/// Parse capability, supplementary-group, and bind-mount flags.
+fn parse_capability_arg(
+    flag: &str,
+    i: &mut usize,
+    inline_val: Option<&str>,
+    next_val: &NextValFn<'_>,
+    result: &mut RunArgsOverrides,
+) {
+    match flag {
+        "--cap-add" => {
+            if let Some(v) = next_val(i, inline_val) {
+                result.cap_add.push(v);
+            }
+        }
+        "--cap-drop" => {
+            if let Some(v) = next_val(i, inline_val) {
+                result.cap_drop.push(v);
+            }
+        }
+        "--group-add" => {
+            if let Some(v) = next_val(i, inline_val) {
+                result.group_add.push(v);
+            }
+        }
+        "--volume" | "-v" => {
+            if let Some(v) = next_val(i, inline_val) {
+                result.binds.push(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parse a byte size string (e.g., "512m", "2g", "1024") into bytes.
 pub fn parse_byte_size(s: &str) -> Option<i64> {
     let s = s.trim().to_lowercase();
@@ -651,6 +689,51 @@ mod tests {
         ]));
         assert_eq!(r.log_driver.as_deref(), Some("json-file"));
         assert_eq!(r.log_opt.get("max-size").unwrap(), "10m");
+    }
+
+    // -- Capabilities / groups / volumes / read-only --
+
+    #[test]
+    fn parse_cap_add_and_drop() {
+        let r = parse_run_args(&args(&["--cap-add=SYS_PTRACE", "--cap-drop", "MKNOD"]));
+        assert_eq!(r.cap_add, vec!["SYS_PTRACE"]);
+        assert_eq!(r.cap_drop, vec!["MKNOD"]);
+    }
+
+    #[test]
+    fn parse_volume_short_and_long() {
+        let r = parse_run_args(&args(&["-v", "/h:/c", "--volume=/data:/data:ro"]));
+        assert_eq!(r.binds, vec!["/h:/c", "/data:/data:ro"]);
+    }
+
+    #[test]
+    fn parse_group_add() {
+        let r = parse_run_args(&args(&["--group-add", "docker"]));
+        assert_eq!(r.group_add, vec!["docker"]);
+    }
+
+    #[test]
+    fn parse_read_only() {
+        let r = parse_run_args(&args(&["--read-only"]));
+        assert_eq!(r.read_only, Some(true));
+    }
+
+    /// The canonical debugger block: `--cap-add` + `--security-opt` together.
+    /// Neither must land in `unrecognized` (the bug this parser arm fixes).
+    #[test]
+    fn cap_add_with_security_opt_not_unrecognized() {
+        let r = parse_run_args(&args(&[
+            "--cap-add=SYS_PTRACE",
+            "--security-opt",
+            "seccomp=unconfined",
+        ]));
+        assert!(
+            r.unrecognized.is_empty(),
+            "unrecognized: {:?}",
+            r.unrecognized
+        );
+        assert_eq!(r.cap_add, vec!["SYS_PTRACE"]);
+        assert_eq!(r.security_opt, vec!["seccomp=unconfined"]);
     }
 
     // -- Unrecognized --
