@@ -155,7 +155,7 @@ pub struct InteractiveExecOptions {
 // ---------------------------------------------------------------------------
 
 /// Image inspection results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImageDetails {
     /// Normalized USER (user portion only, defaults to `"root"`).
     pub user: String,

@@ -145,6 +145,18 @@ const fn base_output(will_build_features: bool, output: Option<&str>) -> Option<
     if will_build_features { None } else { output }
 }
 
+/// Whether to skip inspecting the base image after the build.
+///
+/// A non-loading `--output` export with no features builds the image but does
+/// NOT load it into the local store, so a follow-up `inspect_image_details`
+/// would fail right after a successful export. In that one case the inspect is
+/// skipped (the no-features build path discards these details, and `up` never
+/// exports). With features, the base build still `--load`s (the export rides the
+/// features layer), so the base remains inspectable.
+const fn skip_base_inspect(has_features: bool, output: Option<&str>) -> bool {
+    !has_features && output.is_some()
+}
+
 /// Ensure the dev container image exists (pull or build), including features layer.
 ///
 /// When `no_cache` is true, `--no-cache` and `--pull` are passed to the base
@@ -171,6 +183,14 @@ pub async fn ensure_image(
         .is_some_and(|obj| !obj.is_empty());
 
     let base_image_tag = resolve_base_image(input, has_features).await?;
+
+    // A non-loading `--output` export (no features) builds the image but does
+    // NOT load it into the local store, so inspecting it would fail right after a
+    // successful export. `cella build` discards these details on the no-features
+    // path and `up` never exports, so return empty details instead of failing.
+    if skip_base_inspect(has_features, input.output) {
+        return Ok((base_image_tag, None, ImageDetails::default()));
+    }
 
     let base_image_details = input.client.inspect_image_details(&base_image_tag).await?;
 
@@ -1113,5 +1133,26 @@ mod tests {
             Some("type=local,dest=/tmp/out")
         );
         assert_eq!(base_output(false, None), None);
+    }
+
+    // ── skip_base_inspect: don't inspect a non-loaded export ─────────
+    //
+    // `ensure_image` inspects the base image after building. A non-loading
+    // `--output` export (no features) leaves nothing in the local store to
+    // inspect, so the inspect MUST be skipped — otherwise the command fails
+    // right after a successful export. A regression that re-enabled the inspect
+    // there would break every `cella build --output type=local/tar` on a
+    // Dockerfile config; this pins exactly that case.
+
+    #[test]
+    fn skip_base_inspect_only_for_no_features_export() {
+        // No features + a `--output` export → skip the inspect (image not loaded).
+        assert!(skip_base_inspect(false, Some("type=local,dest=/tmp/out")));
+        // No export → inspect normally (the build loaded the image).
+        assert!(!skip_base_inspect(false, None));
+        // With features the base build still loads (export rides the features
+        // layer), so the base stays inspectable regardless of `--output`.
+        assert!(!skip_base_inspect(true, Some("type=local,dest=/tmp/out")));
+        assert!(!skip_base_inspect(true, None));
     }
 }

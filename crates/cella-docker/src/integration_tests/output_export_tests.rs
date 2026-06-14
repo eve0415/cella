@@ -52,15 +52,13 @@ async fn output_type_local_exports_to_dest() {
 
     let context = scratch_dir("ctx");
     let dest = scratch_dir("dest");
-    if std::fs::create_dir_all(&context).is_err() || std::fs::create_dir_all(&dest).is_err() {
-        return;
-    }
+    // Setup failures are real bugs (not an unavailable runtime) — fail loudly.
+    std::fs::create_dir_all(&context).expect("create build context dir");
+    std::fs::create_dir_all(&dest).expect("create output dest dir");
 
     // Trivial, registry-free build: scratch base + a single sentinel file.
     let dockerfile = "FROM busybox:latest\nRUN echo cella > /cella-export-sentinel\n";
-    if std::fs::write(context.join("Dockerfile"), dockerfile).is_err() {
-        return;
-    }
+    std::fs::write(context.join("Dockerfile"), dockerfile).expect("write test Dockerfile");
     // Pre-pull the base so the build itself needs no registry round-trip beyond
     // the (cached) base; if the pull fails (offline), skip rather than fail.
     if client.pull_image("busybox:latest").await.is_err() {
