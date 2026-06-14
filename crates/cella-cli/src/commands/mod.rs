@@ -72,6 +72,69 @@ pub struct DotfilesArgs {
     pub(crate) target_path: String,
 }
 
+/// Stable feature-lockfile flags controlling lockfile read/write behavior.
+///
+/// Shared verbatim by `up` and `build` (the official CLI exposes the same flags
+/// on both). Split from [`DeprecatedLockfileArgs`] so neither struct exceeds
+/// `clippy::struct_excessive_bools` (max 3 bools); both are flattened together
+/// by each command and consumed by [`derive_lockfile_policy`].
+#[derive(Args)]
+pub struct LockfileArgs {
+    /// Disable lockfile generation and pinning.
+    #[arg(
+        long,
+        conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
+    )]
+    pub(crate) no_lockfile: bool,
+
+    /// Require the lockfile to exist and match resolved digests; fail if missing or different.
+    #[arg(long)]
+    pub(crate) frozen_lockfile: bool,
+}
+
+/// Hidden, deprecated lockfile aliases kept for devcontainer-CLI parity.
+///
+/// Flattened alongside [`LockfileArgs`]; both feed [`derive_lockfile_policy`].
+/// `experimental_lockfile` is a no-op (lockfiles are written by default now);
+/// `experimental_frozen_lockfile` maps to `--frozen-lockfile`.
+#[derive(Args)]
+pub struct DeprecatedLockfileArgs {
+    /// Deprecated: lockfile is now written by default.
+    #[arg(long, hide = true)]
+    pub(crate) experimental_lockfile: bool,
+
+    /// Deprecated alias for --frozen-lockfile.
+    #[arg(long, hide = true)]
+    pub(crate) experimental_frozen_lockfile: bool,
+}
+
+/// Derive the feature lockfile policy from the CLI lockfile flags.
+///
+/// Deprecated aliases emit a warning to stderr before delegating. Shared by
+/// `up` and `build` so both commands map the flags identically.
+pub fn derive_lockfile_policy(
+    lf: &LockfileArgs,
+    deprecated: &DeprecatedLockfileArgs,
+) -> cella_features::LockfilePolicy {
+    if deprecated.experimental_lockfile {
+        eprintln!(
+            "warning: --experimental-lockfile is deprecated; lockfile is now written by default"
+        );
+    }
+    if deprecated.experimental_frozen_lockfile {
+        eprintln!(
+            "warning: --experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead"
+        );
+    }
+    if lf.no_lockfile {
+        cella_features::LockfilePolicy::NoLockfile
+    } else if lf.frozen_lockfile || deprecated.experimental_frozen_lockfile {
+        cella_features::LockfilePolicy::Frozen
+    } else {
+        cella_features::LockfilePolicy::Update
+    }
+}
+
 /// Common flags for commands that support verbose output.
 #[derive(Args, Clone)]
 pub struct VerboseArgs {

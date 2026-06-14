@@ -89,6 +89,12 @@ pub struct BuildArgs {
     /// Log output format.
     #[arg(long = "log-format", value_enum, default_value = "text")]
     log_format: LogFormat,
+
+    #[command(flatten)]
+    lockfile: super::LockfileArgs,
+
+    #[command(flatten)]
+    deprecated_lockfile: super::DeprecatedLockfileArgs,
 }
 
 impl BuildArgs {
@@ -144,51 +150,76 @@ impl BuildArgs {
 
         // Docker Compose path: delegate to orchestrator
         if config.get("dockerComposeFile").is_some() {
-            if self.platform.is_some() {
-                return Err("--platform or --push not supported.".into());
-            }
-            let (sender, renderer) = crate::progress::bridge(&progress);
-            let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
-                config,
-                config_path: &resolved.config_path,
-                workspace_root: &resolved.workspace_root,
-                profiles: self.profile.clone(),
-                env_files: self.env_file.clone(),
-                pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
-                secrets: secrets.clone(),
-                docker_path: self.docker_path.clone(),
-                docker_compose_path: self.docker_compose_path.clone(),
-                // Match the single-container build path: update the lockfile when
-                // features are present (`cella build` has no --no-lockfile flag yet).
-                lockfile_policy: cella_features::LockfilePolicy::Update,
-            };
-            let result = cella_orchestrator::compose_build::compose_build(
-                client.as_ref(),
-                &build_cfg,
-                &sender,
-            )
-            .await
-            .map_err(|e| e.to_string());
-            drop(sender);
-            let _ = renderer.await;
-            let result =
-                result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-
-            print_result(&self.output, &result.image_name, true);
-            return Ok(());
+            return self
+                .execute_compose(client.as_ref(), &resolved, &secrets, progress)
+                .await;
         }
 
-        // Non-compose path
+        self.execute_single_container(client.as_ref(), &resolved, &secrets, progress)
+            .await
+    }
+
+    /// Build the image on the Docker Compose path.
+    ///
+    /// `--cache-from`/`--cache-to`/`--platform` are single-container only and
+    /// are not supported here (matching `up`); `--platform` is rejected
+    /// explicitly for parity with the official error message.
+    async fn execute_compose(
+        &self,
+        client: &dyn cella_backend::ContainerBackend,
+        resolved: &resolve::ResolvedConfig,
+        secrets: &[BuildSecret],
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.platform.is_some() {
+            return Err("--platform or --push not supported.".into());
+        }
+        let (sender, renderer) = crate::progress::bridge(&progress);
+        let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
+            config: &resolved.config,
+            config_path: &resolved.config_path,
+            workspace_root: &resolved.workspace_root,
+            profiles: self.profile.clone(),
+            env_files: self.env_file.clone(),
+            pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
+            secrets: secrets.to_vec(),
+            docker_path: self.docker_path.clone(),
+            docker_compose_path: self.docker_compose_path.clone(),
+            lockfile_policy: super::derive_lockfile_policy(
+                &self.lockfile,
+                &self.deprecated_lockfile,
+            ),
+        };
+        let result = cella_orchestrator::compose_build::compose_build(client, &build_cfg, &sender)
+            .await
+            .map_err(|e| e.to_string());
+        drop(sender);
+        let _ = renderer.await;
+        let result =
+            result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+        print_result(&self.output, &result.image_name, true);
+        Ok(())
+    }
+
+    /// Build the image on the single-container (image / Dockerfile) path.
+    async fn execute_single_container(
+        &self,
+        client: &dyn cella_backend::ContainerBackend,
+        resolved: &resolve::ResolvedConfig,
+        secrets: &[BuildSecret],
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (sender, renderer) = crate::progress::bridge(&progress);
         let input = EnsureImageInput {
-            client: client.as_ref(),
-            config,
+            client,
+            config: &resolved.config,
             workspace_root: &resolved.workspace_root,
-            config_name,
+            config_name: resolved.name(),
             config_path: &resolved.config_path,
             no_cache: self.no_cache,
             pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
-            secrets: &secrets,
+            secrets,
             build_tuning: cella_orchestrator::BuildTuning {
                 docker_path: self.docker_path.as_deref(),
                 use_buildkit: super::buildkit_enabled(self.buildkit),
@@ -199,8 +230,10 @@ impl BuildArgs {
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
             // `cella build` keeps the full metadata label.
             omit_remote_env_from_metadata: false,
-            // `cella build` updates the lockfile when features are present.
-            lockfile_policy: cella_features::LockfilePolicy::Update,
+            lockfile_policy: super::derive_lockfile_policy(
+                &self.lockfile,
+                &self.deprecated_lockfile,
+            ),
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;
@@ -412,6 +445,68 @@ mod tests {
         let args = parse_build(&[]);
         assert!(args.log_level().is_none());
         assert!(matches!(args.log_format(), LogFormat::Text));
+    }
+
+    // ── lockfile policy derivation ──────────────────────────────────
+
+    fn build_lockfile_policy(extra: &[&str]) -> cella_features::LockfilePolicy {
+        let args = parse_build(extra);
+        super::super::derive_lockfile_policy(&args.lockfile, &args.deprecated_lockfile)
+    }
+
+    #[test]
+    fn lockfile_default_is_update() {
+        assert_eq!(
+            build_lockfile_policy(&[]),
+            cella_features::LockfilePolicy::Update
+        );
+    }
+
+    #[test]
+    fn no_lockfile_maps_to_no_lockfile() {
+        assert_eq!(
+            build_lockfile_policy(&["--no-lockfile"]),
+            cella_features::LockfilePolicy::NoLockfile
+        );
+    }
+
+    #[test]
+    fn frozen_lockfile_maps_to_frozen() {
+        assert_eq!(
+            build_lockfile_policy(&["--frozen-lockfile"]),
+            cella_features::LockfilePolicy::Frozen
+        );
+    }
+
+    #[test]
+    fn experimental_frozen_lockfile_maps_to_frozen() {
+        // Hidden deprecated alias behaves like --frozen-lockfile (matches up).
+        assert_eq!(
+            build_lockfile_policy(&["--experimental-frozen-lockfile"]),
+            cella_features::LockfilePolicy::Frozen
+        );
+    }
+
+    #[test]
+    fn experimental_lockfile_is_noop_update() {
+        // Deprecated; lockfile is written by default, so policy stays Update.
+        assert_eq!(
+            build_lockfile_policy(&["--experimental-lockfile"]),
+            cella_features::LockfilePolicy::Update
+        );
+    }
+
+    #[test]
+    fn no_lockfile_conflicts_with_frozen() {
+        let result = TestCli::try_parse_from(["build", "--no-lockfile", "--frozen-lockfile"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_lockfile_conflicts_with_experimental_frozen() {
+        let result =
+            TestCli::try_parse_from(["build", "--no-lockfile", "--experimental-frozen-lockfile"]);
+        assert!(result.is_err());
     }
 
     #[test]

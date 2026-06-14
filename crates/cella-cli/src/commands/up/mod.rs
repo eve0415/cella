@@ -157,30 +157,10 @@ pub struct UpResultArgs {
     pub(crate) omit_config_remote_env_from_metadata: bool,
 }
 
-/// Feature-lockfile flags for controlling lockfile read/write behavior.
-#[derive(Args)]
-pub struct UpLockfileArgs {
-    /// Disable lockfile generation and pinning.
-    #[arg(
-        long,
-        conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
-    )]
-    pub(crate) no_lockfile: bool,
-
-    /// Require the lockfile to exist and match resolved digests; fail if missing or different.
-    #[arg(long)]
-    pub(crate) frozen_lockfile: bool,
-
-    /// Deprecated: lockfile is now written by default.
-    #[arg(long, hide = true)]
-    pub(crate) experimental_lockfile: bool,
-}
-
 /// Compatibility/diagnostic flags accepted for devcontainer-CLI parity.
 ///
-/// The data-folder fields and `omit_syntax_directive`/`experimental_frozen_lockfile`
-/// are no-ops in cella (it manages its own data dirs and has no feature
-/// lockfiles); the rest are wired into behavior in later phases.
+/// The data-folder fields and `omit_syntax_directive` are no-ops in cella (it
+/// manages its own data dirs); the rest are wired into behavior in later phases.
 #[derive(Args)]
 pub struct UpCompatArgs {
     /// Container data folder for in-container user data (compatibility no-op).
@@ -237,10 +217,6 @@ pub struct UpCompatArgs {
     /// Number of rows to render subprocess output for.
     #[arg(long = "terminal-rows", requires = "terminal_columns")]
     pub(crate) terminal_rows: Option<u16>,
-
-    /// Deprecated alias for --frozen-lockfile.
-    #[arg(long, hide = true)]
-    pub(crate) experimental_frozen_lockfile: bool,
 
     // `--omit-syntax-directive` is a true no-op in cella. The official CLI has
     // two effects: (A) it parses the user's Dockerfile in JS and strips any
@@ -324,7 +300,10 @@ pub struct UpArgs {
     pub(crate) result: UpResultArgs,
 
     #[command(flatten)]
-    pub(crate) lockfile: UpLockfileArgs,
+    pub(crate) lockfile: crate::commands::LockfileArgs,
+
+    #[command(flatten)]
+    pub(crate) deprecated_lockfile: crate::commands::DeprecatedLockfileArgs,
 
     #[command(flatten)]
     pub(crate) dotfiles: crate::commands::DotfilesArgs,
@@ -369,32 +348,6 @@ impl UpArgs {
             omit_syntax_directive = c.omit_syntax_directive,
             "up: accepted devcontainer-CLI compatibility no-op flags"
         );
-    }
-}
-
-/// Derive the lockfile policy from the CLI lockfile flags.
-///
-/// Deprecated aliases emit a warning to stderr before delegating.
-fn derive_lockfile_policy(
-    lf: &UpLockfileArgs,
-    compat: &UpCompatArgs,
-) -> cella_features::LockfilePolicy {
-    if lf.experimental_lockfile {
-        eprintln!(
-            "warning: --experimental-lockfile is deprecated; lockfile is now written by default"
-        );
-    }
-    if compat.experimental_frozen_lockfile {
-        eprintln!(
-            "warning: --experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead"
-        );
-    }
-    if lf.no_lockfile {
-        cella_features::LockfilePolicy::NoLockfile
-    } else if lf.frozen_lockfile || compat.experimental_frozen_lockfile {
-        cella_features::LockfilePolicy::Frozen
-    } else {
-        cella_features::LockfilePolicy::Update
     }
 }
 
@@ -913,7 +866,10 @@ impl UpContext {
             ),
             omit_remote_env_from_metadata: args.result.omit_config_remote_env_from_metadata,
             dotfiles: build_dotfiles_config(&args.dotfiles),
-            lockfile_policy: derive_lockfile_policy(&args.lockfile, &args.compat),
+            lockfile_policy: super::derive_lockfile_policy(
+                &args.lockfile,
+                &args.deprecated_lockfile,
+            ),
         })
     }
 
