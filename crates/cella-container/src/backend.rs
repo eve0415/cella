@@ -579,6 +579,14 @@ impl ContainerBackend for AppleContainerBackend {
         Box::pin(async move { self.cli.image_exists(image).await })
     }
 
+    fn tag_image<'a>(
+        &'a self,
+        source: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.cli.image_tag(source, target).await })
+    }
+
     fn inspect_image_details<'a>(
         &'a self,
         image: &'a str,

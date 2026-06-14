@@ -265,6 +265,18 @@ impl ContainerBackend for DockerClient {
         })
     }
 
+    fn tag_image<'a>(
+        &'a self,
+        source: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            DockerClient::tag_image(self, source, target)
+                .await
+                .map_err(BackendError::from)
+        })
+    }
+
     fn inspect_image_details<'a>(
         &'a self,
         image: &'a str,

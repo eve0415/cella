@@ -181,6 +181,19 @@ pub trait ContainerBackend: Send + Sync {
 
     fn image_exists<'a>(&'a self, image: &'a str) -> BoxFuture<'a, Result<bool, BackendError>>;
 
+    /// Add an additional name (`target`) to an existing image (`source`).
+    ///
+    /// The image referenced by `source` must already exist locally. After this
+    /// succeeds the same image is reachable under both names. Used by
+    /// `cella build --image-name` to stamp the built/resolved image with each
+    /// requested name (the official `devcontainer build --image-name`
+    /// build-then-tag behavior).
+    fn tag_image<'a>(
+        &'a self,
+        source: &'a str,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
     fn inspect_image_details<'a>(
         &'a self,
         image: &'a str,

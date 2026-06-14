@@ -2164,6 +2164,14 @@ mod tests {
             unimplemented!()
         }
 
+        fn tag_image<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
         fn inspect_image_details<'a>(
             &'a self,
             _: &'a str,

@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::process::Stdio;
 
-use bollard::query_parameters::CreateImageOptions;
+use bollard::query_parameters::{CreateImageOptions, TagImageOptions};
 use futures_util::StreamExt;
 use tracing::{debug, info};
 
@@ -23,6 +23,33 @@ pub(crate) fn normalize_user(raw: &str) -> String {
     } else {
         user.to_string()
     }
+}
+
+/// Split an image reference into its repository and optional tag.
+///
+/// The tag is the part after the LAST `:` that comes *after* the last `/`. A
+/// `:` that appears before a `/` is a registry-host port (e.g.
+/// `host:5000/img`), not a tag, so it is left in the repository. Returns
+/// `(repo, None)` when no tag is present so the caller can let Docker default
+/// it (`latest`) rather than synthesizing one.
+///
+/// Examples:
+/// - `img` → (`img`, None)
+/// - `img:tag` → (`img`, Some(`tag`))
+/// - `repo/img:tag` → (`repo/img`, Some(`tag`))
+/// - `host:5000/img:tag` → (`host:5000/img`, Some(`tag`))
+/// - `host:5000/img` → (`host:5000/img`, None)
+fn split_image_repo_tag(reference: &str) -> (&str, Option<&str>) {
+    let last_slash = reference.rfind('/');
+    // Only consider a `:` that comes after the last `/` (or anywhere when there
+    // is no `/`) as the tag separator; an earlier `:` is a registry port.
+    let search_from = last_slash.map_or(0, |i| i + 1);
+    reference[search_from..]
+        .rfind(':')
+        .map_or((reference, None), |rel| {
+            let colon = search_from + rel;
+            (&reference[..colon], Some(&reference[colon + 1..]))
+        })
 }
 
 /// Resolve the docker binary path (defaults to `docker` on `PATH`).
@@ -333,6 +360,31 @@ impl DockerClient {
             }) => Ok(false),
             Err(e) => Err(CellaDockerError::DockerApi(e)),
         }
+    }
+
+    /// Add an additional name (`target`) to an existing image (`source`).
+    ///
+    /// `source` is the image to tag (it must already exist locally); `target`
+    /// is the new reference, which may carry a registry host (with a port) and
+    /// an optional tag — e.g. `ghcr.io:443/org/img:1`. The target's repository
+    /// and tag are split apart so a registry port is never mistaken for a tag.
+    /// When the target has no tag, Docker defaults it (`latest`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CellaDockerError::DockerApi` if the tag operation fails (e.g.
+    /// the source image does not exist).
+    pub async fn tag_image(&self, source: &str, target: &str) -> Result<(), CellaDockerError> {
+        let (repo, tag) = split_image_repo_tag(target);
+        let options = TagImageOptions {
+            repo: Some(repo.to_string()),
+            tag: tag.map(ToString::to_string),
+        };
+        debug!("Tagging image {source} as {target}");
+        self.inner()
+            .tag_image(source, Some(options))
+            .await
+            .map_err(CellaDockerError::DockerApi)
     }
 
     /// Inspect an image and return its user, env, and metadata in one API call.
@@ -827,6 +879,55 @@ mod tests {
         assert!(is_cache_to_inline("dest=x,type=inline,mode=max"));
         assert!(!is_cache_to_inline("type=registry,ref=r"));
         assert!(!is_cache_to_inline(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // split_image_repo_tag (target reference parsing for `tag_image`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_repo_tag_bare_name_has_no_tag() {
+        assert_eq!(split_image_repo_tag("img"), ("img", None));
+    }
+
+    #[test]
+    fn split_repo_tag_name_with_tag() {
+        assert_eq!(split_image_repo_tag("img:tag"), ("img", Some("tag")));
+    }
+
+    #[test]
+    fn split_repo_tag_repo_path_with_tag() {
+        assert_eq!(
+            split_image_repo_tag("repo/img:tag"),
+            ("repo/img", Some("tag"))
+        );
+    }
+
+    #[test]
+    fn split_repo_tag_registry_port_and_tag() {
+        // The `:` before the `/` is a registry port, not the tag.
+        assert_eq!(
+            split_image_repo_tag("host:5000/img:tag"),
+            ("host:5000/img", Some("tag"))
+        );
+    }
+
+    #[test]
+    fn split_repo_tag_registry_port_without_tag() {
+        // Only a registry port, no tag — the port must stay in the repo and the
+        // tag must be None (Docker defaults it to `latest`).
+        assert_eq!(
+            split_image_repo_tag("host:5000/img"),
+            ("host:5000/img", None)
+        );
+    }
+
+    #[test]
+    fn split_repo_tag_multi_segment_repo_with_tag() {
+        assert_eq!(
+            split_image_repo_tag("ghcr.io:443/org/img:1"),
+            ("ghcr.io:443/org/img", Some("1"))
+        );
     }
 
     #[test]

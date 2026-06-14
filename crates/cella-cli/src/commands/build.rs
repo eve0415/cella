@@ -45,6 +45,12 @@ pub struct BuildArgs {
     #[arg(long = "secret")]
     secrets: Vec<String>,
 
+    /// Name(s) to tag the built/resolved image with (repeatable). When set,
+    /// these are the names reported in the build result (matching the official
+    /// `devcontainer build --image-name`).
+    #[arg(long = "image-name")]
+    image_name: Vec<String>,
+
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     output: OutputFormat,
@@ -233,7 +239,19 @@ impl BuildArgs {
         let result =
             result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        print_result(&self.output, &result.image_name, true);
+        if !self.image_name.is_empty() {
+            // `docker compose build` neither builds nor pulls an image-only
+            // service, so the resolved image may be remote-only; `tag_image`
+            // needs it present locally. Pull it if missing before tagging.
+            if !client.image_exists(&result.image_name).await? {
+                client.pull_image(&result.image_name).await?;
+            }
+            for name in &self.image_name {
+                client.tag_image(&result.image_name, name).await?;
+            }
+        }
+
+        print_result(&self.output, &self.reported_names(&result.image_name), true);
         Ok(())
     }
 
@@ -276,6 +294,10 @@ impl BuildArgs {
         let (img_name, _resolved_features, _image_details) = result?;
         let _ = renderer.await;
 
+        for name in &self.image_name {
+            client.tag_image(&img_name, name).await?;
+        }
+
         if let Some(container) = client.find_container(&resolved.workspace_root).await?
             && let Some(old_hash) = &container.config_hash
             && *old_hash != resolved.config_hash
@@ -285,8 +307,21 @@ impl BuildArgs {
             );
         }
 
-        print_result(&self.output, &img_name, false);
+        print_result(&self.output, &self.reported_names(&img_name), false);
         Ok(())
+    }
+
+    /// The image name(s) to report in the build result.
+    ///
+    /// When `--image-name` is set, the reported names are exactly those values
+    /// (the official CLI sets `imageNameResult = imageNames`, *replacing* the
+    /// built name). Otherwise the single built/resolved name is reported.
+    fn reported_names(&self, built: &str) -> Vec<String> {
+        if self.image_name.is_empty() {
+            vec![built.to_string()]
+        } else {
+            self.image_name.clone()
+        }
     }
 }
 
@@ -307,26 +342,33 @@ struct BuildResult {
 /// Build the compact JSON result line for `cella build`.
 ///
 /// Compact, single-line output (like the official CLI's `JSON.stringify`) so
-/// consumers that read one JSON object per line keep working.
-fn build_json_result(image_name: &str) -> String {
+/// consumers that read one JSON object per line keep working. `image_names`
+/// lists every reported name: the built name, or all `--image-name` values when
+/// that flag is set.
+fn build_json_result(image_names: &[String]) -> String {
     serde_json::to_string(&BuildResult {
         outcome: "success",
-        image_name: vec![image_name.to_owned()],
+        image_name: image_names.to_vec(),
     })
     .unwrap_or_default()
 }
 
 /// Print the build result in the requested output format.
-fn print_result(output: &OutputFormat, image_name: &str, compose: bool) {
+///
+/// `image_names` holds every reported name (the built name, or all
+/// `--image-name` values when set). The text mode lists them comma-separated.
+fn print_result(output: &OutputFormat, image_names: &[String], compose: bool) {
     match output {
         OutputFormat::Auto | OutputFormat::Text => {
-            if compose {
-                eprintln!("Compose services built. Primary image: {image_name}");
-            } else {
-                eprintln!("Image built: {image_name}");
+            let joined = image_names.join(", ");
+            match (compose, image_names.len() > 1) {
+                (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
+                (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
+                (false, false) => eprintln!("Image built: {joined}"),
+                (false, true) => eprintln!("Image built and tagged: {joined}"),
             }
         }
-        OutputFormat::Json => println!("{}", build_json_result(image_name)),
+        OutputFormat::Json => println!("{}", build_json_result(image_names)),
     }
 }
 
@@ -594,8 +636,49 @@ mod tests {
         // `outcome` is "success" (not "built"), `imageName` is an array, no extra
         // keys, no pretty indentation.
         assert_eq!(
-            build_json_result("ghcr.io/acme/devcontainer:latest"),
+            build_json_result(&["ghcr.io/acme/devcontainer:latest".to_string()]),
             r#"{"outcome":"success","imageName":["ghcr.io/acme/devcontainer:latest"]}"#
+        );
+    }
+
+    #[test]
+    fn build_json_result_lists_all_image_names() {
+        // With multiple `--image-name`, every name appears in the imageName array
+        // in order (official `imageNameResult = imageNames`).
+        assert_eq!(
+            build_json_result(&["one:1".to_string(), "two:2".to_string()]),
+            r#"{"outcome":"success","imageName":["one:1","two:2"]}"#
+        );
+    }
+
+    #[test]
+    fn image_name_is_repeatable() {
+        let args = parse_build(&["--image-name", "a:1", "--image-name", "b:2"]);
+        assert_eq!(args.image_name, vec!["a:1".to_string(), "b:2".to_string()]);
+    }
+
+    #[test]
+    fn image_name_defaults_to_empty() {
+        assert!(parse_build(&[]).image_name.is_empty());
+    }
+
+    #[test]
+    fn reported_names_uses_built_when_no_image_name() {
+        // No --image-name → report the single built/resolved name.
+        let args = parse_build(&[]);
+        assert_eq!(
+            args.reported_names("built:latest"),
+            vec!["built:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn reported_names_replaces_with_image_names() {
+        // --image-name replaces the built name with exactly the given values.
+        let args = parse_build(&["--image-name", "x:1", "--image-name", "y:2"]);
+        assert_eq!(
+            args.reported_names("built:latest"),
+            vec!["x:1".to_string(), "y:2".to_string()]
         );
     }
 }
