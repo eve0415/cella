@@ -44,6 +44,12 @@ pub struct ComposeBuildConfig<'a> {
     pub docker_compose_path: Option<String>,
     /// Feature lockfile policy derived from `--no-lockfile` / `--frozen-lockfile`.
     pub lockfile_policy: cella_features::LockfilePolicy,
+    /// Image labels (`key=value`) from `cella build --label`, applied as the
+    /// primary service's `build.labels` so they bake into the built image
+    /// (mirrors the single-container `docker build --label`). Empty = no labels.
+    /// An image-only service (no build, no features) has nothing to label and is
+    /// rejected up front. Pre-validated `key=value` strings (non-empty key).
+    pub labels: Vec<String>,
 }
 
 /// Run the compose build pipeline: resolve features, write override, build.
@@ -118,6 +124,9 @@ pub async fn compose_build(
             build_context: fb.build_context.clone(),
             additional_contexts: fb.additional_contexts.clone(),
             build_secrets: compose_secrets,
+            // `--label` image labels join the combined-Dockerfile build, so the
+            // final image carries them (parity with single-container --label).
+            build_labels: cfg.labels.clone(),
             extra_volumes: Vec::new(),
             // GPU reservation is emitted only in the final override.
             request_gpu: false,
@@ -128,38 +137,149 @@ pub async fn compose_build(
         crate::override_file::write_override_file(&project.override_file, &yaml)?;
     }
 
-    // Run docker compose build. The override file is only written when features
-    // are resolved (the `if let Some(ref fb)` block above); on the no-features
-    // path it does not exist, so use a command without it — otherwise
-    // `docker compose -f <missing-override> build` fails with "no such file".
-    let compose_cmd = if features_build.is_some() {
-        crate::ComposeCommand::new(&project)
-    } else {
-        crate::ComposeCommand::without_override(&project)
-    }
-    .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
-    compose_cmd.build(None, false).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("docker compose build failed: {e}").into()
-        },
-    )?;
-
     let had_features = features_build.is_some();
-    let image_name = if let Some(image) = features_build.and_then(|b| b.image_name_override) {
-        image
+    let image_name = if let Some(fb) = features_build {
+        // Features path: the override (with any `--label` build.labels) is written
+        // above, so build with it and use its image-name override when present, or
+        // resolve the default `{project}-{service}` via the same override command.
+        let compose_cmd = crate::ComposeCommand::new(&project)
+            .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
+        run_compose_build(&compose_cmd).await?;
+        match fb.image_name_override {
+            Some(image) => image,
+            None => resolve_primary_service_image(&compose_cmd, &project).await?,
+        }
     } else {
-        // No image-name override — the no-features path, or a build-based service
-        // whose features image is the default `{project}-{service}`. Resolve the
-        // real image via `docker compose config`; `compose_cmd` is the same one
-        // used for the build above, so it only references the override when it
-        // actually exists.
-        resolve_primary_service_image(&compose_cmd, &project).await?
+        // No-features path. With no `--label`, build and resolve both run
+        // `without_override` (no override file exists) — unchanged. With
+        // `--label`, a build-based service gets a labels-only override for the
+        // build only, while the image name is still resolved off `without_override`
+        // data so the #192 invariant holds (the labels override never feeds
+        // `resolve_primary_service_image`/`docker compose config`).
+        build_no_features(client, &project, cfg).await?
     };
 
     Ok(ComposeBuildResult {
         image_name,
         had_features,
     })
+}
+
+/// Run `docker compose build` for the primary service, mapping failures to a
+/// uniform error.
+async fn run_compose_build(
+    compose_cmd: &crate::ComposeCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    compose_cmd
+        .build(None, false)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("docker compose build failed: {e}").into()
+        })
+}
+
+/// Build the no-features compose path and resolve the primary service's image.
+///
+/// Two shapes, gated on `--label`:
+/// - **No labels:** build and resolve both run on `without_override` (the
+///   override file is never written) — byte-for-byte the pre-`--label` behavior.
+/// - **Labels:** the service must build (sub-case 2). A bare `image:` service has
+///   no build to attach labels to (sub-case 3) → a clear error. For a build-based
+///   service, a labels-only override (only `build.labels`; dockerfile/context are
+///   inherited from the base compose via `-f` merge) is written and used for the
+///   BUILD only. The image NAME is resolved from the `ServiceBuildInfo` already
+///   fetched off `without_override`, so the labels override never reaches
+///   `docker compose config` — preserving the #192 `resolve_primary_service_image`
+///   invariant.
+async fn build_no_features(
+    client: &dyn ContainerBackend,
+    project: &ComposeProject,
+    cfg: &ComposeBuildConfig<'_>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let plain_cmd = crate::ComposeCommand::without_override(project)
+        .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
+
+    if cfg.labels.is_empty() {
+        run_compose_build(&plain_cmd).await?;
+        return resolve_primary_service_image(&plain_cmd, project).await;
+    }
+
+    // `--label` set: resolve the service shape up front (off `without_override`,
+    // never the labels override) to both gate image-only services out and reuse
+    // the result for the final image name.
+    let resolved = plain_cmd.config().await?;
+    let service_info = crate::extract_service_build_info(&resolved, &project.primary_service)?;
+    if !service_build_can_be_labeled(&service_info) {
+        return Err(image_only_label_error().into());
+    }
+
+    write_labels_only_override(client, project, &cfg.labels)?;
+    let labeled_build_cmd = crate::ComposeCommand::new(project)
+        .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
+    run_compose_build(&labeled_build_cmd).await?;
+
+    Ok(service_info.resolved_image_name(&project.project_name, &project.primary_service))
+}
+
+/// Whether a no-features service can carry `--label` image labels.
+///
+/// `--label` lands on a built image via `build.labels`, so only a service that
+/// actually builds can be labeled. A bare `image:` service is used as-is (Compose
+/// neither builds nor re-tags it), so it has no build to attach labels to.
+const fn service_build_can_be_labeled(info: &crate::ServiceBuildInfo) -> bool {
+    matches!(info, crate::ServiceBuildInfo::Build { .. })
+}
+
+/// Error message for `--label` on a no-features, image-only compose service.
+///
+/// Mirrors the single-container bare-`image:` boundary (both error rather than
+/// silently dropping the flag).
+fn image_only_label_error() -> String {
+    "--label requires a built service; an image-only compose service is used as-is \
+     and cannot be labeled."
+        .to_string()
+}
+
+/// Write a minimal override carrying only the primary service's `build.labels`.
+///
+/// Minimal in the build sense: no dockerfile/context/target/secrets — those are
+/// inherited from the base compose via the `-f` merge; this override exists solely
+/// to attach image labels to the build. The agent volume is still emitted (the
+/// real mount, computed exactly like the features path) so the override is a valid
+/// compose file; `docker compose build` does not instantiate the volume, so this
+/// matches what the features build override already writes. Used for the
+/// no-features, build-based `--label` path.
+fn write_labels_only_override(
+    client: &dyn ContainerBackend,
+    project: &ComposeProject,
+    labels: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (agent_vol_name, agent_vol_target, _) = if client.capabilities().managed_agent {
+        client.agent_volume_mount()
+    } else {
+        (String::new(), String::new(), true)
+    };
+    let override_config = crate::OverrideConfig {
+        primary_service: project.primary_service.clone(),
+        image_override: None,
+        override_command: false,
+        agent_volume_name: agent_vol_name,
+        agent_volume_target: agent_vol_target,
+        extra_env: Vec::new(),
+        extra_labels: std::collections::BTreeMap::new(),
+        build_dockerfile: None,
+        build_target: None,
+        build_context: None,
+        additional_contexts: std::collections::BTreeMap::new(),
+        build_secrets: Vec::new(),
+        build_labels: labels.to_vec(),
+        extra_volumes: Vec::new(),
+        request_gpu: false,
+        security: cella_config::config_map::MergedSecurityConfig::default(),
+    };
+    let yaml = crate::override_file::generate_override_yaml(&override_config);
+    crate::override_file::write_override_file(&project.override_file, &yaml)?;
+    Ok(())
 }
 
 /// Resolve the primary service's image name from the resolved compose config.
@@ -183,4 +303,60 @@ pub(crate) async fn resolve_primary_service_image(
     let resolved = compose_cmd.config().await?;
     let service_info = crate::extract_service_build_info(&resolved, &project.primary_service)?;
     Ok(service_info.resolved_image_name(&project.project_name, &project.primary_service))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use super::{image_only_label_error, service_build_can_be_labeled};
+    use crate::ServiceBuildInfo;
+
+    #[test]
+    fn build_service_can_be_labeled() {
+        // A build-based service has a build to attach `--label` image labels to.
+        let info = ServiceBuildInfo::Build {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile".to_string(),
+            target: None,
+            args: HashMap::new(),
+            image: None,
+        };
+        assert!(service_build_can_be_labeled(&info));
+    }
+
+    #[test]
+    fn build_service_with_image_tag_can_be_labeled() {
+        // A `build:` + `image:` service still builds (Compose tags the output),
+        // so `--label` applies to its build.
+        let info = ServiceBuildInfo::Build {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile".to_string(),
+            target: None,
+            args: HashMap::new(),
+            image: Some("myapp:latest".to_string()),
+        };
+        assert!(service_build_can_be_labeled(&info));
+    }
+
+    #[test]
+    fn image_only_service_cannot_be_labeled() {
+        // A bare `image:` service is used as-is — no build, nothing to label.
+        let info = ServiceBuildInfo::Image {
+            image: "alpine:3.21".to_string(),
+        };
+        assert!(!service_build_can_be_labeled(&info));
+    }
+
+    #[test]
+    fn image_only_label_error_message_matches_boundary() {
+        // Stable, user-facing message mirroring the single-container bare-`image:`
+        // boundary. Pinned so the wording can't silently drift.
+        assert_eq!(
+            image_only_label_error(),
+            "--label requires a built service; an image-only compose service is used as-is \
+             and cannot be labeled."
+        );
+    }
 }

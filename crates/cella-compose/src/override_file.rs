@@ -53,6 +53,15 @@ pub struct OverrideConfig {
     pub additional_contexts: BTreeMap<String, PathBuf>,
     /// `BuildKit` secrets forwarded to compose builds via the override YAML.
     pub build_secrets: Vec<ComposeSecret>,
+    /// Image labels (`key=value`) to bake into the built service image.
+    ///
+    /// Emitted as `build.labels` (list form, `- "key=value"`) on the primary
+    /// service, matching `docker compose`'s `build.labels` → image-label
+    /// semantics. This is the compose equivalent of the single-container
+    /// `docker build --label`, so the labels land on the built image, not on the
+    /// runtime container (which is what `extra_labels` controls). Populated from
+    /// `cella build --label`; empty preserves the existing YAML byte-for-byte.
+    pub build_labels: Vec<String>,
     /// Extra volume mounts (long-form YAML) appended to the primary service's
     /// `volumes:` list after the agent volume.
     ///
@@ -118,32 +127,9 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         let _ = writeln!(yaml, "    image: \"{image}\"");
     }
 
-    // Build override (combined Dockerfile for compose + features)
-    let has_build_section = config.build_dockerfile.is_some() || !config.build_secrets.is_empty();
-    if has_build_section {
-        yaml.push_str("    build:\n");
-        if let Some(ref dockerfile) = config.build_dockerfile {
-            let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
-            if let Some(ref target) = config.build_target {
-                let _ = writeln!(yaml, "      target: \"{target}\"");
-            }
-            if let Some(ref context) = config.build_context {
-                let _ = writeln!(yaml, "      context: \"{}\"", context.display());
-            }
-            if !config.additional_contexts.is_empty() {
-                yaml.push_str("      additional_contexts:\n");
-                for (name, path) in &config.additional_contexts {
-                    let _ = writeln!(yaml, "        - {name}={}", path.display());
-                }
-            }
-        }
-        if !config.build_secrets.is_empty() {
-            yaml.push_str("      secrets:\n");
-            for secret in &config.build_secrets {
-                let _ = writeln!(yaml, "        - {}", secret.id);
-            }
-        }
-    }
+    // Build override (combined Dockerfile for compose + features, build secrets,
+    // and/or image labels).
+    write_build_section(&mut yaml, config);
 
     // Command override (only if explicitly enabled; compose default is false)
     if config.override_command {
@@ -244,6 +230,52 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     yaml
 }
 
+/// Emit the primary service's `build:` section (dockerfile/target/context +
+/// additional contexts, build secrets, and image labels).
+///
+/// The section appears when any build override is present. `build_labels` can
+/// stand alone (no dockerfile) when `--label` targets a service whose `build:` is
+/// inherited from the base compose via `-f` merge — so it independently forces the
+/// `build:` block. Image labels use list form (`- "key=value"`); values are user
+/// free-form, so each is quoted + escaped (a value with `:`/`#`/space would
+/// otherwise break the YAML or inject keys — same reason env/security are quoted).
+fn write_build_section(yaml: &mut String, config: &OverrideConfig) {
+    let has_build_section = config.build_dockerfile.is_some()
+        || !config.build_secrets.is_empty()
+        || !config.build_labels.is_empty();
+    if !has_build_section {
+        return;
+    }
+    yaml.push_str("    build:\n");
+    if let Some(ref dockerfile) = config.build_dockerfile {
+        let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
+        if let Some(ref target) = config.build_target {
+            let _ = writeln!(yaml, "      target: \"{target}\"");
+        }
+        if let Some(ref context) = config.build_context {
+            let _ = writeln!(yaml, "      context: \"{}\"", context.display());
+        }
+        if !config.additional_contexts.is_empty() {
+            yaml.push_str("      additional_contexts:\n");
+            for (name, path) in &config.additional_contexts {
+                let _ = writeln!(yaml, "        - {name}={}", path.display());
+            }
+        }
+    }
+    if !config.build_secrets.is_empty() {
+        yaml.push_str("      secrets:\n");
+        for secret in &config.build_secrets {
+            let _ = writeln!(yaml, "        - {}", secret.id);
+        }
+    }
+    if !config.build_labels.is_empty() {
+        yaml.push_str("      labels:\n");
+        for label in &config.build_labels {
+            let _ = writeln!(yaml, "        - \"{}\"", yaml_dq_escape(label));
+        }
+    }
+}
+
 /// Emit the container security/runtime section (init, user, privileged, capAdd,
 /// securityOpt) onto the primary service, matching the official compose override
 /// (`dockerCompose.ts` emits the same keys on the service definition).
@@ -315,6 +347,7 @@ mod tests {
             build_context: None,
             additional_contexts: BTreeMap::new(),
             build_secrets: Vec::new(),
+            build_labels: Vec::new(),
             extra_volumes: Vec::new(),
             request_gpu: false,
             security: MergedSecurityConfig::default(),
@@ -565,6 +598,97 @@ mod tests {
         assert!(yaml.contains("dockerfile:"));
         assert!(yaml.contains("target:"));
         assert!(yaml.contains("context: \"/tmp/features-context\""));
+    }
+
+    #[test]
+    fn build_labels_emitted_under_build_section() {
+        // `--label` on a features build: the labels join the existing `build:`
+        // section (dockerfile + labels) as a quoted list.
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from("/tmp/Dockerfile.combined"));
+        config.build_target = Some("dev_containers_target_stage".to_string());
+        config.build_labels = vec!["cella.test=1".to_string(), "foo=bar".to_string()];
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("    build:\n"), "yaml:\n{yaml}");
+        assert!(yaml.contains("      labels:\n"), "yaml:\n{yaml}");
+        assert!(
+            yaml.contains("        - \"cella.test=1\"\n"),
+            "yaml:\n{yaml}"
+        );
+        assert!(yaml.contains("        - \"foo=bar\"\n"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn build_labels_only_emits_build_section_without_dockerfile() {
+        // Sub-case 2: a labels-only override (no dockerfile/context — those are
+        // inherited from the base compose via `-f` merge). The `build:` block
+        // must still appear, carrying only `labels:`, and the YAML must be valid.
+        let mut config = base_config();
+        config.build_labels = vec!["cella.test=2".to_string()];
+        let yaml = generate_override_yaml(&config);
+        insta::assert_snapshot!(yaml, @r#"
+        # Auto-generated by cella. Do not edit.
+        services:
+          app:
+            build:
+              labels:
+                - "cella.test=2"
+            volumes:
+              - cella-agent:/cella:ro
+        volumes:
+          cella-agent:
+            external: true
+        "#);
+        // No dockerfile/context/target keys on a labels-only build.
+        assert!(!yaml.contains("dockerfile:"), "yaml:\n{yaml}");
+        assert!(!yaml.contains("context:"), "yaml:\n{yaml}");
+        assert!(!yaml.contains("target:"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn build_labels_with_special_chars_round_trip_through_yaml() {
+        // Label values are user free-form: a value with `:` (and `#`/space) must
+        // survive as a single string, not break the YAML or inject a new key.
+        // Mirrors `metadata_label_json_value_round_trips_through_yaml`.
+        let mut config = base_config();
+        config.build_labels = vec![
+            "org.opencontainers.image.description=Foo: bar #baz".to_string(),
+            "key.with.equals=a=b=c".to_string(),
+        ];
+        let yaml = generate_override_yaml(&config);
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("generated override must be valid YAML");
+        let labels = &parsed["services"]["app"]["build"]["labels"];
+        let entries: Vec<&str> = labels
+            .as_sequence()
+            .expect("build.labels must be a sequence")
+            .iter()
+            .map(|v| v.as_str().expect("each label entry is a string"))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                "org.opencontainers.image.description=Foo: bar #baz",
+                "key.with.equals=a=b=c",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_build_labels_omits_labels_from_build_section() {
+        // Without build_labels, a features-style build override must not emit a
+        // `labels:` line under `build:` (only the existing dockerfile keys).
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from("/tmp/Dockerfile.combined"));
+        let yaml = generate_override_yaml(&config);
+        let build_section = yaml
+            .split("    build:\n")
+            .nth(1)
+            .expect("build section present");
+        assert!(
+            !build_section.contains("labels:"),
+            "build.labels must be absent when build_labels is empty; yaml:\n{yaml}"
+        );
     }
 
     #[test]

@@ -87,12 +87,14 @@ pub struct BuildArgs {
     output: Option<String>,
 
     /// Add metadata to the built image as a `key=value` image label
-    /// (repeatable). Emitted as `docker build --label key=value`, so the label
-    /// is baked into the built image. The value may be empty (`key=`). Applies
-    /// on both the classic and buildx builders. Single-container build path only:
-    /// a bare `image:` config with no build/features cannot be labeled, and the
-    /// Docker Compose path does not yet support it (both error rather than
-    /// silently ignoring the flag).
+    /// (repeatable). The value may be empty (`key=`). On the single-container
+    /// path it is emitted as `docker build --label key=value` (classic and
+    /// buildx builders alike). On the Docker Compose path it is applied as the
+    /// primary service's `build.labels`, so the label bakes into the built
+    /// service image (matching official `devcontainer build --label`). A config
+    /// with no build to attach to — a bare single-container `image:`, or a
+    /// no-features image-only compose service — errors rather than silently
+    /// ignoring the flag.
     #[arg(long = "label", value_parser = parse_build_label)]
     label: Vec<String>,
 
@@ -208,13 +210,6 @@ impl BuildArgs {
         if self.cache_to.is_some() {
             return Err("--cache-to not supported.".into());
         }
-        if !self.label.is_empty() {
-            // Official applies `--label` as compose `build.labels` image labels
-            // via a generated override; cella doesn't yet write those, so error
-            // rather than silently dropping the flag (or mislabeling the
-            // container/service). Tracked follow-up.
-            return Err("--label is not yet supported on Docker Compose builds.".into());
-        }
         if !self.cache_from.is_empty() {
             warn!("--cache-from is ignored on the Docker Compose build path");
         }
@@ -251,6 +246,10 @@ impl BuildArgs {
                 &self.lockfile,
                 &self.deprecated_lockfile,
             ),
+            // `--label` image labels: applied as the primary service's
+            // `build.labels` (image labels on the built service image), the
+            // compose equivalent of the single-container `docker build --label`.
+            labels: self.label.clone(),
         };
         let result = cella_orchestrator::compose_build::compose_build(client, &build_cfg, &sender)
             .await
@@ -644,16 +643,15 @@ mod tests {
     }
 
     #[test]
-    fn compose_rejects_label() {
-        // The compose path does not yet support `--label` (it would need a
-        // generated `build.labels` override). cella errors with the exact
-        // message rather than silently dropping the flag.
-        let err = parse_build(&["--label", "a=1"])
-            .reject_unsupported_compose_flags()
-            .expect_err("compose must reject --label");
-        assert_eq!(
-            err.to_string(),
-            "--label is not yet supported on Docker Compose builds."
+    fn compose_accepts_label() {
+        // The compose path now supports `--label` (applied as the primary
+        // service's `build.labels`), so it must NOT be rejected by the flag gate.
+        // The image-only-no-build boundary is enforced later, in `compose_build`.
+        assert!(
+            parse_build(&["--label", "a=1"])
+                .reject_unsupported_compose_flags()
+                .is_ok(),
+            "compose must accept --label"
         );
     }
 

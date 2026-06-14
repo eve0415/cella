@@ -22,6 +22,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         build_context: None,
         additional_contexts: BTreeMap::new(),
         build_secrets: Vec::new(),
+        build_labels: Vec::new(),
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
@@ -136,6 +137,29 @@ async fn docker_image_exists(image: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Read a single label's value off a built image via
+/// `docker image inspect --format '{{ index .Config.Labels "<key>" }}'`.
+///
+/// Returns the trimmed value, or `None` if the inspect fails or the label is
+/// absent (Go templates print `<no value>` for a missing key).
+async fn docker_image_label(image: &str, key: &str) -> Option<String> {
+    let format = format!("{{{{ index .Config.Labels {key:?} }}}}");
+    let output = tokio::process::Command::new("docker")
+        .args(["image", "inspect", "--format", &format, image])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "<no value>" {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// No-features image-only compose: `cella build` must report the service's real
 /// image (e.g. `alpine:3.21`), not the `"(compose)"` sentinel.
 ///
@@ -197,6 +221,103 @@ async fn no_features_reports_build_image_name() {
     );
 
     ctx.cleanup().await;
+}
+
+/// `--label` on a no-features, build-based compose service (sub-case 2): a
+/// labels-only override (only `build.labels`; dockerfile/context inherited from
+/// the base compose via `-f` merge) must bake the label into the built image.
+///
+/// This drives the same override shape `compose_build` writes via
+/// `write_labels_only_override`, then builds with the override (`new`) and
+/// inspects the resulting `{project}-app` image. Validates the label actually
+/// lands on the image — the point of the feature.
+#[cella_testing::runtime_test(docker, compose)]
+async fn label_lands_on_no_features_build_image() {
+    let ctx = ComposeTestContext::new("build-no-features");
+    let config = load_fixture_config(&ctx.fixture_dir);
+    let config_path = ctx.fixture_dir.join("devcontainer.json");
+    let project = ComposeProject::from_resolved(&config, &config_path, &ctx.fixture_dir)
+        .unwrap()
+        .with_project_name(ctx.project_name.clone());
+
+    // The generated override still emits the external agent volume; create it so
+    // the build's override is valid (mirrors the other smoke tests).
+    let _ = tokio::process::Command::new("docker")
+        .args(["volume", "create", "cella-agent"])
+        .output()
+        .await;
+
+    // Labels-only override: no dockerfile/context (inherited from base compose).
+    let mut override_cfg = plain_override(&project.primary_service);
+    override_cfg.build_labels = vec!["cella.test=2".to_string()];
+    let yaml = generate_override_yaml(&override_cfg);
+    write_override_file(&project.override_file, &yaml).unwrap();
+
+    let cmd = ComposeCommand::new(&project);
+    cmd.build(None, false).await.expect("compose build failed");
+
+    let image_name = format!("{}-app", project.project_name);
+    let label = docker_image_label(&image_name, "cella.test").await;
+
+    ctx.cleanup().await;
+    crate::override_file::cleanup_override_file(&project.override_file);
+
+    assert_eq!(
+        label.as_deref(),
+        Some("2"),
+        "expected build.labels to bake cella.test=2 into {image_name}, got {label:?}"
+    );
+}
+
+/// `--label` alongside a combined Dockerfile (sub-case 1 shape): an override that
+/// carries BOTH a `build.dockerfile` and `build.labels` must bake the label into
+/// the built image.
+///
+/// Real feature resolution isn't available in this crate (no `ContainerBackend`),
+/// so the "with features" case reduces to "a build override that also carries
+/// labels". The override points `build.dockerfile` at the fixture's own
+/// `Dockerfile` (a trivial `FROM alpine`), which is the same override structure
+/// `compose_build` writes when features resolve.
+#[cella_testing::runtime_test(docker, compose)]
+async fn label_lands_on_dockerfile_build_image() {
+    let ctx = ComposeTestContext::new("build-no-features");
+    let config = load_fixture_config(&ctx.fixture_dir);
+    let config_path = ctx.fixture_dir.join("devcontainer.json");
+    let project = ComposeProject::from_resolved(&config, &config_path, &ctx.fixture_dir)
+        .unwrap()
+        .with_project_name(ctx.project_name.clone());
+
+    let _ = tokio::process::Command::new("docker")
+        .args(["volume", "create", "cella-agent"])
+        .output()
+        .await;
+
+    // dockerfile + labels override (the features-build shape, minus feature
+    // contexts which aren't needed to prove labels land on the image). Use a
+    // relative `dockerfile` resolved against `context` — the form compose always
+    // accepts (the production sub-case-2 path inherits the base dockerfile, so it
+    // never emits an absolute one either).
+    let mut override_cfg = plain_override(&project.primary_service);
+    override_cfg.build_dockerfile = Some(std::path::PathBuf::from("Dockerfile"));
+    override_cfg.build_context = Some(ctx.fixture_dir.clone());
+    override_cfg.build_labels = vec!["cella.test=1".to_string()];
+    let yaml = generate_override_yaml(&override_cfg);
+    write_override_file(&project.override_file, &yaml).unwrap();
+
+    let cmd = ComposeCommand::new(&project);
+    cmd.build(None, false).await.expect("compose build failed");
+
+    let image_name = format!("{}-app", project.project_name);
+    let label = docker_image_label(&image_name, "cella.test").await;
+
+    ctx.cleanup().await;
+    crate::override_file::cleanup_override_file(&project.override_file);
+
+    assert_eq!(
+        label.as_deref(),
+        Some("1"),
+        "expected build.labels to bake cella.test=1 into {image_name}, got {label:?}"
+    );
 }
 
 /// Multi-service compose: verify that runServices are started and others are not.

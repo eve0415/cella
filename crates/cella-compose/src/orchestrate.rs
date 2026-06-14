@@ -959,6 +959,9 @@ fn write_build_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        // `up` does not thread `cella build --label`; image labels are a
+        // build-only concern. Keep empty so the `up` override is unchanged.
+        build_labels: Vec::new(),
         extra_volumes: Vec::new(),
         // The build-time override never needs the GPU reservation; it is
         // emitted only in the final override used for `compose up`.
@@ -1182,6 +1185,9 @@ fn write_final_override(
             .map(|b| b.additional_contexts.clone())
             .unwrap_or_default(),
         build_secrets: Vec::new(),
+        // `up` does not thread `cella build --label`; image labels are a
+        // build-only concern. Keep empty so the `up` override is unchanged.
+        build_labels: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
         request_gpu: ov.request_gpu,
         security: ov.security.clone(),
