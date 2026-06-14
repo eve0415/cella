@@ -1942,6 +1942,9 @@ impl EnsureUpContext<'_> {
                 // `up` has no `--output` (it must load the image to run the
                 // container); the buildx export spec is a `build`-only flag.
                 output: None,
+                // `up` has no `--label` either — image labels are a `build`-only
+                // flag (the container picks up config via the metadata label).
+                labels: &[],
                 omit_remote_env_from_metadata: self.config.metadata_options.omit_remote_env,
                 lockfile_policy: self.config.lockfile_policy,
                 progress: &self.progress,

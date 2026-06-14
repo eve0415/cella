@@ -183,6 +183,9 @@ pub async fn build_uid_remap_image(
         // The UID-remap build is a post-build transform on an already-built
         // image, never the `--output` export target — keep the default --load.
         output: None,
+        // Never the user's label target either; user `--label`s are baked onto
+        // the final image (base or features layer) before this transform runs.
+        labels: Vec::new(),
     };
 
     info!("Building UID remap image: {uid_image} (UID {host_uid}:{host_gid})");

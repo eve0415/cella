@@ -211,6 +211,13 @@ pub struct BuildOptions {
     /// loaded base. The backend errors if it is set without `BuildKit`/buildx,
     /// since dropping it would silently exit 0 with nothing written to `dest=`.
     pub output: Option<String>,
+    /// Image labels to bake into the built image (`--label key=value`, the
+    /// `cella build --label` flag). Each entry is a `key=value` string emitted
+    /// as `--label <entry>`; the value may be empty (`key=`). Unlike `--output`,
+    /// `--label` works on both the classic and buildx builders, so it is emitted
+    /// unconditionally. Set only on the final image build (the one that produces
+    /// the image the user ends up with), mirroring `output`.
+    pub labels: Vec<String>,
 }
 
 impl Default for BuildOptions {
@@ -229,6 +236,7 @@ impl Default for BuildOptions {
             docker_path: None,
             platform: None,
             output: None,
+            labels: Vec::new(),
         }
     }
 }
