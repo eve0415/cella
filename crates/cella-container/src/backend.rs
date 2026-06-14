@@ -1148,13 +1148,24 @@ fn push_override_args(args: &mut Vec<String>, overrides: &RunArgsOverrides) {
         args.push("--runtime".to_string());
         args.push(runtime.clone());
     }
+
+    // Capabilities and bind mounts: Apple Container accepts `--cap-add`
+    // (since 0.12.0) and `--volume`, so forward runArgs that use them.
+    for cap in &overrides.cap_add {
+        args.push("--cap-add".to_string());
+        args.push(cap.clone());
+    }
+    for bind in &overrides.binds {
+        args.push("--volume".to_string());
+        args.push(bind.clone());
+    }
 }
 
 /// Collect runArgs override flags that Apple Container has no equivalent for.
 fn collect_unsupported_overrides(overrides: &RunArgsOverrides) -> Vec<&'static str> {
     let mut ignored = Vec::new();
 
-    let flags: [(bool, &'static str); 22] = [
+    let flags: [(bool, &'static str); 25] = [
         (overrides.network_mode.is_some(), "--network"),
         (overrides.hostname.is_some(), "--hostname"),
         (!overrides.extra_hosts.is_empty(), "--add-host"),
@@ -1183,6 +1194,12 @@ fn collect_unsupported_overrides(overrides: &RunArgsOverrides) -> Vec<&'static s
             "--log-driver/--log-opt",
         ),
         (overrides.restart_policy.is_some(), "--restart"),
+        // Apple Container accepts --cap-add (0.12.0+) and --volume (forwarded in
+        // push_override_args), but these three have no verified equivalent — warn
+        // rather than emit an unknown flag that would fail `container create`.
+        (!overrides.cap_drop.is_empty(), "--cap-drop"),
+        (!overrides.group_add.is_empty(), "--group-add"),
+        (overrides.read_only == Some(true), "--read-only"),
     ];
 
     for (present, flag) in flags {
@@ -1888,6 +1905,37 @@ mod tests {
             !args.contains(&"--init".to_string()),
             "--init must not appear here; it is OR-d and emitted in build_create_args"
         );
+    }
+
+    #[test]
+    fn push_override_args_emits_cap_add_and_volume() {
+        let overrides = RunArgsOverrides {
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            binds: vec!["/h:/c:ro".to_string()],
+            ..RunArgsOverrides::default()
+        };
+        let mut args = Vec::new();
+        push_override_args(&mut args, &overrides);
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        assert!(pairs.contains(&("--cap-add", "SYS_PTRACE")));
+        assert!(pairs.contains(&("--volume", "/h:/c:ro")));
+    }
+
+    #[test]
+    fn collect_unsupported_includes_cap_drop_group_add_read_only() {
+        let overrides = RunArgsOverrides {
+            cap_drop: vec!["MKNOD".to_string()],
+            group_add: vec!["docker".to_string()],
+            read_only: Some(true),
+            ..RunArgsOverrides::default()
+        };
+        let ignored = collect_unsupported_overrides(&overrides);
+        assert!(ignored.contains(&"--cap-drop"));
+        assert!(ignored.contains(&"--group-add"));
+        assert!(ignored.contains(&"--read-only"));
     }
 
     #[test]

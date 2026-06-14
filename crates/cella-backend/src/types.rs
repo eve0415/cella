@@ -581,6 +581,15 @@ pub struct RunArgsOverrides {
     pub cgroup_parent: Option<String>,
     pub cgroupns_mode: Option<String>,
 
+    // Capabilities, supplementary groups, bind mounts, and read-only rootfs.
+    // `cap_add` unions with the `capAdd` devcontainer property; the rest have
+    // no dedicated devcontainer.json field and arrive only via `runArgs`.
+    pub cap_add: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub group_add: Vec<String>,
+    pub binds: Vec<String>,
+    pub read_only: Option<bool>,
+
     // Devices
     pub devices: Vec<DeviceSpec>,
     pub device_cgroup_rules: Vec<String>,

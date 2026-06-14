@@ -121,7 +121,7 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
     let mut security_opt = opts.security_opt.clone();
     let mut privileged = opts.privileged;
     let mut init = opts.init;
-    let cap_add = opts.cap_add.clone();
+    let mut cap_add = opts.cap_add.clone();
     let mut labels = opts.labels.clone();
     let mut hostname = None;
 
@@ -129,6 +129,7 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
         apply_run_args_to_host_config(host_config, ra);
         extra_hosts.extend(ra.extra_hosts.clone());
         security_opt.extend(ra.security_opt.clone());
+        cap_add.extend(ra.cap_add.clone());
         if let Some(p) = ra.privileged {
             privileged = p || privileged;
         }
@@ -148,6 +149,13 @@ fn apply_overrides(opts: &CreateContainerOptions, host_config: &mut HostConfig) 
                 .push(gpu_request_to_device_request(gpu));
         }
     }
+
+    // `opts.cap_add` already arrives sorted+deduped from `merge_security_config`
+    // (via `map_merged_string_list`), which feeds both the single-container and
+    // compose paths. Re-apply after unioning runArgs `--cap-add` so the combined
+    // set keeps identical semantics; capability order is irrelevant to Docker.
+    cap_add.sort();
+    cap_add.dedup();
 
     let has_run_args_gpu = opts
         .run_args_overrides
@@ -262,6 +270,18 @@ fn apply_security_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
             _ => bollard::models::HostConfigCgroupnsModeEnum::PRIVATE,
         });
     }
+    // Unlike `cap_add` (unioned with the `capAdd` property in `apply_overrides`),
+    // these come only from runArgs — a single source — so they apply as-is, the
+    // same way other single-source runArgs lists (dns, devices) are passed through.
+    if !ra.cap_drop.is_empty() {
+        hc.cap_drop = Some(ra.cap_drop.clone());
+    }
+    if !ra.group_add.is_empty() {
+        hc.group_add = Some(ra.group_add.clone());
+    }
+    if ra.read_only == Some(true) {
+        hc.readonly_rootfs = Some(true);
+    }
 }
 
 /// Apply device-related overrides to `HostConfig`.
@@ -302,6 +322,11 @@ fn apply_misc_overrides(hc: &mut HostConfig, ra: &RunArgsOverrides) {
     }
     if !ra.tmpfs.is_empty() {
         hc.tmpfs = Some(ra.tmpfs.clone());
+    }
+    // `binds` has a single writer here (configured mounts use `HostConfig.mounts`),
+    // so a plain assignment is safe; revisit if another binds source is added.
+    if !ra.binds.is_empty() {
+        hc.binds = Some(ra.binds.clone());
     }
     if let Some(ref v) = ra.pid_mode {
         hc.pid_mode = Some(v.clone());
@@ -804,6 +829,61 @@ mod tests {
         let hc = config.host_config.unwrap();
         assert!(hc.cap_add.is_none());
         assert!(hc.security_opt.is_none());
+    }
+
+    #[test]
+    fn run_args_cap_add_unions_with_property() {
+        // `capAdd` property + runArgs `--cap-add` must both survive (union),
+        // sorted and deduped — the discriminating both-sources case.
+        let mut opts = minimal_opts();
+        opts.cap_add = vec!["SYS_PTRACE".to_string()];
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            cap_add: vec!["NET_ADMIN".to_string()],
+            ..Default::default()
+        });
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(
+            hc.cap_add,
+            Some(vec!["NET_ADMIN".to_string(), "SYS_PTRACE".to_string()])
+        );
+    }
+
+    #[test]
+    fn run_args_cap_add_dedups_across_sources() {
+        let mut opts = minimal_opts();
+        opts.cap_add = vec!["SYS_PTRACE".to_string()];
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            ..Default::default()
+        });
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(hc.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+    }
+
+    #[test]
+    fn run_args_cap_drop_group_add_read_only() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            cap_drop: vec!["MKNOD".to_string()],
+            group_add: vec!["docker".to_string()],
+            read_only: Some(true),
+            ..Default::default()
+        });
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(hc.cap_drop, Some(vec!["MKNOD".to_string()]));
+        assert_eq!(hc.group_add, Some(vec!["docker".to_string()]));
+        assert_eq!(hc.readonly_rootfs, Some(true));
+    }
+
+    #[test]
+    fn run_args_binds_applied() {
+        let mut opts = minimal_opts();
+        opts.run_args_overrides = Some(RunArgsOverrides {
+            binds: vec!["/host:/container:ro".to_string()],
+            ..Default::default()
+        });
+        let hc = to_bollard_config(&opts).host_config.unwrap();
+        assert_eq!(hc.binds, Some(vec!["/host:/container:ro".to_string()]));
     }
 
     #[test]
