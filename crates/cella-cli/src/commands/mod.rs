@@ -72,6 +72,66 @@ pub struct DotfilesArgs {
     pub(crate) target_path: String,
 }
 
+/// Stable feature-lockfile flags controlling lockfile read/write behavior.
+///
+/// Shared verbatim by `up` and `build` (the official CLI exposes the same flags
+/// on both). Split from [`DeprecatedLockfileArgs`] so neither struct exceeds
+/// `clippy::struct_excessive_bools` (max 3 bools); both are flattened together
+/// by each command and consumed by [`derive_lockfile_policy`].
+#[derive(Args)]
+pub struct LockfileArgs {
+    /// Disable lockfile generation and pinning.
+    #[arg(
+        long,
+        conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
+    )]
+    pub(crate) no_lockfile: bool,
+
+    /// Require the lockfile to exist and match resolved digests; fail if missing or different.
+    #[arg(long)]
+    pub(crate) frozen_lockfile: bool,
+}
+
+/// Hidden, deprecated lockfile aliases kept for devcontainer-CLI parity.
+///
+/// Flattened alongside [`LockfileArgs`]; both feed [`derive_lockfile_policy`].
+/// `experimental_lockfile` is a no-op (lockfiles are written by default now);
+/// `experimental_frozen_lockfile` maps to `--frozen-lockfile`.
+#[derive(Args)]
+pub struct DeprecatedLockfileArgs {
+    /// Deprecated: lockfile is now written by default.
+    #[arg(long, hide = true)]
+    pub(crate) experimental_lockfile: bool,
+
+    /// Deprecated alias for --frozen-lockfile.
+    #[arg(long, hide = true)]
+    pub(crate) experimental_frozen_lockfile: bool,
+}
+
+/// Derive the feature lockfile policy from the CLI lockfile flags.
+///
+/// Deprecated aliases emit a `tracing` deprecation warning before delegating, so
+/// the message respects `--log-format json` instead of corrupting it. Shared by
+/// `up` and `build` so both commands map the flags identically.
+pub fn derive_lockfile_policy(
+    lf: &LockfileArgs,
+    deprecated: &DeprecatedLockfileArgs,
+) -> cella_features::LockfilePolicy {
+    if deprecated.experimental_lockfile {
+        warn!("--experimental-lockfile is deprecated; lockfile is now written by default");
+    }
+    if deprecated.experimental_frozen_lockfile {
+        warn!("--experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead");
+    }
+    if lf.no_lockfile {
+        cella_features::LockfilePolicy::NoLockfile
+    } else if lf.frozen_lockfile || deprecated.experimental_frozen_lockfile {
+        cella_features::LockfilePolicy::Frozen
+    } else {
+        cella_features::LockfilePolicy::Update
+    }
+}
+
 /// Common flags for commands that support verbose output.
 #[derive(Args, Clone)]
 pub struct VerboseArgs {
@@ -230,6 +290,14 @@ pub enum BuildKitMode {
     Never,
 }
 
+/// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
+///
+/// `auto` → `true` (the backend probes for buildx and uses it when present);
+/// `never` → `false` (forces the classic builder). Shared by `up` and `build`.
+pub const fn buildkit_enabled(mode: BuildKitMode) -> bool {
+    !matches!(mode, BuildKitMode::Never)
+}
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {
@@ -338,9 +406,9 @@ impl Command {
 
     /// The `--log-level` value, if the subcommand carries one.
     ///
-    /// `up` (and `code`, which embeds the `up` arg surface), `run-user-commands`,
-    /// `set-up`, `templates`, `features`, and `upgrade` expose `--log-level`;
-    /// every other variant returns
+    /// `up` (and `code`, which embeds the `up` arg surface), `build`,
+    /// `run-user-commands`, `set-up`, `templates`, `features`, and `upgrade`
+    /// expose `--log-level`; every other variant returns
     /// `None`. main.rs reads this once, before subcommand dispatch, to seed the
     /// global tracing filter — the level can't be applied inside `execute()`
     /// because the subscriber is already installed by then.
@@ -348,6 +416,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
+            Self::Build(args) => args.log_level(),
             Self::RunUserCommands(args) => args.compat.log_level,
             Self::SetUp(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
@@ -359,7 +428,8 @@ impl Command {
 
     /// The `--log-format` value (defaults to `Text`).
     ///
-    /// Only `up`/`code` expose `--log-format`; every other variant returns
+    /// `up`/`code`, `build`, `run-user-commands`, and `set-up` expose
+    /// `--log-format`; every other variant returns
     /// `Text`. Read once in main.rs to select the tracing formatter and to
     /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
     /// machine-readable JSON log lines on stderr).
@@ -367,6 +437,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_format,
             Self::Code(args) => args.up.compat.log_format,
+            Self::Build(args) => args.log_format(),
             Self::RunUserCommands(args) => args.compat.log_format,
             Self::SetUp(args) => args.compat.log_format,
             _ => LogFormat::Text,

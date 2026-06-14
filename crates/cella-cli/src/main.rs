@@ -1040,6 +1040,35 @@ mod tests {
     }
 
     #[test]
+    fn build_log_level_feeds_global_filter() {
+        use super::commands::LogLevel;
+        // build's --log-level must reach Command::log_level() so main.rs seeds
+        // the global tracing filter (real handling, not a no-op).
+        let cli = parse(&["cella", "build", "--log-level", "debug"]).unwrap();
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn build_without_log_level_is_none() {
+        let cli = parse(&["cella", "build"]).unwrap();
+        assert!(cli.command.log_level().is_none());
+    }
+
+    #[test]
+    fn build_log_format_json_accessor() {
+        use super::commands::LogFormat;
+        let cli = parse(&["cella", "build", "--log-format", "json"]).unwrap();
+        assert!(matches!(cli.command.log_format(), LogFormat::Json));
+    }
+
+    #[test]
+    fn build_default_log_format_is_text() {
+        use super::commands::LogFormat;
+        let cli = parse(&["cella", "build"]).unwrap();
+        assert!(matches!(cli.command.log_format(), LogFormat::Text));
+    }
+
+    #[test]
     fn up_log_format_json_accessor() {
         use super::commands::LogFormat;
         let cli = parse(&["cella", "up", "--log-format", "json"]).unwrap();

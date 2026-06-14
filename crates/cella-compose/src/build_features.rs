@@ -35,6 +35,11 @@ pub struct ComposeBuildConfig<'a> {
     pub pull_policy: Option<String>,
     /// `BuildKit` secrets forwarded to compose builds.
     pub secrets: Vec<BuildSecret>,
+    /// `docker` CLI binary path (`--docker-path`). `None` = `docker`.
+    pub docker_path: Option<String>,
+    /// Standalone `docker-compose` (V1) binary (`--docker-compose-path`).
+    /// Stored and forwarded; cella is V2-only so it is currently unused.
+    pub docker_compose_path: Option<String>,
     /// Feature lockfile policy derived from `--no-lockfile` / `--frozen-lockfile`.
     pub lockfile_policy: cella_features::LockfilePolicy,
 }
@@ -122,7 +127,8 @@ pub async fn compose_build(
     }
 
     // Run docker compose build
-    let compose_cmd = crate::ComposeCommand::new(&project);
+    let compose_cmd = crate::ComposeCommand::new(&project)
+        .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
     compose_cmd.build(None, false).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("docker compose build failed: {e}").into()
