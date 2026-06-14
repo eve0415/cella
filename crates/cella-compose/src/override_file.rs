@@ -80,6 +80,14 @@ pub struct OverrideConfig {
     /// compose override. Shares the type with the single-container create path so
     /// both apply identical values.
     pub security: MergedSecurityConfig,
+    /// Restrict the override to build-time only: skip the runtime sections that a
+    /// `docker compose build` never needs — the agent volume mount and the
+    /// top-level `volumes:` declarations. Set for the `--label`-only compose
+    /// override, which adjusts the build but never runs the container, so it must
+    /// not reference the (possibly-unprovisioned) external agent volume. The `up`
+    /// path and the features build override leave this `false` to keep emitting
+    /// the agent volume unchanged.
+    pub build_only: bool,
 }
 
 /// Escape a string for embedding in a YAML double-quoted scalar (`key: "{v}"`).
@@ -124,7 +132,7 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
 
     // Image override (for image-only services with features, to avoid retagging original)
     if let Some(ref image) = config.image_override {
-        let _ = writeln!(yaml, "    image: \"{image}\"");
+        let _ = writeln!(yaml, "    image: \"{}\"", yaml_dq_escape(image));
     }
 
     // Build override (combined Dockerfile for compose + features, build secrets,
@@ -167,17 +175,22 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         yaml.push_str("            - capabilities: [gpu]\n");
     }
 
-    // Agent volume mount (read-only)
-    yaml.push_str("    volumes:\n");
-    let _ = writeln!(
-        yaml,
-        "      - {}:{}:ro",
-        config.agent_volume_name, config.agent_volume_target
-    );
+    // Runtime volume mounts — skipped for a build-only override (e.g. the
+    // `--label`-only compose override), which adjusts the build but never runs
+    // the container and so must not reference the agent volume.
+    if !config.build_only {
+        // Agent volume mount (read-only)
+        yaml.push_str("    volumes:\n");
+        let _ = writeln!(
+            yaml,
+            "      - {}:{}:ro",
+            config.agent_volume_name, config.agent_volume_target
+        );
 
-    // Extra volume mounts (long-form YAML entries)
-    for spec in &config.extra_volumes {
-        yaml.push_str(&spec.to_compose_yaml_entry("      "));
+        // Extra volume mounts (long-form YAML entries)
+        for spec in &config.extra_volumes {
+            yaml.push_str(&spec.to_compose_yaml_entry("      "));
+        }
     }
 
     // Top-level secrets declarations (file/environment sources)
@@ -213,17 +226,19 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     // literal Docker volume name in the merged output regardless of what the
     // base compose file declares for that key (project-scoped, aliased via
     // `name:`, or `external: true` with no `name:`).
-    yaml.push_str("volumes:\n");
-    let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
-    yaml.push_str("    external: true\n");
-    let mut emitted_volumes: BTreeSet<&str> = BTreeSet::new();
-    for spec in &config.extra_volumes {
-        if spec.kind == MountKind::Volume
-            && !spec.source.is_empty()
-            && emitted_volumes.insert(spec.source.as_str())
-        {
-            let _ = writeln!(yaml, "  {}:", spec.source);
-            let _ = writeln!(yaml, "    name: {}", spec.source);
+    if !config.build_only {
+        yaml.push_str("volumes:\n");
+        let _ = writeln!(yaml, "  {}:", config.agent_volume_name);
+        yaml.push_str("    external: true\n");
+        let mut emitted_volumes: BTreeSet<&str> = BTreeSet::new();
+        for spec in &config.extra_volumes {
+            if spec.kind == MountKind::Volume
+                && !spec.source.is_empty()
+                && emitted_volumes.insert(spec.source.as_str())
+            {
+                let _ = writeln!(yaml, "  {}:", spec.source);
+                let _ = writeln!(yaml, "    name: {}", spec.source);
+            }
         }
     }
 
@@ -248,12 +263,20 @@ fn write_build_section(yaml: &mut String, config: &OverrideConfig) {
     }
     yaml.push_str("    build:\n");
     if let Some(ref dockerfile) = config.build_dockerfile {
-        let _ = writeln!(yaml, "      dockerfile: \"{}\"", dockerfile.display());
+        let _ = writeln!(
+            yaml,
+            "      dockerfile: \"{}\"",
+            yaml_dq_escape(&dockerfile.display().to_string())
+        );
         if let Some(ref target) = config.build_target {
-            let _ = writeln!(yaml, "      target: \"{target}\"");
+            let _ = writeln!(yaml, "      target: \"{}\"", yaml_dq_escape(target));
         }
         if let Some(ref context) = config.build_context {
-            let _ = writeln!(yaml, "      context: \"{}\"", context.display());
+            let _ = writeln!(
+                yaml,
+                "      context: \"{}\"",
+                yaml_dq_escape(&context.display().to_string())
+            );
         }
         if !config.additional_contexts.is_empty() {
             yaml.push_str("      additional_contexts:\n");
@@ -351,6 +374,7 @@ mod tests {
             extra_volumes: Vec::new(),
             request_gpu: false,
             security: MergedSecurityConfig::default(),
+            build_only: false,
         }
     }
 
@@ -434,6 +458,66 @@ mod tests {
         config.image_override = Some("cella-img-myapp-abc12345-def67890".to_string());
         let yaml = generate_override_yaml(&config);
         assert!(yaml.contains("image: \"cella-img-myapp-abc12345-def67890\""));
+    }
+
+    #[test]
+    fn build_only_omits_runtime_volume_sections() {
+        // A build-only override (the `--label`-only compose path) adjusts the
+        // build but never runs the container, so it must omit the agent volume —
+        // both the service `volumes:` mount and the top-level `volumes:`
+        // declaration, the latter of which would otherwise force `external: true`
+        // validation of an unprovisioned volume on `docker compose build`.
+        let mut config = base_config();
+        config.build_only = true;
+        config.build_labels = vec!["cella.test=1".to_string()];
+        let yaml = generate_override_yaml(&config);
+
+        assert!(
+            !yaml.contains("volumes:"),
+            "build_only override must omit every volumes section; yaml:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("cella-agent"),
+            "build_only override must not reference the agent volume; yaml:\n{yaml}"
+        );
+
+        // Still a valid compose file that carries the build label.
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("build_only override must be valid YAML");
+        assert_eq!(
+            parsed["services"]["app"]["build"]["labels"][0].as_str(),
+            Some("cella.test=1")
+        );
+    }
+
+    #[test]
+    fn build_only_false_keeps_volume_sections() {
+        // The default (up / features-build path) still emits the agent volume.
+        let config = base_config();
+        assert!(!config.build_only);
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("cella-agent:/cella:ro"), "yaml:\n{yaml}");
+        assert!(yaml.contains("external: true"), "yaml:\n{yaml}");
+    }
+
+    #[test]
+    fn build_section_dockerfile_and_context_are_escaped() {
+        // Regression (Windows paths): a `build.dockerfile`/`build.context` with
+        // backslashes (or a `"` in `target`) must stay inside the double-quoted
+        // YAML scalar instead of terminating it early or being read as an escape
+        // (`\t` → TAB), which would break `docker compose`.
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from(r"C:\tmp\My Dockerfile"));
+        config.build_context = Some(PathBuf::from(r"C:\tmp\ctx"));
+        config.build_target = Some("stage\"x".to_string());
+        let yaml = generate_override_yaml(&config);
+
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(&yaml).expect("override with backslash paths must be valid YAML");
+        let build = &parsed["services"]["app"]["build"];
+        assert_eq!(build["dockerfile"].as_str(), Some(r"C:\tmp\My Dockerfile"));
+        assert_eq!(build["context"].as_str(), Some(r"C:\tmp\ctx"));
+        assert_eq!(build["target"].as_str(), Some("stage\"x"));
     }
 
     #[test]

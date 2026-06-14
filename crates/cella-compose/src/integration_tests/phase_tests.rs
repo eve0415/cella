@@ -41,6 +41,7 @@ fn override_file_exists_before_compose_uses_it() {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        build_only: false,
     };
 
     let yaml = generate_override_yaml(&override_cfg);
@@ -194,6 +195,7 @@ fn additional_contexts_in_override_for_features() {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        build_only: false,
     };
 
     let yaml = generate_override_yaml(&override_cfg);

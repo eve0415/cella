@@ -26,6 +26,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        build_only: false,
     }
 }
 
@@ -227,10 +228,12 @@ async fn no_features_reports_build_image_name() {
 /// labels-only override (only `build.labels`; dockerfile/context inherited from
 /// the base compose via `-f` merge) must bake the label into the built image.
 ///
-/// This drives the same override shape `compose_build` writes via
+/// Drives the same `build_only` override shape `compose_build` writes via
 /// `write_labels_only_override`, then builds with the override (`new`) and
-/// inspects the resulting `{project}-app` image. Validates the label actually
-/// lands on the image — the point of the feature.
+/// inspects the resulting `{project}-app` image. Because the override is
+/// `build_only` it carries no agent volume, so the build runs WITHOUT the
+/// `cella-agent` volume pre-created — also regression-guarding that a
+/// labels-only build never references an unprovisioned external volume.
 #[cella_testing::runtime_test(docker, compose)]
 async fn label_lands_on_no_features_build_image() {
     let ctx = ComposeTestContext::new("build-no-features");
@@ -240,16 +243,14 @@ async fn label_lands_on_no_features_build_image() {
         .unwrap()
         .with_project_name(ctx.project_name.clone());
 
-    // The generated override still emits the external agent volume; create it so
-    // the build's override is valid (mirrors the other smoke tests).
-    let _ = tokio::process::Command::new("docker")
-        .args(["volume", "create", "cella-agent"])
-        .output()
-        .await;
-
-    // Labels-only override: no dockerfile/context (inherited from base compose).
+    // Labels-only override: no dockerfile/context (inherited from base compose),
+    // and `build_only` — exactly what `write_labels_only_override` emits, so the
+    // override carries no agent volume. The `cella-agent` volume is deliberately
+    // NOT pre-created here: the build must succeed without it, proving a
+    // build-only override never references an unprovisioned external volume.
     let mut override_cfg = plain_override(&project.primary_service);
     override_cfg.build_labels = vec!["cella.test=2".to_string()];
+    override_cfg.build_only = true;
     let yaml = generate_override_yaml(&override_cfg);
     write_override_file(&project.override_file, &yaml).unwrap();
 

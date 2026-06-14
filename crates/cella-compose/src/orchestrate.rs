@@ -968,6 +968,9 @@ fn write_build_override(
         request_gpu: false,
         // build_ov carries default (empty) security props at build time.
         security: ov.security.clone(),
+        // The `up` flow provisions the agent volume during setup and reuses this
+        // override at runtime, so keep the runtime sections (agent volume).
+        build_only: false,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -1191,6 +1194,8 @@ fn write_final_override(
         extra_volumes: ov.extra_volumes.clone(),
         request_gpu: ov.request_gpu,
         security: ov.security.clone(),
+        // The final `up` override runs the container; keep the runtime sections.
+        build_only: false,
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;

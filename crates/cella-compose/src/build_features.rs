@@ -132,6 +132,9 @@ pub async fn compose_build(
             request_gpu: false,
             // `cella build` only builds the image; runtime security props apply at `up`.
             security: cella_config::config_map::MergedSecurityConfig::default(),
+            // This override persists and is reused at `up`, where the container
+            // runs and needs the agent volume — keep the runtime sections.
+            build_only: false,
         };
         let yaml = crate::override_file::generate_override_yaml(&override_config);
         crate::override_file::write_override_file(&project.override_file, &yaml)?;
@@ -156,7 +159,7 @@ pub async fn compose_build(
         // build only, while the image name is still resolved off `without_override`
         // data so the #192 invariant holds (the labels override never feeds
         // `resolve_primary_service_image`/`docker compose config`).
-        build_no_features(client, &project, cfg).await?
+        build_no_features(&project, cfg).await?
     };
 
     Ok(ComposeBuildResult {
@@ -192,7 +195,6 @@ async fn run_compose_build(
 ///   `docker compose config` — preserving the #192 `resolve_primary_service_image`
 ///   invariant.
 async fn build_no_features(
-    client: &dyn ContainerBackend,
     project: &ComposeProject,
     cfg: &ComposeBuildConfig<'_>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -213,7 +215,7 @@ async fn build_no_features(
         return Err(image_only_label_error().into());
     }
 
-    write_labels_only_override(client, project, &cfg.labels)?;
+    write_labels_only_override(project, &cfg.labels)?;
     let labeled_build_cmd = crate::ComposeCommand::new(project)
         .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
     run_compose_build(&labeled_build_cmd).await?;
@@ -244,27 +246,24 @@ fn image_only_label_error() -> String {
 ///
 /// Minimal in the build sense: no dockerfile/context/target/secrets — those are
 /// inherited from the base compose via the `-f` merge; this override exists solely
-/// to attach image labels to the build. The agent volume is still emitted (the
-/// real mount, computed exactly like the features path) so the override is a valid
-/// compose file; `docker compose build` does not instantiate the volume, so this
-/// matches what the features build override already writes. Used for the
-/// no-features, build-based `--label` path.
+/// to attach image labels to the build. It is marked `build_only`, so it omits the
+/// runtime sections (the agent volume mount and the top-level `volumes:` block):
+/// `cella build --label` only builds the image and never provisions the agent
+/// volume, so an override that declared it as an `external` volume could trip
+/// compose's external-volume validation on a fresh machine. Omitting it entirely
+/// keeps the override valid regardless. Used for the no-features, build-based
+/// `--label` path.
 fn write_labels_only_override(
-    client: &dyn ContainerBackend,
     project: &ComposeProject,
     labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (agent_vol_name, agent_vol_target, _) = if client.capabilities().managed_agent {
-        client.agent_volume_mount()
-    } else {
-        (String::new(), String::new(), true)
-    };
     let override_config = crate::OverrideConfig {
         primary_service: project.primary_service.clone(),
         image_override: None,
         override_command: false,
-        agent_volume_name: agent_vol_name,
-        agent_volume_target: agent_vol_target,
+        // Omitted from output (build_only); the build never mounts the volume.
+        agent_volume_name: String::new(),
+        agent_volume_target: String::new(),
         extra_env: Vec::new(),
         extra_labels: std::collections::BTreeMap::new(),
         build_dockerfile: None,
@@ -276,6 +275,7 @@ fn write_labels_only_override(
         extra_volumes: Vec::new(),
         request_gpu: false,
         security: cella_config::config_map::MergedSecurityConfig::default(),
+        build_only: true,
     };
     let yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &yaml)?;
