@@ -135,8 +135,8 @@ pub struct EnsureImageInput<'a> {
     /// Image labels (`--label key=value`, the `cella build --label` flag) to
     /// bake into the FINAL image. Same placement rule as [`Self::output`]:
     /// applied to exactly one build — the base build when there are no features,
-    /// the features layer when there are — never to a base build a features layer
-    /// will `FROM`. Unlike `output`, labels work on both the classic and buildx
+    /// the features layer when there are — never to a base build that a features
+    /// layer will `FROM`. Unlike `output`, labels work on both the classic and buildx
     /// builders. An empty slice bakes nothing (the `up` path, which never labels).
     ///
     /// A non-empty slice on a bare `image:` config with no features has no build
