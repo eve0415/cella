@@ -127,6 +127,78 @@ async fn image_only_features_lifecycle() {
     crate::override_file::cleanup_override_file(&project.override_file);
 }
 
+/// Whether a Docker image exists locally (`docker image inspect`).
+async fn docker_image_exists(image: &str) -> bool {
+    tokio::process::Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+
+/// No-features image-only compose: `cella build` must report the service's real
+/// image (e.g. `alpine:3.21`), not the `"(compose)"` sentinel.
+///
+/// No existence check here: `docker compose build` is a no-op for an image-only
+/// service (it neither builds nor pulls), so the image's local presence is not a
+/// guarantee of this path — the resolved name is what the fix is about.
+#[cella_testing::runtime_test(docker, compose)]
+async fn no_features_reports_image_only_name() {
+    let ctx = ComposeTestContext::new("plain-compose");
+    let config = load_fixture_config(&ctx.fixture_dir);
+    let config_path = ctx.fixture_dir.join("devcontainer.json");
+    let project = ComposeProject::from_resolved(&config, &config_path, &ctx.fixture_dir)
+        .unwrap()
+        .with_project_name(ctx.project_name.clone());
+
+    // No override file is written on the no-features path, so resolve the image
+    // through a command without it (mirrors `compose_build`).
+    let cmd = ComposeCommand::without_override(&project);
+    cmd.build(None, false).await.expect("compose build failed");
+
+    let image_name = crate::build_features::resolve_primary_service_image(&cmd, &project)
+        .await
+        .expect("resolving primary service image failed");
+
+    assert_ne!(image_name, "(compose)", "must not return the sentinel");
+    assert_eq!(image_name, "alpine:3.21", "should be the service's image");
+
+    ctx.cleanup().await;
+}
+
+/// No-features build-based compose: `cella build` must report the
+/// `{project}-{service}` image Docker Compose produces, not `"(compose)"`,
+/// and that image must exist locally after the build.
+#[cella_testing::runtime_test(docker, compose)]
+async fn no_features_reports_build_image_name() {
+    let ctx = ComposeTestContext::new("build-no-features");
+    let config = load_fixture_config(&ctx.fixture_dir);
+    let config_path = ctx.fixture_dir.join("devcontainer.json");
+    let project = ComposeProject::from_resolved(&config, &config_path, &ctx.fixture_dir)
+        .unwrap()
+        .with_project_name(ctx.project_name.clone());
+
+    let cmd = ComposeCommand::without_override(&project);
+    cmd.build(None, false).await.expect("compose build failed");
+
+    let image_name = crate::build_features::resolve_primary_service_image(&cmd, &project)
+        .await
+        .expect("resolving primary service image failed");
+
+    let expected = format!("{}-app", project.project_name);
+    assert_ne!(image_name, "(compose)", "must not return the sentinel");
+    assert_eq!(
+        image_name, expected,
+        "build-based service should resolve to the project-service image name"
+    );
+    assert!(
+        docker_image_exists(&image_name).await,
+        "resolved image '{image_name}' should exist after build"
+    );
+
+    ctx.cleanup().await;
+}
+
 /// Multi-service compose: verify that runServices are started and others are not.
 #[cella_testing::runtime_test(docker, compose)]
 async fn multi_service_lifecycle() {

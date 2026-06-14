@@ -1037,24 +1037,20 @@ async fn resolve_compose_image_info(
         }
     };
 
-    let image_name = match &service_info {
-        ServiceBuildInfo::Image { image } => {
-            // Pull the image if not locally available.
-            if matches!(client.image_exists(image).await, Ok(false)) {
-                let _ = run_step_result(
-                    progress,
-                    "Pulling compose service image...",
-                    client.pull_image(image),
-                )
-                .await;
-            }
-            image.clone()
-        }
-        ServiceBuildInfo::Build { .. } => {
-            // After compose build, the image exists as {project}-{service}.
-            format!("{}-{}", project.project_name, project.primary_service)
-        }
-    };
+    // For an image-only service, pull it if not locally available so the
+    // following inspect can read its metadata.
+    if let ServiceBuildInfo::Image { image } = &service_info
+        && matches!(client.image_exists(image).await, Ok(false))
+    {
+        let _ = run_step_result(
+            progress,
+            "Pulling compose service image...",
+            client.pull_image(image),
+        )
+        .await;
+    }
+    let image_name =
+        service_info.resolved_image_name(&project.project_name, &project.primary_service);
 
     match client.inspect_image_details(&image_name).await {
         Ok(details) => match details.metadata {
