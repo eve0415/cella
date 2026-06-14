@@ -100,6 +100,21 @@ pub enum ServiceBuildInfo {
     },
 }
 
+impl ServiceBuildInfo {
+    /// The image name the primary service resolves to after `docker compose build`.
+    ///
+    /// For an image-only service this is the image reference itself. For a
+    /// build-based service it is `{project}-{service}`, the name Docker Compose
+    /// assigns to the image it builds.
+    #[must_use]
+    pub fn resolved_image_name(&self, project_name: &str, service: &str) -> String {
+        match self {
+            Self::Image { image } => image.clone(),
+            Self::Build { .. } => format!("{project_name}-{service}"),
+        }
+    }
+}
+
 /// Extract the build/image info for a specific service from the resolved compose config.
 ///
 /// When a service has both `build` and `image`, `build` takes precedence
@@ -238,6 +253,25 @@ mod tests {
             err,
             CellaComposeError::ServiceHasNoBuildOrImage { .. }
         ));
+    }
+
+    #[test]
+    fn resolved_image_name_uses_image_reference() {
+        let info = ServiceBuildInfo::Image {
+            image: "node:20".to_string(),
+        };
+        assert_eq!(info.resolved_image_name("myproj", "app"), "node:20");
+    }
+
+    #[test]
+    fn resolved_image_name_uses_project_service_for_build() {
+        let info = ServiceBuildInfo::Build {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile".to_string(),
+            target: None,
+            args: HashMap::new(),
+        };
+        assert_eq!(info.resolved_image_name("myproj", "app"), "myproj-app");
     }
 
     #[test]

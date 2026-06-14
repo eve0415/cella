@@ -13,7 +13,9 @@ use crate::ComposeProject;
 
 /// Result of a compose build operation.
 pub struct ComposeBuildResult {
-    /// The primary image name (or `"(compose)"` if no features were resolved).
+    /// The primary service's image name. When features are resolved this is the
+    /// combined image cella builds; otherwise it is the service's own image
+    /// (`image:` reference, or `{project}-{service}` for a build-based service).
     pub image_name: String,
     /// Whether features were resolved and a combined Dockerfile was generated.
     pub had_features: bool,
@@ -126,9 +128,16 @@ pub async fn compose_build(
         crate::override_file::write_override_file(&project.override_file, &yaml)?;
     }
 
-    // Run docker compose build
-    let compose_cmd = crate::ComposeCommand::new(&project)
-        .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
+    // Run docker compose build. The override file is only written when features
+    // are resolved (the `if let Some(ref fb)` block above); on the no-features
+    // path it does not exist, so use a command without it — otherwise
+    // `docker compose -f <missing-override> build` fails with "no such file".
+    let compose_cmd = if features_build.is_some() {
+        crate::ComposeCommand::new(&project)
+    } else {
+        crate::ComposeCommand::without_override(&project)
+    }
+    .with_docker_binaries(cfg.docker_path.clone(), cfg.docker_compose_path.clone());
     compose_cmd.build(None, false).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("docker compose build failed: {e}").into()
@@ -136,12 +145,37 @@ pub async fn compose_build(
     )?;
 
     let had_features = features_build.is_some();
-    let image_name = features_build
-        .and_then(|b| b.image_name_override)
-        .unwrap_or_else(|| "(compose)".to_string());
+    let image_name = if let Some(image) = features_build.and_then(|b| b.image_name_override) {
+        image
+    } else {
+        // No features: resolve the service's real image. `compose_cmd` was built
+        // without the override above, so it is safe for `docker compose config`.
+        resolve_primary_service_image(&compose_cmd, &project).await?
+    };
 
     Ok(ComposeBuildResult {
         image_name,
         had_features,
     })
+}
+
+/// Resolve the primary service's image name from the resolved compose config.
+///
+/// Runs `docker compose config` through `compose_cmd` and maps the primary
+/// service's build/image info to the name it resolves to after a build
+/// (`image:` reference, or `{project}-{service}` for a build-based service).
+/// `compose_cmd` must be built without the override file, since this runs on the
+/// no-features path where that file is never written.
+///
+/// # Errors
+///
+/// Returns an error if `docker compose config` fails or the primary service has
+/// neither `build` nor `image`.
+pub(crate) async fn resolve_primary_service_image(
+    compose_cmd: &crate::ComposeCommand,
+    project: &ComposeProject,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let resolved = compose_cmd.config().await?;
+    let service_info = crate::extract_service_build_info(&resolved, &project.primary_service)?;
+    Ok(service_info.resolved_image_name(&project.project_name, &project.primary_service))
 }
