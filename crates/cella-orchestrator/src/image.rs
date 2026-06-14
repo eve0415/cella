@@ -58,6 +58,17 @@ pub async fn build_features_layer(
     if ctx.no_cache {
         options.push("--no-cache".to_string());
     }
+    // Bake the merged `devcontainer.metadata` label onto the features layer (the
+    // final image when features are present), mirroring the no-features build
+    // path and the official CLI (which emits it via the generated Dockerfile).
+    // Without this the built image carries no metadata for `docker inspect` /
+    // downstream `up`, and the `--skip-persisting-customizations-from-features`
+    // and `--omit-config-remote-env-from-metadata` omits would have no effect on
+    // this path.
+    options.push(format!(
+        "--label=devcontainer.metadata={}",
+        ctx.resolved.metadata_label
+    ));
 
     let mut args = HashMap::new();
     args.insert(
