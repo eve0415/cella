@@ -267,6 +267,10 @@ pub mod mock {
         ImageExists {
             image: String,
         },
+        TagImage {
+            source: String,
+            target: String,
+        },
         InspectImageDetails {
             image: String,
         },
@@ -300,6 +304,7 @@ pub mod mock {
         pub pull_image_responses: Mutex<VecDeque<Result<(), BackendError>>>,
         pub build_image_responses: Mutex<VecDeque<Result<String, BackendError>>>,
         pub image_exists_responses: Mutex<VecDeque<Result<bool, BackendError>>>,
+        pub tag_image_responses: Mutex<VecDeque<Result<(), BackendError>>>,
         pub inspect_image_details_responses: Mutex<VecDeque<Result<ImageDetails, BackendError>>>,
         pub upload_files_responses: Mutex<VecDeque<Result<(), BackendError>>>,
     }
@@ -579,6 +584,24 @@ pub mod mock {
                 .unwrap()
                 .pop_front()
                 .expect("MockDockerClient: no image_exists response configured");
+            Box::pin(async move { result })
+        }
+
+        fn tag_image<'a>(
+            &'a self,
+            source: &'a str,
+            target: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            self.record(MockCall::TagImage {
+                source: source.to_string(),
+                target: target.to_string(),
+            });
+            let result = self
+                .tag_image_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockDockerClient: no tag_image response configured");
             Box::pin(async move { result })
         }
 

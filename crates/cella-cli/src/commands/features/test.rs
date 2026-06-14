@@ -1456,6 +1456,14 @@ mod tests {
             panic!("unexpected image_exists call");
         }
 
+        fn tag_image<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            panic!("unexpected tag_image call");
+        }
+
         fn inspect_image_details<'a>(
             &'a self,
             _: &'a str,

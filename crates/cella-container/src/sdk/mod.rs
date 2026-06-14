@@ -262,6 +262,22 @@ impl ContainerCli {
         Ok(output.exit_code == 0)
     }
 
+    /// Add an additional name (`target`) to an existing image (`source`).
+    ///
+    /// Wraps `container image tag <source> <target>`. The Apple `container` CLI
+    /// parses the target reference itself, so it is passed through verbatim
+    /// (registry host, port, and tag included).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero or cannot be spawned.
+    pub async fn image_tag(&self, source: &str, target: &str) -> Result<(), BackendError> {
+        debug!(source, target, "tagging image");
+        run_cli_checked(&self.binary_path, &["image", "tag", source, target])
+            .await
+            .map(drop)
+    }
+
     /// Inspect an image and return raw JSON output (an array of image
     /// resources).
     ///

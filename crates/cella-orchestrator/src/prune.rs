@@ -437,6 +437,7 @@ mod tests {
         panic_method!(pull_image, image: &'a str => Result<(), BackendError>);
         panic_method!(build_image, opts: &'a cella_backend::BuildOptions => Result<String, BackendError>);
         panic_method!(image_exists, image: &'a str => Result<bool, BackendError>);
+        panic_method!(tag_image, source: &'a str, target: &'a str => Result<(), BackendError>);
         panic_method!(inspect_image_details, image: &'a str => Result<cella_backend::ImageDetails, BackendError>);
         fn upload_files<'a>(
             &'a self,
