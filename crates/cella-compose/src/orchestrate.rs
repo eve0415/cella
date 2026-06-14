@@ -1125,6 +1125,13 @@ async fn resolve_compose_user_entrypoint_command(
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
 ) -> crate::override_file::UserEntrypointCommand {
+    // overrideCommand discards the service's original entrypoint+command, so the
+    // result is fixed regardless of the compose config or image — skip resolving
+    // the config and inspecting the image (the official CLI is lazy here too).
+    if project.override_command {
+        return crate::override_file::resolve_user_entrypoint_command(true, None, None, &[], &[]);
+    }
+
     let (dp, dcp) = ctx.cfg.docker_binaries();
     let compose_cmd = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
     let resolved = match compose_cmd.config().await {
