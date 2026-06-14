@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use serde_json::json;
 use tracing::{info, warn};
 
 use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
@@ -181,6 +180,32 @@ impl BuildArgs {
     }
 }
 
+/// JSON result emitted by `cella build --output json`.
+///
+/// Mirrors the official `devcontainer build` contract — devcontainers/cli
+/// `devContainersSpecCLI.ts` emits `JSON.stringify({ outcome: 'success',
+/// imageName: string[] })`. Using a struct (not a `serde_json::Value` map) keeps
+/// the official field order — `outcome` then `imageName` — stable in the emitted
+/// string regardless of `serde_json` features.
+#[derive(serde::Serialize)]
+struct BuildResult {
+    outcome: &'static str,
+    #[serde(rename = "imageName")]
+    image_name: Vec<String>,
+}
+
+/// Build the compact JSON result line for `cella build`.
+///
+/// Compact, single-line output (like the official CLI's `JSON.stringify`) so
+/// consumers that read one JSON object per line keep working.
+fn build_json_result(image_name: &str) -> String {
+    serde_json::to_string(&BuildResult {
+        outcome: "success",
+        image_name: vec![image_name.to_owned()],
+    })
+    .unwrap_or_default()
+}
+
 /// Print the build result in the requested output format.
 fn print_result(output: &OutputFormat, image_name: &str, compose: bool) {
     match output {
@@ -191,16 +216,7 @@ fn print_result(output: &OutputFormat, image_name: &str, compose: bool) {
                 eprintln!("Image built: {image_name}");
             }
         }
-        OutputFormat::Json => {
-            let mut map = json!({
-                "outcome": "built",
-                "imageName": image_name,
-            });
-            if compose {
-                map["compose"] = json!(true);
-            }
-            println!("{}", serde_json::to_string_pretty(&map).unwrap_or_default());
-        }
+        OutputFormat::Json => println!("{}", build_json_result(image_name)),
     }
 }
 
@@ -280,5 +296,17 @@ mod tests {
     fn parse_secret_unknown_keys_ignored() {
         let secret = parse_build_secret("id=mysecret,foo=bar").unwrap();
         assert_eq!(secret.id, "mysecret");
+    }
+
+    #[test]
+    fn build_json_result_matches_official_shape() {
+        // Official `devcontainer build` emits compact single-line
+        // `{"outcome":"success","imageName":[<name>]}` in that field order:
+        // `outcome` is "success" (not "built"), `imageName` is an array, no extra
+        // keys, no pretty indentation.
+        assert_eq!(
+            build_json_result("ghcr.io/acme/devcontainer:latest"),
+            r#"{"outcome":"success","imageName":["ghcr.io/acme/devcontainer:latest"]}"#
+        );
     }
 }
