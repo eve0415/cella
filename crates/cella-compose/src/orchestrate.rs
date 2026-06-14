@@ -1115,72 +1115,74 @@ async fn resolve_compose_image_info(
 /// primary service, mirroring the official compose logic.
 ///
 /// Reads the service's resolved `entrypoint`/`command` from `docker compose
-/// config` and the base image's `ENTRYPOINT`/`CMD` from an inspect, then applies
-/// [`crate::override_file::resolve_user_entrypoint_command`]. Falls back to the
-/// default (empty entrypoint, no command) when the compose config can't be
-/// resolved — the wrapped entrypoint then just runs feature entrypoints and
-/// `exec "$@"` over whatever the service already had.
+/// config`, falling back to the base image's `ENTRYPOINT`/`CMD` (inspected
+/// lazily — only when the service declares no `entrypoint`), then applies
+/// [`crate::override_file::resolve_user_entrypoint_command`].
+///
+/// The wrapped `entrypoint:` REPLACES the service's own entrypoint, so these
+/// values are exactly what `exec "$@"` re-runs. A failure to resolve the compose
+/// config or inspect the needed image is therefore PROPAGATED, not defaulted:
+/// silently emitting an empty `userEntrypoint` would drop the service/image
+/// `ENTRYPOINT` and start the container with the wrong command. `overrideCommand`
+/// discards the original entirely, so the result is fixed and needs no lookup
+/// (the official short-circuits here too).
 async fn resolve_compose_user_entrypoint_command(
     ctx: &Ctx<'_>,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
-) -> crate::override_file::UserEntrypointCommand {
+) -> Result<crate::override_file::UserEntrypointCommand, Box<dyn std::error::Error + Send + Sync>> {
     // overrideCommand discards the service's original entrypoint+command, so the
     // result is fixed regardless of the compose config or image — skip resolving
     // the config and inspecting the image (the official CLI is lazy here too).
     if project.override_command {
-        return crate::override_file::resolve_user_entrypoint_command(true, None, None, &[], &[]);
+        return Ok(crate::override_file::resolve_user_entrypoint_command(
+            true,
+            None,
+            None,
+            &[],
+            &[],
+        ));
     }
 
     let (dp, dcp) = ctx.cfg.docker_binaries();
     let compose_cmd = ComposeCommand::without_override(project).with_docker_binaries(dp, dcp);
-    let resolved = match compose_cmd.config().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to resolve compose config for entrypoint/command: {e}");
-            return crate::override_file::UserEntrypointCommand::default();
-        }
-    };
-
+    let resolved = compose_cmd.config().await?;
     let (compose_entrypoint, compose_command) =
-        match crate::extract_service_entrypoint_command(&resolved, &project.primary_service) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("Failed to extract service entrypoint/command: {e}");
-                (None, None)
-            }
-        };
+        crate::extract_service_entrypoint_command(&resolved, &project.primary_service)?;
 
-    // The base image to inspect for the ENTRYPOINT/CMD fallback: the
-    // features-build override if present, otherwise the service's resolved image.
-    let image_name = features_build
-        .and_then(|b| b.image_name_override.clone())
-        .or_else(|| {
-            crate::extract_service_build_info(&resolved, &project.primary_service)
-                .ok()
-                .map(|info| {
-                    info.resolved_image_name(&project.project_name, &project.primary_service)
-                })
-        });
-
-    let (image_entrypoint, image_cmd) = match image_name {
-        Some(name) => match ctx.client.inspect_image_details(&name).await {
-            Ok(details) => (details.entrypoint, details.cmd),
-            Err(e) => {
-                warn!("Failed to inspect image '{name}' for entrypoint/cmd: {e}");
-                (Vec::new(), Vec::new())
+    // Image `ENTRYPOINT`/`CMD` are only a fallback for a service that declares no
+    // `entrypoint`: when one is declared neither image value is used (the command
+    // branch returns `[]` or the service's own command). Inspect lazily so a
+    // service with its own entrypoint needs no image lookup, mirroring the
+    // official `composeEntrypoint || imageEntrypoint` short-circuit.
+    let (image_entrypoint, image_cmd) = if compose_entrypoint.is_none() {
+        let image_name = features_build
+            .and_then(|b| b.image_name_override.clone())
+            .or_else(|| {
+                crate::extract_service_build_info(&resolved, &project.primary_service)
+                    .ok()
+                    .map(|info| {
+                        info.resolved_image_name(&project.project_name, &project.primary_service)
+                    })
+            });
+        match image_name {
+            Some(name) => {
+                let details = ctx.client.inspect_image_details(&name).await?;
+                (details.entrypoint, details.cmd)
             }
-        },
-        None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new()),
+        }
+    } else {
+        (Vec::new(), Vec::new())
     };
 
-    crate::override_file::resolve_user_entrypoint_command(
-        project.override_command,
+    Ok(crate::override_file::resolve_user_entrypoint_command(
+        false,
         compose_entrypoint.as_deref(),
         compose_command.as_deref(),
         &image_entrypoint,
         &image_cmd,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,7 +1422,7 @@ async fn build_override_and_start(
     let user_entrypoint_command = if feature_entrypoints.is_empty() && !project.override_command {
         crate::override_file::UserEntrypointCommand::default()
     } else {
-        resolve_compose_user_entrypoint_command(ctx, project, features_build).await
+        resolve_compose_user_entrypoint_command(ctx, project, features_build).await?
     };
 
     let mut ov_ctx = OverrideContext {
