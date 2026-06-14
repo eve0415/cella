@@ -239,8 +239,16 @@ impl BuildArgs {
         let result =
             result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        for name in &self.image_name {
-            client.tag_image(&result.image_name, name).await?;
+        if !self.image_name.is_empty() {
+            // `docker compose build` neither builds nor pulls an image-only
+            // service, so the resolved image may be remote-only; `tag_image`
+            // needs it present locally. Pull it if missing before tagging.
+            if !client.image_exists(&result.image_name).await? {
+                client.pull_image(&result.image_name).await?;
+            }
+            for name in &self.image_name {
+                client.tag_image(&result.image_name, name).await?;
+            }
         }
 
         print_result(&self.output, &self.reported_names(&result.image_name), true);
@@ -353,10 +361,11 @@ fn print_result(output: &OutputFormat, image_names: &[String], compose: bool) {
     match output {
         OutputFormat::Auto | OutputFormat::Text => {
             let joined = image_names.join(", ");
-            if compose {
-                eprintln!("Compose services built. Primary image: {joined}");
-            } else {
-                eprintln!("Image built: {joined}");
+            match (compose, image_names.len() > 1) {
+                (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
+                (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
+                (false, false) => eprintln!("Image built: {joined}"),
+                (false, true) => eprintln!("Image built and tagged: {joined}"),
             }
         }
         OutputFormat::Json => println!("{}", build_json_result(image_names)),
