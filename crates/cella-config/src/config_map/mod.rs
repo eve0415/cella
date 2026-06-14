@@ -90,32 +90,8 @@ pub fn map_config<S: std::hash::BuildHasher>(
     let env = map_merged_env(config, image_env);
     let remote_env = map_remote_env(config);
     let port_bindings = map_port_bindings(config);
-    let cap_add = map_merged_string_list(config, "capAdd", feature_config.map(|fc| &fc.cap_add));
-    let security_opt = map_merged_string_list(
-        config,
-        "securityOpt",
-        feature_config.map(|fc| &fc.security_opt),
-    );
-
-    let container_user = config
-        .get("containerUser")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
+    let sec = merge_security_config(config, feature_config);
     let (entrypoint, cmd) = build_entrypoint_cmd(config, feature_config, agent_arch);
-
-    let privileged = config
-        .get("privileged")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || feature_config.is_some_and(|fc| fc.privileged);
-
-    let init = config
-        .get("init")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || feature_config.is_some_and(|fc| fc.init);
-
     let gpu_request = map_gpu_device_request(config);
     let run_args_overrides = parse_run_args_from_config(config);
 
@@ -125,19 +101,72 @@ pub fn map_config<S: std::hash::BuildHasher>(
         labels: labels.into_iter().collect(),
         env,
         remote_env,
-        user: container_user,
+        user: sec.container_user,
         workspace_folder,
         workspace_mount,
         mounts,
         port_bindings,
         entrypoint,
         cmd,
-        cap_add,
-        security_opt,
-        privileged,
-        init,
+        cap_add: sec.cap_add,
+        security_opt: sec.security_opt,
+        privileged: sec.privileged,
+        init: sec.init,
         run_args_overrides,
         gpu_request,
+    }
+}
+
+/// Container security/runtime properties merged from devcontainer.json and
+/// feature/image metadata.
+///
+/// `capAdd`/`securityOpt` are unioned (deduplicated), `privileged`/`init` are
+/// OR-ed, and `containerUser` comes from devcontainer.json. Shared by the
+/// single-container create path ([`map_config`]) and the compose override
+/// generator so both apply identical values — official applies these on both
+/// paths (`devContainersSpecCLI` single-container run args and the
+/// `dockerCompose` service override).
+#[derive(Debug, Clone, Default)]
+pub struct MergedSecurityConfig {
+    /// `containerUser` — the user the container process runs as (`--user`).
+    pub container_user: Option<String>,
+    /// `capAdd` — Linux capabilities to add (`--cap-add`).
+    pub cap_add: Vec<String>,
+    /// `securityOpt` — security options (`--security-opt`).
+    pub security_opt: Vec<String>,
+    /// `privileged` — run the container privileged (`--privileged`).
+    pub privileged: bool,
+    /// `init` — wrap the container entrypoint with an init process (`--init`).
+    pub init: bool,
+}
+
+/// Merge container security/runtime properties from devcontainer.json with the
+/// merged feature/image metadata. See [`MergedSecurityConfig`].
+pub fn merge_security_config(
+    config: &serde_json::Value,
+    feature_config: Option<&FeatureContainerConfig>,
+) -> MergedSecurityConfig {
+    MergedSecurityConfig {
+        container_user: config
+            .get("containerUser")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        cap_add: map_merged_string_list(config, "capAdd", feature_config.map(|fc| &fc.cap_add)),
+        security_opt: map_merged_string_list(
+            config,
+            "securityOpt",
+            feature_config.map(|fc| &fc.security_opt),
+        ),
+        privileged: config
+            .get("privileged")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || feature_config.is_some_and(|fc| fc.privileged),
+        init: config
+            .get("init")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || feature_config.is_some_and(|fc| fc.init),
     }
 }
 

@@ -114,6 +114,8 @@ pub async fn compose_build(
             extra_volumes: Vec::new(),
             // GPU reservation is emitted only in the final override.
             request_gpu: false,
+            // `cella build` only builds the image; runtime security props apply at `up`.
+            security: cella_config::config_map::MergedSecurityConfig::default(),
         };
         let yaml = crate::override_file::generate_override_yaml(&override_config);
         crate::override_file::write_override_file(&project.override_file, &yaml)?;
