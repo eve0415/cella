@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::{info, warn};
 
-use super::{BuildKitMode, ComposePullPolicy, ImagePullPolicy, LogFormat, LogLevel, OutputFormat};
+use super::{BuildKitMode, ComposePullPolicy, ImagePullPolicy, LogFormat, LogLevel};
 
 use cella_backend::{BuildSecret, container_name};
 use cella_config::devcontainer::resolve;
@@ -50,10 +50,6 @@ pub struct BuildArgs {
     /// `devcontainer build --image-name`).
     #[arg(long = "image-name")]
     image_name: Vec<String>,
-
-    /// Output format.
-    #[arg(long, value_enum, default_value = "text")]
-    output: OutputFormat,
 
     /// Docker Compose profile(s) to activate (repeatable).
     #[arg(long = "profile")]
@@ -110,10 +106,6 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
-    }
-
     /// The `--log-level` value, seeded into the global tracing filter by main.rs
     /// before dispatch (mirrors `up`).
     pub const fn log_level(&self) -> Option<LogLevel> {
@@ -251,7 +243,7 @@ impl BuildArgs {
             }
         }
 
-        print_result(&self.output, &self.reported_names(&result.image_name), true);
+        print_result(&self.reported_names(&result.image_name), true);
         Ok(())
     }
 
@@ -307,7 +299,7 @@ impl BuildArgs {
             );
         }
 
-        print_result(&self.output, &self.reported_names(&img_name), false);
+        print_result(&self.reported_names(&img_name), false);
         Ok(())
     }
 
@@ -325,7 +317,7 @@ impl BuildArgs {
     }
 }
 
-/// JSON result emitted by `cella build --output json`.
+/// JSON result emitted by `cella build` on stdout.
 ///
 /// Mirrors the official `devcontainer build` contract — devcontainers/cli
 /// `devContainersSpecCLI.ts` emits `JSON.stringify({ outcome: 'success',
@@ -353,22 +345,25 @@ fn build_json_result(image_names: &[String]) -> String {
     .unwrap_or_default()
 }
 
-/// Print the build result in the requested output format.
+/// Print the build result.
+///
+/// Always emits the machine-readable JSON result line to **stdout** (matching
+/// the official `devcontainer build`, which unconditionally writes
+/// `JSON.stringify(result)`), plus a friendly human summary to **stderr**. The
+/// human line is a cella extra; keeping it on stderr means it never pollutes the
+/// stdout JSON that scripts parse, so there is no `--output text|json` selector.
 ///
 /// `image_names` holds every reported name (the built name, or all
-/// `--image-name` values when set). The text mode lists them comma-separated.
-fn print_result(output: &OutputFormat, image_names: &[String], compose: bool) {
-    match output {
-        OutputFormat::Auto | OutputFormat::Text => {
-            let joined = image_names.join(", ");
-            match (compose, image_names.len() > 1) {
-                (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
-                (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
-                (false, false) => eprintln!("Image built: {joined}"),
-                (false, true) => eprintln!("Image built and tagged: {joined}"),
-            }
-        }
-        OutputFormat::Json => println!("{}", build_json_result(image_names)),
+/// `--image-name` values when set). The human summary lists them comma-separated.
+fn print_result(image_names: &[String], compose: bool) {
+    println!("{}", build_json_result(image_names));
+
+    let joined = image_names.join(", ");
+    match (compose, image_names.len() > 1) {
+        (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
+        (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
+        (false, false) => eprintln!("Image built: {joined}"),
+        (false, true) => eprintln!("Image built and tagged: {joined}"),
     }
 }
 
@@ -649,6 +644,31 @@ mod tests {
             build_json_result(&["one:1".to_string(), "two:2".to_string()]),
             r#"{"outcome":"success","imageName":["one:1","two:2"]}"#
         );
+    }
+
+    #[test]
+    fn build_always_emits_json_result_no_format_flag() {
+        // `cella build` has no `--output text|json` format selector — it always
+        // emits the JSON result to stdout (matching the official `devcontainer
+        // build`, which unconditionally writes `JSON.stringify(result)`). Verify
+        // the result line is well-formed regardless of which other flags were
+        // parsed, so nothing can gate it off.
+        for extra in [
+            vec![],
+            vec!["--no-cache"],
+            vec!["--log-format", "json"],
+            vec!["--image-name", "x:1"],
+        ] {
+            let args = parse_build(&extra);
+            let line = build_json_result(&args.reported_names("built:latest"));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("result line is valid JSON");
+            assert_eq!(parsed["outcome"], "success", "for flags {extra:?}");
+            assert!(
+                parsed["imageName"].is_array(),
+                "imageName must be an array for flags {extra:?}"
+            );
+        }
     }
 
     #[test]
