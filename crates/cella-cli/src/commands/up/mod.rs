@@ -494,7 +494,7 @@ pub fn parse_secrets_file(
     Ok(secrets)
 }
 
-fn compute_default_workspace_folder(workspace_root: &Path, host_mount_folder: &Path) -> String {
+pub fn compute_default_workspace_folder(workspace_root: &Path, host_mount_folder: &Path) -> String {
     let mount_basename = host_mount_folder.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().to_string(),
@@ -1748,9 +1748,10 @@ pub async fn populate_envelope_extras(
 }
 
 /// Inject a `configFilePath` URI object into a cloned `configuration`,
-/// matching the shape the official CLI embeds (and the one
-/// [`super::read_configuration`] emits as a sibling key).
-fn inject_config_file_path(config: &mut serde_json::Value, config_path: &Path) {
+/// matching the shape the official CLI embeds. Shared with
+/// [`super::read_configuration`], which nests it inside `configuration` the
+/// same way.
+pub fn inject_config_file_path(config: &mut serde_json::Value, config_path: &Path) {
     let canonical = config_path
         .canonicalize()
         .unwrap_or_else(|_| config_path.to_path_buf());

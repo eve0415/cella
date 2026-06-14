@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde_json::json;
@@ -82,54 +82,103 @@ impl ReadConfigurationArgs {
             super::features::resolve::merge_additional_features(&mut resolved.config, additional)?;
         }
 
-        let device_type = if resolved.config.get("dockerComposeFile").is_some() {
-            "dockerCompose"
-        } else if resolved.config.get("build").is_some()
-            || resolved.config.get("dockerFile").is_some()
-        {
-            "dockerfile"
-        } else {
-            "image"
-        };
-
-        let workspace_basename = cwd.file_name().map_or_else(
-            || "workspace".to_string(),
-            |n| n.to_string_lossy().to_string(),
+        // Match cella's own mount behaviour: `up` mounts the git-root folder
+        // (mountWorkspaceGitRoot defaults to true), so report that, not the cwd.
+        let host_mount_folder = cella_git::find_git_root_folder(&cwd, true);
+        let mut output = build_base_output(
+            &resolved.config,
+            &resolved.config_path,
+            &cwd,
+            &host_mount_folder,
         );
-        let workspace_folder = resolved
-            .config
-            .get("workspaceFolder")
-            .and_then(|v| v.as_str())
-            .map_or_else(|| format!("/workspaces/{workspace_basename}"), String::from);
-
-        let config_path = resolved
-            .config_path
-            .canonicalize()
-            .unwrap_or_else(|_| resolved.config_path.clone());
-        let config_path_str = config_path.to_string_lossy();
-
-        let mut output = json!({
-            "configFilePath": {
-                "fsPath": config_path_str,
-                "$mid": 1,
-                "path": config_path_str,
-                "scheme": "file"
-            },
-            "configuration": resolved.config,
-            "workspace": {
-                "workspaceFolder": workspace_folder,
-                "deviceContainerType": device_type
-            }
-        });
 
         if self.include_merged_configuration {
             output["mergedConfiguration"] =
                 resolve_merged_config(&resolved.config, &resolved.config_path).await?;
         }
 
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        // Official `read-configuration` prints compact (single-line) JSON.
+        println!("{}", serde_json::to_string(&output)?);
         Ok(())
     }
+}
+
+/// Build the base `read-configuration` envelope: `{configuration, workspace}`.
+///
+/// Matches the official shape: `configFilePath` is nested *inside*
+/// `configuration` (not a top-level sibling), and `workspace` carries
+/// `{workspaceFolder, workspaceMount}` (the official `WorkspaceConfiguration`),
+/// not the cella-only `deviceContainerType`.
+///
+/// `host_mount_folder` is the folder cella actually bind-mounts (the git root
+/// when `mountWorkspaceGitRoot` is on, else the workspace root); it may be a
+/// parent of `workspace_root` when the workspace is a git subdirectory.
+fn build_base_output(
+    config: &serde_json::Value,
+    config_path: &Path,
+    workspace_root: &Path,
+    host_mount_folder: &Path,
+) -> serde_json::Value {
+    // The container mount point mirrors the host mount folder's name; the
+    // workspace folder may sit in a subdirectory beneath it.
+    let mount_basename = host_mount_folder.file_name().map_or_else(
+        || "workspace".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
+    let container_mount_folder = format!("/workspaces/{mount_basename}");
+    let workspace_folder = config
+        .get("workspaceFolder")
+        .and_then(|v| v.as_str())
+        .map_or_else(
+            || super::up::compute_default_workspace_folder(workspace_root, host_mount_folder),
+            String::from,
+        );
+
+    // Report the mount cella would create. An explicit `workspaceMount` in the
+    // config (including `""`) is reported verbatim — official keys on the
+    // property's presence — otherwise derive the default git-root bind string.
+    let workspace_mount = config.get("workspaceMount").cloned().unwrap_or_else(|| {
+        json!(derive_workspace_mount(
+            host_mount_folder,
+            &container_mount_folder
+        ))
+    });
+
+    let mut configuration = config.clone();
+    super::up::inject_config_file_path(&mut configuration, config_path);
+
+    json!({
+        "configuration": configuration,
+        "workspace": {
+            "workspaceFolder": workspace_folder,
+            "workspaceMount": workspace_mount,
+        }
+    })
+}
+
+/// Derive the default workspace bind-mount string for `host_mount_folder` (the
+/// folder cella mounts), matching `cella_config`'s `map_workspace_mount`:
+/// source = the canonicalized host folder, target = the container mount point,
+/// `consistency` only off Linux.
+fn derive_workspace_mount(host_mount_folder: &Path, container_target: &str) -> String {
+    let canonical = host_mount_folder
+        .canonicalize()
+        .unwrap_or_else(|_| host_mount_folder.to_path_buf());
+    let source = canonical.to_string_lossy();
+    let cons = if cfg!(target_os = "linux") {
+        ""
+    } else {
+        ",consistency=cached"
+    };
+    // Quote source/target when they contain a comma, matching the official
+    // mount-string formatting.
+    let src_q = if source.contains(',') { "\"" } else { "" };
+    let tgt_q = if container_target.contains(',') {
+        "\""
+    } else {
+        ""
+    };
+    format!("type=bind,{src_q}source={source}{src_q},{tgt_q}target={container_target}{tgt_q}{cons}")
 }
 
 /// Build the `mergedConfiguration` output for a resolved devcontainer,
@@ -138,7 +187,7 @@ impl ReadConfigurationArgs {
 /// Reused by `up --include-merged-configuration`.
 pub async fn resolve_merged_config(
     config: &serde_json::Value,
-    config_path: &std::path::Path,
+    config_path: &Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let features = super::features::resolve::extract_features(config);
     if features.is_empty() {
@@ -1150,5 +1199,135 @@ mod tests {
         // We just verify it doesn't error; shape tested via build_merged_output unit tests.
         args.execute().await.unwrap();
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // --- read-configuration envelope shape (build_base_output) ---
+
+    // Common case: workspace == git root, so host_mount_folder == workspace_root.
+    #[test]
+    fn base_output_nests_config_file_path_not_top_level() {
+        let config = json!({"image": "ubuntu:22.04"});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/proj/.devcontainer/devcontainer.json"),
+            Path::new("/work/proj"),
+            Path::new("/work/proj"),
+        );
+        assert!(
+            out.get("configFilePath").is_none(),
+            "configFilePath must not be a top-level sibling"
+        );
+        assert_eq!(
+            out["configuration"]["configFilePath"]["scheme"],
+            json!("file")
+        );
+        assert_eq!(out["configuration"]["image"], json!("ubuntu:22.04"));
+    }
+
+    #[test]
+    fn base_output_workspace_shape_drops_device_container_type() {
+        let config = json!({"image": "ubuntu:22.04"});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/proj/.devcontainer/devcontainer.json"),
+            Path::new("/work/proj"),
+            Path::new("/work/proj"),
+        );
+        let ws = &out["workspace"];
+        assert!(
+            ws.get("deviceContainerType").is_none(),
+            "deviceContainerType is a cella-only phantom key"
+        );
+        assert_eq!(ws["workspaceFolder"], json!("/workspaces/proj"));
+        let mount = ws["workspaceMount"].as_str().unwrap();
+        assert!(mount.starts_with("type=bind,"), "got: {mount}");
+        assert!(mount.contains("target=/workspaces/proj"), "got: {mount}");
+    }
+
+    // Git subdirectory: cella mounts the git root, so the report must too —
+    // source = git root, target = the git-root mount point, workspaceFolder
+    // sits in the subdir beneath it.
+    #[test]
+    fn base_output_git_subdir_reports_git_root_mount() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_base_output(
+            &config,
+            Path::new("/repo/packages/app/.devcontainer/devcontainer.json"),
+            Path::new("/repo/packages/app"),
+            Path::new("/repo"),
+        );
+        let ws = &out["workspace"];
+        assert_eq!(
+            ws["workspaceFolder"],
+            json!("/workspaces/repo/packages/app")
+        );
+        let mount = ws["workspaceMount"].as_str().unwrap();
+        assert!(mount.contains("target=/workspaces/repo"), "got: {mount}");
+        assert!(mount.contains("source=/repo"), "got: {mount}");
+    }
+
+    #[test]
+    fn base_output_explicit_empty_workspace_mount_verbatim() {
+        // Presence-keyed: an explicit "" is reported as-is, not derived.
+        let config = json!({"image": "ubuntu", "workspaceMount": ""});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/p/.devcontainer/devcontainer.json"),
+            Path::new("/work/p"),
+            Path::new("/work/p"),
+        );
+        assert_eq!(out["workspace"]["workspaceMount"], json!(""));
+    }
+
+    #[test]
+    fn base_output_explicit_null_workspace_mount_verbatim() {
+        let config = json!({"image": "ubuntu", "workspaceMount": null});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/p/.devcontainer/devcontainer.json"),
+            Path::new("/work/p"),
+            Path::new("/work/p"),
+        );
+        assert_eq!(out["workspace"]["workspaceMount"], json!(null));
+    }
+
+    #[test]
+    fn base_output_explicit_custom_workspace_mount_verbatim() {
+        let config = json!({"image": "ubuntu", "workspaceMount": "type=bind,source=/a,target=/b"});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/p/.devcontainer/devcontainer.json"),
+            Path::new("/work/p"),
+            Path::new("/work/p"),
+        );
+        assert_eq!(
+            out["workspace"]["workspaceMount"],
+            json!("type=bind,source=/a,target=/b")
+        );
+    }
+
+    #[test]
+    fn base_output_respects_explicit_workspace_folder() {
+        let config = json!({"image": "ubuntu", "workspaceFolder": "/custom/wf"});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/p/.devcontainer/devcontainer.json"),
+            Path::new("/work/p"),
+            Path::new("/work/p"),
+        );
+        assert_eq!(out["workspace"]["workspaceFolder"], json!("/custom/wf"));
+    }
+
+    #[test]
+    fn base_output_serializes_compact_single_line() {
+        let config = json!({"image": "ubuntu"});
+        let out = build_base_output(
+            &config,
+            Path::new("/work/p/.devcontainer/devcontainer.json"),
+            Path::new("/work/p"),
+            Path::new("/work/p"),
+        );
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains('\n'), "compact output must be single-line");
     }
 }
