@@ -74,13 +74,24 @@ impl ReadConfigurationArgs {
                 .cloned()
                 .unwrap_or_default();
 
+            // The official `getImageMetadataFromContainer` treats a container
+            // found by `--id-label` specially: only the current config's
+            // updateable props are merged (the baked lifecycle stays). True when
+            // id-labels were given and all are present on the container.
+            let has_id_labels = !self.id_label.is_empty()
+                && self.id_label.iter().all(|kv| {
+                    kv.split_once('=').is_some_and(|(k, v)| {
+                        container.labels.get(k).map(String::as_str) == Some(v)
+                    })
+                });
+
             let workspace_path = container
                 .labels
                 .get("dev.cella.workspace_path")
                 .ok_or("container has no dev.cella.workspace_path label")?;
             let ws = PathBuf::from(workspace_path);
             let res = resolve::config(&ws, config_path)?;
-            (res, ws, Some(metadata_label))
+            (res, ws, Some((metadata_label, has_id_labels)))
         } else {
             let ws = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
             let res = resolve::config(&ws, config_path)?;
@@ -104,14 +115,15 @@ impl ReadConfigurationArgs {
         );
 
         if self.include_merged_configuration {
-            output["mergedConfiguration"] = if let Some(label) = container_metadata_label {
-                // Container target: read from the already-baked `devcontainer.metadata`
-                // label — no OCI network access needed. Matches the official CLI's
-                // `getImageMetadataFromContainer` path.
-                build_merged_from_label(&resolved.config, &label)
-            } else {
-                resolve_merged_config(&resolved.config, &resolved.config_path).await?
-            };
+            output["mergedConfiguration"] =
+                if let Some((label, has_id_labels)) = container_metadata_label {
+                    // Container target: read from the already-baked `devcontainer.metadata`
+                    // label — no OCI network access needed. Matches the official CLI's
+                    // `getImageMetadataFromContainer` path.
+                    build_merged_from_label(&resolved.config, &label, has_id_labels)
+                } else {
+                    resolve_merged_config(&resolved.config, &resolved.config_path).await?
+                };
         }
 
         // Official `read-configuration` prints compact (single-line) JSON.
@@ -259,24 +271,54 @@ pub async fn resolve_merged_config(
 ///
 /// If the label is absent or empty, merges with an empty metadata array, which
 /// is equivalent to no features — only the devcontainer.json config contributes.
-fn build_merged_from_label(config: &serde_json::Value, label_json: &str) -> serde_json::Value {
+/// Build `mergedConfiguration` from a container's baked `devcontainer.metadata`
+/// label, with no OCI/network access — mirroring the official
+/// `getImageMetadataFromContainer` + `mergeConfiguration`.
+///
+/// The official appends the *current* devcontainer.json to the baked metadata
+/// array so it is authoritative in the merge: the `--id-label` path contributes
+/// only the updateable properties (`remoteUser`/`userEnvProbe`/`remoteEnv`),
+/// while other targets (e.g. `--container-id`) append the full config (incl
+/// lifecycle/customizations). A single-object label is normalised to one entry.
+fn build_merged_from_label(
+    config: &serde_json::Value,
+    label_json: &str,
+    has_id_labels: bool,
+) -> serde_json::Value {
     use cella_features::types::{FeatureMetadata, ResolvedFeature};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    // Parse the baked metadata array.  parse_image_metadata handles invalid/empty JSON
-    // gracefully (returns defaults), so no error-path needed here.
-    let (container_config, _user_info) = cella_features::parse_image_metadata(label_json);
+    // The baked metadata is normally a JSON array; some tooling/images emit a
+    // single object instead — normalise it to a one-element array so its
+    // metadata is not silently dropped.
+    let mut entries: Vec<serde_json::Value> =
+        match serde_json::from_str::<serde_json::Value>(label_json) {
+            Ok(serde_json::Value::Array(a)) => a,
+            Ok(obj @ serde_json::Value::Object(_)) => vec![obj],
+            _ => Vec::new(),
+        };
 
-    // Reconstruct per-feature entries for customizations.  The metadata array has:
-    //   [base-image entries..., feature entries (each with "id"), devcontainer.json (last, no "id")]
-    // apply_merged_customizations iterates rf.features for per-source customizations;
-    // the devcontainer.json entry's customizations come from config["customizations"] directly.
-    let entries: Vec<serde_json::Value> = serde_json::from_str(label_json).unwrap_or_default();
+    // Append the current config last so it is authoritative (matches the official
+    // `getImageMetadataFromContainer`). `--id-label` contributes only updateable
+    // props; otherwise the full config (its lifecycle/customizations win).
+    entries.push(if has_id_labels {
+        pick_properties(config, &["remoteUser", "userEnvProbe", "remoteEnv"])
+    } else {
+        config.clone()
+    });
+
+    // Merge the entries into a FeatureContainerConfig (lifecycle/env/caps/mounts),
+    // ordered base→features→devcontainer.json, with no network access.
+    let array_json = serde_json::to_string(&entries).unwrap_or_default();
+    let (container_config, _user_info) = cella_features::parse_image_metadata(&array_json);
+
+    // Reconstruct per-feature entries (those with an "id") for the per-source
+    // customizations Record; devcontainer.json entries (no "id") are handled by
+    // `build_merged_output` via `config` directly.
     let features: Vec<ResolvedFeature> = entries
-        .into_iter()
+        .iter()
         .filter_map(|entry| {
-            // Feature entries have an "id" field; the devcontainer.json entry typically does not.
             let id = entry.get("id").and_then(|v| v.as_str())?.to_string();
             let customizations = entry.get("customizations").cloned();
             Some(ResolvedFeature {
@@ -304,6 +346,19 @@ fn build_merged_from_label(config: &serde_json::Value, label_json: &str) -> serd
     };
 
     build_merged_output(config, Some(&rf))
+}
+
+/// Pick a subset of object keys into a new JSON object (empty when none present).
+fn pick_properties(config: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = config.as_object() {
+        for &key in keys {
+            if let Some(value) = obj.get(key) {
+                out.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Assemble the official `mergeConfiguration` output shape.
@@ -1458,23 +1513,18 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn merged_from_label_lifecycle_features_then_devcontainer_last() {
-        // The metadata label: feat-a contributes postCreateCommand, then devcontainer.json last.
-        let label = json!([
-            {"id": "feat-a", "postCreateCommand": "echo feat-a"},
-            {"image": "ubuntu", "postCreateCommand": "echo base"}
-        ])
-        .to_string();
-        // config (on-disk devcontainer.json) also carries the postCreateCommand.
-        let config = json!({"image": "ubuntu", "postCreateCommand": "echo base"});
-        let out = build_merged_from_label(&config, &label);
+    fn merged_from_label_appends_current_config_lifecycle_last() {
+        // The label carries a feature's hook; the current devcontainer.json is
+        // appended last (matching the official `getImageMetadataFromContainer`),
+        // so its hook is authoritative and ordered after the feature's.
+        let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
+        let config = json!({"image": "ubuntu", "postCreateCommand": "echo dev"});
+        let out = build_merged_from_label(&config, &label, false);
 
-        // Plural array: feature first, devcontainer.json last.
         assert_eq!(
             out["postCreateCommands"],
-            json!(["echo feat-a", "echo base"])
+            json!(["echo feat-a", "echo dev"])
         );
-        // Singular key removed.
         assert!(out.get("postCreateCommand").is_none());
     }
 
@@ -1495,7 +1545,7 @@ mod tests {
             }
         });
 
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         let cust = &out["customizations"];
 
         // vscode: feat-a contribution, feat-b contribution, devcontainer.json contribution.
@@ -1515,7 +1565,7 @@ mod tests {
         .to_string();
         let config = json!({"image": "ubuntu", "containerEnv": {"BASE": "1"}});
 
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         // All env vars from the label are merged into the output.
         assert_eq!(out["containerEnv"]["FOO"], json!("feat"));
         // Later entry in the label wins (last-wins semantics from parse_image_metadata).
@@ -1523,21 +1573,19 @@ mod tests {
     }
 
     #[test]
-    fn merged_from_label_empty_label_produces_empty_lifecycle() {
-        // A container that has no devcontainer.metadata label (cella always bakes
-        // at least the devcontainer.json entry, so this is rare — external containers
-        // built without devcontainer support). The official CLI also reads lifecycle
-        // exclusively from the metadata array; with an empty array, lifecycle arrays
-        // are empty. We match that: an absent/empty label yields empty plural arrays,
-        // matching `mergeLifecycleHooks([], hook) → []` in the official CLI.
+    fn merged_from_label_empty_label_still_includes_current_config() {
+        // A container with no devcontainer.metadata label (e.g. one built by other
+        // tooling). Regression: the current devcontainer.json is still appended, so
+        // its hooks are NOT dropped — the container path must merge the live config,
+        // not ignore it.
         let config = json!({
             "image": "ubuntu",
             "postCreateCommand": "echo hi",
         });
-        let out = build_merged_from_label(&config, "");
+        let out = build_merged_from_label(&config, "", false);
 
-        // Lifecycle comes from the label array only (none here), not from on-disk config.
-        assert_eq!(out["postCreateCommands"], json!([]));
+        // The current config's hook is present (appended as the sole entry).
+        assert_eq!(out["postCreateCommands"], json!(["echo hi"]));
         assert!(out.get("postCreateCommand").is_none());
         assert_eq!(out["init"], json!(false));
         assert_eq!(out["privileged"], json!(false));
@@ -1547,7 +1595,7 @@ mod tests {
     fn merged_from_label_absent_label_yields_empty_array_keys() {
         // Absent label (empty string from unwrap_or_default in execute).
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, "");
+        let out = build_merged_from_label(&config, "", false);
         // All plural lifecycle arrays present and empty.
         assert_eq!(out["onCreateCommands"], json!([]));
         assert_eq!(out["updateContentCommands"], json!([]));
@@ -1566,7 +1614,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         assert_eq!(out["init"], json!(true));
         assert_eq!(out["privileged"], json!(false));
     }
@@ -1580,7 +1628,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         let cap_add = out["capAdd"].as_array().expect("capAdd must be present");
         // Deduplicated: SYS_PTRACE appears once.
         assert!(cap_add.contains(&json!("SYS_PTRACE")));
@@ -1596,7 +1644,7 @@ mod tests {
         ])
         .to_string();
         let config = json!({"image": "ubuntu"});
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         assert_eq!(out["entrypoints"], json!(["/init-feat.sh"]));
     }
 
@@ -1609,9 +1657,33 @@ mod tests {
             "workspaceFolder": "/workspace",
             "name": "my-dev",
         });
-        let out = build_merged_from_label(&config, &label);
+        let out = build_merged_from_label(&config, &label, false);
         assert_eq!(out["remoteUser"], json!("vscode"));
         assert_eq!(out["workspaceFolder"], json!("/workspace"));
         assert_eq!(out["name"], json!("my-dev"));
+    }
+
+    #[test]
+    fn merged_from_label_normalizes_single_object_label() {
+        // Some tooling/images emit `devcontainer.metadata` as a single object
+        // rather than an array; it must be normalised to one entry, not dropped.
+        let label = json!({"id": "feat-a", "postCreateCommand": "echo obj"}).to_string();
+        let config = json!({"image": "ubuntu"});
+        let out = build_merged_from_label(&config, &label, false);
+
+        assert_eq!(out["postCreateCommands"], json!(["echo obj"]));
+    }
+
+    #[test]
+    fn merged_from_label_id_label_path_omits_current_config_lifecycle() {
+        // Found by `--id-label`: the official appends only the updateable props
+        // (remoteUser/userEnvProbe/remoteEnv), NOT the current config's lifecycle,
+        // so the baked/feature hooks stand.
+        let label = json!([{"id": "feat-a", "postCreateCommand": "echo feat-a"}]).to_string();
+        let config = json!({"postCreateCommand": "echo dev", "remoteUser": "vscode"});
+        let out = build_merged_from_label(&config, &label, true);
+
+        // The current config's lifecycle is NOT appended on the id-label path.
+        assert_eq!(out["postCreateCommands"], json!(["echo feat-a"]));
     }
 }
