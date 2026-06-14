@@ -433,31 +433,49 @@ async fn resolve_ssh_agent_proxy_for_compose(
     }
 }
 
-/// Resolve the compose project's remote user, env-forwarding plan,
-/// and ssh-agent proxy status. Extracted from `prepare_and_start` to
-/// keep that function under the `clippy::too_many_lines` ceiling.
+/// Resolved per-service runtime properties for the compose primary service.
+///
+/// Bundles the values derived from the resolved features + base image (remote
+/// user, base image user, security props, and the merged `devcontainer.metadata`
+/// label) together with the env-forwarding plan and ssh-agent proxy status, so
+/// `prepare_and_start` threads one value instead of a wide tuple.
+struct ComposeRuntimeResolution {
+    /// The remote user commands run as.
+    remote_user: String,
+    /// The base image's USER directive (for the UID-remap layer).
+    image_user: String,
+    /// Env-forwarding plan (mutated downstream when starting services).
+    env_fwd: cella_env::EnvForwarding,
+    /// ssh-agent proxy status, surfaced in the up result.
+    ssh_agent_proxy: Option<SshAgentProxyStatus>,
+    /// Merged security props applied to the primary service.
+    security: cella_config::config_map::MergedSecurityConfig,
+    /// The `devcontainer.metadata` label value (base image + features + config
+    /// entries), stamped on the primary service for tooling interop.
+    metadata_label: String,
+}
+
+/// Resolve the compose project's remote user, env-forwarding plan, ssh-agent
+/// proxy status, security props, and `devcontainer.metadata` label. Extracted
+/// from `prepare_and_start` to keep that function under the
+/// `clippy::too_many_lines` ceiling.
 async fn resolve_user_and_env(
     client: &dyn ContainerBackend,
     ctx: &Ctx<'_>,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
-) -> (
-    String,
-    String,
-    cella_env::EnvForwarding,
-    Option<SshAgentProxyStatus>,
-    cella_config::config_map::MergedSecurityConfig,
-) {
+) -> ComposeRuntimeResolution {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let (image_user, image_meta_user, base_image_security) = resolve_compose_image_info(
-        client,
-        project,
-        features_build,
-        cfg.docker_binaries(),
-        progress,
-    )
-    .await;
+    let (image_user, image_meta_user, base_image_security, base_metadata) =
+        resolve_compose_image_info(
+            client,
+            project,
+            features_build,
+            cfg.docker_binaries(),
+            progress,
+        )
+        .await;
     // Runtime security props: prefer the resolved-features config; fall back to
     // the base image's metadata when no features are configured (mirrors the
     // single-container effective_feature_config fallback in up.rs).
@@ -467,6 +485,16 @@ async fn resolve_user_and_env(
     let security = cella_config::config_map::merge_security_config(
         cfg.config,
         effective_feature_config.as_ref(),
+    );
+    // Merged `devcontainer.metadata` label: the features path reuses the label
+    // computed during feature resolution; otherwise merge the base image's
+    // metadata with the devcontainer.json config entry (mirrors single-container
+    // `build_labels`).
+    let metadata_label = compose_metadata_label(
+        features_build.map(|fb| fb.resolved_features.metadata_label.as_str()),
+        cfg.config,
+        base_metadata.as_deref(),
+        cfg.omit_remote_env_from_metadata,
     );
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
@@ -480,7 +508,14 @@ async fn resolve_user_and_env(
         client.host_gateway(),
     )
     .await;
-    (remote_user, image_user, env_fwd, ssh_agent_proxy, security)
+    ComposeRuntimeResolution {
+        remote_user,
+        image_user,
+        env_fwd,
+        ssh_agent_proxy,
+        security,
+        metadata_label,
+    }
 }
 
 /// Prepare environment, write override YAML, and start compose services.
@@ -571,8 +606,14 @@ async fn prepare_and_start(
     .await?;
 
     // 10. Resolve remote user, env forwarding, and ssh-agent proxy.
-    let (remote_user, image_user, mut env_fwd, ssh_agent_proxy, security) =
-        resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
+    let ComposeRuntimeResolution {
+        remote_user,
+        image_user,
+        mut env_fwd,
+        ssh_agent_proxy,
+        security,
+        metadata_label,
+    } = resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
     // 11-15. Build override context, UID remap, write override, and start.
@@ -589,6 +630,7 @@ async fn prepare_and_start(
         agent_vol_name,
         agent_vol_target,
         security,
+        metadata_label,
     )
     .await?;
 
@@ -942,11 +984,13 @@ fn write_build_override(
 /// For image-only services, inspects the image directly (pulling if needed).
 /// For build-based services, inspects the compose-built image (`{project}-{service}`).
 ///
-/// Returns `(image_user, Option<ImageMetadataUserInfo>, Option<FeatureContainerConfig>)`.
+/// Returns `(image_user, Option<ImageMetadataUserInfo>, Option<FeatureContainerConfig>, raw_metadata)`.
 /// The third element is the base image's `devcontainer.metadata` container config,
 /// used for runtime security props when no features are configured (mirrors the
-/// single-container base-image-metadata fallback in `up.rs`). Falls back to
-/// `("root", None, None)` when inspection fails.
+/// single-container base-image-metadata fallback in `up.rs`). The fourth is the
+/// RAW `devcontainer.metadata` label string from the base image, merged into the
+/// `devcontainer.metadata` label stamped on the primary service. Falls back to
+/// `("root", None, None, None)` when inspection fails.
 async fn resolve_compose_image_info(
     client: &dyn ContainerBackend,
     project: &ComposeProject,
@@ -957,6 +1001,7 @@ async fn resolve_compose_image_info(
     String,
     Option<cella_features::ImageMetadataUserInfo>,
     Option<cella_features::FeatureContainerConfig>,
+    Option<String>,
 ) {
     // If features resolved an image, its metadata was already extracted.
     if let Some(fb) = features_build {
@@ -964,7 +1009,12 @@ async fn resolve_compose_image_info(
             .base_image_metadata
             .as_deref()
             .map(|m| cella_features::parse_image_metadata(m).1);
-        return (fb.image_user.clone(), meta_user, None);
+        return (
+            fb.image_user.clone(),
+            meta_user,
+            None,
+            fb.base_image_metadata.clone(),
+        );
     }
 
     // Resolve compose config to find the service's image source.
@@ -974,7 +1024,7 @@ async fn resolve_compose_image_info(
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to resolve compose config for image metadata: {e}");
-            return ("root".to_string(), None, None);
+            return ("root".to_string(), None, None, None);
         }
     };
 
@@ -983,7 +1033,7 @@ async fn resolve_compose_image_info(
         Ok(info) => info,
         Err(e) => {
             warn!("Failed to extract service build info: {e}");
-            return ("root".to_string(), None, None);
+            return ("root".to_string(), None, None, None);
         }
     };
 
@@ -1007,17 +1057,18 @@ async fn resolve_compose_image_info(
     };
 
     match client.inspect_image_details(&image_name).await {
-        Ok(details) => match details
-            .metadata
-            .as_deref()
-            .map(cella_features::parse_image_metadata)
-        {
-            Some((cfg, user)) => (details.user, Some(user), Some(cfg)),
-            None => (details.user, None, None),
+        Ok(details) => match details.metadata {
+            // Keep the raw label string for the merged metadata label; the parsed
+            // form only carries security/user props.
+            Some(meta) => {
+                let (cfg, user) = cella_features::parse_image_metadata(&meta);
+                (details.user, Some(user), Some(cfg), Some(meta))
+            }
+            None => (details.user, None, None, None),
         },
         Err(e) => {
             warn!("Failed to inspect image '{image_name}' for metadata: {e}");
-            ("root".to_string(), None, None)
+            ("root".to_string(), None, None, None)
         }
     }
 }
@@ -1164,6 +1215,7 @@ async fn build_override_and_start(
     agent_vol_name: String,
     agent_vol_target: String,
     security: cella_config::config_map::MergedSecurityConfig,
+    metadata_label: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
@@ -1183,6 +1235,10 @@ async fn build_override_and_start(
     // common case (no `containerEnv` references) is unaffected.
     strip_container_env_polluted_entries(&mut extra_env, cfg.resolved.raw_remote_env.as_ref());
     let mut labels = build_compose_labels(cfg, project, remote_user);
+    // Stamp the merged `devcontainer.metadata` label (base image + features +
+    // config entries) so tooling can reconstruct the merged config from the
+    // running primary service, matching the single-container path.
+    labels.insert("devcontainer.metadata".to_string(), metadata_label);
 
     let settings = cella_config::CellaConfig::load(cfg.workspace_root, Some(cfg.resolved))?;
     cella_tool_install::ensure_tool_config_paths(&settings);
@@ -1344,6 +1400,25 @@ async fn compose_up_with_ssh_fallback(
 // ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------
+
+/// The `devcontainer.metadata` label value for the compose primary service.
+///
+/// Mirrors the single-container `build_labels` logic: when features were
+/// resolved, reuse the label computed during feature resolution (it already
+/// merges the base image, feature, and config entries). Otherwise build it from
+/// the base image's metadata (if any) plus the devcontainer.json config entry —
+/// exactly what the official CLI's `getDevcontainerMetadata` writes.
+fn compose_metadata_label(
+    features_metadata_label: Option<&str>,
+    config: &serde_json::Value,
+    base_metadata: Option<&str>,
+    omit_remote_env: bool,
+) -> String {
+    features_metadata_label.map_or_else(
+        || cella_features::generate_metadata_label(&[], config, base_metadata, omit_remote_env),
+        ToString::to_string,
+    )
+}
 
 /// Build cella labels for the compose override file.
 ///
@@ -1927,6 +2002,44 @@ mod tests {
             labels.get("dev.cella.config_path")
         );
         assert!(labels.contains_key("dev.cella.docker_runtime"));
+    }
+
+    #[test]
+    fn compose_metadata_label_features_reuses_precomputed_label() {
+        // Features path: the label computed during feature resolution (base +
+        // features + config) is reused verbatim; base/config args are ignored.
+        let precomputed = r#"[{"id":"ghcr.io/x/y:1"},{"remoteUser":"vscode"}]"#;
+        let config = serde_json::json!({ "remoteUser": "node" });
+        let label = compose_metadata_label(
+            Some(precomputed),
+            &config,
+            Some(r#"[{"id":"base"}]"#),
+            false,
+        );
+        assert_eq!(label, precomputed);
+    }
+
+    #[test]
+    fn compose_metadata_label_no_features_merges_base_then_config() {
+        // No features: base image metadata entries are prepended and the config
+        // entry appended -- matching official getDevcontainerMetadata.
+        let base = r#"[{"id":"ghcr.io/base/feat:1"}]"#;
+        let config = serde_json::json!({ "remoteUser": "vscode" });
+        let label = compose_metadata_label(None, &config, Some(base), false);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&label).expect("metadata label is a JSON array");
+        assert_eq!(parsed.len(), 2, "base entry + config entry: {label}");
+        assert_eq!(parsed[0]["id"], "ghcr.io/base/feat:1");
+        assert_eq!(parsed[1], config);
+    }
+
+    #[test]
+    fn compose_metadata_label_no_features_no_base_is_config_only() {
+        let config = serde_json::json!({ "remoteUser": "vscode" });
+        let label = compose_metadata_label(None, &config, None, false);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&label).expect("metadata label is a JSON array");
+        assert_eq!(parsed, vec![config]);
     }
 
     #[test]
