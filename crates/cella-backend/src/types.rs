@@ -155,7 +155,7 @@ pub struct InteractiveExecOptions {
 // ---------------------------------------------------------------------------
 
 /// Image inspection results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImageDetails {
     /// Normalized USER (user portion only, defaults to `"root"`).
     pub user: String,
@@ -203,6 +203,14 @@ pub struct BuildOptions {
     /// When set, emits `--platform <value>` on the docker build command.
     /// Derived from the base image's inspected OS/architecture/variant.
     pub platform: Option<String>,
+    /// buildx output spec (`--output`, e.g. `type=local,dest=…`,
+    /// `type=tar,dest=…`). buildx-only: when set it emits `--output <spec>` and
+    /// *replaces* the default `--load` (which is itself shorthand for
+    /// `--output=docker`). Set only on the final image build — exactly one build
+    /// site carries it, so an export spec never starves a follow-up `FROM` of a
+    /// loaded base. The backend errors if it is set without `BuildKit`/buildx,
+    /// since dropping it would silently exit 0 with nothing written to `dest=`.
+    pub output: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -220,6 +228,7 @@ impl Default for BuildOptions {
             use_buildkit: true,
             docker_path: None,
             platform: None,
+            output: None,
         }
     }
 }

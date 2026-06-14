@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::{info, warn};
 
-use super::{BuildKitMode, ComposePullPolicy, ImagePullPolicy, LogFormat, LogLevel, OutputFormat};
+use super::{BuildKitMode, ComposePullPolicy, ImagePullPolicy, LogFormat, LogLevel};
 
 use cella_backend::{BuildSecret, container_name};
 use cella_config::devcontainer::resolve;
@@ -51,10 +51,6 @@ pub struct BuildArgs {
     #[arg(long = "image-name")]
     image_name: Vec<String>,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "text")]
-    output: OutputFormat,
-
     /// Docker Compose profile(s) to activate (repeatable).
     #[arg(long = "profile")]
     profile: Vec<String>,
@@ -81,6 +77,14 @@ pub struct BuildArgs {
     /// Single-container path only (not supported on the Docker Compose path).
     #[arg(long = "cache-to")]
     cache_to: Option<String>,
+
+    /// buildx output spec, passed through to `docker buildx build --output`
+    /// (e.g. `type=local,dest=./out`, `type=tar,dest=image.tar`). Overrides the
+    /// default behavior of loading the built image into the local docker store.
+    /// buildx-only (errors without `BuildKit`/buildx); single-container path
+    /// only (not supported on the Docker Compose path).
+    #[arg(long = "output")]
+    output: Option<String>,
 
     /// Control whether `BuildKit` is used when building images.
     #[arg(long, value_enum, default_value = "auto")]
@@ -110,10 +114,6 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub const fn is_text_output(&self) -> bool {
-        matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
-    }
-
     /// The `--log-level` value, seeded into the global tracing filter by main.rs
     /// before dispatch (mirrors `up`).
     pub const fn log_level(&self) -> Option<LogLevel> {
@@ -181,15 +181,19 @@ impl BuildArgs {
 
     /// Reject or warn on build flags that don't apply to the Docker Compose path.
     ///
-    /// Matches the official CLI, which errors on `--platform`/`--push` and
-    /// `--cache-to` for compose. `--cache-from`/`--buildkit` only affect the
-    /// single-container buildx path; the official CLI accepts them without error,
-    /// so cella warns rather than failing (never silently ignores).
+    /// Matches the official CLI, which errors on `--platform`/`--push`,
+    /// `--output`, and `--cache-to` for compose. `--cache-from`/`--buildkit`
+    /// only affect the single-container buildx path; the official CLI accepts
+    /// them without error, so cella warns rather than failing (never silently
+    /// ignores).
     fn reject_unsupported_compose_flags(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.platform.is_some() {
             return Err("--platform or --push not supported.".into());
+        }
+        if self.output.is_some() {
+            return Err("--output not supported.".into());
         }
         if self.cache_to.is_some() {
             return Err("--cache-to not supported.".into());
@@ -251,7 +255,7 @@ impl BuildArgs {
             }
         }
 
-        print_result(&self.output, &self.reported_names(&result.image_name), true);
+        print_result(&self.reported_names(&result.image_name), true);
         Ok(())
     }
 
@@ -280,6 +284,10 @@ impl BuildArgs {
                 cache_to: self.cache_to.as_deref(),
                 platform: self.platform.as_deref(),
             },
+            // buildx `--output` export spec. The orchestrator routes it to the
+            // single final build (base when there are no features, features
+            // layer otherwise) so an export never starves a `FROM` of a base.
+            output: self.output.as_deref(),
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
             // `cella build` keeps the full metadata label.
             omit_remote_env_from_metadata: false,
@@ -294,8 +302,25 @@ impl BuildArgs {
         let (img_name, _resolved_features, _image_details) = result?;
         let _ = renderer.await;
 
-        for name in &self.image_name {
-            client.tag_image(&img_name, name).await?;
+        // A `--output` export (e.g. type=local/tar) does NOT load the built
+        // image into the docker store, so it can't be tagged afterward. The
+        // official CLI feeds `-t` straight into the single buildx invocation,
+        // where buildx ignores tags for non-loading outputs — so `--image-name`
+        // is effectively a no-op alongside `--output`. Mirror that: skip the tag
+        // step (which would otherwise fail with "no such image") and warn rather
+        // than silently dropping it. The reported names still follow official,
+        // which sets `imageNameResult = imageNames` regardless of `--output`.
+        if self.output.is_some() {
+            if !self.image_name.is_empty() {
+                warn!(
+                    "--image-name tags are not applied alongside --output: the export does not \
+                     load an image into the docker store to tag"
+                );
+            }
+        } else {
+            for name in &self.image_name {
+                client.tag_image(&img_name, name).await?;
+            }
         }
 
         if let Some(container) = client.find_container(&resolved.workspace_root).await?
@@ -307,7 +332,7 @@ impl BuildArgs {
             );
         }
 
-        print_result(&self.output, &self.reported_names(&img_name), false);
+        print_result(&self.reported_names(&img_name), false);
         Ok(())
     }
 
@@ -325,7 +350,7 @@ impl BuildArgs {
     }
 }
 
-/// JSON result emitted by `cella build --output json`.
+/// JSON result emitted by `cella build` on stdout.
 ///
 /// Mirrors the official `devcontainer build` contract — devcontainers/cli
 /// `devContainersSpecCLI.ts` emits `JSON.stringify({ outcome: 'success',
@@ -353,22 +378,25 @@ fn build_json_result(image_names: &[String]) -> String {
     .unwrap_or_default()
 }
 
-/// Print the build result in the requested output format.
+/// Print the build result.
+///
+/// Always emits the machine-readable JSON result line to **stdout** (matching
+/// the official `devcontainer build`, which unconditionally writes
+/// `JSON.stringify(result)`), plus a friendly human summary to **stderr**. The
+/// human line is a cella extra; keeping it on stderr means it never pollutes the
+/// stdout JSON that scripts parse, so there is no `--output text|json` selector.
 ///
 /// `image_names` holds every reported name (the built name, or all
-/// `--image-name` values when set). The text mode lists them comma-separated.
-fn print_result(output: &OutputFormat, image_names: &[String], compose: bool) {
-    match output {
-        OutputFormat::Auto | OutputFormat::Text => {
-            let joined = image_names.join(", ");
-            match (compose, image_names.len() > 1) {
-                (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
-                (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
-                (false, false) => eprintln!("Image built: {joined}"),
-                (false, true) => eprintln!("Image built and tagged: {joined}"),
-            }
-        }
-        OutputFormat::Json => println!("{}", build_json_result(image_names)),
+/// `--image-name` values when set). The human summary lists them comma-separated.
+fn print_result(image_names: &[String], compose: bool) {
+    println!("{}", build_json_result(image_names));
+
+    let joined = image_names.join(", ");
+    match (compose, image_names.len() > 1) {
+        (true, false) => eprintln!("Compose services built. Primary image: {joined}"),
+        (true, true) => eprintln!("Compose services built. Tagged images: {joined}"),
+        (false, false) => eprintln!("Image built: {joined}"),
+        (false, true) => eprintln!("Image built and tagged: {joined}"),
     }
 }
 
@@ -538,6 +566,49 @@ mod tests {
     }
 
     #[test]
+    fn output_buildx_spec_parses_and_is_captured() {
+        // `--output` is a free-form buildx spec passed through to the build.
+        let args = parse_build(&["--output", "type=local,dest=./out"]);
+        assert_eq!(args.output.as_deref(), Some("type=local,dest=./out"));
+    }
+
+    #[test]
+    fn output_defaults_to_none() {
+        assert!(parse_build(&[]).output.is_none());
+    }
+
+    #[test]
+    fn compose_rejects_output() {
+        // Official `doBuild` rejects `--output` for the compose path with the
+        // exact message "--output not supported." cella mirrors it.
+        let err = parse_build(&["--output", "type=local,dest=./out"])
+            .reject_unsupported_compose_flags()
+            .expect_err("compose must reject --output");
+        assert_eq!(err.to_string(), "--output not supported.");
+    }
+
+    #[test]
+    fn output_with_image_name_still_reports_image_names() {
+        // `--output` and `--image-name` can be set together. The tag step is
+        // skipped at runtime (a non-loading export can't be tagged), but the
+        // reported names still follow official, which sets
+        // `imageNameResult = imageNames` regardless of `--output`.
+        let args = parse_build(&[
+            "--output",
+            "type=local,dest=./out",
+            "--image-name",
+            "x:1",
+            "--image-name",
+            "y:2",
+        ]);
+        assert_eq!(args.output.as_deref(), Some("type=local,dest=./out"));
+        assert_eq!(
+            args.reported_names("built:latest"),
+            vec!["x:1".to_string(), "y:2".to_string()]
+        );
+    }
+
+    #[test]
     fn additional_features_parses_and_merges_into_config() {
         let args = parse_build(&[
             "--additional-features",
@@ -649,6 +720,31 @@ mod tests {
             build_json_result(&["one:1".to_string(), "two:2".to_string()]),
             r#"{"outcome":"success","imageName":["one:1","two:2"]}"#
         );
+    }
+
+    #[test]
+    fn build_always_emits_json_result_no_format_flag() {
+        // `cella build` has no `--output text|json` format selector — it always
+        // emits the JSON result to stdout (matching the official `devcontainer
+        // build`, which unconditionally writes `JSON.stringify(result)`). Verify
+        // the result line is well-formed regardless of which other flags were
+        // parsed, so nothing can gate it off.
+        for extra in [
+            vec![],
+            vec!["--no-cache"],
+            vec!["--log-format", "json"],
+            vec!["--image-name", "x:1"],
+        ] {
+            let args = parse_build(&extra);
+            let line = build_json_result(&args.reported_names("built:latest"));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("result line is valid JSON");
+            assert_eq!(parsed["outcome"], "success", "for flags {extra:?}");
+            assert!(
+                parsed["imageName"].is_array(),
+                "imageName must be an array for flags {extra:?}"
+            );
+        }
     }
 
     #[test]

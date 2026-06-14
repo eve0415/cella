@@ -5,5 +5,6 @@
 
 mod claude_seed_tests;
 mod network_tests;
+mod output_export_tests;
 mod spec_identity_tests;
 mod tag_image_tests;

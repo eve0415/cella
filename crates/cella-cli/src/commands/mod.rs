@@ -370,13 +370,15 @@ impl Command {
         match self {
             Self::Up(args) => args.is_text_output(),
             Self::Code(args) => args.is_text_output(),
-            Self::Build(args) => args.is_text_output(),
             Self::Down(args) => args.is_text_output(),
             // These emit a JSON envelope on stdout; spinners would fight it.
             Self::ReadConfiguration(_)
             | Self::RunUserCommands(_)
             | Self::SetUp(_)
             | Self::Templates(_) => false,
+            // `build` falls through to `true`: it always writes its JSON result
+            // to stdout and the human summary to stderr, so spinners (stderr-only)
+            // never corrupt the stdout JSON and follow the normal TTY rules.
             _ => true,
         }
     }
