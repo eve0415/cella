@@ -50,6 +50,9 @@ pub struct ComposeBuildConfig<'a> {
     /// An image-only service (no build, no features) has nothing to label and is
     /// rejected up front. Pre-validated `key=value` strings (non-empty key).
     pub labels: Vec<String>,
+    /// `--skip-persisting-customizations-from-features`: strip `customizations`
+    /// from per-feature entries in the generated `devcontainer.metadata` label.
+    pub omit_feature_customizations_from_metadata: bool,
 }
 
 /// Run the compose build pipeline: resolve features, write override, build.
@@ -84,13 +87,17 @@ pub async fn compose_build(
     // Resolve features via combined-Dockerfile approach
     let features_build = crate::combined_dockerfile_build::resolve_compose_features(
         client,
-        config,
-        config_path,
-        &project,
-        // `cella build` does not yet expose --omit-config-remote-env-from-metadata
-        // (it's wired on the `up` path only); keep the full metadata label here.
-        false,
-        cfg.lockfile_policy,
+        &crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
+            config,
+            config_path,
+            project: &project,
+            // --omit-config-remote-env-from-metadata is an `up`-only flag; `cella
+            // build` always persists remoteEnv in the metadata label.
+            omit_remote_env_from_metadata: false,
+            omit_feature_customizations_from_metadata: cfg
+                .omit_feature_customizations_from_metadata,
+            lockfile_policy: cfg.lockfile_policy,
+        },
         progress,
     )
     .await?;

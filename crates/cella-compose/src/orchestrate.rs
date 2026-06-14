@@ -564,11 +564,16 @@ async fn prepare_and_start(
     // 6. Resolve features via combined-Dockerfile approach (if features configured)
     let features_build = crate::combined_dockerfile_build::resolve_compose_features(
         client,
-        config,
-        cfg.config_path,
-        project,
-        cfg.omit_remote_env_from_metadata,
-        cfg.lockfile_policy,
+        &crate::combined_dockerfile_build::ResolveComposeFeaturesInput {
+            config,
+            config_path: cfg.config_path,
+            project,
+            omit_remote_env_from_metadata: cfg.omit_remote_env_from_metadata,
+            // --skip-persisting-customizations-from-features is a build-only flag;
+            // compose up always persists feature customizations.
+            omit_feature_customizations_from_metadata: false,
+            lockfile_policy: cfg.lockfile_policy,
+        },
         progress,
     )
     .await?;
@@ -1573,7 +1578,18 @@ fn compose_metadata_label(
     omit_remote_env: bool,
 ) -> String {
     features_metadata_label.map_or_else(
-        || cella_features::generate_metadata_label(&[], config, base_metadata, omit_remote_env),
+        || {
+            cella_features::generate_metadata_label(
+                &[],
+                config,
+                base_metadata,
+                cella_features::MetadataOmit {
+                    remote_env: omit_remote_env,
+                    // compose up never strips feature customizations (build-only flag).
+                    feature_customizations: false,
+                },
+            )
+        },
         ToString::to_string,
     )
 }

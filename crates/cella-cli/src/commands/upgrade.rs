@@ -53,7 +53,7 @@ impl UpgradeArgs {
             base_image,
             image_user: "root",
             metadata: None,
-            omit_remote_env: false,
+            omit: cella_features::MetadataOmit::default(),
         };
 
         let resolved = cella_features::resolve_features(

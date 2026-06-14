@@ -123,6 +123,12 @@ pub struct BuildArgs {
 
     #[command(flatten)]
     deprecated_lockfile: super::DeprecatedLockfileArgs,
+
+    /// Do not persist `customizations` from features into the
+    /// `devcontainer.metadata` image label. Hidden parity flag matching the
+    /// official devcontainer CLI.
+    #[arg(long = "skip-persisting-customizations-from-features", hide = true)]
+    skip_persisting_customizations_from_features: bool,
 }
 
 impl BuildArgs {
@@ -250,6 +256,8 @@ impl BuildArgs {
             // `build.labels` (image labels on the built service image), the
             // compose equivalent of the single-container `docker build --label`.
             labels: self.label.clone(),
+            omit_feature_customizations_from_metadata: self
+                .skip_persisting_customizations_from_features,
         };
         let result = cella_orchestrator::compose_build::compose_build(client, &build_cfg, &sender)
             .await
@@ -309,8 +317,10 @@ impl BuildArgs {
             // config (no build to attach them to).
             labels: &self.label,
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
-            // `cella build` keeps the full metadata label.
+            // `cella build` keeps the full metadata label (up-only flag).
             omit_remote_env_from_metadata: false,
+            omit_feature_customizations_from_metadata: self
+                .skip_persisting_customizations_from_features,
             lockfile_policy: super::derive_lockfile_policy(
                 &self.lockfile,
                 &self.deprecated_lockfile,
@@ -866,5 +876,17 @@ mod tests {
             args.reported_names("built:latest"),
             vec!["x:1".to_string(), "y:2".to_string()]
         );
+    }
+
+    #[test]
+    fn skip_persisting_customizations_from_features_defaults_false() {
+        let args = parse_build(&[]);
+        assert!(!args.skip_persisting_customizations_from_features);
+    }
+
+    #[test]
+    fn skip_persisting_customizations_from_features_parses() {
+        let args = parse_build(&["--skip-persisting-customizations-from-features"]);
+        assert!(args.skip_persisting_customizations_from_features);
     }
 }

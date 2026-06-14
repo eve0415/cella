@@ -58,6 +58,17 @@ pub async fn build_features_layer(
     if ctx.no_cache {
         options.push("--no-cache".to_string());
     }
+    // Bake the merged `devcontainer.metadata` label onto the features layer (the
+    // final image when features are present), mirroring the no-features build
+    // path and the official CLI (which emits it via the generated Dockerfile).
+    // Without this the built image carries no metadata for `docker inspect` /
+    // downstream `up`, and the `--skip-persisting-customizations-from-features`
+    // and `--omit-config-remote-env-from-metadata` omits would have no effect on
+    // this path.
+    options.push(format!(
+        "--label=devcontainer.metadata={}",
+        ctx.resolved.metadata_label
+    ));
 
     let mut args = HashMap::new();
     args.insert(
@@ -147,6 +158,9 @@ pub struct EnsureImageInput<'a> {
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
     /// generated `devcontainer.metadata` label baked into the built image.
     pub omit_remote_env_from_metadata: bool,
+    /// `--skip-persisting-customizations-from-features`: strip `customizations`
+    /// from per-feature entries in the generated `devcontainer.metadata` label.
+    pub omit_feature_customizations_from_metadata: bool,
     /// Lockfile policy for feature resolution.
     pub lockfile_policy: cella_features::LockfilePolicy,
     pub progress: &'a ProgressSender,
@@ -259,6 +273,7 @@ pub async fn ensure_image(
         output: input.output,
         labels: input.labels,
         omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
+        omit_feature_customizations_from_metadata: input.omit_feature_customizations_from_metadata,
         lockfile_policy: input.lockfile_policy,
         progress: input.progress,
     };
@@ -380,7 +395,13 @@ async fn resolve_base_image(
                 &[],
                 input.config,
                 None,
-                input.omit_remote_env_from_metadata,
+                cella_features::MetadataOmit {
+                    remote_env: input.omit_remote_env_from_metadata,
+                    // --skip-persisting-customizations-from-features is a no-op
+                    // here: there are no features, so no feature entries exist
+                    // to strip customizations from.
+                    feature_customizations: input.omit_feature_customizations_from_metadata,
+                },
             );
             build_opts
                 .options
@@ -430,6 +451,7 @@ struct FeaturesBuildInput<'a> {
     /// present). Threaded straight through from [`EnsureImageInput::labels`].
     labels: &'a [String],
     omit_remote_env_from_metadata: bool,
+    omit_feature_customizations_from_metadata: bool,
     lockfile_policy: cella_features::LockfilePolicy,
     progress: &'a ProgressSender,
 }
@@ -481,7 +503,10 @@ async fn resolve_and_build_features(
             base_image: input.base_image_tag,
             image_user: &input.base_image_details.user,
             metadata: input.base_image_details.metadata.as_deref(),
-            omit_remote_env: input.omit_remote_env_from_metadata,
+            omit: cella_features::MetadataOmit {
+                remote_env: input.omit_remote_env_from_metadata,
+                feature_customizations: input.omit_feature_customizations_from_metadata,
+            },
         },
         false, // non-compose: build context IS the features dir, bare COPY works
         input.lockfile_policy,
