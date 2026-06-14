@@ -186,6 +186,15 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
         args.push(opt.clone());
     }
 
+    // `--label key=value` bakes an image label into the built image. Unlike
+    // `--output`/`--platform`/`--progress` (buildx-only), `docker build --label`
+    // works on both the classic and buildx builders, so it is emitted on every
+    // path. Two-arg form matches the official CLI (`['--label', label]`). The
+    // value may be empty (`key=`); the CLI validates a non-empty key up front.
+    for label in &opts.labels {
+        args.extend(["--label".to_string(), label.clone()]);
+    }
+
     for secret in &opts.secrets {
         let mut spec = format!("id={}", secret.id);
         if let Some(ref src) = secret.src {
@@ -490,6 +499,7 @@ mod tests {
             docker_path: None,
             platform: None,
             output: None,
+            labels: Vec::new(),
         }
     }
 
@@ -677,6 +687,66 @@ mod tests {
         let args = build_command_args(&opts, true);
         assert!(args.contains(&"--load".to_string()));
         assert!(!args.contains(&"--output".to_string()));
+    }
+
+    #[test]
+    fn build_args_emits_label_on_classic_builder() {
+        // `docker build --label` works on the classic builder (unlike --output),
+        // so each label is emitted as a two-arg `--label key=value`.
+        let mut opts = basic_opts();
+        opts.labels = vec!["cella.test=1".to_string()];
+        let args = build_command_args(&opts, false);
+        let idx = args
+            .iter()
+            .position(|a| a == "--label")
+            .expect("--label emitted on classic builder");
+        assert_eq!(args[idx + 1], "cella.test=1");
+        // Context path is still last (labels precede it).
+        assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    #[test]
+    fn build_args_emits_label_on_buildx_builder() {
+        // `--label` is not buildx-gated: it must also appear on the buildx path.
+        let mut opts = basic_opts();
+        opts.labels = vec!["cella.test=1".to_string()];
+        let args = build_command_args(&opts, true);
+        let idx = args
+            .iter()
+            .position(|a| a == "--label")
+            .expect("--label emitted on buildx builder");
+        assert_eq!(args[idx + 1], "cella.test=1");
+    }
+
+    #[test]
+    fn build_args_emits_each_label() {
+        // Repeatable: every label becomes its own `--label key=value` pair.
+        let mut opts = basic_opts();
+        opts.labels = vec![
+            "a=1".to_string(),
+            "b=2".to_string(),
+            // Empty value is allowed (`key=`).
+            "c=".to_string(),
+        ];
+        let args = build_command_args(&opts, false);
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--label")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 3);
+        assert_eq!(args[positions[0] + 1], "a=1");
+        assert_eq!(args[positions[1] + 1], "b=2");
+        assert_eq!(args[positions[2] + 1], "c=");
+        assert_eq!(args.last().unwrap(), "/src/project");
+    }
+
+    #[test]
+    fn build_args_no_labels_omits_flag() {
+        let opts = basic_opts();
+        let args = build_command_args(&opts, false);
+        assert!(!args.contains(&"--label".to_string()));
     }
 
     #[test]

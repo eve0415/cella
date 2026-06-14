@@ -35,6 +35,10 @@ pub struct FeaturesLayerContext<'a> {
     /// belongs here — never on the base build, which must stay loadable for the
     /// features `FROM`.
     pub output: Option<&'a str>,
+    /// Image labels (`--label key=value`) for the FINAL image. Same placement
+    /// rule as `output`: when features are layered the features image is the
+    /// final image, so the labels are baked here. Empty slice = no labels.
+    pub labels: &'a [String],
     pub progress: &'a ProgressSender,
 }
 
@@ -81,6 +85,9 @@ pub async fn build_features_layer(
         // Features layer is the final image when features are present, so the
         // buildx `--output` export spec is applied here.
         output: ctx.output.map(str::to_string),
+        // Likewise the final image, so user `--label`s are baked here (the base
+        // build stays unlabeled — it is an internal FROM, not the user's image).
+        labels: ctx.labels.to_vec(),
     };
 
     info!(
@@ -125,6 +132,18 @@ pub struct EnsureImageInput<'a> {
     /// not load an image into the docker store. `None` keeps the default
     /// `--load` everywhere (the `up` path, which must run the container).
     pub output: Option<&'a str>,
+    /// Image labels (`--label key=value`, the `cella build --label` flag) to
+    /// bake into the FINAL image. Same placement rule as [`Self::output`]:
+    /// applied to exactly one build — the base build when there are no features,
+    /// the features layer when there are — never to a base build a features layer
+    /// will `FROM`. Unlike `output`, labels work on both the classic and buildx
+    /// builders. An empty slice bakes nothing (the `up` path, which never labels).
+    ///
+    /// A non-empty slice on a bare `image:` config with no features has no build
+    /// to attach to (cella does not wrap a pulled image in a Dockerfile), so
+    /// [`ensure_image`] returns an error rather than silently dropping the
+    /// labels — detected via [`image_labels_have_no_target`].
+    pub labels: &'a [String],
     /// `--omit-config-remote-env-from-metadata`: strip `remoteEnv` from the
     /// generated `devcontainer.metadata` label baked into the built image.
     pub omit_remote_env_from_metadata: bool,
@@ -143,6 +162,35 @@ pub struct EnsureImageInput<'a> {
 /// the base build is the final image and gets the spec.
 const fn base_output(will_build_features: bool, output: Option<&str>) -> Option<&str> {
     if will_build_features { None } else { output }
+}
+
+/// The image labels (`--label`) for the *base* image build.
+///
+/// Same placement rule as [`base_output`]: labels belong on exactly one build —
+/// the final image. When a features layer follows (`will_build_features`), it is
+/// the final image and carries the labels; the base build gets none, since it is
+/// an internal `FROM` target, not the image the user keeps. Otherwise the base
+/// build is the final image and gets all the labels. Unlike `--output`, labels
+/// do not affect whether the image loads, so there is no skip-inspect companion.
+fn base_labels(will_build_features: bool, labels: &[String]) -> Vec<String> {
+    if will_build_features {
+        Vec::new()
+    } else {
+        labels.to_vec()
+    }
+}
+
+/// Whether `--label`s were requested but have no build to attach to.
+///
+/// `--label` bakes a label via a `docker build --label`, so it needs a build.
+/// A bare `image:` config with no features runs no build — cella uses the pulled
+/// image as-is and does not wrap it in a Dockerfile — so requested labels would
+/// be silently dropped. `ensure_image` calls this in the image branch (where
+/// `will_build_features` is false iff there are no features) and errors instead.
+/// With features, the labels ride the features layer, so this is false. This is
+/// consistent with cella not stamping `devcontainer.metadata` on pulled images.
+const fn image_labels_have_no_target(will_build_features: bool, has_labels: bool) -> bool {
+    has_labels && !will_build_features
 }
 
 /// Whether to skip inspecting the base image after the build.
@@ -209,6 +257,7 @@ pub async fn ensure_image(
         no_cache: input.no_cache,
         build_tuning: input.build_tuning,
         output: input.output,
+        labels: input.labels,
         omit_remote_env_from_metadata: input.omit_remote_env_from_metadata,
         lockfile_policy: input.lockfile_policy,
         progress: input.progress,
@@ -275,6 +324,18 @@ async fn resolve_base_image(
     let force_pull = input.pull_policy == Some("always");
     let never_pull = input.pull_policy == Some("never");
     if let Some(image) = input.config.get("image").and_then(|v| v.as_str()) {
+        // A bare `image:` config with no features runs no build, so `--label`
+        // has nothing to attach to (cella uses the pulled image as-is rather
+        // than wrapping it in a Dockerfile). Fail loudly *before* the pull
+        // instead of silently dropping the labels. With features the labels ride
+        // the features layer, so `will_build_features` gates this off.
+        if image_labels_have_no_target(will_build_features, !input.labels.is_empty()) {
+            return Err(
+                "--label requires a build (a Dockerfile, build:, or features); \
+                        a bare image: config is used as-is and cannot be labeled."
+                    .into(),
+            );
+        }
         let exists = input.client.image_exists(image).await?;
         if never_pull {
             if !exists {
@@ -310,6 +371,9 @@ async fn resolve_base_image(
         // (no features layer to follow). With features, the export spec goes on
         // the features layer instead so the base stays loadable for its `FROM`.
         build_opts.output = base_output(will_build_features, input.output).map(str::to_string);
+        // User `--label`s land on the base build only when it is the final image;
+        // with features they move to the features layer (the final image).
+        build_opts.labels = base_labels(will_build_features, input.labels);
 
         if !will_build_features {
             let metadata_label = cella_features::generate_metadata_label(
@@ -362,6 +426,9 @@ struct FeaturesBuildInput<'a> {
     /// buildx output spec for the features layer (the final image when features
     /// are present). Threaded straight through from [`EnsureImageInput::output`].
     output: Option<&'a str>,
+    /// Image labels for the features layer (the final image when features are
+    /// present). Threaded straight through from [`EnsureImageInput::labels`].
+    labels: &'a [String],
     omit_remote_env_from_metadata: bool,
     lockfile_policy: cella_features::LockfilePolicy,
     progress: &'a ProgressSender,
@@ -433,6 +500,7 @@ async fn resolve_and_build_features(
         no_cache: input.no_cache,
         build_tuning: input.build_tuning.toolchain(),
         output: input.output,
+        labels: input.labels,
         progress: input.progress,
     };
     let features_image = build_features_layer(&ctx).await?;
@@ -608,6 +676,9 @@ pub fn parse_build_options(
         // build, not every site): the caller sets it via `base_output` when this
         // base build is the final image.
         output: None,
+        // Same as `output`: the caller sets labels via `base_labels` only when
+        // this base build is the final image (no features layer to follow).
+        labels: Vec::new(),
     }
 }
 
@@ -1133,6 +1204,50 @@ mod tests {
             Some("type=local,dest=/tmp/out")
         );
         assert_eq!(base_output(false, None), None);
+    }
+
+    // ── base_labels: --label placement (final-build only) ────────────
+    //
+    // Same load-bearing rule as `base_output`: user `--label`s belong on the
+    // final image, so a base build that a features layer will `FROM` must stay
+    // unlabeled (the labels move to the features layer). Pinned on the pure
+    // helper since `resolve_base_image` is Docker-coupled.
+
+    #[test]
+    fn base_labels_suppressed_when_features_will_build() {
+        // Features to follow → the base build is an internal FROM, not the final
+        // image, so it gets no user labels (they ride the features layer).
+        assert!(base_labels(true, &["a=1".to_string(), "b=2".to_string()]).is_empty());
+        assert!(base_labels(true, &[]).is_empty());
+    }
+
+    #[test]
+    fn base_labels_applied_when_base_is_final() {
+        // No features: the base build IS the final image, so it carries every
+        // label verbatim (and stays empty when none were requested).
+        assert_eq!(
+            base_labels(false, &["a=1".to_string(), "b=2".to_string()]),
+            vec!["a=1".to_string(), "b=2".to_string()]
+        );
+        assert!(base_labels(false, &[]).is_empty());
+    }
+
+    // ── image_labels_have_no_target: bare image: + --label error ─────
+    //
+    // `--label` needs a build. A bare `image:` config with no features runs no
+    // build (cella uses the pulled image as-is), so requested labels would be
+    // silently dropped — `ensure_image` errors instead. With features the labels
+    // ride the features layer, so there IS a target. This pins exactly that gate.
+
+    #[test]
+    fn image_labels_have_no_target_only_when_no_build_and_labels() {
+        // Bare image: (no features) + labels requested → no target, must error.
+        assert!(image_labels_have_no_target(false, true));
+        // No labels requested → nothing to drop, no error regardless of build.
+        assert!(!image_labels_have_no_target(false, false));
+        // Features will build → the features layer is the label target; OK.
+        assert!(!image_labels_have_no_target(true, true));
+        assert!(!image_labels_have_no_target(true, false));
     }
 
     // ── skip_base_inspect: don't inspect a non-loaded export ─────────

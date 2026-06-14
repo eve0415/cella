@@ -86,6 +86,16 @@ pub struct BuildArgs {
     #[arg(long = "output")]
     output: Option<String>,
 
+    /// Add metadata to the built image as a `key=value` image label
+    /// (repeatable). Emitted as `docker build --label key=value`, so the label
+    /// is baked into the built image. The value may be empty (`key=`). Applies
+    /// on both the classic and buildx builders. Single-container build path only:
+    /// a bare `image:` config with no build/features cannot be labeled, and the
+    /// Docker Compose path does not yet support it (both error rather than
+    /// silently ignoring the flag).
+    #[arg(long = "label", value_parser = parse_build_label)]
+    label: Vec<String>,
+
     /// Control whether `BuildKit` is used when building images.
     #[arg(long, value_enum, default_value = "auto")]
     buildkit: BuildKitMode,
@@ -198,6 +208,13 @@ impl BuildArgs {
         if self.cache_to.is_some() {
             return Err("--cache-to not supported.".into());
         }
+        if !self.label.is_empty() {
+            // Official applies `--label` as compose `build.labels` image labels
+            // via a generated override; cella doesn't yet write those, so error
+            // rather than silently dropping the flag (or mislabeling the
+            // container/service). Tracked follow-up.
+            return Err("--label is not yet supported on Docker Compose builds.".into());
+        }
         if !self.cache_from.is_empty() {
             warn!("--cache-from is ignored on the Docker Compose build path");
         }
@@ -288,6 +305,10 @@ impl BuildArgs {
             // single final build (base when there are no features, features
             // layer otherwise) so an export never starves a `FROM` of a base.
             output: self.output.as_deref(),
+            // `--label` image labels. Routed to the same single final build as
+            // `--output`; the orchestrator errors on a bare image:-no-features
+            // config (no build to attach them to).
+            labels: &self.label,
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
             // `cella build` keeps the full metadata label.
             omit_remote_env_from_metadata: false,
@@ -421,6 +442,18 @@ pub fn parse_build_secret(s: &str) -> Result<BuildSecret, String> {
         src,
         env,
     })
+}
+
+/// Validate a `--label` value (`key=value`). The key must be non-empty; the
+/// value may be empty (`key=`), matching `docker build --label` (which accepts
+/// `k=`). Mirrors [`crate::commands::parse_remote_env`]'s shape (non-empty key,
+/// any value) rather than `parse_id_label` (which also requires a non-empty
+/// value). Rejected at parse time so a malformed label never reaches the build.
+pub fn parse_build_label(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.is_empty() => Ok(s.to_string()),
+        _ => Err("label must match <key>=<value> (key required; value may be empty)".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +596,65 @@ mod tests {
                 .is_ok()
         );
         assert!(parse_build(&[]).reject_unsupported_compose_flags().is_ok());
+    }
+
+    // ── --label parsing / threading ─────────────────────────────────
+
+    #[test]
+    fn label_is_repeatable() {
+        let args = parse_build(&["--label", "a=1", "--label", "b=2"]);
+        assert_eq!(args.label, vec!["a=1".to_string(), "b=2".to_string()]);
+    }
+
+    #[test]
+    fn label_defaults_to_empty() {
+        assert!(parse_build(&[]).label.is_empty());
+    }
+
+    #[test]
+    fn label_accepts_empty_value() {
+        // `docker build --label k=` is valid (label with an empty value), so the
+        // parser must accept it — unlike `--id-label`, which requires a value.
+        let args = parse_build(&["--label", "k="]);
+        assert_eq!(args.label, vec!["k=".to_string()]);
+    }
+
+    #[test]
+    fn label_rejects_missing_equals() {
+        // No `=` at all → rejected at parse time.
+        assert!(TestCli::try_parse_from(["build", "--label", "novalue"]).is_err());
+    }
+
+    #[test]
+    fn label_rejects_empty_key() {
+        // `=value` has an empty key → rejected at parse time.
+        assert!(TestCli::try_parse_from(["build", "--label", "=value"]).is_err());
+    }
+
+    #[test]
+    fn parse_build_label_directly() {
+        // Key required; value optional (may be empty).
+        assert_eq!(parse_build_label("a=1").unwrap(), "a=1");
+        assert_eq!(parse_build_label("a=").unwrap(), "a=");
+        // A value with an `=` keeps the whole string (only the first `=` splits).
+        assert_eq!(parse_build_label("a=b=c").unwrap(), "a=b=c");
+        assert!(parse_build_label("novalue").is_err());
+        assert!(parse_build_label("=value").is_err());
+        assert!(parse_build_label("").is_err());
+    }
+
+    #[test]
+    fn compose_rejects_label() {
+        // The compose path does not yet support `--label` (it would need a
+        // generated `build.labels` override). cella errors with the exact
+        // message rather than silently dropping the flag.
+        let err = parse_build(&["--label", "a=1"])
+            .reject_unsupported_compose_flags()
+            .expect_err("compose must reject --label");
+        assert_eq!(
+            err.to_string(),
+            "--label is not yet supported on Docker Compose builds."
+        );
     }
 
     #[test]
