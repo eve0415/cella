@@ -31,6 +31,12 @@ pub struct BuildArgs {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Additional features to apply, as a JSON object matching the
+    /// devcontainer.json `features` section. Merged into the resolved config
+    /// before the build (applies to both compose and single-container).
+    #[arg(long = "additional-features")]
+    additional_features: Option<String>,
+
     #[command(flatten)]
     backend: crate::backend::BackendArgs,
 
@@ -120,10 +126,18 @@ impl BuildArgs {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         info!("Resolving devcontainer config...");
-        let resolved = resolve::config(&cwd, self.config.as_deref())?;
+        let mut resolved = resolve::config(&cwd, self.config.as_deref())?;
 
         for w in &resolved.warnings {
             warn!("{}", w.message);
+        }
+
+        // Merge CLI --additional-features into the resolved config BEFORE the
+        // compose/single-container split, so both paths build the added features
+        // (the official CLI applies --additional-features to both).
+        if let Some(ref additional) = self.additional_features {
+            super::features::resolve::merge_additional_features(&mut resolved.config, additional)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         }
 
         let config = &resolved.config;
@@ -479,6 +493,22 @@ mod tests {
                 .is_ok()
         );
         assert!(parse_build(&[]).reject_unsupported_compose_flags().is_ok());
+    }
+
+    #[test]
+    fn additional_features_parses_and_merges_into_config() {
+        let args = parse_build(&[
+            "--additional-features",
+            r#"{"ghcr.io/x/y:1":{"version":"1"}}"#,
+        ]);
+        let json = args
+            .additional_features
+            .as_deref()
+            .expect("--additional-features captured");
+        let mut config = serde_json::json!({ "image": "ubuntu" });
+        super::super::features::resolve::merge_additional_features(&mut config, json)
+            .expect("merge succeeds");
+        assert_eq!(config["features"]["ghcr.io/x/y:1"]["version"], "1");
     }
 
     #[test]
