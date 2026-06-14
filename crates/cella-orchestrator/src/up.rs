@@ -1013,7 +1013,11 @@ impl EnsureUpContext<'_> {
                     &[],
                     config,
                     None,
-                    self.config.metadata_options.omit_remote_env,
+                    cella_features::MetadataOmit {
+                        remote_env: self.config.metadata_options.omit_remote_env,
+                        // up never strips feature customizations.
+                        feature_customizations: false,
+                    },
                 ),
             );
         }
@@ -1946,6 +1950,9 @@ impl EnsureUpContext<'_> {
                 // flag (the container picks up config via the metadata label).
                 labels: &[],
                 omit_remote_env_from_metadata: self.config.metadata_options.omit_remote_env,
+                // --skip-persisting-customizations-from-features is a build-only
+                // flag; up always persists feature customizations.
+                omit_feature_customizations_from_metadata: false,
                 lockfile_policy: self.config.lockfile_policy,
                 progress: &self.progress,
             })

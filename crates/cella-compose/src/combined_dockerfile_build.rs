@@ -39,6 +39,24 @@ pub struct ComposeFeaturesBuild {
     pub base_image_metadata: Option<String>,
 }
 
+/// Config for [`resolve_compose_features`].
+pub struct ResolveComposeFeaturesInput<'a> {
+    /// Parsed devcontainer JSON config.
+    pub config: &'a serde_json::Value,
+    /// Path to `devcontainer.json`.
+    pub config_path: &'a Path,
+    /// Compose project (primary service name, project name, paths).
+    pub project: &'a ComposeProject,
+    /// Whether to strip `remoteEnv` from the user-config metadata entry.
+    /// `up`-only flag; pass `false` on the `build` path.
+    pub omit_remote_env_from_metadata: bool,
+    /// Whether to strip `customizations` from per-feature metadata entries.
+    /// `build`-only flag; pass `false` on the `up` path.
+    pub omit_feature_customizations_from_metadata: bool,
+    /// Lockfile policy for feature resolution.
+    pub lockfile_policy: cella_features::LockfilePolicy,
+}
+
 /// Resolve features for a compose service and generate the combined Dockerfile.
 ///
 /// Returns `None` if no features are configured.
@@ -58,13 +76,13 @@ pub struct ComposeFeaturesBuild {
 /// cannot be read, or feature resolution fails.
 pub async fn resolve_compose_features(
     client: &dyn ContainerBackend,
-    config: &serde_json::Value,
-    config_path: &Path,
-    project: &ComposeProject,
-    omit_remote_env_from_metadata: bool,
-    lockfile_policy: cella_features::LockfilePolicy,
+    input: &ResolveComposeFeaturesInput<'_>,
     progress: &ProgressSender,
 ) -> Result<Option<ComposeFeaturesBuild>, Box<dyn std::error::Error + Send + Sync>> {
+    let config = input.config;
+    let config_path = input.config_path;
+    let project = input.project;
+
     // 1. Check if features are present
     if !has_features(config) {
         return Ok(None);
@@ -155,10 +173,13 @@ pub async fn resolve_compose_features(
                 base_image: &stage_name,
                 image_user: &image_user,
                 metadata: base_image_metadata.as_deref(),
-                omit_remote_env: omit_remote_env_from_metadata,
+                omit: cella_features::MetadataOmit {
+                    remote_env: input.omit_remote_env_from_metadata,
+                    feature_customizations: input.omit_feature_customizations_from_metadata,
+                },
             },
             true, // compose builds use named content source via additional_contexts
-            lockfile_policy,
+            input.lockfile_policy,
         )
         .await
         .map_err(|e| format!("feature resolution failed: {e}"))
