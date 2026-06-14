@@ -159,11 +159,34 @@ impl BuildArgs {
             .await
     }
 
+    /// Reject or warn on build flags that don't apply to the Docker Compose path.
+    ///
+    /// Matches the official CLI, which errors on `--platform`/`--push` and
+    /// `--cache-to` for compose. `--cache-from`/`--buildkit` only affect the
+    /// single-container buildx path; the official CLI accepts them without error,
+    /// so cella warns rather than failing (never silently ignores).
+    fn reject_unsupported_compose_flags(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.platform.is_some() {
+            return Err("--platform or --push not supported.".into());
+        }
+        if self.cache_to.is_some() {
+            return Err("--cache-to not supported.".into());
+        }
+        if !self.cache_from.is_empty() {
+            warn!("--cache-from is ignored on the Docker Compose build path");
+        }
+        if matches!(self.buildkit, BuildKitMode::Never) {
+            warn!("--buildkit is ignored on the Docker Compose build path");
+        }
+        Ok(())
+    }
+
     /// Build the image on the Docker Compose path.
     ///
-    /// `--cache-from`/`--cache-to`/`--platform` are single-container only and
-    /// are not supported here (matching `up`); `--platform` is rejected
-    /// explicitly for parity with the official error message.
+    /// Buildx-only flags are validated up front by
+    /// [`reject_unsupported_compose_flags`].
     async fn execute_compose(
         &self,
         client: &dyn cella_backend::ContainerBackend,
@@ -171,9 +194,7 @@ impl BuildArgs {
         secrets: &[BuildSecret],
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.platform.is_some() {
-            return Err("--platform or --push not supported.".into());
-        }
+        self.reject_unsupported_compose_flags()?;
         let (sender, renderer) = crate::progress::bridge(&progress);
         let build_cfg = cella_orchestrator::compose_build::ComposeBuildConfig {
             config: &resolved.config,
@@ -245,10 +266,9 @@ impl BuildArgs {
             && let Some(old_hash) = &container.config_hash
             && *old_hash != resolved.config_hash
         {
-            eprintln!(
-                "\x1b[33mWARNING:\x1b[0m Config has changed since this container was created."
+            warn!(
+                "Config has changed since this container was created. Run `cella up --rebuild` to recreate with the updated config."
             );
-            eprintln!("  Run `cella up --rebuild` to recreate with the updated config.");
         }
 
         print_result(&self.output, &img_name, false);
@@ -431,6 +451,34 @@ mod tests {
             args.docker_compose_path.as_deref(),
             Some("/usr/bin/docker-compose")
         );
+    }
+
+    #[test]
+    fn compose_rejects_platform_and_cache_to_but_warns_on_others() {
+        // Official errors on --platform/--push and --cache-to for compose.
+        assert!(
+            parse_build(&["--platform", "linux/amd64"])
+                .reject_unsupported_compose_flags()
+                .is_err()
+        );
+        assert!(
+            parse_build(&["--cache-to", "type=inline"])
+                .reject_unsupported_compose_flags()
+                .is_err()
+        );
+        // --cache-from / --buildkit are accepted on compose (warn, not error),
+        // matching the official CLI which doesn't reject them.
+        assert!(
+            parse_build(&["--cache-from", "x"])
+                .reject_unsupported_compose_flags()
+                .is_ok()
+        );
+        assert!(
+            parse_build(&["--buildkit", "never"])
+                .reject_unsupported_compose_flags()
+                .is_ok()
+        );
+        assert!(parse_build(&[]).reject_unsupported_compose_flags().is_ok());
     }
 
     #[test]

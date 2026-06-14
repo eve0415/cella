@@ -110,21 +110,18 @@ pub struct DeprecatedLockfileArgs {
 
 /// Derive the feature lockfile policy from the CLI lockfile flags.
 ///
-/// Deprecated aliases emit a warning to stderr before delegating. Shared by
+/// Deprecated aliases emit a `tracing` deprecation warning before delegating, so
+/// the message respects `--log-format json` instead of corrupting it. Shared by
 /// `up` and `build` so both commands map the flags identically.
 pub fn derive_lockfile_policy(
     lf: &LockfileArgs,
     deprecated: &DeprecatedLockfileArgs,
 ) -> cella_features::LockfilePolicy {
     if deprecated.experimental_lockfile {
-        eprintln!(
-            "warning: --experimental-lockfile is deprecated; lockfile is now written by default"
-        );
+        warn!("--experimental-lockfile is deprecated; lockfile is now written by default");
     }
     if deprecated.experimental_frozen_lockfile {
-        eprintln!(
-            "warning: --experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead"
-        );
+        warn!("--experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead");
     }
     if lf.no_lockfile {
         cella_features::LockfilePolicy::NoLockfile
