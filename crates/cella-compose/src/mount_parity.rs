@@ -3471,6 +3471,7 @@ mod tests {
                 tmpfs: json!(["/cella"]),
                 configs: vec![json!({"source": "x", "target": "/cella/cfg"})],
                 secrets: vec![json!("cella")],
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {
@@ -3506,6 +3507,7 @@ mod tests {
                 tmpfs: json!(["/run", "/var/tmp"]),
                 configs: vec![json!({"source": "cfg", "target": "/etc/cfg"})],
                 secrets: vec![json!("mysecret")], // default target: /mysecret
+                ..ResolvedService::default()
             },
         );
         let resolved = ResolvedComposeConfig {

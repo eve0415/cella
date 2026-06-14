@@ -22,7 +22,10 @@ pub mod parse;
 pub mod project;
 
 pub use cli::{ComposeCommand, ComposeServiceStatus, check_compose_features_support};
-pub use config::{ResolvedComposeConfig, ServiceBuildInfo, extract_service_build_info};
+pub use config::{
+    ResolvedComposeConfig, ServiceBuildInfo, ServiceEntrypointCommand, extract_service_build_info,
+    extract_service_entrypoint_command,
+};
 pub use dockerfile::{
     AUTO_STAGE_NAME, FEATURES_TARGET_STAGE, ensure_stage_named, find_stage_base_image,
     find_user_statement, generate_combined_dockerfile, synthetic_dockerfile,

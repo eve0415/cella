@@ -120,6 +120,10 @@ flate2 = "=1.1.9"
 # OCI registry
 oci-distribution = { version = "=0.11.0", default-features = false, features = ["rustls-tls"] }
 
+# Shell word splitting (POSIX-style; mirrors the official CLI's shellQuote.parse
+# when reading a compose service entrypoint/command given as a string)
+shell-words = "=1.1.1"
+
 # Pattern matching
 regex = "=1.12.4"
 
