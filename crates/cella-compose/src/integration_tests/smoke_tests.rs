@@ -24,6 +24,7 @@ fn plain_override(service: &str) -> OverrideConfig {
         build_secrets: Vec::new(),
         extra_volumes: Vec::new(),
         request_gpu: false,
+        security: cella_config::config_map::MergedSecurityConfig::default(),
     }
 }
 

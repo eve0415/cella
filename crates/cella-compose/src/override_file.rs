@@ -9,6 +9,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use cella_backend::{MountKind, MountSpec};
+use cella_config::config_map::MergedSecurityConfig;
 
 use crate::error::CellaComposeError;
 
@@ -64,6 +65,12 @@ pub struct OverrideConfig {
     /// `[gpu]` (matching the official compose GPU override). Decided by
     /// `hostRequirements.gpu` AND `--gpu-availability`.
     pub request_gpu: bool,
+    /// Merged container security/runtime properties (containerUser, init,
+    /// privileged, capAdd, securityOpt). Emitted as `user:`/`init:`/`privileged:`/
+    /// `cap_add:`/`security_opt:` on the primary service, matching the official
+    /// compose override. Shares the type with the single-container create path so
+    /// both apply identical values.
+    pub security: MergedSecurityConfig,
 }
 
 /// Generate the override compose YAML as a string.
@@ -115,6 +122,9 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
         yaml.push_str("    entrypoint: [\"/bin/sh\", \"-c\"]\n");
         yaml.push_str("    command: [\"while sleep 1000; do :; done\"]\n");
     }
+
+    // Container security/runtime properties (init, user, privileged, caps).
+    write_security_section(&mut yaml, &config.security);
 
     // Environment variables
     if !config.extra_env.is_empty() {
@@ -202,6 +212,37 @@ pub fn generate_override_yaml(config: &OverrideConfig) -> String {
     yaml
 }
 
+/// Emit the container security/runtime section (init, user, privileged, capAdd,
+/// securityOpt) onto the primary service, matching the official compose override
+/// (`dockerCompose.ts` emits the same keys on the service definition).
+fn write_security_section(yaml: &mut String, sec: &MergedSecurityConfig) {
+    // Values come from devcontainer.json / image metadata, so quote them
+    // (consistent with the labels/env/image emission above). A double-quoted
+    // scalar keeps a stray `:`/`#`/newline inside the value instead of breaking
+    // the override or injecting new YAML keys.
+    if sec.init {
+        yaml.push_str("    init: true\n");
+    }
+    if let Some(ref user) = sec.container_user {
+        let _ = writeln!(yaml, "    user: \"{user}\"");
+    }
+    if sec.privileged {
+        yaml.push_str("    privileged: true\n");
+    }
+    if !sec.cap_add.is_empty() {
+        yaml.push_str("    cap_add:\n");
+        for cap in &sec.cap_add {
+            let _ = writeln!(yaml, "      - \"{cap}\"");
+        }
+    }
+    if !sec.security_opt.is_empty() {
+        yaml.push_str("    security_opt:\n");
+        for opt in &sec.security_opt {
+            let _ = writeln!(yaml, "      - \"{opt}\"");
+        }
+    }
+}
+
 /// Write the override file to disk, creating parent directories as needed.
 ///
 /// # Errors
@@ -244,7 +285,34 @@ mod tests {
             build_secrets: Vec::new(),
             extra_volumes: Vec::new(),
             request_gpu: false,
+            security: MergedSecurityConfig::default(),
         }
+    }
+
+    #[test]
+    fn runtime_security_properties_emitted() {
+        let mut config = base_config();
+        config.security.container_user = Some("vscode".to_string());
+        config.security.init = true;
+        config.security.privileged = true;
+        config.security.cap_add = vec!["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()];
+        config.security.security_opt = vec!["seccomp=unconfined".to_string()];
+        let yaml = generate_override_yaml(&config);
+        assert!(yaml.contains("    init: true\n"), "yaml:\n{yaml}");
+        assert!(yaml.contains("    user: \"vscode\"\n"), "yaml:\n{yaml}");
+        assert!(yaml.contains("    privileged: true\n"), "yaml:\n{yaml}");
+        assert!(yaml.contains("    cap_add:\n      - \"SYS_PTRACE\"\n      - \"NET_ADMIN\"\n"));
+        assert!(yaml.contains("    security_opt:\n      - \"seccomp=unconfined\"\n"));
+    }
+
+    #[test]
+    fn runtime_security_properties_omitted_when_default() {
+        let yaml = generate_override_yaml(&base_config());
+        assert!(!yaml.contains("init:"));
+        assert!(!yaml.contains("user:"));
+        assert!(!yaml.contains("privileged:"));
+        assert!(!yaml.contains("cap_add:"));
+        assert!(!yaml.contains("security_opt:"));
     }
 
     #[test]

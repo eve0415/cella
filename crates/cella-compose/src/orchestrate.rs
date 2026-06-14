@@ -446,10 +446,11 @@ async fn resolve_user_and_env(
     String,
     cella_env::EnvForwarding,
     Option<SshAgentProxyStatus>,
+    cella_config::config_map::MergedSecurityConfig,
 ) {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
-    let (image_user, image_meta_user) = resolve_compose_image_info(
+    let (image_user, image_meta_user, base_image_security) = resolve_compose_image_info(
         client,
         project,
         features_build,
@@ -457,6 +458,16 @@ async fn resolve_user_and_env(
         progress,
     )
     .await;
+    // Runtime security props: prefer the resolved-features config; fall back to
+    // the base image's metadata when no features are configured (mirrors the
+    // single-container effective_feature_config fallback in up.rs).
+    let effective_feature_config = features_build
+        .map(|fb| fb.resolved_features.container_config.clone())
+        .or(base_image_security);
+    let security = cella_config::config_map::merge_security_config(
+        cfg.config,
+        effective_feature_config.as_ref(),
+    );
     let remote_user = resolve_remote_user(cfg.config, image_meta_user.as_ref(), &image_user);
     let managed_agent = client.capabilities().managed_agent;
     let skip_rules = cfg.network_rule_policy == cella_network::NetworkRulePolicy::Skip;
@@ -469,7 +480,7 @@ async fn resolve_user_and_env(
         client.host_gateway(),
     )
     .await;
-    (remote_user, image_user, env_fwd, ssh_agent_proxy)
+    (remote_user, image_user, env_fwd, ssh_agent_proxy, security)
 }
 
 /// Prepare environment, write override YAML, and start compose services.
@@ -544,6 +555,8 @@ async fn prepare_and_start(
         extra_volumes: Vec::new(),
         // GPU reservation is emitted only in the final override, not at build.
         request_gpu: false,
+        // Runtime security props are applied in the final override, not at build.
+        security: cella_config::config_map::MergedSecurityConfig::default(),
     };
     write_build_override(project, features_build.as_ref(), &build_ov)?;
 
@@ -558,7 +571,7 @@ async fn prepare_and_start(
     .await?;
 
     // 10. Resolve remote user, env forwarding, and ssh-agent proxy.
-    let (remote_user, image_user, mut env_fwd, ssh_agent_proxy) =
+    let (remote_user, image_user, mut env_fwd, ssh_agent_proxy, security) =
         resolve_user_and_env(client, ctx, project, features_build.as_ref()).await;
     info!("Resolved remote user: {remote_user} (image user: {image_user})");
 
@@ -575,6 +588,7 @@ async fn prepare_and_start(
         &image_user,
         agent_vol_name,
         agent_vol_target,
+        security,
     )
     .await?;
 
@@ -873,6 +887,9 @@ struct OverrideContext {
     /// Whether to emit the GPU reservation block (config requires a GPU AND
     /// `--gpu-availability` grants it). Net-new compose GPU support.
     request_gpu: bool,
+    /// Merged container security/runtime properties (containerUser, init,
+    /// privileged, capAdd, securityOpt) applied to the primary service.
+    security: cella_config::config_map::MergedSecurityConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +921,8 @@ fn write_build_override(
         // The build-time override never needs the GPU reservation; it is
         // emitted only in the final override used for `compose up`.
         request_gpu: false,
+        // build_ov carries default (empty) security props at build time.
+        security: ov.security.clone(),
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -923,22 +942,29 @@ fn write_build_override(
 /// For image-only services, inspects the image directly (pulling if needed).
 /// For build-based services, inspects the compose-built image (`{project}-{service}`).
 ///
-/// Returns `(image_user, Option<ImageMetadataUserInfo>)`. Falls back to
-/// `("root", None)` when inspection fails.
+/// Returns `(image_user, Option<ImageMetadataUserInfo>, Option<FeatureContainerConfig>)`.
+/// The third element is the base image's `devcontainer.metadata` container config,
+/// used for runtime security props when no features are configured (mirrors the
+/// single-container base-image-metadata fallback in `up.rs`). Falls back to
+/// `("root", None, None)` when inspection fails.
 async fn resolve_compose_image_info(
     client: &dyn ContainerBackend,
     project: &ComposeProject,
     features_build: Option<&crate::combined_dockerfile_build::ComposeFeaturesBuild>,
     docker_binaries: (Option<String>, Option<String>),
     progress: &ProgressSender,
-) -> (String, Option<cella_features::ImageMetadataUserInfo>) {
+) -> (
+    String,
+    Option<cella_features::ImageMetadataUserInfo>,
+    Option<cella_features::FeatureContainerConfig>,
+) {
     // If features resolved an image, its metadata was already extracted.
     if let Some(fb) = features_build {
         let meta_user = fb
             .base_image_metadata
             .as_deref()
             .map(|m| cella_features::parse_image_metadata(m).1);
-        return (fb.image_user.clone(), meta_user);
+        return (fb.image_user.clone(), meta_user, None);
     }
 
     // Resolve compose config to find the service's image source.
@@ -948,7 +974,7 @@ async fn resolve_compose_image_info(
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to resolve compose config for image metadata: {e}");
-            return ("root".to_string(), None);
+            return ("root".to_string(), None, None);
         }
     };
 
@@ -957,7 +983,7 @@ async fn resolve_compose_image_info(
         Ok(info) => info,
         Err(e) => {
             warn!("Failed to extract service build info: {e}");
-            return ("root".to_string(), None);
+            return ("root".to_string(), None, None);
         }
     };
 
@@ -981,16 +1007,17 @@ async fn resolve_compose_image_info(
     };
 
     match client.inspect_image_details(&image_name).await {
-        Ok(details) => {
-            let meta_user = details
-                .metadata
-                .as_deref()
-                .map(|m| cella_features::parse_image_metadata(m).1);
-            (details.user, meta_user)
-        }
+        Ok(details) => match details
+            .metadata
+            .as_deref()
+            .map(cella_features::parse_image_metadata)
+        {
+            Some((cfg, user)) => (details.user, Some(user), Some(cfg)),
+            None => (details.user, None, None),
+        },
         Err(e) => {
             warn!("Failed to inspect image '{image_name}' for metadata: {e}");
-            ("root".to_string(), None)
+            ("root".to_string(), None, None)
         }
     }
 }
@@ -1110,6 +1137,7 @@ fn write_final_override(
         build_secrets: Vec::new(),
         extra_volumes: ov.extra_volumes.clone(),
         request_gpu: ov.request_gpu,
+        security: ov.security.clone(),
     };
     let override_yaml = crate::override_file::generate_override_yaml(&override_config);
     crate::override_file::write_override_file(&project.override_file, &override_yaml)?;
@@ -1135,6 +1163,7 @@ async fn build_override_and_start(
     image_user: &str,
     agent_vol_name: String,
     agent_vol_target: String,
+    security: cella_config::config_map::MergedSecurityConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ctx.cfg;
     let progress = ctx.progress;
@@ -1191,6 +1220,7 @@ async fn build_override_and_start(
         labels,
         extra_volumes: mount_specs,
         request_gpu,
+        security,
     };
 
     let uid_image =
