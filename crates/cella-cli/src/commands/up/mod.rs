@@ -690,11 +690,6 @@ fn resolve_lifecycle_secrets(
         .map_or_else(|| Ok(Vec::new()), |path| parse_secrets_file(path))
 }
 
-/// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
-const fn buildkit_enabled(mode: BuildKitMode) -> bool {
-    !matches!(mode, BuildKitMode::Never)
-}
-
 /// Map the clap `--gpu-availability` enum to the backend policy.
 const fn map_gpu_availability(g: GpuAvailability) -> cella_backend::GpuAvailability {
     match g {
@@ -911,7 +906,7 @@ impl UpContext {
             docker_compose_path: args.build.docker_compose_path.clone(),
             cache_from: args.build.cache_from.clone(),
             cache_to: args.build.cache_to.clone(),
-            use_buildkit: buildkit_enabled(args.build.buildkit),
+            use_buildkit: super::buildkit_enabled(args.build.buildkit),
             gpu_availability: map_gpu_availability(args.compat.gpu_availability),
             update_remote_user_uid_default: map_uid_default(
                 args.compat.update_remote_user_uid_default,

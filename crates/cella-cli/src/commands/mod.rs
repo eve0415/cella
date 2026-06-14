@@ -230,6 +230,14 @@ pub enum BuildKitMode {
     Never,
 }
 
+/// Map the clap `--buildkit` enum to a resolved "may use `BuildKit`" boolean.
+///
+/// `auto` → `true` (the backend probes for buildx and uses it when present);
+/// `never` → `false` (forces the classic builder). Shared by `up` and `build`.
+pub const fn buildkit_enabled(mode: BuildKitMode) -> bool {
+    !matches!(mode, BuildKitMode::Never)
+}
+
 /// Top-level CLI commands.
 #[derive(Subcommand)]
 pub enum Command {
@@ -338,9 +346,9 @@ impl Command {
 
     /// The `--log-level` value, if the subcommand carries one.
     ///
-    /// `up` (and `code`, which embeds the `up` arg surface), `run-user-commands`,
-    /// `set-up`, `templates`, `features`, and `upgrade` expose `--log-level`;
-    /// every other variant returns
+    /// `up` (and `code`, which embeds the `up` arg surface), `build`,
+    /// `run-user-commands`, `set-up`, `templates`, `features`, and `upgrade`
+    /// expose `--log-level`; every other variant returns
     /// `None`. main.rs reads this once, before subcommand dispatch, to seed the
     /// global tracing filter — the level can't be applied inside `execute()`
     /// because the subscriber is already installed by then.
@@ -348,6 +356,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
+            Self::Build(args) => args.log_level(),
             Self::RunUserCommands(args) => args.compat.log_level,
             Self::SetUp(args) => args.compat.log_level,
             Self::Templates(args) => args.apply_log_level(),
@@ -359,7 +368,8 @@ impl Command {
 
     /// The `--log-format` value (defaults to `Text`).
     ///
-    /// Only `up`/`code` expose `--log-format`; every other variant returns
+    /// `up`/`code`, `build`, `run-user-commands`, and `set-up` expose
+    /// `--log-format`; every other variant returns
     /// `Text`. Read once in main.rs to select the tracing formatter and to
     /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
     /// machine-readable JSON log lines on stderr).
@@ -367,6 +377,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_format,
             Self::Code(args) => args.up.compat.log_format,
+            Self::Build(args) => args.log_format(),
             Self::RunUserCommands(args) => args.compat.log_format,
             Self::SetUp(args) => args.compat.log_format,
             _ => LogFormat::Text,

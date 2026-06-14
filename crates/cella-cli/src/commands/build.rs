@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::{info, warn};
 
-use super::{ComposePullPolicy, ImagePullPolicy, OutputFormat};
+use super::{BuildKitMode, ComposePullPolicy, ImagePullPolicy, LogFormat, LogLevel, OutputFormat};
 
 use cella_backend::{BuildSecret, container_name};
 use cella_config::devcontainer::resolve;
@@ -59,11 +59,52 @@ pub struct BuildArgs {
     /// underlying docker/buildx build. Not supported on the Docker Compose path.
     #[arg(long)]
     platform: Option<String>,
+
+    /// Additional image(s) to use as a layer cache during the build (repeatable).
+    /// Single-container path only (not supported on the Docker Compose path).
+    #[arg(long = "cache-from")]
+    cache_from: Vec<String>,
+
+    /// Cache export destination for the build (`BuildKit` `--cache-to`).
+    /// Single-container path only (not supported on the Docker Compose path).
+    #[arg(long = "cache-to")]
+    cache_to: Option<String>,
+
+    /// Control whether `BuildKit` is used when building images.
+    #[arg(long, value_enum, default_value = "auto")]
+    buildkit: BuildKitMode,
+
+    /// Path to the Docker CLI binary (used for image builds and compose).
+    #[arg(long = "docker-path")]
+    docker_path: Option<String>,
+
+    /// Path to the Docker Compose CLI binary.
+    #[arg(long = "docker-compose-path")]
+    docker_compose_path: Option<String>,
+
+    /// Log verbosity for build output.
+    #[arg(long = "log-level", value_enum)]
+    log_level: Option<LogLevel>,
+
+    /// Log output format.
+    #[arg(long = "log-format", value_enum, default_value = "text")]
+    log_format: LogFormat,
 }
 
 impl BuildArgs {
     pub const fn is_text_output(&self) -> bool {
         matches!(self.output, OutputFormat::Auto | OutputFormat::Text)
+    }
+
+    /// The `--log-level` value, seeded into the global tracing filter by main.rs
+    /// before dispatch (mirrors `up`).
+    pub const fn log_level(&self) -> Option<LogLevel> {
+        self.log_level
+    }
+
+    /// The `--log-format` value (defaults to `Text`).
+    pub const fn log_format(&self) -> LogFormat {
+        self.log_format
     }
 
     pub async fn execute(
@@ -115,6 +156,8 @@ impl BuildArgs {
                 env_files: self.env_file.clone(),
                 pull_policy: self.pull_policy.as_ref().map(|p| p.as_str().to_string()),
                 secrets: secrets.clone(),
+                docker_path: self.docker_path.clone(),
+                docker_compose_path: self.docker_compose_path.clone(),
                 // Match the single-container build path: update the lockfile when
                 // features are present (`cella build` has no --no-lockfile flag yet).
                 lockfile_policy: cella_features::LockfilePolicy::Update,
@@ -147,10 +190,10 @@ impl BuildArgs {
             pull_policy: self.pull.as_ref().map(ImagePullPolicy::as_str),
             secrets: &secrets,
             build_tuning: cella_orchestrator::BuildTuning {
-                docker_path: None,
-                use_buildkit: true,
-                cli_cache_from: &[],
-                cache_to: None,
+                docker_path: self.docker_path.as_deref(),
+                use_buildkit: super::buildkit_enabled(self.buildkit),
+                cli_cache_from: &self.cache_from,
+                cache_to: self.cache_to.as_deref(),
                 platform: self.platform.as_deref(),
             },
             // `--omit-config-remote-env-from-metadata` is wired on `up` only;
@@ -296,6 +339,79 @@ mod tests {
     fn parse_secret_unknown_keys_ignored() {
         let secret = parse_build_secret("id=mysecret,foo=bar").unwrap();
         assert_eq!(secret.id, "mysecret");
+    }
+
+    use clap::Parser;
+
+    /// Minimal CLI wrapper to parse `BuildArgs` in isolation.
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: BuildArgs,
+    }
+
+    fn parse_build(extra: &[&str]) -> BuildArgs {
+        let mut argv = vec!["build"];
+        argv.extend_from_slice(extra);
+        TestCli::try_parse_from(argv).unwrap().args
+    }
+
+    #[test]
+    fn buildkit_default_is_auto_enabled() {
+        // No --buildkit flag → auto → BuildKit enabled.
+        let args = parse_build(&[]);
+        assert!(super::super::buildkit_enabled(args.buildkit));
+    }
+
+    #[test]
+    fn buildkit_never_disables() {
+        // `--buildkit never` maps to use_buildkit == false in BuildTuning.
+        let args = parse_build(&["--buildkit", "never"]);
+        assert!(!super::super::buildkit_enabled(args.buildkit));
+    }
+
+    #[test]
+    fn buildkit_auto_enables() {
+        let args = parse_build(&["--buildkit", "auto"]);
+        assert!(super::super::buildkit_enabled(args.buildkit));
+    }
+
+    #[test]
+    fn cache_from_is_repeatable() {
+        let args = parse_build(&["--cache-from", "a:1", "--cache-from", "b:2"]);
+        assert_eq!(args.cache_from, vec!["a:1".to_string(), "b:2".to_string()]);
+    }
+
+    #[test]
+    fn cache_to_and_docker_paths_parse() {
+        let args = parse_build(&[
+            "--cache-to",
+            "type=inline",
+            "--docker-path",
+            "/usr/bin/docker",
+            "--docker-compose-path",
+            "/usr/bin/docker-compose",
+        ]);
+        assert_eq!(args.cache_to.as_deref(), Some("type=inline"));
+        assert_eq!(args.docker_path.as_deref(), Some("/usr/bin/docker"));
+        assert_eq!(
+            args.docker_compose_path.as_deref(),
+            Some("/usr/bin/docker-compose")
+        );
+    }
+
+    #[test]
+    fn log_level_and_format_accessors_return_parsed_values() {
+        let args = parse_build(&["--log-level", "debug", "--log-format", "json"]);
+        assert!(matches!(args.log_level(), Some(LogLevel::Debug)));
+        assert!(matches!(args.log_format(), LogFormat::Json));
+    }
+
+    #[test]
+    fn log_level_defaults_to_none_and_format_to_text() {
+        let args = parse_build(&[]);
+        assert!(args.log_level().is_none());
+        assert!(matches!(args.log_format(), LogFormat::Text));
     }
 
     #[test]
