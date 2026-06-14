@@ -34,13 +34,14 @@ pub struct ExecArgs {
     #[arg(long, value_parser = crate::commands::parse_id_label)]
     id_label: Vec<String>,
 
-    /// Path to devcontainer.json — targets the container stamped with this
-    /// config file (overrides workspace-folder discovery).
+    /// Path to devcontainer.json. The default is .devcontainer/devcontainer.json
+    /// or, if that does not exist, .devcontainer.json in the workspace folder.
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Path to a devcontainer.json that replaces the discovered config —
-    /// targets the container stamped with this config file.
+    /// Path to a devcontainer.json whose contents override any devcontainer.json
+    /// in the workspace folder (required when there is none otherwise). The
+    /// container is selected by the discovered config path, not this file's path.
     #[arg(long = "override-config")]
     override_config: Option<PathBuf>,
 
@@ -191,8 +192,8 @@ impl ExecArgs {
 /// The spec identity labels `up` stamps for a `(workspace, config)` pair:
 /// `devcontainer.local_folder` and `devcontainer.config_file`, both lexical
 /// (non-symlink-resolving) absolute paths. Byte-identical to what
-/// `build_container_labels` / `build_compose_labels` write, so a container can
-/// be matched by them.
+/// `cella_backend::names::container_labels` (single-container) and
+/// `build_compose_labels` (compose) write, so a container can be matched by them.
 fn spec_identity_labels(workspace_root: &Path, config_path: &Path) -> [String; 2] {
     [
         format!(
