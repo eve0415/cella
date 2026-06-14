@@ -1523,22 +1523,20 @@ mod tests {
     }
 
     #[test]
-    fn merged_from_label_empty_label_merges_config_only() {
-        // No `devcontainer.metadata` label on the container — treat as empty.
+    fn merged_from_label_empty_label_produces_empty_lifecycle() {
+        // A container that has no devcontainer.metadata label (cella always bakes
+        // at least the devcontainer.json entry, so this is rare — external containers
+        // built without devcontainer support). The official CLI also reads lifecycle
+        // exclusively from the metadata array; with an empty array, lifecycle arrays
+        // are empty. We match that: an absent/empty label yields empty plural arrays,
+        // matching `mergeLifecycleHooks([], hook) → []` in the official CLI.
         let config = json!({
             "image": "ubuntu",
             "postCreateCommand": "echo hi",
         });
         let out = build_merged_from_label(&config, "");
 
-        // With no label data, lifecycle comes from config alone (no fc path).
-        // build_merged_from_label with an empty label produces a FeatureContainerConfig
-        // with empty lifecycle — so the fc path is taken but fc.lifecycle is empty.
-        // lifecycle_commands_array with empty fc.lifecycle emits [] for each phase.
-        // The devcontainer.json command is NOT appended via fc here because
-        // parse_image_metadata on "" returns an empty lifecycle.
-        // This is intentional: with no metadata, plural arrays are empty (matching
-        // the official "no features, no base image metadata" case).
+        // Lifecycle comes from the label array only (none here), not from on-disk config.
         assert_eq!(out["postCreateCommands"], json!([]));
         assert!(out.get("postCreateCommand").is_none());
         assert_eq!(out["init"], json!(false));
