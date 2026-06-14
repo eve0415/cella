@@ -667,6 +667,36 @@ mod tests {
     }
 
     #[test]
+    fn build_override_shape_has_build_section_but_no_runtime_entrypoint_or_volumes() {
+        // The compose BUILD override (`cella build`) is build-only: it carries the
+        // `build:` section but must emit NO runtime entrypoint/command (it never
+        // runs the container — `cella up` regenerates the runtime override) and no
+        // agent volume. Regression: a build override built with `override_command`
+        // left on would emit the `exec "$@"` wrapper without a `command:`, so a
+        // container started from the persisted file would ignore overrideCommand.
+        let mut config = base_config();
+        config.build_dockerfile = Some(PathBuf::from("Dockerfile.combined"));
+        config.build_only = true;
+        config.override_command = false;
+        config.feature_entrypoints = Vec::new();
+        let yaml = generate_override_yaml(&config);
+
+        assert!(yaml.contains("    build:\n"), "yaml:\n{yaml}");
+        assert!(
+            !yaml.contains("entrypoint:"),
+            "build override must emit no runtime entrypoint; yaml:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("command:"),
+            "build override must emit no command; yaml:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("volumes:"),
+            "build override must omit volumes; yaml:\n{yaml}"
+        );
+    }
+
+    #[test]
     fn build_section_dockerfile_and_context_are_escaped() {
         // Regression (Windows paths): a `build.dockerfile`/`build.context` with
         // backslashes (or a `"` in `target`) must stay inside the double-quoted
