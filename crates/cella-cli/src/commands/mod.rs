@@ -527,6 +527,7 @@ impl Command {
             Self::Templates(args) => args.apply_log_level(),
             Self::Features(args) => args.log_level(),
             Self::Upgrade(args) => Some(args.log_level),
+            Self::Outdated(args) => args.log_level,
             _ => None,
         }
     }
@@ -547,6 +548,7 @@ impl Command {
             Self::ReadConfiguration(args) => args.compat.log_format,
             Self::RunUserCommands(args) => args.compat.log_format,
             Self::SetUp(args) => args.compat.log_format,
+            Self::Outdated(args) => args.log_format,
             _ => LogFormat::Text,
         }
     }

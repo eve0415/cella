@@ -49,20 +49,26 @@ pub struct OutdatedArgs {
     #[arg(long, hide = true)]
     pub check: bool,
 
-    #[arg(long, hide = true)]
+    /// Number of columns to render output for (compatibility no-op).
+    #[arg(long)]
     pub terminal_columns: Option<u16>,
 
-    #[arg(long, hide = true)]
+    /// Number of rows to render output for (compatibility no-op).
+    #[arg(long)]
     pub terminal_rows: Option<u16>,
 
+    /// Accepted for parity; the official `outdated` doesn't actually expose this
+    /// (kept hidden as a no-op so scripts passing it don't break).
     #[arg(long, hide = true)]
     pub user_data_folder: Option<PathBuf>,
 
-    #[arg(long, hide = true)]
-    pub log_level: Option<String>,
+    /// Log verbosity (seeded into the global tracing filter by `main.rs`).
+    #[arg(long = "log-level", value_enum)]
+    pub log_level: Option<super::LogLevel>,
 
-    #[arg(long, hide = true)]
-    pub log_format: Option<String>,
+    /// Log output format (seeded into the tracing subscriber by `main.rs`).
+    #[arg(long = "log-format", value_enum, default_value = "text")]
+    pub log_format: super::LogFormat,
 }
 
 impl OutdatedArgs {
@@ -534,6 +540,39 @@ mod tests {
     /// Build a DESCENDING version list, as the production code passes around.
     fn versions(list: &[&str]) -> Vec<Version> {
         strict_semver_descending(&list.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn accepts_official_config_and_log_flags() {
+        use clap::Parser as _;
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "outdated",
+            "--config",
+            "/x/devcontainer.json",
+            "--log-level",
+            "debug",
+            "--log-format",
+            "json",
+            "--terminal-columns",
+            "80",
+            "--terminal-rows",
+            "40",
+        ])
+        .expect("official outdated flags must parse");
+        let crate::commands::Command::Outdated(args) = &cli.command else {
+            panic!("expected outdated subcommand");
+        };
+        assert_eq!(
+            args.common.file.as_deref(),
+            Some(std::path::Path::new("/x/devcontainer.json")),
+            "--config must populate the config path (alias of --file)"
+        );
+        assert!(matches!(
+            args.log_level,
+            Some(super::super::LogLevel::Debug)
+        ));
+        assert!(matches!(args.log_format, super::super::LogFormat::Json));
     }
 
     // -----------------------------------------------------------------------
