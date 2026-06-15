@@ -1090,6 +1090,63 @@ fn entry_to_shell_command(entry: &cella_features::LifecycleEntry) -> String {
     "true".to_string()
 }
 
+/// Whether the workspace content differs from the content hash stored in the container.
+///
+/// Returns `true` (→ run the content phases) when no hash is stored yet or when
+/// the stored hash does not match the current workspace hash. This is a pure
+/// reader: it never writes to the container.
+pub async fn content_changed(
+    lc_ctx: &LifecycleContext<'_>,
+    workspace_root: &std::path::Path,
+) -> bool {
+    let current = cella_git::content_hash::compute(workspace_root);
+    let stored = lc_ctx
+        .client
+        .exec_command(
+            lc_ctx.container_id,
+            &ExecOptions {
+                cmd: vec!["cat".to_string(), "/tmp/.cella/content_hash".to_string()],
+                user: lc_ctx.user.map(String::from),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .map(|r| r.stdout.trim().to_string());
+    stored.as_deref() != Some(&current)
+}
+
+/// Whether the container's last background lifecycle run recorded a failure.
+///
+/// Reads `/tmp/.cella/lifecycle_status.json`, which is written ONLY by the
+/// background lifecycle chain. Returns `true` only on an explicit
+/// `{"status":"failed"}`. An ABSENT file (a fully-foreground `up`, an
+/// external/VS Code container seeded without it, or an older cella) means
+/// nothing failed → `false`; the normal skip applies. Mirrors `up`'s own
+/// `.contains("\"failed\"")` check in `handle_running`. Pure reader.
+pub async fn lifecycle_failed(lc_ctx: &LifecycleContext<'_>) -> bool {
+    lc_ctx
+        .client
+        .exec_command(
+            lc_ctx.container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "cat".to_string(),
+                    "/tmp/.cella/lifecycle_status.json".to_string(),
+                ],
+                user: lc_ctx.user.map(String::from),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .is_some_and(|r| r.stdout.contains("\"failed\""))
+}
+
 /// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
 ///
 /// # Errors
@@ -1120,30 +1177,10 @@ pub async fn check_and_run_content_update(
         return Ok(());
     }
 
-    let current_hash = cella_git::content_hash::compute(workspace_root);
-
-    let read_result = lc_ctx
-        .client
-        .exec_command(
-            lc_ctx.container_id,
-            &ExecOptions {
-                cmd: vec!["cat".to_string(), "/tmp/.cella/content_hash".to_string()],
-                user: lc_ctx.user.map(String::from),
-                env: None,
-                working_dir: None,
-            },
-        )
-        .await;
-
-    let stored_hash = read_result
-        .ok()
-        .filter(|r| r.exit_code == 0)
-        .map(|r| r.stdout.trim().to_string());
-
     // --prebuild force-reruns updateContentCommand even when the hash matches
     // (official injectHeadless.ts: rerun = !!prebuild). Otherwise honor the
     // content-hash short-circuit.
-    if stored_hash.as_deref() == Some(&current_hash) && !gate.rerun_update_content() {
+    if !content_changed(lc_ctx, workspace_root).await && !gate.rerun_update_content() {
         return Ok(());
     }
 
@@ -1183,6 +1220,10 @@ pub async fn check_and_run_content_update(
     // hash and permanently skip the deferred postCreateCommand (mirrors the
     // create-path content-hash gating).
     if run_post_create {
+        // Compute the hash only on the persist path — the updateContent-only
+        // (prebuild / skip-non-blocking) branch never writes it, so re-scanning
+        // the workspace there would be wasted work (Copilot review).
+        let current_hash = cella_git::content_hash::compute(workspace_root);
         let _ = lc_ctx
             .client
             .exec_command(

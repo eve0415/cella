@@ -25,18 +25,26 @@
 //! `postAttachCommand` has no `skip_non_blocking` gate; the default `waitFor`
 //! is `updateContentCommand`.
 //!
-//! DIVERGENCE (documented): the official handler computes a per-phase
-//! `doRun` from `createdAt`/`startedAt` marker files, so against a freshly
-//! provisioned container it typically re-runs only `postAttachCommand`. cella
-//! has no createdAt/startedAt markers (its only analogs are the content hash
-//! and `oncreate_done` state used by `up`), so this runner re-runs every gated
-//! phase unconditionally. The observable difference is redundant re-execution
-//! of idempotent hooks, not a different final state or a different status
-//! string.
+//! PHASE SKIPPING: the official handler gates onCreate/updateContent/postCreate
+//! on per-phase `createdAt` marker files (run once per container) and postStart
+//! on `startedAt`. cella has no createdAt/startedAt markers; its analogs are the
+//! `oncreate_done` flag and content hash in `/tmp/.cella/` that `up` writes. This
+//! runner mirrors `up`'s per-phase model fully: it reads those markers up front
+//! to skip `onCreateCommand` when `oncreate_done` and `updateContentCommand`/
+//! `postCreateCommand` when the workspace content hash is unchanged (with
+//! `--prebuild` force-running updateContent, matching the official
+//! `rerun = !!prebuild`), AND it writes each marker back after its phase
+//! succeeds (just like `up`), so repeated invocations don't re-run a phase that
+//! already completed. A FAILED previous background lifecycle re-runs every gated
+//! phase (recovery). `postStartCommand`/`postAttachCommand` still run
+//! unconditionally — `startedAt`-based postStart gating is a follow-up (needs new
+//! ContainerInfo/LifecycleState plumbing).
 
 use cella_backend::ContainerBackend;
 use cella_backend::lifecycle::{
-    LifecycleContext, StopAfter, WaitForPhase, lifecycle_entries_for_phase, run_lifecycle_entries,
+    LifecycleContext, StopAfter, WaitForPhase, content_changed, lifecycle_entries_for_phase,
+    lifecycle_failed, read_lifecycle_state, run_lifecycle_entries, write_content_hash,
+    write_lifecycle_state,
 };
 use cella_backend::progress::ProgressSender;
 use serde_json::Value;
@@ -89,6 +97,62 @@ pub struct Gating {
     pub wait_for: WaitForPhase,
 }
 
+/// Per-phase skip decisions computed before the phase sequence runs.
+///
+/// Computed once by [`phase_skips`] and applied to individual `run_phase`
+/// calls so that the skip logic is unit-testable independently of I/O.
+struct PhaseSkips {
+    /// `false` → skip `onCreateCommand` (oncreate already ran).
+    run_oncreate: bool,
+    /// `false` → skip `updateContentCommand` (content unchanged and not prebuild).
+    run_update_content: bool,
+    /// `false` → skip `postCreateCommand` (content unchanged).
+    run_post_create: bool,
+}
+
+impl PhaseSkips {
+    /// Run every gated phase — the recovery path, taken when the previous
+    /// background lifecycle recorded a FAILURE. The content-hash skip is only
+    /// SOUND when the prior run completed: a failed background `postCreateCommand`
+    /// leaves the content hash matching, so without this `run-user-commands`
+    /// (cella's recovery path) would skip the very phase the user is re-running.
+    /// `lifecycle_status.json` is a single coarse signal, so any failure re-runs
+    /// all gated phases — matching pre-skip `run-user-commands` behavior.
+    const fn run_all() -> Self {
+        Self {
+            run_oncreate: true,
+            run_update_content: true,
+            run_post_create: true,
+        }
+    }
+}
+
+/// Compute which lifecycle phases to skip based on persisted container state,
+/// mirroring `up`'s per-phase gating (NOT the official's lumped `createdAt`):
+///
+/// - `oncreate_done=true` → `onCreateCommand` already ran; skip it.
+/// - `content_changed=false` → workspace content is unchanged; skip
+///   `updateContentCommand` and `postCreateCommand`.
+/// - `prebuild` force-runs `updateContentCommand` even when content is
+///   unchanged, matching the official `rerun = !!params.prebuild`
+///   (injectHeadless.ts) and cella's own `up` reuse path
+///   (`gate.rerun_update_content`). `postCreateCommand` is unreachable under
+///   prebuild (the flow returns `STATUS_PREBUILD` first), so it stays gated on
+///   content alone.
+///
+/// The recovery path (previous lifecycle failed) is handled by the caller via
+/// [`PhaseSkips::run_all`], not here.
+const fn phase_skips(oncreate_done: bool, content_changed: bool, prebuild: bool) -> PhaseSkips {
+    PhaseSkips {
+        run_oncreate: !oncreate_done,
+        run_update_content: content_changed || prebuild,
+        // `|| prebuild` is intentionally omitted: `run_user_commands` returns
+        // STATUS_PREBUILD after updateContent (before postCreate is reached), so
+        // postCreate is unreachable under prebuild and needs no override.
+        run_post_create: content_changed,
+    }
+}
+
 /// Everything the foreground lifecycle runner needs, gathered into one borrow
 /// to keep the argument count under the lint and group related inputs.
 pub struct RunUserCommandsInput<'a> {
@@ -104,6 +168,12 @@ pub struct RunUserCommandsInput<'a> {
     pub gating: Gating,
     /// Dotfiles install inputs.
     pub dotfiles: DotfilesInputs<'a>,
+    /// Host-side workspace root used for content-hash comparison.
+    ///
+    /// When `None` (e.g. bare `--container-id` with no resolvable workspace),
+    /// `content_changed` defaults to `true` so updateContent/postCreate run
+    /// unconditionally — the safe fallback that matches today's behavior.
+    pub workspace_root: Option<&'a std::path::Path>,
 }
 
 /// Run the gated lifecycle phases in the foreground against an existing
@@ -123,18 +193,49 @@ pub async fn run_user_commands(
     let g = &input.gating;
 
     // (a) skip_non_blocking + waitFor == initializeCommand → stop immediately.
+    // Read phase-skip state AFTER this early return so the round-trips are
+    // skipped on the fast path.
     if stops_after(g, WaitForPhase::Initialize) {
         return Ok(STATUS_SKIP_NON_BLOCKING);
     }
 
-    // (b) onCreate, then gate.
-    run_phase(lc_ctx, input, "onCreateCommand", progress).await?;
+    // Read oncreate_done and content-changed state once, before the phase
+    // sequence, so every skip decision uses a consistent snapshot.
+    let remote_user = lc_ctx.user.unwrap_or("root");
+    // Read the full state (not just the flag) so the marker write-back below is a
+    // read-modify-write that preserves any fields a later PR adds.
+    let mut lc_state = read_lifecycle_state(lc_ctx.client, lc_ctx.container_id, remote_user).await;
+    let oncreate_done = lc_state.oncreate_done;
+    // No workspace_root (e.g. bare --container-id) → default to changed (run)
+    // — safe fallback that matches today's unconditional behavior.
+    let is_content_changed = match input.workspace_root {
+        Some(ws) => content_changed(lc_ctx, ws).await,
+        None => true,
+    };
+    // If the previous background lifecycle FAILED, re-run every gated phase —
+    // run-user-commands is cella's recovery path, and the content-hash skip is
+    // only sound when the prior run completed.
+    let skips = if lifecycle_failed(lc_ctx).await {
+        PhaseSkips::run_all()
+    } else {
+        phase_skips(oncreate_done, is_content_changed, g.stop.prebuild)
+    };
+
+    // (b) onCreate, then gate. Mark it done on success so a later run/up skips
+    // it — written only after the phase ran, mirroring `up`.
+    if skips.run_oncreate {
+        run_phase(lc_ctx, input, "onCreateCommand", progress).await?;
+        lc_state.oncreate_done = true;
+        write_lifecycle_state(lc_ctx.client, lc_ctx.container_id, remote_user, &lc_state).await;
+    }
     if stops_after(g, WaitForPhase::OnCreate) {
         return Ok(STATUS_SKIP_NON_BLOCKING);
     }
 
     // (c) updateContent, then gate.
-    run_phase(lc_ctx, input, "updateContentCommand", progress).await?;
+    if skips.run_update_content {
+        run_phase(lc_ctx, input, "updateContentCommand", progress).await?;
+    }
     if stops_after(g, WaitForPhase::UpdateContent) {
         return Ok(STATUS_SKIP_NON_BLOCKING);
     }
@@ -144,8 +245,15 @@ pub async fn run_user_commands(
         return Ok(STATUS_PREBUILD);
     }
 
-    // (e) postCreate, then gate.
-    run_phase(lc_ctx, input, "postCreateCommand", progress).await?;
+    // (e) postCreate, then gate. Persist the content hash on success (only when
+    // there's a workspace to hash) so a later run/up skips the content phases for
+    // unchanged content — mirrors `up`'s `if run_post_create { write_content_hash }`.
+    if skips.run_post_create {
+        run_phase(lc_ctx, input, "postCreateCommand", progress).await?;
+        if let Some(ws) = input.workspace_root {
+            write_content_hash(lc_ctx.client, lc_ctx.container_id, remote_user, ws).await;
+        }
+    }
     if stops_after(g, WaitForPhase::PostCreate) {
         return Ok(STATUS_SKIP_NON_BLOCKING);
     }
@@ -403,5 +511,641 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("root");
         assert_eq!(user, "vscode");
+    }
+
+    // ── phase_skips unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn phase_skips_all_done_skips_create_phases() {
+        // oncreate_done=true, content unchanged → only postStart/postAttach run.
+        let s = phase_skips(true, false, false);
+        assert!(!s.run_oncreate, "onCreate must be skipped when done");
+        assert!(
+            !s.run_update_content,
+            "updateContent skipped when unchanged"
+        );
+        assert!(!s.run_post_create, "postCreate skipped when unchanged");
+    }
+
+    #[test]
+    fn phase_skips_oncreate_not_done_runs_oncreate() {
+        let s = phase_skips(false, false, false);
+        assert!(s.run_oncreate, "onCreate must run when not done");
+        assert!(!s.run_update_content, "updateContent skipped if unchanged");
+        assert!(!s.run_post_create, "postCreate skipped if unchanged");
+    }
+
+    #[test]
+    fn phase_skips_content_changed_runs_content_phases() {
+        let s = phase_skips(true, true, false);
+        assert!(!s.run_oncreate, "onCreate still skipped when done");
+        assert!(s.run_update_content, "updateContent runs when changed");
+        assert!(s.run_post_create, "postCreate runs when changed");
+    }
+
+    #[test]
+    fn phase_skips_nothing_done_runs_all() {
+        let s = phase_skips(false, true, false);
+        assert!(s.run_oncreate);
+        assert!(s.run_update_content);
+        assert!(s.run_post_create);
+    }
+
+    #[test]
+    fn phase_skips_prebuild_forces_update_content() {
+        // Matches `up` + official `rerun = !!prebuild`: prebuild re-runs
+        // updateContent even when unchanged. postCreate is unreachable under
+        // prebuild (flow returns STATUS_PREBUILD first), so it stays content-gated.
+        let s = phase_skips(true, false, true);
+        assert!(s.run_update_content, "prebuild force-runs updateContent");
+        assert!(!s.run_post_create, "postCreate not forced by prebuild");
+    }
+
+    #[test]
+    fn run_all_runs_every_gated_phase() {
+        // The recovery path (previous background lifecycle failed) re-runs every
+        // gated phase regardless of oncreate_done / content-hash.
+        let s = PhaseSkips::run_all();
+        assert!(s.run_oncreate, "recovery re-runs onCreate");
+        assert!(s.run_update_content, "recovery re-runs updateContent");
+        assert!(s.run_post_create, "recovery re-runs postCreate");
+    }
+
+    // ── mock-backend integration tests ───────────────────────────────────────
+    //
+    // These exercise run_user_commands against a mock ContainerBackend that
+    // controls the `oncreate_done` and `content_hash` responses and records
+    // every exec'd command so assertions can verify which phases ran.
+
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use cella_backend::traits::Platform;
+    use cella_backend::types::{BuildOptions, FileToUpload, ImageDetails, InteractiveExecOptions};
+    use cella_backend::{
+        BackendCapabilities, BackendError, BackendKind, BoxFuture, ContainerInfo, ExecOptions,
+        ExecResult, SecretMasker,
+    };
+
+    /// A minimal mock backend for lifecycle gating tests.
+    ///
+    /// - `exec_command` calls that look like `cat /tmp/.cella/lifecycle_state.json`
+    ///   return `{"oncreate_done":true/false}` per `oncreate_done`.
+    /// - Calls that look like `cat /tmp/.cella/content_hash` return `stored_hash`.
+    /// - All other `exec_command` calls succeed (exit 0, empty output) and their
+    ///   third `cmd` element (the sh `-c` argument) is pushed into `recorded`.
+    struct LifecycleMockBackend {
+        oncreate_done: bool,
+        stored_hash: String,
+        /// Returned for `cat /tmp/.cella/lifecycle_status.json`. Empty = absent
+        /// (the common case: nothing failed). Set to `{"status":"failed"}` to
+        /// exercise the recovery path.
+        lifecycle_status: String,
+        recorded: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LifecycleMockBackend {
+        fn new(
+            oncreate_done: bool,
+            stored_hash: impl Into<String>,
+        ) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let backend = Self {
+                oncreate_done,
+                stored_hash: stored_hash.into(),
+                lifecycle_status: String::new(),
+                recorded: Arc::clone(&recorded),
+            };
+            (backend, recorded)
+        }
+    }
+
+    impl ContainerBackend for LifecycleMockBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Docker
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                compose: false,
+                managed_agent: false,
+            }
+        }
+
+        fn find_container<'a>(
+            &'a self,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn find_container_by_label<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn create_container<'a>(
+            &'a self,
+            _: &'a cella_backend::CreateContainerOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn start_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn stop_container<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn remove_container<'a>(
+            &'a self,
+            _: &'a str,
+            _: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_container<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ContainerInfo, BackendError>> {
+            unimplemented!()
+        }
+
+        fn list_cella_containers(
+            &self,
+            _: bool,
+        ) -> BoxFuture<'_, Result<Vec<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn find_compose_service<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ContainerInfo>, BackendError>> {
+            unimplemented!()
+        }
+
+        fn container_logs<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_command<'a>(
+            &'a self,
+            _container_id: &'a str,
+            opts: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            // Intercept cella's two state-read commands and return the mock values.
+            let stdout = if opts
+                .cmd
+                .get(1)
+                .is_some_and(|a| a == "/tmp/.cella/lifecycle_state.json")
+            {
+                let flag = if self.oncreate_done { "true" } else { "false" };
+                format!(r#"{{"oncreate_done":{flag}}}"#)
+            } else if opts
+                .cmd
+                .get(1)
+                .is_some_and(|a| a == "/tmp/.cella/content_hash")
+            {
+                self.stored_hash.clone()
+            } else if opts
+                .cmd
+                .get(1)
+                .is_some_and(|a| a == "/tmp/.cella/lifecycle_status.json")
+            {
+                self.lifecycle_status.clone()
+            } else {
+                // Real lifecycle command: record the sh -c argument (index 2) or
+                // the full command joined, so assertions can match by keyword.
+                let script = opts
+                    .cmd
+                    .get(2)
+                    .cloned()
+                    .unwrap_or_else(|| opts.cmd.join(" "));
+                self.recorded.lock().expect("mutex").push(script);
+                String::new()
+            };
+            Box::pin(async move {
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            })
+        }
+
+        fn exec_stream<'a>(
+            &'a self,
+            container_id: &'a str,
+            opts: &'a ExecOptions,
+            _stdout_writer: Box<dyn std::io::Write + Send + 'a>,
+            _stderr_writer: Box<dyn std::io::Write + Send + 'a>,
+        ) -> BoxFuture<'a, Result<ExecResult, BackendError>> {
+            // Delegate to exec_command so recording works on the non-is_text path too.
+            self.exec_command(container_id, opts)
+        }
+
+        fn exec_interactive<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a InteractiveExecOptions,
+        ) -> BoxFuture<'a, Result<i64, BackendError>> {
+            unimplemented!()
+        }
+
+        fn exec_detached<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a ExecOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn pull_image<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn build_image<'a>(
+            &'a self,
+            _: &'a BuildOptions,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            unimplemented!()
+        }
+
+        fn image_exists<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool, BackendError>> {
+            unimplemented!()
+        }
+
+        fn tag_image<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_details<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<ImageDetails, BackendError>> {
+            unimplemented!()
+        }
+
+        fn inspect_image_env<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<String>, BackendError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn inspect_image_user<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<String, BackendError>> {
+            Box::pin(async { Ok("root".to_string()) })
+        }
+
+        fn upload_files<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [FileToUpload],
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            unimplemented!()
+        }
+
+        fn ping(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn host_gateway(&self) -> &'static str {
+            "host.docker.internal"
+        }
+
+        fn detect_platform(&self) -> BoxFuture<'_, Result<Platform, BackendError>> {
+            Box::pin(async {
+                Ok(Platform {
+                    os: "linux".to_string(),
+                    arch: "amd64".to_string(),
+                })
+            })
+        }
+
+        fn detect_container_arch(&self) -> BoxFuture<'_, Result<String, BackendError>> {
+            Box::pin(async { Ok("amd64".to_string()) })
+        }
+
+        fn ensure_network(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn ensure_container_network<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Path,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_container_ip<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, BackendError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn ensure_agent_provisioned<'a>(
+            &'a self,
+            _version: &'a str,
+            _arch: &'a str,
+            _skip_checksum: bool,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn write_agent_addr<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _addr: &'a str,
+            _token: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn agent_volume_mount(&self) -> (String, String, bool) {
+            (String::new(), String::new(), true)
+        }
+
+        fn prune_old_agent_versions<'a>(
+            &'a self,
+            _current_version: &'a str,
+        ) -> BoxFuture<'a, Result<(), BackendError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Build a default (no-gating) `Gating` suitable for the phase-skip integration tests.
+    fn no_gating() -> Gating {
+        Gating {
+            stop: StopAfter {
+                skip_non_blocking: false,
+                prebuild: false,
+            },
+            stop_for_personalization: false,
+            skip_post_attach: true, // skip postAttach — not relevant to our assertions
+            wait_for: WaitForPhase::UpdateContent,
+        }
+    }
+
+    /// Build a `RunUserCommandsInput` with distinct echo commands for every phase
+    /// so each phase's execution is independently verifiable.
+    fn input_with_phases<'a>(
+        config: &'a Value,
+        workspace_root: Option<&'a Path>,
+    ) -> RunUserCommandsInput<'a> {
+        RunUserCommandsInput {
+            config,
+            metadata: None,
+            gating: no_gating(),
+            dotfiles: DotfilesInputs {
+                repository: None,
+                install_command: None,
+                target_path: "/root/dotfiles",
+            },
+            workspace_root,
+        }
+    }
+
+    /// Build a `LifecycleContext` backed by the given mock.
+    fn lc_ctx<'a>(backend: &'a LifecycleMockBackend, env: &'a [String]) -> LifecycleContext<'a> {
+        LifecycleContext {
+            client: backend,
+            container_id: "test-container",
+            user: Some("root"),
+            env,
+            working_dir: None,
+            is_text: false,
+            on_output: None,
+            secret_masker: SecretMasker::new(&[]),
+        }
+    }
+
+    /// Create a `ProgressSender` that discards all events (for tests).
+    fn noop_sender() -> ProgressSender {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        ProgressSender::new(tx, false)
+    }
+
+    /// Devcontainer config carrying a distinct echo marker for each phase.
+    fn phase_config() -> Value {
+        json!({
+            "onCreateCommand": "MARKER_ONCREATE",
+            "updateContentCommand": "MARKER_UPDATE",
+            "postCreateCommand": "MARKER_POSTCREATE",
+            "postStartCommand": "MARKER_POSTSTART",
+            "postAttachCommand": "MARKER_POSTATTACH",
+        })
+    }
+
+    #[tokio::test]
+    async fn all_done_skips_oncreate_and_content_phases() {
+        // (a) oncreate_done=true + content hash matches → only postStart ran
+        //     (postAttach is gated off by skip_post_attach=true in no_gating()).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The mock returns a hash matching what content_hash::compute computes
+        // on the (empty) temp dir.
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+
+        let (backend, recorded) = LifecycleMockBackend::new(true, expected_hash);
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let input = input_with_phases(&config, Some(tmp.path()));
+
+        let sender = noop_sender();
+        let status = run_user_commands(&ctx, &input, &sender).await.expect("run");
+        assert_eq!(status, STATUS_DONE);
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_ONCREATE")),
+            "onCreate must be skipped; got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "updateContent must be skipped; got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "postCreate must be skipped; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_POSTSTART")),
+            "postStart must still run; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oncreate_not_done_runs_oncreate() {
+        // (b) oncreate_done=false → onCreate runs; content unchanged → content phases skipped.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+
+        let (backend, recorded) = LifecycleMockBackend::new(false, expected_hash);
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let input = input_with_phases(&config, Some(tmp.path()));
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_ONCREATE")),
+            "onCreate must run when not done; got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "updateContent must be skipped (unchanged); got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "postCreate must be skipped (unchanged); got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("> /tmp/.cella/lifecycle_state.json")),
+            "oncreate_done must be persisted after onCreate runs; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_runs_content_phases() {
+        // (c) oncreate_done=true, hash mismatch → updateContent + postCreate run.
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let (backend, recorded) = LifecycleMockBackend::new(true, "stale-hash-value");
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let input = input_with_phases(&config, Some(tmp.path()));
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_ONCREATE")),
+            "onCreate must be skipped when done; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "updateContent must run on hash mismatch; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "postCreate must run on hash mismatch; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("> /tmp/.cella/content_hash")),
+            "new content hash must be persisted after postCreate runs; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_workspace_root_runs_content_phases() {
+        // workspace_root=None defaults to content_changed=true → content phases run.
+        let (backend, recorded) = LifecycleMockBackend::new(true, "any-hash");
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let input = input_with_phases(&config, None);
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "updateContent must run when workspace_root is None; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "postCreate must run when workspace_root is None; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prebuild_forces_update_content_then_stops() {
+        // (d) oncreate_done=true + content unchanged + prebuild=true: onCreate
+        // skipped, updateContent force-runs (official `rerun = !!prebuild`), then
+        // the flow returns STATUS_PREBUILD before postCreate. Mirrors `up`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+
+        let (backend, recorded) = LifecycleMockBackend::new(true, expected_hash);
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let mut input = input_with_phases(&config, Some(tmp.path()));
+        input.gating.stop.prebuild = true;
+
+        let sender = noop_sender();
+        let status = run_user_commands(&ctx, &input, &sender).await.expect("run");
+        assert_eq!(status, STATUS_PREBUILD, "prebuild returns its status");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_ONCREATE")),
+            "onCreate skipped (done); got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "prebuild force-runs updateContent even when unchanged; got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "postCreate unreachable under prebuild; got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_background_lifecycle_recovers_all_phases() {
+        // (e) lifecycle_status=failed re-runs EVERY gated phase even with
+        // oncreate_done=true + content unchanged — the recovery path. (The
+        // absent-status → still-skip case is covered by
+        // `all_done_skips_oncreate_and_content_phases`, where the mock defaults
+        // lifecycle_status to empty.)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected_hash = cella_git::content_hash::compute(tmp.path());
+
+        let (mut backend, recorded) = LifecycleMockBackend::new(true, expected_hash);
+        backend.lifecycle_status = r#"{"status":"failed"}"#.to_string();
+        let config = phase_config();
+        let ctx = lc_ctx(&backend, &[]);
+        let input = input_with_phases(&config, Some(tmp.path()));
+
+        let sender = noop_sender();
+        run_user_commands(&ctx, &input, &sender).await.expect("run");
+
+        let cmds = recorded.lock().expect("mutex").clone();
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_ONCREATE")),
+            "recovery re-runs onCreate; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_UPDATE")),
+            "recovery re-runs updateContent; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("MARKER_POSTCREATE")),
+            "recovery re-runs postCreate; got {cmds:?}"
+        );
     }
 }
