@@ -82,6 +82,8 @@ struct FeatureMetadataDto {
     post_attach_command: Option<serde_json::Value>,
     #[serde(default)]
     legacy_ids: Vec<String>,
+    #[serde(rename = "currentId")]
+    current_id: Option<String>,
     deprecated: Option<bool>,
 }
 
@@ -161,6 +163,7 @@ impl FeatureMetadataDto {
             post_start_command: self.post_start_command,
             post_attach_command: self.post_attach_command,
             legacy_ids: self.legacy_ids,
+            current_id: self.current_id,
             deprecated: self.deprecated,
         })
     }
@@ -551,6 +554,26 @@ mod tests {
             meta.installs_after,
             vec!["ghcr.io/devcontainers/features/base:1"]
         );
+    }
+
+    #[test]
+    fn current_id_parsed() {
+        let json = r#"{
+            "id": "java",
+            "version": "1.0.0",
+            "legacyIds": ["maven", "gradle"],
+            "currentId": "java"
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse currentId");
+        assert_eq!(meta.current_id.as_deref(), Some("java"));
+        assert_eq!(meta.legacy_ids, vec!["maven", "gradle"]);
+    }
+
+    #[test]
+    fn current_id_absent_yields_none() {
+        let json = r#"{"id": "node", "version": "1.0.0"}"#;
+        let meta = parse_feature_metadata(json).expect("should parse without currentId");
+        assert!(meta.current_id.is_none());
     }
 
     #[test]

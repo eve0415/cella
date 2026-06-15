@@ -84,6 +84,11 @@ pub struct FeatureMetadata {
     pub post_start_command: Option<serde_json::Value>,
     pub post_attach_command: Option<serde_json::Value>,
     pub legacy_ids: Vec<String>,
+    /// Canonical id injected at packaging time, present in fetched metadata only
+    /// when `legacyIds` is non-empty.  Used to detect rename warnings: when the
+    /// user's ref leaf differs from `current_id`, the feature was referenced by a
+    /// legacy id and we emit `(!) WARNING: This feature has been renamed…`.
+    pub current_id: Option<String>,
     pub deprecated: Option<bool>,
 }
 
