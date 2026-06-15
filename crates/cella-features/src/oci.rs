@@ -83,8 +83,8 @@ pub struct OciFetchResult {
     /// The full OCI image manifest returned by the registry.
     ///
     /// Always populated — on a cache hit the manifest is read from the
-    /// sidecar `manifest.json` written during the original fetch; on a miss
-    /// it is stored there immediately after pulling.  If the sidecar is
+    /// `manifest-<hash>.json` sidecar written during the original fetch; on a
+    /// miss it is stored there immediately after pulling.  If the sidecar is
     /// absent (pre-existing cache entry), the manifest is re-pulled once.
     pub manifest: oci_distribution::manifest::OciImageManifest,
 }

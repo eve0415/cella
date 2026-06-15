@@ -236,7 +236,14 @@ fn feature_out(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureOut 
         id: f.id.clone(),
         included: true,
         value,
-        cache_path: Some(format!("{dst_folder}/{consecutive_id}")),
+        // Join with the platform separator (matches the official's
+        // path.join(dstFolder, consecutiveId)) rather than a hard-coded `/`.
+        cache_path: Some(
+            std::path::Path::new(dst_folder)
+                .join(&consecutive_id)
+                .to_string_lossy()
+                .into_owned(),
+        ),
         consecutive_id,
         version: non_empty(&m.version),
         name: m.name.clone(),

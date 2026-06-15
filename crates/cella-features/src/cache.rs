@@ -63,11 +63,13 @@ impl FeatureCache {
             .join(hash_ref_component(digest))
     }
 
-    /// Write the OCI manifest for a feature to the cache as `manifest.json`.
+    /// Write the OCI manifest for a feature to the cache.
     ///
-    /// The file is written alongside the artifact directory, keyed by the same
-    /// registry/repository/digest triple.  Serialisation errors are logged and
-    /// silently ignored — a missing manifest.json is treated as a cache miss by
+    /// Stored as a `manifest-<hash>.json` sidecar alongside the artifact
+    /// directory, keyed by the same registry/repository/digest triple, and
+    /// written atomically (staged temp file + `rename`) so a concurrent reader
+    /// never observes a partial file. Failures are logged and swallowed — a
+    /// missing or unreadable sidecar is treated as a cache miss by
     /// [`get_oci_manifest`] and triggers a one-time re-pull.
     pub fn put_oci_manifest(
         &self,
@@ -86,17 +88,25 @@ impl FeatureCache {
             );
             return;
         }
-        match serde_json::to_string(manifest) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("failed to write manifest cache {}: {e}", path.display());
-                }
-            }
+        let json = match serde_json::to_string(manifest) {
+            Ok(json) => json,
             Err(e) => {
                 tracing::warn!(
                     "failed to serialise OCI manifest for {registry}/{repository}@{digest}: {e}"
                 );
+                return;
             }
+        };
+        // Stage to a per-process temp file then atomically rename, so a
+        // concurrent reader never observes a partially-written manifest.
+        let staging = path.with_extension(format!("partial-{}", process::id()));
+        if let Err(e) = std::fs::write(&staging, &json) {
+            tracing::warn!("failed to write manifest cache {}: {e}", staging.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(&staging, &path) {
+            tracing::warn!("failed to commit manifest cache {}: {e}", path.display());
+            let _ = std::fs::remove_file(&staging);
         }
     }
 
