@@ -441,6 +441,30 @@ mod tests {
     }
 
     #[test]
+    fn boolean_flags_accept_explicit_values() {
+        use clap::Parser;
+        // set-up flattens run-user-commands' CompatArgs/AttachArgs, so the same
+        // yargs boolean flags must accept the explicit `--flag false` form here.
+        let r = crate::Cli::try_parse_from([
+            "cella",
+            "set-up",
+            "--container-id",
+            "abc",
+            "--skip-post-attach",
+            "false",
+            "--mount-workspace-git-root",
+            "false",
+            "--mount-git-worktree-common-dir",
+            "true",
+        ]);
+        assert!(
+            r.is_ok(),
+            "explicit boolean values must parse on set-up: {:?}",
+            r.err()
+        );
+    }
+
+    #[test]
     fn error_envelope_shape() {
         let parsed: Value =
             serde_json::from_str(&render_error_envelope("boom")).expect("valid JSON");

@@ -750,6 +750,37 @@ mod tests {
     }
 
     #[test]
+    fn exec_mount_git_worktree_common_dir_boolean_forms() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| -> bool {
+            let cli = crate::Cli::try_parse_from(argv).expect("must parse");
+            let crate::commands::Command::Exec(args) = cli.command else {
+                panic!("expected exec subcommand");
+            };
+            args.compat.mount_git_worktree_common_dir
+        };
+        // Absent → default false.
+        assert!(!parse(&["cella", "exec", "--", "true"]));
+        // Bare flag (official yargs boolean no-value form) → true.
+        assert!(parse(&[
+            "cella",
+            "exec",
+            "--mount-git-worktree-common-dir",
+            "--",
+            "true",
+        ]));
+        // Explicit `false` (official `--mount-git-worktree-common-dir false`).
+        assert!(!parse(&[
+            "cella",
+            "exec",
+            "--mount-git-worktree-common-dir",
+            "false",
+            "--",
+            "true",
+        ]));
+    }
+
+    #[test]
     fn exec_terminal_columns_requires_rows() {
         use clap::Parser;
         // Official pairs terminal-columns/terminal-rows via `implies`; clap's
