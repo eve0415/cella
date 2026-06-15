@@ -323,6 +323,7 @@ fn build_merged_from_label(
                 user_options: HashMap::new(),
                 artifact_dir: PathBuf::new(),
                 has_install_script: false,
+                oci_manifest: None,
             })
         })
         .collect();
@@ -807,6 +808,7 @@ mod tests {
                     user_options: HashMap::new(),
                     artifact_dir: PathBuf::from("/tmp"),
                     has_install_script: false,
+                    oci_manifest: None,
                 },
                 ResolvedFeature {
                     id: "feat-b".to_string(),
@@ -819,6 +821,7 @@ mod tests {
                     user_options: HashMap::new(),
                     artifact_dir: PathBuf::from("/tmp"),
                     has_install_script: false,
+                    oci_manifest: None,
                 },
             ],
             dockerfile: String::new(),
@@ -1124,6 +1127,7 @@ mod tests {
                 user_options: HashMap::new(),
                 artifact_dir: PathBuf::from("/tmp"),
                 has_install_script: false,
+                oci_manifest: None,
             }],
             dockerfile: String::new(),
             build_context: PathBuf::from("/tmp"),

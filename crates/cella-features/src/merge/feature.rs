@@ -112,6 +112,7 @@ mod tests {
             user_options: HashMap::new(),
             artifact_dir: PathBuf::from("/tmp/features"),
             has_install_script: true,
+            oci_manifest: None,
         }
     }
 

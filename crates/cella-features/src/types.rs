@@ -19,6 +19,10 @@ pub struct ResolvedFeature {
     pub user_options: HashMap<String, serde_json::Value>,
     pub artifact_dir: PathBuf,
     pub has_install_script: bool,
+    /// The full OCI image manifest, present only for OCI-fetched features.
+    /// Retained for `read-configuration --include-features-configuration`
+    /// (`featureSets[].sourceInformation.manifest`); `None` for local/tarball.
+    pub oci_manifest: Option<oci_distribution::manifest::OciImageManifest>,
 }
 
 /// Parsed devcontainer-feature.json.
