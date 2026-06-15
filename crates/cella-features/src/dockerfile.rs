@@ -340,6 +340,14 @@ fn escape_quotes_for_shell(s: &str) -> String {
 ///   after it, matching the official output).
 /// - Rename line (NO trailing newline), when the user's ref leaf differs from
 ///   the canonical `currentId` — i.e. the feature was referenced by a legacy id.
+///
+/// The rename check is leaf-to-leaf, and that matches the official exactly:
+/// `currentId` is the feature's bare `id` field (e.g. `docker-outside-of-docker`,
+/// never a namespaced path — it is injected from `id` at packaging time), and the
+/// official compares it to `feature.id`, which the OCI fetch sets to
+/// `featureRef.id` = the last path segment of the user's reference. So both sides
+/// are bare ids (e.g. `docker-from-docker` vs `docker-outside-of-docker`); a
+/// canonical reference's leaf equals `currentId` and correctly does NOT warn.
 fn build_warning_header(feature: &ResolvedFeature, display_id: &str) -> String {
     let mut warning_header = String::new();
 
