@@ -345,7 +345,10 @@ fn render_error_envelope(message: &str) -> String {
     serde_json::to_string(&json!({
         "outcome": "error",
         "message": message,
-        "description": "An error occurred setting up the container.",
+        // set-up's job is running the lifecycle (user) commands in an existing
+        // container, so the official's fallback description is the
+        // run-user-commands wording (`setUp` catch, devContainersSpecCLI.ts:510).
+        "description": "An error occurred running user commands in the container.",
     }))
     .expect("BUG: error envelope is not serialisable")
 }
@@ -445,7 +448,7 @@ mod tests {
         assert_eq!(parsed["message"], "boom");
         assert_eq!(
             parsed["description"],
-            "An error occurred setting up the container."
+            "An error occurred running user commands in the container."
         );
     }
 
