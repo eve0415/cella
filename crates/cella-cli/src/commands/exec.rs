@@ -195,10 +195,10 @@ impl ExecArgs {
 /// `cella_backend::names::container_labels` (single-container) and
 /// `build_compose_labels` (compose) write, so a container can be matched by them.
 ///
-/// `pub` (within the private `exec` module) so `up` can reuse the same label
-/// computation when performing a best-effort container re-find on failure (for
-/// the JSON error envelope's `containerId` field).
-pub fn spec_identity_labels(workspace_root: &Path, config_path: &Path) -> [String; 2] {
+/// `pub(super)` (visible within the `commands` module) so `up` can reuse the
+/// same label computation when performing a best-effort container re-find on
+/// failure (for the JSON error envelope's `containerId` field).
+pub(super) fn spec_identity_labels(workspace_root: &Path, config_path: &Path) -> [String; 2] {
     [
         format!(
             "devcontainer.local_folder={}",

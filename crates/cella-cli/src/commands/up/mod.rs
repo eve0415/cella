@@ -1621,6 +1621,12 @@ impl UpArgs {
         let workspace_folder = self.workspace_folder.clone();
         let config = self.config.clone();
         let override_config = self.config_inputs.override_config.clone();
+        // Mirror how `up` resolves its target so the re-find points at the right
+        // container: an explicit `--id-label` target is found by those labels;
+        // `--branch` runs in a worktree the caller's cwd doesn't identify, so the
+        // re-find is skipped there (rather than risk reporting the cwd's container).
+        let id_labels = self.config_inputs.id_label.clone();
+        let is_branch = self.branch.is_some();
 
         // The `up` argument surface is large; box the inner future to keep
         // the wrapper's frame small (clippy::large_futures).
@@ -1630,6 +1636,8 @@ impl UpArgs {
                 if matches!(resolved_format, OutputFormat::Json) {
                     let container_id = best_effort_container_id(
                         &backend,
+                        &id_labels,
+                        is_branch,
                         workspace_folder.as_deref(),
                         config.as_deref(),
                         override_config.as_deref(),
@@ -1806,10 +1814,11 @@ pub fn output_result(data: &UpRenderData<'_>) {
 /// The structured error envelope emitted to STDOUT on `up` failure in JSON mode.
 ///
 /// Mirrors the official `devcontainer` CLI's `ContainerError` result shape.
-/// Fields beyond `message` and `container_id` are deliberately absent:
-/// - `containerId`: populated here via a best-effort container re-find when an
-///   id can be recovered after failure; absent if the container was never created
-///   or cannot be found.
+/// `message`/`description` are always emitted; `containerId` is emitted when a
+/// best-effort re-find recovers the partial container's id (absent if the
+/// container was never created or can't be found).
+///
+/// The official's other `ContainerError` fields are deliberately NOT emitted:
 /// - `disallowedFeatureId`: cella has no disallowed-feature policy.
 /// - `didStopContainer`: cella does not stop containers on failure and cannot
 ///   attribute a stop to a specific error without deep structured-error
@@ -1863,22 +1872,59 @@ pub fn render_error_result(envelope: ErrorEnvelope<'_>) -> String {
 /// silently returns `None`; the original error message is always preserved.
 async fn best_effort_container_id(
     backend: &crate::backend::BackendArgs,
+    id_labels: &[String],
+    is_branch: bool,
     workspace_folder: Option<&Path>,
     config: Option<&Path>,
     override_config: Option<&Path>,
 ) -> Option<String> {
-    let cwd = crate::commands::resolve_workspace_folder(workspace_folder).ok()?;
-    let resolved = resolve::config_with_override(&cwd, config, override_config).ok()?;
+    let labels = recovery_labels(
+        id_labels,
+        is_branch,
+        resolve_spec_identity_labels(workspace_folder, config, override_config),
+    )?;
     let client = backend.resolve_client().await.ok()?;
     client
-        .find_container_by_labels(&spec_identity_labels(
-            &resolved.workspace_root,
-            &resolved.config_path,
-        ))
+        .find_container_by_labels(&labels)
         .await
         .ok()
         .flatten()
         .map(|c| c.id)
+}
+
+/// Resolve the `[local_folder, config_file]` spec-identity labels for the
+/// caller's workspace/config, or `None` if either can't be resolved (best-effort).
+fn resolve_spec_identity_labels(
+    workspace_folder: Option<&Path>,
+    config: Option<&Path>,
+    override_config: Option<&Path>,
+) -> Option<[String; 2]> {
+    let cwd = crate::commands::resolve_workspace_folder(workspace_folder).ok()?;
+    let resolved = resolve::config_with_override(&cwd, config, override_config).ok()?;
+    Some(spec_identity_labels(
+        &resolved.workspace_root,
+        &resolved.config_path,
+    ))
+}
+
+/// Choose the labels to search for the partial container during JSON error
+/// recovery, mirroring how `up` resolves its target:
+/// - `--branch` runs in a worktree the caller's cwd doesn't identify → `None`
+///   (skip, rather than risk reporting the cwd's container).
+/// - an explicit `--id-label` target → those labels.
+/// - otherwise → the spec-identity labels (when resolvable).
+fn recovery_labels(
+    id_labels: &[String],
+    is_branch: bool,
+    spec_identity: Option<[String; 2]>,
+) -> Option<Vec<String>> {
+    if is_branch {
+        return None;
+    }
+    if !id_labels.is_empty() {
+        return Some(id_labels.to_vec());
+    }
+    spec_identity.map(|labels| labels.to_vec())
 }
 
 /// Pure formatter for the `cella up` success output. Returns the exact
@@ -2720,6 +2766,43 @@ mod tests {
         assert_eq!(parsed["containerId"], json!("abc123def456"));
         assert_eq!(parsed["outcome"], json!("error"));
         assert!(parsed.get("didStopContainer").is_none());
+    }
+
+    #[test]
+    fn recovery_labels_skips_branch() {
+        // --branch runs in a worktree the caller's cwd doesn't identify → skip
+        // (don't risk reporting the cwd's container).
+        assert_eq!(
+            recovery_labels(&[], true, Some(["a".to_string(), "b".to_string()])),
+            None
+        );
+        assert_eq!(recovery_labels(&["x=1".to_string()], true, None), None);
+    }
+
+    #[test]
+    fn recovery_labels_prefers_id_labels() {
+        // An explicit --id-label target is found by those labels, even when the
+        // spec-identity labels are also resolvable.
+        let id = vec!["x=1".to_string(), "y=2".to_string()];
+        assert_eq!(
+            recovery_labels(&id, false, Some(["a".to_string(), "b".to_string()])),
+            Some(id.clone())
+        );
+    }
+
+    #[test]
+    fn recovery_labels_falls_back_to_spec_identity() {
+        let spec = ["local=/ws".to_string(), "cfg=/ws/dc.json".to_string()];
+        assert_eq!(
+            recovery_labels(&[], false, Some(spec.clone())),
+            Some(spec.to_vec())
+        );
+    }
+
+    #[test]
+    fn recovery_labels_none_when_nothing_resolvable() {
+        // No id-labels, not --branch, but spec-identity couldn't be resolved.
+        assert_eq!(recovery_labels(&[], false, None), None);
     }
 
     #[test]
