@@ -86,8 +86,15 @@ impl OutdatedArgs {
 
         // Lockfile is keyed by the full userFeatureId (the reference as written
         // in the config), matching the official `lockfile.features[id]` lookup.
-        // A corrupt/unreadable lockfile is treated as absent here (best-effort).
-        let lockfile = cella_features::read_lockfile(&config_path).ok().flatten();
+        // A corrupt/unreadable lockfile is treated as absent (best-effort) but
+        // logged, so a malformed lockfile is still diagnosable.
+        let lockfile = match cella_features::read_lockfile(&config_path) {
+            Ok(lockfile) => lockfile,
+            Err(err) => {
+                tracing::warn!("outdated: ignoring unreadable lockfile: {err}");
+                None
+            }
+        };
 
         let report = load_version_info(&features, lockfile.as_ref()).await;
 
@@ -117,16 +124,17 @@ fn order_features_by_source(
         return features;
     }
 
-    let rank = |key: &str| {
-        source_order
-            .iter()
-            .position(|k| k == key)
-            .unwrap_or(usize::MAX)
-    };
+    // Rank each key by its source position once (O(n)); sorting is then
+    // O(n log n) rather than an O(n) scan per comparison.
+    let rank: std::collections::HashMap<&str, usize> = source_order
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
     let mut ordered = features;
     // Stable sort keeps the original order among any keys missing from the
     // source (all ranked `usize::MAX`).
-    ordered.sort_by_key(|(key, _)| rank(key));
+    ordered.sort_by_key(|(key, _)| rank.get(key.as_str()).copied().unwrap_or(usize::MAX));
     ordered
 }
 
@@ -250,9 +258,16 @@ async fn load_version_info(
             }
         };
 
+        // Only a full-semver lockfile pin is meaningful for `current`. cella's
+        // lockfile currently stores the OCI *tag* (e.g. `"2"`), not the resolved
+        // feature version (`"2.12.2"`) the official records — so emitting it
+        // would make `current` echo the range while `wanted`/`latest` are
+        // concrete. Fall back to the resolved `wanted` until the lockfile schema
+        // stores the full version (tracked follow-up).
         let lockfile_version = lockfile
             .and_then(|lf| lf.features.get(user_feature_id))
-            .map(|entry| entry.version.clone());
+            .map(|entry| entry.version.clone())
+            .filter(|v| Version::parse(v).is_ok());
 
         // `wanted` comes purely from the tag (cella refs always carry one).
         // It is NOT backfilled from the lockfile when the tag matches nothing:
@@ -284,6 +299,15 @@ async fn load_version_info(
 /// returning `undefined`. The tag defaults to `"latest"` when absent.
 fn versionable_oci_ref(user_feature_id: &str) -> Option<(String, String, String)> {
     use cella_features::{FeatureRef, NormalizedRef};
+
+    // Digest-pinned refs (`…@sha256:…`) aren't tag-versionable, and cella's
+    // `FeatureRef` parser mis-splits the digest colon as a tag — which would
+    // list tags for the wrong repository and emit a misleading entry. Skip them.
+    // (Full digest support — `latest` from the repo plus the digest-resolved
+    // pinned version, as the official does — is a follow-up.)
+    if user_feature_id.contains("@sha256:") {
+        return None;
+    }
 
     let parsed = FeatureRef::parse(user_feature_id).ok()?;
     // Only OCI / GitHub-shorthand references are versionable. Local paths,
@@ -722,6 +746,33 @@ mod tests {
     fn versionable_oci_ref_skips_deprecated_bare_id() {
         // `fish` is a deprecated bare identifier → filtered out.
         assert!(versionable_oci_ref("fish").is_none());
+    }
+
+    #[test]
+    fn versionable_oci_ref_skips_digest_pinned() {
+        // Digest-pinned refs aren't tag-versionable; skip rather than list tags
+        // for the wrong repository (cella's parser mis-splits the digest colon).
+        let digest = format!(
+            "ghcr.io/devcontainers/features/node@sha256:{}",
+            "a".repeat(64)
+        );
+        assert!(versionable_oci_ref(&digest).is_none());
+    }
+
+    #[test]
+    fn tag_only_lockfile_version_is_ignored_for_current() {
+        // cella's lockfile stores the OCI tag (`"2"`), not a full version. The
+        // guard rejects it so `current` doesn't echo the range; with no tag
+        // match (empty versions) `current` stays None rather than `"2"`.
+        let lf = lockfile_pinning("registry.invalid/x/y:99", "2");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let features = vec![("registry.invalid/x/y:99".to_owned(), serde_json::json!({}))];
+        let report = rt.block_on(load_version_info(&features, Some(&lf)));
+        let (_key, info) = &report.entries[0];
+        assert_eq!(
+            info.current, None,
+            "tag-only lockfile version must be ignored"
+        );
     }
 
     // -----------------------------------------------------------------------
