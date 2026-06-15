@@ -524,6 +524,7 @@ mod tests {
             config_hash: None,
             ports: vec![],
             created_at: None,
+            started_at: None,
             container_user: None,
             mounts: vec![],
             backend: BackendKind::Docker,

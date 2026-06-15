@@ -492,6 +492,7 @@ mod tests {
             config_hash: None,
             ports: Vec::new(),
             created_at: None,
+            started_at: None,
             container_user: None,
             image: None,
             mounts: Vec::new(),
