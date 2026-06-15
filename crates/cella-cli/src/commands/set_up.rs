@@ -233,9 +233,15 @@ impl SetUpArgs {
             envelope["configuration"] = config.clone();
         }
         if self.result.include_merged_configuration {
-            let merged = effective_metadata
-                .as_deref()
-                .map_or_else(|| config.clone(), |meta| build_merged_config(meta, &config));
+            // Route through the canonical label-merge (shared with
+            // `read-configuration`) so the shape matches `up`/`read-configuration`:
+            // plural lifecycle arrays + Record-of-arrays customizations. set-up
+            // always targets by container-id, so the full current config is
+            // appended (`has_id_labels = false`).
+            let merged = effective_metadata.as_deref().map_or_else(
+                || config.clone(),
+                |meta| super::read_configuration::build_merged_from_label(&config, meta, false),
+            );
             envelope["mergedConfiguration"] = merged;
         }
 
@@ -330,39 +336,12 @@ fn workspace_folder_in_container(
     "/workspaces".to_string()
 }
 
-/// Build a minimal merged config by folding metadata entries into the on-disk
-/// config, later-wins. Approximates `mergeConfiguration` for the
-/// `--include-merged-configuration` envelope key without pulling in the full
-/// feature-resolution pipeline.
-fn build_merged_config(metadata_json: &str, config: &Value) -> Value {
-    let entries: Vec<Value> = serde_json::from_str(metadata_json).unwrap_or_else(|e| {
-        tracing::warn!("devcontainer.metadata label is not valid JSON, treating as empty: {e}");
-        Vec::new()
-    });
-    let mut merged = serde_json::Map::new();
-    for entry in &entries {
-        if let Some(obj) = entry.as_object() {
-            for (k, v) in obj {
-                merged.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    // On-disk config wins last (matches official: it is the final entry in the
-    // metadata array after mergeConfiguration appends it).
-    if let Some(obj) = config.as_object() {
-        for (k, v) in obj {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    Value::Object(merged)
-}
-
 /// Render the JSON error envelope.
 fn render_error_envelope(message: &str) -> String {
     serde_json::to_string(&json!({
         "outcome": "error",
         "message": message,
-        "description": "An error occurred running user commands in the container.",
+        "description": "An error occurred setting up the container.",
     }))
     .expect("BUG: error envelope is not serialisable")
 }
@@ -462,25 +441,8 @@ mod tests {
         assert_eq!(parsed["message"], "boom");
         assert_eq!(
             parsed["description"],
-            "An error occurred running user commands in the container."
+            "An error occurred setting up the container."
         );
-    }
-
-    #[test]
-    fn build_merged_config_later_wins() {
-        let meta = json!([
-            {"remoteUser": "from-feature", "customizations": {"vscode": {}}},
-            {"remoteUser": "root"}
-        ])
-        .to_string();
-        let config = json!({"remoteUser": "vscode", "workspaceFolder": "/app"});
-        let merged = build_merged_config(&meta, &config);
-        // On-disk config wins for remoteUser
-        assert_eq!(merged["remoteUser"], "vscode");
-        // Config-only key survives
-        assert_eq!(merged["workspaceFolder"], "/app");
-        // Metadata-only key survives
-        assert!(merged.get("customizations").is_some());
     }
 
     #[test]

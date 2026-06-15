@@ -315,7 +315,7 @@ pub async fn resolve_config_features(
 /// only the updateable properties (`remoteUser`/`userEnvProbe`/`remoteEnv`),
 /// while other targets (e.g. `--container-id`) append the full config (incl
 /// lifecycle/customizations). A single-object label is normalised to one entry.
-fn build_merged_from_label(
+pub fn build_merged_from_label(
     config: &serde_json::Value,
     label_json: &str,
     has_id_labels: bool,
