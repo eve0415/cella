@@ -235,10 +235,14 @@ impl SetUpArgs {
         if self.result.include_merged_configuration {
             // Route through the canonical label-merge (shared with
             // `read-configuration`) so the shape matches `up`/`read-configuration`:
-            // plural lifecycle arrays + Record-of-arrays customizations. set-up
-            // always targets by container-id, so the full current config is
-            // appended (`has_id_labels = false`).
-            let merged = effective_metadata.as_deref().map_or_else(
+            // plural lifecycle arrays + Record-of-arrays customizations.
+            //
+            // Use the RAW label, not `effective_metadata`: `build_merged_from_label`
+            // appends the current config itself (in full, since set-up targets by
+            // container-id → `has_id_labels = false`), and `effective_metadata`
+            // has already appended the config's picked lifecycle hooks — passing
+            // it would duplicate them in the plural arrays.
+            let merged = metadata.as_deref().map_or_else(
                 || config.clone(),
                 |meta| super::read_configuration::build_merged_from_label(&config, meta, false),
             );
