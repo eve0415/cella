@@ -169,11 +169,16 @@ impl DockerClient {
             ..Default::default()
         };
         let containers = self.inner().list_containers(Some(options)).await?;
-        match containers.into_iter().next().and_then(|s| s.id) {
-            // A summary without an id can't be inspected — treat it as "no match"
-            // rather than inspecting "" and turning it into a hard API error.
-            Some(id) if !id.is_empty() => Ok(Some(self.inspect_container(&id).await?)),
-            _ => Ok(None),
+        // Use the first summary that actually has a usable id. A summary without
+        // one can't be inspected — skipping it (rather than inspecting "" and
+        // hard-failing) also lets a later valid match still be found.
+        match containers
+            .into_iter()
+            .filter_map(|s| s.id)
+            .find(|id| !id.is_empty())
+        {
+            Some(id) => Ok(Some(self.inspect_container(&id).await?)),
+            None => Ok(None),
         }
     }
 
