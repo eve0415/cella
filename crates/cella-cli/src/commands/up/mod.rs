@@ -24,12 +24,26 @@ pub struct UpBuildArgs {
     #[arg(long)]
     pub(crate) rebuild: bool,
 
-    /// Do not use cache when building the image.
-    #[arg(long)]
+    /// Do not use cache when building the image. Accepts the official yargs
+    /// boolean forms: bare, explicit (`--build-no-cache false`), and absent
+    /// (defaults to `false`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) build_no_cache: bool,
 
-    /// Remove existing container before starting.
-    #[arg(long)]
+    /// Remove existing container before starting. Accepts the official yargs
+    /// boolean forms: bare, explicit (`--remove-existing-container false`), and
+    /// absent (defaults to `false`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) remove_existing_container: bool,
 
     /// Image pull policy.
@@ -79,13 +93,28 @@ pub struct UpMountArgs {
     #[arg(long, value_enum, default_value = "cached")]
     pub(crate) workspace_mount_consistency: MountConsistency,
 
-    /// Mount the workspace using its Git root (default: true).
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    /// Mount the workspace using its Git root (default: true). Accepts the
+    /// official yargs boolean forms: bare (`--mount-workspace-git-root`),
+    /// explicit (`--mount-workspace-git-root false`), and absent (defaults to
+    /// `true`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+    )]
     pub(crate) mount_workspace_git_root: bool,
 
     /// Mount the Git worktree common dir for Git operations in the container.
-    /// Requires the worktree to be created with relative paths.
-    #[arg(long)]
+    /// Requires the worktree to be created with relative paths. Accepts the
+    /// official yargs boolean forms: bare, explicit (`... false`), and absent
+    /// (defaults to `false`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) mount_git_worktree_common_dir: bool,
 }
 
@@ -111,16 +140,37 @@ pub struct UpConfigInputArgs {
     #[arg(long = "remote-env", value_parser = crate::commands::parse_remote_env)]
     pub(crate) remote_env: Vec<String>,
 
-    /// Do not run postAttachCommand.
-    #[arg(long)]
+    /// Do not run postAttachCommand. Accepts the official yargs boolean forms:
+    /// bare, explicit (`--skip-post-attach false`), and absent (defaults to
+    /// `false`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) skip_post_attach: bool,
 
-    /// Fail if the container does not already exist.
-    #[arg(long)]
+    /// Fail if the container does not already exist. Accepts the official yargs
+    /// boolean forms: bare, explicit (`--expect-existing-container false`), and
+    /// absent (defaults to `false`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) expect_existing_container: bool,
 
-    /// Disable automatic feature id mapping (testing only).
-    #[arg(long, hide = true)]
+    /// Disable automatic feature id mapping (testing only). Accepts the official
+    /// yargs boolean forms: bare, explicit (`... false`), and absent.
+    #[arg(
+        long,
+        hide = true,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) skip_feature_auto_mapping: bool,
 }
 
@@ -128,33 +178,72 @@ pub struct UpConfigInputArgs {
 #[derive(Args)]
 pub struct UpLifecycleArgs {
     /// Do not run onCreate/updateContent/postCreate/postStart/postAttach
-    /// commands and do not install dotfiles.
-    #[arg(long)]
+    /// commands and do not install dotfiles. Accepts the official yargs boolean
+    /// forms: bare, explicit (`--skip-post-create false`), and absent.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) skip_post_create: bool,
 
     /// Stop running user commands after the `waitFor` phase (default
-    /// updateContentCommand).
-    #[arg(long)]
+    /// updateContentCommand). Accepts the official yargs boolean forms: bare,
+    /// explicit (`--skip-non-blocking-commands false`), and absent.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) skip_non_blocking_commands: bool,
 
-    /// Stop after onCreateCommand and updateContentCommand.
-    #[arg(long)]
+    /// Stop after onCreateCommand and updateContentCommand. Accepts the official
+    /// yargs boolean forms: bare, explicit (`--prebuild false`), and absent.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) prebuild: bool,
 }
 
 /// Result-shaping flags for an `up` invocation's JSON output.
 #[derive(Args)]
 pub struct UpResultArgs {
-    /// Include the configuration in the JSON result.
-    #[arg(long)]
+    /// Include the configuration in the JSON result. Accepts the official yargs
+    /// boolean forms: bare, explicit (`--include-configuration false`), and
+    /// absent.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) include_configuration: bool,
 
-    /// Include the merged configuration in the JSON result.
-    #[arg(long)]
+    /// Include the merged configuration in the JSON result. Accepts the official
+    /// yargs boolean forms: bare, explicit (`--include-merged-configuration
+    /// false`), and absent.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) include_merged_configuration: bool,
 
-    /// Omit remoteEnv from the container metadata label.
-    #[arg(long, hide = true)]
+    /// Omit remoteEnv from the container metadata label. Accepts the official
+    /// yargs boolean forms: bare, explicit (`... false`), and absent.
+    #[arg(
+        long,
+        hide = true,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) omit_config_remote_env_from_metadata: bool,
 }
 
@@ -229,8 +318,15 @@ pub struct UpCompatArgs {
     // its generated feature Dockerfile emits no `# syntax=` line at all. So
     // cella already behaves as if this flag is permanently on — there is
     // nothing to suppress. Accepted-and-ignored for drop-in parity.
-    /// Omit Dockerfile syntax directives (compatibility no-op).
-    #[arg(long, hide = true)]
+    /// Omit Dockerfile syntax directives (compatibility no-op). Accepts the
+    /// official yargs boolean forms: bare, explicit (`... false`), and absent.
+    #[arg(
+        long,
+        hide = true,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) omit_syntax_directive: bool,
 }
 
@@ -3055,6 +3151,60 @@ mod tests {
             "--include-merged-configuration",
         ]);
         assert!(r.is_ok(), "compat flags should parse: {:?}", r.err());
+    }
+
+    #[test]
+    fn up_mount_workspace_git_root_accepts_yargs_boolean_forms() {
+        // Regression: `--mount-workspace-git-root` used ArgAction::Set, which
+        // REQUIRED a value and rejected the bare official form. It must accept
+        // the bare form (→ true), the explicit `false`, and absence (→ true).
+        assert!(
+            up_args(&["--mount-workspace-git-root"])
+                .mounts
+                .mount_workspace_git_root
+        );
+        assert!(
+            !up_args(&["--mount-workspace-git-root", "false"])
+                .mounts
+                .mount_workspace_git_root
+        );
+        assert!(up_args(&[]).mounts.mount_workspace_git_root);
+    }
+
+    #[test]
+    fn up_boolean_flags_accept_explicit_values() {
+        // Every official `type:'boolean'` up flag must accept both the bare form
+        // and an explicit `--flag false` (yargs boolean parity).
+        let args = up_args(&[
+            "--gpu-availability",
+            "none",
+            "--update-remote-user-uid-default",
+            "off",
+            "--remove-existing-container",
+            "--build-no-cache",
+            "--mount-git-worktree-common-dir",
+            "--skip-post-attach",
+        ]);
+        assert!(args.build.remove_existing_container);
+        assert!(args.build.build_no_cache);
+        assert!(args.mounts.mount_git_worktree_common_dir);
+        assert!(args.config_inputs.skip_post_attach);
+
+        // Explicit `false` must parse and disable the flags.
+        let args = up_args(&[
+            "--remove-existing-container",
+            "false",
+            "--build-no-cache",
+            "false",
+            "--skip-post-attach",
+            "false",
+            "--mount-git-worktree-common-dir",
+            "false",
+        ]);
+        assert!(!args.build.remove_existing_container);
+        assert!(!args.build.build_no_cache);
+        assert!(!args.config_inputs.skip_post_attach);
+        assert!(!args.mounts.mount_git_worktree_common_dir);
     }
 
     #[test]
