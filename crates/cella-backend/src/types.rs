@@ -235,6 +235,12 @@ pub struct BuildOptions {
     /// unconditionally. Set only on the final image build (the one that produces
     /// the image the user ends up with), mirroring `output`.
     pub labels: Vec<String>,
+    /// Push the built image to a registry (`docker buildx build --push`).
+    /// buildx-only: emits `--push` and suppresses `--load` (the two are
+    /// mutually exclusive). Silently dropped (with a warning) when buildx is
+    /// unavailable. `push` and `output` should not be combined — if `push` is
+    /// set, `output` is ignored.
+    pub push: bool,
 }
 
 impl Default for BuildOptions {
@@ -254,6 +260,7 @@ impl Default for BuildOptions {
             platform: None,
             output: None,
             labels: Vec::new(),
+            push: false,
         }
     }
 }
@@ -644,6 +651,10 @@ pub struct RunArgsOverrides {
     pub restart_policy: Option<String>,
     pub init: Option<bool>,
     pub privileged: Option<bool>,
+
+    /// Environment variables from `--env`/`-e` and `--env-file`, in `KEY=VAL` form.
+    /// Appended after `containerEnv`-derived env; Docker last-wins on duplicate keys.
+    pub env: Vec<String>,
 
     /// Flags not recognized by the parser (emitted as warnings).
     pub unrecognized: Vec<String>,

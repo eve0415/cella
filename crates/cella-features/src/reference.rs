@@ -97,6 +97,52 @@ fn split_tag(s: &str) -> (&str, &str) {
     }
 }
 
+/// Return whether `s` is a well-formed OCI content digest.
+///
+/// Only `sha256:<64-hex-chars>` is recognised — other algorithms (`sha512`,
+/// etc.) are reserved but not in common registry use.  The 64-char hex
+/// constraint matches SHA-256 output exactly (256 bits → 32 bytes → 64 hex
+/// digits).
+pub(crate) fn is_digest(s: &str) -> bool {
+    s.strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Try to parse `input` as a digest-pinned OCI reference
+/// (`registry/repo@sha256:<hex>`).
+///
+/// Returns `None` when `input` is not digest-pinned (no `@`, or the suffix is
+/// not a valid digest) so the caller continues with tag parsing. Returns
+/// `Some(Err(..))` for a valid digest that lacks a fully-qualified registry —
+/// digest pins resolve only against an OCI registry.
+///
+/// Must run before `split_tag`, which uses `rsplit_once(':')` and would
+/// otherwise split on the `:` inside `sha256:…`, mis-reading the hex as a tag.
+fn parse_digest_ref(raw: &str, input: &str) -> Option<Result<FeatureRef, FeatureError>> {
+    let (base_no_digest, digest) = input.rsplit_once('@')?;
+    if !is_digest(digest) {
+        return None;
+    }
+    let first_component = base_no_digest.split('/').next().unwrap_or(base_no_digest);
+    if first_component.contains('.') || first_component.contains(':') {
+        // Fully-qualified OCI reference with a hostname.
+        let (registry, repository) = base_no_digest
+            .split_once('/')
+            .expect("contains '/' — first component has '.' or ':'");
+        // Carry the digest in the `tag` field so downstream fetchers can detect
+        // it via `tag.starts_with("sha256:")`.
+        return Some(Ok(FeatureRef::Oci {
+            registry: registry.to_owned(),
+            repository: repository.to_owned(),
+            tag: digest.to_owned(),
+        }));
+    }
+    Some(Err(FeatureError::InvalidReference {
+        reference: raw.to_owned(),
+        reason: "digest-pinned references require a fully-qualified registry".to_owned(),
+    }))
+}
+
 /// Strip a trailing `:tag` or `@digest` from a feature id.
 ///
 /// Matches the official `getFeatureIdWithoutVersion` (`/[:@][^/]*$/`): the
@@ -173,6 +219,12 @@ impl FeatureRef {
                      use a fully-qualified OCI reference instead"
                 ),
             });
+        }
+
+        // Rule 3b: digest-pinned OCI reference (`registry/repo@sha256:<hex>`),
+        // resolved before `split_tag` (which would mis-split the digest `:`).
+        if let Some(result) = parse_digest_ref(raw, input) {
+            return result;
         }
 
         // Split off the tag before counting components.
@@ -362,6 +414,13 @@ impl std::fmt::Display for FeatureRef {
                 registry,
                 repository,
                 tag,
+            } if tag.starts_with("sha256:") => {
+                write!(f, "{registry}/{repository}@{tag}")
+            }
+            Self::Oci {
+                registry,
+                repository,
+                tag,
             } => write!(f, "{registry}/{repository}:{tag}"),
             Self::GitHubShorthand {
                 owner,
@@ -385,6 +444,13 @@ impl std::fmt::Display for FeatureRef {
 impl std::fmt::Display for NormalizedRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::OciTarget {
+                registry,
+                repository,
+                tag,
+            } if tag.starts_with("sha256:") => {
+                write!(f, "{registry}/{repository}@{tag}")
+            }
             Self::OciTarget {
                 registry,
                 repository,
@@ -600,6 +666,99 @@ mod tests {
                 tag: "latest".to_owned(),
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 3b: digest-pinned OCI references
+    // -----------------------------------------------------------------------
+
+    const SHA256_DIGEST: &str =
+        "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4";
+
+    #[test]
+    fn parse_oci_digest_ghcr() {
+        let input = format!("ghcr.io/devcontainers/features/go@{SHA256_DIGEST}");
+        let r = FeatureRef::parse(&input).unwrap();
+        assert_eq!(
+            r,
+            FeatureRef::Oci {
+                registry: "ghcr.io".to_owned(),
+                repository: "devcontainers/features/go".to_owned(),
+                tag: SHA256_DIGEST.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_oci_digest_custom_registry() {
+        let input = format!("myregistry.azurecr.io/team/features/node@{SHA256_DIGEST}");
+        let r = FeatureRef::parse(&input).unwrap();
+        assert_eq!(
+            r,
+            FeatureRef::Oci {
+                registry: "myregistry.azurecr.io".to_owned(),
+                repository: "team/features/node".to_owned(),
+                tag: SHA256_DIGEST.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_oci_digest_localhost_port() {
+        let input = format!("localhost:5000/myfeatures/go@{SHA256_DIGEST}");
+        let r = FeatureRef::parse(&input).unwrap();
+        assert_eq!(
+            r,
+            FeatureRef::Oci {
+                registry: "localhost:5000".to_owned(),
+                repository: "myfeatures/go".to_owned(),
+                tag: SHA256_DIGEST.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_oci_digest_display_uses_at_separator() {
+        let r = FeatureRef::Oci {
+            registry: "ghcr.io".to_owned(),
+            repository: "devcontainers/features/go".to_owned(),
+            tag: SHA256_DIGEST.to_owned(),
+        };
+        assert_eq!(
+            r.to_string(),
+            format!("ghcr.io/devcontainers/features/go@{SHA256_DIGEST}")
+        );
+    }
+
+    #[test]
+    fn is_digest_valid() {
+        assert!(is_digest(SHA256_DIGEST));
+    }
+
+    #[test]
+    fn is_digest_rejects_short_hex() {
+        assert!(!is_digest("sha256:abc123"));
+    }
+
+    #[test]
+    fn is_digest_rejects_non_sha256() {
+        // sha512 is a valid digest algo but we only accept sha256 for now.
+        let sha512 = format!("sha512:{}", "a".repeat(128));
+        assert!(!is_digest(&sha512));
+    }
+
+    #[test]
+    fn is_digest_rejects_no_prefix() {
+        assert!(!is_digest(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn parse_rejects_digest_without_registry() {
+        // A valid digest but no fully-qualified registry must fail with a clear
+        // error, not fall through to `split_tag` and mis-split the digest `:`.
+        let err = FeatureRef::parse(&format!("owner/repo@{SHA256_DIGEST}"))
+            .expect_err("digest without a registry must be rejected");
+        assert!(matches!(err, FeatureError::InvalidReference { .. }));
     }
 
     // -----------------------------------------------------------------------

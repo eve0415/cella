@@ -267,15 +267,27 @@ fn parse_norm_ref(reference: &str) -> Result<NormalizedRef, FeatureError> {
                 reason: "expected registry/repository format".to_owned(),
             })?;
 
-    // Digest-pinned references (`repo@sha256:<hex>`) carry a `:` inside the
-    // digest. Splitting on it would treat the hex as a tag and `@sha256` as
-    // part of the repository, fetching the wrong artifact. Reject them
-    // explicitly rather than silently resolving the wrong target — dependency
-    // graphs don't yet resolve digest pins.
-    if rest.contains('@') {
-        return Err(FeatureError::InvalidReference {
-            reference: reference.to_owned(),
-            reason: "digest-pinned dependency references are not supported".to_owned(),
+    // Digest-pinned references (`repo@sha256:<hex>`) must be split on `@`
+    // rather than `:` — the digest contains a `:` that would otherwise be
+    // misidentified as the tag separator.  Carry the full `sha256:<hex>`
+    // string as the `tag` field so downstream fetchers can detect it via
+    // `tag.starts_with("sha256:")` and route to the locked-digest fetch path.
+    //
+    // `@` in a feature reference is only ever a digest separator, so validate
+    // the digest format (same check as `reference.rs`) and reject a malformed
+    // pin here with a clear error rather than routing a bogus digest to the
+    // registry as a locked-digest fetch.
+    if let Some((repo_part, digest)) = rest.split_once('@') {
+        if !crate::reference::is_digest(digest) {
+            return Err(FeatureError::InvalidReference {
+                reference: reference.to_owned(),
+                reason: format!("malformed digest in pinned reference: {digest:?}"),
+            });
+        }
+        return Ok(NormalizedRef::OciTarget {
+            registry: registry.to_owned(),
+            repository: repo_part.to_owned(),
+            tag: digest.to_owned(),
         });
     }
 
@@ -468,14 +480,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_norm_ref_rejects_digest() {
-        // A digest pin must not be silently mis-parsed (repo `node@sha256`,
-        // tag `<hex>`); it should be rejected explicitly.
-        let err = parse_norm_ref(
-            "ghcr.io/devcontainers/features/node@sha256:\
-             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .unwrap_err();
+    fn parse_norm_ref_parses_digest() {
+        // Digest-pinned dependency refs must be parsed correctly: the full
+        // `sha256:<hex>` string is carried as the `tag` so the fetcher can
+        // route to the locked-digest fetch path.
+        const DIGEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let result =
+            parse_norm_ref(&format!("ghcr.io/devcontainers/features/node@{DIGEST}")).unwrap();
+        match result {
+            NormalizedRef::OciTarget {
+                registry,
+                repository,
+                tag,
+            } => {
+                assert_eq!(registry, "ghcr.io");
+                assert_eq!(repository, "devcontainers/features/node");
+                assert_eq!(tag, DIGEST);
+            }
+            _ => panic!("expected OciTarget"),
+        }
+    }
+
+    #[test]
+    fn parse_norm_ref_rejects_malformed_digest() {
+        // A too-short / non-hex digest must fail clearly here, not get routed
+        // to the registry as a bogus locked-digest fetch.
+        let err = parse_norm_ref("ghcr.io/devcontainers/features/node@sha256:tooshort")
+            .expect_err("malformed digest must be rejected");
         assert!(matches!(err, FeatureError::InvalidReference { .. }));
     }
 }

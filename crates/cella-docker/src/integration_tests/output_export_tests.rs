@@ -80,6 +80,7 @@ async fn output_type_local_exports_to_dest() {
         platform: None,
         output: Some(format!("type=local,dest={}", dest.display())),
         labels: Vec::new(),
+        push: false,
     };
 
     let result = client.build_image(&opts, |_| {}).await;

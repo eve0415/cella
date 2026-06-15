@@ -16,6 +16,7 @@ pub(super) fn map_remote_env(config: &serde_json::Value) -> Vec<String> {
 
     env_obj
         .iter()
+        .filter(|(_, v)| !v.is_null())
         .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
         .collect()
 }
@@ -50,16 +51,32 @@ mod tests {
 
     #[test]
     fn map_remote_env_non_string_values() {
+        // null is filtered out; non-string non-null values (schema violations) coerce to ""
         let config = json!({"remoteEnv": {"NUM": 42, "BOOL": true, "NULL": null}});
         let env = map_remote_env(&config);
-        assert_eq!(env.len(), 3);
+        assert_eq!(
+            env.len(),
+            2,
+            "null must be omitted, not coerced to empty string"
+        );
         for entry in &env {
             let parts: Vec<&str> = entry.splitn(2, '=').collect();
             assert_eq!(parts.len(), 2);
             match parts[0] {
-                "NUM" | "BOOL" | "NULL" => assert_eq!(parts[1], ""),
-                _ => panic!("unexpected key: {}", parts[0]),
+                "NUM" | "BOOL" => assert_eq!(parts[1], ""),
+                other => panic!("unexpected key: {other} (NULL must be absent)"),
             }
         }
+        assert!(
+            !env.iter().any(|e| e.starts_with("NULL=")),
+            "null value must not produce a NULL= entry"
+        );
+    }
+
+    #[test]
+    fn map_remote_env_null_value_omitted() {
+        let config = json!({"remoteEnv": {"VAR": null, "OK": "x"}});
+        let env = map_remote_env(&config);
+        assert_eq!(env, vec!["OK=x"], "null remoteEnv entries must be omitted");
     }
 }

@@ -437,6 +437,18 @@ impl FeatureFetcher for OciFetcher {
             });
         };
 
+        // When the `tag` field carries a content digest (`sha256:<hex>`),
+        // route to the pinned-digest fetch path so the registry serves the
+        // exact artifact — a moved tag can never substitute different content.
+        if tag.starts_with("sha256:") {
+            // The "tag" used for display / version reporting is the digest
+            // itself; the caller set no mutable tag.
+            return self
+                .fetch_by_locked_digest(registry, repository, tag, tag, cache)
+                .await
+                .map(|r| r.artifact_dir);
+        }
+
         if let Some(cached) = cache.get_oci(registry, repository, tag) {
             debug!("cache hit for {registry}/{repository}:{tag}");
             return Ok(cached);

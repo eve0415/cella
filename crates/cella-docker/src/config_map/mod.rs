@@ -44,14 +44,27 @@ pub fn to_bollard_config(opts: &CreateContainerOptions) -> ContainerCreateBody {
     host_config.privileged = Some(merged.privileged);
     host_config.init = Some(merged.init);
 
+    // Merge containerEnv-derived env with any `--env`/`-e`/`--env-file` entries from
+    // runArgs.  Docker applies env in order, last-wins on duplicate keys, which matches
+    // the official CLI where runArgs flags come after containerEnv-derived entries.
+    let env = {
+        let run_args_env = opts
+            .run_args_overrides
+            .as_ref()
+            .map_or(&[] as &[String], |ra| ra.env.as_slice());
+        if opts.env.is_empty() && run_args_env.is_empty() {
+            None
+        } else {
+            let mut combined = opts.env.clone();
+            combined.extend_from_slice(run_args_env);
+            Some(combined)
+        }
+    };
+
     ContainerCreateBody {
         image: Some(opts.image.clone()),
         labels: Some(merged.labels),
-        env: if opts.env.is_empty() {
-            None
-        } else {
-            Some(opts.env.clone())
-        },
+        env,
         user: opts.user.clone(),
         hostname: merged.hostname,
         working_dir: Some(opts.workspace_folder.clone()),

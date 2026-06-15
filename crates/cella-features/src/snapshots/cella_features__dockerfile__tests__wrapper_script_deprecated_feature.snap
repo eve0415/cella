@@ -13,15 +13,14 @@ on_exit () {
 trap on_exit EXIT
 
 echo ===========================================================================
-
+echo '(!) WARNING: Using the deprecated Feature "ghcr.io/devcontainers/features/node". This Feature will no longer receive any further updates/support.'
 echo 'Feature       : Node.js'
 echo 'Description   : Installs Node.js'
 echo 'Id            : ghcr.io/devcontainers/features/node'
 echo 'Version       : 2.1.0'
 echo 'Documentation : https://example.com/node'
 echo 'Options       :'
-echo '    NODEGYPDEPENDENCIES="true"
-    VERSION="18"'
+echo ''
 echo ===========================================================================
 
 cd /tmp/dev-container-features/node

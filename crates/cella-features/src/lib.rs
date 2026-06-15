@@ -950,7 +950,7 @@ fn prepare_build_context(
             )?;
             std::fs::write(
                 dest.join("devcontainer-features-install.sh"),
-                generate_wrapper_script(&feature.id),
+                generate_wrapper_script(feature),
             )?;
         }
     }

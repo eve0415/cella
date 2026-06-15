@@ -74,6 +74,18 @@ pub fn parse_run_args(args: &[String]) -> RunArgsOverrides {
                 parse_capability_arg(flag, &mut i, inline_val, &next_val, &mut result);
             }
 
+            "--env" | "-e" => {
+                if let Some(v) = next_val(&mut i, inline_val) {
+                    result.env.push(v);
+                }
+            }
+
+            "--env-file" => {
+                if let Some(path) = next_val(&mut i, inline_val) {
+                    parse_env_file(&path, &mut result.env);
+                }
+            }
+
             // -- Boolean flags (no value) --
             "--init" => result.init = Some(true),
             "--privileged" => result.privileged = Some(true),
@@ -486,6 +498,46 @@ fn parse_ulimit(s: &str) -> Option<UlimitSpec> {
     })
 }
 
+/// Read an env-file and push `KEY=VAL` entries into `out`, matching Docker's
+/// `--env-file` parsing.
+///
+/// Each line is left-trimmed; blank lines and those beginning with `#` are
+/// skipped. For `KEY=VALUE`, the variable name is trimmed but the value is
+/// passed through verbatim (Docker never trims the value, so a trailing space
+/// is significant). A bare `KEY` with no `=` inherits the value from cella's
+/// own environment, exactly as `docker run --env-file` resolves it from the
+/// client environment. On I/O error, emits a warning and pushes nothing from
+/// the failed file.
+fn parse_env_file(path: &str, out: &mut Vec<String>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("runArgs: --env-file {path:?}: {err}");
+            return;
+        }
+    };
+    for raw in content.lines() {
+        // Docker left-trims the line before testing for blank / comment lines.
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            // `KEY=VALUE`: trim only the name, keep the value untouched.
+            let key = key.trim();
+            if !key.is_empty() {
+                out.push(format!("{key}={value}"));
+            }
+        } else {
+            // Bare `KEY`: inherit from the current environment, like Docker.
+            let key = line.trim();
+            if let Ok(value) = std::env::var(key) {
+                out.push(format!("{key}={value}"));
+            }
+        }
+    }
+}
+
 /// Emit warnings for any unrecognized flags.
 pub fn warn_unrecognized(overrides: &RunArgsOverrides) {
     for flag in &overrides.unrecognized {
@@ -806,6 +858,91 @@ mod tests {
     fn parse_empty_args() {
         let r = parse_run_args(&[]);
         assert!(r.network_mode.is_none());
+        assert!(r.unrecognized.is_empty());
+    }
+
+    // -- Env flags --
+
+    #[test]
+    fn parse_env_long_flag() {
+        let r = parse_run_args(&args(&["--env", "FOO=bar"]));
+        assert_eq!(r.env, vec!["FOO=bar"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_short_flag() {
+        let r = parse_run_args(&args(&["-e", "BAZ=qux"]));
+        assert_eq!(r.env, vec!["BAZ=qux"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_inline_equals() {
+        let r = parse_run_args(&args(&["--env=HELLO=world"]));
+        assert_eq!(r.env, vec!["HELLO=world"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_multiple() {
+        let r = parse_run_args(&args(&["--env", "A=1", "-e", "B=2", "--env=C=3"]));
+        assert_eq!(r.env, vec!["A=1", "B=2", "C=3"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_reads_lines() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "KEY1=val1").unwrap();
+        writeln!(f, "KEY2=val2").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert_eq!(r.env, vec!["KEY1=val1", "KEY2=val2"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_matches_docker_whitespace() {
+        // Docker left-trims each line, treats a leading-space `#` as a comment,
+        // trims only the variable NAME, and keeps the value verbatim (trailing
+        // space significant). A value may itself contain `=`.
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "   # indented comment").unwrap();
+        writeln!(f, "  PADDED = keep me ").unwrap();
+        writeln!(f, "URL=k=v&x=y").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert_eq!(r.env, vec!["PADDED= keep me ", "URL=k=v&x=y"]);
+    }
+
+    #[test]
+    fn parse_env_file_bare_key_absent_from_env_is_skipped() {
+        // A bare `KEY` (no `=`) inherits from the environment; when the var is
+        // unset, Docker contributes nothing — cella must not push a bare key.
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "CELLA_DEFINITELY_UNSET_VAR_XYZ_42").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert!(r.env.is_empty(), "bare key absent from env must be skipped");
+    }
+
+    #[test]
+    fn parse_env_file_missing_warns_and_continues() {
+        // A missing env-file should not crash; the env list stays empty and
+        // other flags still parse correctly.
+        let r = parse_run_args(&args(&[
+            "--env-file",
+            "/nonexistent/does/not/exist.env",
+            "--privileged",
+        ]));
+        assert!(r.env.is_empty());
+        assert_eq!(r.privileged, Some(true));
         assert!(r.unrecognized.is_empty());
     }
 }
