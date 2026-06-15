@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use cella_features::{
-    BaseImageContext, FeatureCache, LockfilePolicy,
+    BaseImageContext, FeatureCache, LockfilePolicy, feature_id_without_version,
     lockfile::{lockfile_path, write_lockfile},
     oci::detect_platform,
 };
@@ -205,16 +205,6 @@ fn is_valid_target_version(version: &str) -> bool {
     true
 }
 
-/// Strip a trailing `:tag` or `@digest` from a Feature id, matching the official
-/// `getFeatureIdWithoutVersion` (`/[:@][^/]*$/`). The delimiter must appear
-/// after the last `/`, so registry ports (`host:5000/repo`) survive.
-fn feature_id_without_version(id: &str) -> &str {
-    let start = id.rfind('/').map_or(0, |i| i + 1);
-    id[start..]
-        .find([':', '@'])
-        .map_or(id, |rel| &id[..start + rel])
-}
-
 /// Outcome of pinning a Feature version into the raw devcontainer.json text.
 enum PinOutcome {
     /// The config declares no `features` object.
@@ -354,19 +344,6 @@ mod tests {
                 "{bad} should be invalid"
             );
         }
-    }
-
-    #[test]
-    fn feature_id_without_version_matches_official() {
-        let strip = super::feature_id_without_version;
-        assert_eq!(strip("node:1"), "node");
-        assert_eq!(strip("ghcr.io/x/node:2"), "ghcr.io/x/node");
-        assert_eq!(strip("ghcr.io/x/node"), "ghcr.io/x/node");
-        // Registry port (`:5000`) is before the last `/`, so it survives.
-        assert_eq!(strip("host:5000/x/node"), "host:5000/x/node");
-        assert_eq!(strip("host:5000/x/node:2"), "host:5000/x/node");
-        // `@digest` delimiter, matching the official `/[:@][^/]*$/`.
-        assert_eq!(strip("node@sha256:abc"), "node");
     }
 
     #[test]
