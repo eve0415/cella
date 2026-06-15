@@ -26,11 +26,13 @@ pub enum FeatureRef {
         tag: String,
     },
     /// GitHub shorthand: `owner/repo/feature` (exactly 3 path components, no
-    /// hostname).  Normalized to `ghcr.io/owner/repo/feature:latest`.
+    /// hostname).  Normalized to `ghcr.io/owner/repo/feature:<tag>` (`tag`
+    /// defaults to `latest` when no `:version` is given).
     GitHubShorthand {
         owner: String,
         repo: String,
         feature: String,
+        tag: String,
     },
     /// HTTP/HTTPS tarball URL.
     TarballUrl { url: String },
@@ -222,6 +224,7 @@ impl FeatureRef {
                     owner,
                     repo,
                     feature,
+                    tag: tag.to_owned(),
                 })
             }
             // Rule 5: 1-2 components without hostname → error
@@ -290,11 +293,12 @@ impl FeatureRef {
                 owner,
                 repo,
                 feature,
+                tag,
             } => Ok((
                 NormalizedRef::OciTarget {
                     registry: "ghcr.io".to_owned(),
                     repository: format!("{owner}/{repo}/{feature}"),
-                    tag: "latest".to_owned(),
+                    tag: tag.clone(),
                 },
                 None,
             )),
@@ -363,7 +367,14 @@ impl std::fmt::Display for FeatureRef {
                 owner,
                 repo,
                 feature,
-            } => write!(f, "{owner}/{repo}/{feature}"),
+                tag,
+            } if tag == "latest" => write!(f, "{owner}/{repo}/{feature}"),
+            Self::GitHubShorthand {
+                owner,
+                repo,
+                feature,
+                tag,
+            } => write!(f, "{owner}/{repo}/{feature}:{tag}"),
             Self::TarballUrl { url } => write!(f, "{url}"),
             Self::LocalPath { path } => write!(f, "{path}"),
             Self::Deprecated { key } => write!(f, "{key}"),
@@ -604,6 +615,22 @@ mod tests {
                 owner: "devcontainers".to_owned(),
                 repo: "features".to_owned(),
                 feature: "go".to_owned(),
+                tag: "latest".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_github_shorthand_with_version() {
+        // A `:version` on a shorthand must be preserved (not silently dropped).
+        let r = FeatureRef::parse("devcontainers/features/go:2").unwrap();
+        assert_eq!(
+            r,
+            FeatureRef::GitHubShorthand {
+                owner: "devcontainers".to_owned(),
+                repo: "features".to_owned(),
+                feature: "go".to_owned(),
+                tag: "2".to_owned(),
             }
         );
     }
@@ -741,6 +768,7 @@ mod tests {
             owner: "devcontainers".to_owned(),
             repo: "features".to_owned(),
             feature: "go".to_owned(),
+            tag: "latest".to_owned(),
         };
         let (norm, warning) = r.normalize(Path::new("/workspace")).unwrap();
         assert_eq!(
@@ -752,6 +780,26 @@ mod tests {
             }
         );
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn normalize_github_shorthand_honors_version() {
+        // An explicit version must flow through to the fetched tag, not `latest`.
+        let r = FeatureRef::GitHubShorthand {
+            owner: "devcontainers".to_owned(),
+            repo: "features".to_owned(),
+            feature: "go".to_owned(),
+            tag: "2".to_owned(),
+        };
+        let (norm, _) = r.normalize(Path::new("/workspace")).unwrap();
+        assert_eq!(
+            norm,
+            NormalizedRef::OciTarget {
+                registry: "ghcr.io".to_owned(),
+                repository: "devcontainers/features/go".to_owned(),
+                tag: "2".to_owned(),
+            }
+        );
     }
 
     #[test]
@@ -867,8 +915,21 @@ mod tests {
             owner: "owner".to_owned(),
             repo: "repo".to_owned(),
             feature: "feat".to_owned(),
+            tag: "latest".to_owned(),
         };
+        // `latest` renders as the canonical bare form (round-trips the input).
         assert_eq!(r.to_string(), "owner/repo/feat");
+    }
+
+    #[test]
+    fn display_github_shorthand_with_version() {
+        let r = FeatureRef::GitHubShorthand {
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            feature: "feat".to_owned(),
+            tag: "2".to_owned(),
+        };
+        assert_eq!(r.to_string(), "owner/repo/feat:2");
     }
 
     #[test]
