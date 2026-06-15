@@ -49,12 +49,14 @@ pub struct OutdatedArgs {
     #[arg(long, hide = true)]
     pub check: bool,
 
-    /// Number of columns to render output for (compatibility no-op).
-    #[arg(long)]
+    /// Number of columns to render output for (compatibility no-op). Paired with
+    /// `--terminal-rows`, matching the official's `implies: ['terminal-rows']`.
+    #[arg(long, requires = "terminal_rows")]
     pub terminal_columns: Option<u16>,
 
-    /// Number of rows to render output for (compatibility no-op).
-    #[arg(long)]
+    /// Number of rows to render output for (compatibility no-op). Paired with
+    /// `--terminal-columns`, matching the official's `implies`.
+    #[arg(long, requires = "terminal_columns")]
     pub terminal_rows: Option<u16>,
 
     /// Accepted for parity; the official `outdated` doesn't actually expose this

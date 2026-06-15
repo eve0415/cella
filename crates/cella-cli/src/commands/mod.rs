@@ -511,8 +511,8 @@ impl Command {
     ///
     /// `up` (and `code`, which embeds the `up` arg surface), `build`, `exec`,
     /// `read-configuration`, `run-user-commands`, `set-up`, `templates`,
-    /// `features`, and `upgrade` expose `--log-level`; every other variant
-    /// returns `None`. main.rs reads this once, before subcommand dispatch, to
+    /// `features`, `upgrade`, and `outdated` expose `--log-level`; every other
+    /// variant returns `None`. main.rs reads this once, before subcommand dispatch, to
     /// seed the global tracing filter — the level can't be applied inside
     /// `execute()` because the subscriber is already installed by then.
     pub const fn log_level(&self) -> Option<LogLevel> {
@@ -535,8 +535,8 @@ impl Command {
     /// The `--log-format` value (defaults to `Text`).
     ///
     /// `up`/`code`, `build`, `exec`, `read-configuration`, `run-user-commands`,
-    /// and `set-up` expose `--log-format`; every other variant returns
-    /// `Text`. Read once in main.rs to select the tracing formatter and to
+    /// `set-up`, and `outdated` expose `--log-format`; every other variant
+    /// returns `Text`. Read once in main.rs to select the tracing formatter and to
     /// force spinners off under `Json` (indicatif ANSI escapes would corrupt
     /// machine-readable JSON log lines on stderr).
     pub const fn log_format(&self) -> LogFormat {
