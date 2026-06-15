@@ -83,6 +83,11 @@ impl ExecArgs {
 
         // Determine container resolution path before consuming self's fields.
         let has_id = self.has_id_target();
+        // Capture whether an explicit config path was given before consuming self.
+        // On a spec-identity miss, an explicit --config/--override-config must
+        // error (no container for this config → run `cella up`); a bare
+        // invocation falls back to the interactive picker instead.
+        let has_explicit_config = self.config.is_some() || self.override_config.is_some();
 
         let container = if has_id {
             // Explicit id target wins: --container-id, --container-name, or --id-label.
@@ -99,8 +104,7 @@ impl ExecArgs {
             // No id target: resolve workspace + config, then use spec-identity lookup
             // with legacy fallback (mirrors the official workspace tier). --config /
             // --override-config are honoured; absent both, the default
-            // devcontainer.json is discovered automatically. On miss: show the
-            // interactive picker for bare invocations (no explicit selector given).
+            // devcontainer.json is discovered automatically.
             let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
             let maybe_container = resolve_by_spec_identity_or_fallback(
                 client.as_ref(),
@@ -111,7 +115,18 @@ impl ExecArgs {
             .await?;
             if let Some(c) = maybe_container {
                 c
+            } else if has_explicit_config {
+                // An explicit --config/--override-config was given but no running
+                // container matched. Error instead of showing the picker — the user
+                // asked for a specific config and it isn't up.
+                return Err(format!(
+                    "no dev container found for workspace '{}' — run `cella up` to start it",
+                    ws.display()
+                )
+                .into());
             } else {
+                // Bare invocation (no explicit selector): fall back to the
+                // interactive picker so the user can choose from running containers.
                 let containers = client.as_ref().list_cella_containers(true).await?;
                 let cwd_container = client
                     .as_ref()
@@ -1089,6 +1104,12 @@ mod tests {
 
     /// Two containers, same `local_folder`, different `config_file` → only the one
     /// matching our `config_file` is selected (exact match wins).
+    ///
+    /// `MockBackend::find_container_by_labels` scans all containers with
+    /// `labels_match_all`, which mirrors the Docker production implementation
+    /// (`docker_api_impl.rs`): it overrides the trait default to pass all labels
+    /// to Docker's native multi-label AND-filter, so Docker returns only the
+    /// matching container rather than the first container sharing `local_folder`.
     #[tokio::test]
     async fn multi_config_selects_matching_config() {
         let backend = MockBackend {
@@ -1117,5 +1138,37 @@ mod tests {
             args.has_id_target(),
             "--container-id must be recognised as id target so spec-identity is skipped"
         );
+    }
+
+    /// `--config` is an explicit config selector (not an id target).
+    /// On a spec-identity miss, execution must error rather than show the picker.
+    /// This test verifies the flag is recognised as an explicit config selector by
+    /// checking neither branch of the id-target path is taken.
+    #[test]
+    fn config_flag_is_explicit_config_not_id_target() {
+        let args = exec_args(["cella", "exec", "--config", "/a/dc.json", "--", "true"].as_ref());
+        // Not an id target (picker bypass is separate from id-target bypass).
+        assert!(!args.has_id_target());
+        // config field set — execute() will set has_explicit_config = true and
+        // return an error on miss instead of showing the picker.
+        assert!(args.config.is_some());
+    }
+
+    /// `--override-config` is likewise an explicit config selector.
+    #[test]
+    fn override_config_flag_is_explicit_config_not_id_target() {
+        let args = exec_args(
+            [
+                "cella",
+                "exec",
+                "--override-config",
+                "/a/o.json",
+                "--",
+                "true",
+            ]
+            .as_ref(),
+        );
+        assert!(!args.has_id_target());
+        assert!(args.override_config.is_some());
     }
 }
