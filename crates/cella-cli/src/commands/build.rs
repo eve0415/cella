@@ -226,6 +226,10 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Validate mutually-exclusive buildx outputs before any filesystem or
+        // daemon work, matching the official CLI's fail-fast ordering.
+        self.reject_conflicting_output_flags()?;
+
         let cwd = super::resolve_workspace_folder(self.effective_workspace_folder())?;
 
         info!("Resolving devcontainer config...");
@@ -283,6 +287,23 @@ impl BuildArgs {
     /// only affect the single-container buildx path; the official CLI accepts
     /// them without error, so cella warns rather than failing (never silently
     /// ignores).
+    /// Reject `--push` combined with `--output`, on any path.
+    ///
+    /// Mirrors the official CLI (`--push true cannot be used with --output.`):
+    /// pushing to a registry and exporting via `--output` are mutually
+    /// exclusive buildx outputs. Validated before the compose/single-container
+    /// split so the error matches regardless of project type — for a compose
+    /// project with both flags, the official emits this message, not the
+    /// `--platform or --push not supported.` one.
+    fn reject_conflicting_output_flags(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.push && self.output.is_some() {
+            return Err("--push true cannot be used with --output.".into());
+        }
+        Ok(())
+    }
+
     fn reject_unsupported_compose_flags(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -726,6 +747,32 @@ mod tests {
             .reject_unsupported_compose_flags()
             .expect_err("compose must reject --push");
         assert_eq!(err.to_string(), "--platform or --push not supported.");
+    }
+
+    #[test]
+    fn push_with_output_is_rejected() {
+        // The official CLI errors on `--push true` + `--output` with this exact
+        // message, before the compose/single split.
+        let err = parse_build(&["--push", "--output", "type=local,dest=out"])
+            .reject_conflicting_output_flags()
+            .expect_err("--push with --output must be rejected");
+        assert_eq!(err.to_string(), "--push true cannot be used with --output.");
+    }
+
+    #[test]
+    fn push_or_output_alone_is_allowed() {
+        // Each flag is fine on its own — only the combination is rejected.
+        assert!(
+            parse_build(&["--push"])
+                .reject_conflicting_output_flags()
+                .is_ok()
+        );
+        assert!(
+            parse_build(&["--output", "type=local,dest=out"])
+                .reject_conflicting_output_flags()
+                .is_ok()
+        );
+        assert!(parse_build(&[]).reject_conflicting_output_flags().is_ok());
     }
 
     // ── --label parsing / threading ─────────────────────────────────
