@@ -117,43 +117,19 @@ impl ExecArgs {
             // --override-config are honoured; absent both, the default
             // devcontainer.json is discovered automatically.
             let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let maybe_container = resolve_by_spec_identity_or_fallback(
+            let target_desc = config_display
+                .clone()
+                .unwrap_or_else(|| ws.display().to_string());
+            resolve_workspace_container_or_pick(
                 client.as_ref(),
                 &ws,
                 self.config.as_deref(),
                 self.override_config.as_deref(),
+                has_explicit_selector,
+                &target_desc,
+                "Select a container:",
             )
-            .await?;
-            if let Some(c) = maybe_container {
-                c
-            } else if has_explicit_selector {
-                // An explicit selector was given but no running container matched.
-                // Error instead of showing the picker — the user targeted a specific
-                // environment and it isn't running yet.
-                let target_desc = config_display
-                    .as_deref()
-                    .unwrap_or_else(|| ws.to_str().unwrap_or("?"));
-                return Err(format!(
-                    "no dev container found for '{target_desc}' — run `cella up` to start it"
-                )
-                .into());
-            } else {
-                // Bare invocation (no explicit selector): fall back to the
-                // interactive picker so the user can choose from running containers.
-                let containers = client.as_ref().list_cella_containers(true).await?;
-                let cwd_container = client
-                    .as_ref()
-                    .find_container(&std::env::current_dir()?)
-                    .await
-                    .ok()
-                    .flatten();
-                picker::resolve_container_interactive(
-                    &containers,
-                    cwd_container.as_ref().map(|c| c.name.as_str()),
-                    "Select a container:",
-                    None,
-                )?
-            }
+            .await?
         };
 
         let user_opt = self.user;
@@ -320,29 +296,76 @@ pub(super) async fn resolve_by_spec_identity_or_fallback(
     config_path_override: Option<&Path>,
     override_config_file: Option<&Path>,
 ) -> Result<Option<cella_backend::ContainerInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(resolved) = cella_config::devcontainer::resolve::config_with_override(
+    let resolved = match cella_config::devcontainer::resolve::config_with_override(
         workspace_root,
         config_path_override,
         override_config_file,
     ) {
-        find_container_spec_identity_with_fallback(
-            client,
-            &resolved.workspace_root,
-            &resolved.config_path,
-        )
-        .await
-    } else {
-        // No devcontainer.json found; degrade to workspace-folder-only lookup.
-        // This preserves the behaviour callers had before spec-identity was added.
-        let maybe = client.find_container(workspace_root).await?;
-        Ok(maybe.and_then(|c| {
-            if c.state == cella_backend::ContainerState::Running {
-                Some(c)
-            } else {
-                None
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // An explicit `--config`/`--override-config` that can't be read/parsed
+            // is a hard error (the user named that file). Only a MISSING default
+            // config degrades to the workspace-folder-only lookup, preserving the
+            // behaviour callers had before spec-identity was added.
+            if config_path_override.is_some() || override_config_file.is_some() {
+                return Err(e.into());
             }
-        }))
+            let maybe = client.find_container(workspace_root).await?;
+            return Ok(maybe.filter(|c| c.state == cella_backend::ContainerState::Running));
+        }
+    };
+    find_container_spec_identity_with_fallback(
+        client,
+        &resolved.workspace_root,
+        &resolved.config_path,
+    )
+    .await
+}
+
+/// Resolve the target container for a no-id-target invocation, then handle a
+/// miss consistently across `exec`/`shell`/`install`: an explicit selector
+/// (`--config`/`--override-config`/`--workspace-folder`) errors ("run `cella
+/// up`"); a bare invocation falls to the interactive picker. Mirrors the
+/// official's "workspace+config required, else error" while keeping cella's
+/// bare-invocation picker UX.
+pub(super) async fn resolve_workspace_container_or_pick(
+    client: &dyn cella_backend::ContainerBackend,
+    workspace_root: &Path,
+    config_path_override: Option<&Path>,
+    override_config_file: Option<&Path>,
+    has_explicit_selector: bool,
+    target_desc: &str,
+    picker_prompt: &str,
+) -> Result<cella_backend::ContainerInfo, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(container) = resolve_by_spec_identity_or_fallback(
+        client,
+        workspace_root,
+        config_path_override,
+        override_config_file,
+    )
+    .await?
+    {
+        return Ok(container);
     }
+    if has_explicit_selector {
+        return Err(format!(
+            "no dev container found for '{target_desc}' — run `cella up` to start it"
+        )
+        .into());
+    }
+    // Bare invocation: let the user choose from running containers.
+    let containers = client.list_cella_containers(true).await?;
+    let cwd_container = client
+        .find_container(&std::env::current_dir()?)
+        .await
+        .ok()
+        .flatten();
+    picker::resolve_container_interactive(
+        &containers,
+        cwd_container.as_ref().map(|c| c.name.as_str()),
+        picker_prompt,
+        None,
+    )
 }
 
 async fn resolve_exec_context(
@@ -1183,5 +1206,41 @@ mod tests {
         );
         assert!(!args.has_id_target());
         assert!(args.override_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_config_error_propagates_not_degrades() {
+        // An explicit --config that can't be resolved is a hard error, not a
+        // silent degrade to the folder-only lookup.
+        let backend = MockBackend { containers: vec![] };
+        let result = resolve_by_spec_identity_or_fallback(
+            &backend,
+            ws(),
+            Some(Path::new("/cella-nonexistent/devcontainer.json")),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "explicit --config miss must propagate");
+    }
+
+    #[tokio::test]
+    async fn explicit_selector_miss_errors_not_picker() {
+        // With an explicit selector and no matching container, error rather than
+        // dropping into the picker (which could enter an unrelated container).
+        let backend = MockBackend { containers: vec![] };
+        let result = resolve_workspace_container_or_pick(
+            &backend,
+            ws(),
+            None,
+            None,
+            true, // has_explicit_selector
+            "/ws",
+            "Select a container:",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "explicit-selector miss must error, not show the picker"
+        );
     }
 }

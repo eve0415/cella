@@ -6,8 +6,6 @@ use tracing::debug;
 use cella_backend::ContainerTarget;
 use cella_orchestrator::tool_install::ToolName;
 
-use crate::picker;
-
 /// Install tools into the running dev container.
 ///
 /// With no arguments, shows an interactive selector. Already-installed tools
@@ -73,28 +71,22 @@ impl InstallArgs {
             target.resolve(client.as_ref(), true).await?
         } else {
             // No id target: resolve workspace + default config, then use spec-identity
-            // lookup with legacy fallback. On miss: show the interactive picker.
+            // lookup with legacy fallback. An explicit --workspace-folder errors on a
+            // miss (the user targeted a specific environment, and installing into an
+            // unrelated picked container would be wrong); a bare invocation pickers.
+            let has_explicit_selector = self.workspace_folder.is_some();
             let ws = crate::commands::resolve_workspace_folder(self.workspace_folder.as_deref())?;
-            let maybe_container =
-                super::exec::resolve_by_spec_identity_or_fallback(client.as_ref(), &ws, None, None)
-                    .await?;
-            if let Some(c) = maybe_container {
-                c
-            } else {
-                let containers = client.as_ref().list_cella_containers(true).await?;
-                let cwd_container = client
-                    .as_ref()
-                    .find_container(&std::env::current_dir()?)
-                    .await
-                    .ok()
-                    .flatten();
-                picker::resolve_container_interactive(
-                    &containers,
-                    cwd_container.as_ref().map(|c| c.name.as_str()),
-                    "Select a container:",
-                    None,
-                )?
-            }
+            let target_desc = ws.display().to_string();
+            super::exec::resolve_workspace_container_or_pick(
+                client.as_ref(),
+                &ws,
+                None,
+                None,
+                has_explicit_selector,
+                &target_desc,
+                "Select a container:",
+            )
+            .await?
         };
         let container =
             super::resolve_service_container(client.as_ref(), container, self.service.as_deref())
