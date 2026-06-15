@@ -5,6 +5,7 @@
 
 use std::fmt::Write;
 
+use crate::reference::feature_id_without_version;
 use crate::types::ResolvedFeature;
 
 /// Named build context for feature content in Docker Compose builds.
@@ -273,8 +274,21 @@ pub fn generate_builtin_env(container_user: &str, remote_user: &str) -> String {
 /// are converted to UPPERCASE, matching the original devcontainer CLI behavior.
 /// The resulting file is sourced with `set -a` in the wrapper script.
 pub fn generate_feature_env(feature: &ResolvedFeature) -> String {
-    let mut out = String::new();
+    feature_env_lines(feature)
+        .into_iter()
+        .fold(String::new(), |mut acc, l| {
+            acc.push_str(&l);
+            acc.push('\n');
+            acc
+        })
+}
 
+/// Build the per-feature option env-var lines as a `Vec<String>`.
+///
+/// Each entry is a `KEY="value"` string without a trailing newline. Used both
+/// by [`generate_feature_env`] (joined with newlines) and by
+/// [`generate_wrapper_script`] (indented into the header block).
+fn feature_env_lines(feature: &ResolvedFeature) -> Vec<String> {
     // Collect all option names: union of declared options and user-provided options.
     let mut all_keys: Vec<String> = feature
         .metadata
@@ -289,6 +303,7 @@ pub fn generate_feature_env(feature: &ResolvedFeature) -> String {
     // Sort for deterministic output.
     all_keys.sort();
 
+    let mut lines = Vec::new();
     for key in &all_keys {
         let value = if let Some(user_val) = feature.user_options.get(key) {
             json_value_to_string(user_val)
@@ -304,28 +319,112 @@ pub fn generate_feature_env(feature: &ResolvedFeature) -> String {
             // User-provided key with no declared option and no value -- skip
             continue;
         };
-
-        writeln!(out, "{}=\"{value}\"", option_key_to_env_var(key)).unwrap();
+        lines.push(format!("{}=\"{value}\"", option_key_to_env_var(key)));
     }
 
-    out
+    lines
+}
+
+/// Replace every `'` in a string with `'\''` so the value can be safely
+/// embedded inside single quotes in a POSIX shell script.
+fn escape_quotes_for_shell(s: &str) -> String {
+    s.replace('\'', "'\\''")
 }
 
 /// Generate `devcontainer-features-install.sh` wrapper script for a feature.
 ///
-/// The wrapper sources the builtin env file and the per-feature env file with
-/// `set -a` (auto-export), then runs `install.sh`. This matches the original
-/// devcontainer CLI's approach of wrapping each feature install.
-pub fn generate_wrapper_script(feature_id: &str) -> String {
+/// Produces a script matching the official `getFeatureInstallWrapperScript`
+/// output, grafted onto cella's `cd /tmp/dev-container-features/<id>` directory
+/// model (instead of Docker WORKDIR). The displayed `Id` field uses the
+/// version-stripped `original_ref`; the `cd` path uses `feature.id` (the
+/// on-disk directory name) — these are intentionally different values.
+pub fn generate_wrapper_script(feature: &ResolvedFeature) -> String {
+    let name = escape_quotes_for_shell(feature.metadata.name.as_deref().unwrap_or("Unknown"));
+    let description =
+        escape_quotes_for_shell(feature.metadata.description.as_deref().unwrap_or(""));
+    let version = escape_quotes_for_shell(&feature.metadata.version);
+    let documentation =
+        escape_quotes_for_shell(feature.metadata.documentation_url.as_deref().unwrap_or(""));
+    // Displayed id: version-stripped user ref, falling back to "Unknown".
+    let display_id = {
+        let raw = feature.original_ref.as_str();
+        let stripped = if raw.is_empty() {
+            "Unknown"
+        } else {
+            feature_id_without_version(raw)
+        };
+        escape_quotes_for_shell(stripped)
+    };
+
+    // troubleshootingMessage: leading space + doc link, only when doc non-empty.
+    let troubleshooting = if feature.metadata.documentation_url.is_some()
+        && !feature
+            .metadata
+            .documentation_url
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+    {
+        format!(
+            " Look at the documentation at {documentation} for help troubleshooting this error."
+        )
+    } else {
+        String::new()
+    };
+
+    // echoWarning slot: blank line when not deprecated, echo when deprecated.
+    let echo_warning = if feature.metadata.deprecated == Some(true) {
+        format!(
+            "echo '(!) WARNING: Using the deprecated Feature \"{display_id}\". \
+             This Feature will no longer receive any further updates/support.'"
+        )
+    } else {
+        String::new()
+    };
+
+    // Options block: indented env-var lines, shell-escaped, joined with literal newlines.
+    let option_lines: Vec<String> = feature_env_lines(feature)
+        .into_iter()
+        .map(|l| format!("    {}", escape_quotes_for_shell(&l)))
+        .collect();
+    let options_indented = if option_lines.is_empty() {
+        String::new()
+    } else {
+        option_lines.join("\n")
+    };
+
+    // The `cd` path uses the canonical feature.id (on-disk dir), NOT original_ref.
+    let dir_id = &feature.id;
+
     format!(
         "#!/bin/sh\n\
          set -e\n\
-         cd /tmp/dev-container-features/{feature_id}\n\
-         chmod +x ./install.sh\n\
+         \n\
+         on_exit () {{\n\
+         \t[ $? -eq 0 ] && exit\n\
+         \techo 'ERROR: Feature \"{name}\" ({display_id}) failed to install!{troubleshooting}'\n\
+         }}\n\
+         \n\
+         trap on_exit EXIT\n\
+         \n\
+         echo ===========================================================================\n\
+         {echo_warning}\n\
+         echo 'Feature       : {name}'\n\
+         echo 'Description   : {description}'\n\
+         echo 'Id            : {display_id}'\n\
+         echo 'Version       : {version}'\n\
+         echo 'Documentation : {documentation}'\n\
+         echo 'Options       :'\n\
+         echo '{options_indented}'\n\
+         echo ===========================================================================\n\
+         \n\
+         cd /tmp/dev-container-features/{dir_id}\n\
          set -a\n\
          . ../devcontainer-features.builtin.env\n\
          . ./devcontainer-features.env\n\
          set +a\n\
+         \n\
+         chmod +x ./install.sh\n\
          ./install.sh\n"
     )
 }
@@ -880,8 +979,88 @@ mod tests {
 
     #[test]
     fn wrapper_script_content() {
-        let script = generate_wrapper_script("node");
+        let mut options = HashMap::new();
+        options.insert("version".to_string(), make_option(serde_json::json!("lts")));
+        options.insert(
+            "nodeGypDependencies".to_string(),
+            make_option(serde_json::json!(true)),
+        );
+        let mut user_options = HashMap::new();
+        user_options.insert("version".to_string(), serde_json::json!("18"));
+
+        let feature = make_feature(
+            "node",
+            "ghcr.io/devcontainers/features/node:1",
+            true,
+            user_options,
+            FeatureMetadata {
+                id: "node".to_string(),
+                version: "2.1.0".to_string(),
+                name: Some("Node.js".to_string()),
+                description: Some("Installs Node.js".to_string()),
+                documentation_url: Some("https://example.com/node".to_string()),
+                options,
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
         insta::assert_snapshot!(script);
+    }
+
+    #[test]
+    fn wrapper_script_deprecated_feature() {
+        let feature = make_feature(
+            "node",
+            "ghcr.io/devcontainers/features/node:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "node".to_string(),
+                version: "2.1.0".to_string(),
+                name: Some("Node.js".to_string()),
+                description: Some("Installs Node.js".to_string()),
+                documentation_url: Some("https://example.com/node".to_string()),
+                deprecated: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        assert!(
+            script.contains("(!) WARNING: Using the deprecated Feature"),
+            "deprecation warning missing:\n{script}"
+        );
+        insta::assert_snapshot!(script);
+    }
+
+    #[test]
+    fn wrapper_script_shell_escape() {
+        // A value with an apostrophe must be escaped so the shell script is valid.
+        let feature = make_feature(
+            "my-tool",
+            "ghcr.io/example/my-tool:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "my-tool".to_string(),
+                version: "1.0.0".to_string(),
+                name: Some("Eve's Tool".to_string()),
+                description: Some("A user's best friend".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        // Apostrophe in name should be shell-escaped as '\''
+        assert!(
+            script.contains("Eve'\\''s Tool"),
+            "name apostrophe not escaped:\n{script}"
+        );
+        assert!(
+            script.contains("A user'\\''s best friend"),
+            "description apostrophe not escaped:\n{script}"
+        );
     }
 
     // ---------------------------------------------------------------

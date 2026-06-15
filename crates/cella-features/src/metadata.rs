@@ -49,6 +49,8 @@ struct FeatureMetadataDto {
     version: String,
     name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "documentationURL")]
+    documentation_url: Option<String>,
     #[serde(default)]
     options: HashMap<String, FeatureOptionDto>,
     /// Hard dependencies: `Record<featureId, options>` where options is
@@ -140,6 +142,7 @@ impl FeatureMetadataDto {
             version: self.version,
             name: self.name,
             description: self.description,
+            documentation_url: self.documentation_url,
             options,
             depends_on: self.depends_on,
             installs_after: self.installs_after,
@@ -433,6 +436,27 @@ mod tests {
         let meta = parse_feature_metadata(json).unwrap();
         let opt = &meta.options["name"];
         assert!(opt.default.is_null());
+    }
+
+    #[test]
+    fn documentation_url_parsed() {
+        let json = r#"{
+            "id": "node",
+            "version": "2.0.0",
+            "documentationURL": "https://github.com/devcontainers/features/tree/main/src/node"
+        }"#;
+        let meta = parse_feature_metadata(json).expect("should parse documentationURL");
+        assert_eq!(
+            meta.documentation_url.as_deref(),
+            Some("https://github.com/devcontainers/features/tree/main/src/node")
+        );
+    }
+
+    #[test]
+    fn documentation_url_absent_yields_none() {
+        let json = r#"{"id": "node", "version": "1.0.0"}"#;
+        let meta = parse_feature_metadata(json).expect("should parse without documentationURL");
+        assert!(meta.documentation_url.is_none());
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub struct FeatureMetadata {
     pub version: String,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub documentation_url: Option<String>,
     pub options: HashMap<String, FeatureOption>,
     /// Hard dependencies declared via `dependsOn` in `devcontainer-feature.json`.
     ///
