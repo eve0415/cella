@@ -1118,6 +1118,35 @@ pub async fn content_changed(
     stored.as_deref() != Some(&current)
 }
 
+/// Whether the container's last background lifecycle run recorded a failure.
+///
+/// Reads `/tmp/.cella/lifecycle_status.json`, which is written ONLY by the
+/// background lifecycle chain. Returns `true` only on an explicit
+/// `{"status":"failed"}`. An ABSENT file (a fully-foreground `up`, an
+/// external/VS Code container seeded without it, or an older cella) means
+/// nothing failed → `false`; the normal skip applies. Mirrors `up`'s own
+/// `.contains("\"failed\"")` check in `handle_running`. Pure reader.
+pub async fn lifecycle_failed(lc_ctx: &LifecycleContext<'_>) -> bool {
+    lc_ctx
+        .client
+        .exec_command(
+            lc_ctx.container_id,
+            &ExecOptions {
+                cmd: vec![
+                    "cat".to_string(),
+                    "/tmp/.cella/lifecycle_status.json".to_string(),
+                ],
+                user: lc_ctx.user.map(String::from),
+                env: None,
+                working_dir: None,
+            },
+        )
+        .await
+        .ok()
+        .filter(|r| r.exit_code == 0)
+        .is_some_and(|r| r.stdout.contains("\"failed\""))
+}
+
 /// Check for workspace content changes and re-run updateContentCommand + postCreateCommand.
 ///
 /// # Errors
@@ -1155,11 +1184,6 @@ pub async fn check_and_run_content_update(
         return Ok(());
     }
 
-    // Recompute the hash here; we need it for the write-back below and
-    // content_changed() does not expose the computed value — recomputing once
-    // at this boundary is simpler than threading it through the helper return type.
-    let current_hash = cella_git::content_hash::compute(workspace_root);
-
     let phases: &[&str] = if run_post_create {
         progress
             .println("  Content changed, re-running updateContentCommand + postCreateCommand...");
@@ -1196,6 +1220,10 @@ pub async fn check_and_run_content_update(
     // hash and permanently skip the deferred postCreateCommand (mirrors the
     // create-path content-hash gating).
     if run_post_create {
+        // Compute the hash only on the persist path — the updateContent-only
+        // (prebuild / skip-non-blocking) branch never writes it, so re-scanning
+        // the workspace there would be wasted work (Copilot review).
+        let current_hash = cella_git::content_hash::compute(workspace_root);
         let _ = lc_ctx
             .client
             .exec_command(

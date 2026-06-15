@@ -348,6 +348,7 @@ impl RunUserCommandsArgs {
                 install_command: self.dotfiles.install_command.as_deref(),
                 target_path: &self.dotfiles.target_path,
             },
+            workspace_root: workspace.as_deref(),
         };
         let status = orchestrator::run_user_commands(&lc_ctx, &input, &sender).await;
         drop(sender);
