@@ -929,11 +929,25 @@ mod tests {
 
     #[test]
     fn no_lockfile_false_with_frozen_is_accepted() {
-        // The official accepts `--no-lockfile false --frozen-lockfile` (no_lockfile
-        // is falsy → no conflict) and resolves to Frozen.
+        // `--no-lockfile=false --frozen-lockfile`: no_lockfile is falsy → no
+        // conflict → Frozen. (`require_equals` is needed so a space-separated
+        // value wouldn't swallow build's positional `[path]`.)
         assert_eq!(
-            build_lockfile_policy(&["--no-lockfile", "false", "--frozen-lockfile"]),
+            build_lockfile_policy(&["--no-lockfile=false", "--frozen-lockfile"]),
             cella_features::LockfilePolicy::Frozen
+        );
+    }
+
+    #[test]
+    fn lockfile_flag_does_not_consume_positional_path() {
+        // Regression: with `num_args = 0..=1`, `--no-lockfile ./path` would
+        // swallow the positional `[path]` as the flag value. `require_equals`
+        // keeps them separate: the flag is bare (→ true) and `./path` is `[path]`.
+        let args = parse_build(&["--no-lockfile", "./some/path"]);
+        assert!(args.lockfile.no_lockfile);
+        assert_eq!(
+            args.path.as_deref(),
+            Some(std::path::Path::new("./some/path"))
         );
     }
 

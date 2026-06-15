@@ -81,16 +81,19 @@ pub struct DotfilesArgs {
 /// by each command and consumed by [`derive_lockfile_policy`].
 #[derive(Args)]
 pub struct LockfileArgs {
-    /// Disable lockfile generation and pinning. Accepts the yargs boolean forms
-    /// (bare → true, `--no-lockfile false` → false). Mutual exclusion with the
-    /// frozen flags is enforced value-aware in [`derive_lockfile_policy`] (only
-    /// when both are *truthy*), matching the official `.check()`.
-    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    /// Disable lockfile generation and pinning. Accepts the bare form (→ true)
+    /// and an explicit `--no-lockfile=false`. `require_equals` is required
+    /// because `cella build` has a positional `[path]` that a space-separated
+    /// value (`--no-lockfile ./path`) would otherwise swallow. Mutual exclusion
+    /// with the frozen flags is enforced value-aware in [`derive_lockfile_policy`]
+    /// (only when both are *truthy*), matching the official `.check()`.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_value_t = false, default_missing_value = "true")]
     pub(crate) no_lockfile: bool,
 
     /// Require the lockfile to exist and match resolved digests; fail if missing
-    /// or different. Accepts the yargs boolean forms.
-    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    /// or different. Bare → true, explicit `--frozen-lockfile=false`
+    /// (`require_equals`, see `no_lockfile`).
+    #[arg(long, num_args = 0..=1, require_equals = true, default_value_t = false, default_missing_value = "true")]
     pub(crate) frozen_lockfile: bool,
 }
 
@@ -102,11 +105,11 @@ pub struct LockfileArgs {
 #[derive(Args)]
 pub struct DeprecatedLockfileArgs {
     /// Deprecated: lockfile is now written by default.
-    #[arg(long, hide = true, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_value_t = false, default_missing_value = "true")]
     pub(crate) experimental_lockfile: bool,
 
     /// Deprecated alias for --frozen-lockfile.
-    #[arg(long, hide = true, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
+    #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_value_t = false, default_missing_value = "true")]
     pub(crate) experimental_frozen_lockfile: bool,
 }
 
