@@ -236,6 +236,16 @@ enum PinOutcome {
 /// corrupts longer ids sharing its prefix (`.../node` rewrites inside
 /// `.../nodejs`). cella replaces the quoted key token `"<id>"` literally —
 /// byte-identical for normal configs, but it never corrupts prefixes.
+///
+/// Like the official, this is still an all-occurrences replace of the quoted
+/// token. Two accepted limitations, both matching upstream behavior on the
+/// configs that trigger them:
+/// - A string *value* byte-identical to the quoted feature key (rare) is
+///   rewritten too. The official `replaceAll` does the same; a precise fix needs
+///   a structural JSONC edit, out of scope for this hidden dependabot flag.
+/// - When two keys strip to the same id-without-version (an invalid config — a
+///   Feature can't be installed twice), the first match wins; iteration order
+///   may differ from the official's, but the input is already malformed.
 fn pin_feature_version_in_text(
     raw: &str,
     config: &serde_json::Value,
