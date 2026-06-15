@@ -185,6 +185,22 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.run(progress).await {
+            Ok(()) => Ok(()),
+            // Mirror the official: a build failure prints the error envelope to
+            // stdout (`{outcome:'error', …}`) and exits 1 — consistent with
+            // up/set-up/run-user-commands rather than a bare stderr report.
+            Err(e) => {
+                println!("{}", render_error_envelope(&e.to_string()));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    async fn run(
+        self,
+        progress: crate::progress::Progress,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
 
         info!("Resolving devcontainer config...");
@@ -444,6 +460,17 @@ fn build_json_result(image_names: &[String]) -> String {
         image_name: image_names.to_vec(),
     })
     .unwrap_or_default()
+}
+
+/// Render the `build` error envelope (stdout JSON), mirroring the official's
+/// `{outcome:'error', message, description}` written on build failure.
+fn render_error_envelope(message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "outcome": "error",
+        "message": message,
+        "description": "An error occurred building the container.",
+    }))
+    .expect("BUG: error envelope is not serialisable")
 }
 
 /// Print the build result.
@@ -836,6 +863,20 @@ mod tests {
         let result =
             TestCli::try_parse_from(["build", "--no-lockfile", "--experimental-frozen-lockfile"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn error_envelope_shape() {
+        // Build failures emit `{outcome:'error', message, description}` to
+        // stdout, mirroring the official and matching the sibling commands.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_error_envelope("boom")).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "error");
+        assert_eq!(parsed["message"], "boom");
+        assert_eq!(
+            parsed["description"],
+            "An error occurred building the container."
+        );
     }
 
     #[test]
