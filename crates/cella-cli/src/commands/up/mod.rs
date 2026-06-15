@@ -966,7 +966,7 @@ impl UpContext {
             lockfile_policy: super::derive_lockfile_policy(
                 &args.lockfile,
                 &args.deprecated_lockfile,
-            ),
+            )?,
         })
     }
 
@@ -3214,10 +3214,12 @@ mod tests {
         assert!(crate::Cli::try_parse_from(["cella", "up", "--id-label", "noequals"]).is_err());
         // remote-env requires a name before '='.
         assert!(crate::Cli::try_parse_from(["cella", "up", "--remote-env", "=novalue"]).is_err());
-        // --no-lockfile conflicts with --frozen-lockfile.
+        // --no-lockfile / --frozen-lockfile now parse together (the mutual
+        // exclusion is enforced value-aware in derive_lockfile_policy, matching
+        // the official `.check()`); tested in build's derive tests.
         assert!(
             crate::Cli::try_parse_from(["cella", "up", "--no-lockfile", "--frozen-lockfile"])
-                .is_err()
+                .is_ok()
         );
         // terminal-columns requires terminal-rows.
         assert!(crate::Cli::try_parse_from(["cella", "up", "--terminal-columns", "80"]).is_err());

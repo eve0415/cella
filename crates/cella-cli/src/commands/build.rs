@@ -325,7 +325,7 @@ impl BuildArgs {
             lockfile_policy: super::derive_lockfile_policy(
                 &self.lockfile,
                 &self.deprecated_lockfile,
-            ),
+            )?,
             // `--label` image labels: applied as the primary service's
             // `build.labels` (image labels on the built service image), the
             // compose equivalent of the single-container `docker build --label`.
@@ -398,7 +398,7 @@ impl BuildArgs {
             lockfile_policy: super::derive_lockfile_policy(
                 &self.lockfile,
                 &self.deprecated_lockfile,
-            ),
+            )?,
             progress: &sender,
         };
         let result = cella_orchestrator::image::ensure_image(&input).await;
@@ -858,6 +858,7 @@ mod tests {
     fn build_lockfile_policy(extra: &[&str]) -> cella_features::LockfilePolicy {
         let args = parse_build(extra);
         super::super::derive_lockfile_policy(&args.lockfile, &args.deprecated_lockfile)
+            .expect("lockfile flags do not conflict")
     }
 
     #[test]
@@ -903,16 +904,37 @@ mod tests {
     }
 
     #[test]
-    fn no_lockfile_conflicts_with_frozen() {
-        let result = TestCli::try_parse_from(["build", "--no-lockfile", "--frozen-lockfile"]);
-        assert!(result.is_err());
+    fn no_lockfile_conflicts_with_frozen_when_both_truthy() {
+        // Parse now succeeds (value-aware); the conflict fires in derive only
+        // when BOTH are truthy, matching the official `.check()`.
+        let args = parse_build(&["--no-lockfile", "--frozen-lockfile"]);
+        let err = super::super::derive_lockfile_policy(&args.lockfile, &args.deprecated_lockfile)
+            .expect_err("both truthy must conflict");
+        assert_eq!(
+            err,
+            "--no-lockfile and --frozen-lockfile are mutually exclusive."
+        );
     }
 
     #[test]
-    fn no_lockfile_conflicts_with_experimental_frozen() {
-        let result =
-            TestCli::try_parse_from(["build", "--no-lockfile", "--experimental-frozen-lockfile"]);
-        assert!(result.is_err());
+    fn no_lockfile_conflicts_with_experimental_frozen_when_both_truthy() {
+        let args = parse_build(&["--no-lockfile", "--experimental-frozen-lockfile"]);
+        let err = super::super::derive_lockfile_policy(&args.lockfile, &args.deprecated_lockfile)
+            .expect_err("both truthy must conflict");
+        assert_eq!(
+            err,
+            "--no-lockfile and --experimental-frozen-lockfile are mutually exclusive."
+        );
+    }
+
+    #[test]
+    fn no_lockfile_false_with_frozen_is_accepted() {
+        // The official accepts `--no-lockfile false --frozen-lockfile` (no_lockfile
+        // is falsy → no conflict) and resolves to Frozen.
+        assert_eq!(
+            build_lockfile_policy(&["--no-lockfile", "false", "--frozen-lockfile"]),
+            cella_features::LockfilePolicy::Frozen
+        );
     }
 
     #[test]

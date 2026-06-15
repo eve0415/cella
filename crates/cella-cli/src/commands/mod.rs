@@ -81,15 +81,16 @@ pub struct DotfilesArgs {
 /// by each command and consumed by [`derive_lockfile_policy`].
 #[derive(Args)]
 pub struct LockfileArgs {
-    /// Disable lockfile generation and pinning.
-    #[arg(
-        long,
-        conflicts_with_all = ["frozen_lockfile", "experimental_lockfile", "experimental_frozen_lockfile"],
-    )]
+    /// Disable lockfile generation and pinning. Accepts the yargs boolean forms
+    /// (bare → true, `--no-lockfile false` → false). Mutual exclusion with the
+    /// frozen flags is enforced value-aware in [`derive_lockfile_policy`] (only
+    /// when both are *truthy*), matching the official `.check()`.
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     pub(crate) no_lockfile: bool,
 
-    /// Require the lockfile to exist and match resolved digests; fail if missing or different.
-    #[arg(long)]
+    /// Require the lockfile to exist and match resolved digests; fail if missing
+    /// or different. Accepts the yargs boolean forms.
+    #[arg(long, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     pub(crate) frozen_lockfile: bool,
 }
 
@@ -101,11 +102,11 @@ pub struct LockfileArgs {
 #[derive(Args)]
 pub struct DeprecatedLockfileArgs {
     /// Deprecated: lockfile is now written by default.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     pub(crate) experimental_lockfile: bool,
 
     /// Deprecated alias for --frozen-lockfile.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, num_args = 0..=1, default_value_t = false, default_missing_value = "true")]
     pub(crate) experimental_frozen_lockfile: bool,
 }
 
@@ -117,20 +118,34 @@ pub struct DeprecatedLockfileArgs {
 pub fn derive_lockfile_policy(
     lf: &LockfileArgs,
     deprecated: &DeprecatedLockfileArgs,
-) -> cella_features::LockfilePolicy {
+) -> Result<cella_features::LockfilePolicy, String> {
+    // Value-aware mutual exclusion, matching the official `.check()`: a conflict
+    // fires only when BOTH flags are truthy, so `--no-lockfile false
+    // --frozen-lockfile` is accepted (no_lockfile is false).
+    if lf.no_lockfile && lf.frozen_lockfile {
+        return Err("--no-lockfile and --frozen-lockfile are mutually exclusive.".to_owned());
+    }
+    if lf.no_lockfile && deprecated.experimental_frozen_lockfile {
+        return Err(
+            "--no-lockfile and --experimental-frozen-lockfile are mutually exclusive.".to_owned(),
+        );
+    }
+    if lf.no_lockfile && deprecated.experimental_lockfile {
+        return Err("--no-lockfile and --experimental-lockfile are mutually exclusive.".to_owned());
+    }
     if deprecated.experimental_lockfile {
         warn!("--experimental-lockfile is deprecated; lockfile is now written by default");
     }
     if deprecated.experimental_frozen_lockfile {
         warn!("--experimental-frozen-lockfile is deprecated; use --frozen-lockfile instead");
     }
-    if lf.no_lockfile {
+    Ok(if lf.no_lockfile {
         cella_features::LockfilePolicy::NoLockfile
     } else if lf.frozen_lockfile || deprecated.experimental_frozen_lockfile {
         cella_features::LockfilePolicy::Frozen
     } else {
         cella_features::LockfilePolicy::Update
-    }
+    })
 }
 
 /// Compatibility/diagnostic flags shared by the workspace-resolving commands
