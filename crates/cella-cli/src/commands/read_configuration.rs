@@ -50,11 +50,11 @@ pub struct ReadConfigurationArgs {
 
     /// Shared devcontainer-CLI compat flags (`--docker-path`,
     /// `--user-data-folder`, `--mount-*`, `--log-level`/`--log-format`,
-    /// `--terminal-*`, `--skip-feature-auto-mapping`). All no-ops except
-    /// log-level/log-format (seeded into tracing by `main.rs`). The
-    /// `--mount-workspace-git-root` value is not consumed here: cella always
-    /// reports the git-root mount (see `find_git_root_folder` below), matching
-    /// the official default of `true`.
+    /// `--terminal-*`, `--skip-feature-auto-mapping`). Mostly no-ops; the
+    /// exceptions are log-level/log-format (seeded into tracing by `main.rs`)
+    /// and `--mount-workspace-git-root`, which is honored here — when `false`
+    /// the reported `workspaceMount` binds the workspace folder itself rather
+    /// than its git root (defaults to `true`, matching the official).
     #[command(flatten)]
     pub(crate) compat: super::WorkspaceCompatArgs,
 }
@@ -116,7 +116,8 @@ impl ReadConfigurationArgs {
         // bind-mounts the git-root folder (mountWorkspaceGitRoot defaults to
         // true). read-configuration exposes no flag to override this, so the
         // default is reported. Compose configs ignore this (no bind mount).
-        let host_mount_folder = cella_git::find_git_root_folder(&cwd, true);
+        let host_mount_folder =
+            cella_git::find_git_root_folder(&cwd, self.compat.mount_workspace_git_root);
         let mut output = build_base_output(
             &resolved.config,
             &resolved.config_path,
@@ -842,6 +843,24 @@ mod tests {
             super::super::LogFormat::Json
         ));
         assert!(!args.compat.mount_workspace_git_root);
+    }
+
+    #[test]
+    fn workspace_mount_reflects_mount_workspace_git_root() {
+        // `execute` now feeds `find_git_root_folder(cwd, mount_workspace_git_root)`
+        // into the reported `workspaceMount`. A git-root mount and a
+        // workspace-folder mount must therefore yield different sources — so
+        // `--mount-workspace-git-root false` is honored, not ignored.
+        let config = serde_json::json!({ "image": "ubuntu" });
+        let cfg = PathBuf::from("/repo/sub/.devcontainer/devcontainer.json");
+        let workspace = PathBuf::from("/repo/sub");
+        let git_root_mount = build_base_output(&config, &cfg, &workspace, &PathBuf::from("/repo"));
+        let workspace_mount = build_base_output(&config, &cfg, &workspace, &workspace);
+        assert_ne!(
+            git_root_mount["workspace"]["workspaceMount"],
+            workspace_mount["workspace"]["workspaceMount"],
+            "mount source must differ between git-root and workspace-folder mounts"
+        );
     }
 
     #[test]
