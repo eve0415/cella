@@ -143,7 +143,7 @@ pub struct TemplatesApplyArgs {
 
 impl TemplatesArgs {
     /// Return the `--log-level` from whichever subcommand carries one (`apply`,
-    /// `metadata`, or `publish`), if active.
+    /// `metadata`, `publish`, or `generate-docs`), if active.
     ///
     /// Called by [`super::Command::log_level`] so the global tracing filter is
     /// seeded before dispatch — the same pattern used by `up` and

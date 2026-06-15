@@ -38,16 +38,16 @@ pub struct UpgradeArgs {
     #[arg(long = "docker-compose-path", default_value = "docker-compose")]
     pub docker_compose_path: String,
 
-    /// Upgrade the version requirements of a given Feature (and its
-    /// dependencies), then upgrade the lockfile. Must be paired with
-    /// `--target-version`. Hidden parity flag (added for dependabot in the
-    /// official CLI); accepted-and-ignored.
+    /// Target a single Feature for upgrade (the official CLI's dependabot path,
+    /// alongside `--target-version`). Hidden parity flag, accepted-and-ignored:
+    /// cella currently refreshes the whole lockfile, so targeted single-Feature
+    /// upgrade is a follow-up. Accepted independently of `--target-version`.
     #[arg(short = 'f', long = "feature", hide = true)]
     pub feature: Option<String>,
 
-    /// The major (x), minor (x.y), or patch (x.y.z) version of the Feature to
-    /// pin in devcontainer.json. Must be paired with `--feature`. Hidden parity
-    /// flag; accepted-and-ignored.
+    /// The target version (`x`, `x.y`, or `x.y.z`) for `--feature`. Hidden
+    /// parity flag, accepted-and-ignored (see `--feature`); accepted
+    /// independently.
     #[arg(short = 'v', long = "target-version", hide = true)]
     pub target_version: Option<String>,
 
