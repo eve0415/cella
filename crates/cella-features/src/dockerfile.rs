@@ -331,6 +331,58 @@ fn escape_quotes_for_shell(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// Build the `warningHeader` string that appears inside the `echo` slot of the
+/// wrapper script, mirroring the official `getFeatureInstallWrapperScript`.
+///
+/// The returned string is empty when no warnings apply; otherwise it contains
+/// one or both of:
+/// - Deprecation line (WITH trailing `\n` so the shell echoes a blank line
+///   after it, matching the official output).
+/// - Rename line (NO trailing newline), when the user's ref leaf differs from
+///   the canonical `currentId` — i.e. the feature was referenced by a legacy id.
+fn build_warning_header(feature: &ResolvedFeature, display_id: &str) -> String {
+    let mut warning_header = String::new();
+
+    if feature.metadata.deprecated == Some(true) {
+        // writeln! appends '\n', matching the official's trailing newline on the
+        // deprecation line (which causes the shell to echo a blank line after it).
+        writeln!(
+            warning_header,
+            "(!) WARNING: Using the deprecated Feature \"{display_id}\". \
+             This Feature will no longer receive any further updates/support."
+        )
+        .unwrap();
+    }
+
+    // The user's ref leaf: last `/`-segment of the version-stripped original_ref.
+    // This matches `feature.id` in the official source (set to featureRef.id =
+    // last path segment of the user's OCI ref), NOT our `feature.id` (on-disk dir).
+    let raw = feature.original_ref.as_str();
+    let user_ref_leaf = if raw.is_empty() {
+        ""
+    } else {
+        feature_id_without_version(raw)
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+    };
+
+    if !feature.metadata.legacy_ids.is_empty()
+        && let Some(current_id) = feature.metadata.current_id.as_deref()
+        && user_ref_leaf != current_id
+    {
+        write!(
+            warning_header,
+            "(!) WARNING: This feature has been renamed. \
+             Please update the reference in devcontainer.json to \"{escaped}\".",
+            escaped = escape_quotes_for_shell(current_id)
+        )
+        .unwrap();
+    }
+
+    warning_header
+}
+
 /// Generate `devcontainer-features-install.sh` wrapper script for a feature.
 ///
 /// Produces a script matching the official `getFeatureInstallWrapperScript`
@@ -357,13 +409,11 @@ pub fn generate_wrapper_script(feature: &ResolvedFeature) -> String {
     };
 
     // troubleshootingMessage: leading space + doc link, only when doc non-empty.
-    let troubleshooting = if feature.metadata.documentation_url.is_some()
-        && !feature
-            .metadata
-            .documentation_url
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
+    let troubleshooting = if feature
+        .metadata
+        .documentation_url
+        .as_deref()
+        .is_some_and(|u| !u.is_empty())
     {
         format!(
             " Look at the documentation at {documentation} for help troubleshooting this error."
@@ -372,14 +422,13 @@ pub fn generate_wrapper_script(feature: &ResolvedFeature) -> String {
         String::new()
     };
 
-    // echoWarning slot: blank line when not deprecated, echo when deprecated.
-    let echo_warning = if feature.metadata.deprecated == Some(true) {
-        format!(
-            "echo '(!) WARNING: Using the deprecated Feature \"{display_id}\". \
-             This Feature will no longer receive any further updates/support.'"
-        )
-    } else {
+    // Build the combined warning header (deprecation + rename), matching the
+    // official single-echo pattern.
+    let warning_header = build_warning_header(feature, &display_id);
+    let echo_warning = if warning_header.is_empty() {
         String::new()
+    } else {
+        format!("echo '{warning_header}'")
     };
 
     // Options block: indented env-var lines, shell-escaped, joined with literal newlines.
@@ -1060,6 +1109,129 @@ mod tests {
         assert!(
             script.contains("A user'\\''s best friend"),
             "description apostrophe not escaped:\n{script}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Rename warning (referenced by legacy id)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn wrapper_script_renamed_feature_emits_warning() {
+        // User referenced `maven:1`; canonical id is `java` — rename warning fires.
+        let feature = make_feature(
+            "java",
+            "ghcr.io/devcontainers/features/maven:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "java".to_string(),
+                version: "1.0.0".to_string(),
+                name: Some("Java".to_string()),
+                legacy_ids: vec!["maven".to_string(), "gradle".to_string()],
+                current_id: Some("java".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        assert!(
+            script.contains("(!) WARNING: This feature has been renamed."),
+            "rename warning missing:\n{script}"
+        );
+        assert!(
+            script.contains("devcontainer.json to \"java\""),
+            "rename warning should mention canonical id:\n{script}"
+        );
+        assert!(
+            !script.contains("(!) WARNING: Using the deprecated Feature"),
+            "should not have deprecation warning:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_canonical_ref_no_rename_warning() {
+        // User referenced `java:1`; leaf matches current_id — no rename warning.
+        let feature = make_feature(
+            "java",
+            "ghcr.io/devcontainers/features/java:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "java".to_string(),
+                version: "1.0.0".to_string(),
+                name: Some("Java".to_string()),
+                legacy_ids: vec!["maven".to_string(), "gradle".to_string()],
+                current_id: Some("java".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        assert!(
+            !script.contains("(!) WARNING: This feature has been renamed."),
+            "should not emit rename warning for canonical ref:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_legacy_ids_without_current_id_no_rename_warning() {
+        // legacyIds present but currentId absent — no rename warning.
+        let feature = make_feature(
+            "java",
+            "ghcr.io/devcontainers/features/maven:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "java".to_string(),
+                version: "1.0.0".to_string(),
+                name: Some("Java".to_string()),
+                legacy_ids: vec!["maven".to_string()],
+                current_id: None,
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        assert!(
+            !script.contains("(!) WARNING: This feature has been renamed."),
+            "should not emit rename warning without currentId:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_deprecated_and_renamed() {
+        // Both deprecated AND referenced by legacy id — both warnings in one echo.
+        let feature = make_feature(
+            "java",
+            "ghcr.io/devcontainers/features/maven:1",
+            true,
+            HashMap::new(),
+            FeatureMetadata {
+                id: "java".to_string(),
+                version: "1.0.0".to_string(),
+                name: Some("Java".to_string()),
+                legacy_ids: vec!["maven".to_string()],
+                current_id: Some("java".to_string()),
+                deprecated: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let script = generate_wrapper_script(&feature);
+        assert!(
+            script.contains("(!) WARNING: Using the deprecated Feature"),
+            "deprecation warning missing:\n{script}"
+        );
+        assert!(
+            script.contains("(!) WARNING: This feature has been renamed."),
+            "rename warning missing:\n{script}"
+        );
+        // Both must be inside a single echo (the echo appears exactly once).
+        let echo_count = script.matches("echo '(!)").count();
+        assert_eq!(
+            echo_count, 1,
+            "both warnings must share one echo: {echo_count} found"
         );
     }
 
