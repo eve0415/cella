@@ -1049,9 +1049,12 @@ mod tests {
     }
 
     #[test]
-    fn build_without_log_level_is_none() {
+    fn build_without_log_level_defaults_to_info() {
+        use super::commands::LogLevel;
+        // Official `devcontainer build --log-level` defaults to info; cella now
+        // matches it (was previously unset/None).
         let cli = parse(&["cella", "build"]).unwrap();
-        assert!(cli.command.log_level().is_none());
+        assert!(matches!(cli.command.log_level(), Some(LogLevel::Info)));
     }
 
     #[test]

@@ -519,7 +519,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
-            Self::Build(args) => args.log_level(),
+            Self::Build(args) => Some(args.log_level()),
             Self::Exec(args) => args.compat.log_level,
             Self::ReadConfiguration(args) => args.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,
