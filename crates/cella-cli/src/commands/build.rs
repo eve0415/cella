@@ -129,6 +129,44 @@ pub struct BuildArgs {
     /// official devcontainer CLI.
     #[arg(long = "skip-persisting-customizations-from-features", hide = true)]
     skip_persisting_customizations_from_features: bool,
+
+    #[command(flatten)]
+    compat: BuildCompatArgs,
+}
+
+/// Compatibility/diagnostic flags accepted for `devcontainer build` parity.
+///
+/// All no-ops in cella, split into their own struct so `BuildArgs` stays under
+/// `clippy::struct_excessive_bools`. Source: devcontainers/cli `buildOptions`
+/// (`devContainersSpecCLI.ts`, lines 525, 542, 548).
+#[derive(Args)]
+struct BuildCompatArgs {
+    /// Host directory persisted across sessions (compatibility no-op). cella
+    /// manages its own data dirs; accepted for drop-in parity with the official
+    /// `devcontainer build --user-data-folder`.
+    #[arg(long = "user-data-folder")]
+    user_data_folder: Option<PathBuf>,
+
+    /// Temporary option for testing; cella performs no feature auto-mapping on
+    /// the build path (compatibility no-op, hidden — matches the official
+    /// `hidden: true`).
+    #[arg(long = "skip-feature-auto-mapping", hide = true)]
+    skip_feature_auto_mapping: bool,
+
+    // `--omit-syntax-directive` is a true no-op in cella's build path. The
+    // official CLI has two effects: (A) it parses the user's Dockerfile in JS
+    // and strips any `# syntax=` directive (a moby/buildkit#4556 workaround),
+    // and (B) it suppresses the `# syntax=` line it would otherwise prepend to
+    // its generated feature-extension Dockerfile. cella does NEITHER: it never
+    // parses Dockerfile content (`BuildOptions.dockerfile` is a filename passed
+    // verbatim as `-f`; the engine reads any `# syntax=` natively), and
+    // `cella_features::generate_dockerfile` emits no `# syntax=` line at all (it
+    // opens with `ARG`/`FROM`). So cella already behaves as if this flag is
+    // permanently on — there is nothing to suppress. Accepted-and-ignored for
+    // drop-in parity (mirrors `up`'s `--omit-syntax-directive`).
+    /// Omit Dockerfile syntax directives (compatibility no-op).
+    #[arg(long = "omit-syntax-directive", hide = true)]
+    omit_syntax_directive: bool,
 }
 
 impl BuildArgs {
@@ -888,5 +926,113 @@ mod tests {
     fn skip_persisting_customizations_from_features_parses() {
         let args = parse_build(&["--skip-persisting-customizations-from-features"]);
         assert!(args.skip_persisting_customizations_from_features);
+    }
+
+    // ── newly-added compat flags ────────────────────────────────────
+
+    #[test]
+    fn user_data_folder_parses() {
+        let args = parse_build(&["--user-data-folder", "/persist"]);
+        assert_eq!(
+            args.compat.user_data_folder,
+            Some(PathBuf::from("/persist"))
+        );
+    }
+
+    #[test]
+    fn skip_feature_auto_mapping_defaults_false_and_parses() {
+        assert!(!parse_build(&[]).compat.skip_feature_auto_mapping);
+        assert!(
+            parse_build(&["--skip-feature-auto-mapping"])
+                .compat
+                .skip_feature_auto_mapping
+        );
+    }
+
+    #[test]
+    fn omit_syntax_directive_defaults_false_and_parses() {
+        // No-op in cella (the generated feature Dockerfile emits no `# syntax=`
+        // line and cella never rewrites a user Dockerfile), but it must parse so
+        // `devcontainer build --omit-syntax-directive` is accepted as a drop-in.
+        assert!(!parse_build(&[]).compat.omit_syntax_directive);
+        assert!(
+            parse_build(&["--omit-syntax-directive"])
+                .compat
+                .omit_syntax_directive
+        );
+    }
+
+    // ── devcontainer-CLI flag parity ───────────────────────────────
+    //
+    // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
+    // `buildOptions` (lines 523-548). Every official long flag MUST be declared
+    // so no official `devcontainer build` invocation errors with "unknown
+    // argument" — EXCEPT `--push`/`--output` of the registry-write surface that
+    // cella intentionally defers (`--push`) or already supports (`--output` is
+    // present). This test pins the surface so it can't silently drift again.
+    const OFFICIAL_BUILD_FLAGS: &[&str] = &[
+        "user-data-folder",
+        "docker-path",
+        "docker-compose-path",
+        "workspace-folder",
+        "config",
+        "log-level",
+        "log-format",
+        "no-cache",
+        "image-name",
+        "cache-from",
+        "cache-to",
+        "buildkit",
+        "platform",
+        "label",
+        "output",
+        "additional-features",
+        "skip-feature-auto-mapping",
+        "skip-persisting-customizations-from-features",
+        "experimental-lockfile",
+        "experimental-frozen-lockfile",
+        "no-lockfile",
+        "frozen-lockfile",
+        "omit-syntax-directive",
+    ];
+
+    #[test]
+    fn build_flag_parity() {
+        use clap::CommandFactory;
+        use std::collections::HashSet;
+        let cli = crate::Cli::command();
+        let cmd = cli
+            .find_subcommand("build")
+            .expect("`build` subcommand must exist");
+        let longs: HashSet<&str> = cmd
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+            .collect();
+        let missing: Vec<&&str> = OFFICIAL_BUILD_FLAGS
+            .iter()
+            .filter(|f| !longs.contains(**f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`build` is missing official flags: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn build_accepts_all_new_compat_flags_together() {
+        // A maximal official-style invocation including the three newly-added
+        // flags must parse Ok.
+        let args = parse_build(&[
+            "--user-data-folder",
+            "/persist",
+            "--skip-feature-auto-mapping",
+            "--omit-syntax-directive",
+        ]);
+        assert_eq!(
+            args.compat.user_data_folder,
+            Some(PathBuf::from("/persist"))
+        );
+        assert!(args.compat.skip_feature_auto_mapping);
+        assert!(args.compat.omit_syntax_directive);
     }
 }
