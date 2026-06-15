@@ -74,6 +74,18 @@ pub fn parse_run_args(args: &[String]) -> RunArgsOverrides {
                 parse_capability_arg(flag, &mut i, inline_val, &next_val, &mut result);
             }
 
+            "--env" | "-e" => {
+                if let Some(v) = next_val(&mut i, inline_val) {
+                    result.env.push(v);
+                }
+            }
+
+            "--env-file" => {
+                if let Some(path) = next_val(&mut i, inline_val) {
+                    parse_env_file(&path, &mut result.env);
+                }
+            }
+
             // -- Boolean flags (no value) --
             "--init" => result.init = Some(true),
             "--privileged" => result.privileged = Some(true),
@@ -486,6 +498,28 @@ fn parse_ulimit(s: &str) -> Option<UlimitSpec> {
     })
 }
 
+/// Read an env-file and push `KEY=VAL` lines into `out`.
+///
+/// Lines that are blank or start with `#` are skipped, matching Docker's
+/// `--env-file` behaviour. On I/O error, emits a warning and returns without
+/// pushing anything from the failed file.
+fn parse_env_file(path: &str, out: &mut Vec<String>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("runArgs: --env-file {path:?}: {err}");
+            return;
+        }
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+}
+
 /// Emit warnings for any unrecognized flags.
 pub fn warn_unrecognized(overrides: &RunArgsOverrides) {
     for flag in &overrides.unrecognized {
@@ -806,6 +840,64 @@ mod tests {
     fn parse_empty_args() {
         let r = parse_run_args(&[]);
         assert!(r.network_mode.is_none());
+        assert!(r.unrecognized.is_empty());
+    }
+
+    // -- Env flags --
+
+    #[test]
+    fn parse_env_long_flag() {
+        let r = parse_run_args(&args(&["--env", "FOO=bar"]));
+        assert_eq!(r.env, vec!["FOO=bar"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_short_flag() {
+        let r = parse_run_args(&args(&["-e", "BAZ=qux"]));
+        assert_eq!(r.env, vec!["BAZ=qux"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_inline_equals() {
+        let r = parse_run_args(&args(&["--env=HELLO=world"]));
+        assert_eq!(r.env, vec!["HELLO=world"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_multiple() {
+        let r = parse_run_args(&args(&["--env", "A=1", "-e", "B=2", "--env=C=3"]));
+        assert_eq!(r.env, vec!["A=1", "B=2", "C=3"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_reads_lines() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "KEY1=val1").unwrap();
+        writeln!(f, "KEY2=val2").unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let r = parse_run_args(&args(&["--env-file", &path]));
+        assert_eq!(r.env, vec!["KEY1=val1", "KEY2=val2"]);
+        assert!(r.unrecognized.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_missing_warns_and_continues() {
+        // A missing env-file should not crash; the env list stays empty and
+        // other flags still parse correctly.
+        let r = parse_run_args(&args(&[
+            "--env-file",
+            "/nonexistent/does/not/exist.env",
+            "--privileged",
+        ]));
+        assert!(r.env.is_empty());
+        assert_eq!(r.privileged, Some(true));
         assert!(r.unrecognized.is_empty());
     }
 }

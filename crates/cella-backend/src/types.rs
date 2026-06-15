@@ -645,6 +645,10 @@ pub struct RunArgsOverrides {
     pub init: Option<bool>,
     pub privileged: Option<bool>,
 
+    /// Environment variables from `--env`/`-e` and `--env-file`, in `KEY=VAL` form.
+    /// Appended after `containerEnv`-derived env; Docker last-wins on duplicate keys.
+    pub env: Vec<String>,
+
     /// Flags not recognized by the parser (emitted as warnings).
     pub unrecognized: Vec<String>,
 }
