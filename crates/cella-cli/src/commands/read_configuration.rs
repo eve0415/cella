@@ -1238,12 +1238,16 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_temp_workspace(config_content: &str) -> PathBuf {
+        // Process id + a monotonic counter guarantees a unique path per call,
+        // even across parallel tests. A nanosecond timestamp alone can collide
+        // on CI VMs with coarse clock resolution, letting one test's
+        // `remove_dir_all` delete another's workspace mid-run (flaky failures).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let workspace = std::env::temp_dir().join(format!(
-            "cella-read-cfg-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
+            "cella-read-cfg-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let dc_dir = workspace.join(".devcontainer");
         std::fs::create_dir_all(&dc_dir).expect("create .devcontainer dir");

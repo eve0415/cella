@@ -33,6 +33,7 @@ inquire.workspace = true
 miette.workspace = true
 nix.workspace = true
 owo-colors.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 terminal_size.workspace = true
@@ -47,6 +48,7 @@ thiserror.workspace = true
 cella-container.workspace = true
 
 [dev-dependencies]
+cella-testing.workspace = true
 insta.workspace = true
 tempfile.workspace = true
 
