@@ -177,7 +177,7 @@ pub fn build(rf: &ResolvedFeatures) -> Result<Option<FeaturesConfiguration>, ser
         .features
         .iter()
         .enumerate()
-        .map(|(idx, f)| feature_set(f, idx, &dst_folder))
+        .map(|(idx, f)| feature_set(f, idx))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(FeaturesConfiguration {
         feature_sets,
@@ -185,14 +185,10 @@ pub fn build(rf: &ResolvedFeatures) -> Result<Option<FeaturesConfiguration>, ser
     }))
 }
 
-fn feature_set(
-    f: &ResolvedFeature,
-    idx: usize,
-    dst_folder: &str,
-) -> Result<FeatureSetOut, serde_json::Error> {
+fn feature_set(f: &ResolvedFeature, idx: usize) -> Result<FeatureSetOut, serde_json::Error> {
     Ok(FeatureSetOut {
         source_information: source_information(f)?,
-        features: vec![feature_out(f, idx, dst_folder)],
+        features: vec![feature_out(f, idx)],
     })
 }
 
@@ -207,7 +203,14 @@ fn source_information(f: &ResolvedFeature) -> Result<SourceInformationOut, serde
             // contract violation, so callers should see the failure.
             manifest: serde_json::to_value(&oci.manifest)?,
             manifest_digest: oci.digest.clone(),
-            feature_ref: parse_feature_ref(&f.original_ref),
+            // featureRef comes from the normalized/fetched coordinates, not the
+            // raw user ref: aliases (e.g. `maven` → java) resolve to a different
+            // registry/repo, and the official builds featureRef from the fetched
+            // identifier while `userFeatureId` keeps the original.
+            feature_ref: parse_feature_ref(&format!(
+                "{}/{}:{}",
+                oci.registry, oci.repository, oci.version
+            )),
             user_feature_id,
             user_feature_id_without_version,
         })),
@@ -224,7 +227,7 @@ fn source_information(f: &ResolvedFeature) -> Result<SourceInformationOut, serde
     })
 }
 
-fn feature_out(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureOut {
+fn feature_out(f: &ResolvedFeature, idx: usize) -> FeatureOut {
     let m = &f.metadata;
     let consecutive_id = format!("{}_{}", f.id, idx);
     // Deterministic key order for `value` (the official preserves the
@@ -236,14 +239,11 @@ fn feature_out(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureOut 
         id: f.id.clone(),
         included: true,
         value,
-        // Join with the platform separator (matches the official's
-        // path.join(dstFolder, consecutiveId)) rather than a hard-coded `/`.
-        cache_path: Some(
-            std::path::Path::new(dst_folder)
-                .join(&consecutive_id)
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        // Point at cella's real cached feature directory — the only path
+        // guaranteed to exist for `read-configuration` (the official's
+        // dstFolder/consecutiveId is a build-time staging copy cella creates
+        // elsewhere).
+        cache_path: Some(f.artifact_dir.to_string_lossy().into_owned()),
         consecutive_id,
         version: non_empty(&m.version),
         name: m.name.clone(),
@@ -257,11 +257,7 @@ fn feature_out(f: &ResolvedFeature, idx: usize, dst_folder: &str) -> FeatureOut 
         installs_after: m.installs_after.clone(),
         legacy_ids: m.legacy_ids.clone(),
         customizations: m.customizations.clone(),
-        mounts: m
-            .mounts
-            .iter()
-            .map(|s| serde_json::Value::String(s.clone()))
-            .collect(),
+        mounts: m.mounts.iter().map(|s| parse_mount_spec(s)).collect(),
         init: m.init,
         privileged: m.privileged,
         cap_add: m.cap_add.clone(),
@@ -376,6 +372,33 @@ fn non_empty(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// Parse a docker mount-spec string (`type=…,source=…,target=…`) — the form
+/// cella's metadata parser flattens feature mounts into — back into the
+/// official object shape (`{type, source?, target}`). Feature mounts are
+/// object-only per the spec, so a string here would be the wrong type. Empty
+/// values are dropped; `src`/`dst` normalise to `source`/`target`.
+fn parse_mount_spec(spec: &str) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for part in spec.split(',') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let key = match key.trim() {
+            "src" => "source",
+            "dst" => "target",
+            other => other,
+        };
+        obj.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +411,9 @@ mod tests {
         // Build the typed manifest via deserialization so the test needs no
         // direct oci_distribution dependency (the field type is inferred).
         ResolvedOciManifest {
+            registry: "ghcr.io".to_string(),
+            repository: "devcontainers/features/node".to_string(),
+            version: "1".to_string(),
             digest: "sha256:manifestdigest".to_string(),
             manifest: serde_json::from_value(serde_json::json!({
                 "schemaVersion": 2,
@@ -498,7 +524,7 @@ mod tests {
         assert_eq!(feat["included"], true);
         assert_eq!(feat["value"], serde_json::json!({"version": "20"}));
         assert_eq!(feat["consecutiveId"], "node_0");
-        assert_eq!(feat["cachePath"], "/tmp/cella-features/node_0");
+        assert_eq!(feat["cachePath"], "/cache/node");
         assert_eq!(feat["version"], "1.3.0");
         assert_eq!(feat["name"], "Node.js");
         assert_eq!(feat["containerEnv"]["NVM_DIR"], "/usr/local/nvm");
@@ -526,6 +552,56 @@ mod tests {
         assert_eq!(si["type"], "file-path");
         assert_eq!(si["userFeatureId"], "./my-feature");
         assert!(si.get("manifest").is_none(), "non-OCI has no manifest");
+    }
+
+    #[test]
+    fn featureref_uses_normalized_coords_not_raw_alias() {
+        // A deprecated alias (`maven`) resolves to a different registry/repo;
+        // featureRef must reflect the fetched target, userFeatureId the alias.
+        let mut f = oci_feature();
+        f.id = "java".to_string();
+        f.original_ref = "maven".to_string();
+        f.oci = Some(ResolvedOciManifest {
+            registry: "ghcr.io".to_string(),
+            repository: "devcontainers/features/java".to_string(),
+            version: "1".to_string(),
+            digest: "sha256:javadigest".to_string(),
+            manifest: manifest().manifest,
+        });
+        let fc = build(&resolved(vec![f]))
+            .unwrap()
+            .expect("features present");
+        let v = serde_json::to_value(&fc).unwrap();
+        let si = &v["featureSets"][0]["sourceInformation"];
+        assert_eq!(si["userFeatureId"], "maven");
+        assert_eq!(si["userFeatureIdWithoutVersion"], "maven");
+        let fr = &si["featureRef"];
+        assert_eq!(fr["id"], "java");
+        assert_eq!(fr["resource"], "ghcr.io/devcontainers/features/java");
+        assert_eq!(fr["registry"], "ghcr.io");
+    }
+
+    #[test]
+    fn feature_mounts_emit_as_objects() {
+        let mut f = oci_feature();
+        f.metadata.mounts =
+            vec!["type=volume,source=node-modules,target=/usr/local/lib".to_string()];
+        let fc = build(&resolved(vec![f]))
+            .unwrap()
+            .expect("features present");
+        let v = serde_json::to_value(&fc).unwrap();
+        let mount = &v["featureSets"][0]["features"][0]["mounts"][0];
+        assert_eq!(mount["type"], "volume");
+        assert_eq!(mount["source"], "node-modules");
+        assert_eq!(mount["target"], "/usr/local/lib");
+    }
+
+    #[test]
+    fn parse_mount_spec_omits_empty_source() {
+        let m = parse_mount_spec("type=volume,source=,target=/data");
+        assert_eq!(m["type"], "volume");
+        assert_eq!(m["target"], "/data");
+        assert!(m.get("source").is_none(), "empty source must be omitted");
     }
 
     #[test]

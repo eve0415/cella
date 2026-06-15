@@ -36,6 +36,13 @@ pub struct ResolvedFeature {
 /// `read-configuration`'s `sourceInformation.{manifestDigest,manifest}`.
 #[derive(Debug, Clone)]
 pub struct ResolvedOciManifest {
+    /// The normalized OCI coordinates actually fetched, after alias/redirect
+    /// resolution (e.g. `maven` → `ghcr.io/devcontainers/features/java`). Used
+    /// to build `sourceInformation.featureRef` — which the official derives from
+    /// the fetched identifier, not the raw user ref.
+    pub registry: String,
+    pub repository: String,
+    pub version: String,
     /// The resolved manifest content digest (`sourceInformation.manifestDigest`,
     /// e.g. `"sha256:abc…"`).
     pub digest: String,

@@ -901,6 +901,9 @@ fn assemble_resolved(
             // info) and the manifest blob; bundle them, or `None` for non-OCI.
             oci: match (&entry.oci, &entry.oci_manifest) {
                 (Some(lock), Some(manifest)) => Some(ResolvedOciManifest {
+                    registry: lock.registry.clone(),
+                    repository: lock.repository.clone(),
+                    version: lock.version.clone(),
                     digest: lock.digest.clone(),
                     manifest: manifest.clone(),
                 }),
