@@ -155,7 +155,7 @@ pub fn write_lockfile(config_path: &Path, lockfile: &Lockfile) -> Result<(), Fea
 ///
 /// Each tuple is `(key, version, resolved_full, integrity, depends_on)` where:
 /// - `key` — feature ID with any `:version` / `@digest` suffix stripped
-/// - `version` — the OCI tag that was fetched
+/// - `version` — the resolved feature version (e.g. `"1.7.1"`), not the tag
 /// - `resolved_full` — `"registry/repository@digest"`
 /// - `integrity` — the manifest digest (`"sha256:..."`)
 /// - `depends_on` — keys of features this one depends on (may be empty)

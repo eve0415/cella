@@ -619,7 +619,10 @@ fn build_lockfile_from_entries(feature_entries: &[FeatureEntry]) -> Lockfile {
             depends_on.dedup();
             Some((
                 entry.original_ref.clone(),
-                oci.version.clone(),
+                // The lockfile records the resolved feature version (e.g.
+                // `"1.7.1"`), not the OCI tag (`"1"`) — matching the official
+                // `version: set.features[0].version`.
+                entry.metadata.version.clone(),
                 resolved,
                 oci.digest.clone(),
                 depends_on,
@@ -2394,6 +2397,9 @@ mod tests {
             install_id: install_identity(original_ref, "{}"),
             metadata: FeatureMetadata {
                 id: repo.rsplit('/').next().unwrap_or(repo).to_string(),
+                // The resolved feature version (from devcontainer-feature.json),
+                // distinct from the OCI tag — this is what the lockfile records.
+                version: "1.7.1".to_string(),
                 ..Default::default()
             },
             artifact_dir: PathBuf::from("/tmp/feature"),
@@ -2426,7 +2432,9 @@ mod tests {
                 .contains_key("ghcr.io/devcontainers/features/node:1")
         );
         let entry = &lf.features["ghcr.io/devcontainers/features/node:1"];
-        assert_eq!(entry.version, "1");
+        // The key keeps the authored tag (`:1`), but `version` is the resolved
+        // feature version (matching the official `set.features[0].version`).
+        assert_eq!(entry.version, "1.7.1");
         assert_eq!(entry.integrity, "sha256:abc");
         assert_eq!(
             entry.resolved,
