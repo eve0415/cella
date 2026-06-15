@@ -18,7 +18,9 @@ use crate::FeatureError;
 /// A single feature entry inside the lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockfileEntry {
-    /// Resolved version (OCI tag, e.g. `"1"` or `"latest"`).
+    /// Resolved feature version (e.g. `"1.7.1"`), from the feature's
+    /// `devcontainer-feature.json` — not the OCI tag. Matches the official
+    /// lockfile's `version: set.features[0].version`.
     pub version: String,
     /// Full resolved reference with manifest digest, e.g.
     /// `"ghcr.io/devcontainers/features/node@sha256:abc..."`.
@@ -154,7 +156,8 @@ pub fn write_lockfile(config_path: &Path, lockfile: &Lockfile) -> Result<(), Fea
 /// Generate a [`Lockfile`] from a list of resolved OCI features.
 ///
 /// Each tuple is `(key, version, resolved_full, integrity, depends_on)` where:
-/// - `key` — feature ID with any `:version` / `@digest` suffix stripped
+/// - `key` — the feature ref exactly as authored; the `:tag` / `@digest`
+///   suffix is part of the key, never stripped
 /// - `version` — the resolved feature version (e.g. `"1.7.1"`), not the tag
 /// - `resolved_full` — `"registry/repository@digest"`
 /// - `integrity` — the manifest digest (`"sha256:..."`)
@@ -187,6 +190,14 @@ pub fn generate_lockfile(
 /// Returns `Ok(())` when they match, or [`LockfileError::Mismatch`] when they
 /// differ. The missing-file case is handled by the caller before this point
 /// (a `read_lockfile` returning `None`), so this only compares structure.
+///
+/// The comparison is a strict whole-entry equality, matching the official CLI's
+/// frozen check (a normalized full-content string compare). A lockfile written
+/// before features[].version switched from the OCI tag to the resolved version
+/// will therefore mismatch under `--frozen` even though the pinned digest is
+/// unchanged — a one-time regeneration, exactly as the official requires for any
+/// lockfile content change. Loosening this to pin only on the digest would make
+/// cella *more* permissive than the official, so it is intentionally strict.
 ///
 /// # Errors
 ///
