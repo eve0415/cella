@@ -12,7 +12,11 @@ use cella_templates::fetcher;
 #[derive(Args, Clone)]
 pub struct CommonFeatureFlags {
     /// Path to devcontainer.json (overrides auto-discovery).
-    #[arg(short = 'f', long = "file")]
+    ///
+    /// `--config` is accepted as an alias: it's the official flag name for
+    /// `outdated` (and the canonical devcontainer.json-path flag); cella's
+    /// feature subcommands historically used `--file`/`-f`.
+    #[arg(short = 'f', long = "file", visible_alias = "config")]
     pub file: Option<PathBuf>,
 
     /// Workspace folder path (defaults to current directory).
