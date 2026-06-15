@@ -897,7 +897,15 @@ fn assemble_resolved(
             user_options: entry.user_options.clone(),
             artifact_dir: entry.artifact_dir.clone(),
             has_install_script: has_install,
-            oci_manifest: entry.oci_manifest.clone(),
+            // An OCI feature carries both its resolved digest (from the lock
+            // info) and the manifest blob; bundle them, or `None` for non-OCI.
+            oci: match (&entry.oci, &entry.oci_manifest) {
+                (Some(lock), Some(manifest)) => Some(ResolvedOciManifest {
+                    digest: lock.digest.clone(),
+                    manifest: manifest.clone(),
+                }),
+                _ => None,
+            },
         });
 
         debug!(
@@ -1259,7 +1267,7 @@ mod tests {
             user_options: HashMap::new(),
             artifact_dir: PathBuf::from("/tmp/features/node"),
             has_install_script: true,
-            oci_manifest: None,
+            oci: None,
         }];
 
         let label = generate_metadata_label(&features, &json!({}), None, MetadataOmit::default());
@@ -1357,7 +1365,7 @@ mod tests {
             user_options: HashMap::new(),
             artifact_dir: PathBuf::from("/tmp/features/python"),
             has_install_script: true,
-            oci_manifest: None,
+            oci: None,
         }];
         let user_config = json!({
             "image": "ubuntu",

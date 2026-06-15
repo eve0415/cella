@@ -10,6 +10,7 @@ mod doctor;
 mod down;
 mod exec;
 pub mod features;
+mod features_configuration;
 mod init;
 mod install;
 mod list;

@@ -393,7 +393,7 @@ mod tests {
             user_options,
             artifact_dir: PathBuf::from(format!("/tmp/features/{id}")),
             has_install_script,
-            oci_manifest: None,
+            oci: None,
         }
     }
 

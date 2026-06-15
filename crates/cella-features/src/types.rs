@@ -19,10 +19,28 @@ pub struct ResolvedFeature {
     pub user_options: HashMap<String, serde_json::Value>,
     pub artifact_dir: PathBuf,
     pub has_install_script: bool,
-    /// The full OCI image manifest, present only for OCI-fetched features.
-    /// Retained for `read-configuration --include-features-configuration`
-    /// (`featureSets[].sourceInformation.manifest`); `None` for local/tarball.
-    pub oci_manifest: Option<oci_distribution::manifest::OciImageManifest>,
+    /// OCI source artifact (resolved manifest digest + the manifest blob),
+    /// present only for OCI-fetched features. `None` for local/tarball.
+    ///
+    /// Retained for `read-configuration --include-features-configuration`:
+    /// `sourceInformation.manifestDigest` and `sourceInformation.manifest`. The
+    /// `featureRef` parts are parsed from `original_ref` (matching the official
+    /// `getRef`), so only the resolved digest + manifest blob need carrying.
+    pub oci: Option<ResolvedOciManifest>,
+}
+
+/// The resolved OCI artifact for a feature: its manifest digest and blob.
+///
+/// Both travel together — an OCI feature always has both — so they are bundled
+/// rather than two parallel `Option`s that could disagree. Retained for
+/// `read-configuration`'s `sourceInformation.{manifestDigest,manifest}`.
+#[derive(Debug, Clone)]
+pub struct ResolvedOciManifest {
+    /// The resolved manifest content digest (`sourceInformation.manifestDigest`,
+    /// e.g. `"sha256:abc…"`).
+    pub digest: String,
+    /// The manifest blob (`sourceInformation.manifest`).
+    pub manifest: oci_distribution::manifest::OciImageManifest,
 }
 
 /// Parsed devcontainer-feature.json.
