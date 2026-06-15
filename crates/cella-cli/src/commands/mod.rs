@@ -179,8 +179,15 @@ pub struct WorkspaceCompatArgs {
     )]
     pub(crate) mount_workspace_git_root: bool,
 
-    /// Mount the Git worktree common dir (compatibility no-op).
-    #[arg(long = "mount-git-worktree-common-dir")]
+    /// Mount the Git worktree common dir (compatibility no-op). Accepts the
+    /// official yargs boolean forms: bare (`--mount-git-worktree-common-dir`),
+    /// explicit (`... false`), and absent (defaults to `false`).
+    #[arg(
+        long = "mount-git-worktree-common-dir",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     pub(crate) mount_git_worktree_common_dir: bool,
 
     /// Log verbosity (seeded into the global tracing filter by `main.rs`).
@@ -512,7 +519,7 @@ impl Command {
         match self {
             Self::Up(args) => args.compat.log_level,
             Self::Code(args) => args.up.compat.log_level,
-            Self::Build(args) => args.log_level(),
+            Self::Build(args) => Some(args.log_level()),
             Self::Exec(args) => args.compat.log_level,
             Self::ReadConfiguration(args) => args.compat.log_level,
             Self::RunUserCommands(args) => args.compat.log_level,

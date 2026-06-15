@@ -27,6 +27,16 @@ pub struct BuildArgs {
     #[arg(long)]
     workspace_folder: Option<PathBuf>,
 
+    /// Optional positional workspace path. The official CLI registers
+    /// `build [path]` but its `doBuild` IGNORES the positional entirely (it
+    /// always resolves from `--workspace-folder`, defaulting to cwd). cella
+    /// instead uses it as the workspace folder when `--workspace-folder` is
+    /// absent — a deliberate usability divergence so `cella build ./foo` works
+    /// as users expect. `--workspace-folder` still takes precedence when both
+    /// are given.
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+
     /// Path to devcontainer.json (overrides auto-discovery).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -110,9 +120,10 @@ pub struct BuildArgs {
     #[arg(long = "docker-compose-path")]
     docker_compose_path: Option<String>,
 
-    /// Log verbosity for build output.
-    #[arg(long = "log-level", value_enum)]
-    log_level: Option<LogLevel>,
+    /// Log verbosity for build output. Defaults to `info`, matching the
+    /// official `devcontainer build --log-level`.
+    #[arg(long = "log-level", value_enum, default_value = "info")]
+    log_level: LogLevel,
 
     /// Log output format.
     #[arg(long = "log-format", value_enum, default_value = "text")]
@@ -171,14 +182,23 @@ struct BuildCompatArgs {
 
 impl BuildArgs {
     /// The `--log-level` value, seeded into the global tracing filter by main.rs
-    /// before dispatch (mirrors `up`).
-    pub const fn log_level(&self) -> Option<LogLevel> {
+    /// before dispatch (mirrors `up`). Build's log level always has a value
+    /// (defaults to `info`, matching the official CLI), so this is non-optional.
+    pub const fn log_level(&self) -> LogLevel {
         self.log_level
     }
 
     /// The `--log-format` value (defaults to `Text`).
     pub const fn log_format(&self) -> LogFormat {
         self.log_format
+    }
+
+    /// The effective workspace folder: `--workspace-folder` wins, else the
+    /// optional positional `[path]`, else (handled downstream) the cwd. Mirrors
+    /// the official `build [path]` surface where `--workspace-folder` takes
+    /// precedence over the positional.
+    fn effective_workspace_folder(&self) -> Option<&std::path::Path> {
+        self.workspace_folder.as_deref().or(self.path.as_deref())
     }
 
     pub async fn execute(
@@ -201,7 +221,7 @@ impl BuildArgs {
         self,
         progress: crate::progress::Progress,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cwd = super::resolve_workspace_folder(self.workspace_folder.as_deref())?;
+        let cwd = super::resolve_workspace_folder(self.effective_workspace_folder())?;
 
         info!("Resolving devcontainer config...");
         let mut resolved = resolve::config(&cwd, self.config.as_deref())?;
@@ -792,15 +812,45 @@ mod tests {
     #[test]
     fn log_level_and_format_accessors_return_parsed_values() {
         let args = parse_build(&["--log-level", "debug", "--log-format", "json"]);
-        assert!(matches!(args.log_level(), Some(LogLevel::Debug)));
+        assert!(matches!(args.log_level(), LogLevel::Debug));
         assert!(matches!(args.log_format(), LogFormat::Json));
     }
 
     #[test]
-    fn log_level_defaults_to_none_and_format_to_text() {
+    fn log_level_defaults_to_info_and_format_to_text() {
+        // Official `devcontainer build --log-level` defaults to `info`; cella
+        // matches it (was previously unset/None).
         let args = parse_build(&[]);
-        assert!(args.log_level().is_none());
+        assert!(matches!(args.log_level(), LogLevel::Info));
         assert!(matches!(args.log_format(), LogFormat::Text));
+    }
+
+    #[test]
+    fn positional_path_sets_workspace_folder() {
+        // Official registers `build [path]`; cella accepts the optional
+        // positional and uses it as the workspace folder when present.
+        let args = parse_build(&["./some/path"]);
+        assert_eq!(
+            args.effective_workspace_folder(),
+            Some(std::path::Path::new("./some/path"))
+        );
+    }
+
+    #[test]
+    fn workspace_folder_flag_wins_over_positional() {
+        // When both are given, `--workspace-folder` takes precedence.
+        let args = parse_build(&["--workspace-folder", "/flag", "/positional"]);
+        assert_eq!(
+            args.effective_workspace_folder(),
+            Some(std::path::Path::new("/flag"))
+        );
+    }
+
+    #[test]
+    fn no_path_or_flag_leaves_workspace_folder_unset() {
+        // Neither given → None (resolve_workspace_folder defaults to cwd).
+        let args = parse_build(&[]);
+        assert!(args.effective_workspace_folder().is_none());
     }
 
     // ── lockfile policy derivation ──────────────────────────────────

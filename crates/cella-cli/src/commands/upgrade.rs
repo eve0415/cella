@@ -28,6 +28,29 @@ pub struct UpgradeArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Path to the `docker` executable (compatibility no-op; cella talks to the
+    /// engine API directly). Matches the official `--docker-path` default.
+    #[arg(long = "docker-path", default_value = "docker")]
+    pub docker_path: String,
+
+    /// Path to the `docker-compose` executable (compatibility no-op). Matches
+    /// the official `--docker-compose-path` default.
+    #[arg(long = "docker-compose-path", default_value = "docker-compose")]
+    pub docker_compose_path: String,
+
+    /// Target a single Feature for upgrade (the official CLI's dependabot path,
+    /// alongside `--target-version`). Hidden parity flag, accepted-and-ignored:
+    /// cella currently refreshes the whole lockfile, so targeted single-Feature
+    /// upgrade is a follow-up. Accepted independently of `--target-version`.
+    #[arg(short = 'f', long = "feature", hide = true)]
+    pub feature: Option<String>,
+
+    /// The target version (`x`, `x.y`, or `x.y.z`) for `--feature`. Hidden
+    /// parity flag, accepted-and-ignored (see `--feature`); accepted
+    /// independently.
+    #[arg(short = 'v', long = "target-version", hide = true)]
+    pub target_version: Option<String>,
+
     /// Log verbosity level.
     #[arg(long, value_enum, default_value_t = crate::commands::LogLevel::Info)]
     pub log_level: crate::commands::LogLevel,
@@ -124,4 +147,56 @@ fn read_config_json(
     let stripped = cella_jsonc::strip(&raw).map_err(|e| e.to_string())?;
     let value = serde_json::from_str(&stripped)?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    fn upgrade_args(extra: &[&str]) -> super::UpgradeArgs {
+        let mut argv = vec!["cella", "upgrade"];
+        argv.extend_from_slice(extra);
+        let cli = crate::Cli::try_parse_from(argv).expect("upgrade args parse");
+        match cli.command {
+            crate::commands::Command::Upgrade(args) => args,
+            _ => panic!("expected upgrade command"),
+        }
+    }
+
+    #[test]
+    fn upgrade_accepts_official_flags() {
+        // Regression: `--docker-path`, `--docker-compose-path`, `--feature`
+        // (alias -f) and `--target-version` (alias -v) are official
+        // featuresUpgradeOptions flags that were missing. They must all parse.
+        let args = upgrade_args(&[
+            "--docker-path",
+            "/x",
+            "--docker-compose-path",
+            "/y",
+            "--feature",
+            "ghcr.io/devcontainers/features/node",
+            "-v",
+            "1",
+        ]);
+        assert_eq!(args.docker_path, "/x");
+        assert_eq!(args.docker_compose_path, "/y");
+        assert_eq!(
+            args.feature.as_deref(),
+            Some("ghcr.io/devcontainers/features/node")
+        );
+        assert_eq!(args.target_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn upgrade_flag_aliases_and_defaults_match_official() {
+        // -f is the alias for --feature; defaults mirror the official CLI.
+        let args = upgrade_args(&["-f", "node"]);
+        assert_eq!(args.feature.as_deref(), Some("node"));
+
+        let args = upgrade_args(&[]);
+        assert_eq!(args.docker_path, "docker");
+        assert_eq!(args.docker_compose_path, "docker-compose");
+        assert!(args.feature.is_none());
+        assert!(args.target_version.is_none());
+    }
 }

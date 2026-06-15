@@ -95,8 +95,15 @@ pub struct GateArgs {
 /// bool-count lint; flattened it merges back into the same CLI surface.
 #[derive(Args)]
 pub struct AttachArgs {
-    /// Do not run `postAttachCommand`.
-    #[arg(long = "skip-post-attach")]
+    /// Do not run `postAttachCommand`. Accepts the official yargs boolean forms:
+    /// bare (`--skip-post-attach`), explicit (`--skip-post-attach false`), and
+    /// absent (defaults to `false`).
+    #[arg(
+        long = "skip-post-attach",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     skip_post_attach: bool,
 }
 
@@ -141,12 +148,26 @@ pub struct CompatArgs {
     #[arg(long = "user-data-folder")]
     user_data_folder: Option<PathBuf>,
 
-    /// Mount the workspace using its Git root (compatibility no-op).
-    #[arg(long = "mount-workspace-git-root", default_value_t = true)]
+    /// Mount the workspace using its Git root (compatibility no-op, default
+    /// `true`). Accepts the official yargs boolean forms: bare, explicit
+    /// (`--mount-workspace-git-root false`), and absent (defaults to `true`).
+    #[arg(
+        long = "mount-workspace-git-root",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+    )]
     mount_workspace_git_root: bool,
 
-    /// Mount the Git worktree common dir (compatibility no-op).
-    #[arg(long = "mount-git-worktree-common-dir")]
+    /// Mount the Git worktree common dir (compatibility no-op). Accepts the
+    /// official yargs boolean forms: bare, explicit (`... false`), and absent
+    /// (defaults to `false`).
+    #[arg(
+        long = "mount-git-worktree-common-dir",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+    )]
     mount_git_worktree_common_dir: bool,
 
     /// Temporary option for testing; cella resolves no features on this path
@@ -755,6 +776,43 @@ mod tests {
             ]);
             assert!(r.is_ok(), "{flag} should parse");
         }
+    }
+
+    #[test]
+    fn boolean_flags_accept_explicit_values() {
+        use clap::Parser;
+        // Official `type:'boolean'` flags accept both the bare form and an
+        // explicit `--flag false` (yargs parity). A prior plain-bool definition
+        // rejected `--skip-post-attach false` etc.
+        let cli = crate::Cli::try_parse_from([
+            "cella",
+            "run-user-commands",
+            "--container-id",
+            "abc",
+            "--skip-post-attach",
+            "false",
+            "--mount-workspace-git-root",
+            "false",
+            "--mount-git-worktree-common-dir",
+            "true",
+        ])
+        .expect("explicit boolean values must parse");
+        let crate::commands::Command::RunUserCommands(args) = &cli.command else {
+            panic!("expected run-user-commands subcommand");
+        };
+        assert!(!args.attach.skip_post_attach());
+        assert!(!args.compat.mount_workspace_git_root);
+        assert!(args.compat.mount_git_worktree_common_dir);
+
+        // Bare forms and absence keep the official defaults.
+        let cli =
+            crate::Cli::try_parse_from(["cella", "run-user-commands", "--container-id", "abc"])
+                .expect("bare invocation must parse");
+        let crate::commands::Command::RunUserCommands(args) = &cli.command else {
+            panic!("expected run-user-commands subcommand");
+        };
+        assert!(!args.attach.skip_post_attach());
+        assert!(args.compat.mount_workspace_git_root);
     }
 
     #[test]
