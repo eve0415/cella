@@ -30,6 +30,14 @@ pub struct BuildTuning<'a> {
     /// every build site (base + features layer) so the whole chain targets the
     /// same arch.
     pub platform: Option<&'a str>,
+    /// Push the FINAL image to a registry (`docker buildx build --push`).
+    /// buildx-only; `build`-command only. Applied to exactly one build — the
+    /// final image: the base build when there are no features, the features
+    /// layer otherwise. The `up` path leaves this `false` (it must load the
+    /// image locally to run the container). The `toolchain()` view preserves
+    /// this flag so the features layer (which IS the final image when features
+    /// are present) can push.
+    pub push: bool,
 }
 
 impl Default for BuildTuning<'_> {
@@ -42,6 +50,7 @@ impl Default for BuildTuning<'_> {
             cli_cache_from: &[],
             cache_to: None,
             platform: None,
+            push: false,
         }
     }
 }
@@ -49,6 +58,11 @@ impl Default for BuildTuning<'_> {
 impl BuildTuning<'_> {
     /// Toolchain-only view (docker binary + `BuildKit` decision) for build
     /// sites that must NOT inherit cache I/O (features layer, UID remap).
+    ///
+    /// `push` is preserved: the features layer is explicitly the final image
+    /// when features are present, so it must carry the push flag through. The
+    /// UID-remap build is the only non-final-image toolchain site, and its
+    /// caller always sets `push: false` on `BuildOptions` directly.
     #[must_use]
     pub const fn toolchain(self) -> Self {
         Self {
@@ -57,6 +71,7 @@ impl BuildTuning<'_> {
             cli_cache_from: &[],
             cache_to: None,
             platform: self.platform,
+            push: self.push,
         }
     }
 }

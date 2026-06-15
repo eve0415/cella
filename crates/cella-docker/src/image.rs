@@ -152,14 +152,18 @@ fn build_command_args(opts: &BuildOptions, use_buildx: bool) -> Vec<String> {
     }
     args.push("build".to_string());
 
-    // `--progress=plain`, `--load`, and `--output` are buildx-only. The classic
-    // builder rejects `--progress`, and official emits none of these on the
-    // legacy path. A `--output <spec>` *replaces* `--load` (which is itself
-    // shorthand for `--output=docker`); the two are mutually exclusive, so the
-    // export spec wins when set (mirrors the official singleContainer.ts).
+    // `--progress=plain`, `--load`, `--push`, and `--output` are buildx-only.
+    // The classic builder rejects `--progress`, and official emits none of these
+    // on the legacy path. `--push` takes highest precedence (pushes to registry
+    // and suppresses `--load`). A `--output <spec>` *replaces* `--load` (which
+    // is itself shorthand for `--output=docker`). The three are mutually
+    // exclusive: push wins first, then output, then the --load default.
+    // Mirrors the official singleContainer.ts ordering.
     if use_buildx {
         args.push("--progress=plain".to_string());
-        if let Some(output) = &opts.output {
+        if opts.push {
+            args.push("--push".to_string());
+        } else if let Some(output) = &opts.output {
             args.extend(["--output".to_string(), output.clone()]);
         } else {
             args.push("--load".to_string());
@@ -348,6 +352,17 @@ impl DockerClient {
             });
         }
 
+        // `--push` is buildx-only (classic `docker build` has no registry push).
+        // Unlike `--output`, it can be silently dropped on the classic path —
+        // the image is still built locally, so nothing is lost to the local
+        // store. Warn so the user knows the registry push did not happen.
+        if !use_buildx && opts.push {
+            tracing::warn!(
+                "--push is ignored without BuildKit/buildx (classic docker build); \
+                 the image was built locally but NOT pushed to the registry"
+            );
+        }
+
         let args = build_command_args(opts, use_buildx);
 
         debug!("{bin} {}", args.join(" "));
@@ -509,6 +524,7 @@ mod tests {
             platform: None,
             output: None,
             labels: Vec::new(),
+            push: false,
         }
     }
 
@@ -1011,6 +1027,65 @@ mod tests {
         assert!(
             !args.contains(&"--platform".to_string()),
             "--platform must be suppressed on classic builder; args: {args:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // --push flag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_args_push_emits_push_and_suppresses_load_on_buildx() {
+        // `--push` (buildx registry push) is mutually exclusive with `--load`.
+        // When push is set on the buildx path, `--push` must be emitted and
+        // `--load` must be suppressed.
+        let mut opts = basic_opts();
+        opts.push = true;
+        let args = build_command_args(&opts, true);
+        assert!(
+            args.contains(&"--push".to_string()),
+            "--push must be emitted when push=true; args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--load".to_string()),
+            "--load must be suppressed when --push is set; args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--output".to_string()),
+            "--output must not appear alongside --push; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_push_false_no_push_arg() {
+        // push=false → --push must never appear in the args (even on buildx path).
+        let opts = basic_opts();
+        let args = build_command_args(&opts, true);
+        assert!(
+            !args.contains(&"--push".to_string()),
+            "--push must not appear when push=false; args: {args:?}"
+        );
+        // Default --load is preserved.
+        assert!(
+            args.contains(&"--load".to_string()),
+            "--load must be present when push=false and no output; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_push_suppressed_on_classic_builder() {
+        // `--push` is buildx-only; classic `docker build` does not support it.
+        // On the classic path it must not be emitted (build_image warns instead).
+        let mut opts = basic_opts();
+        opts.push = true;
+        let args = build_command_args(&opts, false);
+        assert!(
+            !args.contains(&"--push".to_string()),
+            "--push must not appear on classic builder; args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--load".to_string()),
+            "--load must not appear on classic builder; args: {args:?}"
         );
     }
 

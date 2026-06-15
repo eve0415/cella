@@ -39,6 +39,10 @@ pub struct FeaturesLayerContext<'a> {
     /// rule as `output`: when features are layered the features image is the
     /// final image, so the labels are baked here. Empty slice = no labels.
     pub labels: &'a [String],
+    /// Push the FINAL image to a registry (`--push`, buildx-only). When features
+    /// are layered, the features image is the final image, so the push belongs
+    /// here — never on the base build, which must stay loadable for the `FROM`.
+    pub push: bool,
     pub progress: &'a ProgressSender,
 }
 
@@ -99,6 +103,8 @@ pub async fn build_features_layer(
         // Likewise the final image, so user `--label`s are baked here (the base
         // build stays unlabeled — it is an internal FROM, not the user's image).
         labels: ctx.labels.to_vec(),
+        // Features layer is the final image, so `--push` belongs here too.
+        push: ctx.push,
     };
 
     info!(
@@ -194,6 +200,17 @@ fn base_labels(will_build_features: bool, labels: &[String]) -> Vec<String> {
     }
 }
 
+/// Whether to push on the *base* image build.
+///
+/// Same placement rule as [`base_output`]: `--push` belongs on exactly one build
+/// — the final image. When a features layer follows (`will_build_features`), the
+/// features image is the final image and carries `--push`; the base build must
+/// stay `--load`-able for the features `FROM`. Returns `false` in that case;
+/// otherwise the base build is the final image and gets the push flag as-is.
+const fn base_push(will_build_features: bool, push: bool) -> bool {
+    !will_build_features && push
+}
+
 /// Whether `--label`s were requested but have no build to attach to.
 ///
 /// `--label` bakes a label via a `docker build --label`, so it needs a build.
@@ -209,14 +226,15 @@ const fn image_labels_have_no_target(will_build_features: bool, has_labels: bool
 
 /// Whether to skip inspecting the base image after the build.
 ///
-/// A non-loading `--output` export with no features builds the image but does
-/// NOT load it into the local store, so a follow-up `inspect_image_details`
-/// would fail right after a successful export. In that one case the inspect is
-/// skipped (the no-features build path discards these details, and `up` never
-/// exports). With features, the base build still `--load`s (the export rides the
-/// features layer), so the base remains inspectable.
-const fn skip_base_inspect(has_features: bool, output: Option<&str>) -> bool {
-    !has_features && output.is_some()
+/// A non-loading `--output` export or a `--push` with no features builds the
+/// image but does NOT load it into the local store, so a follow-up
+/// `inspect_image_details` would fail right after a successful export/push. In
+/// those cases the inspect is skipped (the no-features build path discards these
+/// details, and `up` never exports or pushes). With features, the base build
+/// still `--load`s (the export/push rides the features layer), so the base
+/// remains inspectable.
+const fn skip_base_inspect(has_features: bool, output: Option<&str>, push: bool) -> bool {
+    !has_features && (output.is_some() || push)
 }
 
 /// Ensure the dev container image exists (pull or build), including features layer.
@@ -246,11 +264,12 @@ pub async fn ensure_image(
 
     let base_image_tag = resolve_base_image(input, has_features).await?;
 
-    // A non-loading `--output` export (no features) builds the image but does
-    // NOT load it into the local store, so inspecting it would fail right after a
-    // successful export. `cella build` discards these details on the no-features
-    // path and `up` never exports, so return empty details instead of failing.
-    if skip_base_inspect(has_features, input.output) {
+    // A non-loading `--output` export or `--push` (no features) builds the image
+    // but does NOT load it into the local store, so inspecting it would fail
+    // right after a successful export/push. `cella build` discards these details
+    // on the no-features path and `up` never exports or pushes, so return empty
+    // details instead of failing.
+    if skip_base_inspect(has_features, input.output, input.build_tuning.push) {
         return Ok((base_image_tag, None, ImageDetails::default()));
     }
 
@@ -389,6 +408,10 @@ async fn resolve_base_image(
         // User `--label`s land on the base build only when it is the final image;
         // with features they move to the features layer (the final image).
         build_opts.labels = base_labels(will_build_features, input.labels);
+        // `--push` lands on the base build only when it is the final image.
+        // With features the features layer is the final image and gets `--push`;
+        // the base must stay `--load`-able for the features `FROM`.
+        build_opts.push = base_push(will_build_features, input.build_tuning.push);
 
         if !will_build_features {
             let metadata_label = cella_features::generate_metadata_label(
@@ -526,6 +549,11 @@ async fn resolve_and_build_features(
         build_tuning: input.build_tuning.toolchain(),
         output: input.output,
         labels: input.labels,
+        // Features layer is the final image when features are present, so it
+        // should push when requested. The toolchain() view preserves `push`
+        // (the features layer is explicitly the final image, unlike the base
+        // build which must stay loadable when features will follow).
+        push: input.build_tuning.push,
         progress: input.progress,
     };
     let features_image = build_features_layer(&ctx).await?;
@@ -704,6 +732,9 @@ pub fn parse_build_options(
         // Same as `output`: the caller sets labels via `base_labels` only when
         // this base build is the final image (no features layer to follow).
         labels: Vec::new(),
+        // `push` likewise: the caller sets it via `base_push` only when this
+        // base build is the final image (no features layer to follow).
+        push: false,
     }
 }
 
@@ -915,6 +946,7 @@ mod tests {
             cache_to: Some("type=registry,ref=r"),
             cli_cache_from: &[],
             platform: None,
+            push: false,
         };
         let opts = parse_build_options(&build, "img", Path::new("/ws"), false, None, tuning);
         assert_eq!(opts.cache_to.as_deref(), Some("type=registry,ref=r"));
@@ -1287,12 +1319,58 @@ mod tests {
     #[test]
     fn skip_base_inspect_only_for_no_features_export() {
         // No features + a `--output` export → skip the inspect (image not loaded).
-        assert!(skip_base_inspect(false, Some("type=local,dest=/tmp/out")));
-        // No export → inspect normally (the build loaded the image).
-        assert!(!skip_base_inspect(false, None));
+        assert!(skip_base_inspect(
+            false,
+            Some("type=local,dest=/tmp/out"),
+            false
+        ));
+        // No export, no push → inspect normally (the build loaded the image).
+        assert!(!skip_base_inspect(false, None, false));
         // With features the base build still loads (export rides the features
         // layer), so the base stays inspectable regardless of `--output`.
-        assert!(!skip_base_inspect(true, Some("type=local,dest=/tmp/out")));
-        assert!(!skip_base_inspect(true, None));
+        assert!(!skip_base_inspect(
+            true,
+            Some("type=local,dest=/tmp/out"),
+            false
+        ));
+        assert!(!skip_base_inspect(true, None, false));
+        // No features + `--push` → skip the inspect (push does not load locally).
+        assert!(skip_base_inspect(false, None, true));
+        // With features + `--push` → base build still loads (push rides the
+        // features layer), so the base remains inspectable.
+        assert!(!skip_base_inspect(true, None, true));
+        // Both output and push (unusual combo, but test both paths covered).
+        assert!(skip_base_inspect(
+            false,
+            Some("type=local,dest=/tmp/out"),
+            true
+        ));
+        assert!(!skip_base_inspect(
+            true,
+            Some("type=local,dest=/tmp/out"),
+            true
+        ));
+    }
+
+    // ── base_push: --push placement (final-build only) ───────────────
+    //
+    // Same load-bearing rule as `base_output`: `--push` belongs on the final
+    // image. A base build that a features layer will `FROM` must stay
+    // `--load`-able (the push moves to the features layer). Pinned on the
+    // pure helper since `resolve_base_image` is Docker-coupled.
+
+    #[test]
+    fn base_push_suppressed_when_features_will_build() {
+        // Features to follow → the base build must NOT carry push
+        // (it has to stay loadable for the features `FROM`).
+        assert!(!base_push(true, true));
+        assert!(!base_push(true, false));
+    }
+
+    #[test]
+    fn base_push_applied_when_base_is_final() {
+        // No features: the base build IS the final image.
+        assert!(base_push(false, true));
+        assert!(!base_push(false, false));
     }
 }

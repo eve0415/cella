@@ -78,6 +78,11 @@ pub struct BuildArgs {
     #[arg(long)]
     platform: Option<String>,
 
+    /// Push the built image to a registry (buildx). Passes `--push` to
+    /// `docker buildx build`. Not supported on the Docker Compose path.
+    #[arg(long)]
+    push: bool,
+
     /// Additional image(s) to use as a layer cache during the build (repeatable).
     /// Single-container path only (not supported on the Docker Compose path).
     #[arg(long = "cache-from")]
@@ -281,7 +286,7 @@ impl BuildArgs {
     fn reject_unsupported_compose_flags(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.platform.is_some() {
+        if self.platform.is_some() || self.push {
             return Err("--platform or --push not supported.".into());
         }
         if self.output.is_some() {
@@ -381,6 +386,11 @@ impl BuildArgs {
                 cli_cache_from: &self.cache_from,
                 cache_to: self.cache_to.as_deref(),
                 platform: self.platform.as_deref(),
+                // `--push`: push the final image to a registry (buildx-only).
+                // The orchestrator routes it to the single final build (base
+                // when there are no features, features layer otherwise) so the
+                // base stays loadable for any `FROM`.
+                push: self.push,
             },
             // buildx `--output` export spec. The orchestrator routes it to the
             // single final build (base when there are no features, features
@@ -673,6 +683,12 @@ mod tests {
                 .is_err()
         );
         assert!(
+            parse_build(&["--push"])
+                .reject_unsupported_compose_flags()
+                .is_err(),
+            "--push must be rejected on compose path"
+        );
+        assert!(
             parse_build(&["--cache-to", "type=inline"])
                 .reject_unsupported_compose_flags()
                 .is_err()
@@ -690,6 +706,26 @@ mod tests {
                 .is_ok()
         );
         assert!(parse_build(&[]).reject_unsupported_compose_flags().is_ok());
+    }
+
+    #[test]
+    fn push_defaults_to_false() {
+        assert!(!parse_build(&[]).push);
+    }
+
+    #[test]
+    fn push_parses_as_boolean_flag() {
+        assert!(parse_build(&["--push"]).push);
+    }
+
+    #[test]
+    fn compose_rejects_push_with_correct_message() {
+        // The official CLI rejects --push for compose with "--platform or --push
+        // not supported." cella mirrors that exact message.
+        let err = parse_build(&["--push"])
+            .reject_unsupported_compose_flags()
+            .expect_err("compose must reject --push");
+        assert_eq!(err.to_string(), "--platform or --push not supported.");
     }
 
     // ── --label parsing / threading ─────────────────────────────────
@@ -1094,9 +1130,7 @@ mod tests {
     // Source of truth: devcontainers/cli `src/spec-node/devContainersSpecCLI.ts`
     // `buildOptions` (lines 523-548). Every official long flag MUST be declared
     // so no official `devcontainer build` invocation errors with "unknown
-    // argument" — EXCEPT `--push`/`--output` of the registry-write surface that
-    // cella intentionally defers (`--push`) or already supports (`--output` is
-    // present). This test pins the surface so it can't silently drift again.
+    // argument". This test pins the surface so it can't silently drift again.
     const OFFICIAL_BUILD_FLAGS: &[&str] = &[
         "user-data-folder",
         "docker-path",
@@ -1111,6 +1145,7 @@ mod tests {
         "cache-to",
         "buildkit",
         "platform",
+        "push",
         "label",
         "output",
         "additional-features",
