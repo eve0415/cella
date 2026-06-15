@@ -103,9 +103,44 @@ fn split_tag(s: &str) -> (&str, &str) {
 /// etc.) are reserved but not in common registry use.  The 64-char hex
 /// constraint matches SHA-256 output exactly (256 bits → 32 bytes → 64 hex
 /// digits).
-fn is_digest(s: &str) -> bool {
+pub(crate) fn is_digest(s: &str) -> bool {
     s.strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Try to parse `input` as a digest-pinned OCI reference
+/// (`registry/repo@sha256:<hex>`).
+///
+/// Returns `None` when `input` is not digest-pinned (no `@`, or the suffix is
+/// not a valid digest) so the caller continues with tag parsing. Returns
+/// `Some(Err(..))` for a valid digest that lacks a fully-qualified registry —
+/// digest pins resolve only against an OCI registry.
+///
+/// Must run before `split_tag`, which uses `rsplit_once(':')` and would
+/// otherwise split on the `:` inside `sha256:…`, mis-reading the hex as a tag.
+fn parse_digest_ref(raw: &str, input: &str) -> Option<Result<FeatureRef, FeatureError>> {
+    let (base_no_digest, digest) = input.rsplit_once('@')?;
+    if !is_digest(digest) {
+        return None;
+    }
+    let first_component = base_no_digest.split('/').next().unwrap_or(base_no_digest);
+    if first_component.contains('.') || first_component.contains(':') {
+        // Fully-qualified OCI reference with a hostname.
+        let (registry, repository) = base_no_digest
+            .split_once('/')
+            .expect("contains '/' — first component has '.' or ':'");
+        // Carry the digest in the `tag` field so downstream fetchers can detect
+        // it via `tag.starts_with("sha256:")`.
+        return Some(Ok(FeatureRef::Oci {
+            registry: registry.to_owned(),
+            repository: repository.to_owned(),
+            tag: digest.to_owned(),
+        }));
+    }
+    Some(Err(FeatureError::InvalidReference {
+        reference: raw.to_owned(),
+        reason: "digest-pinned references require a fully-qualified registry".to_owned(),
+    }))
 }
 
 /// Strip a trailing `:tag` or `@digest` from a feature id.
@@ -186,28 +221,10 @@ impl FeatureRef {
             });
         }
 
-        // Rule 3b: digest-pinned OCI reference (`registry/repo@sha256:<hex>`).
-        //
-        // Must be checked BEFORE `split_tag` — `split_tag` uses `rsplit_once(':')`
-        // which would split on the `:` inside the digest (`sha256:abc…`) and
-        // treat `abc…` as the tag and `…@sha256` as part of the repository path.
-        if let Some((base_no_digest, digest)) = input.rsplit_once('@')
-            && is_digest(digest)
-        {
-            let first_component = base_no_digest.split('/').next().unwrap_or(base_no_digest);
-            if first_component.contains('.') || first_component.contains(':') {
-                // Fully-qualified OCI reference with a hostname.
-                let (registry, repository) = base_no_digest
-                    .split_once('/')
-                    .expect("contains '/' — first component has '.' or ':'");
-                return Ok(Self::Oci {
-                    registry: registry.to_owned(),
-                    repository: repository.to_owned(),
-                    // Carry the digest in the `tag` field so downstream
-                    // fetchers can detect it via `tag.starts_with("sha256:")`.
-                    tag: digest.to_owned(),
-                });
-            }
+        // Rule 3b: digest-pinned OCI reference (`registry/repo@sha256:<hex>`),
+        // resolved before `split_tag` (which would mis-split the digest `:`).
+        if let Some(result) = parse_digest_ref(raw, input) {
+            return result;
         }
 
         // Split off the tag before counting components.
@@ -733,6 +750,15 @@ mod tests {
     #[test]
     fn is_digest_rejects_no_prefix() {
         assert!(!is_digest(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn parse_rejects_digest_without_registry() {
+        // A valid digest but no fully-qualified registry must fail with a clear
+        // error, not fall through to `split_tag` and mis-split the digest `:`.
+        let err = FeatureRef::parse(&format!("owner/repo@{SHA256_DIGEST}"))
+            .expect_err("digest without a registry must be rejected");
+        assert!(matches!(err, FeatureError::InvalidReference { .. }));
     }
 
     // -----------------------------------------------------------------------
